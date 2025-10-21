@@ -1,0 +1,29 @@
+# Build
+_build/
+deps/
+ebin/
+*.beam
+*.o
+*.so
+*.dylib
+
+# Rebar3
+rebar.lock
+.rebar3/
+
+# Data
+.beamchain/
+
+# Editor
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Crash dumps
+erl_crash.dump
