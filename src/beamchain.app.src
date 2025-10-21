@@ -1,0 +1,29 @@
+{application, beamchain, [
+    {description, "Bitcoin full node in Erlang/OTP"},
+    {vsn, "0.1.0"},
+    {registered, [
+        beamchain_sup,
+        beamchain_node_sup,
+        beamchain_config,
+        beamchain_db,
+        beamchain_chainstate,
+        beamchain_mempool,
+        beamchain_peer_manager,
+        beamchain_sync
+    ]},
+    {mod, {beamchain_app, []}},
+    {applications, [
+        kernel,
+        stdlib,
+        crypto,
+        ssl,
+        inets
+    ]},
+    {env, [
+        {network, mainnet},
+        {datadir, undefined}
+    ]},
+    {modules, []},
+    {licenses, ["MIT"]},
+    {links, [{"GitHub", "https://github.com/hashhog/beamchain"}]}
+]}.
