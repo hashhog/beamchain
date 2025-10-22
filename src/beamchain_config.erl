@@ -1,6 +1,8 @@
 -module(beamchain_config).
 -behaviour(gen_server).
 
+-compile({no_auto_import, [get/1]}).
+
 -include("beamchain.hrl").
 -include("beamchain_protocol.hrl").
 
