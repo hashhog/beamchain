@@ -13,8 +13,14 @@
 %% Variable-length string/bytes
 -export([encode_varstr/1, decode_varstr/1]).
 
+%% Block header
+-export([encode_block_header/1, decode_block_header/1]).
+
+%% Hashing
+-export([block_hash/1, hash256/1, hash160/1]).
+
 %% Utility
--export([hex_encode/1, hex_decode/1]).
+-export([reverse_bytes/1, hex_encode/1, hex_decode/1]).
 
 %%% -------------------------------------------------------------------
 %%% Varint (CompactSize) encoding
@@ -71,8 +77,67 @@ decode_varstr(Bin) ->
     {Str, Rest2}.
 
 %%% -------------------------------------------------------------------
+%%% Block header (80 bytes)
+%%% -------------------------------------------------------------------
+
+-spec encode_block_header(#block_header{}) -> binary().
+encode_block_header(#block_header{version = Version,
+                                  prev_hash = PrevHash,
+                                  merkle_root = MerkleRoot,
+                                  timestamp = Timestamp,
+                                  bits = Bits,
+                                  nonce = Nonce}) ->
+    <<Version:32/little,
+      PrevHash:32/binary,
+      MerkleRoot:32/binary,
+      Timestamp:32/little,
+      Bits:32/little,
+      Nonce:32/little>>.
+
+-spec decode_block_header(binary()) -> {#block_header{}, binary()}.
+decode_block_header(<<Version:32/little,
+                      PrevHash:32/binary,
+                      MerkleRoot:32/binary,
+                      Timestamp:32/little,
+                      Bits:32/little,
+                      Nonce:32/little,
+                      Rest/binary>>) ->
+    Header = #block_header{
+        version = Version,
+        prev_hash = PrevHash,
+        merkle_root = MerkleRoot,
+        timestamp = Timestamp,
+        bits = Bits,
+        nonce = Nonce
+    },
+    {Header, Rest}.
+
+%%% -------------------------------------------------------------------
+%%% Hashing
+%%% -------------------------------------------------------------------
+
+-spec hash256(binary()) -> binary().
+hash256(Data) ->
+    crypto:hash(sha256, crypto:hash(sha256, Data)).
+
+-spec hash160(binary()) -> binary().
+hash160(Data) ->
+    crypto:hash(ripemd160, crypto:hash(sha256, Data)).
+
+-spec block_hash(#block_header{} | #block{}) -> binary().
+block_hash(#block{header = Header}) ->
+    block_hash(Header);
+block_hash(#block_header{} = Header) ->
+    hash256(encode_block_header(Header)).
+
+%%% -------------------------------------------------------------------
 %%% Utility functions
 %%% -------------------------------------------------------------------
+
+-spec reverse_bytes(binary()) -> binary().
+reverse_bytes(Bin) ->
+    list_to_binary(lists:reverse(binary_to_list(Bin))).
+
 
 -spec hex_encode(binary()) -> binary().
 hex_encode(Bin) ->
