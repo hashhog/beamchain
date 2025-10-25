@@ -34,6 +34,9 @@
 %% Merkle
 -export([compute_merkle_root/1, compute_witness_commitment/2]).
 
+%% Weight/vsize
+-export([tx_weight/1, tx_vsize/1]).
+
 %% Utility
 -export([reverse_bytes/1, hex_encode/1, hex_decode/1]).
 
@@ -311,6 +314,26 @@ decode_block(Bin) ->
         transactions = Txs
     },
     {Block, Rest2}.
+
+%%% -------------------------------------------------------------------
+%%% Weight / vsize
+%%% -------------------------------------------------------------------
+
+-spec tx_weight(#transaction{}) -> non_neg_integer().
+tx_weight(Tx) ->
+    BaseSize = byte_size(encode_transaction(Tx, no_witness)),
+    case has_witness(Tx) of
+        true ->
+            TotalSize = byte_size(encode_transaction(Tx, witness)),
+            (BaseSize * (?WITNESS_SCALE_FACTOR - 1)) + TotalSize;
+        false ->
+            BaseSize * ?WITNESS_SCALE_FACTOR
+    end.
+
+-spec tx_vsize(#transaction{}) -> non_neg_integer().
+tx_vsize(Tx) ->
+    Weight = tx_weight(Tx),
+    (Weight + ?WITNESS_SCALE_FACTOR - 1) div ?WITNESS_SCALE_FACTOR.
 
 %%% -------------------------------------------------------------------
 %%% Utility functions
