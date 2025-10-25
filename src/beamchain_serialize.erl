@@ -31,6 +31,9 @@
 -export([block_hash/1, tx_hash/1, wtx_hash/1,
          hash256/1, hash160/1]).
 
+%% Merkle
+-export([compute_merkle_root/1, compute_witness_commitment/2]).
+
 %% Utility
 -export([reverse_bytes/1, hex_encode/1, hex_decode/1]).
 
@@ -152,6 +155,33 @@ wtx_hash(Tx) ->
         true  -> hash256(encode_transaction(Tx, witness));
         false -> tx_hash(Tx)
     end.
+
+%%% -------------------------------------------------------------------
+%%% Merkle tree
+%%% -------------------------------------------------------------------
+
+-spec compute_merkle_root([binary()]) -> binary().
+compute_merkle_root([]) ->
+    <<0:256>>;
+compute_merkle_root([Root]) ->
+    Root;
+compute_merkle_root(Hashes) ->
+    NextLevel = merkle_pairs(Hashes),
+    compute_merkle_root(NextLevel).
+
+merkle_pairs([]) ->
+    [];
+merkle_pairs([A]) ->
+    %% odd element: duplicate it
+    [hash256(<<A/binary, A/binary>>)];
+merkle_pairs([A, B | Rest]) ->
+    [hash256(<<A/binary, B/binary>>) | merkle_pairs(Rest)].
+
+-spec compute_witness_commitment([binary()], binary()) -> binary().
+compute_witness_commitment(Wtxids, WitnessNonce) ->
+    %% coinbase wtxid is 32 zero bytes (first element should already be set)
+    WitnessRoot = compute_merkle_root(Wtxids),
+    hash256(<<WitnessRoot/binary, WitnessNonce/binary>>).
 
 %%% -------------------------------------------------------------------
 %%% Transaction input
