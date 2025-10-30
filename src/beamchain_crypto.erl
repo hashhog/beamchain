@@ -33,7 +33,9 @@
 
 init() ->
     SoName = filename:join(priv_dir(), "beamchain_crypto_nif"),
-    erlang:load_nif(SoName, 0).
+    Ret = erlang:load_nif(SoName, 0),
+    init_tag_hashes(),
+    Ret.
 
 priv_dir() ->
     case code:priv_dir(beamchain) of
@@ -160,6 +162,13 @@ hmac_sha512(Key, Data) ->
 %%% -------------------------------------------------------------------
 %%% Tag hash cache (persistent_term for fast lookups)
 %%% -------------------------------------------------------------------
+
+%% Pre-warm cache for all known BIP 340/341 tags at module load time
+%% so the first call to tagged_hash doesn't pay the cache miss cost
+init_tag_hashes() ->
+    Tags = [<<"BIP0340/challenge">>, <<"BIP0340/aux">>, <<"BIP0340/nonce">>,
+            <<"TapLeaf">>, <<"TapBranch">>, <<"TapTweak">>, <<"TapSighash">>],
+    lists:foreach(fun(Tag) -> get_tag_hash(Tag) end, Tags).
 
 get_tag_hash(Tag) ->
     case persistent_term:get({beamchain_tag_hash, Tag}, undefined) of
