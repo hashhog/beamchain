@@ -1,5 +1,7 @@
 -module(beamchain_address).
 
+-include("beamchain.hrl").
+
 %% Base58Check
 -export([base58check_encode/2, base58check_decode/1]).
 
@@ -7,11 +9,15 @@
 -export([bech32_encode/2, bech32_decode/1,
          bech32m_encode/2, bech32m_decode/1]).
 
-%% Bit conversion helpers
+%% High-level address functions
+-export([script_to_address/2, address_to_script/2,
+         classify_script/1]).
+
+%% Bit conversion helpers (exported for testing)
 -export([convert_bits/4]).
 
 %%% -------------------------------------------------------------------
-%%% Base58 alphabet
+%%% Base58 alphabet and constants
 %%% -------------------------------------------------------------------
 
 -define(BASE58_ALPHABET, "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz").
@@ -88,6 +94,114 @@ bech32m_encode(Hrp, Data) ->
 -spec bech32m_decode(string()) -> {ok, {string(), [integer()]}} | {error, term()}.
 bech32m_decode(Str) ->
     bech32_decode_internal(Str, ?BECH32M_CONST).
+
+%%% -------------------------------------------------------------------
+%%% High-level: scriptPubKey → address
+%%% -------------------------------------------------------------------
+
+-spec script_to_address(binary(), mainnet | testnet) -> string() | unknown.
+%% P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+script_to_address(<<16#76, 16#a9, 16#14, Hash:20/binary, 16#88, 16#ac>>, Network) ->
+    Version = case Network of
+        mainnet -> 16#00;
+        testnet -> 16#6f
+    end,
+    base58check_encode(Version, Hash);
+
+%% P2SH: OP_HASH160 <20> OP_EQUAL
+script_to_address(<<16#a9, 16#14, Hash:20/binary, 16#87>>, Network) ->
+    Version = case Network of
+        mainnet -> 16#05;
+        testnet -> 16#c4
+    end,
+    base58check_encode(Version, Hash);
+
+%% Witness programs: OP_n <len> <program>
+script_to_address(<<WitVer:8, Len:8, Program:Len/binary>>, Network)
+  when (WitVer =:= 16#00 orelse (WitVer >= 16#51 andalso WitVer =< 16#60)),
+       (Len >= 2 andalso Len =< 40) ->
+    Hrp = case Network of
+        mainnet -> "bc";
+        testnet -> "tb"
+    end,
+    Version = case WitVer of
+        16#00 -> 0;
+        V     -> V - 16#50
+    end,
+    ProgramBits = convert_bits(binary_to_list(Program), 8, 5, true),
+    case Version of
+        0 -> bech32_encode(Hrp, [Version | ProgramBits]);
+        _ -> bech32m_encode(Hrp, [Version | ProgramBits])
+    end;
+
+%% OP_RETURN
+script_to_address(<<16#6a, _/binary>>, _Network) ->
+    "OP_RETURN";
+
+script_to_address(_, _) ->
+    unknown.
+
+%%% -------------------------------------------------------------------
+%%% High-level: address → scriptPubKey
+%%% -------------------------------------------------------------------
+
+-spec address_to_script(string(), mainnet | testnet) -> {ok, binary()} | {error, term()}.
+address_to_script(Address, Network) ->
+    %% try bech32/bech32m first, then base58check
+    case try_decode_segwit(Address, Network) of
+        {ok, Script} -> {ok, Script};
+        {error, _} ->
+            case base58check_decode(Address) of
+                {ok, {Version, Payload}} ->
+                    address_version_to_script(Version, Payload, Network);
+                {error, _} = E -> E
+            end
+    end.
+
+%%% -------------------------------------------------------------------
+%%% Script classification
+%%% -------------------------------------------------------------------
+
+-spec classify_script(binary()) ->
+    p2pkh | p2sh | p2wpkh | p2wsh | p2tr | op_return |
+    {witness, non_neg_integer(), binary()} | nonstandard.
+
+%% P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+classify_script(<<16#76, 16#a9, 16#14, _:20/binary, 16#88, 16#ac>>) ->
+    p2pkh;
+
+%% P2SH: OP_HASH160 <20> OP_EQUAL
+classify_script(<<16#a9, 16#14, _:20/binary, 16#87>>) ->
+    p2sh;
+
+%% P2WPKH: OP_0 <20>
+classify_script(<<16#00, 16#14, _:20/binary>>) ->
+    p2wpkh;
+
+%% P2WSH: OP_0 <32>
+classify_script(<<16#00, 16#20, _:32/binary>>) ->
+    p2wsh;
+
+%% P2TR: OP_1 <32>
+classify_script(<<16#51, 16#20, _:32/binary>>) ->
+    p2tr;
+
+%% OP_RETURN
+classify_script(<<16#6a, _/binary>>) ->
+    op_return;
+
+%% Other witness programs (future versions)
+classify_script(<<WitVer:8, Len:8, Program:Len/binary>>)
+  when (WitVer =:= 16#00 orelse (WitVer >= 16#51 andalso WitVer =< 16#60)),
+       (Len >= 2 andalso Len =< 40) ->
+    Version = case WitVer of
+        16#00 -> 0;
+        V     -> V - 16#50
+    end,
+    {witness, Version, Program};
+
+classify_script(_) ->
+    nonstandard.
 
 %%% -------------------------------------------------------------------
 %%% Internal: Base58 helpers
@@ -246,7 +360,7 @@ decode_bech32_chars([C | Rest], Acc) ->
     end.
 
 %%% -------------------------------------------------------------------
-%%% Bit conversion (8-to-5 and 5-to-8)
+%%% Internal: Bit conversion (8-to-5 and 5-to-8)
 %%% -------------------------------------------------------------------
 
 -spec convert_bits([integer()], pos_integer(), pos_integer(), boolean()) ->
@@ -282,3 +396,75 @@ extract_bits(Acc, Bits, ToBits, MaxV, Ret) when Bits >= ToBits ->
     extract_bits(Acc, Bits1, ToBits, MaxV, [Val | Ret]);
 extract_bits(Acc, Bits, _ToBits, _MaxV, Ret) ->
     {Ret, Acc, Bits}.
+
+%%% -------------------------------------------------------------------
+%%% Internal: SegWit address decode
+%%% -------------------------------------------------------------------
+
+try_decode_segwit(Address, Network) ->
+    ExpectedHrp = case Network of
+        mainnet -> "bc";
+        testnet -> "tb"
+    end,
+    %% try bech32 first, then bech32m
+    case try_decode_segwit_variant(Address, ExpectedHrp) of
+        {ok, _} = Result -> Result;
+        {error, _} -> {error, not_segwit}
+    end.
+
+try_decode_segwit_variant(Address, ExpectedHrp) ->
+    %% try both bech32 and bech32m, verify version matches encoding
+    case bech32_decode(Address) of
+        {ok, {Hrp, [WitVer | Data5]}} when Hrp =:= ExpectedHrp, WitVer =:= 0 ->
+            decode_witness_program(WitVer, Data5);
+        _ ->
+            case bech32m_decode(Address) of
+                {ok, {Hrp, [WitVer | Data5]}} when Hrp =:= ExpectedHrp,
+                                                     WitVer >= 1,
+                                                     WitVer =< 16 ->
+                    decode_witness_program(WitVer, Data5);
+                {ok, _} ->
+                    {error, invalid_witness_version};
+                {error, _} = E -> E
+            end
+    end.
+
+decode_witness_program(WitVer, Data5) ->
+    case convert_bits(Data5, 5, 8, false) of
+        error -> {error, invalid_program};
+        Program when length(Program) < 2 -> {error, program_too_short};
+        Program when length(Program) > 40 -> {error, program_too_long};
+        Program ->
+            %% witness v0 must be 20 or 32 bytes
+            ProgramLen = length(Program),
+            case WitVer =:= 0 andalso ProgramLen =/= 20 andalso ProgramLen =/= 32 of
+                true -> {error, invalid_v0_program_length};
+                false ->
+                    ProgramBin = list_to_binary(Program),
+                    OpVer = case WitVer of
+                        0 -> 16#00;
+                        N -> 16#50 + N
+                    end,
+                    Script = <<OpVer:8, ProgramLen:8, ProgramBin/binary>>,
+                    {ok, Script}
+            end
+    end.
+
+%%% -------------------------------------------------------------------
+%%% Internal: Base58 version → script
+%%% -------------------------------------------------------------------
+
+address_version_to_script(16#00, Hash, mainnet) when byte_size(Hash) =:= 20 ->
+    %% mainnet P2PKH
+    {ok, <<16#76, 16#a9, 16#14, Hash/binary, 16#88, 16#ac>>};
+address_version_to_script(16#6f, Hash, testnet) when byte_size(Hash) =:= 20 ->
+    %% testnet P2PKH
+    {ok, <<16#76, 16#a9, 16#14, Hash/binary, 16#88, 16#ac>>};
+address_version_to_script(16#05, Hash, mainnet) when byte_size(Hash) =:= 20 ->
+    %% mainnet P2SH
+    {ok, <<16#a9, 16#14, Hash/binary, 16#87>>};
+address_version_to_script(16#c4, Hash, testnet) when byte_size(Hash) =:= 20 ->
+    %% testnet P2SH
+    {ok, <<16#a9, 16#14, Hash/binary, 16#87>>};
+address_version_to_script(_, _, _) ->
+    {error, unknown_version}.
