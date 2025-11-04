@@ -297,13 +297,357 @@ is_op_success(Op) when Op >= 16#bb, Op =< 16#fe -> true;
 is_op_success(_) -> false.
 
 %%% -------------------------------------------------------------------
+%%% Execution state helpers
+%%% -------------------------------------------------------------------
+
+executing(#script_state{exec_stack = []}) -> true;
+executing(#script_state{exec_stack = Stack}) ->
+    lists:all(fun(V) -> V end, Stack).
+
+push(Value, #script_state{stack = Stack} = State) ->
+    State#script_state{stack = [Value | Stack]}.
+
+push_num(N, State) -> push(encode_script_num(N), State).
+
+pop(#script_state{stack = []}) ->
+    {error, stack_underflow};
+pop(#script_state{stack = [Top | Rest]} = State) ->
+    {ok, Top, State#script_state{stack = Rest}}.
+
+pop2(State) ->
+    case pop(State) of
+        {ok, A, State1} ->
+            case pop(State1) of
+                {ok, B, State2} -> {ok, B, A, State2};
+                Error -> Error
+            end;
+        Error -> Error
+    end.
+
+pop3(State) ->
+    case pop(State) of
+        {ok, A, State1} ->
+            case pop2(State1) of
+                {ok, B, C, State2} -> {ok, B, C, A, State2};
+                Error -> Error
+            end;
+        Error -> Error
+    end.
+
+pop_num(State) ->
+    pop_num(State, 4).
+pop_num(State, MaxLen) ->
+    case pop(State) of
+        {ok, Bin, State1} ->
+            case decode_script_num(Bin, MaxLen) of
+                {ok, N} -> {ok, N, State1};
+                {error, _} = E -> E
+            end;
+        Error -> Error
+    end.
+
+pop_num2(State) ->
+    case pop_num(State) of
+        {ok, A, State1} ->
+            case pop_num(State1) of
+                {ok, B, State2} -> {ok, B, A, State2};
+                Error -> Error
+            end;
+        Error -> Error
+    end.
+
+check_stack_size(#script_state{stack = S, altstack = A}) ->
+    length(S) + length(A) =< ?MAX_STACK_SIZE.
+
+count_op(#script_state{op_count = Count, sig_version = SigVer} = State) ->
+    NewCount = Count + 1,
+    case SigVer of
+        tapscript ->
+            %% tapscript has no opcode limit
+            {ok, State#script_state{op_count = NewCount}};
+        _ when NewCount > ?MAX_OPS_PER_SCRIPT ->
+            {error, op_count_exceeded};
+        _ ->
+            {ok, State#script_state{op_count = NewCount}}
+    end.
+
+%%% -------------------------------------------------------------------
+%%% Main evaluation entry point
+%%% -------------------------------------------------------------------
+
+-spec eval_script(binary(), [binary()], non_neg_integer(),
+                  term(), base | witness_v0 | tapscript) ->
+    {ok, [binary()]} | {error, atom()}.
+eval_script(Script, Stack, Flags, SigChecker, SigVersion) ->
+    %% Check for OP_SUCCESS in tapscript before execution
+    case SigVersion of
+        tapscript ->
+            case check_op_success(Script, Flags) of
+                {success, true} ->
+                    {ok, [script_true()]};
+                {error, _} = E ->
+                    E;
+                ok ->
+                    do_eval_script(Script, Stack, Flags, SigChecker, SigVersion)
+            end;
+        _ ->
+            do_eval_script(Script, Stack, Flags, SigChecker, SigVersion)
+    end.
+
+do_eval_script(Script, Stack, Flags, SigChecker, SigVersion) ->
+    case byte_size(Script) > ?MAX_SCRIPT_SIZE andalso SigVersion =/= tapscript of
+        true -> {error, script_too_large};
+        false ->
+            State0 = #script_state{
+                stack = Stack,
+                flags = Flags,
+                sig_checker = SigChecker,
+                sig_version = SigVersion,
+                script = Script,
+                sigops_budget = 0  %% set by caller for tapscript
+            },
+            execute(Script, 0, State0)
+    end.
+
+%%% -------------------------------------------------------------------
+%%% Check for OP_SUCCESS in tapscript (BIP 342)
+%%% -------------------------------------------------------------------
+
+check_op_success(Script, Flags) ->
+    case scan_for_op_success(Script) of
+        true ->
+            case Flags band ?SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS of
+                0 -> {success, true};
+                _ -> {error, discourage_op_success}
+            end;
+        false ->
+            ok
+    end.
+
+scan_for_op_success(<<>>) ->
+    false;
+scan_for_op_success(<<Op, _Rest/binary>>) when Op >= 1, Op =< 16#4b ->
+    %% data push, skip bytes
+    skip_push(Op, _Rest);
+scan_for_op_success(<<?OP_PUSHDATA1, Len:8, Rest/binary>>) ->
+    skip_data(Len, Rest);
+scan_for_op_success(<<?OP_PUSHDATA2, Len:16/little, Rest/binary>>) ->
+    skip_data(Len, Rest);
+scan_for_op_success(<<?OP_PUSHDATA4, Len:32/little, Rest/binary>>) ->
+    skip_data(Len, Rest);
+scan_for_op_success(<<Op, _Rest/binary>>) ->
+    case is_op_success(Op) of
+        true -> true;
+        false -> scan_for_op_success(_Rest)
+    end.
+
+skip_push(N, Bin) ->
+    case Bin of
+        <<_:N/binary, Rest/binary>> -> scan_for_op_success(Rest);
+        _ -> false
+    end.
+
+skip_data(Len, Bin) ->
+    case Bin of
+        <<_:Len/binary, Rest/binary>> -> scan_for_op_success(Rest);
+        _ -> false
+    end.
+
+%%% -------------------------------------------------------------------
+%%% Script execution loop
+%%% -------------------------------------------------------------------
+
+execute(<<>>, _Pos, #script_state{exec_stack = ExecStack} = State) ->
+    case ExecStack of
+        [] -> {ok, State#script_state.stack};
+        _ -> {error, unbalanced_conditional}
+    end;
+
+%% --- Data push: 1-75 bytes ---
+execute(<<PushLen, Rest/binary>>, Pos, State)
+  when PushLen >= 1, PushLen =< 16#4b ->
+    case Rest of
+        <<Data:PushLen/binary, Rest2/binary>> ->
+            case executing(State) of
+                true ->
+                    case check_push_size(Data, State) of
+                        ok ->
+                            State1 = push(Data, State),
+                            case check_stack_size(State1) of
+                                true -> execute(Rest2, Pos + 1 + PushLen, State1);
+                                false -> {error, stack_overflow}
+                            end;
+                        Error -> Error
+                    end;
+                false ->
+                    execute(Rest2, Pos + 1 + PushLen, State)
+            end;
+        _ ->
+            {error, script_truncated}
+    end;
+
+%% --- OP_0 (push empty) ---
+execute(<<?OP_0, Rest/binary>>, Pos, State) ->
+    case executing(State) of
+        true ->
+            State1 = push(<<>>, State),
+            execute(Rest, Pos + 1, State1);
+        false ->
+            execute(Rest, Pos + 1, State)
+    end;
+
+%% --- OP_PUSHDATA1 ---
+execute(<<?OP_PUSHDATA1, Len:8, Rest/binary>>, Pos, State) ->
+    execute_pushdata(Len, Rest, Pos + 2, State);
+
+%% --- OP_PUSHDATA2 ---
+execute(<<?OP_PUSHDATA2, Len:16/little, Rest/binary>>, Pos, State) ->
+    execute_pushdata(Len, Rest, Pos + 3, State);
+
+%% --- OP_PUSHDATA4 ---
+execute(<<?OP_PUSHDATA4, Len:32/little, Rest/binary>>, Pos, State) ->
+    execute_pushdata(Len, Rest, Pos + 5, State);
+
+%% --- OP_1NEGATE ---
+execute(<<?OP_1NEGATE, Rest/binary>>, Pos, State) ->
+    case executing(State) of
+        true ->
+            State1 = push(encode_script_num(-1), State),
+            execute(Rest, Pos + 1, State1);
+        false ->
+            execute(Rest, Pos + 1, State)
+    end;
+
+%% --- OP_RESERVED (0x50) - causes failure if executed ---
+execute(<<?OP_RESERVED, Rest/binary>>, Pos, State) ->
+    case executing(State) of
+        true -> {error, op_reserved};
+        false -> execute(Rest, Pos + 1, State)
+    end;
+
+%% --- OP_1 through OP_16 ---
+execute(<<Op, Rest/binary>>, Pos, State)
+  when Op >= ?OP_1, Op =< ?OP_16 ->
+    case executing(State) of
+        true ->
+            N = Op - ?OP_1 + 1,
+            State1 = push(encode_script_num(N), State),
+            execute(Rest, Pos + 1, State1);
+        false ->
+            execute(Rest, Pos + 1, State)
+    end;
+
+%% --- OP_NOP ---
+execute(<<?OP_NOP, Rest/binary>>, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} -> execute(Rest, Pos + 1, State1);
+        Error -> Error
+    end;
+
+%% --- OP_VER (causes failure if executed) ---
+execute(<<?OP_VER, Rest/binary>>, Pos, State) ->
+    case executing(State) of
+        true -> {error, op_ver};
+        false -> execute(Rest, Pos + 1, State)
+    end;
+
+%% --- OP_VERIF / OP_VERNOTIF (always fail) ---
+execute(<<?OP_VERIF, _/binary>>, _Pos, _State) ->
+    {error, op_verif};
+execute(<<?OP_VERNOTIF, _/binary>>, _Pos, _State) ->
+    {error, op_vernotif};
+
+%% --- OP_VERIFY ---
+execute(<<?OP_VERIFY, Rest/binary>>, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} ->
+            case executing(State1) of
+                true ->
+                    case pop(State1) of
+                        {ok, Top, State2} ->
+                            case script_bool(Top) of
+                                true -> execute(Rest, Pos + 1, State2);
+                                false -> {error, verify_failed}
+                            end;
+                        Error -> Error
+                    end;
+                false ->
+                    execute(Rest, Pos + 1, State1)
+            end;
+        Error -> Error
+    end;
+
+%% --- OP_RETURN ---
+execute(<<?OP_RETURN, _Rest/binary>>, _Pos, State) ->
+    case executing(State) of
+        true -> {error, op_return};
+        false ->
+            %% still need to parse the rest for IF nesting
+            {error, op_return}
+    end;
+
+%% --- Disabled opcodes ---
+execute(<<Op, _Rest/binary>>, _Pos, #script_state{sig_version = SigVer} = _State)
+  when is_integer(Op) ->
+    case is_disabled_opcode(Op) of
+        true when SigVer =/= tapscript ->
+            {error, disabled_opcode};
+        _ ->
+            execute_remaining(Op, _Rest, _Pos, _State)
+    end;
+
+execute(_, _Pos, _State) ->
+    {error, invalid_script}.
+
+%%% -------------------------------------------------------------------
+%%% Remaining opcodes dispatch (stubs for now)
+%%% -------------------------------------------------------------------
+
+execute_remaining(Op, _Rest, _Pos, _State) ->
+    {error, {unknown_opcode, Op}}.
+
+%%% -------------------------------------------------------------------
+%%% Pushdata helper
+%%% -------------------------------------------------------------------
+
+execute_pushdata(Len, Bin, Pos, State) ->
+    case Bin of
+        <<Data:Len/binary, Rest/binary>> ->
+            case executing(State) of
+                true ->
+                    case check_push_size(Data, State) of
+                        ok ->
+                            State1 = push(Data, State),
+                            case check_stack_size(State1) of
+                                true -> execute(Rest, Pos + Len, State1);
+                                false -> {error, stack_overflow}
+                            end;
+                        Error -> Error
+                    end;
+                false ->
+                    execute(Rest, Pos + Len, State)
+            end;
+        _ ->
+            {error, script_truncated}
+    end.
+
+check_push_size(Data, #script_state{sig_version = tapscript}) ->
+    %% tapscript: max push size is 520 bytes
+    case byte_size(Data) > ?MAX_SCRIPT_ELEMENT_SIZE of
+        true -> {error, push_size_exceeded};
+        false -> ok
+    end;
+check_push_size(Data, _State) ->
+    case byte_size(Data) > ?MAX_SCRIPT_ELEMENT_SIZE of
+        true -> {error, push_size_exceeded};
+        false -> ok
+    end.
+
+%%% -------------------------------------------------------------------
 %%% Stubs (to be implemented)
 %%% -------------------------------------------------------------------
 
 verify_script(_ScriptSig, _ScriptPubKey, _Witness, _Flags, _SigChecker) ->
-    {error, not_implemented}.
-
-eval_script(_Script, _Stack, _Flags, _SigChecker, _SigVersion) ->
     {error, not_implemented}.
 
 flags_for_height(_Height, _Network) ->
