@@ -586,6 +586,108 @@ execute(<<?OP_RETURN, _Rest/binary>>, _Pos, State) ->
             {error, op_return}
     end;
 
+%% --- Stack operations ---
+execute(<<?OP_TOALTSTACK, Rest/binary>>, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} -> execute_stack_op(toaltstack, Rest, Pos + 1, State1);
+        Error -> Error
+    end;
+execute(<<?OP_FROMALTSTACK, Rest/binary>>, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} -> execute_stack_op(fromaltstack, Rest, Pos + 1, State1);
+        Error -> Error
+    end;
+execute(<<?OP_2DROP, Rest/binary>>, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} -> execute_stack_op('2drop', Rest, Pos + 1, State1);
+        Error -> Error
+    end;
+execute(<<?OP_2DUP, Rest/binary>>, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} -> execute_stack_op('2dup', Rest, Pos + 1, State1);
+        Error -> Error
+    end;
+execute(<<?OP_3DUP, Rest/binary>>, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} -> execute_stack_op('3dup', Rest, Pos + 1, State1);
+        Error -> Error
+    end;
+execute(<<?OP_2OVER, Rest/binary>>, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} -> execute_stack_op('2over', Rest, Pos + 1, State1);
+        Error -> Error
+    end;
+execute(<<?OP_2ROT, Rest/binary>>, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} -> execute_stack_op('2rot', Rest, Pos + 1, State1);
+        Error -> Error
+    end;
+execute(<<?OP_2SWAP, Rest/binary>>, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} -> execute_stack_op('2swap', Rest, Pos + 1, State1);
+        Error -> Error
+    end;
+execute(<<?OP_IFDUP, Rest/binary>>, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} -> execute_stack_op(ifdup, Rest, Pos + 1, State1);
+        Error -> Error
+    end;
+execute(<<?OP_DEPTH, Rest/binary>>, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} -> execute_stack_op(depth, Rest, Pos + 1, State1);
+        Error -> Error
+    end;
+execute(<<?OP_DROP, Rest/binary>>, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} -> execute_stack_op(drop, Rest, Pos + 1, State1);
+        Error -> Error
+    end;
+execute(<<?OP_DUP, Rest/binary>>, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} -> execute_stack_op(dup, Rest, Pos + 1, State1);
+        Error -> Error
+    end;
+execute(<<?OP_NIP, Rest/binary>>, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} -> execute_stack_op(nip, Rest, Pos + 1, State1);
+        Error -> Error
+    end;
+execute(<<?OP_OVER, Rest/binary>>, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} -> execute_stack_op(over, Rest, Pos + 1, State1);
+        Error -> Error
+    end;
+execute(<<?OP_PICK, Rest/binary>>, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} -> execute_stack_op(pick, Rest, Pos + 1, State1);
+        Error -> Error
+    end;
+execute(<<?OP_ROLL, Rest/binary>>, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} -> execute_stack_op(roll, Rest, Pos + 1, State1);
+        Error -> Error
+    end;
+execute(<<?OP_ROT, Rest/binary>>, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} -> execute_stack_op(rot, Rest, Pos + 1, State1);
+        Error -> Error
+    end;
+execute(<<?OP_SWAP, Rest/binary>>, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} -> execute_stack_op(swap, Rest, Pos + 1, State1);
+        Error -> Error
+    end;
+execute(<<?OP_TUCK, Rest/binary>>, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} -> execute_stack_op(tuck, Rest, Pos + 1, State1);
+        Error -> Error
+    end;
+execute(<<?OP_SIZE, Rest/binary>>, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} -> execute_stack_op(size, Rest, Pos + 1, State1);
+        Error -> Error
+    end;
+
 %% --- Disabled opcodes ---
 execute(<<Op, _Rest/binary>>, _Pos, #script_state{sig_version = SigVer} = _State)
   when is_integer(Op) ->
@@ -605,6 +707,181 @@ execute(_, _Pos, _State) ->
 
 execute_remaining(Op, _Rest, _Pos, _State) ->
     {error, {unknown_opcode, Op}}.
+
+%%% -------------------------------------------------------------------
+%%% Stack operations implementation
+%%% -------------------------------------------------------------------
+
+execute_stack_op(Op, Rest, Pos, State) ->
+    case executing(State) of
+        false -> execute(Rest, Pos, State);
+        true -> do_stack_op(Op, Rest, Pos, State)
+    end.
+
+do_stack_op(toaltstack, Rest, Pos, State) ->
+    case pop(State) of
+        {ok, Top, State1} ->
+            State2 = State1#script_state{
+                altstack = [Top | State1#script_state.altstack]
+            },
+            execute(Rest, Pos, State2);
+        Error -> Error
+    end;
+do_stack_op(fromaltstack, _Rest, _Pos, #script_state{altstack = []} = _State) ->
+    {error, altstack_underflow};
+do_stack_op(fromaltstack, Rest, Pos,
+            #script_state{altstack = [Top | AltRest]} = State) ->
+    State1 = push(Top, State#script_state{altstack = AltRest}),
+    execute(Rest, Pos, State1);
+do_stack_op('2drop', Rest, Pos, State) ->
+    case pop(State) of
+        {ok, _, State1} ->
+            case pop(State1) of
+                {ok, _, State2} -> execute(Rest, Pos, State2);
+                Error -> Error
+            end;
+        Error -> Error
+    end;
+do_stack_op('2dup', Rest, Pos, #script_state{stack = [A, B | _]} = State) ->
+    State1 = State#script_state{stack = [A, B | State#script_state.stack]},
+    case check_stack_size(State1) of
+        true -> execute(Rest, Pos, State1);
+        false -> {error, stack_overflow}
+    end;
+do_stack_op('2dup', _Rest, _Pos, _State) ->
+    {error, stack_underflow};
+do_stack_op('3dup', Rest, Pos, #script_state{stack = [A, B, C | _]} = State) ->
+    State1 = State#script_state{stack = [A, B, C | State#script_state.stack]},
+    case check_stack_size(State1) of
+        true -> execute(Rest, Pos, State1);
+        false -> {error, stack_overflow}
+    end;
+do_stack_op('3dup', _Rest, _Pos, _State) ->
+    {error, stack_underflow};
+do_stack_op('2over', Rest, Pos, #script_state{stack = [_, _, C, D | _]} = State) ->
+    State1 = State#script_state{stack = [C, D | State#script_state.stack]},
+    case check_stack_size(State1) of
+        true -> execute(Rest, Pos, State1);
+        false -> {error, stack_overflow}
+    end;
+do_stack_op('2over', _Rest, _Pos, _State) ->
+    {error, stack_underflow};
+do_stack_op('2rot', Rest, Pos,
+            #script_state{stack = [A, B, C, D, E, F | Tail]} = State) ->
+    State1 = State#script_state{stack = [E, F, A, B, C, D | Tail]},
+    execute(Rest, Pos, State1);
+do_stack_op('2rot', _Rest, _Pos, _State) ->
+    {error, stack_underflow};
+do_stack_op('2swap', Rest, Pos,
+            #script_state{stack = [A, B, C, D | Tail]} = State) ->
+    State1 = State#script_state{stack = [C, D, A, B | Tail]},
+    execute(Rest, Pos, State1);
+do_stack_op('2swap', _Rest, _Pos, _State) ->
+    {error, stack_underflow};
+do_stack_op(ifdup, Rest, Pos, State) ->
+    case State#script_state.stack of
+        [Top | _] ->
+            case script_bool(Top) of
+                true ->
+                    State1 = push(Top, State),
+                    case check_stack_size(State1) of
+                        true -> execute(Rest, Pos, State1);
+                        false -> {error, stack_overflow}
+                    end;
+                false ->
+                    execute(Rest, Pos, State)
+            end;
+        [] -> {error, stack_underflow}
+    end;
+do_stack_op(depth, Rest, Pos, State) ->
+    Depth = length(State#script_state.stack),
+    State1 = push_num(Depth, State),
+    execute(Rest, Pos, State1);
+do_stack_op(drop, Rest, Pos, State) ->
+    case pop(State) of
+        {ok, _, State1} -> execute(Rest, Pos, State1);
+        Error -> Error
+    end;
+do_stack_op(dup, Rest, Pos, #script_state{stack = [Top | _]} = State) ->
+    State1 = push(Top, State),
+    case check_stack_size(State1) of
+        true -> execute(Rest, Pos, State1);
+        false -> {error, stack_overflow}
+    end;
+do_stack_op(dup, _Rest, _Pos, _State) ->
+    {error, stack_underflow};
+do_stack_op(nip, Rest, Pos, #script_state{stack = [A, _ | Tail]} = State) ->
+    State1 = State#script_state{stack = [A | Tail]},
+    execute(Rest, Pos, State1);
+do_stack_op(nip, _Rest, _Pos, _State) ->
+    {error, stack_underflow};
+do_stack_op(over, Rest, Pos, #script_state{stack = [_, B | _]} = State) ->
+    State1 = push(B, State),
+    case check_stack_size(State1) of
+        true -> execute(Rest, Pos, State1);
+        false -> {error, stack_overflow}
+    end;
+do_stack_op(over, _Rest, _Pos, _State) ->
+    {error, stack_underflow};
+do_stack_op(pick, Rest, Pos, State) ->
+    case pop_num(State) of
+        {ok, N, State1} when N >= 0 ->
+            Stack = State1#script_state.stack,
+            case N < length(Stack) of
+                true ->
+                    Item = lists:nth(N + 1, Stack),
+                    State2 = push(Item, State1),
+                    case check_stack_size(State2) of
+                        true -> execute(Rest, Pos, State2);
+                        false -> {error, stack_overflow}
+                    end;
+                false -> {error, stack_underflow}
+            end;
+        {ok, _, _} -> {error, invalid_stack_index};
+        Error -> Error
+    end;
+do_stack_op(roll, Rest, Pos, State) ->
+    case pop_num(State) of
+        {ok, N, State1} when N >= 0 ->
+            Stack = State1#script_state.stack,
+            case N < length(Stack) of
+                true ->
+                    Item = lists:nth(N + 1, Stack),
+                    {Before, [_ | After]} = lists:split(N, Stack),
+                    State2 = State1#script_state{stack = [Item | Before ++ After]},
+                    execute(Rest, Pos, State2);
+                false -> {error, stack_underflow}
+            end;
+        {ok, _, _} -> {error, invalid_stack_index};
+        Error -> Error
+    end;
+do_stack_op(rot, Rest, Pos, #script_state{stack = [A, B, C | Tail]} = State) ->
+    State1 = State#script_state{stack = [C, A, B | Tail]},
+    execute(Rest, Pos, State1);
+do_stack_op(rot, _Rest, _Pos, _State) ->
+    {error, stack_underflow};
+do_stack_op(swap, Rest, Pos, #script_state{stack = [A, B | Tail]} = State) ->
+    State1 = State#script_state{stack = [B, A | Tail]},
+    execute(Rest, Pos, State1);
+do_stack_op(swap, _Rest, _Pos, _State) ->
+    {error, stack_underflow};
+do_stack_op(tuck, Rest, Pos, #script_state{stack = [A, B | Tail]} = State) ->
+    State1 = State#script_state{stack = [A, B, A | Tail]},
+    case check_stack_size(State1) of
+        true -> execute(Rest, Pos, State1);
+        false -> {error, stack_overflow}
+    end;
+do_stack_op(tuck, _Rest, _Pos, _State) ->
+    {error, stack_underflow};
+do_stack_op(size, Rest, Pos, #script_state{stack = [Top | _]} = State) ->
+    Size = byte_size(Top),
+    State1 = push_num(Size, State),
+    case check_stack_size(State1) of
+        true -> execute(Rest, Pos, State1);
+        false -> {error, stack_overflow}
+    end;
+do_stack_op(size, _Rest, _Pos, _State) ->
+    {error, stack_underflow}.
 
 %%% -------------------------------------------------------------------
 %%% Pushdata helper
