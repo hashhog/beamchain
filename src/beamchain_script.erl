@@ -577,6 +577,48 @@ execute(<<?OP_VERIFY, Rest/binary>>, Pos, State) ->
         Error -> Error
     end;
 
+%% --- OP_IF ---
+execute(<<?OP_IF, Rest/binary>>, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} -> execute_if(true, Rest, Pos + 1, State1);
+        Error -> Error
+    end;
+
+%% --- OP_NOTIF ---
+execute(<<?OP_NOTIF, Rest/binary>>, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} -> execute_if(false, Rest, Pos + 1, State1);
+        Error -> Error
+    end;
+
+%% --- OP_ELSE ---
+execute(<<?OP_ELSE, _Rest/binary>>, _Pos,
+        #script_state{exec_stack = []} = _State) ->
+    {error, unexpected_else};
+execute(<<?OP_ELSE, Rest/binary>>, Pos,
+        #script_state{exec_stack = [Top | ExRest]} = State) ->
+    case count_op(State) of
+        {ok, State1} ->
+            State2 = State1#script_state{
+                exec_stack = [not Top | ExRest]
+            },
+            execute(Rest, Pos + 1, State2);
+        Error -> Error
+    end;
+
+%% --- OP_ENDIF ---
+execute(<<?OP_ENDIF, _Rest/binary>>, _Pos,
+        #script_state{exec_stack = []} = _State) ->
+    {error, unexpected_endif};
+execute(<<?OP_ENDIF, Rest/binary>>, Pos,
+        #script_state{exec_stack = [_ | ExRest]} = State) ->
+    case count_op(State) of
+        {ok, State1} ->
+            State2 = State1#script_state{exec_stack = ExRest},
+            execute(Rest, Pos + 1, State2);
+        Error -> Error
+    end;
+
 %% --- OP_RETURN ---
 execute(<<?OP_RETURN, _Rest/binary>>, _Pos, State) ->
     case executing(State) of
@@ -707,6 +749,56 @@ execute(_, _Pos, _State) ->
 
 execute_remaining(Op, _Rest, _Pos, _State) ->
     {error, {unknown_opcode, Op}}.
+
+%%% -------------------------------------------------------------------
+%%% IF/NOTIF execution
+%%% -------------------------------------------------------------------
+
+execute_if(ExpectTrue, Rest, Pos, State) ->
+    case executing(State) of
+        true ->
+            case pop(State) of
+                {ok, Cond, State1} ->
+                    Bool = case State1#script_state.sig_version of
+                        tapscript ->
+                            %% MINIMALIF is always on in tapscript
+                            case Cond of
+                                <<>> -> false;
+                                <<1>> -> true;
+                                _ -> error
+                            end;
+                        _ ->
+                            case (State1#script_state.flags band
+                                  ?SCRIPT_VERIFY_MINIMALIF) =/= 0 of
+                                true ->
+                                    case Cond of
+                                        <<>> -> false;
+                                        <<1>> -> true;
+                                        _ -> error
+                                    end;
+                                false ->
+                                    script_bool(Cond)
+                            end
+                    end,
+                    case Bool of
+                        error ->
+                            {error, minimalif_failed};
+                        _ ->
+                            Exec = case ExpectTrue of
+                                true -> Bool;
+                                false -> not Bool
+                            end,
+                            ExecStack = [Exec | State1#script_state.exec_stack],
+                            execute(Rest, Pos,
+                                    State1#script_state{exec_stack = ExecStack})
+                    end;
+                Error -> Error
+            end;
+        false ->
+            %% not executing, just push false onto exec stack
+            ExecStack = [false | State#script_state.exec_stack],
+            execute(Rest, Pos, State#script_state{exec_stack = ExecStack})
+    end.
 
 %%% -------------------------------------------------------------------
 %%% Stack operations implementation
