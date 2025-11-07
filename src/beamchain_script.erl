@@ -747,8 +747,169 @@ execute(_, _Pos, _State) ->
 %%% Remaining opcodes dispatch (stubs for now)
 %%% -------------------------------------------------------------------
 
-execute_remaining(Op, _Rest, _Pos, _State) ->
-    {error, {unknown_opcode, Op}}.
+execute_remaining(Op, Rest, Pos, State) ->
+    case Op of
+        _ when Op >= ?OP_1ADD, Op =< ?OP_WITHIN ->
+            execute_arith(Op, Rest, Pos + 1, State);
+        _ ->
+            {error, {unknown_opcode, Op}}
+    end.
+
+%%% -------------------------------------------------------------------
+%%% Arithmetic opcodes
+%%% -------------------------------------------------------------------
+
+execute_arith(Op, Rest, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} ->
+            case executing(State1) of
+                false -> execute(Rest, Pos, State1);
+                true -> do_arith(Op, Rest, Pos, State1)
+            end;
+        Error -> Error
+    end.
+
+%% Unary arithmetic
+do_arith(?OP_1ADD, Rest, Pos, State) ->
+    case pop_num(State) of
+        {ok, A, State1} -> execute(Rest, Pos, push_num(A + 1, State1));
+        Error -> Error
+    end;
+do_arith(?OP_1SUB, Rest, Pos, State) ->
+    case pop_num(State) of
+        {ok, A, State1} -> execute(Rest, Pos, push_num(A - 1, State1));
+        Error -> Error
+    end;
+do_arith(?OP_NEGATE, Rest, Pos, State) ->
+    case pop_num(State) of
+        {ok, A, State1} -> execute(Rest, Pos, push_num(-A, State1));
+        Error -> Error
+    end;
+do_arith(?OP_ABS, Rest, Pos, State) ->
+    case pop_num(State) of
+        {ok, A, State1} -> execute(Rest, Pos, push_num(abs(A), State1));
+        Error -> Error
+    end;
+do_arith(?OP_NOT, Rest, Pos, State) ->
+    case pop_num(State) of
+        {ok, 0, State1} -> execute(Rest, Pos, push_num(1, State1));
+        {ok, _, State1} -> execute(Rest, Pos, push_num(0, State1));
+        Error -> Error
+    end;
+do_arith(?OP_0NOTEQUAL, Rest, Pos, State) ->
+    case pop_num(State) of
+        {ok, 0, State1} -> execute(Rest, Pos, push_num(0, State1));
+        {ok, _, State1} -> execute(Rest, Pos, push_num(1, State1));
+        Error -> Error
+    end;
+
+%% Binary arithmetic
+do_arith(?OP_ADD, Rest, Pos, State) ->
+    case pop_num2(State) of
+        {ok, A, B, State1} -> execute(Rest, Pos, push_num(A + B, State1));
+        Error -> Error
+    end;
+do_arith(?OP_SUB, Rest, Pos, State) ->
+    case pop_num2(State) of
+        {ok, A, B, State1} -> execute(Rest, Pos, push_num(A - B, State1));
+        Error -> Error
+    end;
+do_arith(?OP_BOOLAND, Rest, Pos, State) ->
+    case pop_num2(State) of
+        {ok, A, B, State1} ->
+            R = case A =/= 0 andalso B =/= 0 of
+                true -> 1; false -> 0
+            end,
+            execute(Rest, Pos, push_num(R, State1));
+        Error -> Error
+    end;
+do_arith(?OP_BOOLOR, Rest, Pos, State) ->
+    case pop_num2(State) of
+        {ok, A, B, State1} ->
+            R = case A =/= 0 orelse B =/= 0 of
+                true -> 1; false -> 0
+            end,
+            execute(Rest, Pos, push_num(R, State1));
+        Error -> Error
+    end;
+do_arith(?OP_NUMEQUAL, Rest, Pos, State) ->
+    case pop_num2(State) of
+        {ok, A, B, State1} ->
+            execute(Rest, Pos, push_num(case A =:= B of true -> 1; false -> 0 end, State1));
+        Error -> Error
+    end;
+do_arith(?OP_NUMEQUALVERIFY, Rest, Pos, State) ->
+    case pop_num2(State) of
+        {ok, A, B, State1} ->
+            case A =:= B of
+                true -> execute(Rest, Pos, State1);
+                false -> {error, numequalverify_failed}
+            end;
+        Error -> Error
+    end;
+do_arith(?OP_NUMNOTEQUAL, Rest, Pos, State) ->
+    case pop_num2(State) of
+        {ok, A, B, State1} ->
+            execute(Rest, Pos, push_num(case A =/= B of true -> 1; false -> 0 end, State1));
+        Error -> Error
+    end;
+do_arith(?OP_LESSTHAN, Rest, Pos, State) ->
+    case pop_num2(State) of
+        {ok, A, B, State1} ->
+            execute(Rest, Pos, push_num(case A < B of true -> 1; false -> 0 end, State1));
+        Error -> Error
+    end;
+do_arith(?OP_GREATERTHAN, Rest, Pos, State) ->
+    case pop_num2(State) of
+        {ok, A, B, State1} ->
+            execute(Rest, Pos, push_num(case A > B of true -> 1; false -> 0 end, State1));
+        Error -> Error
+    end;
+do_arith(?OP_LESSTHANOREQUAL, Rest, Pos, State) ->
+    case pop_num2(State) of
+        {ok, A, B, State1} ->
+            execute(Rest, Pos, push_num(case A =< B of true -> 1; false -> 0 end, State1));
+        Error -> Error
+    end;
+do_arith(?OP_GREATERTHANOREQUAL, Rest, Pos, State) ->
+    case pop_num2(State) of
+        {ok, A, B, State1} ->
+            execute(Rest, Pos, push_num(case A >= B of true -> 1; false -> 0 end, State1));
+        Error -> Error
+    end;
+do_arith(?OP_MIN, Rest, Pos, State) ->
+    case pop_num2(State) of
+        {ok, A, B, State1} -> execute(Rest, Pos, push_num(min(A, B), State1));
+        Error -> Error
+    end;
+do_arith(?OP_MAX, Rest, Pos, State) ->
+    case pop_num2(State) of
+        {ok, A, B, State1} -> execute(Rest, Pos, push_num(max(A, B), State1));
+        Error -> Error
+    end;
+do_arith(?OP_WITHIN, Rest, Pos, State) ->
+    case pop3(State) of
+        {ok, X, Min, Max, State1} ->
+            case decode_script_num(X, 4) of
+                {ok, XN} ->
+                    case decode_script_num(Min, 4) of
+                        {ok, MinN} ->
+                            case decode_script_num(Max, 4) of
+                                {ok, MaxN} ->
+                                    R = case MinN =< XN andalso XN < MaxN of
+                                        true -> 1; false -> 0
+                                    end,
+                                    execute(Rest, Pos, push_num(R, State1));
+                                Error -> Error
+                            end;
+                        Error -> Error
+                    end;
+                Error -> Error
+            end;
+        Error -> Error
+    end;
+do_arith(Op, _Rest, _Pos, _State) ->
+    {error, {disabled_opcode, Op}}.
 
 %%% -------------------------------------------------------------------
 %%% IF/NOTIF execution
