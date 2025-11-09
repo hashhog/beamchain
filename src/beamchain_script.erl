@@ -749,10 +749,54 @@ execute(_, _Pos, _State) ->
 
 execute_remaining(Op, Rest, Pos, State) ->
     case Op of
+        ?OP_EQUAL -> execute_equal(Rest, Pos + 1, State);
+        ?OP_EQUALVERIFY -> execute_equalverify(Rest, Pos + 1, State);
         _ when Op >= ?OP_1ADD, Op =< ?OP_WITHIN ->
             execute_arith(Op, Rest, Pos + 1, State);
         _ ->
             {error, {unknown_opcode, Op}}
+    end.
+
+%%% -------------------------------------------------------------------
+%%% OP_EQUAL / OP_EQUALVERIFY
+%%% -------------------------------------------------------------------
+
+execute_equal(Rest, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} ->
+            case executing(State1) of
+                false -> execute(Rest, Pos, State1);
+                true ->
+                    case pop2(State1) of
+                        {ok, A, B, State2} ->
+                            Result = case A =:= B of
+                                true -> script_true();
+                                false -> script_false()
+                            end,
+                            State3 = push(Result, State2),
+                            execute(Rest, Pos, State3);
+                        Error -> Error
+                    end
+            end;
+        Error -> Error
+    end.
+
+execute_equalverify(Rest, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} ->
+            case executing(State1) of
+                false -> execute(Rest, Pos, State1);
+                true ->
+                    case pop2(State1) of
+                        {ok, A, B, State2} ->
+                            case A =:= B of
+                                true -> execute(Rest, Pos, State2);
+                                false -> {error, equalverify_failed}
+                            end;
+                        Error -> Error
+                    end
+            end;
+        Error -> Error
     end.
 
 %%% -------------------------------------------------------------------
