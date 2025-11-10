@@ -753,6 +753,12 @@ execute_remaining(Op, Rest, Pos, State) ->
         ?OP_EQUALVERIFY -> execute_equalverify(Rest, Pos + 1, State);
         _ when Op >= ?OP_1ADD, Op =< ?OP_WITHIN ->
             execute_arith(Op, Rest, Pos + 1, State);
+        ?OP_RIPEMD160 -> execute_hash(ripemd160, Rest, Pos + 1, State);
+        ?OP_SHA1 -> execute_hash(sha1, Rest, Pos + 1, State);
+        ?OP_SHA256 -> execute_hash(sha256, Rest, Pos + 1, State);
+        ?OP_HASH160 -> execute_hash(hash160, Rest, Pos + 1, State);
+        ?OP_HASH256 -> execute_hash(hash256, Rest, Pos + 1, State);
+        ?OP_CODESEPARATOR -> execute_codesep(Rest, Pos + 1, State);
         _ ->
             {error, {unknown_opcode, Op}}
     end.
@@ -794,6 +800,60 @@ execute_equalverify(Rest, Pos, State) ->
                                 false -> {error, equalverify_failed}
                             end;
                         Error -> Error
+                    end
+            end;
+        Error -> Error
+    end.
+
+%%% -------------------------------------------------------------------
+%%% Hash opcodes
+%%% -------------------------------------------------------------------
+
+execute_hash(HashType, Rest, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} ->
+            case executing(State1) of
+                false -> execute(Rest, Pos, State1);
+                true ->
+                    case pop(State1) of
+                        {ok, Data, State2} ->
+                            Hash = do_hash(HashType, Data),
+                            State3 = push(Hash, State2),
+                            execute(Rest, Pos, State3);
+                        Error -> Error
+                    end
+            end;
+        Error -> Error
+    end.
+
+do_hash(ripemd160, Data) -> crypto:hash(ripemd160, Data);
+do_hash(sha1, Data) -> crypto:hash(sha, Data);
+do_hash(sha256, Data) -> crypto:hash(sha256, Data);
+do_hash(hash160, Data) -> beamchain_crypto:hash160(Data);
+do_hash(hash256, Data) -> beamchain_crypto:hash256(Data).
+
+%%% -------------------------------------------------------------------
+%%% OP_CODESEPARATOR
+%%% -------------------------------------------------------------------
+
+execute_codesep(Rest, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} ->
+            case executing(State1) of
+                false -> execute(Rest, Pos, State1);
+                true ->
+                    %% In tapscript, CONST_SCRIPTCODE flag makes this
+                    %% fail when CONST_SCRIPTCODE is set... but actually
+                    %% OP_CODESEPARATOR is valid in tapscript.
+                    %% It fails in witness_v0 if CONST_SCRIPTCODE is set.
+                    case State1#script_state.sig_version of
+                        witness_v0 when
+                            (State1#script_state.flags band
+                             ?SCRIPT_VERIFY_CONST_SCRIPTCODE) =/= 0 ->
+                            {error, op_codeseparator_in_witness};
+                        _ ->
+                            State2 = State1#script_state{codesep_pos = Pos},
+                            execute(Rest, Pos, State2)
                     end
             end;
         Error -> Error
