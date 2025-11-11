@@ -759,6 +759,8 @@ execute_remaining(Op, Rest, Pos, State) ->
         ?OP_HASH160 -> execute_hash(hash160, Rest, Pos + 1, State);
         ?OP_HASH256 -> execute_hash(hash256, Rest, Pos + 1, State);
         ?OP_CODESEPARATOR -> execute_codesep(Rest, Pos + 1, State);
+        ?OP_CHECKSIG -> execute_checksig(Rest, Pos + 1, State);
+        ?OP_CHECKSIGVERIFY -> execute_checksigverify(Rest, Pos + 1, State);
         _ ->
             {error, {unknown_opcode, Op}}
     end.
@@ -1276,6 +1278,185 @@ check_push_size(Data, _State) ->
         true -> {error, push_size_exceeded};
         false -> ok
     end.
+
+%%% -------------------------------------------------------------------
+%%% OP_CHECKSIG (ECDSA for base/witness_v0)
+%%% -------------------------------------------------------------------
+
+execute_checksig(Rest, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} ->
+            case executing(State1) of
+                false -> execute(Rest, Pos, State1);
+                true -> do_checksig(Rest, Pos, State1)
+            end;
+        Error -> Error
+    end.
+
+do_checksig(Rest, Pos, #script_state{sig_version = tapscript} = State) ->
+    do_checksig_tapscript(Rest, Pos, State);
+do_checksig(Rest, Pos, State) ->
+    do_checksig_ecdsa(Rest, Pos, State).
+
+do_checksig_ecdsa(Rest, Pos, State) ->
+    case pop2(State) of
+        {ok, PubKey, Sig, State1} ->
+            case Sig of
+                <<>> ->
+                    %% empty sig = push false (no NULLFAIL issue with empty)
+                    execute(Rest, Pos, push(script_false(), State1));
+                _ ->
+                    %% extract hash type (last byte)
+                    SigLen = byte_size(Sig),
+                    HashTypeByte = binary:at(Sig, SigLen - 1),
+                    SigBody = binary:part(Sig, 0, SigLen - 1),
+                    Flags = State1#script_state.flags,
+                    %% check DER encoding
+                    DerOk = case Flags band ?SCRIPT_VERIFY_DERSIG of
+                        0 -> true;
+                        _ -> beamchain_crypto:check_strict_der(SigBody)
+                    end,
+                    LowSOk = case Flags band ?SCRIPT_VERIFY_LOW_S of
+                        0 -> true;
+                        _ ->
+                            case beamchain_crypto:decode_der_signature(SigBody) of
+                                {ok, {_R, S}} -> beamchain_crypto:is_low_s(S);
+                                _ -> false
+                            end
+                    end,
+                    StrictEncOk = case Flags band ?SCRIPT_VERIFY_STRICTENC of
+                        0 -> true;
+                        _ -> check_hash_type(HashTypeByte) andalso
+                             beamchain_crypto:validate_pubkey(PubKey)
+                    end,
+                    case DerOk andalso LowSOk andalso StrictEncOk of
+                        false ->
+                            case Flags band ?SCRIPT_VERIFY_NULLFAIL of
+                                0 -> execute(Rest, Pos, push(script_false(), State1));
+                                _ -> {error, sig_encoding}
+                            end;
+                        true ->
+                            SigChecker = State1#script_state.sig_checker,
+                            SigHash = compute_sig_hash(State1, HashTypeByte, Pos),
+                            Valid = check_ecdsa_sig(SigChecker, SigBody, PubKey, SigHash),
+                            case Valid of
+                                true ->
+                                    execute(Rest, Pos, push(script_true(), State1));
+                                false ->
+                                    case Flags band ?SCRIPT_VERIFY_NULLFAIL of
+                                        0 ->
+                                            execute(Rest, Pos,
+                                                    push(script_false(), State1));
+                                        _ ->
+                                            {error, nullfail}
+                                    end
+                            end
+                    end
+            end;
+        Error -> Error
+    end.
+
+%% tapscript checksig stub (to be implemented with schnorr)
+do_checksig_tapscript(_Rest, _Pos, _State) ->
+    {error, not_implemented}.
+
+%%% -------------------------------------------------------------------
+%%% OP_CHECKSIGVERIFY
+%%% -------------------------------------------------------------------
+
+execute_checksigverify(Rest, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} ->
+            case executing(State1) of
+                false -> execute(Rest, Pos, State1);
+                true ->
+                    case do_checksig_result(State1, Pos) of
+                        {ok, true, State2} ->
+                            execute(Rest, Pos, State2);
+                        {ok, false, _State2} ->
+                            {error, checksigverify_failed};
+                        {error, _} = E -> E
+                    end
+            end;
+        Error -> Error
+    end.
+
+do_checksig_result(#script_state{sig_version = tapscript} = _State, _Pos) ->
+    {error, not_implemented};
+do_checksig_result(State, Pos) ->
+    case pop2(State) of
+        {ok, PubKey, Sig, State1} ->
+            case Sig of
+                <<>> -> {ok, false, State1};
+                _ ->
+                    SigLen = byte_size(Sig),
+                    HashTypeByte = binary:at(Sig, SigLen - 1),
+                    SigBody = binary:part(Sig, 0, SigLen - 1),
+                    SigHash = compute_sig_hash(State1, HashTypeByte, Pos),
+                    Valid = check_ecdsa_sig(
+                        State1#script_state.sig_checker, SigBody, PubKey, SigHash),
+                    Flags = State1#script_state.flags,
+                    case Valid of
+                        false when (Flags band ?SCRIPT_VERIFY_NULLFAIL) =/= 0 ->
+                            {error, nullfail};
+                        _ ->
+                            {ok, Valid, State1}
+                    end
+            end;
+        Error -> Error
+    end.
+
+%%% -------------------------------------------------------------------
+%%% Signature checking delegation to sig_checker
+%%% -------------------------------------------------------------------
+
+%% The sig_checker is either a fun or a map with callback functions.
+%% We'll define it as a map: #{check_sig => Fun, check_locktime => Fun, ...}
+%% Or for simplicity, a tuple {Module, State} where Module exports callbacks.
+%%
+%% For now, support map-based checker:
+%%   #{check_ecdsa_sig => fun(Sig, PubKey, SigHash) -> boolean(),
+%%     check_schnorr_sig => fun(Sig, PubKey, SigHash) -> boolean(),
+%%     check_locktime => fun(LockTime) -> boolean(),
+%%     check_sequence => fun(Sequence) -> boolean(),
+%%     compute_sighash => fun(HashType, SigVersion, CodeSepPos) -> binary(),
+%%     compute_taproot_sighash => fun(HashType, CodeSepPos) -> binary()}
+
+check_ecdsa_sig(#{check_ecdsa_sig := Fun}, Sig, PubKey, SigHash) ->
+    Fun(Sig, PubKey, SigHash);
+check_ecdsa_sig(_, _Sig, _PubKey, _SigHash) ->
+    false.
+
+check_schnorr_sig(#{check_schnorr_sig := Fun}, Sig, PubKey, SigHash) ->
+    Fun(Sig, PubKey, SigHash);
+check_schnorr_sig(_, _Sig, _PubKey, _SigHash) ->
+    false.
+
+check_locktime(#{check_locktime := Fun}, LockTime) ->
+    Fun(LockTime);
+check_locktime(_, _LockTime) ->
+    false.
+
+check_sequence(#{check_sequence := Fun}, Sequence) ->
+    Fun(Sequence);
+check_sequence(_, _Sequence) ->
+    false.
+
+compute_sig_hash(#script_state{sig_checker = Checker}, HashType, CodeSepPos) ->
+    case Checker of
+        #{compute_sighash := Fun} -> Fun(HashType, CodeSepPos);
+        _ -> <<0:256>>
+    end.
+
+compute_taproot_sig_hash(#script_state{sig_checker = Checker}, HashType, CodeSepPos) ->
+    case Checker of
+        #{compute_taproot_sighash := Fun} -> Fun(HashType, CodeSepPos);
+        _ -> <<0:256>>
+    end.
+
+check_hash_type(HT) ->
+    Base = HT band (bnot ?SIGHASH_ANYONECANPAY),
+    Base >= ?SIGHASH_ALL andalso Base =< ?SIGHASH_SINGLE.
 
 %%% -------------------------------------------------------------------
 %%% Stubs (to be implemented)
