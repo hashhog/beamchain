@@ -763,6 +763,11 @@ execute_remaining(Op, Rest, Pos, State) ->
         ?OP_CHECKSIGVERIFY -> execute_checksigverify(Rest, Pos + 1, State);
         ?OP_CHECKMULTISIG -> execute_checkmultisig(Rest, Pos + 1, State);
         ?OP_CHECKMULTISIGVERIFY -> execute_checkmultisigverify(Rest, Pos + 1, State);
+        ?OP_CHECKLOCKTIMEVERIFY -> execute_cltv(Rest, Pos + 1, State);
+        ?OP_CHECKSEQUENCEVERIFY -> execute_csv(Rest, Pos + 1, State);
+        Nop when Nop =:= ?OP_NOP1;
+                 Nop >= ?OP_NOP4, Nop =< ?OP_NOP10 ->
+            execute_nop(Rest, Pos + 1, State);
         _ ->
             {error, {unknown_opcode, Op}}
     end.
@@ -1553,6 +1558,97 @@ execute_checkmultisigverify(Rest, Pos, State) ->
 do_checkmultisig_result(Rest, Pos, State) ->
     %% This duplicates do_checkmultisig but returns state
     do_checkmultisig(Rest, Pos, State).
+
+%%% -------------------------------------------------------------------
+%%% OP_CHECKLOCKTIMEVERIFY (BIP 65) / OP_CHECKSEQUENCEVERIFY (BIP 112)
+%%% -------------------------------------------------------------------
+
+execute_cltv(Rest, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} ->
+            case executing(State1) of
+                false -> execute(Rest, Pos, State1);
+                true ->
+                    Flags = State1#script_state.flags,
+                    case Flags band ?SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY of
+                        0 ->
+                            %% treat as NOP
+                            execute(Rest, Pos, State1);
+                        _ ->
+                            %% peek at top (don't pop)
+                            case State1#script_state.stack of
+                                [Top | _] ->
+                                    case decode_script_num(Top, 5) of
+                                        {ok, N} when N < 0 ->
+                                            {error, negative_locktime};
+                                        {ok, N} ->
+                                            SigChecker = State1#script_state.sig_checker,
+                                            case check_locktime(SigChecker, N) of
+                                                true -> execute(Rest, Pos, State1);
+                                                false -> {error, locktime_failed}
+                                            end;
+                                        Error -> Error
+                                    end;
+                                [] -> {error, stack_underflow}
+                            end
+                    end
+            end;
+        Error -> Error
+    end.
+
+execute_csv(Rest, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} ->
+            case executing(State1) of
+                false -> execute(Rest, Pos, State1);
+                true ->
+                    Flags = State1#script_state.flags,
+                    case Flags band ?SCRIPT_VERIFY_CHECKSEQUENCEVERIFY of
+                        0 ->
+                            %% treat as NOP
+                            execute(Rest, Pos, State1);
+                        _ ->
+                            case State1#script_state.stack of
+                                [Top | _] ->
+                                    case decode_script_num(Top, 5) of
+                                        {ok, N} when N < 0 ->
+                                            {error, negative_sequence};
+                                        {ok, N} ->
+                                            %% If disable flag is set, treat as NOP
+                                            case N band ?SEQUENCE_LOCKTIME_DISABLE_FLAG of
+                                                0 ->
+                                                    SigChecker = State1#script_state.sig_checker,
+                                                    case check_sequence(SigChecker, N) of
+                                                        true -> execute(Rest, Pos, State1);
+                                                        false -> {error, sequence_failed}
+                                                    end;
+                                                _ ->
+                                                    %% disable flag set, treat as NOP
+                                                    execute(Rest, Pos, State1)
+                                            end;
+                                        Error -> Error
+                                    end;
+                                [] -> {error, stack_underflow}
+                            end
+                    end
+            end;
+        Error -> Error
+    end.
+
+%%% -------------------------------------------------------------------
+%%% NOP opcodes
+%%% -------------------------------------------------------------------
+
+execute_nop(Rest, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} ->
+            Flags = State1#script_state.flags,
+            case Flags band ?SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS of
+                0 -> execute(Rest, Pos, State1);
+                _ -> {error, discourage_upgradable_nops}
+            end;
+        Error -> Error
+    end.
 
 %%% -------------------------------------------------------------------
 %%% Pop N items from stack
