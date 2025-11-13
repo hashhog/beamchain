@@ -761,6 +761,8 @@ execute_remaining(Op, Rest, Pos, State) ->
         ?OP_CODESEPARATOR -> execute_codesep(Rest, Pos + 1, State);
         ?OP_CHECKSIG -> execute_checksig(Rest, Pos + 1, State);
         ?OP_CHECKSIGVERIFY -> execute_checksigverify(Rest, Pos + 1, State);
+        ?OP_CHECKMULTISIG -> execute_checkmultisig(Rest, Pos + 1, State);
+        ?OP_CHECKMULTISIGVERIFY -> execute_checkmultisigverify(Rest, Pos + 1, State);
         _ ->
             {error, {unknown_opcode, Op}}
     end.
@@ -1402,6 +1404,168 @@ do_checksig_result(State, Pos) ->
                         _ ->
                             {ok, Valid, State1}
                     end
+            end;
+        Error -> Error
+    end.
+
+%%% -------------------------------------------------------------------
+%%% OP_CHECKMULTISIG
+%%% -------------------------------------------------------------------
+
+execute_checkmultisig(Rest, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} ->
+            case executing(State1) of
+                false -> execute(Rest, Pos, State1);
+                true ->
+                    case State1#script_state.sig_version of
+                        tapscript ->
+                            %% OP_CHECKMULTISIG disabled in tapscript
+                            {error, checkmultisig_in_tapscript};
+                        _ ->
+                            do_checkmultisig(Rest, Pos, State1)
+                    end
+            end;
+        Error -> Error
+    end.
+
+do_checkmultisig(Rest, Pos, State) ->
+    %% pop nkeys
+    case pop_num(State) of
+        {ok, NKeys, State1} when NKeys >= 0, NKeys =< ?MAX_PUBKEYS_PER_MULTISIG ->
+            %% add nkeys to op_count
+            NewOpCount = State1#script_state.op_count + NKeys,
+            case NewOpCount > ?MAX_OPS_PER_SCRIPT andalso
+                 State1#script_state.sig_version =/= tapscript of
+                true -> {error, op_count_exceeded};
+                false ->
+                    State2 = State1#script_state{op_count = NewOpCount},
+                    %% pop public keys
+                    case pop_n(NKeys, State2) of
+                        {ok, PubKeys, State3} ->
+                            %% pop nsigs
+                            case pop_num(State3) of
+                                {ok, NSigs, State4} when NSigs >= 0, NSigs =< NKeys ->
+                                    %% pop signatures
+                                    case pop_n(NSigs, State4) of
+                                        {ok, Sigs, State5} ->
+                                            %% pop the off-by-one dummy element
+                                            case pop(State5) of
+                                                {ok, Dummy, State6} ->
+                                                    Flags = State6#script_state.flags,
+                                                    %% NULLDUMMY check
+                                                    case (Flags band ?SCRIPT_VERIFY_NULLDUMMY) =/= 0 andalso
+                                                         Dummy =/= <<>> of
+                                                        true -> {error, nulldummy_failed};
+                                                        false ->
+                                                            do_multisig_verify(
+                                                                PubKeys, Sigs,
+                                                                Rest, Pos, State6)
+                                                    end;
+                                                Error -> Error
+                                            end;
+                                        Error -> Error
+                                    end;
+                                {ok, _, _} -> {error, invalid_multisig};
+                                Error -> Error
+                            end;
+                        Error -> Error
+                    end
+            end;
+        {ok, _, _} -> {error, invalid_multisig_key_count};
+        Error -> Error
+    end.
+
+do_multisig_verify(PubKeys, Sigs, Rest, Pos, State) ->
+    %% sequential matching: each sig must match a pubkey in order
+    Result = verify_multisig_sigs(PubKeys, Sigs, State, Pos),
+    Flags = State#script_state.flags,
+    case Result of
+        true ->
+            execute(Rest, Pos, push(script_true(), State));
+        false ->
+            %% NULLFAIL: if any sig is non-empty and verification failed, error
+            case (Flags band ?SCRIPT_VERIFY_NULLFAIL) =/= 0 andalso
+                 lists:any(fun(S) -> S =/= <<>> end, Sigs) of
+                true -> {error, nullfail};
+                false -> execute(Rest, Pos, push(script_false(), State))
+            end
+    end.
+
+verify_multisig_sigs(_PubKeys, [], _State, _Pos) ->
+    true;
+verify_multisig_sigs([], [_ | _], _State, _Pos) ->
+    false;  %% more sigs than pubkeys remaining
+verify_multisig_sigs([PK | PKRest], [Sig | SigRest] = Sigs, State, Pos) ->
+    case Sig of
+        <<>> ->
+            %% empty sig - try next pubkey? No, empty sig always fails
+            verify_multisig_sigs(PKRest, Sigs, State, Pos);
+        _ ->
+            SigLen = byte_size(Sig),
+            HashTypeByte = binary:at(Sig, SigLen - 1),
+            SigBody = binary:part(Sig, 0, SigLen - 1),
+            SigHash = compute_sig_hash(State, HashTypeByte, Pos),
+            case check_ecdsa_sig(State#script_state.sig_checker, SigBody, PK, SigHash) of
+                true ->
+                    %% matched, advance both
+                    verify_multisig_sigs(PKRest, SigRest, State, Pos);
+                false ->
+                    %% sig didn't match this key, try next key
+                    %% but only if remaining keys >= remaining sigs
+                    case length(PKRest) >= length(Sigs) of
+                        true ->
+                            verify_multisig_sigs(PKRest, Sigs, State, Pos);
+                        false ->
+                            false
+                    end
+            end
+    end.
+
+execute_checkmultisigverify(Rest, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} ->
+            case executing(State1) of
+                false -> execute(Rest, Pos, State1);
+                true ->
+                    case State1#script_state.sig_version of
+                        tapscript ->
+                            {error, checkmultisig_in_tapscript};
+                        _ ->
+                            %% Run multisig, then verify
+                            case do_checkmultisig_result(Rest, Pos, State1) of
+                                {ok, State2} ->
+                                    case pop(State2) of
+                                        {ok, Top, State3} ->
+                                            case script_bool(Top) of
+                                                true -> execute(Rest, Pos, State3);
+                                                false -> {error, checkmultisigverify_failed}
+                                            end;
+                                        Error -> Error
+                                    end;
+                                Error -> Error
+                            end
+                    end
+            end;
+        Error -> Error
+    end.
+
+do_checkmultisig_result(Rest, Pos, State) ->
+    %% This duplicates do_checkmultisig but returns state
+    do_checkmultisig(Rest, Pos, State).
+
+%%% -------------------------------------------------------------------
+%%% Pop N items from stack
+%%% -------------------------------------------------------------------
+
+pop_n(0, State) ->
+    {ok, [], State};
+pop_n(N, State) when N > 0 ->
+    case pop(State) of
+        {ok, Item, State1} ->
+            case pop_n(N - 1, State1) of
+                {ok, Items, State2} -> {ok, [Item | Items], State2};
+                Error -> Error
             end;
         Error -> Error
     end.
