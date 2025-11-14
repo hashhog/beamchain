@@ -1719,11 +1719,175 @@ check_hash_type(HT) ->
     Base >= ?SIGHASH_ALL andalso Base =< ?SIGHASH_SINGLE.
 
 %%% -------------------------------------------------------------------
-%%% Stubs (to be implemented)
+%%% Top-level script verification
 %%% -------------------------------------------------------------------
 
-verify_script(_ScriptSig, _ScriptPubKey, _Witness, _Flags, _SigChecker) ->
-    {error, not_implemented}.
+-spec verify_script(binary(), binary(), [binary()],
+                    non_neg_integer(), term()) -> boolean().
+verify_script(ScriptSig, ScriptPubKey, Witness, Flags, SigChecker) ->
+    try
+        do_verify_script(ScriptSig, ScriptPubKey, Witness, Flags, SigChecker)
+    catch
+        _:_ -> false
+    end.
+
+do_verify_script(ScriptSig, ScriptPubKey, Witness, Flags, SigChecker) ->
+    %% SIGPUSHONLY: scriptSig must contain only push ops
+    case (Flags band ?SCRIPT_VERIFY_SIGPUSHONLY) =/= 0 of
+        true ->
+            case is_push_only(ScriptSig) of
+                true -> ok;
+                false -> throw(sig_pushonly)
+            end;
+        false -> ok
+    end,
+    %% Step 1: Execute ScriptSig
+    case eval_script(ScriptSig, [], Flags, SigChecker, base) of
+        {ok, Stack1} ->
+            StackCopy = Stack1,
+            %% Step 2: Execute ScriptPubKey with resulting stack
+            case eval_script(ScriptPubKey, Stack1, Flags, SigChecker, base) of
+                {ok, []} ->
+                    false;
+                {ok, Stack2} ->
+                    [Top | _] = Stack2,
+                    case script_bool(Top) of
+                        false -> false;
+                        true ->
+                            %% Step 3: P2SH evaluation
+                            IsP2SH = (Flags band ?SCRIPT_VERIFY_P2SH) =/= 0 andalso
+                                     is_p2sh(ScriptPubKey),
+                            Stack3 = case IsP2SH of
+                                true ->
+                                    %% The serialized script is top of StackCopy
+                                    case StackCopy of
+                                        [] -> throw(p2sh_no_script);
+                                        [RedeemScript | StackRest] ->
+                                            case eval_script(RedeemScript, StackRest,
+                                                           Flags, SigChecker, base) of
+                                                {ok, []} -> throw(p2sh_empty_stack);
+                                                {ok, S} ->
+                                                    case script_bool(hd(S)) of
+                                                        true -> S;
+                                                        false -> throw(p2sh_failed)
+                                                    end;
+                                                {error, E} -> throw(E)
+                                            end
+                                    end;
+                                false ->
+                                    Stack2
+                            end,
+                            %% Step 4: Witness program check
+                            WitnessProg = extract_witness_program(ScriptPubKey),
+                            WitnessResult = case WitnessProg of
+                                {ok, WitVer, WitProg} when
+                                    (Flags band ?SCRIPT_VERIFY_WITNESS) =/= 0 ->
+                                    verify_witness_program(
+                                        WitVer, WitProg, Witness,
+                                        Flags, SigChecker);
+                                _ ->
+                                    %% Check if P2SH redeem script is witness program
+                                    check_p2sh_witness(IsP2SH, StackCopy,
+                                        Witness, Flags, SigChecker, Stack3)
+                            end,
+                            case WitnessResult of
+                                {ok, FinalStack} ->
+                                    %% CLEANSTACK check
+                                    case (Flags band ?SCRIPT_VERIFY_CLEANSTACK) =/= 0 of
+                                        true ->
+                                            length(FinalStack) =:= 1;
+                                        false ->
+                                            true
+                                    end;
+                                {error, _} ->
+                                    false
+                            end
+                    end;
+                {error, _} ->
+                    false
+            end;
+        {error, _} ->
+            false
+    end.
+
+%%% -------------------------------------------------------------------
+%%% Witness program verification (stub for now)
+%%% -------------------------------------------------------------------
+
+verify_witness_program(_Version, _Program, _Witness, _Flags, _SigChecker) ->
+    {ok, [script_true()]}.
+
+%%% -------------------------------------------------------------------
+%%% Witness program extraction
+%%% -------------------------------------------------------------------
+
+extract_witness_program(<<Version, PushLen, Program/binary>>)
+  when Version =:= ?OP_0 orelse (Version >= ?OP_1 andalso Version =< ?OP_16),
+       PushLen >= 2, PushLen =< 40,
+       byte_size(Program) =:= PushLen ->
+    WitVer = case Version of
+        ?OP_0 -> 0;
+        _ -> Version - ?OP_1 + 1
+    end,
+    {ok, WitVer, Program};
+extract_witness_program(_) ->
+    none.
+
+%%% -------------------------------------------------------------------
+%%% P2SH detection
+%%% -------------------------------------------------------------------
+
+is_p2sh(<<16#a9, 16#14, _:20/binary, 16#87>>) -> true;
+is_p2sh(_) -> false.
+
+check_p2sh_witness(true, [RS | _], Witness, Flags, SigChecker, _Stack3) ->
+    case extract_witness_program(RS) of
+        {ok, WV, WP} when (Flags band ?SCRIPT_VERIFY_WITNESS) =/= 0 ->
+            verify_witness_program(WV, WP, Witness, Flags, SigChecker);
+        _ ->
+            {ok, _Stack3}
+    end;
+check_p2sh_witness(_, _, _, _, _, Stack3) ->
+    {ok, Stack3}.
+
+%%% -------------------------------------------------------------------
+%%% Push-only check (for scriptSig with SIGPUSHONLY flag)
+%%% -------------------------------------------------------------------
+
+is_push_only(<<>>) ->
+    true;
+is_push_only(<<Op, Rest/binary>>) when Op >= 1, Op =< 16#4b ->
+    case Rest of
+        <<_:Op/binary, Rest2/binary>> -> is_push_only(Rest2);
+        _ -> false
+    end;
+is_push_only(<<?OP_0, Rest/binary>>) ->
+    is_push_only(Rest);
+is_push_only(<<?OP_PUSHDATA1, Len:8, Rest/binary>>) ->
+    case Rest of
+        <<_:Len/binary, Rest2/binary>> -> is_push_only(Rest2);
+        _ -> false
+    end;
+is_push_only(<<?OP_PUSHDATA2, Len:16/little, Rest/binary>>) ->
+    case Rest of
+        <<_:Len/binary, Rest2/binary>> -> is_push_only(Rest2);
+        _ -> false
+    end;
+is_push_only(<<?OP_PUSHDATA4, Len:32/little, Rest/binary>>) ->
+    case Rest of
+        <<_:Len/binary, Rest2/binary>> -> is_push_only(Rest2);
+        _ -> false
+    end;
+is_push_only(<<?OP_1NEGATE, Rest/binary>>) ->
+    is_push_only(Rest);
+is_push_only(<<Op, Rest/binary>>) when Op >= ?OP_1, Op =< ?OP_16 ->
+    is_push_only(Rest);
+is_push_only(_) ->
+    false.
+
+%%% -------------------------------------------------------------------
+%%% Stubs (to be implemented)
+%%% -------------------------------------------------------------------
 
 flags_for_height(_Height, _Network) ->
     ?SCRIPT_VERIFY_NONE.
