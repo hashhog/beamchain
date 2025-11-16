@@ -1811,10 +1811,91 @@ do_verify_script(ScriptSig, ScriptPubKey, Witness, Flags, SigChecker) ->
     end.
 
 %%% -------------------------------------------------------------------
-%%% Witness program verification (stub for now)
+%%% Witness program verification
 %%% -------------------------------------------------------------------
 
-verify_witness_program(_Version, _Program, _Witness, _Flags, _SigChecker) ->
+verify_witness_program(0, Program, Witness, Flags, SigChecker)
+  when byte_size(Program) =:= 20 ->
+    %% P2WPKH
+    case Witness of
+        [Sig, PubKey] ->
+            %% construct P2PKH script from the 20-byte program
+            Script = <<?OP_DUP, ?OP_HASH160,
+                       20, Program/binary,
+                       ?OP_EQUALVERIFY, ?OP_CHECKSIG>>,
+            case eval_script(Script, [Sig, PubKey], Flags, SigChecker, witness_v0) of
+                {ok, [Top]} ->
+                    case script_bool(Top) of
+                        true -> {ok, [Top]};
+                        false -> {error, witness_program_failed}
+                    end;
+                {ok, _} -> {error, witness_cleanstack};
+                {error, _} = E -> E
+            end;
+        _ ->
+            {error, witness_program_mismatch}
+    end;
+
+verify_witness_program(0, Program, Witness, Flags, SigChecker)
+  when byte_size(Program) =:= 32 ->
+    %% P2WSH
+    case Witness of
+        [] -> {error, witness_program_empty};
+        _ ->
+            WitnessScript = lists:last(Witness),
+            StackItems = lists:droplast(Witness),
+            %% SHA256(witness_script) must equal program
+            case crypto:hash(sha256, WitnessScript) =:= Program of
+                true ->
+                    case byte_size(WitnessScript) > ?MAX_SCRIPT_SIZE of
+                        true -> {error, witness_script_too_large};
+                        false ->
+                            case eval_script(WitnessScript, StackItems,
+                                           Flags, SigChecker, witness_v0) of
+                                {ok, [Top]} ->
+                                    case script_bool(Top) of
+                                        true -> {ok, [Top]};
+                                        false -> {error, witness_program_failed}
+                                    end;
+                                {ok, _} -> {error, witness_cleanstack};
+                                {error, _} = E -> E
+                            end
+                    end;
+                false ->
+                    {error, witness_program_mismatch}
+            end
+    end;
+
+verify_witness_program(Version, _Program, Witness, Flags, _SigChecker)
+  when Version >= 2, Version =< 16 ->
+    %% future witness versions
+    case (Flags band ?SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM) =/= 0 of
+        true -> {error, discourage_upgradable_witness_program};
+        false ->
+            %% unknown witness version succeeds
+            case Witness of
+                [] -> {error, witness_program_empty};
+                _ -> {ok, [script_true()]}
+            end
+    end;
+
+verify_witness_program(1, Program, _Witness, Flags, _SigChecker)
+  when byte_size(Program) =:= 32,
+       (Flags band ?SCRIPT_VERIFY_TAPROOT) =:= 0 ->
+    %% taproot not active yet, succeed
+    {ok, [script_true()]};
+
+verify_witness_program(1, Program, Witness, Flags, SigChecker)
+  when byte_size(Program) =:= 32,
+       (Flags band ?SCRIPT_VERIFY_TAPROOT) =/= 0 ->
+    %% P2TR (Taproot) - stub for now
+    verify_taproot(Program, Witness, Flags, SigChecker);
+
+verify_witness_program(_, _, _, _, _) ->
+    {error, witness_program_wrong_length}.
+
+%% taproot stub (to be implemented)
+verify_taproot(_OutputKey, _Witness, _Flags, _SigChecker) ->
     {ok, [script_true()]}.
 
 %%% -------------------------------------------------------------------
