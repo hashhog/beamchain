@@ -1967,18 +1967,184 @@ is_push_only(_) ->
     false.
 
 %%% -------------------------------------------------------------------
+%%% Sighash computation
+%%% -------------------------------------------------------------------
+
+-spec sighash_legacy(#transaction{}, non_neg_integer(),
+                     binary(), non_neg_integer()) -> binary().
+sighash_legacy(Tx, InputIndex, ScriptCode, HashType) ->
+    BaseType = HashType band 16#1f,
+    AnyoneCanPay = (HashType band ?SIGHASH_ANYONECANPAY) =/= 0,
+    %% SIGHASH_SINGLE with input index >= outputs: return magic hash
+    case BaseType =:= ?SIGHASH_SINGLE andalso
+         InputIndex >= length(Tx#transaction.outputs) of
+        true ->
+            <<1, 0:248>>;
+        false ->
+            %% Remove OP_CODESEPARATOR from scriptCode
+            CleanScript = remove_codeseparator(ScriptCode),
+            %% Build modified transaction
+            Inputs = Tx#transaction.inputs,
+            ModInputs = case AnyoneCanPay of
+                true ->
+                    [modify_input(lists:nth(InputIndex + 1, Inputs),
+                                  CleanScript, BaseType, true)];
+                false ->
+                    lists:map(fun({I, Idx}) ->
+                        IsSelf = Idx =:= InputIndex,
+                        modify_input(I, case IsSelf of
+                            true -> CleanScript;
+                            false -> <<>>
+                        end, BaseType, IsSelf)
+                    end, lists:zip(Inputs, lists:seq(0, length(Inputs) - 1)))
+            end,
+            ModOutputs = case BaseType of
+                ?SIGHASH_NONE ->
+                    [];
+                ?SIGHASH_SINGLE ->
+                    %% Keep only outputs up to InputIndex
+                    Outs = Tx#transaction.outputs,
+                    Padded = [#tx_out{value = 16#ffffffffffffffff,
+                                     script_pubkey = <<>>}
+                              || _ <- lists:seq(0, InputIndex - 1)],
+                    Padded ++ [lists:nth(InputIndex + 1, Outs)];
+                _ ->
+                    Tx#transaction.outputs
+            end,
+            ModTx = Tx#transaction{
+                inputs = ModInputs,
+                outputs = ModOutputs
+            },
+            %% Serialize without witness + hash type as LE uint32
+            TxBin = beamchain_serialize:encode_transaction(ModTx, no_witness),
+            beamchain_crypto:hash256(<<TxBin/binary, HashType:32/little>>)
+    end.
+
+modify_input(#tx_in{} = Input, ScriptCode, BaseType, IsSelf) ->
+    Seq = case IsSelf of
+        true -> Input#tx_in.sequence;
+        false ->
+            case BaseType of
+                ?SIGHASH_NONE -> 0;
+                ?SIGHASH_SINGLE -> 0;
+                _ -> Input#tx_in.sequence
+            end
+    end,
+    Input#tx_in{script_sig = ScriptCode, sequence = Seq, witness = []}.
+
+remove_codeseparator(Script) ->
+    remove_codesep(Script, <<>>).
+
+remove_codesep(<<>>, Acc) ->
+    Acc;
+remove_codesep(<<?OP_CODESEPARATOR, Rest/binary>>, Acc) ->
+    remove_codesep(Rest, Acc);
+remove_codesep(<<Op, Rest/binary>>, Acc) when Op >= 1, Op =< 16#4b ->
+    case Rest of
+        <<Data:Op/binary, Rest2/binary>> ->
+            remove_codesep(Rest2, <<Acc/binary, Op, Data/binary>>);
+        _ ->
+            <<Acc/binary, Op, Rest/binary>>
+    end;
+remove_codesep(<<?OP_PUSHDATA1, Len:8, Rest/binary>>, Acc) ->
+    case Rest of
+        <<Data:Len/binary, Rest2/binary>> ->
+            remove_codesep(Rest2, <<Acc/binary, ?OP_PUSHDATA1, Len:8, Data/binary>>);
+        _ ->
+            <<Acc/binary, ?OP_PUSHDATA1, Len:8, Rest/binary>>
+    end;
+remove_codesep(<<?OP_PUSHDATA2, Len:16/little, Rest/binary>>, Acc) ->
+    case Rest of
+        <<Data:Len/binary, Rest2/binary>> ->
+            remove_codesep(Rest2, <<Acc/binary, ?OP_PUSHDATA2, Len:16/little, Data/binary>>);
+        _ ->
+            <<Acc/binary, ?OP_PUSHDATA2, Len:16/little, Rest/binary>>
+    end;
+remove_codesep(<<B, Rest/binary>>, Acc) ->
+    remove_codesep(Rest, <<Acc/binary, B>>).
+
+-spec sighash_witness_v0(#transaction{}, non_neg_integer(),
+                         binary(), non_neg_integer(),
+                         non_neg_integer()) -> binary().
+sighash_witness_v0(Tx, InputIndex, ScriptCode, Amount, HashType) ->
+    BaseType = HashType band 16#1f,
+    AnyoneCanPay = (HashType band ?SIGHASH_ANYONECANPAY) =/= 0,
+    Inputs = Tx#transaction.inputs,
+    Input = lists:nth(InputIndex + 1, Inputs),
+
+    %% hashPrevouts
+    HashPrevouts = case AnyoneCanPay of
+        true -> <<0:256>>;
+        false ->
+            PrevoutsData = list_to_binary([
+                encode_outpoint(I#tx_in.prev_out) || I <- Inputs
+            ]),
+            beamchain_crypto:hash256(PrevoutsData)
+    end,
+
+    %% hashSequence
+    HashSequence = case AnyoneCanPay orelse BaseType =:= ?SIGHASH_SINGLE orelse
+                        BaseType =:= ?SIGHASH_NONE of
+        true -> <<0:256>>;
+        false ->
+            SeqData = list_to_binary([
+                begin Seq = I#tx_in.sequence, <<Seq:32/little>> end || I <- Inputs
+            ]),
+            beamchain_crypto:hash256(SeqData)
+    end,
+
+    %% outpoint
+    Outpoint = encode_outpoint(Input#tx_in.prev_out),
+
+    %% scriptCode (serialized with varint length prefix)
+    ScriptCodeSer = beamchain_serialize:encode_varstr(ScriptCode),
+
+    %% hashOutputs
+    HashOutputs = case BaseType of
+        ?SIGHASH_SINGLE when InputIndex < length(Tx#transaction.outputs) ->
+            Output = lists:nth(InputIndex + 1, Tx#transaction.outputs),
+            beamchain_crypto:hash256(beamchain_serialize:encode_tx_out(Output));
+        ?SIGHASH_SINGLE ->
+            <<0:256>>;
+        ?SIGHASH_NONE ->
+            <<0:256>>;
+        _ ->
+            OutsData = list_to_binary([
+                beamchain_serialize:encode_tx_out(O)
+                || O <- Tx#transaction.outputs
+            ]),
+            beamchain_crypto:hash256(OutsData)
+    end,
+
+    %% Compose preimage
+    Preimage = <<(Tx#transaction.version):32/little,
+                 HashPrevouts/binary,
+                 HashSequence/binary,
+                 Outpoint/binary,
+                 ScriptCodeSer/binary,
+                 Amount:64/little,
+                 (Input#tx_in.sequence):32/little,
+                 HashOutputs/binary,
+                 (Tx#transaction.locktime):32/little,
+                 HashType:32/little>>,
+    beamchain_crypto:hash256(Preimage).
+
+encode_outpoint(#outpoint{hash = Hash, index = Index}) ->
+    <<Hash/binary, Index:32/little>>.
+
+%%% -------------------------------------------------------------------
 %%% Stubs (to be implemented)
 %%% -------------------------------------------------------------------
 
-flags_for_height(_Height, _Network) ->
-    ?SCRIPT_VERIFY_NONE.
-
-sighash_legacy(_Tx, _InputIndex, _ScriptCode, _HashType) ->
-    <<0:256>>.
-
-sighash_witness_v0(_Tx, _InputIndex, _ScriptCode, _Amount, _HashType) ->
-    <<0:256>>.
-
+-spec sighash_taproot(#transaction{}, non_neg_integer(),
+                      [{non_neg_integer(), binary()}],
+                      non_neg_integer(),
+                      binary() | undefined,
+                      binary() | undefined,
+                      non_neg_integer()) -> binary().
 sighash_taproot(_Tx, _InputIndex, _PrevOuts, _HashType,
                 _AnnexHash, _LeafHash, _CodeSepPos) ->
     <<0:256>>.
+
+flags_for_height(_Height, _Network) ->
+    ?SCRIPT_VERIFY_NONE.
