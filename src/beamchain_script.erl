@@ -1894,9 +1894,54 @@ verify_witness_program(1, Program, Witness, Flags, SigChecker)
 verify_witness_program(_, _, _, _, _) ->
     {error, witness_program_wrong_length}.
 
-%% taproot stub (to be implemented)
-verify_taproot(_OutputKey, _Witness, _Flags, _SigChecker) ->
-    {ok, [script_true()]}.
+%%% -------------------------------------------------------------------
+%%% Taproot verification
+%%% -------------------------------------------------------------------
+
+verify_taproot(OutputKey, Witness, Flags, SigChecker) ->
+    %% Check for annex (last witness item starting with 0x50)
+    {CleanWitness, _Annex} = strip_annex(Witness),
+    case CleanWitness of
+        [] ->
+            {error, witness_program_empty};
+        [Sig] ->
+            %% Key path spend
+            verify_taproot_key_path(OutputKey, Sig, Flags, SigChecker);
+        _ ->
+            %% Script path spend (to be implemented)
+            {ok, [script_true()]}
+    end.
+
+strip_annex(Witness) when length(Witness) >= 2 ->
+    Last = lists:last(Witness),
+    case Last of
+        <<16#50, _/binary>> ->
+            {lists:droplast(Witness), Last};
+        _ ->
+            {Witness, undefined}
+    end;
+strip_annex(Witness) ->
+    {Witness, undefined}.
+
+verify_taproot_key_path(OutputKey, Sig, _Flags, SigChecker) ->
+    {HashType, SigBytes} = parse_schnorr_sig(Sig),
+    case HashType of
+        invalid ->
+            {error, invalid_schnorr_sig_size};
+        _ ->
+            SigHash = case SigChecker of
+                #{compute_taproot_sighash := Fun} -> Fun(HashType, 16#ffffffff);
+                _ -> <<0:256>>
+            end,
+            case check_schnorr_sig(SigChecker, SigBytes, OutputKey, SigHash) of
+                true -> {ok, [script_true()]};
+                false -> {error, taproot_sig_failed}
+            end
+    end.
+
+parse_schnorr_sig(<<S:64/binary>>) -> {?SIGHASH_DEFAULT, S};
+parse_schnorr_sig(<<S:64/binary, HT:8>>) when HT =/= 0 -> {HT, S};
+parse_schnorr_sig(_) -> {invalid, <<>>}.
 
 %%% -------------------------------------------------------------------
 %%% Witness program extraction
@@ -2133,7 +2178,7 @@ encode_outpoint(#outpoint{hash = Hash, index = Index}) ->
     <<Hash/binary, Index:32/little>>.
 
 %%% -------------------------------------------------------------------
-%%% Stubs (to be implemented)
+%%% Taproot sighash (BIP 341)
 %%% -------------------------------------------------------------------
 
 -spec sighash_taproot(#transaction{}, non_neg_integer(),
@@ -2142,9 +2187,130 @@ encode_outpoint(#outpoint{hash = Hash, index = Index}) ->
                       binary() | undefined,
                       binary() | undefined,
                       non_neg_integer()) -> binary().
-sighash_taproot(_Tx, _InputIndex, _PrevOuts, _HashType,
-                _AnnexHash, _LeafHash, _CodeSepPos) ->
-    <<0:256>>.
+sighash_taproot(Tx, InputIndex, PrevOuts, HashType, AnnexHash,
+                LeafHash, CodeSepPos) ->
+    BaseType = HashType band 16#1f,
+    AnyoneCanPay = (HashType band ?SIGHASH_ANYONECANPAY) =/= 0,
+    Inputs = Tx#transaction.inputs,
+    Input = lists:nth(InputIndex + 1, Inputs),
+
+    %% epoch
+    Epoch = <<0>>,
+
+    %% hash_type byte
+    OutputType = case BaseType of
+        ?SIGHASH_DEFAULT -> ?SIGHASH_ALL;
+        _ -> BaseType
+    end,
+    ActualHashType = case AnyoneCanPay of
+        true -> OutputType bor ?SIGHASH_ANYONECANPAY;
+        false -> OutputType
+    end,
+
+    %% Common data
+    Version = <<(Tx#transaction.version):32/little>>,
+    LockTime = <<(Tx#transaction.locktime):32/little>>,
+
+    {CommonPrevouts, CommonAmounts, CommonScriptPubkeys, CommonSequences} =
+        case AnyoneCanPay of
+            false ->
+                PrevoutsData = list_to_binary([
+                    encode_outpoint(I#tx_in.prev_out) || I <- Inputs
+                ]),
+                AmountsData = list_to_binary([
+                    <<Amt:64/little>> || {Amt, _} <- PrevOuts
+                ]),
+                ScriptPKData = list_to_binary([
+                    beamchain_serialize:encode_varstr(SPK) || {_, SPK} <- PrevOuts
+                ]),
+                SeqData = list_to_binary([
+                    begin Seq = I#tx_in.sequence, <<Seq:32/little>> end || I <- Inputs
+                ]),
+                {beamchain_crypto:sha256(PrevoutsData),
+                 beamchain_crypto:sha256(AmountsData),
+                 beamchain_crypto:sha256(ScriptPKData),
+                 beamchain_crypto:sha256(SeqData)};
+            true ->
+                {<<>>, <<>>, <<>>, <<>>}
+        end,
+
+    CommonOutputs = case OutputType of
+        T when T =:= ?SIGHASH_ALL; T =:= ?SIGHASH_DEFAULT ->
+            OutsData = list_to_binary([
+                beamchain_serialize:encode_tx_out(O)
+                || O <- Tx#transaction.outputs
+            ]),
+            beamchain_crypto:sha256(OutsData);
+        _ ->
+            <<>>
+    end,
+
+    %% spend_type
+    SpendType0 = case AnnexHash of
+        undefined -> 0;
+        _ -> 1
+    end,
+    ExtFlag = case LeafHash of
+        undefined -> 0;
+        _ -> 1
+    end,
+    SpendTypeByte = (ExtFlag bsl 1) bor SpendType0,
+
+    %% input-specific data
+    InputSpecific = case AnyoneCanPay of
+        true ->
+            {Amt, SPK} = lists:nth(InputIndex + 1, PrevOuts),
+            OutpointBin = encode_outpoint(Input#tx_in.prev_out),
+            SPKBin = beamchain_serialize:encode_varstr(SPK),
+            <<OutpointBin/binary,
+              Amt:64/little,
+              SPKBin/binary,
+              (Input#tx_in.sequence):32/little>>;
+        false ->
+            <<InputIndex:32/little>>
+    end,
+
+    %% Annex
+    AnnexPart = case AnnexHash of
+        undefined -> <<>>;
+        _ -> AnnexHash
+    end,
+
+    %% Single output
+    SingleOutput = case OutputType of
+        ?SIGHASH_SINGLE when InputIndex < length(Tx#transaction.outputs) ->
+            Output = lists:nth(InputIndex + 1, Tx#transaction.outputs),
+            beamchain_crypto:sha256(beamchain_serialize:encode_tx_out(Output));
+        _ ->
+            <<>>
+    end,
+
+    %% Leaf hash extension
+    LeafPart = case LeafHash of
+        undefined -> <<>>;
+        _ -> <<LeafHash/binary, 0, CodeSepPos:32/little>>
+    end,
+
+    %% Compose the tagged hash preimage
+    Preimage = <<Epoch/binary,
+                 ActualHashType:8,
+                 Version/binary,
+                 LockTime/binary,
+                 CommonPrevouts/binary,
+                 CommonAmounts/binary,
+                 CommonScriptPubkeys/binary,
+                 CommonSequences/binary,
+                 CommonOutputs/binary,
+                 SpendTypeByte:8,
+                 InputSpecific/binary,
+                 AnnexPart/binary,
+                 SingleOutput/binary,
+                 LeafPart/binary>>,
+    beamchain_crypto:tagged_hash(<<"TapSighash">>, Preimage).
+
+%%% -------------------------------------------------------------------
+%%% Stubs (to be implemented)
+%%% -------------------------------------------------------------------
 
 flags_for_height(_Height, _Network) ->
     ?SCRIPT_VERIFY_NONE.
