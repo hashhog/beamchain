@@ -765,6 +765,7 @@ execute_remaining(Op, Rest, Pos, State) ->
         ?OP_CHECKMULTISIGVERIFY -> execute_checkmultisigverify(Rest, Pos + 1, State);
         ?OP_CHECKLOCKTIMEVERIFY -> execute_cltv(Rest, Pos + 1, State);
         ?OP_CHECKSEQUENCEVERIFY -> execute_csv(Rest, Pos + 1, State);
+        ?OP_CHECKSIGADD -> execute_checksigadd(Rest, Pos + 1, State);
         Nop when Nop =:= ?OP_NOP1;
                  Nop >= ?OP_NOP4, Nop =< ?OP_NOP10 ->
             execute_nop(Rest, Pos + 1, State);
@@ -1363,9 +1364,62 @@ do_checksig_ecdsa(Rest, Pos, State) ->
         Error -> Error
     end.
 
-%% tapscript checksig stub (to be implemented with schnorr)
-do_checksig_tapscript(_Rest, _Pos, _State) ->
-    {error, not_implemented}.
+do_checksig_tapscript(Rest, Pos, State) ->
+    case pop2(State) of
+        {ok, PubKey, Sig, State1} ->
+            case PubKey of
+                <<>> ->
+                    {error, tapscript_empty_pubkey};
+                _ when byte_size(PubKey) =:= 32 ->
+                    %% x-only pubkey: Schnorr verify
+                    do_schnorr_checksig(Rest, Pos, PubKey, Sig, State1);
+                _ ->
+                    %% unknown pubkey type
+                    Flags = State1#script_state.flags,
+                    case Flags band ?SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE of
+                        0 ->
+                            %% unknown pubkey type succeeds
+                            execute(Rest, Pos, push(script_true(), State1));
+                        _ ->
+                            {error, discourage_upgradable_pubkeytype}
+                    end
+            end;
+        Error -> Error
+    end.
+
+do_schnorr_checksig(Rest, Pos, _PubKey, <<>>, State) ->
+    %% empty sig = push false, don't consume sigops budget
+    execute(Rest, Pos, push(script_false(), State));
+do_schnorr_checksig(Rest, Pos, PubKey, Sig, State) ->
+    {HashType, SigBytes} = case Sig of
+        <<S:64/binary>> ->
+            {?SIGHASH_DEFAULT, S};
+        <<S:64/binary, HT:8>> when HT =/= 0 ->
+            {HT, S};
+        _ ->
+            {invalid, <<>>}
+    end,
+    case HashType of
+        invalid ->
+            {error, invalid_schnorr_sig_size};
+        _ ->
+            %% consume sigops budget
+            Budget = State#script_state.sigops_budget - 50,
+            case Budget < 0 of
+                true -> {error, tapscript_sigops_exceeded};
+                false ->
+                    State1 = State#script_state{sigops_budget = Budget},
+                    SigChecker = State1#script_state.sig_checker,
+                    SigHash = compute_taproot_sig_hash(State1, HashType, Pos),
+                    Valid = check_schnorr_sig(SigChecker, SigBytes, PubKey, SigHash),
+                    case Valid of
+                        true ->
+                            execute(Rest, Pos, push(script_true(), State1));
+                        false ->
+                            {error, schnorr_sig_failed}
+                    end
+            end
+    end.
 
 %%% -------------------------------------------------------------------
 %%% OP_CHECKSIGVERIFY
@@ -1388,8 +1442,42 @@ execute_checksigverify(Rest, Pos, State) ->
         Error -> Error
     end.
 
-do_checksig_result(#script_state{sig_version = tapscript} = _State, _Pos) ->
-    {error, not_implemented};
+do_checksig_result(#script_state{sig_version = tapscript} = State, Pos) ->
+    case pop2(State) of
+        {ok, PubKey, Sig, State1} ->
+            case PubKey of
+                <<>> ->
+                    {error, tapscript_empty_pubkey};
+                _ when byte_size(PubKey) =:= 32 ->
+                    case Sig of
+                        <<>> -> {ok, false, State1};
+                        _ ->
+                            {HashType, SigBytes} = parse_schnorr_sig(Sig),
+                            case HashType of
+                                invalid -> {error, invalid_schnorr_sig_size};
+                                _ ->
+                                    Budget = State1#script_state.sigops_budget - 50,
+                                    case Budget < 0 of
+                                        true -> {error, tapscript_sigops_exceeded};
+                                        false ->
+                                            State2 = State1#script_state{sigops_budget = Budget},
+                                            SigHash = compute_taproot_sig_hash(State2, HashType, Pos),
+                                            Valid = check_schnorr_sig(
+                                                State2#script_state.sig_checker,
+                                                SigBytes, PubKey, SigHash),
+                                            {ok, Valid, State2}
+                                    end
+                            end
+                    end;
+                _ ->
+                    Flags = State1#script_state.flags,
+                    case Flags band ?SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE of
+                        0 -> {ok, true, State1};
+                        _ -> {error, discourage_upgradable_pubkeytype}
+                    end
+            end;
+        Error -> Error
+    end;
 do_checksig_result(State, Pos) ->
     case pop2(State) of
         {ok, PubKey, Sig, State1} ->
@@ -1558,6 +1646,85 @@ execute_checkmultisigverify(Rest, Pos, State) ->
 do_checkmultisig_result(Rest, Pos, State) ->
     %% This duplicates do_checkmultisig but returns state
     do_checkmultisig(Rest, Pos, State).
+
+%%% -------------------------------------------------------------------
+%%% OP_CHECKSIGADD (tapscript only, BIP 342)
+%%% -------------------------------------------------------------------
+
+execute_checksigadd(Rest, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} ->
+            case executing(State1) of
+                false -> execute(Rest, Pos, State1);
+                true ->
+                    case State1#script_state.sig_version of
+                        tapscript ->
+                            do_checksigadd(Rest, Pos, State1);
+                        _ ->
+                            {error, {unknown_opcode, ?OP_CHECKSIGADD}}
+                    end
+            end;
+        Error -> Error
+    end.
+
+do_checksigadd(Rest, Pos, State) ->
+    %% stack: ... <sig> <n> <pubkey>  (pubkey is on top)
+    case pop(State) of
+        {ok, PubKey, State1} ->
+            case pop_num(State1) of
+                {ok, N, State2} ->
+                    case pop(State2) of
+                        {ok, Sig, State3} ->
+                            case PubKey of
+                                <<>> ->
+                                    {error, tapscript_empty_pubkey};
+                                _ when byte_size(PubKey) =:= 32 ->
+                                    case Sig of
+                                        <<>> ->
+                                            %% empty sig = no contribution
+                                            execute(Rest, Pos, push_num(N, State3));
+                                        _ ->
+                                            {HashType, SigBytes} = parse_schnorr_sig(Sig),
+                                            case HashType of
+                                                invalid ->
+                                                    {error, invalid_schnorr_sig_size};
+                                                _ ->
+                                                    Budget = State3#script_state.sigops_budget - 50,
+                                                    case Budget < 0 of
+                                                        true -> {error, tapscript_sigops_exceeded};
+                                                        false ->
+                                                            State4 = State3#script_state{sigops_budget = Budget},
+                                                            SigHash = compute_taproot_sig_hash(State4, HashType, Pos),
+                                                            Valid = check_schnorr_sig(
+                                                                State4#script_state.sig_checker,
+                                                                SigBytes, PubKey, SigHash),
+                                                            case Valid of
+                                                                true ->
+                                                                    execute(Rest, Pos, push_num(N + 1, State4));
+                                                                false ->
+                                                                    {error, schnorr_sig_failed}
+                                                            end
+                                                    end
+                                            end
+                                    end;
+                                _ ->
+                                    Flags = State3#script_state.flags,
+                                    case Flags band ?SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE of
+                                        0 ->
+                                            case Sig of
+                                                <<>> -> execute(Rest, Pos, push_num(N, State3));
+                                                _ -> execute(Rest, Pos, push_num(N + 1, State3))
+                                            end;
+                                        _ ->
+                                            {error, discourage_upgradable_pubkeytype}
+                                    end
+                            end;
+                        Error -> Error
+                    end;
+                Error -> Error
+            end;
+        Error -> Error
+    end.
 
 %%% -------------------------------------------------------------------
 %%% OP_CHECKLOCKTIMEVERIFY (BIP 65) / OP_CHECKSEQUENCEVERIFY (BIP 112)
@@ -1908,8 +2075,13 @@ verify_taproot(OutputKey, Witness, Flags, SigChecker) ->
             %% Key path spend
             verify_taproot_key_path(OutputKey, Sig, Flags, SigChecker);
         _ ->
-            %% Script path spend (to be implemented)
-            {ok, [script_true()]}
+            %% Script path spend
+            %% Last two items: script and control block
+            Script = lists:nth(length(CleanWitness) - 1, CleanWitness),
+            ControlBlock = lists:last(CleanWitness),
+            ScriptArgs = lists:sublist(CleanWitness, length(CleanWitness) - 2),
+            verify_taproot_script_path(
+                OutputKey, Script, ControlBlock, ScriptArgs, Flags, SigChecker)
     end.
 
 strip_annex(Witness) when length(Witness) >= 2 ->
@@ -1942,6 +2114,102 @@ verify_taproot_key_path(OutputKey, Sig, _Flags, SigChecker) ->
 parse_schnorr_sig(<<S:64/binary>>) -> {?SIGHASH_DEFAULT, S};
 parse_schnorr_sig(<<S:64/binary, HT:8>>) when HT =/= 0 -> {HT, S};
 parse_schnorr_sig(_) -> {invalid, <<>>}.
+
+verify_taproot_script_path(OutputKey, Script, ControlBlock,
+                           ScriptArgs, Flags, SigChecker) ->
+    %% Validate control block
+    CBLen = byte_size(ControlBlock),
+    case CBLen >= 33 andalso (CBLen - 33) rem 32 =:= 0 of
+        false ->
+            {error, invalid_control_block};
+        true ->
+            <<LeafVersion:8, InternalKey:32/binary, MerklePath/binary>> = ControlBlock,
+            %% Compute leaf hash
+            ScriptLen = byte_size(Script),
+            LeafData = <<LeafVersion, (encode_compact_size(ScriptLen))/binary, Script/binary>>,
+            LeafHash = beamchain_crypto:tagged_hash(<<"TapLeaf">>, LeafData),
+            %% Walk merkle path
+            MerkleRoot = compute_taproot_merkle(LeafHash, MerklePath),
+            %% Compute tweak
+            TweakHash = beamchain_crypto:tagged_hash(
+                <<"TapTweak">>,
+                <<InternalKey/binary, MerkleRoot/binary>>),
+            %% Verify tweaked key matches output key
+            case beamchain_crypto:xonly_pubkey_tweak_add(InternalKey, TweakHash) of
+                {ok, TweakedKey, _Parity} ->
+                    case TweakedKey =:= OutputKey of
+                        true ->
+                            %% Execute script in tapscript mode
+                            TapLeafVer = LeafVersion band 16#fe,
+                            case TapLeafVer of
+                                16#c0 ->
+                                    %% Known leaf version (tapscript)
+                                    WitnessSize = lists:foldl(
+                                        fun(W, Acc) -> Acc + byte_size(W) end,
+                                        0, ScriptArgs),
+                                    Budget = WitnessSize,
+                                    eval_tapscript(Script, ScriptArgs, Budget,
+                                                  Flags, SigChecker);
+                                _ ->
+                                    case (Flags band ?SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION) =/= 0 of
+                                        true ->
+                                            {error, discourage_upgradable_taproot_version};
+                                        false ->
+                                            {ok, [script_true()]}
+                                    end
+                            end;
+                        false ->
+                            {error, taproot_commitment_mismatch}
+                    end;
+                {error, _} ->
+                    {error, taproot_tweak_failed}
+            end
+    end.
+
+eval_tapscript(Script, Stack, SigopsBudget, Flags, SigChecker) ->
+    State0 = #script_state{
+        stack = Stack,
+        flags = Flags,
+        sig_checker = SigChecker,
+        sig_version = tapscript,
+        script = Script,
+        sigops_budget = SigopsBudget
+    },
+    %% check for OP_SUCCESS first
+    case check_op_success(Script, Flags) of
+        {success, true} ->
+            {ok, [script_true()]};
+        {error, _} = E ->
+            E;
+        ok ->
+            case execute(Script, 0, State0) of
+                {ok, [Top]} ->
+                    case script_bool(Top) of
+                        true -> {ok, [Top]};
+                        false -> {error, tapscript_failed}
+                    end;
+                {ok, []} ->
+                    {error, tapscript_empty_stack};
+                {ok, _} ->
+                    {error, tapscript_cleanstack};
+                {error, _} = E ->
+                    E
+            end
+    end.
+
+compute_taproot_merkle(Current, <<>>) ->
+    Current;
+compute_taproot_merkle(Current, <<Node:32/binary, Rest/binary>>) ->
+    %% lexicographic ordering for the pair
+    Combined = case Current =< Node of
+        true -> <<Current/binary, Node/binary>>;
+        false -> <<Node/binary, Current/binary>>
+    end,
+    Next = beamchain_crypto:tagged_hash(<<"TapBranch">>, Combined),
+    compute_taproot_merkle(Next, Rest).
+
+encode_compact_size(N) ->
+    beamchain_serialize:encode_varint(N).
 
 %%% -------------------------------------------------------------------
 %%% Witness program extraction
