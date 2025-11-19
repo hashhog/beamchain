@@ -557,26 +557,6 @@ execute(<<?OP_VERIF, _/binary>>, _Pos, _State) ->
 execute(<<?OP_VERNOTIF, _/binary>>, _Pos, _State) ->
     {error, op_vernotif};
 
-%% --- OP_VERIFY ---
-execute(<<?OP_VERIFY, Rest/binary>>, Pos, State) ->
-    case count_op(State) of
-        {ok, State1} ->
-            case executing(State1) of
-                true ->
-                    case pop(State1) of
-                        {ok, Top, State2} ->
-                            case script_bool(Top) of
-                                true -> execute(Rest, Pos + 1, State2);
-                                false -> {error, verify_failed}
-                            end;
-                        Error -> Error
-                    end;
-                false ->
-                    execute(Rest, Pos + 1, State1)
-            end;
-        Error -> Error
-    end;
-
 %% --- OP_IF ---
 execute(<<?OP_IF, Rest/binary>>, Pos, State) ->
     case count_op(State) of
@@ -616,6 +596,26 @@ execute(<<?OP_ENDIF, Rest/binary>>, Pos,
         {ok, State1} ->
             State2 = State1#script_state{exec_stack = ExRest},
             execute(Rest, Pos + 1, State2);
+        Error -> Error
+    end;
+
+%% --- OP_VERIFY ---
+execute(<<?OP_VERIFY, Rest/binary>>, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} ->
+            case executing(State1) of
+                true ->
+                    case pop(State1) of
+                        {ok, Top, State2} ->
+                            case script_bool(Top) of
+                                true -> execute(Rest, Pos + 1, State2);
+                                false -> {error, verify_failed}
+                            end;
+                        Error -> Error
+                    end;
+                false ->
+                    execute(Rest, Pos + 1, State1)
+            end;
         Error -> Error
     end;
 
@@ -744,7 +744,7 @@ execute(_, _Pos, _State) ->
     {error, invalid_script}.
 
 %%% -------------------------------------------------------------------
-%%% Remaining opcodes dispatch (stubs for now)
+%%% Remaining opcodes dispatch
 %%% -------------------------------------------------------------------
 
 execute_remaining(Op, Rest, Pos, State) ->
@@ -774,256 +774,41 @@ execute_remaining(Op, Rest, Pos, State) ->
     end.
 
 %%% -------------------------------------------------------------------
-%%% OP_EQUAL / OP_EQUALVERIFY
+%%% Pushdata helper
 %%% -------------------------------------------------------------------
 
-execute_equal(Rest, Pos, State) ->
-    case count_op(State) of
-        {ok, State1} ->
-            case executing(State1) of
-                false -> execute(Rest, Pos, State1);
+execute_pushdata(Len, Bin, Pos, State) ->
+    case Bin of
+        <<Data:Len/binary, Rest/binary>> ->
+            case executing(State) of
                 true ->
-                    case pop2(State1) of
-                        {ok, A, B, State2} ->
-                            Result = case A =:= B of
-                                true -> script_true();
-                                false -> script_false()
-                            end,
-                            State3 = push(Result, State2),
-                            execute(Rest, Pos, State3);
-                        Error -> Error
-                    end
-            end;
-        Error -> Error
-    end.
-
-execute_equalverify(Rest, Pos, State) ->
-    case count_op(State) of
-        {ok, State1} ->
-            case executing(State1) of
-                false -> execute(Rest, Pos, State1);
-                true ->
-                    case pop2(State1) of
-                        {ok, A, B, State2} ->
-                            case A =:= B of
-                                true -> execute(Rest, Pos, State2);
-                                false -> {error, equalverify_failed}
-                            end;
-                        Error -> Error
-                    end
-            end;
-        Error -> Error
-    end.
-
-%%% -------------------------------------------------------------------
-%%% Hash opcodes
-%%% -------------------------------------------------------------------
-
-execute_hash(HashType, Rest, Pos, State) ->
-    case count_op(State) of
-        {ok, State1} ->
-            case executing(State1) of
-                false -> execute(Rest, Pos, State1);
-                true ->
-                    case pop(State1) of
-                        {ok, Data, State2} ->
-                            Hash = do_hash(HashType, Data),
-                            State3 = push(Hash, State2),
-                            execute(Rest, Pos, State3);
-                        Error -> Error
-                    end
-            end;
-        Error -> Error
-    end.
-
-do_hash(ripemd160, Data) -> crypto:hash(ripemd160, Data);
-do_hash(sha1, Data) -> crypto:hash(sha, Data);
-do_hash(sha256, Data) -> crypto:hash(sha256, Data);
-do_hash(hash160, Data) -> beamchain_crypto:hash160(Data);
-do_hash(hash256, Data) -> beamchain_crypto:hash256(Data).
-
-%%% -------------------------------------------------------------------
-%%% OP_CODESEPARATOR
-%%% -------------------------------------------------------------------
-
-execute_codesep(Rest, Pos, State) ->
-    case count_op(State) of
-        {ok, State1} ->
-            case executing(State1) of
-                false -> execute(Rest, Pos, State1);
-                true ->
-                    %% In tapscript, CONST_SCRIPTCODE flag makes this
-                    %% fail when CONST_SCRIPTCODE is set... but actually
-                    %% OP_CODESEPARATOR is valid in tapscript.
-                    %% It fails in witness_v0 if CONST_SCRIPTCODE is set.
-                    case State1#script_state.sig_version of
-                        witness_v0 when
-                            (State1#script_state.flags band
-                             ?SCRIPT_VERIFY_CONST_SCRIPTCODE) =/= 0 ->
-                            {error, op_codeseparator_in_witness};
-                        _ ->
-                            State2 = State1#script_state{codesep_pos = Pos},
-                            execute(Rest, Pos, State2)
-                    end
-            end;
-        Error -> Error
-    end.
-
-%%% -------------------------------------------------------------------
-%%% Arithmetic opcodes
-%%% -------------------------------------------------------------------
-
-execute_arith(Op, Rest, Pos, State) ->
-    case count_op(State) of
-        {ok, State1} ->
-            case executing(State1) of
-                false -> execute(Rest, Pos, State1);
-                true -> do_arith(Op, Rest, Pos, State1)
-            end;
-        Error -> Error
-    end.
-
-%% Unary arithmetic
-do_arith(?OP_1ADD, Rest, Pos, State) ->
-    case pop_num(State) of
-        {ok, A, State1} -> execute(Rest, Pos, push_num(A + 1, State1));
-        Error -> Error
-    end;
-do_arith(?OP_1SUB, Rest, Pos, State) ->
-    case pop_num(State) of
-        {ok, A, State1} -> execute(Rest, Pos, push_num(A - 1, State1));
-        Error -> Error
-    end;
-do_arith(?OP_NEGATE, Rest, Pos, State) ->
-    case pop_num(State) of
-        {ok, A, State1} -> execute(Rest, Pos, push_num(-A, State1));
-        Error -> Error
-    end;
-do_arith(?OP_ABS, Rest, Pos, State) ->
-    case pop_num(State) of
-        {ok, A, State1} -> execute(Rest, Pos, push_num(abs(A), State1));
-        Error -> Error
-    end;
-do_arith(?OP_NOT, Rest, Pos, State) ->
-    case pop_num(State) of
-        {ok, 0, State1} -> execute(Rest, Pos, push_num(1, State1));
-        {ok, _, State1} -> execute(Rest, Pos, push_num(0, State1));
-        Error -> Error
-    end;
-do_arith(?OP_0NOTEQUAL, Rest, Pos, State) ->
-    case pop_num(State) of
-        {ok, 0, State1} -> execute(Rest, Pos, push_num(0, State1));
-        {ok, _, State1} -> execute(Rest, Pos, push_num(1, State1));
-        Error -> Error
-    end;
-
-%% Binary arithmetic
-do_arith(?OP_ADD, Rest, Pos, State) ->
-    case pop_num2(State) of
-        {ok, A, B, State1} -> execute(Rest, Pos, push_num(A + B, State1));
-        Error -> Error
-    end;
-do_arith(?OP_SUB, Rest, Pos, State) ->
-    case pop_num2(State) of
-        {ok, A, B, State1} -> execute(Rest, Pos, push_num(A - B, State1));
-        Error -> Error
-    end;
-do_arith(?OP_BOOLAND, Rest, Pos, State) ->
-    case pop_num2(State) of
-        {ok, A, B, State1} ->
-            R = case A =/= 0 andalso B =/= 0 of
-                true -> 1; false -> 0
-            end,
-            execute(Rest, Pos, push_num(R, State1));
-        Error -> Error
-    end;
-do_arith(?OP_BOOLOR, Rest, Pos, State) ->
-    case pop_num2(State) of
-        {ok, A, B, State1} ->
-            R = case A =/= 0 orelse B =/= 0 of
-                true -> 1; false -> 0
-            end,
-            execute(Rest, Pos, push_num(R, State1));
-        Error -> Error
-    end;
-do_arith(?OP_NUMEQUAL, Rest, Pos, State) ->
-    case pop_num2(State) of
-        {ok, A, B, State1} ->
-            execute(Rest, Pos, push_num(case A =:= B of true -> 1; false -> 0 end, State1));
-        Error -> Error
-    end;
-do_arith(?OP_NUMEQUALVERIFY, Rest, Pos, State) ->
-    case pop_num2(State) of
-        {ok, A, B, State1} ->
-            case A =:= B of
-                true -> execute(Rest, Pos, State1);
-                false -> {error, numequalverify_failed}
-            end;
-        Error -> Error
-    end;
-do_arith(?OP_NUMNOTEQUAL, Rest, Pos, State) ->
-    case pop_num2(State) of
-        {ok, A, B, State1} ->
-            execute(Rest, Pos, push_num(case A =/= B of true -> 1; false -> 0 end, State1));
-        Error -> Error
-    end;
-do_arith(?OP_LESSTHAN, Rest, Pos, State) ->
-    case pop_num2(State) of
-        {ok, A, B, State1} ->
-            execute(Rest, Pos, push_num(case A < B of true -> 1; false -> 0 end, State1));
-        Error -> Error
-    end;
-do_arith(?OP_GREATERTHAN, Rest, Pos, State) ->
-    case pop_num2(State) of
-        {ok, A, B, State1} ->
-            execute(Rest, Pos, push_num(case A > B of true -> 1; false -> 0 end, State1));
-        Error -> Error
-    end;
-do_arith(?OP_LESSTHANOREQUAL, Rest, Pos, State) ->
-    case pop_num2(State) of
-        {ok, A, B, State1} ->
-            execute(Rest, Pos, push_num(case A =< B of true -> 1; false -> 0 end, State1));
-        Error -> Error
-    end;
-do_arith(?OP_GREATERTHANOREQUAL, Rest, Pos, State) ->
-    case pop_num2(State) of
-        {ok, A, B, State1} ->
-            execute(Rest, Pos, push_num(case A >= B of true -> 1; false -> 0 end, State1));
-        Error -> Error
-    end;
-do_arith(?OP_MIN, Rest, Pos, State) ->
-    case pop_num2(State) of
-        {ok, A, B, State1} -> execute(Rest, Pos, push_num(min(A, B), State1));
-        Error -> Error
-    end;
-do_arith(?OP_MAX, Rest, Pos, State) ->
-    case pop_num2(State) of
-        {ok, A, B, State1} -> execute(Rest, Pos, push_num(max(A, B), State1));
-        Error -> Error
-    end;
-do_arith(?OP_WITHIN, Rest, Pos, State) ->
-    case pop3(State) of
-        {ok, X, Min, Max, State1} ->
-            case decode_script_num(X, 4) of
-                {ok, XN} ->
-                    case decode_script_num(Min, 4) of
-                        {ok, MinN} ->
-                            case decode_script_num(Max, 4) of
-                                {ok, MaxN} ->
-                                    R = case MinN =< XN andalso XN < MaxN of
-                                        true -> 1; false -> 0
-                                    end,
-                                    execute(Rest, Pos, push_num(R, State1));
-                                Error -> Error
+                    case check_push_size(Data, State) of
+                        ok ->
+                            State1 = push(Data, State),
+                            case check_stack_size(State1) of
+                                true -> execute(Rest, Pos + Len, State1);
+                                false -> {error, stack_overflow}
                             end;
                         Error -> Error
                     end;
-                Error -> Error
+                false ->
+                    execute(Rest, Pos + Len, State)
             end;
-        Error -> Error
+        _ ->
+            {error, script_truncated}
+    end.
+
+check_push_size(Data, #script_state{sig_version = tapscript}) ->
+    %% tapscript: max push size is 520 bytes
+    case byte_size(Data) > ?MAX_SCRIPT_ELEMENT_SIZE of
+        true -> {error, push_size_exceeded};
+        false -> ok
     end;
-do_arith(Op, _Rest, _Pos, _State) ->
-    {error, {disabled_opcode, Op}}.
+check_push_size(Data, _State) ->
+    case byte_size(Data) > ?MAX_SCRIPT_ELEMENT_SIZE of
+        true -> {error, push_size_exceeded};
+        false -> ok
+    end.
 
 %%% -------------------------------------------------------------------
 %%% IF/NOTIF execution
@@ -1251,44 +1036,259 @@ do_stack_op(size, _Rest, _Pos, _State) ->
     {error, stack_underflow}.
 
 %%% -------------------------------------------------------------------
-%%% Pushdata helper
+%%% OP_EQUAL / OP_EQUALVERIFY
 %%% -------------------------------------------------------------------
 
-execute_pushdata(Len, Bin, Pos, State) ->
-    case Bin of
-        <<Data:Len/binary, Rest/binary>> ->
-            case executing(State) of
+execute_equal(Rest, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} ->
+            case executing(State1) of
+                false -> execute(Rest, Pos, State1);
                 true ->
-                    case check_push_size(Data, State) of
-                        ok ->
-                            State1 = push(Data, State),
-                            case check_stack_size(State1) of
-                                true -> execute(Rest, Pos + Len, State1);
-                                false -> {error, stack_overflow}
+                    case pop2(State1) of
+                        {ok, A, B, State2} ->
+                            Result = case A =:= B of
+                                true -> script_true();
+                                false -> script_false()
+                            end,
+                            State3 = push(Result, State2),
+                            execute(Rest, Pos, State3);
+                        Error -> Error
+                    end
+            end;
+        Error -> Error
+    end.
+
+execute_equalverify(Rest, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} ->
+            case executing(State1) of
+                false -> execute(Rest, Pos, State1);
+                true ->
+                    case pop2(State1) of
+                        {ok, A, B, State2} ->
+                            case A =:= B of
+                                true -> execute(Rest, Pos, State2);
+                                false -> {error, equalverify_failed}
+                            end;
+                        Error -> Error
+                    end
+            end;
+        Error -> Error
+    end.
+
+%%% -------------------------------------------------------------------
+%%% Arithmetic opcodes
+%%% -------------------------------------------------------------------
+
+execute_arith(Op, Rest, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} ->
+            case executing(State1) of
+                false -> execute(Rest, Pos, State1);
+                true -> do_arith(Op, Rest, Pos, State1)
+            end;
+        Error -> Error
+    end.
+
+%% Unary arithmetic
+do_arith(?OP_1ADD, Rest, Pos, State) ->
+    case pop_num(State) of
+        {ok, A, State1} -> execute(Rest, Pos, push_num(A + 1, State1));
+        Error -> Error
+    end;
+do_arith(?OP_1SUB, Rest, Pos, State) ->
+    case pop_num(State) of
+        {ok, A, State1} -> execute(Rest, Pos, push_num(A - 1, State1));
+        Error -> Error
+    end;
+do_arith(?OP_NEGATE, Rest, Pos, State) ->
+    case pop_num(State) of
+        {ok, A, State1} -> execute(Rest, Pos, push_num(-A, State1));
+        Error -> Error
+    end;
+do_arith(?OP_ABS, Rest, Pos, State) ->
+    case pop_num(State) of
+        {ok, A, State1} -> execute(Rest, Pos, push_num(abs(A), State1));
+        Error -> Error
+    end;
+do_arith(?OP_NOT, Rest, Pos, State) ->
+    case pop_num(State) of
+        {ok, 0, State1} -> execute(Rest, Pos, push_num(1, State1));
+        {ok, _, State1} -> execute(Rest, Pos, push_num(0, State1));
+        Error -> Error
+    end;
+do_arith(?OP_0NOTEQUAL, Rest, Pos, State) ->
+    case pop_num(State) of
+        {ok, 0, State1} -> execute(Rest, Pos, push_num(0, State1));
+        {ok, _, State1} -> execute(Rest, Pos, push_num(1, State1));
+        Error -> Error
+    end;
+
+%% Binary arithmetic
+do_arith(?OP_ADD, Rest, Pos, State) ->
+    case pop_num2(State) of
+        {ok, A, B, State1} -> execute(Rest, Pos, push_num(A + B, State1));
+        Error -> Error
+    end;
+do_arith(?OP_SUB, Rest, Pos, State) ->
+    case pop_num2(State) of
+        {ok, A, B, State1} -> execute(Rest, Pos, push_num(A - B, State1));
+        Error -> Error
+    end;
+do_arith(?OP_BOOLAND, Rest, Pos, State) ->
+    case pop_num2(State) of
+        {ok, A, B, State1} ->
+            R = case A =/= 0 andalso B =/= 0 of
+                true -> 1; false -> 0
+            end,
+            execute(Rest, Pos, push_num(R, State1));
+        Error -> Error
+    end;
+do_arith(?OP_BOOLOR, Rest, Pos, State) ->
+    case pop_num2(State) of
+        {ok, A, B, State1} ->
+            R = case A =/= 0 orelse B =/= 0 of
+                true -> 1; false -> 0
+            end,
+            execute(Rest, Pos, push_num(R, State1));
+        Error -> Error
+    end;
+do_arith(?OP_NUMEQUAL, Rest, Pos, State) ->
+    case pop_num2(State) of
+        {ok, A, B, State1} ->
+            execute(Rest, Pos, push_num(case A =:= B of true -> 1; false -> 0 end, State1));
+        Error -> Error
+    end;
+do_arith(?OP_NUMEQUALVERIFY, Rest, Pos, State) ->
+    case pop_num2(State) of
+        {ok, A, B, State1} ->
+            case A =:= B of
+                true -> execute(Rest, Pos, State1);
+                false -> {error, numequalverify_failed}
+            end;
+        Error -> Error
+    end;
+do_arith(?OP_NUMNOTEQUAL, Rest, Pos, State) ->
+    case pop_num2(State) of
+        {ok, A, B, State1} ->
+            execute(Rest, Pos, push_num(case A =/= B of true -> 1; false -> 0 end, State1));
+        Error -> Error
+    end;
+do_arith(?OP_LESSTHAN, Rest, Pos, State) ->
+    case pop_num2(State) of
+        {ok, A, B, State1} ->
+            execute(Rest, Pos, push_num(case A < B of true -> 1; false -> 0 end, State1));
+        Error -> Error
+    end;
+do_arith(?OP_GREATERTHAN, Rest, Pos, State) ->
+    case pop_num2(State) of
+        {ok, A, B, State1} ->
+            execute(Rest, Pos, push_num(case A > B of true -> 1; false -> 0 end, State1));
+        Error -> Error
+    end;
+do_arith(?OP_LESSTHANOREQUAL, Rest, Pos, State) ->
+    case pop_num2(State) of
+        {ok, A, B, State1} ->
+            execute(Rest, Pos, push_num(case A =< B of true -> 1; false -> 0 end, State1));
+        Error -> Error
+    end;
+do_arith(?OP_GREATERTHANOREQUAL, Rest, Pos, State) ->
+    case pop_num2(State) of
+        {ok, A, B, State1} ->
+            execute(Rest, Pos, push_num(case A >= B of true -> 1; false -> 0 end, State1));
+        Error -> Error
+    end;
+do_arith(?OP_MIN, Rest, Pos, State) ->
+    case pop_num2(State) of
+        {ok, A, B, State1} -> execute(Rest, Pos, push_num(min(A, B), State1));
+        Error -> Error
+    end;
+do_arith(?OP_MAX, Rest, Pos, State) ->
+    case pop_num2(State) of
+        {ok, A, B, State1} -> execute(Rest, Pos, push_num(max(A, B), State1));
+        Error -> Error
+    end;
+do_arith(?OP_WITHIN, Rest, Pos, State) ->
+    case pop3(State) of
+        {ok, X, Min, Max, State1} ->
+            case decode_script_num(X, 4) of
+                {ok, XN} ->
+                    case decode_script_num(Min, 4) of
+                        {ok, MinN} ->
+                            case decode_script_num(Max, 4) of
+                                {ok, MaxN} ->
+                                    R = case MinN =< XN andalso XN < MaxN of
+                                        true -> 1; false -> 0
+                                    end,
+                                    execute(Rest, Pos, push_num(R, State1));
+                                Error -> Error
                             end;
                         Error -> Error
                     end;
-                false ->
-                    execute(Rest, Pos + Len, State)
+                Error -> Error
             end;
-        _ ->
-            {error, script_truncated}
+        Error -> Error
+    end;
+do_arith(Op, _Rest, _Pos, _State) ->
+    {error, {disabled_opcode, Op}}.
+
+%%% -------------------------------------------------------------------
+%%% Hash opcodes
+%%% -------------------------------------------------------------------
+
+execute_hash(HashType, Rest, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} ->
+            case executing(State1) of
+                false -> execute(Rest, Pos, State1);
+                true ->
+                    case pop(State1) of
+                        {ok, Data, State2} ->
+                            Hash = do_hash(HashType, Data),
+                            State3 = push(Hash, State2),
+                            execute(Rest, Pos, State3);
+                        Error -> Error
+                    end
+            end;
+        Error -> Error
     end.
 
-check_push_size(Data, #script_state{sig_version = tapscript}) ->
-    %% tapscript: max push size is 520 bytes
-    case byte_size(Data) > ?MAX_SCRIPT_ELEMENT_SIZE of
-        true -> {error, push_size_exceeded};
-        false -> ok
-    end;
-check_push_size(Data, _State) ->
-    case byte_size(Data) > ?MAX_SCRIPT_ELEMENT_SIZE of
-        true -> {error, push_size_exceeded};
-        false -> ok
+do_hash(ripemd160, Data) -> crypto:hash(ripemd160, Data);
+do_hash(sha1, Data) -> crypto:hash(sha, Data);
+do_hash(sha256, Data) -> crypto:hash(sha256, Data);
+do_hash(hash160, Data) -> beamchain_crypto:hash160(Data);
+do_hash(hash256, Data) -> beamchain_crypto:hash256(Data).
+
+%%% -------------------------------------------------------------------
+%%% OP_CODESEPARATOR
+%%% -------------------------------------------------------------------
+
+execute_codesep(Rest, Pos, State) ->
+    case count_op(State) of
+        {ok, State1} ->
+            case executing(State1) of
+                false -> execute(Rest, Pos, State1);
+                true ->
+                    %% In tapscript, CONST_SCRIPTCODE flag makes this
+                    %% fail when CONST_SCRIPTCODE is set... but actually
+                    %% OP_CODESEPARATOR is valid in tapscript.
+                    %% It fails in witness_v0 if CONST_SCRIPTCODE is set.
+                    case State1#script_state.sig_version of
+                        witness_v0 when
+                            (State1#script_state.flags band
+                             ?SCRIPT_VERIFY_CONST_SCRIPTCODE) =/= 0 ->
+                            {error, op_codeseparator_in_witness};
+                        _ ->
+                            State2 = State1#script_state{codesep_pos = Pos},
+                            execute(Rest, Pos, State2)
+                    end
+            end;
+        Error -> Error
     end.
 
 %%% -------------------------------------------------------------------
-%%% OP_CHECKSIG (ECDSA for base/witness_v0)
+%%% OP_CHECKSIG (ECDSA for base/witness_v0, Schnorr for tapscript)
 %%% -------------------------------------------------------------------
 
 execute_checksig(Rest, Pos, State) ->
@@ -1500,6 +1500,10 @@ do_checksig_result(State, Pos) ->
             end;
         Error -> Error
     end.
+
+parse_schnorr_sig(<<S:64/binary>>) -> {?SIGHASH_DEFAULT, S};
+parse_schnorr_sig(<<S:64/binary, HT:8>>) when HT =/= 0 -> {HT, S};
+parse_schnorr_sig(_) -> {invalid, <<>>}.
 
 %%% -------------------------------------------------------------------
 %%% OP_CHECKMULTISIG
@@ -2033,6 +2037,12 @@ verify_witness_program(0, Program, Witness, Flags, SigChecker)
             end
     end;
 
+verify_witness_program(1, Program, Witness, Flags, SigChecker)
+  when byte_size(Program) =:= 32,
+       (Flags band ?SCRIPT_VERIFY_TAPROOT) =/= 0 ->
+    %% P2TR (Taproot)
+    verify_taproot(Program, Witness, Flags, SigChecker);
+
 verify_witness_program(Version, _Program, Witness, Flags, _SigChecker)
   when Version >= 2, Version =< 16 ->
     %% future witness versions
@@ -2051,12 +2061,6 @@ verify_witness_program(1, Program, _Witness, Flags, _SigChecker)
        (Flags band ?SCRIPT_VERIFY_TAPROOT) =:= 0 ->
     %% taproot not active yet, succeed
     {ok, [script_true()]};
-
-verify_witness_program(1, Program, Witness, Flags, SigChecker)
-  when byte_size(Program) =:= 32,
-       (Flags band ?SCRIPT_VERIFY_TAPROOT) =/= 0 ->
-    %% P2TR (Taproot) - stub for now
-    verify_taproot(Program, Witness, Flags, SigChecker);
 
 verify_witness_program(_, _, _, _, _) ->
     {error, witness_program_wrong_length}.
@@ -2110,10 +2114,6 @@ verify_taproot_key_path(OutputKey, Sig, _Flags, SigChecker) ->
                 false -> {error, taproot_sig_failed}
             end
     end.
-
-parse_schnorr_sig(<<S:64/binary>>) -> {?SIGHASH_DEFAULT, S};
-parse_schnorr_sig(<<S:64/binary, HT:8>>) when HT =/= 0 -> {HT, S};
-parse_schnorr_sig(_) -> {invalid, <<>>}.
 
 verify_taproot_script_path(OutputKey, Script, ControlBlock,
                            ScriptArgs, Flags, SigChecker) ->
@@ -2210,6 +2210,9 @@ compute_taproot_merkle(Current, <<Node:32/binary, Rest/binary>>) ->
 
 encode_compact_size(N) ->
     beamchain_serialize:encode_varint(N).
+
+encode_outpoint(#outpoint{hash = Hash, index = Index}) ->
+    <<Hash/binary, Index:32/little>>.
 
 %%% -------------------------------------------------------------------
 %%% Witness program extraction
@@ -2442,13 +2445,6 @@ sighash_witness_v0(Tx, InputIndex, ScriptCode, Amount, HashType) ->
                  HashType:32/little>>,
     beamchain_crypto:hash256(Preimage).
 
-encode_outpoint(#outpoint{hash = Hash, index = Index}) ->
-    <<Hash/binary, Index:32/little>>.
-
-%%% -------------------------------------------------------------------
-%%% Taproot sighash (BIP 341)
-%%% -------------------------------------------------------------------
-
 -spec sighash_taproot(#transaction{}, non_neg_integer(),
                       [{non_neg_integer(), binary()}],
                       non_neg_integer(),
@@ -2577,8 +2573,63 @@ sighash_taproot(Tx, InputIndex, PrevOuts, HashType, AnnexHash,
     beamchain_crypto:tagged_hash(<<"TapSighash">>, Preimage).
 
 %%% -------------------------------------------------------------------
-%%% Stubs (to be implemented)
+%%% Script flags for a given height
 %%% -------------------------------------------------------------------
 
+-spec flags_for_height(non_neg_integer(), atom()) -> non_neg_integer().
+flags_for_height(Height, mainnet) ->
+    F0 = ?SCRIPT_VERIFY_NONE,
+    F1 = case Height >= 173805 of
+        true -> F0 bor ?SCRIPT_VERIFY_P2SH;
+        false -> F0
+    end,
+    F2 = case Height >= 363725 of
+        true -> F1 bor ?SCRIPT_VERIFY_DERSIG;
+        false -> F1
+    end,
+    F3 = case Height >= 388381 of
+        true -> F2 bor ?SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY;
+        false -> F2
+    end,
+    F4 = case Height >= 419328 of
+        true -> F3 bor ?SCRIPT_VERIFY_CHECKSEQUENCEVERIFY;
+        false -> F3
+    end,
+    F5 = case Height >= 481824 of
+        true -> F4 bor ?SCRIPT_VERIFY_WITNESS;
+        false -> F4
+    end,
+    F6 = case Height >= 709632 of
+        true -> F5 bor ?SCRIPT_VERIFY_TAPROOT;
+        false -> F5
+    end,
+    %% always-on flags (after respective activations are well past)
+    F6 bor ?SCRIPT_VERIFY_STRICTENC
+       bor ?SCRIPT_VERIFY_MINIMALDATA
+       bor ?SCRIPT_VERIFY_NULLDUMMY
+       bor ?SCRIPT_VERIFY_LOW_S
+       bor ?SCRIPT_VERIFY_CLEANSTACK
+       bor ?SCRIPT_VERIFY_NULLFAIL
+       bor ?SCRIPT_VERIFY_MINIMALIF
+       bor ?SCRIPT_VERIFY_WITNESS_PUBKEYTYPE
+       bor ?SCRIPT_VERIFY_CONST_SCRIPTCODE
+       bor ?SCRIPT_VERIFY_SIGPUSHONLY;
+
 flags_for_height(_Height, _Network) ->
-    ?SCRIPT_VERIFY_NONE.
+    %% testnet/regtest: all flags active
+    ?SCRIPT_VERIFY_P2SH
+    bor ?SCRIPT_VERIFY_DERSIG
+    bor ?SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY
+    bor ?SCRIPT_VERIFY_CHECKSEQUENCEVERIFY
+    bor ?SCRIPT_VERIFY_WITNESS
+    bor ?SCRIPT_VERIFY_TAPROOT
+    bor ?SCRIPT_VERIFY_STRICTENC
+    bor ?SCRIPT_VERIFY_MINIMALDATA
+    bor ?SCRIPT_VERIFY_NULLDUMMY
+    bor ?SCRIPT_VERIFY_LOW_S
+    bor ?SCRIPT_VERIFY_CLEANSTACK
+    bor ?SCRIPT_VERIFY_NULLFAIL
+    bor ?SCRIPT_VERIFY_MINIMALIF
+    bor ?SCRIPT_VERIFY_WITNESS_PUBKEYTYPE
+    bor ?SCRIPT_VERIFY_CONST_SCRIPTCODE
+    bor ?SCRIPT_VERIFY_SIGPUSHONLY.
