@@ -5,7 +5,7 @@
 -include("beamchain.hrl").
 -include("beamchain_protocol.hrl").
 
--export([params/1]).
+-export([params/1, genesis_block/1]).
 
 %% @doc Returns comprehensive chain parameters for the given network.
 -spec params(mainnet | testnet | testnet4 | regtest | signet) -> map().
@@ -19,6 +19,7 @@ params(mainnet) ->
         %% genesis block hash (display byte order)
         genesis_hash => hex_to_bin(
             "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"),
+        genesis_block => genesis_block(mainnet),
 
         %% proof of work
         pow_limit => hex_to_bin(
@@ -91,6 +92,85 @@ mainnet_checkpoints() ->
         250000 => hex_to_bin("000000000000003887df1f29024b06fc2200b55f8af8f35453d7be294df2d214"),
         279000 => hex_to_bin("0000000000000001ae8c72a0b0c301f67e3afca10e819efa9041e458e9bd7e40"),
         295000 => hex_to_bin("00000000000000004d9b4ef50f0f9d686fd69db2e03af35a100370c64632a983")
+    }.
+
+%%% -------------------------------------------------------------------
+%%% Genesis blocks
+%%% -------------------------------------------------------------------
+
+%% @doc Build the genesis block for the given network.
+%% Mainnet/testnet/regtest/signet use satoshi's original coinbase.
+%% Testnet4 (BIP94) uses a different coinbase message and null output key.
+-spec genesis_block(atom()) -> #block{}.
+genesis_block(mainnet) ->
+    make_genesis(satoshi_coinbase(), 1231006505, 2083236893, 16#1d00ffff);
+genesis_block(testnet) ->
+    make_genesis(satoshi_coinbase(), 1296688602, 414098458, 16#1d00ffff);
+genesis_block(testnet4) ->
+    make_genesis(testnet4_coinbase(), 1714777860, 393743547, 16#1d00ffff);
+genesis_block(regtest) ->
+    make_genesis(satoshi_coinbase(), 1296688602, 2, 16#207fffff);
+genesis_block(signet) ->
+    make_genesis(satoshi_coinbase(), 1598918400, 52613770, 16#1e0377ae).
+
+make_genesis(CoinbaseTx, Timestamp, Nonce, Bits) ->
+    MerkleRoot = beamchain_serialize:tx_hash(CoinbaseTx),
+    Header = #block_header{
+        version = 1,
+        prev_hash = <<0:256>>,
+        merkle_root = MerkleRoot,
+        timestamp = Timestamp,
+        bits = Bits,
+        nonce = Nonce
+    },
+    Hash = beamchain_serialize:block_hash(Header),
+    #block{
+        header = Header,
+        transactions = [CoinbaseTx],
+        hash = Hash,
+        height = 0
+    }.
+
+%% The original satoshi coinbase used by mainnet, testnet3, regtest, signet
+satoshi_coinbase() ->
+    %% scriptSig: push(4) ffff001d push(1) 04 push(69) "The Times..."
+    ScriptSig = hex_to_bin(
+        "04ffff001d0104455468652054696d65732030332f4a616e2f323030"
+        "39204368616e63656c6c6f72206f6e206272696e6b206f66207365"
+        "636f6e64206261696c6f757420666f722062616e6b73"),
+    %% output: <65-byte uncompressed pubkey> OP_CHECKSIG
+    ScriptPubKey = hex_to_bin(
+        "4104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962"
+        "e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba"
+        "0b8d578a4c702b6bf11d5fac"),
+    make_coinbase_tx(ScriptSig, ScriptPubKey).
+
+%% BIP94 testnet4 coinbase — different message, null compressed pubkey
+testnet4_coinbase() ->
+    Msg = <<"03/May/2024 000000000000000000001ebd58c244970b3aa9d783bb001011fbe8ea8e98e00e">>,
+    %% scriptSig: push(4) ffff001d push(1) 04 OP_PUSHDATA1(76) <msg>
+    ScriptSig = <<16#04, 16#ff, 16#ff, 16#00, 16#1d,
+                  16#01, 16#04,
+                  16#4c, (byte_size(Msg)):8,
+                  Msg/binary>>,
+    %% output: <33 zero bytes (null compressed pubkey)> OP_CHECKSIG
+    ScriptPubKey = <<16#21, 0:264, 16#ac>>,
+    make_coinbase_tx(ScriptSig, ScriptPubKey).
+
+make_coinbase_tx(ScriptSig, ScriptPubKey) ->
+    #transaction{
+        version = 1,
+        inputs = [#tx_in{
+            prev_out = #outpoint{hash = <<0:256>>, index = 16#ffffffff},
+            script_sig = ScriptSig,
+            sequence = 16#ffffffff,
+            witness = []
+        }],
+        outputs = [#tx_out{
+            value = ?INITIAL_SUBSIDY,
+            script_pubkey = ScriptPubKey
+        }],
+        locktime = 0
     }.
 
 %%% -------------------------------------------------------------------
