@@ -71,6 +71,173 @@ params(mainnet) ->
         pubkey_prefix => 0,
         script_prefix => 5,
         bech32_hrp => "bc"
+    };
+
+params(testnet) ->
+    #{
+        network => testnet,
+        magic => <<16#0B, 16#11, 16#09, 16#07>>,
+        default_port => 18333,
+        rpc_port => 18332,
+
+        genesis_hash => hex_to_bin(
+            "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943"),
+        genesis_block => genesis_block(testnet),
+
+        pow_limit => hex_to_bin(
+            "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+        pow_target_timespan => ?POW_TARGET_TIMESPAN,
+        pow_target_spacing => ?POW_TARGET_SPACING,
+        pow_allow_min_difficulty => true,
+        pow_no_retargeting => false,
+
+        subsidy_halving_interval => ?SUBSIDY_HALVING_INTERVAL,
+
+        bip34_height => 21111,
+        bip65_height => 581885,
+        bip66_height => 330776,
+        csv_height => 770112,
+        segwit_height => 834624,
+        taproot_height => 0,
+
+        min_chainwork => <<0:256>>,
+        assume_valid => <<0:256>>,
+        checkpoints => #{},
+
+        dns_seeds => [
+            "testnet-seed.bitcoin.jonasschnelli.ch",
+            "seed.tbtc.petertodd.net",
+            "seed.testnet.bitcoin.sprovoost.nl",
+            "testnet-seed.bluematt.me"
+        ],
+
+        bip30_exceptions => [],
+        pubkey_prefix => 111,
+        script_prefix => 196,
+        bech32_hrp => "tb"
+    };
+
+params(testnet4) ->
+    #{
+        network => testnet4,
+        magic => <<16#1C, 16#16, 16#3F, 16#28>>,
+        default_port => 48333,
+        rpc_port => 48332,
+
+        genesis_hash => hex_to_bin(
+            "00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043"),
+        genesis_block => genesis_block(testnet4),
+
+        pow_limit => hex_to_bin(
+            "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+        pow_target_timespan => ?POW_TARGET_TIMESPAN,
+        pow_target_spacing => ?POW_TARGET_SPACING,
+        pow_allow_min_difficulty => true,
+        pow_no_retargeting => false,
+
+        subsidy_halving_interval => ?SUBSIDY_HALVING_INTERVAL,
+
+        %% all BIPs active from block 1 on testnet4
+        bip34_height => 1,
+        bip65_height => 1,
+        bip66_height => 1,
+        csv_height => 1,
+        segwit_height => 1,
+        taproot_height => 1,
+
+        min_chainwork => <<0:256>>,
+        assume_valid => <<0:256>>,
+        checkpoints => #{},
+
+        dns_seeds => [
+            "seed.testnet4.bitcoin.sprovoost.nl",
+            "seed.testnet4.wiz.biz"
+        ],
+
+        bip30_exceptions => [],
+        pubkey_prefix => 111,
+        script_prefix => 196,
+        bech32_hrp => "tb"
+    };
+
+params(regtest) ->
+    #{
+        network => regtest,
+        magic => <<16#FA, 16#BF, 16#B5, 16#DA>>,
+        default_port => 18444,
+        rpc_port => 18443,
+
+        genesis_hash => hex_to_bin(
+            "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"),
+        genesis_block => genesis_block(regtest),
+
+        pow_limit => hex_to_bin(
+            "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+        pow_target_timespan => ?POW_TARGET_TIMESPAN,
+        pow_target_spacing => ?POW_TARGET_SPACING,
+        pow_allow_min_difficulty => true,
+        pow_no_retargeting => true,
+
+        subsidy_halving_interval => 150,
+
+        bip34_height => 1,
+        bip65_height => 1,
+        bip66_height => 1,
+        csv_height => 1,
+        segwit_height => 1,
+        taproot_height => 1,
+
+        min_chainwork => <<0:256>>,
+        assume_valid => <<0:256>>,
+        checkpoints => #{},
+
+        dns_seeds => [],
+
+        bip30_exceptions => [],
+        pubkey_prefix => 111,
+        script_prefix => 196,
+        bech32_hrp => "bcrt"
+    };
+
+params(signet) ->
+    #{
+        network => signet,
+        magic => <<16#0A, 16#03, 16#CF, 16#40>>,
+        default_port => 38333,
+        rpc_port => 38332,
+
+        genesis_hash => hex_to_bin(
+            "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6"),
+        genesis_block => genesis_block(signet),
+
+        pow_limit => hex_to_bin(
+            "00000377ae000000000000000000000000000000000000000000000000000000"),
+        pow_target_timespan => ?POW_TARGET_TIMESPAN,
+        pow_target_spacing => ?POW_TARGET_SPACING,
+        pow_allow_min_difficulty => false,
+        pow_no_retargeting => false,
+
+        subsidy_halving_interval => ?SUBSIDY_HALVING_INTERVAL,
+
+        bip34_height => 1,
+        bip65_height => 1,
+        bip66_height => 1,
+        csv_height => 1,
+        segwit_height => 1,
+        taproot_height => 1,
+
+        min_chainwork => <<0:256>>,
+        assume_valid => <<0:256>>,
+        checkpoints => #{},
+
+        dns_seeds => [
+            "seed.signet.bitcoin.sprovoost.nl"
+        ],
+
+        bip30_exceptions => [],
+        pubkey_prefix => 111,
+        script_prefix => 196,
+        bech32_hrp => "tb"
     }.
 
 %%% -------------------------------------------------------------------
