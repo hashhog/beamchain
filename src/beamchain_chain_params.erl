@@ -5,7 +5,7 @@
 -include("beamchain.hrl").
 -include("beamchain_protocol.hrl").
 
--export([params/1, genesis_block/1]).
+-export([params/1, genesis_block/1, block_subsidy/2]).
 
 %% @doc Returns comprehensive chain parameters for the given network.
 -spec params(mainnet | testnet | testnet4 | regtest | signet) -> map().
@@ -339,6 +339,22 @@ make_coinbase_tx(ScriptSig, ScriptPubKey) ->
         }],
         locktime = 0
     }.
+
+%%% -------------------------------------------------------------------
+%%% Block subsidy
+%%% -------------------------------------------------------------------
+
+%% @doc Calculate the block subsidy (mining reward) at a given height.
+%% Starts at 50 BTC, halves every `subsidy_halving_interval` blocks.
+%% Returns 0 after 64 halvings.
+-spec block_subsidy(non_neg_integer(), atom()) -> non_neg_integer().
+block_subsidy(Height, Network) ->
+    #{subsidy_halving_interval := Interval} = params(Network),
+    Halvings = Height div Interval,
+    case Halvings >= 64 of
+        true -> 0;
+        false -> ?INITIAL_SUBSIDY bsr Halvings
+    end.
 
 %%% -------------------------------------------------------------------
 %%% Internal helpers
