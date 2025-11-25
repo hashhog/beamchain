@@ -6,6 +6,9 @@
 %% API
 -export([start_link/0, stop/0]).
 
+%% Block storage
+-export([store_block/2, get_block/1, get_block_by_height/1, has_block/1]).
+
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2]).
@@ -41,6 +44,26 @@ start_link() ->
 
 stop() ->
     gen_server:stop(?SERVER).
+
+%% @doc Store a block with its height
+-spec store_block(#block{}, non_neg_integer()) -> ok | {error, term()}.
+store_block(Block, Height) ->
+    gen_server:call(?SERVER, {store_block, Block, Height}).
+
+%% @doc Get a block by hash
+-spec get_block(binary()) -> {ok, #block{}} | not_found.
+get_block(Hash) when byte_size(Hash) =:= 32 ->
+    gen_server:call(?SERVER, {get_block, Hash}).
+
+%% @doc Get a block by height
+-spec get_block_by_height(non_neg_integer()) -> {ok, #block{}} | not_found.
+get_block_by_height(Height) ->
+    gen_server:call(?SERVER, {get_block_by_height, Height}).
+
+%% @doc Check if a block exists
+-spec has_block(binary()) -> boolean().
+has_block(Hash) when byte_size(Hash) =:= 32 ->
+    gen_server:call(?SERVER, {has_block, Hash}).
 
 %%% ===================================================================
 %%% gen_server callbacks
@@ -90,6 +113,58 @@ init([]) ->
             {stop, {db_open_failed, Reason}}
     end.
 
+%% Block storage
+handle_call({store_block, Block, Height}, _From,
+            #state{db_handle = Db, cf_blocks = CF} = State) ->
+    Hash = block_hash(Block),
+    BlockBin = beamchain_serialize:encode_block(Block),
+    %% Store block data keyed by hash
+    Result = rocksdb:put(Db, CF, Hash, BlockBin, []),
+    %% Also store height -> hash mapping in block_index for lookup by height
+    HeightKey = encode_height(Height),
+    rocksdb:put(Db, State#state.cf_block_idx, HeightKey,
+                Hash, []),
+    {reply, Result, State};
+
+handle_call({get_block, Hash}, _From,
+            #state{db_handle = Db, cf_blocks = CF} = State) ->
+    Result = case rocksdb:get(Db, CF, Hash, []) of
+        {ok, BlockBin} ->
+            {Block, <<>>} = beamchain_serialize:decode_block(BlockBin),
+            {ok, Block};
+        not_found ->
+            not_found;
+        {error, _} = Err ->
+            Err
+    end,
+    {reply, Result, State};
+
+handle_call({get_block_by_height, Height}, _From,
+            #state{db_handle = Db, cf_blocks = BlocksCF,
+                   cf_block_idx = IdxCF} = State) ->
+    HeightKey = encode_height(Height),
+    Result = case rocksdb:get(Db, IdxCF, HeightKey, []) of
+        {ok, Hash} ->
+            case rocksdb:get(Db, BlocksCF, Hash, []) of
+                {ok, BlockBin} ->
+                    {Block, <<>>} = beamchain_serialize:decode_block(BlockBin),
+                    {ok, Block};
+                not_found ->
+                    not_found
+            end;
+        not_found ->
+            not_found
+    end,
+    {reply, Result, State};
+
+handle_call({has_block, Hash}, _From,
+            #state{db_handle = Db, cf_blocks = CF} = State) ->
+    Result = case rocksdb:get(Db, CF, Hash, []) of
+        {ok, _} -> true;
+        not_found -> false
+    end,
+    {reply, Result, State};
+
 handle_call(_Request, _From, State) ->
     {reply, {error, not_implemented}, State}.
 
@@ -105,3 +180,17 @@ terminate(_Reason, #state{db_handle = DbHandle}) ->
     logger:info("beamchain_db: closing rocksdb"),
     rocksdb:close(DbHandle),
     ok.
+
+%%% ===================================================================
+%%% Internal helpers
+%%% ===================================================================
+
+%% @doc Encode height as 8-byte big-endian for sorted storage
+encode_height(Height) ->
+    <<Height:64/big>>.
+
+%% @doc Compute block hash
+block_hash(#block{hash = Hash}) when is_binary(Hash), byte_size(Hash) =:= 32 ->
+    Hash;
+block_hash(#block{header = Header}) ->
+    beamchain_serialize:block_hash(Header).
