@@ -9,6 +9,9 @@
 %% Block storage
 -export([store_block/2, get_block/1, get_block_by_height/1, has_block/1]).
 
+%% UTXO set
+-export([get_utxo/2, store_utxo/3, spend_utxo/2, has_utxo/2]).
+
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2]).
@@ -64,6 +67,26 @@ get_block_by_height(Height) ->
 -spec has_block(binary()) -> boolean().
 has_block(Hash) when byte_size(Hash) =:= 32 ->
     gen_server:call(?SERVER, {has_block, Hash}).
+
+%% @doc Get a UTXO by outpoint
+-spec get_utxo(binary(), non_neg_integer()) -> {ok, #utxo{}} | not_found.
+get_utxo(Txid, Vout) when byte_size(Txid) =:= 32 ->
+    gen_server:call(?SERVER, {get_utxo, Txid, Vout}).
+
+%% @doc Store a UTXO
+-spec store_utxo(binary(), non_neg_integer(), #utxo{}) -> ok.
+store_utxo(Txid, Vout, Utxo) when byte_size(Txid) =:= 32 ->
+    gen_server:call(?SERVER, {store_utxo, Txid, Vout, Utxo}).
+
+%% @doc Spend (remove) a UTXO, returns the spent UTXO for undo data
+-spec spend_utxo(binary(), non_neg_integer()) -> {ok, #utxo{}} | not_found.
+spend_utxo(Txid, Vout) when byte_size(Txid) =:= 32 ->
+    gen_server:call(?SERVER, {spend_utxo, Txid, Vout}).
+
+%% @doc Check if a UTXO exists
+-spec has_utxo(binary(), non_neg_integer()) -> boolean().
+has_utxo(Txid, Vout) when byte_size(Txid) =:= 32 ->
+    gen_server:call(?SERVER, {has_utxo, Txid, Vout}).
 
 %%% ===================================================================
 %%% gen_server callbacks
@@ -165,6 +188,45 @@ handle_call({has_block, Hash}, _From,
     end,
     {reply, Result, State};
 
+%% UTXO operations
+handle_call({store_utxo, Txid, Vout, Utxo}, _From,
+            #state{db_handle = Db, cf_chainstate = CF} = State) ->
+    Key = encode_outpoint(Txid, Vout),
+    Value = encode_utxo(Utxo),
+    Result = rocksdb:put(Db, CF, Key, Value, []),
+    {reply, Result, State};
+
+handle_call({get_utxo, Txid, Vout}, _From,
+            #state{db_handle = Db, cf_chainstate = CF} = State) ->
+    Key = encode_outpoint(Txid, Vout),
+    Result = case rocksdb:get(Db, CF, Key, []) of
+        {ok, Bin} -> {ok, decode_utxo(Bin)};
+        not_found -> not_found
+    end,
+    {reply, Result, State};
+
+handle_call({spend_utxo, Txid, Vout}, _From,
+            #state{db_handle = Db, cf_chainstate = CF} = State) ->
+    Key = encode_outpoint(Txid, Vout),
+    Result = case rocksdb:get(Db, CF, Key, []) of
+        {ok, Bin} ->
+            Utxo = decode_utxo(Bin),
+            rocksdb:delete(Db, CF, Key, []),
+            {ok, Utxo};
+        not_found ->
+            not_found
+    end,
+    {reply, Result, State};
+
+handle_call({has_utxo, Txid, Vout}, _From,
+            #state{db_handle = Db, cf_chainstate = CF} = State) ->
+    Key = encode_outpoint(Txid, Vout),
+    Result = case rocksdb:get(Db, CF, Key, []) of
+        {ok, _} -> true;
+        not_found -> false
+    end,
+    {reply, Result, State};
+
 handle_call(_Request, _From, State) ->
     {reply, {error, not_implemented}, State}.
 
@@ -194,3 +256,24 @@ block_hash(#block{hash = Hash}) when is_binary(Hash), byte_size(Hash) =:= 32 ->
     Hash;
 block_hash(#block{header = Header}) ->
     beamchain_serialize:block_hash(Header).
+
+%% @doc Encode outpoint as key: txid(32) ++ vout(4 big-endian)
+encode_outpoint(Txid, Vout) ->
+    <<Txid:32/binary, Vout:32/big>>.
+
+%% @doc Encode a UTXO record to binary for storage
+%% Format: value(8 LE) | height(4 LE) | is_coinbase(1) | script_pubkey(rest)
+encode_utxo(#utxo{value = Value, script_pubkey = Script,
+                  is_coinbase = IsCoinbase, height = Height}) ->
+    CoinbaseFlag = case IsCoinbase of true -> 1; false -> 0 end,
+    <<Value:64/little, Height:32/little, CoinbaseFlag:8, Script/binary>>.
+
+%% @doc Decode a UTXO from stored binary
+decode_utxo(<<Value:64/little, Height:32/little, CoinbaseFlag:8,
+              Script/binary>>) ->
+    #utxo{
+        value = Value,
+        script_pubkey = Script,
+        is_coinbase = CoinbaseFlag =:= 1,
+        height = Height
+    }.
