@@ -18,6 +18,15 @@
 %% Chain tip
 -export([get_chain_tip/0, set_chain_tip/2]).
 
+%% Transaction index
+-export([store_tx_index/4, get_tx_location/1]).
+
+%% Undo data
+-export([store_undo/2, get_undo/1]).
+
+%% Batch writes
+-export([write_batch/1]).
+
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2]).
@@ -124,6 +133,36 @@ get_chain_tip() ->
 -spec set_chain_tip(binary(), non_neg_integer()) -> ok.
 set_chain_tip(Hash, Height) when byte_size(Hash) =:= 32 ->
     gen_server:call(?SERVER, {set_chain_tip, Hash, Height}).
+
+%% @doc Store transaction index entry
+-spec store_tx_index(binary(), binary(), non_neg_integer(),
+                     non_neg_integer()) -> ok.
+store_tx_index(Txid, BlockHash, Height, Position) ->
+    gen_server:call(?SERVER, {store_tx_index, Txid, BlockHash, Height, Position}).
+
+%% @doc Get transaction location (which block, height, position)
+-spec get_tx_location(binary()) ->
+    {ok, #{block_hash => binary(), height => integer(),
+           position => integer()}} | not_found.
+get_tx_location(Txid) when byte_size(Txid) =:= 32 ->
+    gen_server:call(?SERVER, {get_tx_location, Txid}).
+
+%% @doc Store undo data for a block (spent UTXOs, for reorgs)
+-spec store_undo(binary(), binary()) -> ok.
+store_undo(BlockHash, UndoData) when byte_size(BlockHash) =:= 32 ->
+    gen_server:call(?SERVER, {store_undo, BlockHash, UndoData}).
+
+%% @doc Get undo data for a block
+-spec get_undo(binary()) -> {ok, binary()} | not_found.
+get_undo(BlockHash) when byte_size(BlockHash) =:= 32 ->
+    gen_server:call(?SERVER, {get_undo, BlockHash}).
+
+%% @doc Atomic batch write across column families
+%% Ops = [{put, CF, Key, Value} | {delete, CF, Key}]
+%% CF is one of: blocks, block_index, chainstate, tx_index, meta, undo
+-spec write_batch([tuple()]) -> ok | {error, term()}.
+write_batch(Ops) ->
+    gen_server:call(?SERVER, {write_batch, Ops}).
 
 %%% ===================================================================
 %%% gen_server callbacks
@@ -323,6 +362,44 @@ handle_call({set_chain_tip, Hash, Height}, _From,
     Result = rocksdb:put(Db, CF, <<"chain_tip">>, Value, []),
     {reply, Result, State};
 
+%% Transaction index
+handle_call({store_tx_index, Txid, BlockHash, Height, Position}, _From,
+            #state{db_handle = Db, cf_tx_index = CF} = State) ->
+    Value = <<BlockHash:32/binary, Height:64/big, Position:32/big>>,
+    Result = rocksdb:put(Db, CF, Txid, Value, []),
+    {reply, Result, State};
+
+handle_call({get_tx_location, Txid}, _From,
+            #state{db_handle = Db, cf_tx_index = CF} = State) ->
+    Result = case rocksdb:get(Db, CF, Txid, []) of
+        {ok, <<BlockHash:32/binary, Height:64/big, Position:32/big>>} ->
+            {ok, #{block_hash => BlockHash, height => Height,
+                   position => Position}};
+        not_found ->
+            not_found
+    end,
+    {reply, Result, State};
+
+%% Undo data
+handle_call({store_undo, BlockHash, UndoData}, _From,
+            #state{db_handle = Db, cf_undo = CF} = State) ->
+    Result = rocksdb:put(Db, CF, BlockHash, UndoData, []),
+    {reply, Result, State};
+
+handle_call({get_undo, BlockHash}, _From,
+            #state{db_handle = Db, cf_undo = CF} = State) ->
+    Result = case rocksdb:get(Db, CF, BlockHash, []) of
+        {ok, UndoData} -> {ok, UndoData};
+        not_found -> not_found
+    end,
+    {reply, Result, State};
+
+%% Batch writes
+handle_call({write_batch, Ops}, _From, State) ->
+    WriteActions = lists:map(fun(Op) -> resolve_batch_op(Op, State) end, Ops),
+    Result = rocksdb:write(State#state.db_handle, WriteActions, []),
+    {reply, Result, State};
+
 handle_call(_Request, _From, State) ->
     {reply, {error, not_implemented}, State}.
 
@@ -390,3 +467,17 @@ decode_block_index_entry(<<Hash:32/binary, HeaderBin:80/binary,
     {Header, <<>>} = beamchain_serialize:decode_block_header(HeaderBin),
     #{hash => Hash, header => Header,
       chainwork => Chainwork, status => Status}.
+
+%% @doc Resolve a batch operation's CF name to a CF handle
+resolve_batch_op({put, CF, Key, Value}, State) ->
+    {put, cf_handle(CF, State), Key, Value};
+resolve_batch_op({delete, CF, Key}, State) ->
+    {delete, cf_handle(CF, State), Key}.
+
+%% @doc Map column family name atom to handle
+cf_handle(blocks, #state{cf_blocks = H}) -> H;
+cf_handle(block_index, #state{cf_block_idx = H}) -> H;
+cf_handle(chainstate, #state{cf_chainstate = H}) -> H;
+cf_handle(tx_index, #state{cf_tx_index = H}) -> H;
+cf_handle(meta, #state{cf_meta = H}) -> H;
+cf_handle(undo, #state{cf_undo = H}) -> H.
