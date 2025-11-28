@@ -12,6 +12,12 @@
 %% UTXO set
 -export([get_utxo/2, store_utxo/3, spend_utxo/2, has_utxo/2]).
 
+%% Block index
+-export([store_block_index/5, get_block_index/1, get_block_index_by_hash/1]).
+
+%% Chain tip
+-export([get_chain_tip/0, set_chain_tip/2]).
+
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2]).
@@ -88,6 +94,37 @@ spend_utxo(Txid, Vout) when byte_size(Txid) =:= 32 ->
 has_utxo(Txid, Vout) when byte_size(Txid) =:= 32 ->
     gen_server:call(?SERVER, {has_utxo, Txid, Vout}).
 
+%% @doc Store block index entry (header metadata for a given height)
+-spec store_block_index(non_neg_integer(), binary(), #block_header{},
+                        binary(), integer()) -> ok.
+store_block_index(Height, Hash, Header, Chainwork, Status) ->
+    gen_server:call(?SERVER, {store_block_index, Height, Hash, Header,
+                              Chainwork, Status}).
+
+%% @doc Get block index by height
+-spec get_block_index(non_neg_integer()) ->
+    {ok, #{hash => binary(), header => #block_header{},
+           chainwork => binary(), status => integer()}} | not_found.
+get_block_index(Height) ->
+    gen_server:call(?SERVER, {get_block_index, Height}).
+
+%% @doc Get block index by hash (reverse lookup)
+-spec get_block_index_by_hash(binary()) ->
+    {ok, #{height => integer(), header => #block_header{},
+           chainwork => binary(), status => integer()}} | not_found.
+get_block_index_by_hash(Hash) when byte_size(Hash) =:= 32 ->
+    gen_server:call(?SERVER, {get_block_index_by_hash, Hash}).
+
+%% @doc Get the current chain tip
+-spec get_chain_tip() -> {ok, #{hash => binary(), height => integer()}} | not_found.
+get_chain_tip() ->
+    gen_server:call(?SERVER, get_chain_tip).
+
+%% @doc Set the chain tip
+-spec set_chain_tip(binary(), non_neg_integer()) -> ok.
+set_chain_tip(Hash, Height) when byte_size(Hash) =:= 32 ->
+    gen_server:call(?SERVER, {set_chain_tip, Hash, Height}).
+
 %%% ===================================================================
 %%% gen_server callbacks
 %%% ===================================================================
@@ -138,15 +175,15 @@ init([]) ->
 
 %% Block storage
 handle_call({store_block, Block, Height}, _From,
-            #state{db_handle = Db, cf_blocks = CF} = State) ->
+            #state{db_handle = Db, cf_blocks = CF,
+                   cf_block_idx = IdxCF} = State) ->
     Hash = block_hash(Block),
     BlockBin = beamchain_serialize:encode_block(Block),
     %% Store block data keyed by hash
     Result = rocksdb:put(Db, CF, Hash, BlockBin, []),
-    %% Also store height -> hash mapping in block_index for lookup by height
+    %% Store height -> hash in block_index for height lookup
     HeightKey = encode_height(Height),
-    rocksdb:put(Db, State#state.cf_block_idx, HeightKey,
-                Hash, []),
+    rocksdb:put(Db, IdxCF, HeightKey, Hash, []),
     {reply, Result, State};
 
 handle_call({get_block, Hash}, _From,
@@ -227,6 +264,65 @@ handle_call({has_utxo, Txid, Vout}, _From,
     end,
     {reply, Result, State};
 
+%% Block index operations
+handle_call({store_block_index, Height, Hash, Header, Chainwork, Status},
+            _From, #state{db_handle = Db, cf_block_idx = CF,
+                          cf_meta = MetaCF} = State) ->
+    HeightKey = encode_height(Height),
+    Value = encode_block_index_entry(Hash, Header, Chainwork, Status),
+    rocksdb:put(Db, CF, HeightKey, Value, []),
+    %% Reverse index: hash -> height for lookup by hash
+    HashKey = <<"blkidx:", Hash/binary>>,
+    rocksdb:put(Db, MetaCF, HashKey, HeightKey, []),
+    {reply, ok, State};
+
+handle_call({get_block_index, Height}, _From,
+            #state{db_handle = Db, cf_block_idx = CF} = State) ->
+    HeightKey = encode_height(Height),
+    Result = case rocksdb:get(Db, CF, HeightKey, []) of
+        {ok, Bin} ->
+            {ok, decode_block_index_entry(Bin)};
+        not_found ->
+            not_found
+    end,
+    {reply, Result, State};
+
+handle_call({get_block_index_by_hash, Hash}, _From,
+            #state{db_handle = Db, cf_block_idx = CF,
+                   cf_meta = MetaCF} = State) ->
+    HashKey = <<"blkidx:", Hash/binary>>,
+    Result = case rocksdb:get(Db, MetaCF, HashKey, []) of
+        {ok, HeightKey} ->
+            <<Height:64/big>> = HeightKey,
+            case rocksdb:get(Db, CF, HeightKey, []) of
+                {ok, Bin} ->
+                    Entry = decode_block_index_entry(Bin),
+                    {ok, Entry#{height => Height}};
+                not_found ->
+                    not_found
+            end;
+        not_found ->
+            not_found
+    end,
+    {reply, Result, State};
+
+%% Chain tip metadata
+handle_call(get_chain_tip, _From,
+            #state{db_handle = Db, cf_meta = CF} = State) ->
+    Result = case rocksdb:get(Db, CF, <<"chain_tip">>, []) of
+        {ok, <<Hash:32/binary, Height:64/big>>} ->
+            {ok, #{hash => Hash, height => Height}};
+        not_found ->
+            not_found
+    end,
+    {reply, Result, State};
+
+handle_call({set_chain_tip, Hash, Height}, _From,
+            #state{db_handle = Db, cf_meta = CF} = State) ->
+    Value = <<Hash:32/binary, Height:64/big>>,
+    Result = rocksdb:put(Db, CF, <<"chain_tip">>, Value, []),
+    {reply, Result, State};
+
 handle_call(_Request, _From, State) ->
     {reply, {error, not_implemented}, State}.
 
@@ -277,3 +373,20 @@ decode_utxo(<<Value:64/little, Height:32/little, CoinbaseFlag:8,
         is_coinbase = CoinbaseFlag =:= 1,
         height = Height
     }.
+
+%% @doc Encode a block index entry for storage
+%% Format: hash(32) | header(80) | chainwork_len(2) | chainwork(var) | status(4)
+encode_block_index_entry(Hash, Header, Chainwork, Status) ->
+    HeaderBin = beamchain_serialize:encode_block_header(Header),
+    CWLen = byte_size(Chainwork),
+    <<Hash:32/binary, HeaderBin:80/binary,
+      CWLen:16/big, Chainwork:CWLen/binary,
+      Status:32/little>>.
+
+%% @doc Decode a block index entry
+decode_block_index_entry(<<Hash:32/binary, HeaderBin:80/binary,
+                           CWLen:16/big, Rest/binary>>) ->
+    <<Chainwork:CWLen/binary, Status:32/little>> = Rest,
+    {Header, <<>>} = beamchain_serialize:decode_block_header(HeaderBin),
+    #{hash => Hash, header => Header,
+      chainwork => Chainwork, status => Status}.
