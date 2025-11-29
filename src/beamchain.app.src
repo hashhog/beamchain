@@ -17,7 +17,8 @@
         stdlib,
         crypto,
         ssl,
-        inets
+        inets,
+        rocksdb
     ]},
     {env, [
         {network, mainnet},
