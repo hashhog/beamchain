@@ -27,6 +27,9 @@
 %% Batch writes
 -export([write_batch/1]).
 
+%% Generic metadata and stats
+-export([get_meta/1, put_meta/2, get_db_stats/0]).
+
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2]).
@@ -163,6 +166,21 @@ get_undo(BlockHash) when byte_size(BlockHash) =:= 32 ->
 -spec write_batch([tuple()]) -> ok | {error, term()}.
 write_batch(Ops) ->
     gen_server:call(?SERVER, {write_batch, Ops}).
+
+%% @doc Get a value from the meta column family
+-spec get_meta(binary()) -> {ok, binary()} | not_found.
+get_meta(Key) when is_binary(Key) ->
+    gen_server:call(?SERVER, {get_meta, Key}).
+
+%% @doc Put a value in the meta column family
+-spec put_meta(binary(), binary()) -> ok.
+put_meta(Key, Value) when is_binary(Key), is_binary(Value) ->
+    gen_server:call(?SERVER, {put_meta, Key, Value}).
+
+%% @doc Get database statistics
+-spec get_db_stats() -> map().
+get_db_stats() ->
+    gen_server:call(?SERVER, get_db_stats).
 
 %%% ===================================================================
 %%% gen_server callbacks
@@ -399,6 +417,32 @@ handle_call({write_batch, Ops}, _From, State) ->
     WriteActions = lists:map(fun(Op) -> resolve_batch_op(Op, State) end, Ops),
     Result = rocksdb:write(State#state.db_handle, WriteActions, []),
     {reply, Result, State};
+
+%% Generic metadata
+handle_call({get_meta, Key}, _From,
+            #state{db_handle = Db, cf_meta = CF} = State) ->
+    Result = case rocksdb:get(Db, CF, Key, []) of
+        {ok, Value} -> {ok, Value};
+        not_found -> not_found
+    end,
+    {reply, Result, State};
+
+handle_call({put_meta, Key, Value}, _From,
+            #state{db_handle = Db, cf_meta = CF} = State) ->
+    Result = rocksdb:put(Db, CF, Key, Value, []),
+    {reply, Result, State};
+
+%% Database stats
+handle_call(get_db_stats, _From,
+            #state{db_handle = Db, data_dir = DataDir} = State) ->
+    Stats = #{
+        data_dir => DataDir,
+        rocksdb_stats => case rocksdb:stats(Db) of
+            {ok, S} -> S;
+            _ -> <<"unavailable">>
+        end
+    },
+    {reply, Stats, State};
 
 handle_call(_Request, _From, State) ->
     {reply, {error, not_implemented}, State}.
