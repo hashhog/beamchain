@@ -7,6 +7,7 @@
 
 -export([bits_to_target/1, target_to_bits/1]).
 -export([check_pow/3, compute_work/1]).
+-export([get_next_work_required/3]).
 
 %%% -------------------------------------------------------------------
 %%% Compact bits <-> 256-bit target conversion
@@ -85,6 +86,115 @@ compute_work(Bits) ->
             %% 2^256 / (target + 1)
             (1 bsl 256) div (Target + 1)
     end.
+
+%%% -------------------------------------------------------------------
+%%% Difficulty retargeting
+%%% -------------------------------------------------------------------
+
+%% @doc Calculate the required difficulty for the next block.
+%% PrevIndex is a map with keys: height, header, bits (the previous block).
+%% Params is the chain params map from beamchain_chain_params.
+-spec get_next_work_required(map(), #block_header{}, map()) -> non_neg_integer().
+get_next_work_required(PrevIndex, Header, Params) ->
+    PrevHeight = maps:get(height, PrevIndex),
+    PrevHeader = maps:get(header, PrevIndex),
+    PrevBits = PrevHeader#block_header.bits,
+    PowNoRetargeting = maps:get(pow_no_retargeting, Params, false),
+    AllowMinDiff = maps:get(pow_allow_min_difficulty, Params, false),
+    PowLimitBits = pow_limit_bits(Params),
+    Height = PrevHeight + 1,
+
+    case PowNoRetargeting of
+        true ->
+            %% regtest: never adjust difficulty
+            PrevBits;
+        false ->
+            case Height rem ?DIFFICULTY_ADJUSTMENT_INTERVAL of
+                0 ->
+                    %% retarget boundary
+                    calculate_retarget(PrevIndex, Params);
+                _ ->
+                    %% not at a retarget boundary
+                    case AllowMinDiff of
+                        true ->
+                            %% testnet rule: if block timestamp > prev + spacing*2
+                            %% allow mining at minimum difficulty
+                            Spacing = maps:get(pow_target_spacing, Params,
+                                               ?POW_TARGET_SPACING),
+                            case Header#block_header.timestamp >
+                                 PrevHeader#block_header.timestamp + Spacing * 2 of
+                                true ->
+                                    PowLimitBits;
+                                false ->
+                                    %% walk back to find the last non-min-difficulty block
+                                    find_last_non_special_block(PrevIndex, Params)
+                            end;
+                        false ->
+                            PrevBits
+                    end
+            end
+    end.
+
+%% Calculate new target at a retarget boundary
+calculate_retarget(PrevIndex, Params) ->
+    PrevHeight = maps:get(height, PrevIndex),
+    PrevHeader = maps:get(header, PrevIndex),
+    TargetTimespan = maps:get(pow_target_timespan, Params, ?POW_TARGET_TIMESPAN),
+    PowLimit = maps:get(pow_limit, Params),
+    PowLimitInt = binary:decode_unsigned(PowLimit, big),
+
+    %% find the block at the start of this retarget period
+    FirstHeight = PrevHeight - (?DIFFICULTY_ADJUSTMENT_INTERVAL - 1),
+    FirstIndex = get_block_index(FirstHeight),
+    FirstHeader = maps:get(header, FirstIndex),
+
+    %% calculate actual timespan
+    ActualTimespan0 = PrevHeader#block_header.timestamp -
+                      FirstHeader#block_header.timestamp,
+
+    %% clamp to [timespan/4, timespan*4]
+    ActualTimespan1 = max(TargetTimespan div 4, ActualTimespan0),
+    ActualTimespan = min(TargetTimespan * 4, ActualTimespan1),
+
+    %% new_target = old_target * actual_timespan / target_timespan
+    OldTarget = bits_to_target(PrevHeader#block_header.bits),
+    NewTarget0 = (OldTarget * ActualTimespan) div TargetTimespan,
+
+    %% clamp to pow_limit
+    NewTarget = min(NewTarget0, PowLimitInt),
+    target_to_bits(NewTarget).
+
+%% On testnet, walk back to find the last block that wasn't mined at
+%% minimum difficulty. This handles the testnet difficulty reset rule.
+find_last_non_special_block(Index, Params) ->
+    Height = maps:get(height, Index),
+    Header = maps:get(header, Index),
+    PowLimitBits = pow_limit_bits(Params),
+    case Height rem ?DIFFICULTY_ADJUSTMENT_INTERVAL =:= 0 of
+        true ->
+            Header#block_header.bits;
+        false ->
+            case Header#block_header.bits =:= PowLimitBits of
+                true when Height > 0 ->
+                    PrevIndex = get_block_index(Height - 1),
+                    find_last_non_special_block(PrevIndex, Params);
+                _ ->
+                    Header#block_header.bits
+            end
+    end.
+
+%% Look up a block index entry by height. This calls the db module.
+get_block_index(Height) ->
+    case beamchain_db:get_block_index(Height) of
+        {ok, Entry} -> Entry;
+        not_found -> error({block_index_not_found, Height})
+    end.
+
+%% Calculate the pow_limit in compact bits form
+pow_limit_bits(Params) ->
+    PowLimit = maps:get(pow_limit, Params),
+    PowLimitInt = binary:decode_unsigned(PowLimit, big),
+    target_to_bits(PowLimitInt).
 
 %%% -------------------------------------------------------------------
 %%% Internal helpers
