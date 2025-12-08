@@ -13,6 +13,11 @@
 -export([contextual_check_block_header/3]).
 -export([median_time_past/1]).
 
+%% Sigops counting
+-export([count_legacy_sigops/1]).
+-export([count_p2sh_sigops/2, count_witness_sigops/2]).
+-export([get_tx_sigop_cost/3]).
+
 %%% -------------------------------------------------------------------
 %%% Context-free block header validation
 %%% -------------------------------------------------------------------
@@ -350,3 +355,153 @@ check_merkle_malleation(Hashes) ->
                 false -> ok
             end
     end.
+
+%%% -------------------------------------------------------------------
+%%% Sigops counting (context-dependent)
+%%% -------------------------------------------------------------------
+
+%% @doc Count P2SH sigops for a transaction.
+%% For each P2SH input, deserializes the redeem script from scriptSig
+%% and counts sigops in it.
+-spec count_p2sh_sigops(#transaction{}, [#utxo{}]) -> non_neg_integer().
+count_p2sh_sigops(#transaction{inputs = Inputs}, InputCoins) ->
+    lists:foldl(fun({Input, Coin}, Acc) ->
+        case is_p2sh_script(Coin#utxo.script_pubkey) of
+            true ->
+                %% get the redeem script (last push in scriptSig)
+                case get_last_push(Input#tx_in.script_sig) of
+                    {ok, RedeemScript} ->
+                        Acc + count_legacy_sigops(RedeemScript, 0);
+                    error ->
+                        Acc
+                end;
+            false ->
+                Acc
+        end
+    end, 0, lists:zip(Inputs, InputCoins)).
+
+%% @doc Count witness sigops for a transaction.
+%% P2WPKH: 1 sigop
+%% P2WSH: count sigops in the witness script
+%% P2SH-wrapped witness: check the redeem script for witness program
+-spec count_witness_sigops(#transaction{}, [#utxo{}]) -> non_neg_integer().
+count_witness_sigops(#transaction{inputs = Inputs}, InputCoins) ->
+    lists:foldl(fun({Input, Coin}, Acc) ->
+        ScriptPubKey = Coin#utxo.script_pubkey,
+        Witness = Input#tx_in.witness,
+        case classify_witness_program(ScriptPubKey) of
+            {ok, Version, Program} ->
+                Acc + witness_sigops_for_program(Version, Program, Witness);
+            not_witness ->
+                %% check for P2SH-wrapped witness
+                case is_p2sh_script(ScriptPubKey) of
+                    true ->
+                        case get_last_push(Input#tx_in.script_sig) of
+                            {ok, RedeemScript} ->
+                                case classify_witness_program(RedeemScript) of
+                                    {ok, V, P} ->
+                                        Acc + witness_sigops_for_program(V, P, Witness);
+                                    not_witness ->
+                                        Acc
+                                end;
+                            error ->
+                                Acc
+                        end;
+                    false ->
+                        Acc
+                end
+        end
+    end, 0, lists:zip(Inputs, InputCoins)).
+
+%% @doc Get total sigop cost for a transaction.
+%% Cost = legacy_sigops * WITNESS_SCALE_FACTOR + witness_sigops
+-spec get_tx_sigop_cost(#transaction{}, [#utxo{}], non_neg_integer()) ->
+    non_neg_integer().
+get_tx_sigop_cost(Tx, InputCoins, Flags) ->
+    LegacySigops = count_legacy_sigops_tx(Tx),
+    P2shSigops = case (Flags band ?SCRIPT_VERIFY_P2SH) =/= 0 of
+        true -> count_p2sh_sigops(Tx, InputCoins);
+        false -> 0
+    end,
+    WitnessSigops = case (Flags band ?SCRIPT_VERIFY_WITNESS) =/= 0 of
+        true -> count_witness_sigops(Tx, InputCoins);
+        false -> 0
+    end,
+    (LegacySigops + P2shSigops) * ?WITNESS_SCALE_FACTOR + WitnessSigops.
+
+%% Count sigops for a witness program
+witness_sigops_for_program(0, Program, _Witness) when byte_size(Program) =:= 20 ->
+    %% P2WPKH: 1 sigop
+    1;
+witness_sigops_for_program(0, Program, Witness) when byte_size(Program) =:= 32 ->
+    %% P2WSH: count sigops in the witness script (last item)
+    case Witness of
+        [] -> 0;
+        _ ->
+            WitnessScript = lists:last(Witness),
+            count_legacy_sigops(WitnessScript, 0)
+    end;
+witness_sigops_for_program(_Version, _Program, _Witness) ->
+    %% unknown witness version: 0 sigops
+    0.
+
+%% Check if a scriptPubKey is P2SH: OP_HASH160 <20 bytes> OP_EQUAL
+is_p2sh_script(<<16#a9, 16#14, _Hash:20/binary, 16#87>>) -> true;
+is_p2sh_script(_) -> false.
+
+%% Classify a script as a witness program.
+%% Witness program: OP_n <2-40 bytes>
+%% OP_0 = 0x00, OP_1..OP_16 = 0x51..0x60
+classify_witness_program(<<0:8, Len:8, Program:Len/binary>>)
+    when Len >= 2, Len =< 40 ->
+    {ok, 0, Program};
+classify_witness_program(<<OpN:8, Len:8, Program:Len/binary>>)
+    when OpN >= 16#51, OpN =< 16#60, Len >= 2, Len =< 40 ->
+    {ok, OpN - 16#50, Program};
+classify_witness_program(_) ->
+    not_witness.
+
+%% Get the last data push from a script (used to extract P2SH redeem script)
+get_last_push(Script) ->
+    get_last_push(Script, error).
+
+get_last_push(<<>>, Last) -> Last;
+%% direct push: 1-75 bytes
+get_last_push(<<N:8, Rest/binary>>, _Last) when N >= 1, N =< 75 ->
+    case Rest of
+        <<Data:N/binary, Rest2/binary>> ->
+            get_last_push(Rest2, {ok, Data});
+        _ -> error
+    end;
+%% OP_PUSHDATA1
+get_last_push(<<16#4c:8, Len:8, Rest/binary>>, _Last) ->
+    case Rest of
+        <<Data:Len/binary, Rest2/binary>> ->
+            get_last_push(Rest2, {ok, Data});
+        _ -> error
+    end;
+%% OP_PUSHDATA2
+get_last_push(<<16#4d:8, Len:16/little, Rest/binary>>, _Last) ->
+    case Rest of
+        <<Data:Len/binary, Rest2/binary>> ->
+            get_last_push(Rest2, {ok, Data});
+        _ -> error
+    end;
+%% OP_PUSHDATA4
+get_last_push(<<16#4e:8, Len:32/little, Rest/binary>>, _Last) ->
+    case Rest of
+        <<Data:Len/binary, Rest2/binary>> ->
+            get_last_push(Rest2, {ok, Data});
+        _ -> error
+    end;
+%% OP_0: pushes empty
+get_last_push(<<16#00:8, Rest/binary>>, _Last) ->
+    get_last_push(Rest, {ok, <<>>});
+%% OP_1NEGATE .. OP_16: small number pushes
+get_last_push(<<16#4f:8, Rest/binary>>, _Last) ->
+    get_last_push(Rest, {ok, <<16#81>>});
+get_last_push(<<OpN:8, Rest/binary>>, _Last) when OpN >= 16#51, OpN =< 16#60 ->
+    get_last_push(Rest, {ok, <<(OpN - 16#50):8>>});
+%% any other opcode: not a push, reset
+get_last_push(<<_:8, Rest/binary>>, Last) ->
+    get_last_push(Rest, Last).
