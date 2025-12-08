@@ -9,6 +9,10 @@
 -export([check_transaction/1]).
 -export([check_block_header/2, check_block/2]).
 
+%% Contextual checks (need chain state)
+-export([contextual_check_block_header/3]).
+-export([median_time_past/1]).
+
 %%% -------------------------------------------------------------------
 %%% Context-free block header validation
 %%% -------------------------------------------------------------------
@@ -102,6 +106,86 @@ check_block(#block{header = Header, transactions = Txs}, Params) ->
         ok
     catch
         throw:Reason -> {error, Reason}
+    end.
+
+%%% -------------------------------------------------------------------
+%%% Contextual block header validation
+%%% -------------------------------------------------------------------
+
+%% @doc Validate a block header with chain context (previous block info).
+%% PrevIndex is a map with keys: height, header, chainwork, status.
+-spec contextual_check_block_header(#block_header{}, map(), map()) ->
+    ok | {error, atom()}.
+contextual_check_block_header(Header, PrevIndex, Params) ->
+    try
+        PrevHeight = maps:get(height, PrevIndex),
+        Height = PrevHeight + 1,
+
+        %% 1. verify difficulty matches expected
+        ExpectedBits = beamchain_pow:get_next_work_required(
+            PrevIndex, Header, Params),
+        Header#block_header.bits =:= ExpectedBits
+            orelse throw(bad_diffbits),
+
+        %% 2. verify timestamp > median time past
+        MTP = median_time_past(PrevIndex),
+        Header#block_header.timestamp > MTP
+            orelse throw(time_too_old),
+
+        %% 3. verify block version (BIP 34: version >= 2 after activation)
+        Bip34Height = maps:get(bip34_height, Params, 0),
+        case Height >= Bip34Height of
+            true ->
+                Header#block_header.version >= 2
+                    orelse throw(bad_version);
+            false -> ok
+        end,
+
+        %% BIP 66: version >= 3 after activation
+        Bip66Height = maps:get(bip66_height, Params, 0),
+        case Height >= Bip66Height of
+            true ->
+                Header#block_header.version >= 3
+                    orelse throw(bad_version);
+            false -> ok
+        end,
+
+        %% BIP 65: version >= 4 after activation
+        Bip65Height = maps:get(bip65_height, Params, 0),
+        case Height >= Bip65Height of
+            true ->
+                Header#block_header.version >= 4
+                    orelse throw(bad_version);
+            false -> ok
+        end,
+
+        ok
+    catch
+        throw:Reason -> {error, Reason}
+    end.
+
+%% @doc Compute median time past from the previous block index.
+%% Returns the median timestamp of the last 11 blocks.
+-spec median_time_past(map()) -> non_neg_integer().
+median_time_past(PrevIndex) ->
+    Timestamps = collect_timestamps(PrevIndex, 11, []),
+    Sorted = lists:sort(Timestamps),
+    lists:nth((length(Sorted) div 2) + 1, Sorted).
+
+%% Collect up to N timestamps walking backwards through the chain
+collect_timestamps(_Index, 0, Acc) -> Acc;
+collect_timestamps(Index, N, Acc) ->
+    Header = maps:get(header, Index),
+    Height = maps:get(height, Index),
+    Ts = Header#block_header.timestamp,
+    case Height of
+        0 -> [Ts | Acc];
+        _ ->
+            PrevIndex = case beamchain_db:get_block_index(Height - 1) of
+                {ok, PI} -> PI;
+                not_found -> error({block_index_not_found, Height - 1})
+            end,
+            collect_timestamps(PrevIndex, N - 1, [Ts | Acc])
     end.
 
 %%% -------------------------------------------------------------------
