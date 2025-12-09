@@ -13,6 +13,9 @@
 -export([contextual_check_block_header/3]).
 -export([median_time_past/1]).
 
+%% Contextual block checks
+-export([contextual_check_block/4]).
+
 %% Sigops counting
 -export([count_legacy_sigops/1]).
 -export([count_p2sh_sigops/2, count_witness_sigops/2]).
@@ -192,6 +195,138 @@ collect_timestamps(Index, N, Acc) ->
             end,
             collect_timestamps(PrevIndex, N - 1, [Ts | Acc])
     end.
+
+%%% -------------------------------------------------------------------
+%%% Contextual block validation
+%%% -------------------------------------------------------------------
+
+%% @doc Validate a block with chain context.
+%% Checks BIP 34 coinbase height, witness commitment, etc.
+-spec contextual_check_block(#block{}, non_neg_integer(), map(), map()) ->
+    ok | {error, atom()}.
+contextual_check_block(#block{header = _Header, transactions = Txs},
+                       Height, _PrevIndex, Params) ->
+    try
+        [CoinbaseTx | _] = Txs,
+
+        %% 1. BIP 34: coinbase must contain block height
+        Bip34Height = maps:get(bip34_height, Params, 0),
+        case Height >= Bip34Height of
+            true ->
+                check_coinbase_height(CoinbaseTx, Height);
+            false -> ok
+        end,
+
+        %% 2. BIP 141: witness commitment in coinbase
+        SegwitHeight = maps:get(segwit_height, Params, 0),
+        case Height >= SegwitHeight of
+            true ->
+                HasWitnessTx = lists:any(fun has_witness/1, tl(Txs)),
+                case HasWitnessTx of
+                    true ->
+                        check_witness_commitment(CoinbaseTx, Txs);
+                    false ->
+                        %% no witness txs, commitment is optional
+                        ok
+                end;
+            false -> ok
+        end,
+
+        ok
+    catch
+        throw:Reason -> {error, Reason}
+    end.
+
+%% @doc Check BIP 34: coinbase scriptSig must start with a push of the height.
+%% Bitcoin Core uses the direct push encoding:
+%%   <<NumBytes, Height:NumBytes*8/little>>
+check_coinbase_height(#transaction{inputs = [#tx_in{script_sig = ScriptSig}]},
+                      Height) ->
+    case Height of
+        0 ->
+            %% height 0: OP_0 is acceptable (empty push)
+            ok;
+        _ when Height >= 1, Height =< 16 ->
+            %% heights 1-16: could use OP_1..OP_16 but Bitcoin Core
+            %% uses the push encoding: <<0x01, Height>>
+            case ScriptSig of
+                <<16#01, H:8, _/binary>> when H =:= Height -> ok;
+                <<OpN:8, _/binary>> when OpN =:= 16#50 + Height -> ok;
+                _ -> throw(bad_cb_height)
+            end;
+        _ ->
+            %% general case: <<NumBytes, Height:NumBytes*8/little, ...>>
+            NumBytes = height_byte_len(Height),
+            case ScriptSig of
+                <<NB:8, _/binary>> when NB =:= NumBytes ->
+                    <<_:8, HeightBytes:NumBytes/binary, _/binary>> = ScriptSig,
+                    %% decode little-endian height
+                    Decoded = decode_le_uint(HeightBytes),
+                    Decoded =:= Height orelse throw(bad_cb_height),
+                    ok;
+                _ ->
+                    throw(bad_cb_height)
+            end
+    end.
+
+%% Calculate minimum bytes needed to encode a height in little-endian
+height_byte_len(N) when N =< 16#ff -> 1;
+height_byte_len(N) when N =< 16#ffff -> 2;
+height_byte_len(N) when N =< 16#ffffff -> 3;
+height_byte_len(N) when N =< 16#ffffffff -> 4;
+height_byte_len(_) -> 5.
+
+%% Decode a little-endian unsigned integer from bytes
+decode_le_uint(Bytes) ->
+    decode_le_uint(Bytes, 0, 0).
+
+decode_le_uint(<<>>, _Shift, Acc) -> Acc;
+decode_le_uint(<<B:8, Rest/binary>>, Shift, Acc) ->
+    decode_le_uint(Rest, Shift + 8, Acc bor (B bsl Shift)).
+
+%% @doc Check BIP 141 witness commitment in coinbase.
+%% The coinbase must contain an output whose scriptPubKey starts with:
+%%   OP_RETURN 0x24 0xaa21a9ed <32-byte commitment>
+%% Use the LAST matching output if multiple exist.
+check_witness_commitment(CoinbaseTx, AllTxs) ->
+    %% find the witness commitment output (last matching one)
+    Outputs = CoinbaseTx#transaction.outputs,
+    WitnessCommitmentPrefix = <<16#6a, 16#24, 16#aa, 16#21, 16#a9, 16#ed>>,
+    CommitmentOutputs = lists:filter(fun(#tx_out{script_pubkey = SPK}) ->
+        byte_size(SPK) >= 38 andalso
+        binary:part(SPK, 0, 6) =:= WitnessCommitmentPrefix
+    end, Outputs),
+
+    case CommitmentOutputs of
+        [] ->
+            throw(missing_witness_commitment);
+        _ ->
+            %% use the last matching output
+            #tx_out{script_pubkey = CommitSPK} = lists:last(CommitmentOutputs),
+            <<_:6/binary, ExpectedCommitment:32/binary, _/binary>> = CommitSPK,
+
+            %% get witness nonce from coinbase witness
+            [CbInput | _] = CoinbaseTx#transaction.inputs,
+            WitnessNonce = case CbInput#tx_in.witness of
+                [Nonce | _] when byte_size(Nonce) =:= 32 -> Nonce;
+                _ -> throw(bad_witness_nonce)
+            end,
+
+            %% compute expected commitment
+            %% wtxids: coinbase wtxid is 32 zero bytes
+            Wtxids = [<<0:256>> | [beamchain_serialize:wtx_hash(Tx) || Tx <- tl(AllTxs)]],
+            Commitment = beamchain_serialize:compute_witness_commitment(
+                Wtxids, WitnessNonce),
+
+            Commitment =:= ExpectedCommitment orelse throw(bad_witness_commitment),
+            ok
+    end.
+
+%% Check if a transaction has witness data
+has_witness(#transaction{inputs = Inputs}) ->
+    lists:any(fun(#tx_in{witness = W}) ->
+        W =/= [] andalso W =/= undefined
+    end, Inputs).
 
 %%% -------------------------------------------------------------------
 %%% Context-free transaction validation
