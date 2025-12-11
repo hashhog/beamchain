@@ -16,6 +16,9 @@
 %% Contextual block checks
 -export([contextual_check_block/4]).
 
+%% Connect / disconnect
+-export([connect_block/4]).
+
 %% Sigops counting
 -export([count_legacy_sigops/1]).
 -export([count_p2sh_sigops/2, count_witness_sigops/2]).
@@ -640,3 +643,261 @@ get_last_push(<<OpN:8, Rest/binary>>, _Last) when OpN >= 16#51, OpN =< 16#60 ->
 %% any other opcode: not a push, reset
 get_last_push(<<_:8, Rest/binary>>, Last) ->
     get_last_push(Rest, Last).
+
+%%% -------------------------------------------------------------------
+%%% Connect block (full consensus validation + UTXO update)
+%%% -------------------------------------------------------------------
+
+%% @doc Connect a block to the chain: full validation + UTXO set update.
+%% This is the main consensus enforcement function.
+-spec connect_block(#block{}, non_neg_integer(), map(), map()) ->
+    ok | {error, atom()}.
+connect_block(#block{header = Header, transactions = Txs} = Block,
+              Height, PrevIndex, Params) ->
+    try
+        %% 1. contextual header checks
+        case contextual_check_block_header(Header, PrevIndex, Params) of
+            ok -> ok;
+            {error, E1} -> throw(E1)
+        end,
+
+        %% 2. contextual block checks (BIP 34, witness commitment)
+        case contextual_check_block(Block, Height, PrevIndex, Params) of
+            ok -> ok;
+            {error, E2} -> throw(E2)
+        end,
+
+        %% 3. BIP 30: no duplicate txids in UTXO set
+        Bip30Exceptions = maps:get(bip30_exceptions, Params, []),
+        case lists:member(Height, Bip30Exceptions) of
+            false ->
+                lists:foreach(fun(Tx) ->
+                    Txid = beamchain_serialize:tx_hash(Tx),
+                    NumOutputs = length(Tx#transaction.outputs),
+                    check_no_existing_outputs(Txid, NumOutputs)
+                end, Txs);
+            true ->
+                ok  %% skip BIP 30 for exception heights
+        end,
+
+        %% get script flags for this height
+        Network = maps:get(network, Params, mainnet),
+        Flags = beamchain_script:flags_for_height(Height, Network),
+
+        %% get assume_valid hash
+        AssumeValid = maps:get(assume_valid, Params, <<0:256>>),
+        BlockHash = beamchain_serialize:block_hash(Header),
+        SkipScripts = AssumeValid =/= <<0:256>> andalso BlockHash =:= AssumeValid,
+
+        %% 4. validate each transaction
+        [CoinbaseTx | _RegularTxs] = Txs,
+        {TotalFees, AllUndoData, TotalSigopCost} = lists:foldl(
+            fun(Tx, {FeesAcc, UndoAcc, SigopsAcc}) ->
+                IsCoinbase = is_coinbase_tx(Tx),
+                case IsCoinbase of
+                    true ->
+                        %% coinbase: no inputs to validate
+                        {FeesAcc, UndoAcc, SigopsAcc};
+                    false ->
+                        %% a. verify all inputs exist in UTXO set
+                        InputCoins = fetch_input_coins(Tx),
+
+                        %% b. verify total input value >= total output value
+                        TotalIn = lists:foldl(fun(C, A) ->
+                            A + C#utxo.value
+                        end, 0, InputCoins),
+                        TotalOut = lists:foldl(fun(#tx_out{value = V}, A) ->
+                            A + V
+                        end, 0, Tx#transaction.outputs),
+
+                        %% c. verify amounts
+                        TotalIn >= 0 orelse throw(negative_input),
+                        TotalIn =< ?MAX_MONEY orelse throw(input_overflow),
+                        TotalIn >= TotalOut orelse throw(insufficient_input),
+
+                        %% d. check coinbase maturity
+                        check_coinbase_maturity(InputCoins, Height),
+
+                        %% e. BIP 68 relative locktime
+                        case Tx#transaction.version >= 2 of
+                            true ->
+                                check_sequence_locks(Tx, InputCoins,
+                                                     Height, PrevIndex);
+                            false -> ok
+                        end,
+
+                        %% f. count sigops
+                        TxSigopCost = get_tx_sigop_cost(Tx, InputCoins, Flags),
+                        NewSigops = SigopsAcc + TxSigopCost,
+                        NewSigops =< ?MAX_BLOCK_SIGOPS_COST
+                            orelse throw(bad_blk_sigops),
+
+                        %% g. verify scripts (unless assumevalid)
+                        case SkipScripts of
+                            true -> ok;
+                            false ->
+                                verify_tx_scripts(Tx, InputCoins, Height,
+                                                  Flags)
+                        end,
+
+                        Fee = TotalIn - TotalOut,
+                        SpentCoins = lists:zip(
+                            [#outpoint{hash = H, index = I} ||
+                             #tx_in{prev_out = #outpoint{hash = H, index = I}}
+                             <- Tx#transaction.inputs],
+                            InputCoins),
+                        {FeesAcc + Fee, UndoAcc ++ SpentCoins, NewSigops}
+                end
+            end,
+            {0, [], 0},
+            Txs),
+
+        %% Also count coinbase legacy sigops in the total
+        CbSigops = count_legacy_sigops_tx(CoinbaseTx) * ?WITNESS_SCALE_FACTOR,
+        (TotalSigopCost + CbSigops) =< ?MAX_BLOCK_SIGOPS_COST
+            orelse throw(bad_blk_sigops),
+
+        %% 5. verify block subsidy
+        Subsidy = beamchain_chain_params:block_subsidy(Height, Network),
+        CbValue = lists:foldl(fun(#tx_out{value = V}, A) -> A + V end,
+                              0, CoinbaseTx#transaction.outputs),
+        CbValue =< Subsidy + TotalFees orelse throw(bad_cb_amount),
+
+        %% 6. apply UTXO changes
+
+        %% 6a. spend inputs (remove from UTXO set)
+        lists:foreach(fun(Tx) ->
+            case is_coinbase_tx(Tx) of
+                true -> ok;
+                false ->
+                    lists:foreach(fun(#tx_in{prev_out = #outpoint{hash = H, index = I}}) ->
+                        beamchain_db:spend_utxo(H, I)
+                    end, Tx#transaction.inputs)
+            end
+        end, Txs),
+
+        %% 6b. create outputs (add to UTXO set)
+        lists:foreach(fun(Tx) ->
+            Txid = beamchain_serialize:tx_hash(Tx),
+            IsCb = is_coinbase_tx(Tx),
+            lists:foldl(fun(#tx_out{value = V, script_pubkey = SPK}, Idx) ->
+                Utxo = #utxo{
+                    value = V,
+                    script_pubkey = SPK,
+                    is_coinbase = IsCb,
+                    height = Height
+                },
+                beamchain_db:store_utxo(Txid, Idx, Utxo),
+                Idx + 1
+            end, 0, Tx#transaction.outputs)
+        end, Txs),
+
+        %% 7. store undo data
+        UndoBin = encode_undo_data(AllUndoData),
+        beamchain_db:store_undo(BlockHash, UndoBin),
+
+        %% 8. update chain tip
+        beamchain_db:set_chain_tip(BlockHash, Height),
+
+        ok
+    catch
+        throw:Reason -> {error, Reason}
+    end.
+
+%% @doc Fetch UTXO coins for all inputs of a transaction.
+fetch_input_coins(#transaction{inputs = Inputs}) ->
+    lists:map(fun(#tx_in{prev_out = #outpoint{hash = H, index = I}}) ->
+        case beamchain_db:get_utxo(H, I) of
+            {ok, Coin} -> Coin;
+            not_found -> throw(missing_inputs)
+        end
+    end, Inputs).
+
+%% @doc Check BIP 30: no existing unspent outputs for this txid.
+check_no_existing_outputs(Txid, NumOutputs) ->
+    lists:foreach(fun(Idx) ->
+        case beamchain_db:has_utxo(Txid, Idx) of
+            true -> throw(duplicate_txid);
+            false -> ok
+        end
+    end, lists:seq(0, NumOutputs - 1)).
+
+%% @doc Check coinbase maturity: inputs spending coinbase outputs must
+%% have at least COINBASE_MATURITY confirmations.
+check_coinbase_maturity(InputCoins, Height) ->
+    lists:foreach(fun(Coin) ->
+        case Coin#utxo.is_coinbase of
+            true ->
+                Confirmations = Height - Coin#utxo.height,
+                Confirmations >= ?COINBASE_MATURITY
+                    orelse throw(premature_spend_of_coinbase);
+            false -> ok
+        end
+    end, InputCoins).
+
+%% @doc Check BIP 68 sequence locks.
+%% For tx version >= 2, verify relative timelocks are satisfied.
+check_sequence_locks(#transaction{inputs = Inputs}, InputCoins,
+                     Height, PrevIndex) ->
+    MTP = median_time_past(PrevIndex),
+    lists:foreach(fun({Input, Coin}) ->
+        Seq = Input#tx_in.sequence,
+        %% if disable flag is set, skip
+        case (Seq band ?SEQUENCE_LOCKTIME_DISABLE_FLAG) =/= 0 of
+            true -> ok;
+            false ->
+                Masked = Seq band ?SEQUENCE_LOCKTIME_MASK,
+                case (Seq band ?SEQUENCE_LOCKTIME_TYPE_FLAG) =/= 0 of
+                    false ->
+                        %% height-based: input must have Masked confirmations
+                        MinHeight = Coin#utxo.height + Masked,
+                        Height >= MinHeight
+                            orelse throw(sequence_lock_not_met);
+                    true ->
+                        %% time-based: check against MTP
+                        %% each unit = 512 seconds
+                        CoinHeader = case beamchain_db:get_block_index(
+                                Coin#utxo.height - 1) of
+                            {ok, CI} -> maps:get(header, CI);
+                            not_found -> throw(missing_block_index)
+                        end,
+                        CoinMTP = CoinHeader#block_header.timestamp,
+                        MinTime = CoinMTP + (Masked bsl ?SEQUENCE_LOCKTIME_GRANULARITY),
+                        MTP >= MinTime
+                            orelse throw(sequence_lock_not_met)
+                end
+        end
+    end, lists:zip(Inputs, InputCoins)).
+
+%% @doc Verify scripts for all inputs of a transaction.
+verify_tx_scripts(Tx, InputCoins, _Height, Flags) ->
+    Inputs = Tx#transaction.inputs,
+    lists:foldl(fun({Input, Coin}, Idx) ->
+        ScriptSig = Input#tx_in.script_sig,
+        ScriptPubKey = Coin#utxo.script_pubkey,
+        Witness = Input#tx_in.witness,
+        Amount = Coin#utxo.value,
+        SigChecker = {Tx, Idx, Amount},
+        case beamchain_script:verify_script(
+                ScriptSig, ScriptPubKey, Witness, Flags, SigChecker) of
+            true -> ok;
+            false -> throw({script_verify_failed, Idx})
+        end,
+        Idx + 1
+    end, 0, lists:zip(Inputs, InputCoins)),
+    ok.
+
+%% @doc Encode undo data (list of {outpoint, utxo} pairs) to binary.
+encode_undo_data(SpentCoins) ->
+    Count = length(SpentCoins),
+    Entries = lists:map(fun({#outpoint{hash = H, index = I}, Coin}) ->
+        CbFlag = case Coin#utxo.is_coinbase of true -> 1; false -> 0 end,
+        SPK = Coin#utxo.script_pubkey,
+        SPKLen = byte_size(SPK),
+        <<H:32/binary, I:32/little,
+          (Coin#utxo.value):64/little,
+          (Coin#utxo.height):32/little,
+          CbFlag:8,
+          SPKLen:32/little, SPK/binary>>
+    end, SpentCoins),
+    <<Count:32/little, (list_to_binary(Entries))/binary>>.
