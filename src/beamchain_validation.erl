@@ -17,7 +17,7 @@
 -export([contextual_check_block/4]).
 
 %% Connect / disconnect
--export([connect_block/4]).
+-export([connect_block/4, disconnect_block/3]).
 
 %% Sigops counting
 -export([count_legacy_sigops/1]).
@@ -901,3 +901,89 @@ encode_undo_data(SpentCoins) ->
           SPKLen:32/little, SPK/binary>>
     end, SpentCoins),
     <<Count:32/little, (list_to_binary(Entries))/binary>>.
+
+%% @doc Decode undo data back to list of {outpoint, utxo} pairs.
+decode_undo_data(<<Count:32/little, Rest/binary>>) ->
+    decode_undo_entries(Count, Rest, []).
+
+decode_undo_entries(0, <<>>, Acc) ->
+    lists:reverse(Acc);
+decode_undo_entries(N, <<H:32/binary, I:32/little,
+                         Value:64/little, CoinHeight:32/little,
+                         CbFlag:8,
+                         SPKLen:32/little, SPK:SPKLen/binary,
+                         Rest/binary>>, Acc) ->
+    Outpoint = #outpoint{hash = H, index = I},
+    Coin = #utxo{
+        value = Value,
+        script_pubkey = SPK,
+        is_coinbase = CbFlag =:= 1,
+        height = CoinHeight
+    },
+    decode_undo_entries(N - 1, Rest, [{Outpoint, Coin} | Acc]).
+
+%%% -------------------------------------------------------------------
+%%% Disconnect block (reverse a connected block for reorgs)
+%%% -------------------------------------------------------------------
+
+%% @doc Disconnect a block, reversing its effects on the UTXO set.
+%% Uses stored undo data to restore spent outputs.
+-spec disconnect_block(#block{}, non_neg_integer(), map()) ->
+    ok | {error, atom()}.
+disconnect_block(#block{header = Header, transactions = Txs},
+                 Height, _Params) ->
+    try
+        BlockHash = beamchain_serialize:block_hash(Header),
+
+        %% 1. load undo data
+        UndoData = case beamchain_db:get_undo(BlockHash) of
+            {ok, UndoBin} -> decode_undo_data(UndoBin);
+            not_found -> throw(missing_undo_data)
+        end,
+
+        %% 2. process transactions in reverse order
+        RevTxs = lists:reverse(Txs),
+        lists:foldl(fun(Tx, RemainingUndo) ->
+            Txid = beamchain_serialize:tx_hash(Tx),
+
+            %% 2a. remove created outputs from UTXO set
+            NumOutputs = length(Tx#transaction.outputs),
+            lists:foreach(fun(Idx) ->
+                beamchain_db:spend_utxo(Txid, Idx)
+            end, lists:seq(0, NumOutputs - 1)),
+
+            %% 2b. restore spent inputs from undo data
+            case is_coinbase_tx(Tx) of
+                true ->
+                    %% coinbase has no inputs to restore
+                    RemainingUndo;
+                false ->
+                    NumInputs = length(Tx#transaction.inputs),
+                    %% take NumInputs entries from the end of undo data
+                    %% (since we're processing in reverse)
+                    {ToRestore, Rest} = split_last_n(RemainingUndo, NumInputs),
+                    lists:foreach(fun({#outpoint{hash = H, index = I}, Coin}) ->
+                        beamchain_db:store_utxo(H, I, Coin)
+                    end, ToRestore),
+                    Rest
+            end
+        end, UndoData, RevTxs),
+
+        %% 3. update chain tip to previous block
+        PrevHash = Header#block_header.prev_hash,
+        PrevHeight = Height - 1,
+        beamchain_db:set_chain_tip(PrevHash, PrevHeight),
+
+        %% 4. delete undo data
+        %% (we keep it for now; could add a delete_undo function later)
+
+        ok
+    catch
+        throw:Reason -> {error, Reason}
+    end.
+
+%% Split a list, taking the last N elements.
+%% Returns {LastN, Rest} where Rest ++ LastN = List.
+split_last_n(List, N) ->
+    Len = length(List),
+    {lists:sublist(List, Len - N), lists:nthtail(Len - N, List)}.
