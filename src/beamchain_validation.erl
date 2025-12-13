@@ -477,22 +477,36 @@ count_legacy_sigops(<<_:8, Rest/binary>>, Count) ->
     count_legacy_sigops(Rest, Count).
 
 %% @doc Check for merkle tree malleation (CVE-2012-2459).
-%% If the tx list has duplicate trailing entries, the merkle root
-%% could be made identical with a different set of transactions.
+%% At each level of the merkle tree, if the count is odd and the last
+%% two entries are equal, the tree can be mutated.
 check_merkle_malleation([]) -> ok;
 check_merkle_malleation([_]) -> ok;
 check_merkle_malleation(Hashes) ->
-    %% Check if the last two hashes are equal at any odd-length level
-    Last = lists:last(Hashes),
-    SecondLast = lists:nth(length(Hashes) - 1, Hashes),
-    case length(Hashes) rem 2 =:= 1 of
-        false -> ok;
+    check_merkle_malleation_level(Hashes).
+
+check_merkle_malleation_level([_]) -> ok;
+check_merkle_malleation_level([]) -> ok;
+check_merkle_malleation_level(Hashes) ->
+    Len = length(Hashes),
+    case Len rem 2 =:= 1 andalso Len >= 2 of
         true ->
+            Last = lists:last(Hashes),
+            SecondLast = lists:nth(Len - 1, Hashes),
             case Last =:= SecondLast of
                 true -> throw(mutated_merkle);
                 false -> ok
-            end
-    end.
+            end;
+        false -> ok
+    end,
+    %% check next level up
+    NextLevel = merkle_pairs_check(Hashes),
+    check_merkle_malleation_level(NextLevel).
+
+merkle_pairs_check([]) -> [];
+merkle_pairs_check([A]) ->
+    [beamchain_serialize:hash256(<<A/binary, A/binary>>)];
+merkle_pairs_check([A, B | Rest]) ->
+    [beamchain_serialize:hash256(<<A/binary, B/binary>>) | merkle_pairs_check(Rest)].
 
 %%% -------------------------------------------------------------------
 %%% Sigops counting (context-dependent)
@@ -855,13 +869,13 @@ check_sequence_locks(#transaction{inputs = Inputs}, InputCoins,
                             orelse throw(sequence_lock_not_met);
                     true ->
                         %% time-based: check against MTP
-                        %% each unit = 512 seconds
-                        CoinHeader = case beamchain_db:get_block_index(
+                        %% BIP 68: MTP(spending block - 1) - MTP(coin block - 1) >= masked * 512
+                        CoinMTPIndex = case beamchain_db:get_block_index(
                                 Coin#utxo.height - 1) of
-                            {ok, CI} -> maps:get(header, CI);
+                            {ok, CI} -> CI;
                             not_found -> throw(missing_block_index)
                         end,
-                        CoinMTP = CoinHeader#block_header.timestamp,
+                        CoinMTP = median_time_past(CoinMTPIndex),
                         MinTime = CoinMTP + (Masked bsl ?SEQUENCE_LOCKTIME_GRANULARITY),
                         MTP >= MinTime
                             orelse throw(sequence_lock_not_met)
