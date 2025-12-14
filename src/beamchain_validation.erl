@@ -24,6 +24,9 @@
 -export([count_p2sh_sigops/2, count_witness_sigops/2]).
 -export([get_tx_sigop_cost/3]).
 
+%% Utility
+-export([is_coinbase_tx/1]).
+
 %%% -------------------------------------------------------------------
 %%% Context-free block header validation
 %%% -------------------------------------------------------------------
