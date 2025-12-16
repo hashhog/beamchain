@@ -21,6 +21,12 @@
 %% Network address (26 bytes, no timestamp — used in version msg)
 -export([encode_net_addr/1, decode_net_addr/1]).
 
+%% Addr entry (30 bytes, with timestamp — used in addr msg)
+-export([encode_addr_entry/1, decode_addr_entry/1]).
+
+%% Inventory items
+-export([encode_inv_item/1, decode_inv_item/1]).
+
 %%% ===================================================================
 %%% Message framing
 %%% ===================================================================
@@ -143,7 +149,57 @@ encode_payload(ping, #{nonce := Nonce}) ->
     <<Nonce:64/little>>;
 
 encode_payload(pong, #{nonce := Nonce}) ->
-    <<Nonce:64/little>>.
+    <<Nonce:64/little>>;
+
+%% -- Address discovery ------------------------------------------------
+
+encode_payload(addr, #{addrs := Addrs}) ->
+    Count = beamchain_serialize:encode_varint(length(Addrs)),
+    Data = << <<(encode_addr_entry(A))/binary>> || A <- Addrs >>,
+    <<Count/binary, Data/binary>>;
+
+encode_payload(getaddr, _) -> <<>>;
+
+%% -- Inventory --------------------------------------------------------
+
+encode_payload(inv, #{items := Items}) ->
+    encode_inv_list(Items);
+
+encode_payload(getdata, #{items := Items}) ->
+    encode_inv_list(Items);
+
+encode_payload(notfound, #{items := Items}) ->
+    encode_inv_list(Items);
+
+%% -- Headers/blocks ---------------------------------------------------
+
+encode_payload(getheaders, #{version := V, locators := Locators,
+                             stop_hash := Stop}) ->
+    Count = beamchain_serialize:encode_varint(length(Locators)),
+    LocBin = << <<H:32/binary>> || H <- Locators >>,
+    <<V:32/little, Count/binary, LocBin/binary, Stop:32/binary>>;
+
+encode_payload(headers, #{headers := Headers}) ->
+    Count = beamchain_serialize:encode_varint(length(Headers)),
+    Data = << <<(beamchain_serialize:encode_block_header(H))/binary,
+               0:8>> || H <- Headers >>,
+    <<Count/binary, Data/binary>>;
+
+encode_payload(getblocks, #{version := V, locators := Locators,
+                            stop_hash := Stop}) ->
+    Count = beamchain_serialize:encode_varint(length(Locators)),
+    LocBin = << <<H:32/binary>> || H <- Locators >>,
+    <<V:32/little, Count/binary, LocBin/binary, Stop:32/binary>>;
+
+encode_payload(block, Block) ->
+    beamchain_serialize:encode_block(Block);
+
+encode_payload(tx, Tx) ->
+    beamchain_serialize:encode_transaction(Tx);
+
+encode_payload(sendheaders, _) -> <<>>;
+
+encode_payload(mempool, _) -> <<>>.
 
 %%% ===================================================================
 %%% Payload decoding
@@ -164,7 +220,61 @@ decode_payload(ping, <<Nonce:64/little>>) ->
     {ok, #{nonce => Nonce}};
 
 decode_payload(pong, <<Nonce:64/little>>) ->
-    {ok, #{nonce => Nonce}}.
+    {ok, #{nonce => Nonce}};
+
+%% -- Address discovery ------------------------------------------------
+
+decode_payload(addr, Bin) ->
+    {Count, Rest} = beamchain_serialize:decode_varint(Bin),
+    {Addrs, _} = decode_addr_entries(Count, Rest, []),
+    {ok, #{addrs => Addrs}};
+
+decode_payload(getaddr, <<>>) ->
+    {ok, #{}};
+
+%% -- Inventory --------------------------------------------------------
+
+decode_payload(inv, Bin) ->
+    {ok, #{items => decode_inv_list(Bin)}};
+
+decode_payload(getdata, Bin) ->
+    {ok, #{items => decode_inv_list(Bin)}};
+
+decode_payload(notfound, Bin) ->
+    {ok, #{items => decode_inv_list(Bin)}};
+
+%% -- Headers/blocks ---------------------------------------------------
+
+decode_payload(getheaders, <<V:32/little, Rest/binary>>) ->
+    {Count, Rest2} = beamchain_serialize:decode_varint(Rest),
+    {Locators, Rest3} = decode_hashes(Count, Rest2, []),
+    <<Stop:32/binary, _/binary>> = Rest3,
+    {ok, #{version => V, locators => Locators, stop_hash => Stop}};
+
+decode_payload(headers, Bin) ->
+    {Count, Rest} = beamchain_serialize:decode_varint(Bin),
+    {Headers, _} = decode_headers_list(Count, Rest, []),
+    {ok, #{headers => Headers}};
+
+decode_payload(getblocks, <<V:32/little, Rest/binary>>) ->
+    {Count, Rest2} = beamchain_serialize:decode_varint(Rest),
+    {Locators, Rest3} = decode_hashes(Count, Rest2, []),
+    <<Stop:32/binary, _/binary>> = Rest3,
+    {ok, #{version => V, locators => Locators, stop_hash => Stop}};
+
+decode_payload(block, Bin) ->
+    {Block, _} = beamchain_serialize:decode_block(Bin),
+    {ok, Block};
+
+decode_payload(tx, Bin) ->
+    {Tx, _} = beamchain_serialize:decode_transaction(Bin),
+    {ok, Tx};
+
+decode_payload(sendheaders, <<>>) ->
+    {ok, #{}};
+
+decode_payload(mempool, <<>>) ->
+    {ok, #{}}.
 
 %%% ===================================================================
 %%% Version message decoding
@@ -198,6 +308,67 @@ encode_net_addr(#{services := Svc, ip := IP, port := Port}) ->
 -spec decode_net_addr(binary()) -> {map(), binary()}.
 decode_net_addr(<<Svc:64/little, IPBin:16/binary, Port:16/big, Rest/binary>>) ->
     {#{services => Svc, ip => decode_ip(IPBin), port => Port}, Rest}.
+
+%%% ===================================================================
+%%% Addr entry (30 bytes: timestamp + net_addr)
+%%% ===================================================================
+
+-spec encode_addr_entry(map()) -> binary().
+encode_addr_entry(#{timestamp := T, services := Svc, ip := IP, port := Port}) ->
+    IPBin = encode_ip(IP),
+    <<T:32/little, Svc:64/little, IPBin:16/binary, Port:16/big>>.
+
+-spec decode_addr_entry(binary()) -> {map(), binary()}.
+decode_addr_entry(<<T:32/little, Svc:64/little, IPBin:16/binary,
+                    Port:16/big, Rest/binary>>) ->
+    {#{timestamp => T, services => Svc,
+       ip => decode_ip(IPBin), port => Port}, Rest}.
+
+decode_addr_entries(0, Rest, Acc) -> {lists:reverse(Acc), Rest};
+decode_addr_entries(N, Bin, Acc) ->
+    {Entry, Rest} = decode_addr_entry(Bin),
+    decode_addr_entries(N - 1, Rest, [Entry | Acc]).
+
+%%% ===================================================================
+%%% Inventory items (36 bytes: type + hash)
+%%% ===================================================================
+
+-spec encode_inv_item(map()) -> binary().
+encode_inv_item(#{type := Type, hash := Hash}) ->
+    <<Type:32/little, Hash:32/binary>>.
+
+-spec decode_inv_item(binary()) -> {map(), binary()}.
+decode_inv_item(<<Type:32/little, Hash:32/binary, Rest/binary>>) ->
+    {#{type => Type, hash => Hash}, Rest}.
+
+encode_inv_list(Items) ->
+    Count = beamchain_serialize:encode_varint(length(Items)),
+    Data = << <<(encode_inv_item(I))/binary>> || I <- Items >>,
+    <<Count/binary, Data/binary>>.
+
+decode_inv_list(Bin) ->
+    {Count, Rest} = beamchain_serialize:decode_varint(Bin),
+    decode_inv_items(Count, Rest, []).
+
+decode_inv_items(0, _Rest, Acc) -> lists:reverse(Acc);
+decode_inv_items(N, Bin, Acc) ->
+    {Item, Rest} = decode_inv_item(Bin),
+    decode_inv_items(N - 1, Rest, [Item | Acc]).
+
+%%% ===================================================================
+%%% Hash list / headers list helpers
+%%% ===================================================================
+
+decode_hashes(0, Rest, Acc) -> {lists:reverse(Acc), Rest};
+decode_hashes(N, <<H:32/binary, Rest/binary>>, Acc) ->
+    decode_hashes(N - 1, Rest, [H | Acc]).
+
+%% Each header entry in a "headers" message is 80 bytes + varint(0)
+decode_headers_list(0, Rest, Acc) -> {lists:reverse(Acc), Rest};
+decode_headers_list(N, Bin, Acc) ->
+    {Header, Rest} = beamchain_serialize:decode_block_header(Bin),
+    {_TxCount, Rest2} = beamchain_serialize:decode_varint(Rest),
+    decode_headers_list(N - 1, Rest2, [Header | Acc]).
 
 %%% ===================================================================
 %%% Internal helpers
