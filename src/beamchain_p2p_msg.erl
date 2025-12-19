@@ -199,7 +199,44 @@ encode_payload(tx, Tx) ->
 
 encode_payload(sendheaders, _) -> <<>>;
 
-encode_payload(mempool, _) -> <<>>.
+encode_payload(mempool, _) -> <<>>;
+
+%% -- Policy ---------------------------------------------------------------
+
+encode_payload(feefilter, #{feerate := Fee}) ->
+    <<Fee:64/little>>;
+
+encode_payload(sendcmpct, #{announce := Ann, version := V}) ->
+    <<(encode_bool(Ann)):8, V:64/little>>;
+
+encode_payload(wtxidrelay, _) -> <<>>;
+
+encode_payload(sendaddrv2, _) -> <<>>;
+
+%% -- Compact blocks (BIP 152) --------------------------------------------
+
+encode_payload(cmpctblock, #{header := Header, nonce := Nonce,
+                             short_ids := ShortIds,
+                             prefilled_txns := Prefilled}) ->
+    HdrBin = beamchain_serialize:encode_block_header(Header),
+    SIDCount = beamchain_serialize:encode_varint(length(ShortIds)),
+    SIDBin = << <<SID:6/binary>> || SID <- ShortIds >>,
+    PreCount = beamchain_serialize:encode_varint(length(Prefilled)),
+    PreBin = << <<(encode_prefilled_txn(P))/binary>> || P <- Prefilled >>,
+    <<HdrBin/binary, Nonce:64/little,
+      SIDCount/binary, SIDBin/binary,
+      PreCount/binary, PreBin/binary>>;
+
+encode_payload(getblocktxn, #{block_hash := Hash, indexes := Indexes}) ->
+    Count = beamchain_serialize:encode_varint(length(Indexes)),
+    IdxBin = encode_diff_indexes(Indexes),
+    <<Hash:32/binary, Count/binary, IdxBin/binary>>;
+
+encode_payload(blocktxn, #{block_hash := Hash, transactions := Txs}) ->
+    Count = beamchain_serialize:encode_varint(length(Txs)),
+    TxsBin = << <<(beamchain_serialize:encode_transaction(T))/binary>>
+                || T <- Txs >>,
+    <<Hash:32/binary, Count/binary, TxsBin/binary>>.
 
 %%% ===================================================================
 %%% Payload decoding
@@ -274,7 +311,43 @@ decode_payload(sendheaders, <<>>) ->
     {ok, #{}};
 
 decode_payload(mempool, <<>>) ->
-    {ok, #{}}.
+    {ok, #{}};
+
+%% -- Policy ---------------------------------------------------------------
+
+decode_payload(feefilter, <<Fee:64/little>>) ->
+    {ok, #{feerate => Fee}};
+
+decode_payload(sendcmpct, <<Ann:8, V:64/little>>) ->
+    {ok, #{announce => Ann =/= 0, version => V}};
+
+decode_payload(wtxidrelay, <<>>) ->
+    {ok, #{}};
+
+decode_payload(sendaddrv2, <<>>) ->
+    {ok, #{}};
+
+%% -- Compact blocks (BIP 152) --------------------------------------------
+
+decode_payload(cmpctblock, Bin) ->
+    {Header, Rest} = beamchain_serialize:decode_block_header(Bin),
+    <<Nonce:64/little, Rest2/binary>> = Rest,
+    {SIDCount, Rest3} = beamchain_serialize:decode_varint(Rest2),
+    {ShortIds, Rest4} = decode_short_ids(SIDCount, Rest3, []),
+    {PreCount, Rest5} = beamchain_serialize:decode_varint(Rest4),
+    {Prefilled, _} = decode_prefilled_txns(PreCount, Rest5, []),
+    {ok, #{header => Header, nonce => Nonce,
+           short_ids => ShortIds, prefilled_txns => Prefilled}};
+
+decode_payload(getblocktxn, <<Hash:32/binary, Rest/binary>>) ->
+    {Count, Rest2} = beamchain_serialize:decode_varint(Rest),
+    {Indexes, _} = decode_diff_indexes(Count, Rest2),
+    {ok, #{block_hash => Hash, indexes => Indexes}};
+
+decode_payload(blocktxn, <<Hash:32/binary, Rest/binary>>) ->
+    {Count, Rest2} = beamchain_serialize:decode_varint(Rest),
+    {Txs, _} = decode_txs(Count, Rest2, []),
+    {ok, #{block_hash => Hash, transactions => Txs}}.
 
 %%% ===================================================================
 %%% Version message decoding
@@ -369,6 +442,51 @@ decode_headers_list(N, Bin, Acc) ->
     {Header, Rest} = beamchain_serialize:decode_block_header(Bin),
     {_TxCount, Rest2} = beamchain_serialize:decode_varint(Rest),
     decode_headers_list(N - 1, Rest2, [Header | Acc]).
+
+%%% ===================================================================
+%%% Compact block helpers (BIP 152)
+%%% ===================================================================
+
+encode_prefilled_txn(#{index := Idx, tx := Tx}) ->
+    IdxBin = beamchain_serialize:encode_varint(Idx),
+    TxBin = beamchain_serialize:encode_transaction(Tx),
+    <<IdxBin/binary, TxBin/binary>>.
+
+decode_prefilled_txns(0, Rest, Acc) -> {lists:reverse(Acc), Rest};
+decode_prefilled_txns(N, Bin, Acc) ->
+    {Idx, Rest} = beamchain_serialize:decode_varint(Bin),
+    {Tx, Rest2} = beamchain_serialize:decode_transaction(Rest),
+    decode_prefilled_txns(N - 1, Rest2, [#{index => Idx, tx => Tx} | Acc]).
+
+decode_short_ids(0, Rest, Acc) -> {lists:reverse(Acc), Rest};
+decode_short_ids(N, <<SID:6/binary, Rest/binary>>, Acc) ->
+    decode_short_ids(N - 1, Rest, [SID | Acc]).
+
+%% Differentially-encoded indexes for getblocktxn.
+%% Each index is encoded as the difference from the previous index minus one.
+encode_diff_indexes([]) -> <<>>;
+encode_diff_indexes([First | Rest]) ->
+    encode_diff_indexes(Rest, First, beamchain_serialize:encode_varint(First)).
+
+encode_diff_indexes([], _Prev, Acc) -> Acc;
+encode_diff_indexes([Idx | Rest], Prev, Acc) ->
+    Diff = Idx - Prev - 1,
+    DiffBin = beamchain_serialize:encode_varint(Diff),
+    encode_diff_indexes(Rest, Idx, <<Acc/binary, DiffBin/binary>>).
+
+decode_diff_indexes(Count, Bin) ->
+    decode_diff_indexes(Count, Bin, -1, []).
+
+decode_diff_indexes(0, Rest, _Prev, Acc) -> {lists:reverse(Acc), Rest};
+decode_diff_indexes(N, Bin, Prev, Acc) ->
+    {Diff, Rest} = beamchain_serialize:decode_varint(Bin),
+    Idx = Prev + Diff + 1,
+    decode_diff_indexes(N - 1, Rest, Idx, [Idx | Acc]).
+
+decode_txs(0, Rest, Acc) -> {lists:reverse(Acc), Rest};
+decode_txs(N, Bin, Acc) ->
+    {Tx, Rest} = beamchain_serialize:decode_transaction(Bin),
+    decode_txs(N - 1, Rest, [Tx | Acc]).
 
 %%% ===================================================================
 %%% Internal helpers
