@@ -13,7 +13,7 @@
 -include("beamchain_protocol.hrl").
 
 %% API
--export([connect/3, disconnect/1]).
+-export([connect/3, send_message/2, disconnect/1]).
 
 %% gen_statem callbacks
 -export([callback_mode/0, init/1, terminate/3]).
@@ -25,6 +25,11 @@
 
 -define(CONNECT_TIMEOUT, 10000).       %% 10 seconds
 -define(HANDSHAKE_TIMEOUT, 10000).     %% 10 seconds
+-define(PING_INTERVAL, 120000).        %% 2 minutes
+-define(PONG_TIMEOUT, 1200000).        %% 20 minutes
+-define(INACTIVITY_TIMEOUT, 1800000).  %% 30 minutes
+
+-define(BAN_SCORE, 100).
 
 %%% -------------------------------------------------------------------
 %%% State data
@@ -47,6 +52,13 @@
     peer_height = 0         :: integer(),
     peer_relay = true       :: boolean(),
     peer_nonce              :: non_neg_integer() | undefined,
+    %% Feature negotiation
+    wants_headers = false   :: boolean(),
+    wants_cmpct = false     :: boolean(),
+    cmpct_version = 0       :: non_neg_integer(),
+    wants_addrv2 = false    :: boolean(),
+    wtxidrelay = false      :: boolean(),
+    fee_filter = 0          :: non_neg_integer(),
     %% Our state
     our_nonce               :: non_neg_integer(),
     magic                   :: binary(),
@@ -55,8 +67,12 @@
     %% Stats
     connected_at            :: non_neg_integer() | undefined,
     last_recv               :: non_neg_integer() | undefined,
+    last_ping_nonce         :: non_neg_integer() | undefined,
+    ping_sent_at            :: non_neg_integer() | undefined,
+    latency_ms              :: non_neg_integer() | undefined,
     bytes_sent = 0          :: non_neg_integer(),
-    bytes_recv = 0          :: non_neg_integer()
+    bytes_recv = 0          :: non_neg_integer(),
+    misbehavior = 0         :: non_neg_integer()
 }).
 
 %%% ===================================================================
@@ -68,6 +84,11 @@
     {ok, pid()} | {error, term()}.
 connect(Address, Handler, Opts) ->
     gen_statem:start_link(?MODULE, {outbound, Address, Handler, Opts}, []).
+
+%% @doc Send a P2P message to this peer.
+-spec send_message(pid(), {atom(), map()}) -> ok.
+send_message(Pid, {Command, Payload}) ->
+    gen_statem:cast(Pid, {send, Command, Payload}).
 
 %% @doc Disconnect the peer gracefully.
 -spec disconnect(pid()) -> ok.
@@ -176,24 +197,55 @@ ready(enter, handshaking, Data) ->
                 [Data#peer_data.address,
                  Data#peer_data.peer_user_agent,
                  Data#peer_data.peer_height]),
-    Data#peer_data.handler ! {peer_connected, self(), Data#peer_data.address},
-    keep_state_and_data;
+    %% Send feature negotiation messages
+    Data2 = send_feature_msgs(Data),
+    %% Notify handler
+    Data2#peer_data.handler ! {peer_connected, self(), build_info(Data2)},
+    %% Start ping timer and inactivity timeout
+    {keep_state, Data2,
+     [{{timeout, ping}, ?PING_INTERVAL, send_ping},
+      {{timeout, inactivity}, ?INACTIVITY_TIMEOUT, inactive}]};
+
+ready({timeout, ping}, send_ping, Data) ->
+    Data2 = do_send_ping(Data),
+    {keep_state, Data2,
+     [{{timeout, ping}, ?PING_INTERVAL, send_ping},
+      {{timeout, pong}, ?PONG_TIMEOUT, pong_timeout}]};
+
+ready({timeout, inactivity}, inactive, Data) ->
+    logger:info("peer ~p inactivity timeout", [Data#peer_data.address]),
+    {stop, inactivity_timeout};
+
+ready({timeout, pong}, pong_timeout, Data) ->
+    logger:info("peer ~p pong timeout", [Data#peer_data.address]),
+    {stop, pong_timeout};
 
 ready(info, {tcp, Socket, Bin}, #peer_data{socket = Socket} = Data) ->
     case handle_tcp_data(Bin, Data) of
-        {ok, Data2}    -> {keep_state, Data2};
-        {stop, Reason} -> {stop, Reason}
+        {ok, Data2} ->
+            %% Reset inactivity timer on received data
+            {keep_state, Data2,
+             [{{timeout, inactivity}, ?INACTIVITY_TIMEOUT, inactive}]};
+        {stop, Reason} ->
+            {stop, Reason}
     end;
 
 ready(info, {tcp_closed, _}, Data) ->
     logger:info("peer ~p disconnected", [Data#peer_data.address]),
+    Data#peer_data.handler ! {peer_disconnected, self(), closed},
     {stop, normal};
 
 ready(info, {tcp_error, _, Reason}, Data) ->
     logger:warning("peer ~p tcp error: ~p", [Data#peer_data.address, Reason]),
+    Data#peer_data.handler ! {peer_disconnected, self(), {tcp_error, Reason}},
     {stop, {tcp_error, Reason}};
 
-ready(cast, disconnect, _Data) ->
+ready(cast, {send, Command, PayloadData}, Data) ->
+    Data2 = do_send_msg(Command, PayloadData, Data),
+    {keep_state, Data2};
+
+ready(cast, disconnect, Data) ->
+    Data#peer_data.handler ! {peer_disconnected, self(), requested},
     {stop, normal};
 
 ready(_EventType, _Event, _Data) ->
@@ -252,6 +304,20 @@ dispatch_message(version, Payload, Data) ->
     handle_version_msg(Payload, Data);
 dispatch_message(verack, _Payload, Data) ->
     handle_verack_msg(Data);
+dispatch_message(ping, Payload, Data) ->
+    handle_ping_msg(Payload, Data);
+dispatch_message(pong, Payload, Data) ->
+    handle_pong_msg(Payload, Data);
+dispatch_message(sendheaders, _Payload, Data) ->
+    {ok, Data#peer_data{wants_headers = true}};
+dispatch_message(sendcmpct, Payload, Data) ->
+    handle_sendcmpct_msg(Payload, Data);
+dispatch_message(sendaddrv2, _Payload, Data) ->
+    {ok, Data#peer_data{wants_addrv2 = true}};
+dispatch_message(wtxidrelay, _Payload, Data) ->
+    {ok, Data#peer_data{wtxidrelay = true}};
+dispatch_message(feefilter, Payload, Data) ->
+    handle_feefilter_msg(Payload, Data);
 dispatch_message(Command, Payload, Data) ->
     %% Forward everything else to handler
     Data#peer_data.handler ! {peer_message, self(), Command, Payload},
@@ -314,8 +380,82 @@ handshake_complete(_) ->
     false.
 
 %%% ===================================================================
+%%% Internal: Ping / Pong
+%%% ===================================================================
+
+handle_ping_msg(Payload, Data) ->
+    case beamchain_p2p_msg:decode_payload(ping, Payload) of
+        {ok, #{nonce := Nonce}} ->
+            Pong = beamchain_p2p_msg:encode_payload(pong, #{nonce => Nonce}),
+            {ok, do_send_raw(pong, Pong, Data)};
+        _ ->
+            {ok, Data}
+    end.
+
+handle_pong_msg(Payload, Data) ->
+    case beamchain_p2p_msg:decode_payload(pong, Payload) of
+        {ok, #{nonce := Nonce}} ->
+            case Data#peer_data.last_ping_nonce of
+                Nonce when Data#peer_data.ping_sent_at =/= undefined ->
+                    Now = erlang:system_time(millisecond),
+                    Latency = Now - Data#peer_data.ping_sent_at,
+                    {ok, Data#peer_data{
+                        latency_ms = Latency,
+                        last_ping_nonce = undefined,
+                        ping_sent_at = undefined
+                    }};
+                _ ->
+                    %% Stale or unexpected pong, ignore
+                    {ok, Data}
+            end;
+        _ ->
+            {ok, Data}
+    end.
+
+do_send_ping(Data) ->
+    Nonce = generate_nonce(),
+    Payload = beamchain_p2p_msg:encode_payload(ping, #{nonce => Nonce}),
+    Data2 = do_send_raw(ping, Payload, Data),
+    Data2#peer_data{
+        last_ping_nonce = Nonce,
+        ping_sent_at = erlang:system_time(millisecond)
+    }.
+
+%%% ===================================================================
+%%% Internal: Feature negotiation
+%%% ===================================================================
+
+handle_sendcmpct_msg(Payload, Data) ->
+    case beamchain_p2p_msg:decode_payload(sendcmpct, Payload) of
+        {ok, #{announce := Ann, version := V}} ->
+            {ok, Data#peer_data{wants_cmpct = Ann, cmpct_version = V}};
+        _ ->
+            {ok, Data}
+    end.
+
+handle_feefilter_msg(Payload, Data) ->
+    case beamchain_p2p_msg:decode_payload(feefilter, Payload) of
+        {ok, #{feerate := Fee}} ->
+            {ok, Data#peer_data{fee_filter = Fee}};
+        _ ->
+            {ok, Data}
+    end.
+
+send_feature_msgs(Data) ->
+    D1 = do_send_raw(sendheaders, <<>>, Data),
+    CmpctPayload = beamchain_p2p_msg:encode_payload(sendcmpct,
+                       #{announce => false, version => 2}),
+    D2 = do_send_raw(sendcmpct, CmpctPayload, D1),
+    D3 = do_send_raw(wtxidrelay, <<>>, D2),
+    do_send_raw(sendaddrv2, <<>>, D3).
+
+%%% ===================================================================
 %%% Internal: Send helpers
 %%% ===================================================================
+
+do_send_msg(Command, PayloadData, Data) ->
+    Payload = beamchain_p2p_msg:encode_payload(Command, PayloadData),
+    do_send_raw(Command, Payload, Data).
 
 do_send_raw(Command, Payload, #peer_data{socket = Socket, magic = Magic} = Data) ->
     Msg = beamchain_p2p_msg:encode_msg(Magic, Command, Payload),
@@ -329,3 +469,16 @@ do_send_raw(Command, Payload, #peer_data{socket = Socket, magic = Magic} = Data)
 generate_nonce() ->
     <<N:64>> = crypto:strong_rand_bytes(8),
     N.
+
+build_info(#peer_data{} = D) ->
+    #{address       => D#peer_data.address,
+      direction     => D#peer_data.direction,
+      version       => D#peer_data.peer_version,
+      services      => D#peer_data.peer_services,
+      user_agent    => D#peer_data.peer_user_agent,
+      start_height  => D#peer_data.peer_height,
+      relay         => D#peer_data.peer_relay,
+      latency_ms    => D#peer_data.latency_ms,
+      bytes_sent    => D#peer_data.bytes_sent,
+      bytes_recv    => D#peer_data.bytes_recv,
+      connected_at  => D#peer_data.connected_at}.
