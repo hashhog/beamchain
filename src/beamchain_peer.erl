@@ -13,7 +13,9 @@
 -include("beamchain_protocol.hrl").
 
 %% API
--export([connect/3, send_message/2, disconnect/1]).
+-export([connect/3, accept/3,
+         send_message/2, add_misbehavior/2,
+         disconnect/1, info/1]).
 
 %% gen_statem callbacks
 -export([callback_mode/0, init/1, terminate/3]).
@@ -85,15 +87,31 @@
 connect(Address, Handler, Opts) ->
     gen_statem:start_link(?MODULE, {outbound, Address, Handler, Opts}, []).
 
+%% @doc Accept an inbound peer connection on an existing socket.
+-spec accept(gen_tcp:socket(), {inet:ip_address(), inet:port_number()}, pid()) ->
+    {ok, pid()} | {error, term()}.
+accept(Socket, Address, Handler) ->
+    gen_statem:start_link(?MODULE, {inbound, Socket, Address, Handler}, []).
+
 %% @doc Send a P2P message to this peer.
 -spec send_message(pid(), {atom(), map()}) -> ok.
 send_message(Pid, {Command, Payload}) ->
     gen_statem:cast(Pid, {send, Command, Payload}).
 
+%% @doc Add misbehavior points. Peer is banned at >= 100.
+-spec add_misbehavior(pid(), non_neg_integer()) -> ok.
+add_misbehavior(Pid, Score) ->
+    gen_statem:cast(Pid, {misbehavior, Score}).
+
 %% @doc Disconnect the peer gracefully.
 -spec disconnect(pid()) -> ok.
 disconnect(Pid) ->
     gen_statem:cast(Pid, disconnect).
+
+%% @doc Get peer connection info.
+-spec info(pid()) -> {ok, map()} | {error, term()}.
+info(Pid) ->
+    gen_statem:call(Pid, info).
 
 %%% ===================================================================
 %%% gen_statem callbacks
@@ -126,7 +144,25 @@ init({outbound, {IP, Port} = Addr, Handler, _Opts}) ->
             {ok, connecting, Data2};
         {error, Reason} ->
             {stop, {connection_failed, Reason}}
-    end.
+    end;
+
+init({inbound, Socket, Addr, Handler}) ->
+    Nonce = generate_nonce(),
+    Magic = beamchain_config:magic(),
+    MonRef = erlang:monitor(process, Handler),
+    inet:setopts(Socket, [{active, once}]),
+    Data = #peer_data{
+        socket = Socket,
+        address = Addr,
+        direction = inbound,
+        our_nonce = Nonce,
+        magic = Magic,
+        handler = Handler,
+        handler_mon = MonRef,
+        connected_at = erlang:system_time(millisecond)
+    },
+    %% Inbound: go straight to handshaking, wait for their version
+    {ok, handshaking, Data}.
 
 %%% -------------------------------------------------------------------
 %%% connecting - TCP socket is open, send version
@@ -182,8 +218,18 @@ handshaking(info, {tcp_error, _, Reason}, Data) ->
     logger:warning("peer ~p tcp error: ~p", [Data#peer_data.address, Reason]),
     {stop, {tcp_error, Reason}};
 
+handshaking(info, {'DOWN', Ref, process, _, _}, #peer_data{handler_mon = Ref}) ->
+    {stop, handler_down};
+
 handshaking(cast, disconnect, _Data) ->
     {stop, normal};
+
+handshaking(cast, {misbehavior, Score}, Data) ->
+    check_ban(Data#peer_data{
+        misbehavior = Data#peer_data.misbehavior + Score});
+
+handshaking({call, From}, info, Data) ->
+    {keep_state_and_data, [{reply, From, {ok, build_info(Data)}}]};
 
 handshaking(_EventType, _Event, _Data) ->
     keep_state_and_data.
@@ -240,6 +286,9 @@ ready(info, {tcp_error, _, Reason}, Data) ->
     Data#peer_data.handler ! {peer_disconnected, self(), {tcp_error, Reason}},
     {stop, {tcp_error, Reason}};
 
+ready(info, {'DOWN', Ref, process, _, _}, #peer_data{handler_mon = Ref}) ->
+    {stop, handler_down};
+
 ready(cast, {send, Command, PayloadData}, Data) ->
     Data2 = do_send_msg(Command, PayloadData, Data),
     {keep_state, Data2};
@@ -247,6 +296,13 @@ ready(cast, {send, Command, PayloadData}, Data) ->
 ready(cast, disconnect, Data) ->
     Data#peer_data.handler ! {peer_disconnected, self(), requested},
     {stop, normal};
+
+ready(cast, {misbehavior, Score}, Data) ->
+    check_ban(Data#peer_data{
+        misbehavior = Data#peer_data.misbehavior + Score});
+
+ready({call, From}, info, Data) ->
+    {keep_state_and_data, [{reply, From, {ok, build_info(Data)}}]};
 
 ready(_EventType, _Event, _Data) ->
     keep_state_and_data.
@@ -353,22 +409,37 @@ handle_version_msg(Payload, Data) ->
     case beamchain_p2p_msg:decode_payload(version, Payload) of
         {ok, #{version := V, services := Svc, user_agent := UA,
                start_height := Height, relay := Relay, nonce := PeerNonce}} ->
-            Data2 = Data#peer_data{
-                version_recv = true,
-                peer_version = V,
-                peer_services = Svc,
-                peer_user_agent = UA,
-                peer_height = Height,
-                peer_relay = Relay,
-                peer_nonce = PeerNonce
-            },
-            %% Send verack
-            Data3 = do_send_raw(verack, <<>>, Data2),
-            {ok, Data3#peer_data{verack_sent = true}};
+            %% Self-connection detection
+            case PeerNonce =:= Data#peer_data.our_nonce of
+                true ->
+                    logger:info("peer ~p self-connection detected",
+                                [Data#peer_data.address]),
+                    {stop, self_connection};
+                false ->
+                    Data2 = Data#peer_data{
+                        version_recv = true,
+                        peer_version = V,
+                        peer_services = Svc,
+                        peer_user_agent = UA,
+                        peer_height = Height,
+                        peer_relay = Relay,
+                        peer_nonce = PeerNonce
+                    },
+                    %% Inbound: send our version if we haven't yet
+                    Data3 = maybe_send_version(Data2),
+                    %% Send verack
+                    Data4 = do_send_raw(verack, <<>>, Data3),
+                    {ok, Data4#peer_data{verack_sent = true}}
+            end;
         {error, _} ->
             logger:warning("peer ~p bad version", [Data#peer_data.address]),
             {stop, bad_version}
     end.
+
+maybe_send_version(#peer_data{direction = inbound, version_sent = false} = Data) ->
+    do_send_version(Data);
+maybe_send_version(Data) ->
+    Data.
 
 handle_verack_msg(Data) ->
     {ok, Data#peer_data{verack_recv = true}}.
@@ -448,6 +519,18 @@ send_feature_msgs(Data) ->
     D2 = do_send_raw(sendcmpct, CmpctPayload, D1),
     D3 = do_send_raw(wtxidrelay, <<>>, D2),
     do_send_raw(sendaddrv2, <<>>, D3).
+
+%%% ===================================================================
+%%% Internal: Misbehavior
+%%% ===================================================================
+
+check_ban(#peer_data{misbehavior = Score, address = Addr} = Data)
+        when Score >= ?BAN_SCORE ->
+    logger:info("peer ~p banned (score=~B)", [Addr, Score]),
+    Data#peer_data.handler ! {peer_banned, self(), Addr},
+    {stop, banned};
+check_ban(Data) ->
+    {keep_state, Data}.
 
 %%% ===================================================================
 %%% Internal: Send helpers
