@@ -269,9 +269,13 @@ ready({timeout, pong}, pong_timeout, Data) ->
 ready(info, {tcp, Socket, Bin}, #peer_data{socket = Socket} = Data) ->
     case handle_tcp_data(Bin, Data) of
         {ok, Data2} ->
-            %% Reset inactivity timer on received data
-            {keep_state, Data2,
-             [{{timeout, inactivity}, ?INACTIVITY_TIMEOUT, inactive}]};
+            Actions = [{{timeout, inactivity}, ?INACTIVITY_TIMEOUT, inactive}],
+            %% Cancel pong timeout if pong was received (nonce cleared)
+            Actions2 = case Data2#peer_data.last_ping_nonce of
+                undefined -> [{{timeout, pong}, infinity, pong_timeout} | Actions];
+                _         -> Actions
+            end,
+            {keep_state, Data2, Actions2};
         {stop, Reason} ->
             {stop, Reason}
     end;
@@ -369,9 +373,17 @@ dispatch_message(sendheaders, _Payload, Data) ->
 dispatch_message(sendcmpct, Payload, Data) ->
     handle_sendcmpct_msg(Payload, Data);
 dispatch_message(sendaddrv2, _Payload, Data) ->
-    {ok, Data#peer_data{wants_addrv2 = true}};
+    %% BIP 155: only valid before handshake complete
+    case handshake_complete(Data) of
+        false -> {ok, Data#peer_data{wants_addrv2 = true}};
+        true  -> {ok, Data}
+    end;
 dispatch_message(wtxidrelay, _Payload, Data) ->
-    {ok, Data#peer_data{wtxidrelay = true}};
+    %% BIP 339: only valid before handshake complete
+    case handshake_complete(Data) of
+        false -> {ok, Data#peer_data{wtxidrelay = true}};
+        true  -> {ok, Data}
+    end;
 dispatch_message(feefilter, Payload, Data) ->
     handle_feefilter_msg(Payload, Data);
 dispatch_message(Command, Payload, Data) ->
@@ -427,9 +439,12 @@ handle_version_msg(Payload, Data) ->
                     },
                     %% Inbound: send our version if we haven't yet
                     Data3 = maybe_send_version(Data2),
+                    %% Send wtxidrelay and sendaddrv2 before verack (BIP 339/155)
+                    Data4 = do_send_raw(wtxidrelay, <<>>, Data3),
+                    Data5 = do_send_raw(sendaddrv2, <<>>, Data4),
                     %% Send verack
-                    Data4 = do_send_raw(verack, <<>>, Data3),
-                    {ok, Data4#peer_data{verack_sent = true}}
+                    Data6 = do_send_raw(verack, <<>>, Data5),
+                    {ok, Data6#peer_data{verack_sent = true}}
             end;
         {error, _} ->
             logger:warning("peer ~p bad version", [Data#peer_data.address]),
@@ -513,12 +528,12 @@ handle_feefilter_msg(Payload, Data) ->
     end.
 
 send_feature_msgs(Data) ->
+    %% sendheaders and sendcmpct are sent after handshake complete.
+    %% wtxidrelay and sendaddrv2 are sent before verack (see handle_version_msg).
     D1 = do_send_raw(sendheaders, <<>>, Data),
     CmpctPayload = beamchain_p2p_msg:encode_payload(sendcmpct,
                        #{announce => false, version => 2}),
-    D2 = do_send_raw(sendcmpct, CmpctPayload, D1),
-    D3 = do_send_raw(wtxidrelay, <<>>, D2),
-    do_send_raw(sendaddrv2, <<>>, D3).
+    do_send_raw(sendcmpct, CmpctPayload, D1).
 
 %%% ===================================================================
 %%% Internal: Misbehavior
