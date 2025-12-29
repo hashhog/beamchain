@@ -18,7 +18,8 @@
          peer_count/0,
          outbound_count/0,
          inbound_count/0,
-         disconnect_peer/1]).
+         disconnect_peer/1,
+         resolve_dns_seeds/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -40,7 +41,11 @@
     %% Our random nonce for self-connection detection across peers
     our_nonce   :: non_neg_integer(),
     %% Address -> ban_until (erlang:system_time(second))
-    banned = #{} :: #{term() => non_neg_integer()}
+    banned = #{} :: #{term() => non_neg_integer()},
+    %% Addresses discovered from DNS seeds [{IP, Port}]
+    discovered = [] :: [{inet:ip_address(), inet:port_number()}],
+    %% Whether DNS resolution is in progress
+    dns_pending = false :: boolean()
 }).
 
 %%% ===================================================================
@@ -90,6 +95,12 @@ inbound_count() ->
 -spec disconnect_peer(pid()) -> ok.
 disconnect_peer(Pid) ->
     gen_server:cast(?SERVER, {disconnect_peer, Pid}).
+
+%% @doc Resolve DNS seeds and return discovered addresses.
+%% Runs asynchronously — spawns one process per seed.
+-spec resolve_dns_seeds() -> ok.
+resolve_dns_seeds() ->
+    gen_server:cast(?SERVER, resolve_dns_seeds).
 
 %%% ===================================================================
 %%% gen_server callbacks
@@ -145,6 +156,21 @@ handle_cast({disconnect_peer, Pid}, State) ->
     end,
     {noreply, State};
 
+handle_cast(resolve_dns_seeds, #state{dns_pending = true} = State) ->
+    %% Already resolving, skip
+    {noreply, State};
+handle_cast(resolve_dns_seeds, State) ->
+    Self = self(),
+    Params = beamchain_config:network_params(),
+    Seeds = Params#network_params.dns_seeds,
+    Port = Params#network_params.default_port,
+    %% Spawn a process to resolve all seeds concurrently
+    spawn_link(fun() ->
+        Addrs = resolve_seeds(Seeds, Port),
+        Self ! {dns_seeds_resolved, Addrs}
+    end),
+    {noreply, State#state{dns_pending = true}};
+
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
@@ -181,6 +207,16 @@ handle_info({peer_banned, Pid, Address}, State) ->
     BanUntil = erlang:system_time(second) + 86400,
     Banned2 = maps:put(Address, BanUntil, State#state.banned),
     {noreply, State#state{banned = Banned2}};
+
+%% DNS seed resolution completed
+handle_info({dns_seeds_resolved, Addrs}, State) ->
+    logger:info("dns seeds: discovered ~B addresses", [length(Addrs)]),
+    %% Shuffle to avoid always connecting in the same order
+    Shuffled = shuffle(Addrs),
+    %% Merge with existing discovered addresses, dedup
+    Existing = State#state.discovered,
+    Merged = lists:usort(Shuffled ++ Existing),
+    {noreply, State#state{discovered = Merged, dns_pending = false}};
 
 %% Peer messages (forwarded from peer process)
 handle_info({peer_message, Pid, Command, Payload}, State) ->
@@ -269,9 +305,52 @@ is_banned(Address, #state{banned = Banned}) ->
     end.
 
 %%% ===================================================================
+%%% Internal: DNS seed resolution
+%%% ===================================================================
+
+%% @doc Resolve all DNS seeds concurrently, return [{IP, Port}].
+resolve_seeds(Seeds, Port) ->
+    Parent = self(),
+    Refs = lists:map(fun(Seed) ->
+        Ref = make_ref(),
+        spawn(fun() ->
+            Result = resolve_one_seed(Seed, Port),
+            Parent ! {dns_result, Ref, Result}
+        end),
+        Ref
+    end, Seeds),
+    %% Collect results with a timeout per seed
+    collect_dns_results(Refs, []).
+
+collect_dns_results([], Acc) ->
+    lists:flatten(Acc);
+collect_dns_results([Ref | Rest], Acc) ->
+    receive
+        {dns_result, Ref, Addrs} ->
+            collect_dns_results(Rest, [Addrs | Acc])
+    after 5000 ->
+        %% Timed out on this seed, move on
+        collect_dns_results(Rest, Acc)
+    end.
+
+resolve_one_seed(Seed, Port) ->
+    case inet_res:lookup(Seed, in, a, [], 5000) of
+        [] ->
+            logger:debug("dns seed ~s: no results", [Seed]),
+            [];
+        IPs ->
+            logger:debug("dns seed ~s: ~B addresses", [Seed, length(IPs)]),
+            [{IP, Port} || IP <- IPs]
+    end.
+
+%%% ===================================================================
 %%% Internal: helpers
 %%% ===================================================================
 
 generate_nonce() ->
     <<N:64>> = crypto:strong_rand_bytes(8),
     N.
+
+shuffle(List) ->
+    Tagged = [{rand:uniform(), X} || X <- List],
+    [X || {_, X} <- lists:sort(Tagged)].
