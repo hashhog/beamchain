@@ -19,6 +19,7 @@ init([]) ->
         child_spec(beamchain_db, worker),
         child_spec(beamchain_chainstate, worker),
         child_spec(beamchain_mempool, worker),
+        child_spec(beamchain_addrman, worker),
         child_spec(beamchain_peer_manager, worker),
         child_spec(beamchain_sync, worker)
         %% beamchain_rpc will be added when cowboy is wired up
