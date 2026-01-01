@@ -28,6 +28,11 @@
 -define(SERVER, ?MODULE).
 -define(PEER_TABLE, beamchain_peers).
 
+%% Connection loop intervals
+-define(CONNECT_INTERVAL, 500).        %% 500ms between connection attempts
+-define(CONNECT_INTERVAL_SLOW, 10000). %% 10s when at target count
+-define(CONNECT_INTERVAL_FAST, 3000).  %% 3s when below minimum
+
 -record(peer_entry, {
     pid         :: pid(),
     address     :: {inet:ip_address(), inet:port_number()},
@@ -45,7 +50,11 @@
     %% Addresses discovered from DNS seeds [{IP, Port}]
     discovered = [] :: [{inet:ip_address(), inet:port_number()}],
     %% Whether DNS resolution is in progress
-    dns_pending = false :: boolean()
+    dns_pending = false :: boolean(),
+    %% Connection loop timer reference
+    connect_timer :: reference() | undefined,
+    %% Set of /16 netgroups we're connected to (for diversity)
+    netgroups = sets:new([{version, 2}]) :: sets:set(term())
 }).
 
 %%% ===================================================================
@@ -113,7 +122,11 @@ init([]) ->
                           {keypos, #peer_entry.pid},
                           {read_concurrency, true}]),
     Nonce = generate_nonce(),
-    {ok, #state{our_nonce = Nonce}}.
+    %% Kick off DNS seed resolution
+    self() ! bootstrap,
+    %% Start connection maintenance loop
+    Timer = erlang:send_after(?CONNECT_INTERVAL, self(), connect_tick),
+    {ok, #state{our_nonce = Nonce, connect_timer = Timer}}.
 
 handle_call({connect_to, IP, Port}, _From, State) ->
     Address = {IP, Port},
@@ -177,36 +190,66 @@ handle_cast(_Msg, State) ->
 %% Peer handshake completed
 handle_info({peer_connected, Pid, Info}, State) ->
     case ets:lookup(?PEER_TABLE, Pid) of
-        [#peer_entry{} = Entry] ->
+        [#peer_entry{address = Addr} = Entry] ->
             Entry2 = Entry#peer_entry{
                 connected = true,
                 info = Info
             },
             ets:insert(?PEER_TABLE, Entry2),
+            %% Mark as tried in addrman
+            beamchain_addrman:mark_tried(Addr),
+            %% Track netgroup
+            NG = netgroup(Addr),
+            Netgroups2 = sets:add_element(NG, State#state.netgroups),
             logger:info("peer manager: ~p connected (~s)",
-                        [Entry2#peer_entry.address,
-                         maps:get(user_agent, Info, <<"unknown">>)]);
+                        [Addr, maps:get(user_agent, Info, <<"unknown">>)]),
+            {noreply, State#state{netgroups = Netgroups2}};
         [] ->
             %% Unknown peer, ignore
-            ok
-    end,
-    {noreply, State};
+            {noreply, State}
+    end;
 
 %% Peer disconnected gracefully
 handle_info({peer_disconnected, Pid, Reason}, State) ->
     logger:debug("peer manager: ~p disconnected: ~p",
                  [Pid, Reason]),
-    remove_peer(Pid),
-    {noreply, State};
+    State2 = remove_peer_and_update(Pid, State),
+    {noreply, State2};
 
 %% Peer banned due to misbehavior
 handle_info({peer_banned, Pid, Address}, State) ->
     logger:info("peer manager: banning ~p", [Address]),
-    remove_peer(Pid),
+    State2 = remove_peer_and_update(Pid, State),
     %% Ban for 24 hours
     BanUntil = erlang:system_time(second) + 86400,
-    Banned2 = maps:put(Address, BanUntil, State#state.banned),
-    {noreply, State#state{banned = Banned2}};
+    Banned2 = maps:put(Address, BanUntil, State2#state.banned),
+    {noreply, State2#state{banned = Banned2}};
+
+%% Bootstrap: resolve DNS seeds and load from addrman on first start
+handle_info(bootstrap, State) ->
+    %% Check if addrman has enough addresses
+    case beamchain_addrman:count() of
+        {New, Tried} when New + Tried < 10 ->
+            %% Not enough addresses, resolve DNS seeds
+            gen_server:cast(self(), resolve_dns_seeds);
+        _ ->
+            ok
+    end,
+    {noreply, State};
+
+%% Connection maintenance tick
+handle_info(connect_tick, State) ->
+    State2 = maybe_open_connection(State),
+    %% Schedule next tick based on how many outbounds we need
+    Outbound = outbound_count(),
+    Target = ?MAX_OUTBOUND_FULL_RELAY + ?MAX_BLOCK_RELAY_ONLY,
+    Interval = case Outbound of
+        N when N >= Target -> ?CONNECT_INTERVAL_SLOW;
+        N when N < 4       -> ?CONNECT_INTERVAL;
+        _                  -> ?CONNECT_INTERVAL_FAST
+    end,
+    Timer = erlang:send_after(Interval, self(), connect_tick),
+    {noreply, State2#state{connect_timer = Timer}};
 
 %% DNS seed resolution completed
 handle_info({dns_seeds_resolved, Addrs}, State) ->
@@ -228,11 +271,11 @@ handle_info({'DOWN', _MonRef, process, Pid, Reason}, State) ->
         [#peer_entry{address = Addr}] ->
             logger:debug("peer ~p (~p) process down: ~p",
                          [Addr, Pid, Reason]),
-            remove_peer(Pid);
+            State2 = remove_peer_and_update(Pid, State),
+            {noreply, State2};
         [] ->
-            ok
-    end,
-    {noreply, State};
+            {noreply, State}
+    end;
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -245,8 +288,91 @@ terminate(_Reason, _State) ->
     ok.
 
 %%% ===================================================================
-%%% Internal: connection
+%%% Internal: outbound connection logic
 %%% ===================================================================
+
+maybe_open_connection(State) ->
+    Outbound = outbound_count(),
+    Target = ?MAX_OUTBOUND_FULL_RELAY + ?MAX_BLOCK_RELAY_ONLY,
+    case Outbound >= Target of
+        true ->
+            State;   %% at capacity
+        false ->
+            try_connect_one(State)
+    end.
+
+try_connect_one(State) ->
+    %% First try addrman
+    case beamchain_addrman:select_address() of
+        {ok, Address} ->
+            attempt_connection(Address, State);
+        empty ->
+            %% Fall back to discovered DNS addresses
+            case State#state.discovered of
+                [] ->
+                    %% No addresses at all, trigger DNS if needed
+                    case State#state.dns_pending of
+                        false ->
+                            gen_server:cast(self(), resolve_dns_seeds);
+                        true ->
+                            ok
+                    end,
+                    State;
+                [Address | Rest] ->
+                    State2 = State#state{discovered = Rest},
+                    attempt_connection(Address, State2)
+            end
+    end.
+
+attempt_connection(Address, State) ->
+    case can_connect(Address, State) of
+        true ->
+            case do_connect(Address) of
+                {ok, Pid} ->
+                    MonRef = erlang:monitor(process, Pid),
+                    Entry = #peer_entry{
+                        pid = Pid,
+                        address = Address,
+                        direction = outbound,
+                        mon_ref = MonRef,
+                        connected = false
+                    },
+                    ets:insert(?PEER_TABLE, Entry),
+                    %% Also add to addrman so it knows about this addr
+                    beamchain_addrman:add_address(Address, 0, dns),
+                    State;
+                {error, Reason} ->
+                    logger:debug("failed to connect to ~p: ~p",
+                                 [Address, Reason]),
+                    beamchain_addrman:mark_failed(Address),
+                    State
+            end;
+        false ->
+            State
+    end.
+
+%% Check if we should connect to this address
+can_connect(Address, State) ->
+    not is_banned(Address, State)
+        andalso find_peer_by_address(Address) =:= error
+        andalso has_netgroup_diversity(Address, State).
+
+%% Ensure we don't connect to too many peers in the same /16 subnet
+has_netgroup_diversity(Address, #state{netgroups = _NGs}) ->
+    NG = netgroup(Address),
+    %% Allow up to 2 peers per netgroup
+    Count = ets:foldl(fun(#peer_entry{address = A, direction = outbound}, C) ->
+        case netgroup(A) =:= NG of
+            true  -> C + 1;
+            false -> C
+        end;
+    (_, C) -> C
+    end, 0, ?PEER_TABLE),
+    Count < 2.
+
+%% /16 netgroup for IPv4
+netgroup({{A, B, _, _}, _Port}) -> {A, B};
+netgroup({_IPv6Addr, _Port}) -> other.
 
 do_connect(Address) ->
     beamchain_peer:connect(Address, self(), #{}).
@@ -255,14 +381,24 @@ do_connect(Address) ->
 %%% Internal: peer registry helpers
 %%% ===================================================================
 
-remove_peer(Pid) ->
+remove_peer_and_update(Pid, State) ->
     case ets:lookup(?PEER_TABLE, Pid) of
-        [#peer_entry{mon_ref = MonRef}] ->
+        [#peer_entry{address = _Addr, mon_ref = MonRef}] ->
             erlang:demonitor(MonRef, [flush]),
-            ets:delete(?PEER_TABLE, Pid);
+            ets:delete(?PEER_TABLE, Pid),
+            %% Rebuild netgroups (simpler than tracking removal)
+            NGs = rebuild_netgroups(),
+            State#state{netgroups = NGs};
         [] ->
-            ok
+            State
     end.
+
+rebuild_netgroups() ->
+    ets:foldl(fun(#peer_entry{address = A, direction = outbound,
+                               connected = true}, Acc) ->
+        sets:add_element(netgroup(A), Acc);
+    (_, Acc) -> Acc
+    end, sets:new([{version, 2}]), ?PEER_TABLE).
 
 find_peer_by_address(Address) ->
     case ets:match_object(?PEER_TABLE,
