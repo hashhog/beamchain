@@ -19,7 +19,8 @@
          outbound_count/0,
          inbound_count/0,
          disconnect_peer/1,
-         resolve_dns_seeds/0]).
+         resolve_dns_seeds/0,
+         is_banned/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -54,7 +55,11 @@
     %% Connection loop timer reference
     connect_timer :: reference() | undefined,
     %% Set of /16 netgroups we're connected to (for diversity)
-    netgroups = sets:new([{version, 2}]) :: sets:set(term())
+    netgroups = sets:new([{version, 2}]) :: sets:set(term()),
+    %% Listening socket for inbound connections
+    listen_socket :: gen_tcp:socket() | undefined,
+    %% Acceptor process
+    acceptor :: pid() | undefined
 }).
 
 %%% ===================================================================
@@ -111,6 +116,11 @@ disconnect_peer(Pid) ->
 resolve_dns_seeds() ->
     gen_server:cast(?SERVER, resolve_dns_seeds).
 
+%% @doc Check if an address is currently banned.
+-spec is_banned({inet:ip_address(), inet:port_number()}) -> boolean().
+is_banned(Address) ->
+    gen_server:call(?SERVER, {is_banned, Address}).
+
 %%% ===================================================================
 %%% gen_server callbacks
 %%% ===================================================================
@@ -122,15 +132,18 @@ init([]) ->
                           {keypos, #peer_entry.pid},
                           {read_concurrency, true}]),
     Nonce = generate_nonce(),
+    %% Start listening for inbound connections
+    {ListenSock, Acceptor} = start_listener(),
     %% Kick off DNS seed resolution
     self() ! bootstrap,
     %% Start connection maintenance loop
     Timer = erlang:send_after(?CONNECT_INTERVAL, self(), connect_tick),
-    {ok, #state{our_nonce = Nonce, connect_timer = Timer}}.
+    {ok, #state{our_nonce = Nonce, connect_timer = Timer,
+                listen_socket = ListenSock, acceptor = Acceptor}}.
 
 handle_call({connect_to, IP, Port}, _From, State) ->
     Address = {IP, Port},
-    case is_banned(Address, State) of
+    case is_banned_internal(Address, State) of
         true ->
             {reply, {error, banned}, State};
         false ->
@@ -155,6 +168,9 @@ handle_call({connect_to, IP, Port}, _From, State) ->
                     end
             end
     end;
+
+handle_call({is_banned, Address}, _From, State) ->
+    {reply, is_banned_internal(Address, State), State};
 
 handle_call(get_state, _From, State) ->
     {reply, State, State};
@@ -265,6 +281,26 @@ handle_info({dns_seeds_resolved, Addrs}, State) ->
 handle_info({peer_message, Pid, Command, Payload}, State) ->
     handle_peer_message(Pid, Command, Payload, State);
 
+%% Inbound connection accepted
+handle_info({accepted, Socket, Address}, State) ->
+    State2 = handle_inbound(Socket, Address, State),
+    %% Restart acceptor
+    Acceptor = spawn_acceptor(State2#state.listen_socket),
+    {noreply, State2#state{acceptor = Acceptor}};
+
+%% Acceptor process died (maybe listen socket closed)
+handle_info({'DOWN', _MonRef, process, Pid, Reason},
+            #state{acceptor = Pid} = State) ->
+    logger:warning("acceptor died: ~p", [Reason]),
+    %% Restart acceptor if we still have a listen socket
+    case State#state.listen_socket of
+        undefined ->
+            {noreply, State#state{acceptor = undefined}};
+        LSock ->
+            Acceptor = spawn_acceptor(LSock),
+            {noreply, State#state{acceptor = Acceptor}}
+    end;
+
 %% Monitored peer process died
 handle_info({'DOWN', _MonRef, process, Pid, Reason}, State) ->
     case ets:lookup(?PEER_TABLE, Pid) of
@@ -280,7 +316,12 @@ handle_info({'DOWN', _MonRef, process, Pid, Reason}, State) ->
 handle_info(_Info, State) ->
     {noreply, State}.
 
-terminate(_Reason, _State) ->
+terminate(_Reason, State) ->
+    %% Close listen socket
+    case State#state.listen_socket of
+        undefined -> ok;
+        LSock -> gen_tcp:close(LSock)
+    end,
     %% Disconnect all peers
     ets:foldl(fun(#peer_entry{pid = Pid}, _) ->
         catch beamchain_peer:disconnect(Pid)
@@ -353,7 +394,7 @@ attempt_connection(Address, State) ->
 
 %% Check if we should connect to this address
 can_connect(Address, State) ->
-    not is_banned(Address, State)
+    not is_banned_internal(Address, State)
         andalso find_peer_by_address(Address) =:= error
         andalso has_netgroup_diversity(Address, State).
 
@@ -432,13 +473,95 @@ handle_peer_message(_Pid, _Command, _Payload, State) ->
 %%% Internal: ban management
 %%% ===================================================================
 
-is_banned(Address, #state{banned = Banned}) ->
+is_banned_internal(Address, #state{banned = Banned}) ->
     case maps:find(Address, Banned) of
         {ok, BanUntil} ->
             erlang:system_time(second) < BanUntil;
         error ->
             false
     end.
+
+%%% ===================================================================
+%%% Internal: inbound connections
+%%% ===================================================================
+
+start_listener() ->
+    Params = beamchain_config:network_params(),
+    Port = Params#network_params.default_port,
+    case gen_tcp:listen(Port, [binary, {active, false}, {packet, raw},
+                                {reuseaddr, true}, {nodelay, true},
+                                {backlog, 128}]) of
+        {ok, LSock} ->
+            logger:info("listening on port ~B", [Port]),
+            Acceptor = spawn_acceptor(LSock),
+            {LSock, Acceptor};
+        {error, eaddrinuse} ->
+            logger:warning("port ~B already in use, skipping listener", [Port]),
+            {undefined, undefined};
+        {error, Reason} ->
+            logger:warning("failed to listen on port ~B: ~p", [Port, Reason]),
+            {undefined, undefined}
+    end.
+
+spawn_acceptor(undefined) -> undefined;
+spawn_acceptor(LSock) ->
+    Self = self(),
+    Pid = spawn_link(fun() -> accept_loop(LSock, Self) end),
+    Pid.
+
+accept_loop(LSock, Manager) ->
+    case gen_tcp:accept(LSock) of
+        {ok, Socket} ->
+            case inet:peername(Socket) of
+                {ok, {IP, Port}} ->
+                    %% Transfer socket ownership to manager temporarily
+                    Manager ! {accepted, Socket, {IP, Port}};
+                {error, _} ->
+                    gen_tcp:close(Socket)
+            end,
+            accept_loop(LSock, Manager);
+        {error, closed} ->
+            ok;
+        {error, _Reason} ->
+            %% Brief pause before retrying
+            timer:sleep(100),
+            accept_loop(LSock, Manager)
+    end.
+
+handle_inbound(Socket, Address, State) ->
+    case can_accept_inbound(Address, State) of
+        true ->
+            case beamchain_peer:accept(Socket, Address, self()) of
+                {ok, Pid} ->
+                    %% Transfer socket ownership to peer process
+                    gen_tcp:controlling_process(Socket, Pid),
+                    MonRef = erlang:monitor(process, Pid),
+                    Entry = #peer_entry{
+                        pid = Pid,
+                        address = Address,
+                        direction = inbound,
+                        mon_ref = MonRef,
+                        connected = false
+                    },
+                    ets:insert(?PEER_TABLE, Entry),
+                    logger:debug("accepted inbound from ~p", [Address]),
+                    State;
+                {error, Reason} ->
+                    logger:debug("failed to accept from ~p: ~p",
+                                 [Address, Reason]),
+                    gen_tcp:close(Socket),
+                    State
+            end;
+        false ->
+            gen_tcp:close(Socket),
+            State
+    end.
+
+can_accept_inbound(Address, State) ->
+    Inbound = inbound_count(),
+    not is_banned_internal(Address, State)
+        andalso find_peer_by_address(Address) =:= error
+        andalso Inbound < ?MAX_INBOUND.
 
 %%% ===================================================================
 %%% Internal: DNS seed resolution
