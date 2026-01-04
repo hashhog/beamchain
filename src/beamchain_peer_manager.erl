@@ -20,7 +20,10 @@
          inbound_count/0,
          disconnect_peer/1,
          resolve_dns_seeds/0,
-         is_banned/1]).
+         is_banned/1,
+         broadcast/2,
+         broadcast/3,
+         request_addresses/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -121,6 +124,28 @@ resolve_dns_seeds() ->
 is_banned(Address) ->
     gen_server:call(?SERVER, {is_banned, Address}).
 
+%% @doc Broadcast a message to all ready peers.
+-spec broadcast(atom(), map()) -> ok.
+broadcast(Command, Payload) ->
+    broadcast(Command, Payload, fun(_) -> true end).
+
+%% @doc Broadcast a message to peers matching a filter function.
+%% FilterFun receives a peer entry map and returns true to include.
+-spec broadcast(atom(), map(), fun((map()) -> boolean())) -> ok.
+broadcast(Command, Payload, FilterFun) ->
+    ets:foldl(fun(#peer_entry{pid = Pid, connected = true} = E, _) ->
+        case FilterFun(entry_to_map(E)) of
+            true  -> beamchain_peer:send_message(Pid, {Command, Payload});
+            false -> ok
+        end;
+    (_, _) -> ok
+    end, ok, ?PEER_TABLE).
+
+%% @doc Send a getaddr to a specific peer.
+-spec request_addresses(pid()) -> ok.
+request_addresses(Pid) ->
+    beamchain_peer:send_message(Pid, {getaddr, #{}}).
+
 %%% ===================================================================
 %%% gen_server callbacks
 %%% ===================================================================
@@ -219,6 +244,13 @@ handle_info({peer_connected, Pid, Info}, State) ->
             Netgroups2 = sets:add_element(NG, State#state.netgroups),
             logger:info("peer manager: ~p connected (~s)",
                         [Addr, maps:get(user_agent, Info, <<"unknown">>)]),
+            %% Request addresses from new outbound peers
+            case Entry#peer_entry.direction of
+                outbound ->
+                    beamchain_peer:send_message(Pid, {getaddr, #{}});
+                inbound ->
+                    ok
+            end,
             {noreply, State#state{netgroups = Netgroups2}};
         [] ->
             %% Unknown peer, ignore
@@ -465,8 +497,43 @@ entry_to_map(#peer_entry{pid = Pid, address = Addr, direction = Dir,
 %%% Internal: message handling
 %%% ===================================================================
 
+handle_peer_message(Pid, addr, Payload, State) ->
+    handle_addr_msg(Pid, Payload, State);
+handle_peer_message(Pid, getaddr, _Payload, State) ->
+    handle_getaddr_msg(Pid, State);
 handle_peer_message(_Pid, _Command, _Payload, State) ->
-    %% For now just ignore — sync module will handle these
+    %% Everything else gets forwarded to sync module later
+    {noreply, State}.
+
+handle_addr_msg(Pid, Payload, State) ->
+    case beamchain_p2p_msg:decode_payload(addr, Payload) of
+        {ok, #{addrs := Addrs}} when length(Addrs) =< 1000 ->
+            %% Feed addresses to addrman
+            lists:foreach(fun(#{ip := IP, port := Port} = Entry) ->
+                Svc = maps:get(services, Entry, 0),
+                beamchain_addrman:add_address({IP, Port}, Svc, Pid)
+            end, Addrs),
+            logger:debug("received ~B addresses from ~p",
+                         [length(Addrs), Pid]),
+            {noreply, State};
+        {ok, #{addrs := Addrs}} when length(Addrs) > 1000 ->
+            %% Too many addresses, misbehaving
+            beamchain_peer:add_misbehavior(Pid, 20),
+            {noreply, State};
+        _ ->
+            {noreply, State}
+    end.
+
+handle_getaddr_msg(Pid, State) ->
+    %% Respond with up to 1000 addresses from addrman
+    Addrs = beamchain_addrman:get_addresses(1000),
+    Now = erlang:system_time(second),
+    Entries = [#{timestamp => Now, services => 0,
+                 ip => IP, port => Port} || {IP, Port} <- Addrs],
+    case Entries of
+        [] -> ok;
+        _  -> beamchain_peer:send_message(Pid, {addr, #{addrs => Entries}})
+    end,
     {noreply, State}.
 
 %%% ===================================================================
