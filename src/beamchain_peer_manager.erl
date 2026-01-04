@@ -219,7 +219,7 @@ handle_cast(resolve_dns_seeds, State) ->
     Seeds = Params#network_params.dns_seeds,
     Port = Params#network_params.default_port,
     %% Spawn a process to resolve all seeds concurrently
-    spawn_link(fun() ->
+    spawn(fun() ->
         Addrs = resolve_seeds(Seeds, Port),
         Self ! {dns_seeds_resolved, Addrs}
     end),
@@ -573,7 +573,8 @@ start_listener() ->
 spawn_acceptor(undefined) -> undefined;
 spawn_acceptor(LSock) ->
     Self = self(),
-    Pid = spawn_link(fun() -> accept_loop(LSock, Self) end),
+    Pid = spawn(fun() -> accept_loop(LSock, Self) end),
+    erlang:monitor(process, Pid),
     Pid.
 
 accept_loop(LSock, Manager) ->
