@@ -293,7 +293,7 @@ build_locator_hashes(Height, Hash, Step, Acc) ->
     end.
 
 %%% ===================================================================
-%%% Internal: header processing (TODO: validation)
+%%% Internal: header processing
 %%% ===================================================================
 
 process_headers([], State) ->
@@ -301,17 +301,136 @@ process_headers([], State) ->
     check_sync_complete(State);
 
 process_headers(Headers, State) ->
-    %% TODO: validate headers before storing
-    NumReceived = length(Headers),
-    Total = State#state.headers_received + NumReceived,
-    State2 = State#state{headers_received = Total},
-    case NumReceived >= ?MAX_HEADERS_RESULTS of
-        true ->
-            send_getheaders(State2);
-        false ->
-            logger:info("header_sync: received ~B headers (~B total, tip at ~B)",
-                        [NumReceived, Total, State2#state.tip_height]),
-            check_sync_complete(State2)
+    case validate_and_store_headers(Headers, State) of
+        {ok, State2} ->
+            NumReceived = length(Headers),
+            Total = State2#state.headers_received + NumReceived,
+            State3 = State2#state{headers_received = Total},
+            case NumReceived >= ?MAX_HEADERS_RESULTS of
+                true ->
+                    %% Peer likely has more, request next batch
+                    send_getheaders(State3);
+                false ->
+                    logger:info("header_sync: received ~B headers "
+                                "(~B total, tip at ~B)",
+                                [NumReceived, Total,
+                                 State3#state.tip_height]),
+                    check_sync_complete(State3)
+            end;
+        {error, Reason, State2} ->
+            logger:warning("header_sync: validation failed: ~p", [Reason]),
+            case State2#state.sync_peer of
+                undefined -> ok;
+                Peer -> beamchain_peer:add_misbehavior(Peer, 20)
+            end,
+            State3 = State2#state{sync_peer = undefined, status = idle},
+            pick_sync_peer_and_start(State3)
+    end.
+
+%% Validate a batch of headers and store them.
+validate_and_store_headers([], State) ->
+    {ok, State};
+validate_and_store_headers([Header | Rest], State) ->
+    case validate_one_header(Header, State) of
+        {ok, State2} ->
+            validate_and_store_headers(Rest, State2);
+        {error, Reason} ->
+            {error, Reason, State}
+    end.
+
+%% Validate a single header against our current tip.
+validate_one_header(Header, #state{tip_height = TipHeight,
+                                    tip_hash = TipHash,
+                                    tip_chainwork = TipCW,
+                                    mtp_window = MTPWindow,
+                                    params = Params} = State) ->
+    NewHeight = TipHeight + 1,
+    BlockHash = beamchain_serialize:block_hash(Header),
+    PowLimit = maps:get(pow_limit, Params),
+
+    try
+        %% 1. prev_hash must connect to our tip
+        Header#block_header.prev_hash =:= TipHash
+            orelse throw(bad_prev_hash),
+
+        %% 2. PoW: block hash <= target, target <= pow_limit
+        beamchain_pow:check_pow(BlockHash, Header#block_header.bits, PowLimit)
+            orelse throw(high_hash),
+
+        %% 3. Timestamp must be > MTP
+        MTP = compute_mtp(MTPWindow),
+        Header#block_header.timestamp > MTP
+            orelse throw(time_too_old),
+
+        %% 4. Timestamp must be < now + 2 hours
+        Now = erlang:system_time(second),
+        Header#block_header.timestamp =< Now + ?MAX_FUTURE_DRIFT
+            orelse throw(time_too_new),
+
+        %% 5. Difficulty must match expected
+        PrevIndex = #{height => TipHeight, header => prev_header(State),
+                      chainwork => TipCW},
+        ExpectedBits = beamchain_pow:get_next_work_required(
+            PrevIndex, Header, Params),
+        Header#block_header.bits =:= ExpectedBits
+            orelse throw(bad_diffbits),
+
+        %% 6. Calculate chainwork
+        BlockWork = beamchain_pow:compute_work(Header#block_header.bits),
+        PrevCWInt = binary:decode_unsigned(TipCW, big),
+        NewCWInt = PrevCWInt + BlockWork,
+        NewCW = chainwork_to_binary(NewCWInt),
+
+        %% 7. Store in block index
+        %% Status 1 = headers only (not fully validated with block data)
+        ok = beamchain_db:store_block_index(NewHeight, BlockHash, Header,
+                                             NewCW, 1),
+
+        %% 8. Update chain tip in DB
+        ok = beamchain_db:set_chain_tip(BlockHash, NewHeight),
+
+        %% 9. Update MTP window
+        NewMTPWindow = update_mtp_window(MTPWindow, NewHeight,
+                                          Header#block_header.timestamp),
+
+        {ok, State#state{
+            tip_height = NewHeight,
+            tip_hash = BlockHash,
+            tip_chainwork = NewCW,
+            mtp_window = NewMTPWindow
+        }}
+    catch
+        throw:Reason -> {error, Reason}
+    end.
+
+%% Get the header record for the current tip (needed for difficulty calc).
+prev_header(#state{tip_height = -1, params = Params}) ->
+    Genesis = maps:get(genesis_block, Params),
+    Genesis#block.header;
+prev_header(#state{tip_height = Height}) ->
+    case beamchain_db:get_block_index(Height) of
+        {ok, #{header := Header}} -> Header;
+        not_found -> error({block_index_not_found, Height})
+    end.
+
+%%% ===================================================================
+%%% Internal: MTP sliding window
+%%% ===================================================================
+
+%% Compute MTP from the sliding window.
+compute_mtp([]) ->
+    0;
+compute_mtp(Window) ->
+    Timestamps = [Ts || {_H, Ts} <- Window],
+    Sorted = lists:sort(Timestamps),
+    lists:nth((length(Sorted) div 2) + 1, Sorted).
+
+%% Add a new timestamp and keep only the last 11.
+update_mtp_window(Window, Height, Timestamp) ->
+    Window2 = Window ++ [{Height, Timestamp}],
+    case length(Window2) > ?MTP_WINDOW of
+        true -> tl(Window2);
+        false -> Window2
     end.
 
 check_sync_complete(#state{peer_heights = PeerHeights,
