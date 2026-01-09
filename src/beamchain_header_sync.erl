@@ -375,21 +375,27 @@ validate_one_header(Header, #state{tip_height = TipHeight,
         Header#block_header.bits =:= ExpectedBits
             orelse throw(bad_diffbits),
 
-        %% 6. Calculate chainwork
+        %% 6. Checkpoint enforcement
+        check_checkpoint(NewHeight, BlockHash, Params),
+
+        %% 7. BIP94 (testnet4): first block of retarget period
+        check_bip94(NewHeight, Header, State),
+
+        %% 8. Calculate chainwork
         BlockWork = beamchain_pow:compute_work(Header#block_header.bits),
         PrevCWInt = binary:decode_unsigned(TipCW, big),
         NewCWInt = PrevCWInt + BlockWork,
         NewCW = chainwork_to_binary(NewCWInt),
 
-        %% 7. Store in block index
+        %% 9. Store in block index
         %% Status 1 = headers only (not fully validated with block data)
         ok = beamchain_db:store_block_index(NewHeight, BlockHash, Header,
                                              NewCW, 1),
 
-        %% 8. Update chain tip in DB
+        %% 10. Update chain tip in DB
         ok = beamchain_db:set_chain_tip(BlockHash, NewHeight),
 
-        %% 9. Update MTP window
+        %% 11. Update MTP window
         NewMTPWindow = update_mtp_window(MTPWindow, NewHeight,
                                           Header#block_header.timestamp),
 
@@ -431,6 +437,46 @@ update_mtp_window(Window, Height, Timestamp) ->
     case length(Window2) > ?MTP_WINDOW of
         true -> tl(Window2);
         false -> Window2
+    end.
+
+%%% ===================================================================
+%%% Internal: checkpoint enforcement
+%%% ===================================================================
+
+check_checkpoint(Height, BlockHash, Params) ->
+    Checkpoints = maps:get(checkpoints, Params, #{}),
+    case maps:find(Height, Checkpoints) of
+        {ok, ExpectedHash} ->
+            case BlockHash =:= ExpectedHash of
+                true -> ok;
+                false -> throw(checkpoint_mismatch)
+            end;
+        error ->
+            ok
+    end.
+
+%%% ===================================================================
+%%% Internal: BIP94 (testnet4 difficulty adjustment)
+%%% ===================================================================
+
+%% BIP94: On testnet4, the first block of a retarget period must have
+%% a timestamp >= the last block of the previous period.
+check_bip94(Height, Header, #state{params = Params} = State) ->
+    Network = maps:get(network, Params),
+    case Network of
+        testnet4 ->
+            case Height rem ?DIFFICULTY_ADJUSTMENT_INTERVAL =:= 0
+                 andalso Height > 0 of
+                true ->
+                    PrevHeader = prev_header(State),
+                    Header#block_header.timestamp >=
+                        PrevHeader#block_header.timestamp
+                        orelse throw(bip94_timestamp);
+                false ->
+                    ok
+            end;
+        _ ->
+            ok
     end.
 
 check_sync_complete(#state{peer_heights = PeerHeights,
