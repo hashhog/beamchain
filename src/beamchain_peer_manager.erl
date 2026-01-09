@@ -244,6 +244,8 @@ handle_info({peer_connected, Pid, Info}, State) ->
             Netgroups2 = sets:add_element(NG, State#state.netgroups),
             logger:info("peer manager: ~p connected (~s)",
                         [Addr, maps:get(user_agent, Info, <<"unknown">>)]),
+            %% Notify sync coordinator about the new peer
+            beamchain_sync:notify_peer_connected(Pid, Info),
             %% Request addresses from new outbound peers
             case Entry#peer_entry.direction of
                 outbound ->
@@ -261,6 +263,7 @@ handle_info({peer_connected, Pid, Info}, State) ->
 handle_info({peer_disconnected, Pid, Reason}, State) ->
     logger:debug("peer manager: ~p disconnected: ~p",
                  [Pid, Reason]),
+    beamchain_sync:notify_peer_disconnected(Pid),
     State2 = remove_peer_and_update(Pid, State),
     {noreply, State2};
 
@@ -501,8 +504,23 @@ handle_peer_message(Pid, addr, Payload, State) ->
     handle_addr_msg(Pid, Payload, State);
 handle_peer_message(Pid, getaddr, _Payload, State) ->
     handle_getaddr_msg(Pid, State);
+%% Sync-related messages: forward to sync coordinator
+handle_peer_message(Pid, headers, Payload, State) ->
+    beamchain_sync:handle_peer_message(Pid, headers, Payload),
+    {noreply, State};
+handle_peer_message(Pid, inv, Payload, State) ->
+    beamchain_sync:handle_peer_message(Pid, inv, Payload),
+    {noreply, State};
+handle_peer_message(Pid, block, Payload, State) ->
+    beamchain_sync:handle_peer_message(Pid, block, Payload),
+    {noreply, State};
+handle_peer_message(Pid, tx, Payload, State) ->
+    beamchain_sync:handle_peer_message(Pid, tx, Payload),
+    {noreply, State};
+handle_peer_message(Pid, notfound, Payload, State) ->
+    beamchain_sync:handle_peer_message(Pid, notfound, Payload),
+    {noreply, State};
 handle_peer_message(_Pid, _Command, _Payload, State) ->
-    %% Everything else gets forwarded to sync module later
     {noreply, State}.
 
 handle_addr_msg(Pid, Payload, State) ->
