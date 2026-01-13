@@ -1,0 +1,817 @@
+-module(beamchain_block_sync).
+-behaviour(gen_server).
+
+%% Parallel block download for Initial Block Download (IBD).
+%%
+%% After headers are synced, downloads blocks out-of-order from
+%% multiple peers but validates them strictly in-order.
+%%
+%% Architecture:
+%%   - download_queue: heights remaining to fetch
+%%   - in_flight: height -> {peer, requested_at, hash}
+%%   - downloaded: height -> block (awaiting sequential validation)
+%%   - next_to_validate: counter for in-order processing
+
+-include("beamchain.hrl").
+-include("beamchain_protocol.hrl").
+
+%% API
+-export([start_link/0,
+         start_sync/1,
+         stop_sync/0,
+         handle_block/2,
+         handle_peer_connected/2,
+         handle_peer_disconnected/1,
+         get_status/0]).
+
+%% gen_server callbacks
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2,
+         terminate/2]).
+
+-define(SERVER, ?MODULE).
+
+%% Download limits
+-define(MAX_IN_FLIGHT, 128).
+-define(MAX_PER_PEER, 16).
+
+%% Stall detection
+-define(INITIAL_TIMEOUT_MS, 5000).
+-define(MAX_TIMEOUT_MS, 64000).
+-define(STALL_CHECK_INTERVAL, 5000).
+
+%% UTXO batch flush every N blocks during IBD
+-define(UTXO_FLUSH_INTERVAL, 1000).
+
+%% Memory cap: max blocks downloaded ahead of validation
+-define(MAX_DOWNLOADED_AHEAD, 1000).
+
+%% Progress reporting interval
+-define(PROGRESS_INTERVAL, 1000).
+
+%% Per-peer tracking
+-record(peer_stats, {
+    in_flight_count = 0  :: non_neg_integer(),
+    stall_count = 0      :: non_neg_integer(),
+    avg_response_ms = 0  :: non_neg_integer(),
+    total_blocks = 0     :: non_neg_integer(),
+    total_time_ms = 0    :: non_neg_integer()
+}).
+
+-record(state, {
+    %% Current sync status
+    status = idle          :: idle | syncing | complete,
+
+    %% Heights remaining to fetch (list used as queue, front = next to dequeue)
+    download_queue = []    :: [non_neg_integer()],
+
+    %% Height -> {Peer, RequestedAtMs, Hash}
+    in_flight = #{}        :: #{non_neg_integer() =>
+                                {pid(), integer(), binary()}},
+
+    %% Height -> #block{} — downloaded but not yet validated
+    downloaded = #{}       :: #{non_neg_integer() => #block{}},
+
+    %% Next height that needs sequential validation
+    next_to_validate = 0   :: non_neg_integer(),
+
+    %% Target height (from header sync tip)
+    target_height = 0      :: non_neg_integer(),
+
+    %% Per-peer stats: Pid -> #peer_stats{}
+    peer_stats = #{}       :: #{pid() => #peer_stats{}},
+
+    %% Known connected peers: Pid -> Info map
+    peers = #{}            :: #{pid() => map()},
+
+    %% Chain params
+    params = #{}           :: map(),
+
+    %% Stall check timer
+    stall_timer            :: reference() | undefined,
+
+    %% Progress report timer
+    progress_timer         :: reference() | undefined,
+
+    %% Progress callback
+    progress_cb            :: function() | undefined,
+
+    %% Rolling stats for progress
+    blocks_validated = 0   :: non_neg_integer(),
+    last_progress_time = 0 :: integer(),
+    last_progress_height = 0 :: non_neg_integer(),
+
+    %% Assumevalid: block hash below which we skip scripts
+    assume_valid = <<0:256>> :: binary()
+}).
+
+%%% ===================================================================
+%%% API
+%%% ===================================================================
+
+start_link() ->
+    gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
+
+%% @doc Start block download. Called after header sync completes.
+%% Opts: #{target_height => N, progress_cb => fun(Map)}
+-spec start_sync(map()) -> ok.
+start_sync(Opts) ->
+    gen_server:cast(?SERVER, {start_sync, Opts}).
+
+%% @doc Stop block sync.
+-spec stop_sync() -> ok.
+stop_sync() ->
+    gen_server:cast(?SERVER, stop_sync).
+
+%% @doc Handle a received block from a peer.
+-spec handle_block(pid(), #block{}) -> ok.
+handle_block(Peer, Block) ->
+    gen_server:cast(?SERVER, {block, Peer, Block}).
+
+%% @doc Peer completed handshake.
+-spec handle_peer_connected(pid(), map()) -> ok.
+handle_peer_connected(Peer, Info) ->
+    gen_server:cast(?SERVER, {peer_connected, Peer, Info}).
+
+%% @doc Peer disconnected.
+-spec handle_peer_disconnected(pid()) -> ok.
+handle_peer_disconnected(Peer) ->
+    gen_server:cast(?SERVER, {peer_disconnected, Peer}).
+
+%% @doc Get current block sync status.
+-spec get_status() -> map().
+get_status() ->
+    gen_server:call(?SERVER, get_status).
+
+%%% ===================================================================
+%%% gen_server callbacks
+%%% ===================================================================
+
+init([]) ->
+    Network = beamchain_config:network(),
+    Params = beamchain_chain_params:params(Network),
+    AssumeValid = maps:get(assume_valid, Params, <<0:256>>),
+    {ok, #state{params = Params, assume_valid = AssumeValid}}.
+
+handle_call(get_status, _From, State) ->
+    Status = #{
+        status => State#state.status,
+        next_to_validate => State#state.next_to_validate,
+        target_height => State#state.target_height,
+        in_flight_count => maps:size(State#state.in_flight),
+        downloaded_count => maps:size(State#state.downloaded),
+        queue_length => length(State#state.download_queue),
+        peer_count => maps:size(State#state.peers),
+        blocks_validated => State#state.blocks_validated
+    },
+    {reply, Status, State};
+
+handle_call(_Request, _From, State) ->
+    {reply, {error, not_implemented}, State}.
+
+handle_cast({start_sync, Opts}, #state{status = idle} = State) ->
+    TargetHeight = maps:get(target_height, Opts, 0),
+    ProgressCb = maps:get(progress_cb, Opts, undefined),
+
+    %% Determine where to start: after last fully validated block
+    StartHeight = find_start_height(),
+
+    logger:info("block_sync: starting IBD from ~B to ~B",
+                [StartHeight, TargetHeight]),
+
+    %% Build the download queue
+    Queue = case TargetHeight > StartHeight of
+        true -> lists:seq(StartHeight, TargetHeight);
+        false -> []
+    end,
+
+    %% Gather currently connected peers
+    Peers = gather_connected_peers(),
+
+    Now = erlang:monotonic_time(millisecond),
+    State2 = State#state{
+        status = syncing,
+        download_queue = Queue,
+        in_flight = #{},
+        downloaded = #{},
+        next_to_validate = StartHeight,
+        target_height = TargetHeight,
+        peers = Peers,
+        peer_stats = maps:from_list(
+            [{Pid, #peer_stats{}} || Pid <- maps:keys(Peers)]),
+        progress_cb = ProgressCb,
+        blocks_validated = 0,
+        last_progress_time = Now,
+        last_progress_height = StartHeight
+    },
+
+    %% Start timers
+    StallTimer = erlang:send_after(?STALL_CHECK_INTERVAL, self(),
+                                    stall_check),
+    ProgressTimer = erlang:send_after(?PROGRESS_INTERVAL, self(),
+                                       progress_tick),
+    State3 = State2#state{stall_timer = StallTimer,
+                           progress_timer = ProgressTimer},
+
+    %% Fill the pipeline
+    State4 = fill_pipeline(State3),
+    {noreply, State4};
+
+handle_cast({start_sync, _Opts}, State) ->
+    %% Already syncing
+    {noreply, State};
+
+handle_cast(stop_sync, State) ->
+    State2 = cancel_timers(State),
+    {noreply, State2#state{status = idle, in_flight = #{},
+                            downloaded = #{}, download_queue = []}};
+
+handle_cast({block, Peer, Block}, #state{status = syncing} = State) ->
+    State2 = handle_block_received(Peer, Block, State),
+    {noreply, State2};
+handle_cast({block, _Peer, _Block}, State) ->
+    {noreply, State};
+
+handle_cast({peer_connected, Peer, Info}, State) ->
+    Peers = maps:put(Peer, Info, State#state.peers),
+    PeerStats = case maps:is_key(Peer, State#state.peer_stats) of
+        true -> State#state.peer_stats;
+        false -> maps:put(Peer, #peer_stats{}, State#state.peer_stats)
+    end,
+    State2 = State#state{peers = Peers, peer_stats = PeerStats},
+    %% If syncing, try to use the new peer
+    State3 = case State2#state.status of
+        syncing -> fill_pipeline(State2);
+        _ -> State2
+    end,
+    {noreply, State3};
+
+handle_cast({peer_disconnected, Peer}, State) ->
+    State2 = handle_peer_disconnect(Peer, State),
+    {noreply, State2};
+
+handle_cast(_Msg, State) ->
+    {noreply, State}.
+
+handle_info(stall_check, #state{status = syncing} = State) ->
+    State2 = check_stalls(State),
+    %% Reschedule
+    Timer = erlang:send_after(?STALL_CHECK_INTERVAL, self(), stall_check),
+    State3 = fill_pipeline(State2#state{stall_timer = Timer}),
+    {noreply, State3};
+handle_info(stall_check, State) ->
+    {noreply, State#state{stall_timer = undefined}};
+
+handle_info(progress_tick, #state{status = syncing} = State) ->
+    report_progress(State),
+    Timer = erlang:send_after(?PROGRESS_INTERVAL, self(), progress_tick),
+    {noreply, State#state{progress_timer = Timer}};
+handle_info(progress_tick, State) ->
+    {noreply, State#state{progress_timer = undefined}};
+
+handle_info(_Info, State) ->
+    {noreply, State}.
+
+terminate(_Reason, State) ->
+    cancel_timers(State),
+    ok.
+
+%%% ===================================================================
+%%% Internal: sync lifecycle
+%%% ===================================================================
+
+%% Find the height to start downloading from.
+%% Look at block_index status: status=2 means fully validated,
+%% status=1 means headers-only.
+find_start_height() ->
+    case beamchain_db:get_chain_tip() of
+        {ok, #{height := TipHeight}} ->
+            %% Walk back to find the last fully validated block
+            find_last_validated(TipHeight);
+        not_found ->
+            0
+    end.
+
+find_last_validated(Height) when Height =< 0 ->
+    0;
+find_last_validated(Height) ->
+    case beamchain_db:get_block_index(Height) of
+        {ok, #{status := 2}} ->
+            %% This block is fully validated, start after it
+            Height + 1;
+        _ ->
+            find_last_validated(Height - 1)
+    end.
+
+%% Gather currently connected peers from peer_manager.
+gather_connected_peers() ->
+    AllPeers = beamchain_peer_manager:get_peers(),
+    lists:foldl(fun(PeerMap, Acc) ->
+        case maps:get(connected, PeerMap, false) of
+            true ->
+                Pid = maps:get(pid, PeerMap),
+                Info = maps:get(info, PeerMap, #{}),
+                maps:put(Pid, Info, Acc);
+            false ->
+                Acc
+        end
+    end, #{}, AllPeers).
+
+%%% ===================================================================
+%%% Internal: pipeline fill — request blocks from peers
+%%% ===================================================================
+
+fill_pipeline(#state{status = syncing, download_queue = []} = State) ->
+    %% Queue is empty. Check if we're done.
+    maybe_complete(State);
+
+fill_pipeline(#state{status = syncing} = State) ->
+    %% Get available peers with capacity
+    AvailablePeers = get_available_peers(State),
+    case AvailablePeers of
+        [] ->
+            %% No peers with capacity right now
+            State;
+        _ ->
+            %% Check global in-flight limit
+            TotalInFlight = maps:size(State#state.in_flight),
+            case TotalInFlight >= ?MAX_IN_FLIGHT of
+                true ->
+                    State;
+                false ->
+                    %% Also cap by downloaded-ahead to limit memory
+                    DownloadedAhead = maps:size(State#state.downloaded),
+                    case DownloadedAhead >= ?MAX_DOWNLOADED_AHEAD of
+                        true ->
+                            State;
+                        false ->
+                            assign_blocks_to_peers(AvailablePeers, State)
+                    end
+            end
+    end;
+fill_pipeline(State) ->
+    State.
+
+%% Get peers that have capacity for more in-flight blocks.
+get_available_peers(#state{peer_stats = PeerStats, peers = Peers}) ->
+    lists:filtermap(fun({Pid, Stats}) ->
+        case maps:is_key(Pid, Peers) andalso
+             Stats#peer_stats.in_flight_count < ?MAX_PER_PEER of
+            true -> {true, Pid};
+            false -> false
+        end
+    end, maps:to_list(PeerStats)).
+
+%% Assign blocks from the queue to available peers round-robin.
+assign_blocks_to_peers([], State) ->
+    State;
+assign_blocks_to_peers(_Peers, #state{download_queue = []} = State) ->
+    State;
+assign_blocks_to_peers([Peer | RestPeers],
+                       #state{download_queue = [Height | RestQueue]} = State) ->
+    TotalInFlight = maps:size(State#state.in_flight),
+    case TotalInFlight >= ?MAX_IN_FLIGHT of
+        true ->
+            State;
+        false ->
+            %% Check memory cap
+            DownloadedAhead = maps:size(State#state.downloaded),
+            case DownloadedAhead >= ?MAX_DOWNLOADED_AHEAD of
+                true ->
+                    State;
+                false ->
+                    State2 = request_block(Peer, Height, State#state{
+                        download_queue = RestQueue}),
+                    %% Check if this peer still has capacity
+                    PeerStats = maps:get(Peer, State2#state.peer_stats,
+                                          #peer_stats{}),
+                    NextPeers = case PeerStats#peer_stats.in_flight_count
+                                     < ?MAX_PER_PEER of
+                        true -> RestPeers ++ [Peer];
+                        false -> RestPeers
+                    end,
+                    assign_blocks_to_peers(NextPeers, State2)
+            end
+    end.
+
+%% Send getdata for a specific block height to a peer.
+request_block(Peer, Height,
+              #state{in_flight = InFlight,
+                     peer_stats = AllStats} = State) ->
+    case beamchain_db:get_block_index(Height) of
+        {ok, #{hash := Hash}} ->
+            Now = erlang:monotonic_time(millisecond),
+            %% Request witness block
+            beamchain_peer:send_message(Peer,
+                {getdata, #{items => [{?MSG_WITNESS_BLOCK, Hash}]}}),
+            %% Track in-flight
+            InFlight2 = maps:put(Height, {Peer, Now, Hash}, InFlight),
+            %% Update peer stats
+            Stats = maps:get(Peer, AllStats, #peer_stats{}),
+            Stats2 = Stats#peer_stats{
+                in_flight_count = Stats#peer_stats.in_flight_count + 1
+            },
+            AllStats2 = maps:put(Peer, Stats2, AllStats),
+            State#state{in_flight = InFlight2, peer_stats = AllStats2};
+        not_found ->
+            logger:warning("block_sync: no block index for height ~B",
+                           [Height]),
+            %% Skip this height
+            State
+    end.
+
+%%% ===================================================================
+%%% Internal: block arrival and validation
+%%% ===================================================================
+
+handle_block_received(Peer, Block, State) ->
+    BlockHash = beamchain_serialize:block_hash(Block#block.header),
+
+    %% Find which height this block corresponds to
+    case find_in_flight_by_hash(BlockHash, State#state.in_flight) of
+        {ok, Height, {Peer, RequestedAt, _Hash}} ->
+            Now = erlang:monotonic_time(millisecond),
+            ResponseMs = Now - RequestedAt,
+
+            %% Remove from in_flight
+            InFlight2 = maps:remove(Height, State#state.in_flight),
+
+            %% Update peer stats
+            AllStats = State#state.peer_stats,
+            Stats = maps:get(Peer, AllStats, #peer_stats{}),
+            NewTotal = Stats#peer_stats.total_blocks + 1,
+            NewTotalTime = Stats#peer_stats.total_time_ms + ResponseMs,
+            AvgMs = NewTotalTime div max(1, NewTotal),
+            Stats2 = Stats#peer_stats{
+                in_flight_count = max(0, Stats#peer_stats.in_flight_count - 1),
+                total_blocks = NewTotal,
+                total_time_ms = NewTotalTime,
+                avg_response_ms = AvgMs
+            },
+            AllStats2 = maps:put(Peer, Stats2, AllStats),
+
+            %% Store in downloaded map
+            Downloaded2 = maps:put(Height, Block, State#state.downloaded),
+
+            State2 = State#state{
+                in_flight = InFlight2,
+                peer_stats = AllStats2,
+                downloaded = Downloaded2
+            },
+
+            %% Try to validate as many sequential blocks as possible
+            State3 = validate_sequential(State2),
+
+            %% Fill pipeline with freed capacity
+            fill_pipeline(State3);
+
+        {ok, Height, {_OtherPeer, _RequestedAt, _Hash}} ->
+            %% Block from a different peer than expected (maybe re-assigned)
+            %% Still accept it
+            InFlight2 = maps:remove(Height, State#state.in_flight),
+            Downloaded2 = maps:put(Height, Block, State#state.downloaded),
+
+            %% Decrement old peer's in_flight
+            AllStats = decrement_peer_in_flight(_OtherPeer,
+                                                 State#state.peer_stats),
+            State2 = State#state{
+                in_flight = InFlight2,
+                peer_stats = AllStats,
+                downloaded = Downloaded2
+            },
+            State3 = validate_sequential(State2),
+            fill_pipeline(State3);
+
+        not_found ->
+            %% Unsolicited block, ignore
+            logger:debug("block_sync: unsolicited block ~s from ~p",
+                         [hash_hex(BlockHash), Peer]),
+            State
+    end.
+
+%% Find an in-flight entry by block hash.
+find_in_flight_by_hash(Hash, InFlight) ->
+    maps:fold(fun(Height, {_Peer, _At, H} = Entry, Acc) ->
+        case H =:= Hash of
+            true -> {ok, Height, Entry};
+            false -> Acc
+        end
+    end, not_found, InFlight).
+
+%% Validate blocks sequentially starting from next_to_validate.
+validate_sequential(#state{next_to_validate = NextH,
+                            downloaded = Downloaded} = State) ->
+    case maps:find(NextH, Downloaded) of
+        {ok, Block} ->
+            case validate_and_connect(NextH, Block, State) of
+                {ok, State2} ->
+                    %% Remove from downloaded, advance counter
+                    Downloaded2 = maps:remove(NextH, State2#state.downloaded),
+                    State3 = State2#state{
+                        next_to_validate = NextH + 1,
+                        downloaded = Downloaded2,
+                        blocks_validated = State2#state.blocks_validated + 1
+                    },
+                    %% Continue validating the next one
+                    validate_sequential(State3);
+                {error, Reason} ->
+                    logger:error("block_sync: validation failed at height ~B: ~p",
+                                 [NextH, Reason]),
+                    %% Drop this block, it will need to be re-fetched
+                    Downloaded2 = maps:remove(NextH, State#state.downloaded),
+                    %% Re-queue this height
+                    Queue = [NextH | State#state.download_queue],
+                    State#state{downloaded = Downloaded2,
+                                download_queue = Queue}
+            end;
+        error ->
+            %% Not yet downloaded, nothing to do
+            State
+    end.
+
+%% Validate and connect a single block.
+validate_and_connect(Height, Block, #state{params = Params,
+                                            assume_valid = AssumeValid} = State) ->
+    try
+        %% 1. Context-free block check
+        case beamchain_validation:check_block(Block, Params) of
+            ok -> ok;
+            {error, E1} -> throw(E1)
+        end,
+
+        %% 2. Get previous block index
+        PrevHeight = Height - 1,
+        PrevIndex = case PrevHeight < 0 of
+            true ->
+                %% Genesis block
+                #{height => -1, header => undefined,
+                  chainwork => <<0:256>>, status => 2};
+            false ->
+                case beamchain_db:get_block_index(PrevHeight) of
+                    {ok, PI} -> PI#{height => PrevHeight};
+                    not_found -> throw(missing_prev_block_index)
+                end
+        end,
+
+        %% 3. Check if we should skip script verification (assumevalid)
+        BlockHash = beamchain_serialize:block_hash(Block#block.header),
+        SkipScripts = AssumeValid =/= <<0:256>> andalso
+                      is_below_assume_valid(Height, AssumeValid),
+
+        %% 4. Connect block (full validation + UTXO update)
+        ParamsWithAV = case SkipScripts of
+            true ->
+                %% Set assume_valid to this block's hash so connect_block
+                %% will skip script verification
+                Params#{assume_valid => BlockHash};
+            false ->
+                Params
+        end,
+
+        case beamchain_validation:connect_block(Block, Height, PrevIndex,
+                                                 ParamsWithAV) of
+            ok -> ok;
+            {error, E2} -> throw(E2)
+        end,
+
+        %% 5. Store the block
+        ok = beamchain_db:store_block(Block, Height),
+
+        %% 6. Store tx index entries
+        store_tx_index(Block, Height),
+
+        %% 7. Update block_index status to fully validated (status=2)
+        case beamchain_db:get_block_index(Height) of
+            {ok, #{hash := BH, header := Hdr, chainwork := CW}} ->
+                beamchain_db:store_block_index(Height, BH, Hdr, CW, 2);
+            not_found ->
+                ok
+        end,
+
+        %% 8. Periodic UTXO flush during IBD
+        MaybeFlush = (Height rem ?UTXO_FLUSH_INTERVAL =:= 0),
+        case MaybeFlush of
+            true ->
+                logger:debug("block_sync: utxo checkpoint at height ~B",
+                             [Height]);
+            false ->
+                ok
+        end,
+
+        {ok, State}
+    catch
+        throw:Reason -> {error, Reason};
+        error:Reason:Stack ->
+            logger:error("block_sync: error at height ~B: ~p~n~p",
+                         [Height, Reason, Stack]),
+            {error, Reason}
+    end.
+
+%% Check if a height is below the assumevalid block.
+is_below_assume_valid(Height, AssumeValidHash) ->
+    case beamchain_db:get_block_index_by_hash(AssumeValidHash) of
+        {ok, #{height := AVHeight}} ->
+            Height =< AVHeight;
+        not_found ->
+            %% If we can't find the assumevalid block, don't skip
+            false
+    end.
+
+%% Store transaction index entries for all txs in a block.
+store_tx_index(#block{header = Header, transactions = Txs}, Height) ->
+    BlockHash = beamchain_serialize:block_hash(Header),
+    lists:foldl(fun(Tx, Pos) ->
+        Txid = beamchain_serialize:tx_hash(Tx),
+        beamchain_db:store_tx_index(Txid, BlockHash, Height, Pos),
+        Pos + 1
+    end, 0, Txs).
+
+%%% ===================================================================
+%%% Internal: stall detection
+%%% ===================================================================
+
+check_stalls(#state{in_flight = InFlight} = State) ->
+    Now = erlang:monotonic_time(millisecond),
+    maps:fold(fun(Height, {Peer, RequestedAt, _Hash}, AccState) ->
+        %% Adaptive timeout: base * 2^stall_count
+        PeerStallCount = case maps:get(Peer, AccState#state.peer_stats, undefined) of
+            undefined -> 0;
+            PS -> PS#peer_stats.stall_count
+        end,
+        Timeout = min(?MAX_TIMEOUT_MS,
+                      ?INITIAL_TIMEOUT_MS * (1 bsl PeerStallCount)),
+        Elapsed = Now - RequestedAt,
+        case Elapsed > Timeout of
+            true ->
+                logger:debug("block_sync: stall at height ~B from ~p "
+                             "(~Bms > ~Bms)",
+                             [Height, Peer, Elapsed, Timeout]),
+                handle_stall(Height, Peer, AccState);
+            false ->
+                AccState
+        end
+    end, State, InFlight).
+
+handle_stall(Height, Peer, #state{in_flight = InFlight,
+                                    peer_stats = AllStats} = State) ->
+    %% Remove from in_flight, re-queue
+    InFlight2 = maps:remove(Height, InFlight),
+    Queue = [Height | State#state.download_queue],
+
+    %% Update peer stall count
+    Stats = maps:get(Peer, AllStats, #peer_stats{}),
+    Stats2 = Stats#peer_stats{
+        stall_count = Stats#peer_stats.stall_count + 1,
+        in_flight_count = max(0, Stats#peer_stats.in_flight_count - 1)
+    },
+    AllStats2 = maps:put(Peer, Stats2, AllStats),
+
+    %% If peer has stalled too many times, disconnect
+    case Stats2#peer_stats.stall_count >= 3 of
+        true ->
+            logger:info("block_sync: disconnecting stalling peer ~p", [Peer]),
+            beamchain_peer:disconnect(Peer),
+            %% Re-queue ALL blocks from this peer
+            requeue_peer_blocks(Peer,
+                State#state{in_flight = InFlight2,
+                            download_queue = Queue,
+                            peer_stats = AllStats2});
+        false ->
+            State#state{in_flight = InFlight2,
+                        download_queue = Queue,
+                        peer_stats = AllStats2}
+    end.
+
+%%% ===================================================================
+%%% Internal: peer disconnect handling
+%%% ===================================================================
+
+handle_peer_disconnect(Peer, State) ->
+    %% Re-queue all blocks that were in flight from this peer
+    State2 = requeue_peer_blocks(Peer, State),
+    %% Remove peer from tracking
+    Peers2 = maps:remove(Peer, State2#state.peers),
+    PeerStats2 = maps:remove(Peer, State2#state.peer_stats),
+    State3 = State2#state{peers = Peers2, peer_stats = PeerStats2},
+    case State3#state.status of
+        syncing -> fill_pipeline(State3);
+        _ -> State3
+    end.
+
+%% Re-queue all in-flight blocks from a given peer.
+requeue_peer_blocks(Peer, #state{in_flight = InFlight,
+                                   download_queue = Queue} = State) ->
+    {ReQueued, Remaining} = maps:fold(
+        fun(Height, {P, _At, _Hash}, {RQ, Rem}) when P =:= Peer ->
+            {[Height | RQ], Rem};
+           (Height, Entry, {RQ, Rem}) ->
+            {RQ, maps:put(Height, Entry, Rem)}
+        end, {[], #{}}, InFlight),
+
+    %% Sort re-queued heights and prepend to queue for sequential fetch
+    SortedRQ = lists:sort(ReQueued),
+    State#state{in_flight = Remaining,
+                download_queue = SortedRQ ++ Queue}.
+
+%%% ===================================================================
+%%% Internal: completion check
+%%% ===================================================================
+
+maybe_complete(#state{in_flight = InFlight, downloaded = Downloaded,
+                       download_queue = [], next_to_validate = NextH,
+                       target_height = TargetH} = State) ->
+    case maps:size(InFlight) =:= 0 andalso maps:size(Downloaded) =:= 0
+         andalso NextH > TargetH of
+        true ->
+            logger:info("block_sync: IBD complete at height ~B",
+                        [TargetH]),
+            State2 = cancel_timers(State),
+            report_progress(State2),
+            State2#state{status = complete};
+        false ->
+            %% Still have in-flight or downloaded blocks to process
+            State
+    end;
+maybe_complete(State) ->
+    State.
+
+%%% ===================================================================
+%%% Internal: progress reporting
+%%% ===================================================================
+
+report_progress(#state{progress_cb = undefined}) ->
+    ok;
+report_progress(#state{progress_cb = Cb,
+                         next_to_validate = NextH,
+                         target_height = TargetH,
+                         blocks_validated = Validated,
+                         last_progress_time = LastTime,
+                         last_progress_height = LastHeight,
+                         in_flight = InFlight,
+                         peers = Peers} = _State) ->
+    Now = erlang:monotonic_time(millisecond),
+    Elapsed = max(1, Now - LastTime),
+    BlocksSince = NextH - LastHeight,
+    BlocksPerSec = (BlocksSince * 1000) / max(1, Elapsed),
+    Remaining = max(0, TargetH - NextH + 1),
+    Eta = case BlocksPerSec > 0.1 of
+        true -> round(Remaining / BlocksPerSec);
+        false -> 0
+    end,
+    Progress = case TargetH > 0 of
+        true ->
+            min(100.0, ((NextH - 1) * 100.0) / max(1, TargetH));
+        false ->
+            0.0
+    end,
+    Info = #{
+        phase => block,
+        current_height => NextH - 1,
+        total_height => TargetH,
+        progress_percent => Progress,
+        blocks_per_second => BlocksPerSec,
+        eta_seconds => Eta,
+        peer_count => maps:size(Peers),
+        in_flight_count => maps:size(InFlight),
+        blocks_validated => Validated
+    },
+    try Cb(Info)
+    catch _:_ -> ok
+    end.
+
+%%% ===================================================================
+%%% Internal: helpers
+%%% ===================================================================
+
+cancel_timers(#state{stall_timer = ST, progress_timer = PT} = State) ->
+    case ST of
+        undefined -> ok;
+        _ -> erlang:cancel_timer(ST)
+    end,
+    case PT of
+        undefined -> ok;
+        _ -> erlang:cancel_timer(PT)
+    end,
+    %% Flush timer messages
+    receive stall_check -> ok after 0 -> ok end,
+    receive progress_tick -> ok after 0 -> ok end,
+    State#state{stall_timer = undefined, progress_timer = undefined}.
+
+decrement_peer_in_flight(Peer, AllStats) ->
+    case maps:get(Peer, AllStats, undefined) of
+        undefined -> AllStats;
+        Stats ->
+            Stats2 = Stats#peer_stats{
+                in_flight_count = max(0,
+                    Stats#peer_stats.in_flight_count - 1)
+            },
+            maps:put(Peer, Stats2, AllStats)
+    end.
+
+%% Format a hash as hex for logging (first 8 chars).
+hash_hex(<<H:4/binary, _/binary>>) ->
+    lists:flatten(io_lib:format("~s...", [binary_to_hex_str(H)]));
+hash_hex(_) ->
+    "???".
+
+binary_to_hex_str(Bin) ->
+    lists:flatten([io_lib:format("~2.16.0b", [B]) || <<B:8>> <= Bin]).
