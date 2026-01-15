@@ -20,6 +20,7 @@
          start_sync/1,
          stop_sync/0,
          handle_block/2,
+         handle_notfound/2,
          handle_peer_connected/2,
          handle_peer_disconnected/1,
          get_status/0]).
@@ -127,6 +128,12 @@ stop_sync() ->
 handle_block(Peer, Block) ->
     gen_server:cast(?SERVER, {block, Peer, Block}).
 
+%% @doc Handle a notfound response from a peer.
+%% Re-queues the requested blocks for download from another peer.
+-spec handle_notfound(pid(), [{integer(), binary()}]) -> ok.
+handle_notfound(Peer, Items) ->
+    gen_server:cast(?SERVER, {notfound, Peer, Items}).
+
 %% @doc Peer completed handshake.
 -spec handle_peer_connected(pid(), map()) -> ok.
 handle_peer_connected(Peer, Info) ->
@@ -229,6 +236,13 @@ handle_cast({block, Peer, Block}, #state{status = syncing} = State) ->
     State2 = handle_block_received(Peer, Block, State),
     {noreply, State2};
 handle_cast({block, _Peer, _Block}, State) ->
+    {noreply, State};
+
+handle_cast({notfound, Peer, Items}, #state{status = syncing} = State) ->
+    State2 = handle_notfound_items(Peer, Items, State),
+    State3 = fill_pipeline(State2),
+    {noreply, State3};
+handle_cast({notfound, _Peer, _Items}, State) ->
     {noreply, State};
 
 handle_cast({peer_connected, Peer, Info}, State) ->
@@ -720,6 +734,31 @@ handle_stall(Height, Peer, #state{in_flight = InFlight,
                         download_queue = Queue,
                         peer_stats = AllStats2}
     end.
+
+%%% ===================================================================
+%%% Internal: notfound handling
+%%% ===================================================================
+
+%% Handle notfound response — peer doesn't have the requested blocks.
+%% Re-queue those blocks for download from other peers.
+handle_notfound_items(Peer, Items, State) ->
+    lists:foldl(fun({_Type, Hash}, AccState) ->
+        case find_in_flight_by_hash(Hash, AccState#state.in_flight) of
+            {ok, Height, {Peer, _At, _H}} ->
+                %% Remove from in_flight, re-queue
+                InFlight2 = maps:remove(Height, AccState#state.in_flight),
+                Queue = [Height | AccState#state.download_queue],
+                AllStats = decrement_peer_in_flight(Peer,
+                    AccState#state.peer_stats),
+                AccState#state{
+                    in_flight = InFlight2,
+                    download_queue = Queue,
+                    peer_stats = AllStats
+                };
+            _ ->
+                AccState
+        end
+    end, State, Items).
 
 %%% ===================================================================
 %%% Internal: peer disconnect handling
