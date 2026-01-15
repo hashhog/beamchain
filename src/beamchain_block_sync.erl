@@ -361,63 +361,103 @@ get_available_peers(#state{peer_stats = PeerStats, peers = Peers}) ->
         end
     end, maps:to_list(PeerStats)).
 
-%% Assign blocks from the queue to available peers round-robin.
-assign_blocks_to_peers([], State) ->
+%% Assign blocks from the queue to available peers.
+%% Batches multiple block requests per peer in a single getdata message
+%% for more efficient downloading.
+assign_blocks_to_peers(Peers, State) ->
+    assign_blocks_round_robin(Peers, Peers, State).
+
+assign_blocks_round_robin([], _AllPeers, State) ->
     State;
-assign_blocks_to_peers(_Peers, #state{download_queue = []} = State) ->
+assign_blocks_round_robin(_Peers, _AllPeers,
+                           #state{download_queue = []} = State) ->
     State;
-assign_blocks_to_peers([Peer | RestPeers],
-                       #state{download_queue = [Height | RestQueue]} = State) ->
+assign_blocks_round_robin([Peer | RestPeers], AllPeers, State) ->
     TotalInFlight = maps:size(State#state.in_flight),
-    case TotalInFlight >= ?MAX_IN_FLIGHT of
+    DownloadedAhead = maps:size(State#state.downloaded),
+    case TotalInFlight >= ?MAX_IN_FLIGHT orelse
+         DownloadedAhead >= ?MAX_DOWNLOADED_AHEAD of
         true ->
             State;
         false ->
-            %% Check memory cap
-            DownloadedAhead = maps:size(State#state.downloaded),
-            case DownloadedAhead >= ?MAX_DOWNLOADED_AHEAD of
+            %% How many blocks can this peer take?
+            PeerStats = maps:get(Peer, State#state.peer_stats,
+                                  #peer_stats{}),
+            PeerCapacity = ?MAX_PER_PEER -
+                           PeerStats#peer_stats.in_flight_count,
+            GlobalCapacity = ?MAX_IN_FLIGHT - TotalInFlight,
+            MemCapacity = ?MAX_DOWNLOADED_AHEAD - DownloadedAhead,
+            BatchSize = min(PeerCapacity,
+                            min(GlobalCapacity, MemCapacity)),
+            case BatchSize > 0 of
                 true ->
-                    State;
+                    State2 = request_batch(Peer, BatchSize, State),
+                    assign_blocks_round_robin(RestPeers, AllPeers, State2);
                 false ->
-                    State2 = request_block(Peer, Height, State#state{
-                        download_queue = RestQueue}),
-                    %% Check if this peer still has capacity
-                    PeerStats = maps:get(Peer, State2#state.peer_stats,
-                                          #peer_stats{}),
-                    NextPeers = case PeerStats#peer_stats.in_flight_count
-                                     < ?MAX_PER_PEER of
-                        true -> RestPeers ++ [Peer];
-                        false -> RestPeers
-                    end,
-                    assign_blocks_to_peers(NextPeers, State2)
+                    assign_blocks_round_robin(RestPeers, AllPeers, State)
             end
     end.
 
-%% Send getdata for a specific block height to a peer.
-request_block(Peer, Height,
-              #state{in_flight = InFlight,
+%% Take up to BatchSize heights from the queue and send a batched
+%% getdata message to the peer.
+request_batch(Peer, BatchSize,
+              #state{download_queue = Queue,
+                     in_flight = InFlight,
                      peer_stats = AllStats} = State) ->
-    case beamchain_db:get_block_index(Height) of
-        {ok, #{hash := Hash}} ->
+    {Heights, RestQueue} = take_from_queue(BatchSize, Queue),
+    case Heights of
+        [] ->
+            State;
+        _ ->
             Now = erlang:monotonic_time(millisecond),
-            %% Request witness block
-            beamchain_peer:send_message(Peer,
-                {getdata, #{items => [{?MSG_WITNESS_BLOCK, Hash}]}}),
-            %% Track in-flight
-            InFlight2 = maps:put(Height, {Peer, Now, Hash}, InFlight),
-            %% Update peer stats
-            Stats = maps:get(Peer, AllStats, #peer_stats{}),
-            Stats2 = Stats#peer_stats{
-                in_flight_count = Stats#peer_stats.in_flight_count + 1
-            },
-            AllStats2 = maps:put(Peer, Stats2, AllStats),
-            State#state{in_flight = InFlight2, peer_stats = AllStats2};
-        not_found ->
-            logger:warning("block_sync: no block index for height ~B",
-                           [Height]),
-            %% Skip this height
-            State
+            %% Look up hashes and build getdata items
+            {Items, InFlight2, _Skipped} = lists:foldl(
+                fun(Height, {ItemsAcc, IFAcc, SkipAcc}) ->
+                    case beamchain_db:get_block_index(Height) of
+                        {ok, #{hash := Hash}} ->
+                            Item = {?MSG_WITNESS_BLOCK, Hash},
+                            IF = maps:put(Height, {Peer, Now, Hash}, IFAcc),
+                            {[Item | ItemsAcc], IF, SkipAcc};
+                        not_found ->
+                            logger:warning("block_sync: no block index "
+                                           "for height ~B", [Height]),
+                            {ItemsAcc, IFAcc, SkipAcc + 1}
+                    end
+                end, {[], InFlight, 0}, Heights),
+
+            %% Send getdata with all items at once
+            case Items of
+                [] ->
+                    State#state{download_queue = RestQueue};
+                _ ->
+                    beamchain_peer:send_message(Peer,
+                        {getdata, #{items => lists:reverse(Items)}}),
+                    %% Update peer stats
+                    NumRequested = length(Items),
+                    Stats = maps:get(Peer, AllStats, #peer_stats{}),
+                    Stats2 = Stats#peer_stats{
+                        in_flight_count =
+                            Stats#peer_stats.in_flight_count + NumRequested
+                    },
+                    AllStats2 = maps:put(Peer, Stats2, AllStats),
+                    State#state{
+                        download_queue = RestQueue,
+                        in_flight = InFlight2,
+                        peer_stats = AllStats2
+                    }
+            end
     end.
+
+%% Take up to N items from the front of a list.
+take_from_queue(N, List) ->
+    take_from_queue(N, List, []).
+
+take_from_queue(0, Rest, Acc) ->
+    {lists:reverse(Acc), Rest};
+take_from_queue(_N, [], Acc) ->
+    {lists:reverse(Acc), []};
+take_from_queue(N, [H | T], Acc) ->
+    take_from_queue(N - 1, T, [H | Acc]).
 
 %%% ===================================================================
 %%% Internal: block arrival and validation
