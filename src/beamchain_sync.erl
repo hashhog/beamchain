@@ -156,6 +156,22 @@ route_message(Peer, block, Payload, State) ->
     end,
     State;
 
+route_message(Peer, notfound, Payload, State) ->
+    case beamchain_p2p_msg:decode_payload(notfound, Payload) of
+        {ok, #{items := Items}} ->
+            %% Filter to block items and forward to block_sync
+            BlockItems = [{Type, Hash} || {Type, Hash} <- Items,
+                          Type =:= ?MSG_BLOCK orelse
+                          Type =:= ?MSG_WITNESS_BLOCK],
+            case BlockItems of
+                [] -> ok;
+                _ -> beamchain_block_sync:handle_notfound(Peer, BlockItems)
+            end;
+        _Error ->
+            ok
+    end,
+    State;
+
 route_message(_Peer, inv, _Payload, State) ->
     %% TODO: handle block announcements via inv
     State;
