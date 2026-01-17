@@ -102,7 +102,9 @@
     last_progress_height = 0 :: non_neg_integer(),
 
     %% Assumevalid: block hash below which we skip scripts
-    assume_valid = <<0:256>> :: binary()
+    assume_valid = <<0:256>> :: binary(),
+    %% Cached height of the assumevalid block (avoids repeated DB lookups)
+    assume_valid_height = -1 :: integer()
 }).
 
 %%% ===================================================================
@@ -157,7 +159,10 @@ init([]) ->
     Network = beamchain_config:network(),
     Params = beamchain_chain_params:params(Network),
     AssumeValid = maps:get(assume_valid, Params, <<0:256>>),
-    {ok, #state{params = Params, assume_valid = AssumeValid}}.
+    %% Cache the height of the assumevalid block
+    AVHeight = lookup_assume_valid_height(AssumeValid),
+    {ok, #state{params = Params, assume_valid = AssumeValid,
+                assume_valid_height = AVHeight}}.
 
 handle_call(get_status, _From, State) ->
     Status = #{
@@ -175,7 +180,8 @@ handle_call(get_status, _From, State) ->
 handle_call(_Request, _From, State) ->
     {reply, {error, not_implemented}, State}.
 
-handle_cast({start_sync, Opts}, #state{status = idle} = State) ->
+handle_cast({start_sync, Opts}, #state{status = idle,
+                                         assume_valid = AV} = State) ->
     TargetHeight = maps:get(target_height, Opts, 0),
     ProgressCb = maps:get(progress_cb, Opts, undefined),
 
@@ -189,6 +195,15 @@ handle_cast({start_sync, Opts}, #state{status = idle} = State) ->
     Queue = case TargetHeight > StartHeight of
         true -> lists:seq(StartHeight, TargetHeight);
         false -> []
+    end,
+
+    %% Re-lookup assumevalid height now that headers are synced
+    AVHeight = lookup_assume_valid_height(AV),
+    case AVHeight > 0 of
+        true ->
+            logger:info("block_sync: assumevalid active, skipping scripts "
+                        "below height ~B", [AVHeight]);
+        false -> ok
     end,
 
     %% Gather currently connected peers
@@ -208,7 +223,8 @@ handle_cast({start_sync, Opts}, #state{status = idle} = State) ->
         progress_cb = ProgressCb,
         blocks_validated = 0,
         last_progress_time = Now,
-        last_progress_height = StartHeight
+        last_progress_height = StartHeight,
+        assume_valid_height = AVHeight
     },
 
     %% Start timers
@@ -277,8 +293,13 @@ handle_info(stall_check, State) ->
 
 handle_info(progress_tick, #state{status = syncing} = State) ->
     report_progress(State),
+    Now = erlang:monotonic_time(millisecond),
     Timer = erlang:send_after(?PROGRESS_INTERVAL, self(), progress_tick),
-    {noreply, State#state{progress_timer = Timer}};
+    {noreply, State#state{
+        progress_timer = Timer,
+        last_progress_time = Now,
+        last_progress_height = State#state.next_to_validate
+    }};
 handle_info(progress_tick, State) ->
     {noreply, State#state{progress_timer = undefined}};
 
@@ -583,8 +604,10 @@ validate_sequential(#state{next_to_validate = NextH,
     end.
 
 %% Validate and connect a single block.
-validate_and_connect(Height, Block, #state{params = Params,
-                                            assume_valid = AssumeValid} = State) ->
+validate_and_connect(Height, Block,
+                     #state{params = Params,
+                            assume_valid = AssumeValid,
+                            assume_valid_height = AVHeight} = State) ->
     try
         %% 1. Context-free block check
         case beamchain_validation:check_block(Block, Params) of
@@ -609,7 +632,7 @@ validate_and_connect(Height, Block, #state{params = Params,
         %% 3. Check if we should skip script verification (assumevalid)
         BlockHash = beamchain_serialize:block_hash(Block#block.header),
         SkipScripts = AssumeValid =/= <<0:256>> andalso
-                      is_below_assume_valid(Height, AssumeValid),
+                      AVHeight > 0 andalso Height =< AVHeight,
 
         %% 4. Connect block (full validation + UTXO update)
         ParamsWithAV = case SkipScripts of
@@ -660,14 +683,13 @@ validate_and_connect(Height, Block, #state{params = Params,
             {error, Reason}
     end.
 
-%% Check if a height is below the assumevalid block.
-is_below_assume_valid(Height, AssumeValidHash) ->
-    case beamchain_db:get_block_index_by_hash(AssumeValidHash) of
-        {ok, #{height := AVHeight}} ->
-            Height =< AVHeight;
-        not_found ->
-            %% If we can't find the assumevalid block, don't skip
-            false
+%% Look up the height of the assumevalid block at startup.
+lookup_assume_valid_height(<<0:256>>) ->
+    -1;
+lookup_assume_valid_height(Hash) ->
+    case beamchain_db:get_block_index_by_hash(Hash) of
+        {ok, #{height := H}} -> H;
+        not_found -> -1  %% headers not yet synced, will update later
     end.
 
 %% Store transaction index entries for all txs in a block.
