@@ -664,12 +664,16 @@ validate_and_connect(Height, Block,
                 ok
         end,
 
-        %% 8. Periodic UTXO flush during IBD
-        MaybeFlush = (Height rem ?UTXO_FLUSH_INTERVAL =:= 0),
-        case MaybeFlush of
+        %% 8. Log checkpoint every UTXO_FLUSH_INTERVAL blocks
+        case Height rem ?UTXO_FLUSH_INTERVAL =:= 0 of
             true ->
-                logger:debug("block_sync: utxo checkpoint at height ~B",
-                             [Height]);
+                logger:info("block_sync: checkpoint at height ~B "
+                            "(~s scripts)",
+                            [Height,
+                             case SkipScripts of
+                                 true -> "skipping";
+                                 false -> "verifying"
+                             end]);
             false ->
                 ok
         end,

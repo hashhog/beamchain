@@ -366,6 +366,8 @@ check_sync_complete(#state{peer_heights = PeerHeights,
         false ->
             logger:info("header_sync: sync complete at height ~B",
                         [TipHeight]),
+            %% Notify sync coordinator that headers are done
+            beamchain_sync:notify_headers_complete(TipHeight),
             State#state{status = complete, sync_peer = undefined}
     end.
 
