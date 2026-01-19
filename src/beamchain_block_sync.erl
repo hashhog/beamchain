@@ -69,6 +69,9 @@
     in_flight = #{}        :: #{non_neg_integer() =>
                                 {pid(), integer(), binary()}},
 
+    %% Reverse index: Hash -> Height (for fast block arrival lookup)
+    hash_to_height = #{}   :: #{binary() => non_neg_integer()},
+
     %% Height -> #block{} — downloaded but not yet validated
     downloaded = #{}       :: #{non_neg_integer() => #block{}},
 
@@ -214,6 +217,7 @@ handle_cast({start_sync, Opts}, #state{status = idle,
         status = syncing,
         download_queue = Queue,
         in_flight = #{},
+        hash_to_height = #{},
         downloaded = #{},
         next_to_validate = StartHeight,
         target_height = TargetHeight,
@@ -246,6 +250,7 @@ handle_cast({start_sync, _Opts}, State) ->
 handle_cast(stop_sync, State) ->
     State2 = cancel_timers(State),
     {noreply, State2#state{status = idle, in_flight = #{},
+                            hash_to_height = #{},
                             downloaded = #{}, download_queue = []}};
 
 handle_cast({block, Peer, Block}, #state{status = syncing} = State) ->
@@ -438,6 +443,7 @@ assign_blocks_round_robin([Peer | RestPeers], AllPeers, State) ->
 request_batch(Peer, BatchSize,
               #state{download_queue = Queue,
                      in_flight = InFlight,
+                     hash_to_height = H2H,
                      peer_stats = AllStats} = State) ->
     {Heights, RestQueue} = take_from_queue(BatchSize, Queue),
     case Heights of
@@ -446,24 +452,26 @@ request_batch(Peer, BatchSize,
         _ ->
             Now = erlang:monotonic_time(millisecond),
             %% Look up hashes and build getdata items
-            {Items, InFlight2, _Skipped} = lists:foldl(
-                fun(Height, {ItemsAcc, IFAcc, SkipAcc}) ->
+            {Items, InFlight2, H2H2, _Skipped} = lists:foldl(
+                fun(Height, {ItemsAcc, IFAcc, H2HAcc, SkipAcc}) ->
                     case beamchain_db:get_block_index(Height) of
                         {ok, #{hash := Hash}} ->
                             Item = {?MSG_WITNESS_BLOCK, Hash},
                             IF = maps:put(Height, {Peer, Now, Hash}, IFAcc),
-                            {[Item | ItemsAcc], IF, SkipAcc};
+                            H2HNew = maps:put(Hash, Height, H2HAcc),
+                            {[Item | ItemsAcc], IF, H2HNew, SkipAcc};
                         not_found ->
                             logger:warning("block_sync: no block index "
                                            "for height ~B", [Height]),
-                            {ItemsAcc, IFAcc, SkipAcc + 1}
+                            {ItemsAcc, IFAcc, H2HAcc, SkipAcc + 1}
                     end
-                end, {[], InFlight, 0}, Heights),
+                end, {[], InFlight, H2H, 0}, Heights),
 
             %% Send getdata with all items at once
             case Items of
                 [] ->
-                    State#state{download_queue = RestQueue};
+                    State#state{download_queue = RestQueue,
+                                hash_to_height = H2H2};
                 _ ->
                     beamchain_peer:send_message(Peer,
                         {getdata, #{items => lists:reverse(Items)}}),
@@ -478,6 +486,7 @@ request_batch(Peer, BatchSize,
                     State#state{
                         download_queue = RestQueue,
                         in_flight = InFlight2,
+                        hash_to_height = H2H2,
                         peer_stats = AllStats2
                     }
             end
@@ -501,76 +510,66 @@ take_from_queue(N, [H | T], Acc) ->
 handle_block_received(Peer, Block, State) ->
     BlockHash = beamchain_serialize:block_hash(Block#block.header),
 
-    %% Find which height this block corresponds to
-    case find_in_flight_by_hash(BlockHash, State#state.in_flight) of
-        {ok, Height, {Peer, RequestedAt, _Hash}} ->
-            Now = erlang:monotonic_time(millisecond),
-            ResponseMs = Now - RequestedAt,
+    %% Use hash_to_height reverse index for O(1) lookup
+    case maps:find(BlockHash, State#state.hash_to_height) of
+        {ok, Height} ->
+            %% Remove from reverse index
+            H2H2 = maps:remove(BlockHash, State#state.hash_to_height),
 
-            %% Remove from in_flight
-            InFlight2 = maps:remove(Height, State#state.in_flight),
+            case maps:find(Height, State#state.in_flight) of
+                {ok, {RequestPeer, RequestedAt, _Hash}} ->
+                    Now = erlang:monotonic_time(millisecond),
+                    ResponseMs = Now - RequestedAt,
 
-            %% Update peer stats
-            AllStats = State#state.peer_stats,
-            Stats = maps:get(Peer, AllStats, #peer_stats{}),
-            NewTotal = Stats#peer_stats.total_blocks + 1,
-            NewTotalTime = Stats#peer_stats.total_time_ms + ResponseMs,
-            AvgMs = NewTotalTime div max(1, NewTotal),
-            Stats2 = Stats#peer_stats{
-                in_flight_count = max(0, Stats#peer_stats.in_flight_count - 1),
-                total_blocks = NewTotal,
-                total_time_ms = NewTotalTime,
-                avg_response_ms = AvgMs
-            },
-            AllStats2 = maps:put(Peer, Stats2, AllStats),
+                    %% Remove from in_flight
+                    InFlight2 = maps:remove(Height, State#state.in_flight),
 
-            %% Store in downloaded map
-            Downloaded2 = maps:put(Height, Block, State#state.downloaded),
+                    %% Update requesting peer's stats
+                    AllStats = update_peer_block_received(
+                        RequestPeer, ResponseMs, State#state.peer_stats),
 
-            State2 = State#state{
-                in_flight = InFlight2,
-                peer_stats = AllStats2,
-                downloaded = Downloaded2
-            },
+                    %% Store in downloaded map
+                    Downloaded2 = maps:put(Height, Block,
+                                           State#state.downloaded),
 
-            %% Try to validate as many sequential blocks as possible
-            State3 = validate_sequential(State2),
+                    State2 = State#state{
+                        in_flight = InFlight2,
+                        hash_to_height = H2H2,
+                        peer_stats = AllStats,
+                        downloaded = Downloaded2
+                    },
 
-            %% Fill pipeline with freed capacity
-            fill_pipeline(State3);
+                    %% Try to validate as many sequential blocks as possible
+                    State3 = validate_sequential(State2),
 
-        {ok, Height, {_OtherPeer, _RequestedAt, _Hash}} ->
-            %% Block from a different peer than expected (maybe re-assigned)
-            %% Still accept it
-            InFlight2 = maps:remove(Height, State#state.in_flight),
-            Downloaded2 = maps:put(Height, Block, State#state.downloaded),
+                    %% Fill pipeline with freed capacity
+                    fill_pipeline(State3);
 
-            %% Decrement old peer's in_flight
-            AllStats = decrement_peer_in_flight(_OtherPeer,
-                                                 State#state.peer_stats),
-            State2 = State#state{
-                in_flight = InFlight2,
-                peer_stats = AllStats,
-                downloaded = Downloaded2
-            },
-            State3 = validate_sequential(State2),
-            fill_pipeline(State3);
+                error ->
+                    %% Height was in hash index but not in_flight (race)
+                    State#state{hash_to_height = H2H2}
+            end;
 
-        not_found ->
+        error ->
             %% Unsolicited block, ignore
             logger:debug("block_sync: unsolicited block ~s from ~p",
                          [hash_hex(BlockHash), Peer]),
             State
     end.
 
-%% Find an in-flight entry by block hash.
-find_in_flight_by_hash(Hash, InFlight) ->
-    maps:fold(fun(Height, {_Peer, _At, H} = Entry, Acc) ->
-        case H =:= Hash of
-            true -> {ok, Height, Entry};
-            false -> Acc
-        end
-    end, not_found, InFlight).
+%% Update peer stats after receiving a block.
+update_peer_block_received(Peer, ResponseMs, AllStats) ->
+    Stats = maps:get(Peer, AllStats, #peer_stats{}),
+    NewTotal = Stats#peer_stats.total_blocks + 1,
+    NewTotalTime = Stats#peer_stats.total_time_ms + ResponseMs,
+    AvgMs = NewTotalTime div max(1, NewTotal),
+    Stats2 = Stats#peer_stats{
+        in_flight_count = max(0, Stats#peer_stats.in_flight_count - 1),
+        total_blocks = NewTotal,
+        total_time_ms = NewTotalTime,
+        avg_response_ms = AvgMs
+    },
+    maps:put(Peer, Stats2, AllStats).
 
 %% Validate blocks sequentially starting from next_to_validate.
 validate_sequential(#state{next_to_validate = NextH,
@@ -732,9 +731,18 @@ check_stalls(#state{in_flight = InFlight} = State) ->
     end, State, InFlight).
 
 handle_stall(Height, Peer, #state{in_flight = InFlight,
+                                    hash_to_height = H2H,
                                     peer_stats = AllStats} = State) ->
-    %% Remove from in_flight, re-queue
+    %% Remove from in_flight and reverse index, re-queue
+    StallHash = case maps:get(Height, InFlight, undefined) of
+        {_, _, H} -> H;
+        _ -> undefined
+    end,
     InFlight2 = maps:remove(Height, InFlight),
+    H2H2 = case StallHash of
+        undefined -> H2H;
+        _ -> maps:remove(StallHash, H2H)
+    end,
     Queue = [Height | State#state.download_queue],
 
     %% Update peer stall count
@@ -753,10 +761,12 @@ handle_stall(Height, Peer, #state{in_flight = InFlight,
             %% Re-queue ALL blocks from this peer
             requeue_peer_blocks(Peer,
                 State#state{in_flight = InFlight2,
+                            hash_to_height = H2H2,
                             download_queue = Queue,
                             peer_stats = AllStats2});
         false ->
             State#state{in_flight = InFlight2,
+                        hash_to_height = H2H2,
                         download_queue = Queue,
                         peer_stats = AllStats2}
     end.
@@ -769,19 +779,21 @@ handle_stall(Height, Peer, #state{in_flight = InFlight,
 %% Re-queue those blocks for download from other peers.
 handle_notfound_items(Peer, Items, State) ->
     lists:foldl(fun({_Type, Hash}, AccState) ->
-        case find_in_flight_by_hash(Hash, AccState#state.in_flight) of
-            {ok, Height, {Peer, _At, _H}} ->
-                %% Remove from in_flight, re-queue
+        case maps:find(Hash, AccState#state.hash_to_height) of
+            {ok, Height} ->
+                %% Remove from in_flight and reverse index, re-queue
                 InFlight2 = maps:remove(Height, AccState#state.in_flight),
+                H2H2 = maps:remove(Hash, AccState#state.hash_to_height),
                 Queue = [Height | AccState#state.download_queue],
                 AllStats = decrement_peer_in_flight(Peer,
                     AccState#state.peer_stats),
                 AccState#state{
                     in_flight = InFlight2,
+                    hash_to_height = H2H2,
                     download_queue = Queue,
                     peer_stats = AllStats
                 };
-            _ ->
+            error ->
                 AccState
         end
     end, State, Items).
@@ -804,17 +816,19 @@ handle_peer_disconnect(Peer, State) ->
 
 %% Re-queue all in-flight blocks from a given peer.
 requeue_peer_blocks(Peer, #state{in_flight = InFlight,
+                                   hash_to_height = H2H,
                                    download_queue = Queue} = State) ->
-    {ReQueued, Remaining} = maps:fold(
-        fun(Height, {P, _At, _Hash}, {RQ, Rem}) when P =:= Peer ->
-            {[Height | RQ], Rem};
-           (Height, Entry, {RQ, Rem}) ->
-            {RQ, maps:put(Height, Entry, Rem)}
-        end, {[], #{}}, InFlight),
+    {ReQueued, Remaining, H2H2} = maps:fold(
+        fun(Height, {P, _At, Hash}, {RQ, Rem, H2HAcc}) when P =:= Peer ->
+            {[Height | RQ], Rem, maps:remove(Hash, H2HAcc)};
+           (Height, Entry, {RQ, Rem, H2HAcc}) ->
+            {RQ, maps:put(Height, Entry, Rem), H2HAcc}
+        end, {[], #{}, H2H}, InFlight),
 
     %% Sort re-queued heights and prepend to queue for sequential fetch
     SortedRQ = lists:sort(ReQueued),
     State#state{in_flight = Remaining,
+                hash_to_height = H2H2,
                 download_queue = SortedRQ ++ Queue}.
 
 %%% ===================================================================
