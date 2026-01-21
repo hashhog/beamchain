@@ -13,6 +13,7 @@
 -export([handle_peer_message/3]).
 -export([notify_peer_connected/2, notify_peer_disconnected/1]).
 -export([notify_headers_complete/1]).
+-export([notify_blocks_complete/1]).
 -export([get_sync_status/0]).
 
 %% gen_server callbacks
@@ -60,6 +61,11 @@ notify_peer_disconnected(Peer) ->
 -spec notify_headers_complete(non_neg_integer()) -> ok.
 notify_headers_complete(TipHeight) ->
     gen_server:cast(?SERVER, {headers_complete, TipHeight}).
+
+%% @doc Notify that block sync has completed.
+-spec notify_blocks_complete(non_neg_integer()) -> ok.
+notify_blocks_complete(Height) ->
+    gen_server:cast(?SERVER, {blocks_complete, Height}).
 
 %% @doc Get overall sync status.
 -spec get_sync_status() -> map().
@@ -110,6 +116,13 @@ handle_cast({headers_complete, TipHeight}, #state{phase = headers} = State) ->
     State3 = start_block_sync(TipHeight, State2),
     {noreply, State3};
 handle_cast({headers_complete, _TipHeight}, State) ->
+    {noreply, State};
+
+%% Block sync completed
+handle_cast({blocks_complete, Height}, #state{phase = blocks} = State) ->
+    logger:info("sync: block download complete at height ~B", [Height]),
+    {noreply, State#state{phase = complete}};
+handle_cast({blocks_complete, _Height}, State) ->
     {noreply, State};
 
 %% Route peer messages to the right handler
