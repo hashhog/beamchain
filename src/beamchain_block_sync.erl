@@ -845,6 +845,8 @@ maybe_complete(#state{in_flight = InFlight, downloaded = Downloaded,
                         [TargetH]),
             State2 = cancel_timers(State),
             report_progress(State2),
+            %% Notify sync coordinator
+            beamchain_sync:notify_blocks_complete(TargetH),
             State2#state{status = complete};
         false ->
             %% Still have in-flight or downloaded blocks to process
