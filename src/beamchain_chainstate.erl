@@ -13,6 +13,9 @@
 %% Chain queries
 -export([get_tip/0, get_mtp/0, is_synced/0]).
 
+%% UTXO cache — module functions (direct ETS access, no gen_server call)
+-export([get_utxo/2, has_utxo/2, add_utxo/3, spend_utxo/2]).
+
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2]).
@@ -73,6 +76,63 @@ get_mtp() ->
 -spec is_synced() -> boolean().
 is_synced() ->
     gen_server:call(?SERVER, is_synced).
+
+%%% ===================================================================
+%%% UTXO cache (public ETS, called from any process)
+%%% ===================================================================
+
+%% @doc Look up a UTXO. Checks ETS cache first, falls through to RocksDB.
+-spec get_utxo(binary(), non_neg_integer()) -> {ok, #utxo{}} | not_found.
+get_utxo(Txid, Vout) ->
+    Key = {Txid, Vout},
+    case ets:lookup(?UTXO_CACHE, Key) of
+        [{Key, Utxo}] ->
+            {ok, Utxo};
+        [] ->
+            %% Fall through to RocksDB
+            case beamchain_db:get_utxo(Txid, Vout) of
+                {ok, Utxo} ->
+                    %% Cache for future lookups
+                    ets:insert(?UTXO_CACHE, {Key, Utxo}),
+                    {ok, Utxo};
+                not_found ->
+                    not_found
+            end
+    end.
+
+%% @doc Check if a UTXO exists. Checks ETS first.
+-spec has_utxo(binary(), non_neg_integer()) -> boolean().
+has_utxo(Txid, Vout) ->
+    Key = {Txid, Vout},
+    case ets:member(?UTXO_CACHE, Key) of
+        true -> true;
+        false -> beamchain_db:has_utxo(Txid, Vout)
+    end.
+
+%% @doc Add a UTXO to the cache. Write-through to RocksDB.
+-spec add_utxo(binary(), non_neg_integer(), #utxo{}) -> ok.
+add_utxo(Txid, Vout, Utxo) ->
+    Key = {Txid, Vout},
+    ets:insert(?UTXO_CACHE, {Key, Utxo}),
+    %% Write-through: also persist to DB for durability
+    beamchain_db:store_utxo(Txid, Vout, Utxo),
+    ok.
+
+%% @doc Spend (remove) a UTXO from the cache and DB.
+%% Returns the spent UTXO for undo data.
+-spec spend_utxo(binary(), non_neg_integer()) -> {ok, #utxo{}} | not_found.
+spend_utxo(Txid, Vout) ->
+    Key = {Txid, Vout},
+    case ets:lookup(?UTXO_CACHE, Key) of
+        [{Key, Utxo}] ->
+            ets:delete(?UTXO_CACHE, Key),
+            %% Also remove from DB
+            beamchain_db:spend_utxo(Txid, Vout),
+            {ok, Utxo};
+        [] ->
+            %% Not in cache, pass through to DB
+            beamchain_db:spend_utxo(Txid, Vout)
+    end.
 
 %%% ===================================================================
 %%% gen_server callbacks
