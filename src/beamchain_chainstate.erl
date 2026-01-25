@@ -16,6 +16,9 @@
 %% UTXO cache — module functions (direct ETS access, no gen_server call)
 -export([get_utxo/2, has_utxo/2, add_utxo/3, spend_utxo/2]).
 
+%% Block connection
+-export([connect_block/1]).
+
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2]).
@@ -76,6 +79,12 @@ get_mtp() ->
 -spec is_synced() -> boolean().
 is_synced() ->
     gen_server:call(?SERVER, is_synced).
+
+%% @doc Connect a block to the chain tip.
+%% Validates the block, updates UTXOs, and advances the tip.
+-spec connect_block(#block{}) -> ok | {error, term()}.
+connect_block(Block) ->
+    gen_server:call(?SERVER, {connect_block, Block}, 60000).
 
 %%% ===================================================================
 %%% UTXO cache (public ETS, called from any process)
@@ -181,6 +190,14 @@ handle_call(is_synced, _From, #state{mtp_timestamps = Ts} = State) ->
     Now = erlang:system_time(second),
     {reply, (Now - Latest) < 3600, State};
 
+handle_call({connect_block, Block}, _From, State) ->
+    case do_connect_block(Block, State) of
+        {ok, State2} ->
+            {reply, ok, State2};
+        {error, Reason} ->
+            {reply, {error, Reason}, State}
+    end;
+
 handle_call(_Request, _From, State) ->
     {reply, {error, not_implemented}, State}.
 
@@ -224,6 +241,77 @@ collect_timestamps(Height, N, Acc) ->
         not_found ->
             Acc
     end.
+
+%%% ===================================================================
+%%% Internal: connect block
+%%% ===================================================================
+
+do_connect_block(#block{header = Header} = Block,
+                 #state{tip_height = TipHeight, params = Params} = State) ->
+    Height = TipHeight + 1,
+
+    %% Build PrevIndex for validation
+    PrevIndex = case TipHeight < 0 of
+        true ->
+            %% Genesis block — no previous block
+            #{height => -1, header => undefined,
+              chainwork => <<0:256>>, status => 2};
+        false ->
+            case beamchain_db:get_block_index(TipHeight) of
+                {ok, PI} -> PI#{height => TipHeight};
+                not_found -> error({missing_prev_index, TipHeight})
+            end
+    end,
+
+    %% Full consensus validation + UTXO update
+    case beamchain_validation:connect_block(Block, Height, PrevIndex, Params) of
+        ok ->
+            BlockHash = beamchain_serialize:block_hash(Header),
+
+            %% Update chain tip in ETS for fast reads
+            ets:insert(?CHAIN_META, {tip, BlockHash, Height}),
+
+            %% Update MTP sliding window
+            NewMTP = update_mtp_connect(Header#block_header.timestamp,
+                                         State#state.mtp_timestamps),
+
+            BlocksSinceFlush = State#state.blocks_since_flush + 1,
+            State2 = State#state{
+                tip_hash = BlockHash,
+                tip_height = Height,
+                mtp_timestamps = NewMTP,
+                blocks_since_flush = BlocksSinceFlush
+            },
+            State3 = maybe_check_ibd(State2),
+            {ok, State3};
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% Append a new timestamp to the MTP window, keeping at most 11.
+update_mtp_connect(Timestamp, Timestamps) ->
+    Updated = Timestamps ++ [Timestamp],
+    case length(Updated) > 11 of
+        true -> tl(Updated);
+        false -> Updated
+    end.
+
+%% Check if we've left IBD based on the tip timestamp.
+maybe_check_ibd(#state{mtp_timestamps = []} = State) ->
+    State;
+maybe_check_ibd(#state{ibd = true, mtp_timestamps = Ts} = State) ->
+    Latest = lists:last(Ts),
+    Now = erlang:system_time(second),
+    case (Now - Latest) < 3600 of
+        true ->
+            logger:info("chainstate: leaving IBD at height ~B",
+                        [State#state.tip_height]),
+            State#state{ibd = false};
+        false ->
+            State
+    end;
+maybe_check_ibd(State) ->
+    State.
 
 %%% ===================================================================
 %%% Internal: MTP computation
