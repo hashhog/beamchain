@@ -788,7 +788,7 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
                 true -> ok;
                 false ->
                     lists:foreach(fun(#tx_in{prev_out = #outpoint{hash = H, index = I}}) ->
-                        beamchain_db:spend_utxo(H, I)
+                        beamchain_chainstate:spend_utxo(H, I)
                     end, Tx#transaction.inputs)
             end
         end, Txs),
@@ -804,7 +804,7 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
                     is_coinbase = IsCb,
                     height = Height
                 },
-                beamchain_db:store_utxo(Txid, Idx, Utxo),
+                beamchain_chainstate:add_utxo(Txid, Idx, Utxo),
                 Idx + 1
             end, 0, Tx#transaction.outputs)
         end, Txs),
@@ -822,9 +822,10 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
     end.
 
 %% @doc Fetch UTXO coins for all inputs of a transaction.
+%% Uses the chainstate ETS cache with RocksDB fallback.
 fetch_input_coins(#transaction{inputs = Inputs}) ->
     lists:map(fun(#tx_in{prev_out = #outpoint{hash = H, index = I}}) ->
-        case beamchain_db:get_utxo(H, I) of
+        case beamchain_chainstate:get_utxo(H, I) of
             {ok, Coin} -> Coin;
             not_found -> throw(missing_inputs)
         end
@@ -833,7 +834,7 @@ fetch_input_coins(#transaction{inputs = Inputs}) ->
 %% @doc Check BIP 30: no existing unspent outputs for this txid.
 check_no_existing_outputs(Txid, NumOutputs) ->
     lists:foreach(fun(Idx) ->
-        case beamchain_db:has_utxo(Txid, Idx) of
+        case beamchain_chainstate:has_utxo(Txid, Idx) of
             true -> throw(duplicate_txid);
             false -> ok
         end
@@ -966,7 +967,7 @@ disconnect_block(#block{header = Header, transactions = Txs},
             %% 2a. remove created outputs from UTXO set
             NumOutputs = length(Tx#transaction.outputs),
             lists:foreach(fun(Idx) ->
-                beamchain_db:spend_utxo(Txid, Idx)
+                beamchain_chainstate:spend_utxo(Txid, Idx)
             end, lists:seq(0, NumOutputs - 1)),
 
             %% 2b. restore spent inputs from undo data
@@ -980,7 +981,7 @@ disconnect_block(#block{header = Header, transactions = Txs},
                     %% (since we're processing in reverse)
                     {ToRestore, Rest} = split_last_n(RemainingUndo, NumInputs),
                     lists:foreach(fun({#outpoint{hash = H, index = I}, Coin}) ->
-                        beamchain_db:store_utxo(H, I, Coin)
+                        beamchain_chainstate:add_utxo(H, I, Coin)
                     end, ToRestore),
                     Rest
             end
