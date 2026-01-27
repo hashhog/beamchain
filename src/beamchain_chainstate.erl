@@ -16,8 +16,8 @@
 %% UTXO cache — module functions (direct ETS access, no gen_server call)
 -export([get_utxo/2, has_utxo/2, add_utxo/3, spend_utxo/2]).
 
-%% Block connection
--export([connect_block/1]).
+%% Block connection / disconnection
+-export([connect_block/1, disconnect_block/0, reorganize/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -85,6 +85,20 @@ is_synced() ->
 -spec connect_block(#block{}) -> ok | {error, term()}.
 connect_block(Block) ->
     gen_server:call(?SERVER, {connect_block, Block}, 60000).
+
+%% @doc Disconnect the current tip block.
+%% Restores spent UTXOs from undo data and moves the tip back one.
+-spec disconnect_block() -> ok | {error, term()}.
+disconnect_block() ->
+    gen_server:call(?SERVER, disconnect_block, 30000).
+
+%% @doc Reorganize to a new chain.
+%% NewBlocks = ordered list from fork point+1 to new tip.
+%% Returns {ok, DisconnectedTxs} where DisconnectedTxs are the
+%% non-coinbase transactions from the disconnected blocks (for mempool).
+-spec reorganize([#block{}]) -> {ok, [#transaction{}]} | {error, term()}.
+reorganize(NewBlocks) ->
+    gen_server:call(?SERVER, {reorganize, NewBlocks}, 120000).
 
 %%% ===================================================================
 %%% UTXO cache (public ETS, called from any process)
@@ -194,6 +208,22 @@ handle_call({connect_block, Block}, _From, State) ->
     case do_connect_block(Block, State) of
         {ok, State2} ->
             {reply, ok, State2};
+        {error, Reason} ->
+            {reply, {error, Reason}, State}
+    end;
+
+handle_call(disconnect_block, _From, State) ->
+    case do_disconnect_block(State) of
+        {ok, State2} ->
+            {reply, ok, State2};
+        {error, Reason} ->
+            {reply, {error, Reason}, State}
+    end;
+
+handle_call({reorganize, NewBlocks}, _From, State) ->
+    case do_reorganize(NewBlocks, State) of
+        {ok, State2, DisconnectedTxs} ->
+            {reply, {ok, DisconnectedTxs}, State2};
         {error, Reason} ->
             {reply, {error, Reason}, State}
     end;
@@ -312,6 +342,141 @@ maybe_check_ibd(#state{ibd = true, mtp_timestamps = Ts} = State) ->
     end;
 maybe_check_ibd(State) ->
     State.
+
+%%% ===================================================================
+%%% Internal: disconnect block
+%%% ===================================================================
+
+do_disconnect_block(#state{tip_hash = undefined}) ->
+    {error, no_tip};
+do_disconnect_block(#state{tip_hash = TipHash, tip_height = TipHeight,
+                            params = Params} = State) ->
+    %% Get the tip block from DB
+    case beamchain_db:get_block(TipHash) of
+        {ok, Block} ->
+            %% Call validation to reverse the block's UTXO changes
+            case beamchain_validation:disconnect_block(Block, TipHeight, Params) of
+                ok ->
+                    %% Move tip back to previous block
+                    PrevHash = Block#block.header#block_header.prev_hash,
+                    PrevHeight = TipHeight - 1,
+
+                    ets:insert(?CHAIN_META, {tip, PrevHash, PrevHeight}),
+                    beamchain_db:set_chain_tip(PrevHash, PrevHeight),
+
+                    %% Update MTP: drop newest, restore oldest if possible
+                    NewMTP = update_mtp_disconnect(PrevHeight,
+                                                    State#state.mtp_timestamps),
+
+                    {ok, State#state{
+                        tip_hash = PrevHash,
+                        tip_height = PrevHeight,
+                        mtp_timestamps = NewMTP
+                    }};
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        not_found ->
+            {error, tip_block_not_found}
+    end.
+
+%% Remove the newest timestamp from MTP window and try to restore
+%% the oldest one that fell off when we connected this block.
+update_mtp_disconnect(_NewTipHeight, []) ->
+    [];
+update_mtp_disconnect(NewTipHeight, Timestamps) ->
+    %% Drop the last timestamp (the disconnected block's)
+    Trimmed = lists:sublist(Timestamps, length(Timestamps) - 1),
+    %% Try to restore the timestamp that was dropped when this block
+    %% was originally connected. It would be at height NewTipHeight - 10.
+    RestoreHeight = NewTipHeight - 10,
+    case RestoreHeight >= 0 of
+        true ->
+            case beamchain_db:get_block_index(RestoreHeight) of
+                {ok, #{header := Hdr}} ->
+                    [Hdr#block_header.timestamp | Trimmed];
+                not_found ->
+                    Trimmed
+            end;
+        false ->
+            Trimmed
+    end.
+
+%%% ===================================================================
+%%% Internal: chain reorganization
+%%% ===================================================================
+
+%% Reorganize the chain to include NewBlocks.
+%% NewBlocks must be ordered from fork_point+1 to new tip.
+do_reorganize([], State) ->
+    {ok, State, []};
+do_reorganize(NewBlocks, State) ->
+    %% The first new block's prev_hash is our fork point
+    [FirstBlock | _] = NewBlocks,
+    ForkHash = FirstBlock#block.header#block_header.prev_hash,
+
+    logger:info("chainstate: reorganizing to fork point ~s",
+                [hash_hex(ForkHash)]),
+
+    %% Step 1: disconnect blocks from current tip back to fork point
+    case disconnect_to(ForkHash, State, []) of
+        {ok, State2, DisconnectedTxs} ->
+            logger:info("chainstate: disconnected ~B blocks, connecting ~B new",
+                        [length(DisconnectedTxs), length(NewBlocks)]),
+
+            %% Step 2: connect the new chain
+            case connect_blocks(NewBlocks, State2) of
+                {ok, State3} ->
+                    {ok, State3, DisconnectedTxs};
+                {error, Reason} ->
+                    %% Failed to connect new chain — critical error.
+                    %% In a production node we'd try to reconnect the old chain.
+                    logger:error("chainstate: reorg failed on connect: ~p",
+                                 [Reason]),
+                    {error, {reorg_connect_failed, Reason}}
+            end;
+        {error, Reason} ->
+            {error, {reorg_disconnect_failed, Reason}}
+    end.
+
+%% Disconnect blocks until tip_hash == TargetHash.
+disconnect_to(TargetHash, #state{tip_hash = TargetHash} = State, AccTxs) ->
+    {ok, State, AccTxs};
+disconnect_to(_TargetHash, #state{tip_height = H} = _State, _AccTxs)
+  when H < 0 ->
+    {error, fork_point_not_found};
+disconnect_to(TargetHash, State, AccTxs) ->
+    %% Get the tip block to collect its transactions
+    case beamchain_db:get_block(State#state.tip_hash) of
+        {ok, Block} ->
+            %% Collect non-coinbase txs for mempool re-submission
+            NonCbTxs = [Tx || Tx <- Block#block.transactions,
+                         not beamchain_validation:is_coinbase_tx(Tx)],
+            case do_disconnect_block(State) of
+                {ok, State2} ->
+                    disconnect_to(TargetHash, State2, AccTxs ++ NonCbTxs);
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        not_found ->
+            {error, tip_block_not_found}
+    end.
+
+%% Connect a list of blocks in order.
+connect_blocks([], State) ->
+    {ok, State};
+connect_blocks([Block | Rest], State) ->
+    case do_connect_block(Block, State) of
+        {ok, State2} ->
+            connect_blocks(Rest, State2);
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% Format hash for logging.
+hash_hex(<<H:4/binary, _/binary>>) ->
+    lists:flatten([io_lib:format("~2.16.0b", [B]) || <<B:8>> <= H]) ++ "...";
+hash_hex(_) -> "???".
 
 %%% ===================================================================
 %%% Internal: MTP computation
