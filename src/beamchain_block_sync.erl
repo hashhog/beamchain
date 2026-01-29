@@ -603,6 +603,8 @@ validate_sequential(#state{next_to_validate = NextH,
     end.
 
 %% Validate and connect a single block.
+%% Delegates to beamchain_chainstate which manages the UTXO cache,
+%% then stores block data and updates the block index.
 validate_and_connect(Height, Block,
                      #state{params = Params,
                             assume_valid = AssumeValid,
@@ -614,48 +616,19 @@ validate_and_connect(Height, Block,
             {error, E1} -> throw(E1)
         end,
 
-        %% 2. Get previous block index
-        PrevHeight = Height - 1,
-        PrevIndex = case PrevHeight < 0 of
-            true ->
-                %% Genesis block
-                #{height => -1, header => undefined,
-                  chainwork => <<0:256>>, status => 2};
-            false ->
-                case beamchain_db:get_block_index(PrevHeight) of
-                    {ok, PI} -> PI#{height => PrevHeight};
-                    not_found -> throw(missing_prev_block_index)
-                end
-        end,
-
-        %% 3. Check if we should skip script verification (assumevalid)
-        BlockHash = beamchain_serialize:block_hash(Block#block.header),
-        SkipScripts = AssumeValid =/= <<0:256>> andalso
-                      AVHeight > 0 andalso Height =< AVHeight,
-
-        %% 4. Connect block (full validation + UTXO update)
-        ParamsWithAV = case SkipScripts of
-            true ->
-                %% Set assume_valid to this block's hash so connect_block
-                %% will skip script verification
-                Params#{assume_valid => BlockHash};
-            false ->
-                Params
-        end,
-
-        case beamchain_validation:connect_block(Block, Height, PrevIndex,
-                                                 ParamsWithAV) of
+        %% 2. Connect block via chainstate (validation + UTXO update + tip)
+        case beamchain_chainstate:connect_block(Block) of
             ok -> ok;
             {error, E2} -> throw(E2)
         end,
 
-        %% 5. Store the block
+        %% 3. Store the block
         ok = beamchain_db:store_block(Block, Height),
 
-        %% 6. Store tx index entries
+        %% 4. Store tx index entries
         store_tx_index(Block, Height),
 
-        %% 7. Update block_index status to fully validated (status=2)
+        %% 5. Update block_index status to fully validated (status=2)
         case beamchain_db:get_block_index(Height) of
             {ok, #{hash := BH, header := Hdr, chainwork := CW}} ->
                 beamchain_db:store_block_index(Height, BH, Hdr, CW, 2);
@@ -663,7 +636,9 @@ validate_and_connect(Height, Block,
                 ok
         end,
 
-        %% 8. Log checkpoint every UTXO_FLUSH_INTERVAL blocks
+        %% 6. Log checkpoint every UTXO_FLUSH_INTERVAL blocks
+        SkipScripts = AssumeValid =/= <<0:256>> andalso
+                      AVHeight > 0 andalso Height =< AVHeight,
         case Height rem ?UTXO_FLUSH_INTERVAL =:= 0 of
             true ->
                 logger:info("block_sync: checkpoint at height ~B "
