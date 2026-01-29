@@ -19,6 +19,9 @@
 %% Block connection / disconnection
 -export([connect_block/1, disconnect_block/0, reorganize/1]).
 
+%% Flush
+-export([flush/0]).
+
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2]).
@@ -27,6 +30,8 @@
 
 %% ETS table names
 -define(UTXO_CACHE, beamchain_utxo_cache).
+-define(UTXO_DIRTY, beamchain_utxo_dirty).
+-define(UTXO_SPENT, beamchain_utxo_spent).
 -define(CHAIN_META, beamchain_chain_meta).
 
 %% Flush tuning
@@ -100,8 +105,18 @@ disconnect_block() ->
 reorganize(NewBlocks) ->
     gen_server:call(?SERVER, {reorganize, NewBlocks}, 120000).
 
+%% @doc Flush dirty UTXO cache entries to RocksDB.
+-spec flush() -> ok.
+flush() ->
+    gen_server:call(?SERVER, flush, 60000).
+
 %%% ===================================================================
 %%% UTXO cache (public ETS, called from any process)
+%%%
+%%% Write-behind strategy: new/modified UTXOs are written only to ETS
+%%% and tracked in UTXO_DIRTY. Spent UTXOs are tracked in UTXO_SPENT.
+%%% Periodically (or on shutdown) we flush dirty entries to RocksDB
+%%% and delete spent entries from RocksDB in a single WriteBatch.
 %%% ===================================================================
 
 %% @doc Look up a UTXO. Checks ETS cache first, falls through to RocksDB.
@@ -112,14 +127,20 @@ get_utxo(Txid, Vout) ->
         [{Key, Utxo}] ->
             {ok, Utxo};
         [] ->
-            %% Fall through to RocksDB
-            case beamchain_db:get_utxo(Txid, Vout) of
-                {ok, Utxo} ->
-                    %% Cache for future lookups
-                    ets:insert(?UTXO_CACHE, {Key, Utxo}),
-                    {ok, Utxo};
-                not_found ->
-                    not_found
+            %% If it was spent in cache (pending flush), it's gone
+            case ets:member(?UTXO_SPENT, Key) of
+                true ->
+                    not_found;
+                false ->
+                    %% Fall through to RocksDB
+                    case beamchain_db:get_utxo(Txid, Vout) of
+                        {ok, Utxo} ->
+                            %% Cache for future lookups
+                            ets:insert(?UTXO_CACHE, {Key, Utxo}),
+                            {ok, Utxo};
+                        not_found ->
+                            not_found
+                    end
             end
     end.
 
@@ -129,19 +150,24 @@ has_utxo(Txid, Vout) ->
     Key = {Txid, Vout},
     case ets:member(?UTXO_CACHE, Key) of
         true -> true;
-        false -> beamchain_db:has_utxo(Txid, Vout)
+        false ->
+            case ets:member(?UTXO_SPENT, Key) of
+                true -> false;
+                false -> beamchain_db:has_utxo(Txid, Vout)
+            end
     end.
 
-%% @doc Add a UTXO to the cache. Write-through to RocksDB.
+%% @doc Add a UTXO to the cache (write-behind, not persisted until flush).
 -spec add_utxo(binary(), non_neg_integer(), #utxo{}) -> ok.
 add_utxo(Txid, Vout, Utxo) ->
     Key = {Txid, Vout},
     ets:insert(?UTXO_CACHE, {Key, Utxo}),
-    %% Write-through: also persist to DB for durability
-    beamchain_db:store_utxo(Txid, Vout, Utxo),
+    ets:insert(?UTXO_DIRTY, {Key}),
+    %% If it was pending a DB delete, cancel that
+    ets:delete(?UTXO_SPENT, Key),
     ok.
 
-%% @doc Spend (remove) a UTXO from the cache and DB.
+%% @doc Spend (remove) a UTXO from the cache.
 %% Returns the spent UTXO for undo data.
 -spec spend_utxo(binary(), non_neg_integer()) -> {ok, #utxo{}} | not_found.
 spend_utxo(Txid, Vout) ->
@@ -149,12 +175,25 @@ spend_utxo(Txid, Vout) ->
     case ets:lookup(?UTXO_CACHE, Key) of
         [{Key, Utxo}] ->
             ets:delete(?UTXO_CACHE, Key),
-            %% Also remove from DB
-            beamchain_db:spend_utxo(Txid, Vout),
+            case ets:member(?UTXO_DIRTY, Key) of
+                true ->
+                    %% Was freshly created, never persisted — just forget it
+                    ets:delete(?UTXO_DIRTY, Key);
+                false ->
+                    %% Was loaded from RocksDB — schedule a DB delete on flush
+                    ets:insert(?UTXO_SPENT, {Key})
+            end,
             {ok, Utxo};
         [] ->
-            %% Not in cache, pass through to DB
-            beamchain_db:spend_utxo(Txid, Vout)
+            %% Not in cache, try RocksDB
+            case beamchain_db:get_utxo(Txid, Vout) of
+                {ok, Utxo} ->
+                    %% Schedule DB delete on flush
+                    ets:insert(?UTXO_SPENT, {Key}),
+                    {ok, Utxo};
+                not_found ->
+                    not_found
+            end
     end.
 
 %%% ===================================================================
@@ -165,6 +204,8 @@ init([]) ->
     %% Create ETS tables
     ets:new(?UTXO_CACHE, [set, public, named_table,
                            {read_concurrency, true}]),
+    ets:new(?UTXO_DIRTY, [set, public, named_table]),
+    ets:new(?UTXO_SPENT, [set, public, named_table]),
     ets:new(?CHAIN_META, [set, public, named_table]),
 
     %% Load network params
@@ -228,6 +269,10 @@ handle_call({reorganize, NewBlocks}, _From, State) ->
             {reply, {error, Reason}, State}
     end;
 
+handle_call(flush, _From, State) ->
+    State2 = do_flush(State),
+    {reply, ok, State2};
+
 handle_call(_Request, _From, State) ->
     {reply, {error, not_implemented}, State}.
 
@@ -237,7 +282,9 @@ handle_cast(_Msg, State) ->
 handle_info(_Info, State) ->
     {noreply, State}.
 
-terminate(_Reason, _State) ->
+terminate(_Reason, State) ->
+    logger:info("chainstate: flushing UTXO cache on shutdown"),
+    do_flush(State),
     ok.
 
 %%% ===================================================================
@@ -313,7 +360,8 @@ do_connect_block(#block{header = Header} = Block,
                 blocks_since_flush = BlocksSinceFlush
             },
             State3 = maybe_check_ibd(State2),
-            {ok, State3};
+            State4 = maybe_flush(State3),
+            {ok, State4};
         {error, Reason} ->
             {error, Reason}
     end.
@@ -477,6 +525,100 @@ connect_blocks([Block | Rest], State) ->
 hash_hex(<<H:4/binary, _/binary>>) ->
     lists:flatten([io_lib:format("~2.16.0b", [B]) || <<B:8>> <= H]) ++ "...";
 hash_hex(_) -> "???".
+
+%%% ===================================================================
+%%% Internal: UTXO cache flush
+%%% ===================================================================
+
+%% Decide whether to flush based on IBD interval or cache size.
+maybe_flush(#state{ibd = true, blocks_since_flush = N} = State)
+  when N >= ?IBD_FLUSH_INTERVAL ->
+    do_flush(State);
+maybe_flush(#state{ibd = false} = State) ->
+    %% In normal operation, flush if cache exceeds max size
+    CacheBytes = ets:info(?UTXO_CACHE, memory) * erlang:system_info(wordsize),
+    case CacheBytes > State#state.max_cache_bytes of
+        true -> do_flush(State);
+        false -> State
+    end;
+maybe_flush(State) ->
+    State.
+
+%% Flush dirty entries to RocksDB in a single write batch.
+do_flush(#state{tip_hash = undefined} = State) ->
+    State;
+do_flush(#state{tip_hash = TipHash, tip_height = TipHeight} = State) ->
+    DirtyCount = ets:info(?UTXO_DIRTY, size),
+    SpentCount = ets:info(?UTXO_SPENT, size),
+    case DirtyCount =:= 0 andalso SpentCount =:= 0 of
+        true ->
+            %% Nothing to flush
+            State#state{blocks_since_flush = 0};
+        false ->
+            %% Write HEAD_BLOCKS marker (crash recovery sentinel)
+            Marker = <<TipHash/binary, TipHeight:64/big>>,
+            beamchain_db:put_meta(<<"HEAD_BLOCKS">>, Marker),
+
+            %% Build write batch
+            Ops = build_flush_ops(),
+
+            %% Add chain tip and flush height to the batch
+            TipValue = <<TipHash:32/binary, TipHeight:64/big>>,
+            AllOps = Ops ++ [
+                {put, meta, <<"chain_tip">>, TipValue},
+                {put, meta, <<"utxo_flush_height">>,
+                 <<TipHeight:64/big>>}
+            ],
+
+            case beamchain_db:write_batch(AllOps) of
+                ok ->
+                    %% Clear dirty/spent tracking
+                    ets:delete_all_objects(?UTXO_DIRTY),
+                    ets:delete_all_objects(?UTXO_SPENT),
+
+                    %% Remove crash recovery marker
+                    beamchain_db:put_meta(<<"HEAD_BLOCKS">>, <<>>),
+
+                    logger:debug("chainstate: flushed ~B dirty, ~B spent "
+                                 "at height ~B",
+                                 [DirtyCount, SpentCount, TipHeight]),
+                    State#state{blocks_since_flush = 0};
+                {error, Reason} ->
+                    logger:error("chainstate: flush failed: ~p", [Reason]),
+                    State
+            end
+    end.
+
+%% Build the list of write batch operations from dirty/spent tables.
+build_flush_ops() ->
+    %% Dirty entries: write UTXO to chainstate CF
+    DirtyOps = ets:foldl(fun({Key}, Acc) ->
+        case ets:lookup(?UTXO_CACHE, Key) of
+            [{Key, Utxo}] ->
+                {Txid, Vout} = Key,
+                OutpointKey = <<Txid:32/binary, Vout:32/big>>,
+                Value = encode_utxo(Utxo),
+                [{put, chainstate, OutpointKey, Value} | Acc];
+            [] ->
+                %% Entry was removed between dirty mark and flush
+                Acc
+        end
+    end, [], ?UTXO_DIRTY),
+
+    %% Spent entries: delete from chainstate CF
+    SpentOps = ets:foldl(fun({Key}, Acc) ->
+        {Txid, Vout} = Key,
+        OutpointKey = <<Txid:32/binary, Vout:32/big>>,
+        [{delete, chainstate, OutpointKey} | Acc]
+    end, [], ?UTXO_SPENT),
+
+    DirtyOps ++ SpentOps.
+
+%% Encode UTXO to binary (same format as beamchain_db).
+encode_utxo(#utxo{value = Value, script_pubkey = Script,
+                   is_coinbase = IsCoinbase, height = Height}) ->
+    CoinbaseFlag = case IsCoinbase of true -> 1; false -> 0 end,
+    <<Value:64/little, Height:32/little, CoinbaseFlag:8, Script/binary>>.
 
 %%% ===================================================================
 %%% Internal: MTP computation
