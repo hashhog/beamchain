@@ -253,12 +253,12 @@ terminate(_Reason, _State) ->
     ok.
 
 %%% ===================================================================
-%%% Internal: add transaction (stub — filled in next commits)
+%%% Internal: add transaction
 %%% ===================================================================
 
 do_add_transaction(Tx, State) ->
     Txid = beamchain_serialize:tx_hash(Tx),
-    _Wtxid = beamchain_serialize:wtx_hash(Tx),
+    Wtxid = beamchain_serialize:wtx_hash(Tx),
 
     try
         %% 1. basic structure check
@@ -270,17 +270,261 @@ do_add_transaction(Tx, State) ->
         %% 2. not already in mempool
         ets:member(?MEMPOOL_TXS, Txid) andalso throw(already_in_mempool),
 
-        %% TODO: full validation pipeline
-        {error, not_implemented}
+        %% 3. check standardness (weight, version)
+        check_standard(Tx),
+
+        %% 4. look up all inputs (UTXO set + mempool)
+        {InputCoins, SpendsCoinbase} = lookup_inputs(Tx),
+
+        %% 5. check for double-spends in mempool
+        check_mempool_conflicts(Tx),
+
+        %% 6. compute fee
+        TotalIn = lists:foldl(fun(C, A) -> A + C#utxo.value end,
+                              0, InputCoins),
+        TotalOut = lists:foldl(fun(#tx_out{value = V}, A) -> A + V end,
+                               0, Tx#transaction.outputs),
+        TotalIn >= TotalOut orelse throw(insufficient_fee),
+        Fee = TotalIn - TotalOut,
+
+        %% 7. compute size metrics
+        Weight = beamchain_serialize:tx_weight(Tx),
+        VSize = beamchain_serialize:tx_vsize(Tx),
+        Size = byte_size(beamchain_serialize:encode_transaction(Tx)),
+        FeeRate = Fee / max(1, VSize),
+
+        %% 8. check minimum relay fee (1 sat/vB)
+        FeeRate >= 1.0 orelse throw(mempool_min_fee_not_met),
+
+        %% 9. check dust outputs
+        check_dust(Tx),
+
+        %% 10. verify scripts
+        verify_scripts(Tx, InputCoins),
+
+        %% 11. check coinbase maturity for mempool spending
+        {ok, {_, TipHeight}} = beamchain_chainstate:get_tip(),
+        check_mempool_coinbase_maturity(InputCoins, TipHeight + 1),
+
+        %% 12. build entry
+        Now = erlang:system_time(second),
+        RbfSignaling = lists:any(fun(#tx_in{sequence = Seq}) ->
+            Seq < 16#fffffffe
+        end, Tx#transaction.inputs),
+
+        Entry = #mempool_entry{
+            txid = Txid,
+            wtxid = Wtxid,
+            tx = Tx,
+            fee = Fee,
+            size = Size,
+            vsize = VSize,
+            weight = Weight,
+            fee_rate = FeeRate,
+            time_added = Now,
+            height_added = TipHeight,
+            ancestor_count = 1,
+            ancestor_size = VSize,
+            ancestor_fee = Fee,
+            descendant_count = 1,
+            descendant_size = VSize,
+            descendant_fee = Fee,
+            spends_coinbase = SpendsCoinbase,
+            rbf_signaling = RbfSignaling
+        },
+
+        %% 13. insert into all tables
+        insert_entry(Entry),
+
+        %% 14. update state
+        State2 = State#state{
+            total_bytes = State#state.total_bytes + VSize,
+            total_count = State#state.total_count + 1
+        },
+
+        logger:debug("mempool: accepted ~s (fee_rate=~.1f sat/vB, ~B vB)",
+                     [short_hex(Txid), FeeRate, VSize]),
+        {ok, Txid, State2}
     catch
         throw:{validation, Reason} ->
             {error, Reason};
+        throw:orphan ->
+            add_orphan(Tx, Txid),
+            {error, orphan};
         throw:Reason ->
             {error, Reason}
     end.
 
 %%% ===================================================================
-%%% Internal: entry management (stubs)
+%%% Internal: input lookup
+%%% ===================================================================
+
+%% Look up all inputs. For each input, first check the UTXO set
+%% (confirmed outputs), then fall back to mempool outputs.
+lookup_inputs(#transaction{inputs = Inputs}) ->
+    {Coins, AnyMissing, AnyCoinbase} = lists:foldl(
+        fun(#tx_in{prev_out = #outpoint{hash = H, index = I}},
+            {Acc, Missing, Cb}) ->
+            case beamchain_chainstate:get_utxo(H, I) of
+                {ok, Coin} ->
+                    {[Coin | Acc], Missing,
+                     Cb orelse Coin#utxo.is_coinbase};
+                not_found ->
+                    %% check mempool
+                    case get_mempool_utxo(H, I) of
+                        {ok, Coin} ->
+                            {[Coin | Acc], Missing, Cb};
+                        not_found ->
+                            {Acc, true, Cb}
+                    end
+            end
+        end,
+        {[], false, false},
+        Inputs),
+    case AnyMissing of
+        true -> throw(orphan);
+        false -> {lists:reverse(Coins), AnyCoinbase}
+    end.
+
+%%% ===================================================================
+%%% Internal: standardness checks
+%%% ===================================================================
+
+check_standard(#transaction{version = V} = Tx) ->
+    %% version must be 1 or 2
+    (V =:= 1 orelse V =:= 2) orelse throw(version),
+    %% weight limit
+    Weight = beamchain_serialize:tx_weight(Tx),
+    Weight =< ?MAX_STANDARD_TX_WEIGHT orelse throw(tx_size),
+    ok.
+
+%%% ===================================================================
+%%% Internal: mempool conflict detection
+%%% ===================================================================
+
+check_mempool_conflicts(#transaction{inputs = Inputs}) ->
+    lists:foreach(
+        fun(#tx_in{prev_out = #outpoint{hash = H, index = I}}) ->
+            Key = {H, I},
+            case ets:lookup(?MEMPOOL_OUTPOINTS, Key) of
+                [{Key, _SpendingTxid}] ->
+                    throw(txn_mempool_conflict);
+                [] ->
+                    ok
+            end
+        end,
+        Inputs),
+    ok.
+
+%%% ===================================================================
+%%% Internal: dust check
+%%% ===================================================================
+
+check_dust(#transaction{outputs = Outputs}) ->
+    lists:foreach(fun(#tx_out{value = Value, script_pubkey = SPK}) ->
+        %% OP_RETURN outputs are allowed to be zero value
+        case SPK of
+            <<16#6a, _/binary>> -> ok;
+            _ ->
+                Threshold = dust_threshold(SPK),
+                Value >= Threshold orelse throw(dust)
+        end
+    end, Outputs).
+
+%% dust = (output_size + spend_input_size) * dust_relay_fee / 1000
+dust_threshold(SPK) ->
+    OutputSize = 8 + 1 + byte_size(SPK),
+    SpendSize = spend_input_size(SPK),
+    (OutputSize + SpendSize) * ?DUST_RELAY_TX_FEE div 1000.
+
+spend_input_size(SPK) ->
+    case classify_output(SPK) of
+        p2pkh     -> 148;
+        p2sh      -> 148;
+        p2wpkh    -> 68;
+        p2wsh     -> 68;
+        p2tr      -> 58;
+        _unknown  -> 148
+    end.
+
+classify_output(<<16#76, 16#a9, 16#14, _:20/binary, 16#88, 16#ac>>) ->
+    p2pkh;
+classify_output(<<16#a9, 16#14, _:20/binary, 16#87>>) ->
+    p2sh;
+classify_output(<<16#00, 16#14, _:20/binary>>) ->
+    p2wpkh;
+classify_output(<<16#00, 16#20, _:32/binary>>) ->
+    p2wsh;
+classify_output(<<16#51, 16#20, _:32/binary>>) ->
+    p2tr;
+classify_output(_) ->
+    unknown.
+
+%%% ===================================================================
+%%% Internal: script verification
+%%% ===================================================================
+
+verify_scripts(Tx, InputCoins) ->
+    Flags = all_standard_flags(),
+    Inputs = Tx#transaction.inputs,
+    lists:foldl(fun({Input, Coin}, Idx) ->
+        ScriptSig = Input#tx_in.script_sig,
+        ScriptPubKey = Coin#utxo.script_pubkey,
+        Witness = Input#tx_in.witness,
+        Amount = Coin#utxo.value,
+        SigChecker = {Tx, Idx, Amount},
+        case beamchain_script:verify_script(
+                ScriptSig, ScriptPubKey, Witness, Flags, SigChecker) of
+            true -> ok;
+            false -> throw({script_verify_failed, Idx})
+        end,
+        Idx + 1
+    end, 0, lists:zip(Inputs, InputCoins)),
+    ok.
+
+all_standard_flags() ->
+    ?SCRIPT_VERIFY_P2SH bor
+    ?SCRIPT_VERIFY_STRICTENC bor
+    ?SCRIPT_VERIFY_DERSIG bor
+    ?SCRIPT_VERIFY_LOW_S bor
+    ?SCRIPT_VERIFY_NULLDUMMY bor
+    ?SCRIPT_VERIFY_MINIMALDATA bor
+    ?SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS bor
+    ?SCRIPT_VERIFY_CLEANSTACK bor
+    ?SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY bor
+    ?SCRIPT_VERIFY_CHECKSEQUENCEVERIFY bor
+    ?SCRIPT_VERIFY_WITNESS bor
+    ?SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM bor
+    ?SCRIPT_VERIFY_MINIMALIF bor
+    ?SCRIPT_VERIFY_NULLFAIL bor
+    ?SCRIPT_VERIFY_WITNESS_PUBKEYTYPE bor
+    ?SCRIPT_VERIFY_CONST_SCRIPTCODE bor
+    ?SCRIPT_VERIFY_TAPROOT.
+
+%%% ===================================================================
+%%% Internal: coinbase maturity check
+%%% ===================================================================
+
+check_mempool_coinbase_maturity(InputCoins, NextHeight) ->
+    lists:foreach(fun(Coin) ->
+        case Coin#utxo.is_coinbase of
+            true ->
+                Confs = NextHeight - Coin#utxo.height,
+                Confs >= ?COINBASE_MATURITY
+                    orelse throw(premature_spend_of_coinbase);
+            false -> ok
+        end
+    end, InputCoins).
+
+%%% ===================================================================
+%%% Internal: orphan pool (stubs for now)
+%%% ===================================================================
+
+add_orphan(_Tx, _Txid) ->
+    ok.
+
+%%% ===================================================================
+%%% Internal: entry management
 %%% ===================================================================
 
 insert_entry(#mempool_entry{txid = Txid, fee_rate = FeeRate, tx = Tx} = Entry) ->
