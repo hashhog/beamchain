@@ -302,11 +302,17 @@ do_add_transaction(Tx, State) ->
         %% 10. verify scripts
         verify_scripts(Tx, InputCoins),
 
-        %% 11. check coinbase maturity for mempool spending
+        %% 11. ancestor/descendant limits
+        {AncCount, AncSize, AncFee} = compute_ancestors(Tx, Fee, VSize),
+        AncCount =< ?MAX_ANCESTOR_COUNT orelse throw(too_many_ancestors),
+        AncSize =< ?MAX_ANCESTOR_SIZE orelse throw(ancestor_size_limit),
+        check_descendant_limits(Tx),
+
+        %% 12. check coinbase maturity for mempool spending
         {ok, {_, TipHeight}} = beamchain_chainstate:get_tip(),
         check_mempool_coinbase_maturity(InputCoins, TipHeight + 1),
 
-        %% 12. build entry
+        %% 13. build entry
         Now = erlang:system_time(second),
         RbfSignaling = lists:any(fun(#tx_in{sequence = Seq}) ->
             Seq < 16#fffffffe
@@ -323,9 +329,9 @@ do_add_transaction(Tx, State) ->
             fee_rate = FeeRate,
             time_added = Now,
             height_added = TipHeight,
-            ancestor_count = 1,
-            ancestor_size = VSize,
-            ancestor_fee = Fee,
+            ancestor_count = AncCount,
+            ancestor_size = AncSize,
+            ancestor_fee = AncFee,
             descendant_count = 1,
             descendant_size = VSize,
             descendant_fee = Fee,
@@ -333,10 +339,13 @@ do_add_transaction(Tx, State) ->
             rbf_signaling = RbfSignaling
         },
 
-        %% 13. insert into all tables
+        %% 14. insert into all tables
         insert_entry(Entry),
 
-        %% 14. update state
+        %% 15. update ancestor descendant stats
+        update_ancestors_for_new_tx(Tx, VSize, Fee),
+
+        %% 16. update state
         State2 = State#state{
             total_bytes = State#state.total_bytes + VSize,
             total_count = State#state.total_count + 1
@@ -515,6 +524,95 @@ check_mempool_coinbase_maturity(InputCoins, NextHeight) ->
             false -> ok
         end
     end, InputCoins).
+
+%%% ===================================================================
+%%% Internal: ancestor / descendant tracking
+%%% ===================================================================
+
+%% Compute ancestor stats for a new transaction.
+compute_ancestors(#transaction{inputs = Inputs}, Fee, VSize) ->
+    ParentTxids = get_parent_txids_from_inputs(Inputs),
+    lists:foldl(
+        fun(ParentTxid, {AC, AS, AF}) ->
+            case ets:lookup(?MEMPOOL_TXS, ParentTxid) of
+                [{_, Parent}] ->
+                    {AC + Parent#mempool_entry.ancestor_count,
+                     AS + Parent#mempool_entry.ancestor_size,
+                     AF + Parent#mempool_entry.ancestor_fee};
+                [] ->
+                    {AC, AS, AF}
+            end
+        end,
+        {1, VSize, Fee},
+        ParentTxids).
+
+%% Update each ancestor's descendant stats when a new tx is added.
+update_ancestors_for_new_tx(#transaction{inputs = Inputs}, VSize, Fee) ->
+    ParentTxids = get_parent_txids_from_inputs(Inputs),
+    update_ancestor_descendants(ParentTxids, VSize, Fee, []).
+
+update_ancestor_descendants([], _VSize, _Fee, _Visited) ->
+    ok;
+update_ancestor_descendants([Txid | Rest], VSize, Fee, Visited) ->
+    case lists:member(Txid, Visited) of
+        true ->
+            update_ancestor_descendants(Rest, VSize, Fee, Visited);
+        false ->
+            case ets:lookup(?MEMPOOL_TXS, Txid) of
+                [{Txid, Entry}] ->
+                    Updated = Entry#mempool_entry{
+                        descendant_count = Entry#mempool_entry.descendant_count + 1,
+                        descendant_size = Entry#mempool_entry.descendant_size + VSize,
+                        descendant_fee = Entry#mempool_entry.descendant_fee + Fee
+                    },
+                    ets:insert(?MEMPOOL_TXS, {Txid, Updated}),
+                    Parents = get_parent_txids(Entry#mempool_entry.tx),
+                    update_ancestor_descendants(Parents ++ Rest, VSize, Fee,
+                                                [Txid | Visited]);
+                [] ->
+                    update_ancestor_descendants(Rest, VSize, Fee, Visited)
+            end
+    end.
+
+%% Check that adding a new tx won't bust any ancestor's descendant limits.
+check_descendant_limits(#transaction{inputs = Inputs}) ->
+    ParentTxids = get_parent_txids_from_inputs(Inputs),
+    check_desc_limits_walk(ParentTxids, []).
+
+check_desc_limits_walk([], _Visited) ->
+    ok;
+check_desc_limits_walk([Txid | Rest], Visited) ->
+    case lists:member(Txid, Visited) of
+        true ->
+            check_desc_limits_walk(Rest, Visited);
+        false ->
+            case ets:lookup(?MEMPOOL_TXS, Txid) of
+                [{_, Entry}] ->
+                    (Entry#mempool_entry.descendant_count + 1) =<
+                        ?MAX_DESCENDANT_COUNT
+                        orelse throw(too_many_descendants),
+                    (Entry#mempool_entry.descendant_size) =<
+                        ?MAX_DESCENDANT_SIZE
+                        orelse throw(descendant_size_limit),
+                    Parents = get_parent_txids(Entry#mempool_entry.tx),
+                    check_desc_limits_walk(Parents ++ Rest, [Txid | Visited]);
+                [] ->
+                    check_desc_limits_walk(Rest, Visited)
+            end
+    end.
+
+%% Get unique list of mempool parent txids from input list.
+get_parent_txids_from_inputs(Inputs) ->
+    lists:usort(lists:filtermap(
+        fun(#tx_in{prev_out = #outpoint{hash = H}}) ->
+            case ets:member(?MEMPOOL_TXS, H) of
+                true -> {true, H};
+                false -> false
+            end
+        end, Inputs)).
+
+get_parent_txids(#transaction{inputs = Inputs}) ->
+    get_parent_txids_from_inputs(Inputs).
 
 %%% ===================================================================
 %%% Internal: orphan pool (stubs for now)
