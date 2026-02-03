@@ -276,8 +276,8 @@ do_add_transaction(Tx, State) ->
         %% 4. look up all inputs (UTXO set + mempool)
         {InputCoins, SpendsCoinbase} = lookup_inputs(Tx),
 
-        %% 5. check for double-spends in mempool
-        check_mempool_conflicts(Tx),
+        %% 5. check for double-spends in mempool (+ RBF)
+        check_mempool_conflicts(Tx, InputCoins),
 
         %% 6. compute fee
         TotalIn = lists:foldl(fun(C, A) -> A + C#utxo.value end,
@@ -408,22 +408,137 @@ check_standard(#transaction{version = V} = Tx) ->
     ok.
 
 %%% ===================================================================
-%%% Internal: mempool conflict detection
+%%% Internal: mempool conflict detection + RBF
 %%% ===================================================================
 
-check_mempool_conflicts(#transaction{inputs = Inputs}) ->
-    lists:foreach(
+check_mempool_conflicts(Tx, _InputCoins) ->
+    case find_mempool_conflicts(Tx) of
+        [] ->
+            ok;
+        ConflictTxids ->
+            %% attempt RBF (BIP 125)
+            do_rbf(Tx, ConflictTxids)
+    end.
+
+find_mempool_conflicts(#transaction{inputs = Inputs}) ->
+    lists:usort(lists:filtermap(
         fun(#tx_in{prev_out = #outpoint{hash = H, index = I}}) ->
             Key = {H, I},
             case ets:lookup(?MEMPOOL_OUTPOINTS, Key) of
-                [{Key, _SpendingTxid}] ->
-                    throw(txn_mempool_conflict);
-                [] ->
-                    ok
+                [{Key, SpendingTxid}] -> {true, SpendingTxid};
+                [] -> false
             end
         end,
-        Inputs),
+        Inputs)).
+
+%% @doc Replace-by-fee (BIP 125).
+do_rbf(NewTx, ConflictTxids) ->
+    %% gather all conflicting entries
+    ConflictEntries = lists:filtermap(fun(Cid) ->
+        case ets:lookup(?MEMPOOL_TXS, Cid) of
+            [{_, E}] -> {true, E};
+            [] -> false
+        end
+    end, ConflictTxids),
+
+    %% 1. all conflicting txs must signal RBF
+    lists:foreach(fun(E) ->
+        E#mempool_entry.rbf_signaling orelse throw(rbf_not_signaled)
+    end, ConflictEntries),
+
+    %% 2. new tx must not add new unconfirmed parents
+    NewParents = get_parent_txids(NewTx),
+    OldParents = lists:usort(lists:flatmap(fun(E) ->
+        get_parent_txids(E#mempool_entry.tx)
+    end, ConflictEntries)),
+    NewUnconfirmed = NewParents -- OldParents -- ConflictTxids,
+    NewUnconfirmed =:= [] orelse throw(rbf_new_unconfirmed_inputs),
+
+    %% 3. collect all descendants of conflicting txs
+    AllEvictTxids = lists:usort(lists:flatmap(fun(Cid) ->
+        [Cid | get_all_descendants(Cid)]
+    end, ConflictTxids)),
+    length(AllEvictTxids) =< ?MAX_RBF_EVICTIONS
+        orelse throw(rbf_too_many_evictions),
+
+    AllEvictEntries = lists:filtermap(fun(Eid) ->
+        case ets:lookup(?MEMPOOL_TXS, Eid) of
+            [{_, E}] -> {true, E};
+            [] -> false
+        end
+    end, AllEvictTxids),
+
+    %% 4. new tx fee must exceed sum of all evicted fees
+    EvictedFeeTotal = lists:foldl(fun(E, Acc) ->
+        Acc + E#mempool_entry.fee
+    end, 0, AllEvictEntries),
+
+    %% compute new tx fee from its inputs
+    NewTotalIn = compute_tx_input_value(NewTx),
+    NewTotalOut = lists:foldl(fun(#tx_out{value = V}, A) -> A + V end,
+                               0, NewTx#transaction.outputs),
+    NewFee = NewTotalIn - NewTotalOut,
+    NewFee > EvictedFeeTotal orelse throw(rbf_insufficient_fee),
+
+    %% 5. additional fee must cover min relay fee for the new tx
+    NewVSize = beamchain_serialize:tx_vsize(NewTx),
+    MinAdditionalFee = NewVSize,
+    (NewFee - EvictedFeeTotal) >= MinAdditionalFee
+        orelse throw(rbf_insufficient_additional_fee),
+
+    %% evict all conflicting txs + descendants
+    lists:foreach(fun(EvictTxid) ->
+        remove_entry(EvictTxid)
+    end, AllEvictTxids),
+
+    logger:debug("mempool: rbf evicted ~B txs", [length(AllEvictTxids)]),
     ok.
+
+%% Sum the input values for a transaction (UTXO set + mempool).
+compute_tx_input_value(#transaction{inputs = Inputs}) ->
+    lists:foldl(
+        fun(#tx_in{prev_out = #outpoint{hash = H, index = I}}, Acc) ->
+            case beamchain_chainstate:get_utxo(H, I) of
+                {ok, Coin} -> Acc + Coin#utxo.value;
+                not_found ->
+                    case get_mempool_utxo(H, I) of
+                        {ok, Coin} -> Acc + Coin#utxo.value;
+                        not_found -> Acc
+                    end
+            end
+        end, 0, Inputs).
+
+%% Get all descendant txids for a given mempool tx.
+get_all_descendants(Txid) ->
+    get_all_descendants([Txid], [], []).
+
+get_all_descendants([], _Visited, Acc) ->
+    Acc;
+get_all_descendants([Txid | Rest], Visited, Acc) ->
+    case lists:member(Txid, Visited) of
+        true ->
+            get_all_descendants(Rest, Visited, Acc);
+        false ->
+            Children = find_children(Txid),
+            get_all_descendants(Children ++ Rest,
+                                [Txid | Visited],
+                                Children ++ Acc)
+    end.
+
+%% Find mempool txs that spend outputs of a given txid.
+find_children(ParentTxid) ->
+    case ets:lookup(?MEMPOOL_TXS, ParentTxid) of
+        [{_, Entry}] ->
+            NumOutputs = length((Entry#mempool_entry.tx)#transaction.outputs),
+            lists:filtermap(fun(Vout) ->
+                case ets:lookup(?MEMPOOL_OUTPOINTS, {ParentTxid, Vout}) of
+                    [{_, ChildTxid}] -> {true, ChildTxid};
+                    [] -> false
+                end
+            end, lists:seq(0, NumOutputs - 1));
+        [] ->
+            []
+    end.
 
 %%% ===================================================================
 %%% Internal: dust check
