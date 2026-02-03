@@ -351,6 +351,9 @@ do_add_transaction(Tx, State) ->
             total_count = State#state.total_count + 1
         },
 
+        %% 17. check if any orphans now have parents
+        reprocess_orphans(Txid),
+
         logger:debug("mempool: accepted ~s (fee_rate=~.1f sat/vB, ~B vB)",
                      [short_hex(Txid), FeeRate, VSize]),
         {ok, Txid, State2}
@@ -730,11 +733,51 @@ get_parent_txids(#transaction{inputs = Inputs}) ->
     get_parent_txids_from_inputs(Inputs).
 
 %%% ===================================================================
-%%% Internal: orphan pool (stubs for now)
+%%% Internal: orphan pool
 %%% ===================================================================
 
-add_orphan(_Tx, _Txid) ->
-    ok.
+add_orphan(Tx, Txid) ->
+    OrphanCount = ets:info(?MEMPOOL_ORPHANS, size),
+    case OrphanCount < ?MAX_ORPHAN_TXS of
+        true ->
+            Expiry = erlang:system_time(second) + ?ORPHAN_TX_EXPIRE_TIME,
+            ets:insert(?MEMPOOL_ORPHANS, {Txid, Tx, Expiry}),
+            logger:debug("mempool: added orphan ~s (~B total)",
+                         [short_hex(Txid), OrphanCount + 1]);
+        false ->
+            %% evict a random orphan to make room
+            case ets:first(?MEMPOOL_ORPHANS) of
+                '$end_of_table' -> ok;
+                OldTxid ->
+                    ets:delete(?MEMPOOL_ORPHANS, OldTxid)
+            end,
+            Expiry = erlang:system_time(second) + ?ORPHAN_TX_EXPIRE_TIME,
+            ets:insert(?MEMPOOL_ORPHANS, {Txid, Tx, Expiry})
+    end.
+
+%% Attempt to re-process orphans whose missing parent might now exist.
+reprocess_orphans(NewTxid) ->
+    Orphans = ets:tab2list(?MEMPOOL_ORPHANS),
+    lists:foreach(fun({OrphanTxid, OrphanTx, _Expiry}) ->
+        HasParent = lists:any(
+            fun(#tx_in{prev_out = #outpoint{hash = H}}) ->
+                H =:= NewTxid
+            end,
+            OrphanTx#transaction.inputs),
+        case HasParent of
+            true ->
+                ets:delete(?MEMPOOL_ORPHANS, OrphanTxid),
+                case add_transaction(OrphanTx) of
+                    {ok, _} ->
+                        logger:debug("mempool: promoted orphan ~s",
+                                     [short_hex(OrphanTxid)]);
+                    {error, _} ->
+                        ok
+                end;
+            false ->
+                ok
+        end
+    end, Orphans).
 
 %%% ===================================================================
 %%% Internal: entry management
@@ -800,7 +843,22 @@ do_expire_old(State) ->
     {0, State}.
 
 do_expire_orphans() ->
-    ok.
+    Now = erlang:system_time(second),
+    Orphans = ets:tab2list(?MEMPOOL_ORPHANS),
+    Expired = lists:foldl(fun({Txid, _Tx, Expiry}, Count) ->
+        case Now >= Expiry of
+            true ->
+                ets:delete(?MEMPOOL_ORPHANS, Txid),
+                Count + 1;
+            false ->
+                Count
+        end
+    end, 0, Orphans),
+    case Expired > 0 of
+        true ->
+            logger:debug("mempool: expired ~B orphans", [Expired]);
+        false -> ok
+    end.
 
 %%% ===================================================================
 %%% Internal: helpers
