@@ -836,11 +836,63 @@ do_remove_for_block(Txids, State) ->
 %%% Internal: trimming / eviction (stub)
 %%% ===================================================================
 
-do_trim_to_size(_MaxBytes, State) ->
-    State.
+%% Remove lowest fee-rate transactions until total size fits.
+do_trim_to_size(MaxBytes, State) ->
+    case State#state.total_bytes =< MaxBytes of
+        true ->
+            State;
+        false ->
+            case ets:first(?MEMPOOL_BY_FEE) of
+                '$end_of_table' ->
+                    State;
+                {_FeeRate, Txid} ->
+                    %% remove this tx and all its descendants
+                    Desc = get_all_descendants(Txid),
+                    AllRemove = [Txid | Desc],
+                    {RemovedBytes, RemovedCount} = lists:foldl(
+                        fun(RTxid, {Bytes, Count}) ->
+                            case remove_entry(RTxid) of
+                                #mempool_entry{vsize = VSize} ->
+                                    {Bytes + VSize, Count + 1};
+                                not_found ->
+                                    {Bytes, Count}
+                            end
+                        end, {0, 0}, AllRemove),
+                    State2 = State#state{
+                        total_bytes = max(0, State#state.total_bytes - RemovedBytes),
+                        total_count = max(0, State#state.total_count - RemovedCount)
+                    },
+                    do_trim_to_size(MaxBytes, State2)
+            end
+    end.
 
+%% Expire transactions older than 14 days (336 hours).
 do_expire_old(State) ->
-    {0, State}.
+    CutoffTime = erlang:system_time(second) - (?MEMPOOL_EXPIRY_HOURS * 3600),
+    AllEntries = ets:tab2list(?MEMPOOL_TXS),
+    {ExpiredCount, ExpiredBytes} = lists:foldl(
+        fun({Txid, Entry}, {Count, Bytes}) ->
+            case Entry#mempool_entry.time_added < CutoffTime of
+                true ->
+                    remove_entry(Txid),
+                    {Count + 1, Bytes + Entry#mempool_entry.vsize};
+                false ->
+                    {Count, Bytes}
+            end
+        end,
+        {0, 0},
+        AllEntries),
+    case ExpiredCount > 0 of
+        true ->
+            logger:debug("mempool: expired ~B old txs (~B vB)",
+                         [ExpiredCount, ExpiredBytes]);
+        false -> ok
+    end,
+    State2 = State#state{
+        total_bytes = max(0, State#state.total_bytes - ExpiredBytes),
+        total_count = max(0, State#state.total_count - ExpiredCount)
+    },
+    {ExpiredCount, State2}.
 
 do_expire_orphans() ->
     Now = erlang:system_time(second),
