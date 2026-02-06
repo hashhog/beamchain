@@ -810,6 +810,7 @@ remove_entry(Txid) ->
 %%% ===================================================================
 
 do_remove_for_block(Txids, State) ->
+    %% 1. remove confirmed transactions
     {RemovedBytes, RemovedCount} = lists:foldl(
         fun(Txid, {Bytes, Count}) ->
             case remove_entry(Txid) of
@@ -821,16 +822,60 @@ do_remove_for_block(Txids, State) ->
         end,
         {0, 0},
         Txids),
-    case RemovedCount > 0 of
+
+    %% 2. remove any mempool txs that conflict with the block
+    %%    (their inputs were spent by block transactions)
+    {ConflictBytes, ConflictCount} = remove_block_conflicts(Txids),
+
+    TotalBytes = RemovedBytes + ConflictBytes,
+    TotalCount = RemovedCount + ConflictCount,
+    case TotalCount > 0 of
         true ->
-            logger:debug("mempool: removed ~B txs for block (~B vB)",
-                         [RemovedCount, RemovedBytes]);
+            logger:debug("mempool: removed ~B txs for block (~B confirmed, "
+                         "~B conflicts)", [TotalCount, RemovedCount, ConflictCount]);
         false -> ok
     end,
     State#state{
-        total_bytes = max(0, State#state.total_bytes - RemovedBytes),
-        total_count = max(0, State#state.total_count - RemovedCount)
+        total_bytes = max(0, State#state.total_bytes - TotalBytes),
+        total_count = max(0, State#state.total_count - TotalCount)
     }.
+
+%% After confirming block transactions, check if any remaining mempool
+%% transactions now double-spend a confirmed output. Remove them.
+remove_block_conflicts(ConfirmedTxids) ->
+    %% Build set of outpoints spent by confirmed txs
+    %% For each confirmed txid, its outputs are now in the UTXO set,
+    %% and any mempool tx spending the same inputs as a confirmed tx
+    %% is now invalid.
+    ConfSet = sets:from_list(ConfirmedTxids),
+    AllEntries = ets:tab2list(?MEMPOOL_TXS),
+    lists:foldl(fun({Txid, Entry}, {Bytes, Count}) ->
+        %% skip if we already removed it
+        case sets:is_element(Txid, ConfSet) of
+            true -> {Bytes, Count};
+            false ->
+                %% check if any input's previous output was just confirmed
+                HasConflict = lists:any(
+                    fun(#tx_in{prev_out = #outpoint{hash = H}}) ->
+                        sets:is_element(H, ConfSet)
+                    end,
+                    (Entry#mempool_entry.tx)#transaction.inputs),
+                case HasConflict of
+                    true ->
+                        %% remove this tx and its descendants
+                        Desc = get_all_descendants(Txid),
+                        AllRemove = [Txid | Desc],
+                        lists:foldl(fun(RTxid, {B, C}) ->
+                            case remove_entry(RTxid) of
+                                #mempool_entry{vsize = VS} -> {B + VS, C + 1};
+                                not_found -> {B, C}
+                            end
+                        end, {Bytes, Count}, AllRemove);
+                    false ->
+                        {Bytes, Count}
+                end
+        end
+    end, {0, 0}, AllEntries).
 
 %%% ===================================================================
 %%% Internal: trimming / eviction (stub)
