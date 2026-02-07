@@ -134,15 +134,17 @@ get_info() ->
 %% @doc Get mempool entries sorted by descending fee rate.
 -spec get_sorted_by_fee() -> [#mempool_entry{}].
 get_sorted_by_fee() ->
-    %% ordered_set stores ascending, so we fold from the end
-    Pairs = ets:tab2list(?MEMPOOL_BY_FEE),
-    SortedDesc = lists:reverse(lists:sort(Pairs)),
-    lists:filtermap(fun({_FeeRate, Txid}) ->
-        case ets:lookup(?MEMPOOL_TXS, Txid) of
-            [{Txid, Entry}] -> {true, Entry};
-            [] -> false
-        end
-    end, SortedDesc).
+    %% ordered_set is ascending by key, so collect and reverse
+    collect_by_fee_desc(ets:last(?MEMPOOL_BY_FEE), []).
+
+collect_by_fee_desc('$end_of_table', Acc) ->
+    lists:reverse(Acc);
+collect_by_fee_desc({_FeeRate, Txid} = Key, Acc) ->
+    Acc2 = case ets:lookup(?MEMPOOL_TXS, Txid) of
+        [{Txid, E}] -> [E | Acc];
+        [] -> Acc
+    end,
+    collect_by_fee_desc(ets:prev(?MEMPOOL_BY_FEE, Key), Acc2).
 
 %% @doc Remove confirmed transactions from the mempool.
 -spec remove_for_block([binary()]) -> ok.
