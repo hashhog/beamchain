@@ -8,6 +8,7 @@
         beamchain_db,
         beamchain_chainstate,
         beamchain_mempool,
+        beamchain_fee_estimator,
         beamchain_peer_manager,
         beamchain_sync
     ]},

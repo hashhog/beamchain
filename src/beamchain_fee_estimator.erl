@@ -9,6 +9,7 @@
 %% API
 -export([start_link/0]).
 -export([track_tx/3, process_block/2]).
+-export([estimate_fee/1, get_fee_histogram/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -69,6 +70,21 @@ track_tx(Txid, FeeRate, Height) ->
 process_block(Height, Txids) ->
     gen_server:cast(?SERVER, {process_block, Height, Txids}).
 
+%% @doc Estimate the fee rate (sat/vB) needed for confirmation within
+%% ConfTarget blocks (1-1008).
+-spec estimate_fee(integer()) -> {ok, float()} | {error, term()}.
+estimate_fee(ConfTarget) when is_integer(ConfTarget),
+                              ConfTarget >= 1,
+                              ConfTarget =< ?MAX_CONF_TARGET ->
+    gen_server:call(?SERVER, {estimate_fee, ConfTarget});
+estimate_fee(_) ->
+    {error, invalid_target}.
+
+%% @doc Return fee rate distribution of the current mempool.
+-spec get_fee_histogram() -> [{float(), integer()}].
+get_fee_histogram() ->
+    gen_server:call(?SERVER, get_fee_histogram).
+
 %%% ===================================================================
 %%% gen_server callbacks
 %%% ===================================================================
@@ -95,6 +111,12 @@ init([]) ->
         block_height = Height
     }}.
 
+handle_call({estimate_fee, ConfTarget}, _From, State) ->
+    Result = do_estimate_fee(ConfTarget, State),
+    {reply, Result, State};
+handle_call(get_fee_histogram, _From, State) ->
+    Histogram = do_get_fee_histogram(State),
+    {reply, Histogram, State};
 handle_call(_Request, _From, State) ->
     {reply, {error, not_implemented}, State}.
 
@@ -214,3 +236,112 @@ decay_bucket(#bucket_data{total = T, in_mempool = M, confirmed = C}) ->
         in_mempool = M * ?DECAY_FACTOR,
         confirmed = maps:map(fun(_K, V) -> V * ?DECAY_FACTOR end, C)
     }.
+
+%%% ===================================================================
+%%% Internal: fee estimation
+%%% ===================================================================
+
+do_estimate_fee(ConfTarget, #state{total_tracked = Total} = State)
+  when Total < ?MIN_TRACKED_TXS ->
+    %% Not enough historical data — fall back to mempool percentile
+    estimate_from_mempool(ConfTarget, State);
+do_estimate_fee(ConfTarget, #state{buckets = Buckets, data = Data,
+                                    num_buckets = NumBuckets} = State) ->
+    case find_passing_bucket(0, NumBuckets, ConfTarget, Buckets, Data) of
+        {ok, FeeRate} ->
+            {ok, FeeRate};
+        not_found ->
+            %% Bucket model couldn't find a passing bucket, try mempool
+            estimate_from_mempool(ConfTarget, State)
+    end.
+
+%% Scan buckets from lowest fee rate upward. Return the fee rate of
+%% the first bucket where the confirmation success rate meets threshold.
+find_passing_bucket(Idx, NumBuckets, _Target, _Buckets, _Data)
+  when Idx >= NumBuckets ->
+    not_found;
+find_passing_bucket(Idx, NumBuckets, Target, Buckets, Data) ->
+    BD = maps:get(Idx, Data, #bucket_data{}),
+    %% Only consider txs that have resolved (confirmed or dropped),
+    %% not ones still sitting in the mempool
+    Resolved = BD#bucket_data.total - BD#bucket_data.in_mempool,
+    case Resolved >= 1.0 of
+        true ->
+            ConfWithin = sum_confirmed_within(Target,
+                                              BD#bucket_data.confirmed),
+            SuccessRate = ConfWithin / Resolved,
+            case SuccessRate >= ?SUCCESS_THRESHOLD of
+                true ->
+                    {ok, lists:nth(Idx + 1, Buckets)};
+                false ->
+                    find_passing_bucket(Idx + 1, NumBuckets, Target,
+                                        Buckets, Data)
+            end;
+        false ->
+            %% Not enough resolved data in this bucket
+            find_passing_bucket(Idx + 1, NumBuckets, Target, Buckets, Data)
+    end.
+
+%% Sum the weighted confirmed count for all delays <= MaxBlocks.
+sum_confirmed_within(MaxBlocks, Confirmed) ->
+    maps:fold(fun(BlocksWaited, Count, Acc) ->
+        case BlocksWaited =< MaxBlocks of
+            true -> Acc + Count;
+            false -> Acc
+        end
+    end, 0.0, Confirmed).
+
+%%% ===================================================================
+%%% Internal: mempool fallback estimation
+%%% ===================================================================
+
+%% When we don't have enough historical block data, estimate from the
+%% current mempool distribution using a percentile-based heuristic.
+estimate_from_mempool(ConfTarget, _State) ->
+    try
+        FeeRates = collect_mempool_fee_rates(),
+        case FeeRates of
+            [] ->
+                {error, insufficient_data};
+            _ ->
+                N = length(FeeRates),
+                %% Map confirmation target to percentile via log scale.
+                %% Target 1 → ~95th percentile, target 144 → ~5th
+                Pct = max(0.05, min(0.95,
+                    1.0 - math:log(max(1, ConfTarget)) * 0.2)),
+                Idx = max(1, min(N, ceil(N * Pct))),
+                FeeRate = lists:nth(Idx, FeeRates),
+                {ok, max(1.0, FeeRate)}
+        end
+    catch
+        _:_ ->
+            {error, insufficient_data}
+    end.
+
+%% Collect all fee rates from the mempool's ordered ETS table.
+%% Returns ascending order (lowest fee rate first).
+collect_mempool_fee_rates() ->
+    try
+        collect_rates_asc(ets:first(mempool_by_fee), [])
+    catch
+        error:badarg -> []  %% table doesn't exist yet
+    end.
+
+collect_rates_asc('$end_of_table', Acc) ->
+    lists:reverse(Acc);
+collect_rates_asc({FeeRate, _Txid} = Key, Acc) ->
+    collect_rates_asc(ets:next(mempool_by_fee, Key), [FeeRate | Acc]).
+
+%%% ===================================================================
+%%% Internal: fee histogram
+%%% ===================================================================
+
+%% Build histogram of current mempool fee rates grouped by bucket.
+do_get_fee_histogram(#state{buckets = Buckets, num_buckets = NumBuckets}) ->
+    FeeRates = collect_mempool_fee_rates(),
+    Counts = lists:foldl(fun(Rate, Acc) ->
+        Idx = find_bucket(Rate, Buckets),
+        maps:update_with(Idx, fun(C) -> C + 1 end, 1, Acc)
+    end, #{}, FeeRates),
+    [{lists:nth(I + 1, Buckets), maps:get(I, Counts, 0)} ||
+     I <- lists:seq(0, NumBuckets - 1)].
