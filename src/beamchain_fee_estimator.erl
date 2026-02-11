@@ -8,7 +8,7 @@
 
 %% API
 -export([start_link/0]).
--export([track_tx/3]).
+-export([track_tx/3, process_block/2]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -63,6 +63,12 @@ start_link() ->
 track_tx(Txid, FeeRate, Height) ->
     gen_server:cast(?SERVER, {track_tx, Txid, FeeRate, Height}).
 
+%% @doc Process a newly connected block. Updates confirmation stats
+%% for tracked transactions and applies exponential decay.
+-spec process_block(integer(), [binary()]) -> ok.
+process_block(Height, Txids) ->
+    gen_server:cast(?SERVER, {process_block, Height, Txids}).
+
 %%% ===================================================================
 %%% gen_server callbacks
 %%% ===================================================================
@@ -94,6 +100,9 @@ handle_call(_Request, _From, State) ->
 
 handle_cast({track_tx, Txid, FeeRate, Height}, State) ->
     State2 = do_track_tx(Txid, FeeRate, Height, State),
+    {noreply, State2};
+handle_cast({process_block, Height, Txids}, State) ->
+    State2 = do_process_block(Height, Txids, State),
     {noreply, State2};
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -154,4 +163,54 @@ do_track_tx(Txid, FeeRate, Height,
     State#state{
         data = maps:put(BucketIdx, BD2, Data),
         total_tracked = Total + 1
+    }.
+
+%%% ===================================================================
+%%% Internal: process block
+%%% ===================================================================
+
+do_process_block(Height, Txids, State) ->
+    %% 1. Update confirmed counts for each tracked tx that got confirmed
+    State2 = lists:foldl(fun(Txid, S) ->
+        case ets:lookup(?FEE_EST_TRACKED, Txid) of
+            [{Txid, BucketIdx, EntryHeight}] ->
+                BlocksWaited = max(1, Height - EntryHeight + 1),
+                ets:delete(?FEE_EST_TRACKED, Txid),
+                record_confirmation(BucketIdx, BlocksWaited, S);
+            [] ->
+                %% Not tracked (entered before estimator, or already gone)
+                S
+        end
+    end, State, Txids),
+
+    %% 2. Apply exponential decay to all bucket data
+    State3 = apply_decay(State2),
+    State3#state{block_height = Height}.
+
+%% Record that a tx in BucketIdx was confirmed after BlocksWaited blocks.
+record_confirmation(BucketIdx, BlocksWaited,
+                    #state{data = Data} = State) ->
+    BD = maps:get(BucketIdx, Data, #bucket_data{}),
+    Confirmed = BD#bucket_data.confirmed,
+    OldCount = maps:get(BlocksWaited, Confirmed, 0.0),
+    BD2 = BD#bucket_data{
+        confirmed = maps:put(BlocksWaited, OldCount + 1.0, Confirmed),
+        in_mempool = max(0.0, BD#bucket_data.in_mempool - 1.0)
+    },
+    State#state{data = maps:put(BucketIdx, BD2, Data)}.
+
+%%% ===================================================================
+%%% Internal: exponential decay
+%%% ===================================================================
+
+%% Apply decay factor to all bucket counters. Called once per block.
+apply_decay(#state{data = Data} = State) ->
+    Data2 = maps:map(fun(_Idx, BD) -> decay_bucket(BD) end, Data),
+    State#state{data = Data2}.
+
+decay_bucket(#bucket_data{total = T, in_mempool = M, confirmed = C}) ->
+    #bucket_data{
+        total = T * ?DECAY_FACTOR,
+        in_mempool = M * ?DECAY_FACTOR,
+        confirmed = maps:map(fun(_K, V) -> V * ?DECAY_FACTOR end, C)
     }.
