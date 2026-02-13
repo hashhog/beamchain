@@ -93,3 +93,181 @@ handle_info(_Info, State) ->
 
 terminate(_Reason, _State) ->
     ok.
+
+%%% ===================================================================
+%%% Internal: transaction selection
+%%% ===================================================================
+
+%% Select transactions from the mempool for inclusion in a block.
+%% Sorts by ancestor fee rate (CPFP-aware), then greedily fills the
+%% block respecting weight and sigop limits. Returns a topologically
+%% ordered list of entries (parents before children).
+select_transactions() ->
+    %% Get all mempool entries sorted by fee rate (highest first)
+    Entries = beamchain_mempool:get_sorted_by_fee(),
+
+    %% Re-sort by ancestor fee rate for CPFP
+    Sorted = lists:sort(fun(A, B) ->
+        ancestor_fee_rate(A) >= ancestor_fee_rate(B)
+    end, Entries),
+
+    %% Available weight: max block weight minus header and coinbase reserve
+    MaxWeight = ?MAX_BLOCK_WEIGHT - ?COINBASE_WEIGHT_RESERVE
+                - (80 * ?WITNESS_SCALE_FACTOR),
+    MaxSigops = ?MAX_BLOCK_SIGOPS_COST,
+
+    {Selected, Fees, Weight, Sigops} =
+        greedy_select(Sorted, MaxWeight, MaxSigops,
+                      sets:new([{version, 2}]), [], 0, 0, 0),
+
+    %% Topological sort so parents appear before children
+    Ordered = topological_sort(Selected),
+    {Ordered, Fees, Weight, Sigops}.
+
+ancestor_fee_rate(Entry) ->
+    case Entry#mempool_entry.ancestor_size of
+        0 -> Entry#mempool_entry.fee_rate;
+        AncSize -> Entry#mempool_entry.ancestor_fee / AncSize
+    end.
+
+%%% ===================================================================
+%%% Internal: greedy block filling
+%%% ===================================================================
+
+greedy_select([], _MaxW, _MaxS, _Seen, Acc, Fees, Weight, Sigops) ->
+    {lists:reverse(Acc), Fees, Weight, Sigops};
+greedy_select([Entry | Rest], MaxW, MaxS, Seen, Acc,
+              Fees, Weight, Sigops) ->
+    Txid = Entry#mempool_entry.txid,
+
+    %% Skip if already selected (pulled in as a dependency)
+    case sets:is_element(Txid, Seen) of
+        true ->
+            greedy_select(Rest, MaxW, MaxS, Seen, Acc,
+                          Fees, Weight, Sigops);
+        false ->
+            TxWeight = Entry#mempool_entry.weight,
+            TxSigops = estimate_sigops(Entry#mempool_entry.tx),
+
+            %% Resolve parent txs that are still in mempool
+            {Parents, Seen2} = resolve_parents(
+                Entry#mempool_entry.tx, Seen),
+            ParentWeight = lists:foldl(fun(PE, W) ->
+                W + PE#mempool_entry.weight
+            end, 0, Parents),
+            ParentFees = lists:foldl(fun(PE, F) ->
+                F + PE#mempool_entry.fee
+            end, 0, Parents),
+
+            TotalNewWeight = TxWeight + ParentWeight,
+            NewWeight = Weight + TotalNewWeight,
+            NewSigops = Sigops + TxSigops,
+
+            case NewWeight > MaxW orelse NewSigops > MaxS of
+                true ->
+                    %% Doesn't fit, try next
+                    greedy_select(Rest, MaxW, MaxS, Seen, Acc,
+                                  Fees, Weight, Sigops);
+                false ->
+                    AllNew = Parents ++ [Entry],
+                    Seen3 = lists:foldl(fun(E, S) ->
+                        sets:add_element(E#mempool_entry.txid, S)
+                    end, Seen2, AllNew),
+                    greedy_select(
+                        Rest, MaxW, MaxS, Seen3,
+                        AllNew ++ Acc,
+                        Fees + Entry#mempool_entry.fee + ParentFees,
+                        NewWeight, NewSigops)
+            end
+    end.
+
+%% Recursively resolve unselected mempool parents.
+resolve_parents(#transaction{inputs = Inputs}, AlreadySelected) ->
+    ParentTxids = lists:usort(lists:filtermap(
+        fun(#tx_in{prev_out = #outpoint{hash = H}}) ->
+            case beamchain_mempool:has_tx(H) of
+                true ->
+                    case sets:is_element(H, AlreadySelected) of
+                        true -> false;
+                        false -> {true, H}
+                    end;
+                false -> false
+            end
+        end, Inputs)),
+
+    lists:foldl(fun(PTxid, {Ents, Sel}) ->
+        case beamchain_mempool:get_entry(PTxid) of
+            {ok, PE} ->
+                %% Resolve grandparents first
+                {GrandParents, Sel2} =
+                    resolve_parents(PE#mempool_entry.tx, Sel),
+                Sel3 = sets:add_element(PTxid, Sel2),
+                {Ents ++ GrandParents ++ [PE], Sel3};
+            not_found ->
+                {Ents, Sel}
+        end
+    end, {[], AlreadySelected}, ParentTxids).
+
+%% Estimate sigops for a tx (legacy count * witness scale factor).
+estimate_sigops(Tx) ->
+    beamchain_validation:count_legacy_sigops(
+        iolist_to_binary([S || #tx_in{script_sig = S}
+                               <- Tx#transaction.inputs])) *
+    ?WITNESS_SCALE_FACTOR +
+    beamchain_validation:count_legacy_sigops(
+        iolist_to_binary([S || #tx_out{script_pubkey = S}
+                               <- Tx#transaction.outputs])) *
+    ?WITNESS_SCALE_FACTOR.
+
+%%% ===================================================================
+%%% Internal: topological sort (Kahn's algorithm)
+%%% ===================================================================
+
+%% Sort entries so that parent transactions appear before children.
+topological_sort(Entries) ->
+    TxMap = maps:from_list(
+        [{E#mempool_entry.txid, E} || E <- Entries]),
+    TxidSet = sets:from_list(maps:keys(TxMap), [{version, 2}]),
+
+    %% Build in-degree map and children adjacency
+    {InDegree, Children} = lists:foldl(fun(E, {InD, Ch}) ->
+        Txid = E#mempool_entry.txid,
+        Parents = in_block_parents(E#mempool_entry.tx, TxidSet),
+        InD2 = maps:put(Txid, length(Parents), InD),
+        Ch2 = lists:foldl(fun(P, C) ->
+            maps:update_with(P,
+                fun(Existing) -> [Txid | Existing] end,
+                [Txid], C)
+        end, Ch, Parents),
+        {InD2, Ch2}
+    end, {#{}, #{}}, Entries),
+
+    %% Start with zero in-degree nodes
+    Queue = [Txid || Txid <- maps:keys(TxMap),
+                     maps:get(Txid, InDegree, 0) =:= 0],
+    topo_loop(Queue, InDegree, Children, TxMap, []).
+
+topo_loop([], _InDegree, _Children, _TxMap, Acc) ->
+    lists:reverse(Acc);
+topo_loop([Txid | Rest], InDegree, Children, TxMap, Acc) ->
+    Entry = maps:get(Txid, TxMap),
+    ChildList = maps:get(Txid, Children, []),
+    {NewQueue, InDegree2} = lists:foldl(fun(Child, {Q, ID}) ->
+        NewDeg = maps:get(Child, ID, 1) - 1,
+        ID2 = maps:put(Child, NewDeg, ID),
+        case NewDeg of
+            0 -> {Q ++ [Child], ID2};
+            _ -> {Q, ID2}
+        end
+    end, {Rest, InDegree}, ChildList),
+    topo_loop(NewQueue, InDegree2, Children, TxMap, [Entry | Acc]).
+
+%% Get parent txids of a tx that are in the selected set.
+in_block_parents(#transaction{inputs = Inputs}, TxidSet) ->
+    lists:usort(lists:filtermap(
+        fun(#tx_in{prev_out = #outpoint{hash = H}}) ->
+            case sets:is_element(H, TxidSet) of
+                true -> {true, H};
+                false -> false
+            end
+        end, Inputs)).
