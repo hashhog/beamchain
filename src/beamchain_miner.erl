@@ -271,3 +271,90 @@ in_block_parents(#transaction{inputs = Inputs}, TxidSet) ->
                 false -> false
             end
         end, Inputs)).
+
+%%% ===================================================================
+%%% Internal: coinbase transaction
+%%% ===================================================================
+
+%% Build the coinbase transaction for a block template.
+%% Includes BIP 34 height encoding and (if needed) witness commitment.
+build_coinbase(Height, CoinbaseScriptPubKey, CoinbaseValue,
+               HasWitnessTx, SelectedEntries) ->
+    %% BIP 34: encode block height in scriptSig
+    HeightScript = encode_coinbase_height(Height),
+    %% Extra nonce space (8 bytes for miner to vary)
+    ExtraNonce = <<0, 0, 0, 0, 0, 0, 0, 0>>,
+    ScriptSig = <<HeightScript/binary, ExtraNonce/binary>>,
+
+    %% Coinbase input
+    CbInput = #tx_in{
+        prev_out = #outpoint{hash = <<0:256>>, index = 16#ffffffff},
+        script_sig = ScriptSig,
+        sequence = 16#ffffffff,
+        witness = case HasWitnessTx of
+            true -> [<<0:256>>];   %% witness nonce: 32 zero bytes
+            false -> []
+        end
+    },
+
+    %% Main payout output
+    PayoutOutput = #tx_out{
+        value = CoinbaseValue,
+        script_pubkey = CoinbaseScriptPubKey
+    },
+
+    %% Optionally add witness commitment output
+    Outputs = case HasWitnessTx of
+        true ->
+            CommitOutput = witness_commitment_output(
+                SelectedEntries, CbInput),
+            [PayoutOutput, CommitOutput];
+        false ->
+            [PayoutOutput]
+    end,
+
+    #transaction{
+        version = 2,
+        inputs = [CbInput],
+        outputs = Outputs,
+        locktime = 0
+    }.
+
+%% Build the OP_RETURN witness commitment output (BIP 141).
+%% commitment = SHA256d(witness_root || witness_nonce)
+witness_commitment_output(SelectedEntries, CbInput) ->
+    %% Coinbase wtxid is always 32 zero bytes
+    Wtxids = [<<0:256>> |
+              [beamchain_serialize:wtx_hash(E#mempool_entry.tx)
+               || E <- SelectedEntries]],
+
+    %% Witness nonce from the coinbase input
+    [WitnessNonce | _] = CbInput#tx_in.witness,
+
+    %% Compute commitment hash
+    Commitment = beamchain_serialize:compute_witness_commitment(
+        Wtxids, WitnessNonce),
+
+    %% OP_RETURN <36 bytes> 0xaa21a9ed <32-byte commitment>
+    Script = <<16#6a, 16#24, 16#aa, 16#21, 16#a9, 16#ed,
+               Commitment/binary>>,
+    #tx_out{value = 0, script_pubkey = Script}.
+
+%% Encode block height for BIP 34 coinbase scriptSig.
+%% Heights are pushed as minimal little-endian byte arrays.
+encode_coinbase_height(0) ->
+    <<0>>;
+encode_coinbase_height(Height) when Height >= 1, Height =< 16 ->
+    <<1, Height:8>>;
+encode_coinbase_height(Height) ->
+    Bytes = le_minimal(Height),
+    Len = byte_size(Bytes),
+    <<Len:8, Bytes/binary>>.
+
+le_minimal(N) ->
+    le_minimal_acc(N, <<>>).
+
+le_minimal_acc(0, Acc) -> Acc;
+le_minimal_acc(N, Acc) ->
+    Byte = N band 16#ff,
+    le_minimal_acc(N bsr 8, <<Acc/binary, Byte:8>>).
