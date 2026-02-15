@@ -74,9 +74,13 @@ init([]) ->
         tip_hash = undefined
     }}.
 
-handle_call({create_template, _CoinbaseScriptPubKey, _Opts}, _From, State) ->
-    %% TODO: build block template
-    {reply, {error, not_implemented}, State};
+handle_call({create_template, CoinbaseScriptPubKey, Opts}, _From, State) ->
+    case do_create_template(CoinbaseScriptPubKey, Opts, State) of
+        {ok, Template, State2} ->
+            {reply, {ok, Template}, State2};
+        {error, Reason} ->
+            {reply, {error, Reason}, State}
+    end;
 
 handle_call({submit_block, _HexBlock}, _From, State) ->
     %% TODO: validate and connect block
@@ -93,6 +97,172 @@ handle_info(_Info, State) ->
 
 terminate(_Reason, _State) ->
     ok.
+
+%%% ===================================================================
+%%% Internal: create block template
+%%% ===================================================================
+
+do_create_template(CoinbaseScriptPubKey, _Opts,
+                   #state{params = Params, network = Network} = State) ->
+    case beamchain_chainstate:get_tip() of
+        {ok, {TipHash, TipHeight}} ->
+            Height = TipHeight + 1,
+            MTP = beamchain_chainstate:get_mtp(),
+
+            %% Compute required difficulty for the next block
+            PrevIndex = get_prev_index(TipHeight),
+            Now = erlang:system_time(second),
+            DummyHeader = #block_header{
+                version = 16#20000000,
+                prev_hash = TipHash,
+                merkle_root = <<0:256>>,
+                timestamp = Now,
+                bits = 0,
+                nonce = 0
+            },
+            Bits = beamchain_pow:get_next_work_required(
+                PrevIndex, DummyHeader, Params),
+
+            %% Select transactions from mempool
+            {SelectedEntries, TotalFees, TotalWeight, TotalSigops} =
+                select_transactions(),
+
+            %% Block subsidy + fees
+            Subsidy = beamchain_chain_params:block_subsidy(Height, Network),
+            CoinbaseValue = Subsidy + TotalFees,
+
+            %% Check if any selected tx has witness data
+            HasWitnessTx = lists:any(fun(E) ->
+                has_witness(E#mempool_entry.tx)
+            end, SelectedEntries),
+
+            %% Build coinbase
+            CoinbaseTx = build_coinbase(Height, CoinbaseScriptPubKey,
+                                         CoinbaseValue, HasWitnessTx,
+                                         SelectedEntries),
+
+            %% Assemble full transaction list
+            AllTxs = [CoinbaseTx |
+                      [E#mempool_entry.tx || E <- SelectedEntries]],
+
+            %% Compute merkle root
+            TxHashes = [beamchain_serialize:tx_hash(Tx) || Tx <- AllTxs],
+            MerkleRoot = beamchain_serialize:compute_merkle_root(TxHashes),
+
+            %% Timestamp: must be > MTP, use current time if ahead
+            Timestamp = max(MTP + 1, Now),
+
+            %% Assemble block header
+            Header = #block_header{
+                version = 16#20000000,
+                prev_hash = TipHash,
+                merkle_root = MerkleRoot,
+                timestamp = Timestamp,
+                bits = Bits,
+                nonce = 0
+            },
+
+            %% BIP 22 response
+            Target = beamchain_pow:bits_to_target(Bits),
+            TxEntries = format_tx_entries(SelectedEntries),
+
+            Template = #{
+                <<"version">> => 16#20000000,
+                <<"previousblockhash">> => hash_to_hex(TipHash),
+                <<"transactions">> => TxEntries,
+                <<"coinbaseaux">> => #{<<"flags">> => <<>>},
+                <<"coinbasevalue">> => CoinbaseValue,
+                <<"target">> => target_to_hex(Target),
+                <<"mintime">> => MTP + 1,
+                <<"mutable">> => [<<"time">>, <<"transactions">>,
+                                  <<"prevblock">>],
+                <<"noncerange">> => <<"00000000ffffffff">>,
+                <<"sigoplimit">> => ?MAX_BLOCK_SIGOPS_COST,
+                <<"sizelimit">> => ?MAX_BLOCK_SERIALIZED_SIZE,
+                <<"weightlimit">> => ?MAX_BLOCK_WEIGHT,
+                <<"curtime">> => Timestamp,
+                <<"bits">> => bits_to_hex(Bits),
+                <<"height">> => Height,
+                %% internal fields for our own use
+                <<"_header">> => Header,
+                <<"_coinbase_tx">> => CoinbaseTx,
+                <<"_all_txs">> => AllTxs,
+                <<"_total_weight">> => TotalWeight,
+                <<"_total_sigops">> => TotalSigops
+            },
+
+            State2 = State#state{template = Template, tip_hash = TipHash},
+            {ok, Template, State2};
+
+        not_found ->
+            {error, no_chain_tip}
+    end.
+
+get_prev_index(TipHeight) ->
+    case beamchain_db:get_block_index(TipHeight) of
+        {ok, PI} -> PI#{height => TipHeight};
+        not_found -> error({missing_block_index, TipHeight})
+    end.
+
+has_witness(#transaction{inputs = Inputs}) ->
+    lists:any(fun(#tx_in{witness = W}) ->
+        W =/= [] andalso W =/= undefined
+    end, Inputs).
+
+%%% ===================================================================
+%%% Internal: BIP 22 transaction entry formatting
+%%% ===================================================================
+
+format_tx_entries(Entries) ->
+    format_tx_entries(Entries, 1, #{}, []).
+
+format_tx_entries([], _Idx, _IdxMap, Acc) ->
+    lists:reverse(Acc);
+format_tx_entries([Entry | Rest], Idx, IdxMap, Acc) ->
+    Tx = Entry#mempool_entry.tx,
+    Txid = Entry#mempool_entry.txid,
+    Wtxid = Entry#mempool_entry.wtxid,
+
+    %% Serialize the transaction
+    TxHex = beamchain_serialize:hex_encode(
+        beamchain_serialize:encode_transaction(Tx)),
+
+    %% Find in-template parent indices
+    Depends = lists:filtermap(
+        fun(#tx_in{prev_out = #outpoint{hash = H}}) ->
+            case maps:find(H, IdxMap) of
+                {ok, ParentIdx} -> {true, ParentIdx};
+                error -> false
+            end
+        end, Tx#transaction.inputs),
+
+    TxEntry = #{
+        <<"data">> => TxHex,
+        <<"txid">> => hash_to_hex(Txid),
+        <<"hash">> => hash_to_hex(Wtxid),
+        <<"fee">> => Entry#mempool_entry.fee,
+        <<"sigops">> => estimate_sigops(Tx),
+        <<"weight">> => Entry#mempool_entry.weight,
+        <<"depends">> => lists:usort(Depends)
+    },
+
+    IdxMap2 = maps:put(Txid, Idx, IdxMap),
+    format_tx_entries(Rest, Idx + 1, IdxMap2, [TxEntry | Acc]).
+
+%%% ===================================================================
+%%% Internal: hex/hash helpers
+%%% ===================================================================
+
+%% Display-order hex: reversed bytes then hex-encoded.
+hash_to_hex(Hash) when byte_size(Hash) =:= 32 ->
+    beamchain_serialize:hex_encode(
+        beamchain_serialize:reverse_bytes(Hash)).
+
+bits_to_hex(Bits) ->
+    beamchain_serialize:hex_encode(<<Bits:32/big>>).
+
+target_to_hex(Target) ->
+    beamchain_serialize:hex_encode(<<Target:256/big>>).
 
 %%% ===================================================================
 %%% Internal: transaction selection
