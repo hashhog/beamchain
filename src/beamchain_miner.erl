@@ -82,9 +82,14 @@ handle_call({create_template, CoinbaseScriptPubKey, Opts}, _From, State) ->
             {reply, {error, Reason}, State}
     end;
 
-handle_call({submit_block, _HexBlock}, _From, State) ->
-    %% TODO: validate and connect block
-    {reply, {error, not_implemented}, State};
+handle_call({submit_block, HexBlock}, _From, State) ->
+    Result = do_submit_block(HexBlock),
+    %% Invalidate cached template on success
+    State2 = case Result of
+        ok -> State#state{template = undefined};
+        _ -> State
+    end,
+    {reply, Result, State2};
 
 handle_call(_Request, _From, State) ->
     {reply, {error, not_implemented}, State}.
@@ -263,6 +268,59 @@ bits_to_hex(Bits) ->
 
 target_to_hex(Target) ->
     beamchain_serialize:hex_encode(<<Target:256/big>>).
+
+short_hex(<<H:4/binary, _/binary>>) ->
+    beamchain_serialize:hex_encode(H);
+short_hex(Other) ->
+    beamchain_serialize:hex_encode(Other).
+
+%%% ===================================================================
+%%% Internal: submit block
+%%% ===================================================================
+
+do_submit_block(HexBlock) ->
+    try
+        %% 1. decode hex to binary
+        BlockBin = beamchain_serialize:hex_decode(HexBlock),
+
+        %% 2. deserialize block
+        {Block, _Rest} = beamchain_serialize:decode_block(BlockBin),
+
+        %% 3. validate and connect to chain
+        case beamchain_chainstate:connect_block(Block) of
+            ok ->
+                %% 4. remove confirmed txs from mempool
+                Txids = [beamchain_serialize:tx_hash(Tx)
+                         || Tx <- Block#block.transactions],
+                beamchain_mempool:remove_for_block(Txids),
+
+                %% 5. announce new block to peers
+                BlockHash = beamchain_serialize:block_hash(
+                    Block#block.header),
+                broadcast_new_block(BlockHash),
+
+                logger:info("miner: accepted block ~s",
+                            [short_hex(BlockHash)]),
+                ok;
+            {error, Reason} ->
+                logger:warning("miner: rejected block: ~p", [Reason]),
+                {error, Reason}
+        end
+    catch
+        error:Reason2 ->
+            logger:warning("miner: submit_block error: ~p", [Reason2]),
+            {error, Reason2}
+    end.
+
+%% Broadcast a newly mined block hash via inv to all connected peers.
+broadcast_new_block(BlockHash) ->
+    try
+        beamchain_peer_manager:broadcast(inv, [
+            {?MSG_BLOCK, BlockHash}
+        ])
+    catch
+        _:_ -> ok   %% peer manager may not be running
+    end.
 
 %%% ===================================================================
 %%% Internal: transaction selection
