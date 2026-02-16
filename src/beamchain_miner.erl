@@ -315,9 +315,9 @@ do_submit_block(HexBlock) ->
 %% Broadcast a newly mined block hash via inv to all connected peers.
 broadcast_new_block(BlockHash) ->
     try
-        beamchain_peer_manager:broadcast(inv, [
-            {?MSG_BLOCK, BlockHash}
-        ])
+        beamchain_peer_manager:broadcast(inv, #{
+            items => [#{type => ?MSG_BLOCK, hash => BlockHash}]
+        })
     catch
         _:_ -> ok   %% peer manager may not be running
     end.
@@ -437,15 +437,15 @@ resolve_parents(#transaction{inputs = Inputs}, AlreadySelected) ->
     end, {[], AlreadySelected}, ParentTxids).
 
 %% Estimate sigops for a tx (legacy count * witness scale factor).
-estimate_sigops(Tx) ->
-    beamchain_validation:count_legacy_sigops(
-        iolist_to_binary([S || #tx_in{script_sig = S}
-                               <- Tx#transaction.inputs])) *
-    ?WITNESS_SCALE_FACTOR +
-    beamchain_validation:count_legacy_sigops(
-        iolist_to_binary([S || #tx_out{script_pubkey = S}
-                               <- Tx#transaction.outputs])) *
-    ?WITNESS_SCALE_FACTOR.
+%% This is a conservative estimate used for block filling, not consensus.
+estimate_sigops(#transaction{inputs = Inputs, outputs = Outputs}) ->
+    InSigops = lists:foldl(fun(#tx_in{script_sig = S}, Acc) ->
+        Acc + beamchain_validation:count_legacy_sigops(S)
+    end, 0, Inputs),
+    OutSigops = lists:foldl(fun(#tx_out{script_pubkey = S}, Acc) ->
+        Acc + beamchain_validation:count_legacy_sigops(S)
+    end, 0, Outputs),
+    (InSigops + OutSigops) * ?WITNESS_SCALE_FACTOR.
 
 %%% ===================================================================
 %%% Internal: topological sort (Kahn's algorithm)
