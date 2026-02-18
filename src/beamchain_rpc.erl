@@ -302,6 +302,18 @@ handle_method(<<"getdifficulty">>, _) -> rpc_getdifficulty();
 handle_method(<<"getchaintips">>, _) -> rpc_getchaintips();
 handle_method(<<"verifychain">>, _) -> rpc_verifychain();
 
+%% -- Transactions --
+handle_method(<<"getrawtransaction">>, P) -> rpc_getrawtransaction(P);
+handle_method(<<"decoderawtransaction">>, P) -> rpc_decoderawtransaction(P);
+handle_method(<<"sendrawtransaction">>, P) -> rpc_sendrawtransaction(P);
+handle_method(<<"testmempoolaccept">>, P) -> rpc_testmempoolaccept(P);
+handle_method(<<"gettxout">>, P) -> rpc_gettxout(P);
+
+%% -- Mempool --
+handle_method(<<"getmempoolinfo">>, _) -> rpc_getmempoolinfo();
+handle_method(<<"getrawmempool">>, P) -> rpc_getrawmempool(P);
+handle_method(<<"getmempoolentry">>, P) -> rpc_getmempoolentry(P);
+
 handle_method(Method, _) ->
     {error, ?RPC_METHOD_NOT_FOUND,
      <<"Method not found: ", Method/binary>>}.
@@ -558,6 +570,195 @@ rpc_verifychain() ->
     end.
 
 %%% ===================================================================
+%%% Transaction methods
+%%% ===================================================================
+
+rpc_getrawtransaction([TxidHex]) ->
+    rpc_getrawtransaction([TxidHex, false]);
+rpc_getrawtransaction([TxidHex, Verbose | _]) when is_binary(TxidHex) ->
+    Txid = hex_to_internal_hash(TxidHex),
+    case find_transaction(Txid) of
+        {ok, Tx, BlockHash, Height, _Pos} ->
+            case Verbose of
+                true ->
+                    TxJson = format_tx_json(Tx),
+                    TxJson2 = case BlockHash of
+                        undefined -> TxJson;
+                        _ ->
+                            TxJson#{
+                                <<"blockhash">> => hash_to_hex(BlockHash),
+                                <<"confirmations">> => confirmations(Height),
+                                <<"blocktime">> => block_time(Height)
+                            }
+                    end,
+                    {ok, TxJson2};
+                _ ->
+                    Hex = beamchain_serialize:hex_encode(
+                        beamchain_serialize:encode_transaction(Tx)),
+                    {ok, Hex}
+            end;
+        not_found ->
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+             <<"No such mempool or blockchain transaction">>}
+    end;
+rpc_getrawtransaction(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: getrawtransaction \"txid\" ( verbose )">>}.
+
+rpc_decoderawtransaction([HexStr]) when is_binary(HexStr) ->
+    try
+        Bin = beamchain_serialize:hex_decode(HexStr),
+        {Tx, _Rest} = beamchain_serialize:decode_transaction(Bin),
+        {ok, format_tx_json(Tx)}
+    catch
+        _:_ ->
+            {error, ?RPC_DESERIALIZATION_ERROR,
+             <<"TX decode failed">>}
+    end;
+rpc_decoderawtransaction(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: decoderawtransaction \"hexstring\"">>}.
+
+rpc_sendrawtransaction([HexStr]) when is_binary(HexStr) ->
+    try
+        Bin = beamchain_serialize:hex_decode(HexStr),
+        {Tx, _} = beamchain_serialize:decode_transaction(Bin),
+        case beamchain_mempool:add_transaction(Tx) of
+            {ok, Txid} ->
+                %% Broadcast to peers
+                try beamchain_peer_manager:broadcast(inv, #{
+                    items => [#{type => ?MSG_TX, hash => Txid}]
+                }) catch _:_ -> ok end,
+                {ok, hash_to_hex(Txid)};
+            {error, Reason} ->
+                {error, ?RPC_VERIFY_REJECTED,
+                 iolist_to_binary(io_lib:format("~p", [Reason]))}
+        end
+    catch
+        _:_ ->
+            {error, ?RPC_DESERIALIZATION_ERROR,
+             <<"TX decode failed">>}
+    end;
+rpc_sendrawtransaction(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: sendrawtransaction \"hexstring\"">>}.
+
+rpc_testmempoolaccept([RawTxs]) when is_list(RawTxs) ->
+    Results = lists:map(fun(HexStr) ->
+        try
+            Bin = beamchain_serialize:hex_decode(HexStr),
+            {Tx, _} = beamchain_serialize:decode_transaction(Bin),
+            Txid = beamchain_serialize:tx_hash(Tx),
+            case beamchain_mempool:add_transaction(Tx) of
+                {ok, _} ->
+                    %% Remove it right away (this was just a test)
+                    beamchain_mempool:remove_for_block([Txid]),
+                    #{<<"txid">> => hash_to_hex(Txid),
+                      <<"allowed">> => true};
+                {error, Reason} ->
+                    #{<<"txid">> => hash_to_hex(Txid),
+                      <<"allowed">> => false,
+                      <<"reject-reason">> =>
+                          iolist_to_binary(io_lib:format("~p", [Reason]))}
+            end
+        catch
+            _:_ ->
+                #{<<"txid">> => <<>>,
+                  <<"allowed">> => false,
+                  <<"reject-reason">> => <<"TX decode failed">>}
+        end
+    end, RawTxs),
+    {ok, Results};
+rpc_testmempoolaccept(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: testmempoolaccept [\"rawtx\"]">>}.
+
+rpc_gettxout([TxidHex, N]) ->
+    rpc_gettxout([TxidHex, N, true]);
+rpc_gettxout([TxidHex, N, IncludeMempool]) when is_binary(TxidHex),
+                                                  is_integer(N) ->
+    Txid = hex_to_internal_hash(TxidHex),
+    %% Check mempool first if requested
+    MempoolResult = case IncludeMempool of
+        true ->
+            beamchain_mempool:get_mempool_utxo(Txid, N);
+        _ ->
+            not_found
+    end,
+    case MempoolResult of
+        {ok, #utxo{value = V, script_pubkey = Script}} ->
+            {ok, format_utxo_result(V, Script, 0, true)};
+        not_found ->
+            case beamchain_chainstate:get_utxo(Txid, N) of
+                {ok, #utxo{value = V, script_pubkey = Script,
+                           is_coinbase = IsCb, height = Height}} ->
+                    {ok, format_utxo_result(V, Script,
+                        confirmations(Height), IsCb)};
+                not_found ->
+                    {ok, null}
+            end
+    end;
+rpc_gettxout(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: gettxout \"txid\" n ( include_mempool )">>}.
+
+%%% ===================================================================
+%%% Mempool methods
+%%% ===================================================================
+
+rpc_getmempoolinfo() ->
+    Info = beamchain_mempool:get_info(),
+    Size = maps:get(size, Info, 0),
+    Bytes = maps:get(bytes, Info, 0),
+    {ok, #{
+        <<"loaded">> => true,
+        <<"size">> => Size,
+        <<"bytes">> => Bytes,
+        <<"usage">> => Bytes,
+        <<"maxmempool">> => ?DEFAULT_MEMPOOL_MAX_SIZE,
+        <<"mempoolminfee">> => ?DEFAULT_MIN_RELAY_TX_FEE / 100000.0,
+        <<"minrelaytxfee">> => ?DEFAULT_MIN_RELAY_TX_FEE / 100000.0,
+        <<"incrementalrelayfee">> => 0.00001,
+        <<"unbroadcastcount">> => 0,
+        <<"fullrbf">> => false
+    }}.
+
+rpc_getrawmempool([]) ->
+    rpc_getrawmempool([false]);
+rpc_getrawmempool([Verbose]) ->
+    Txids = beamchain_mempool:get_all_txids(),
+    case Verbose of
+        true ->
+            Entries = lists:filtermap(fun(Txid) ->
+                case beamchain_mempool:get_entry(Txid) of
+                    {ok, Entry} ->
+                        {true, {hash_to_hex(Txid), format_mempool_entry(Entry)}};
+                    not_found ->
+                        false
+                end
+            end, Txids),
+            {ok, maps:from_list(Entries)};
+        _ ->
+            {ok, [hash_to_hex(T) || T <- Txids]}
+    end;
+rpc_getrawmempool(_) ->
+    Txids = beamchain_mempool:get_all_txids(),
+    {ok, [hash_to_hex(T) || T <- Txids]}.
+
+rpc_getmempoolentry([TxidHex]) when is_binary(TxidHex) ->
+    Txid = hex_to_internal_hash(TxidHex),
+    case beamchain_mempool:get_entry(Txid) of
+        {ok, Entry} ->
+            {ok, format_mempool_entry(Entry)};
+        not_found ->
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+             <<"Transaction not in mempool">>}
+    end;
+rpc_getmempoolentry(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: getmempoolentry \"txid\"">>}.
+
+%%% ===================================================================
 %%% Internal helpers
 %%% ===================================================================
 
@@ -801,3 +1002,116 @@ stripped_size(#block{} = Block) ->
 strip_witness(#transaction{inputs = Inputs} = Tx) ->
     Tx#transaction{inputs =
         [In#tx_in{witness = []} || In <- Inputs]}.
+
+%% Find a transaction in the mempool or on-chain.
+%% Returns {ok, Tx, BlockHash | undefined, Height | -1, Position | -1}
+find_transaction(Txid) ->
+    %% Check mempool first
+    case beamchain_mempool:get_tx(Txid) of
+        {ok, Tx} ->
+            {ok, Tx, undefined, -1, -1};
+        not_found ->
+            %% Check tx index
+            case beamchain_db:get_tx_location(Txid) of
+                {ok, #{block_hash := BlockHash, height := Height,
+                       position := Pos}} ->
+                    case beamchain_db:get_block(BlockHash) of
+                        {ok, #block{transactions = Txs}} ->
+                            case Pos < length(Txs) of
+                                true ->
+                                    Tx = lists:nth(Pos + 1, Txs),
+                                    {ok, Tx, BlockHash, Height, Pos};
+                                false ->
+                                    not_found
+                            end;
+                        _ -> not_found
+                    end;
+                not_found ->
+                    not_found
+            end
+    end.
+
+%% Get block timestamp by height.
+block_time(Height) ->
+    case beamchain_db:get_block_index(Height) of
+        {ok, #{header := Hdr}} -> Hdr#block_header.timestamp;
+        _ -> 0
+    end.
+
+%% Format a UTXO for gettxout response.
+format_utxo_result(Value, Script, Confirmations, IsCoinbase) ->
+    Network = beamchain_config:network(),
+    NetType = case Network of mainnet -> mainnet; _ -> testnet end,
+    Type = beamchain_address:classify_script(Script),
+    Address = beamchain_address:script_to_address(Script, NetType),
+    #{
+        <<"bestblock">> => case beamchain_chainstate:get_tip() of
+            {ok, {H, _}} -> hash_to_hex(H);
+            _ -> <<>>
+        end,
+        <<"confirmations">> => Confirmations,
+        <<"value">> => satoshi_to_btc(Value),
+        <<"scriptPubKey">> => #{
+            <<"hex">> => beamchain_serialize:hex_encode(Script),
+            <<"type">> => script_type_name(Type),
+            <<"address">> => case Address of
+                unknown -> null;
+                "OP_RETURN" -> null;
+                Addr -> iolist_to_binary(Addr)
+            end
+        },
+        <<"coinbase">> => IsCoinbase
+    }.
+
+%% Format a mempool entry for getrawmempool verbose / getmempoolentry.
+%% Note: mempool_entry is a record defined in beamchain_mempool,
+%% but we access it via get_entry which returns the record.
+format_mempool_entry(Entry) ->
+    %% Entry is a mempool_entry record; use element access
+    %% since we don't have the record definition imported.
+    %% Fields: txid, wtxid, tx, fee, size, vsize, weight, fee_rate,
+    %%   time_added, height_added, ancestor_count, ancestor_size,
+    %%   ancestor_fee, descendant_count, descendant_size, descendant_fee,
+    %%   spends_coinbase, rbf_signaling
+    try
+        Fee = element(5, Entry),
+        Vsize = element(7, Entry),
+        Weight = element(8, Entry),
+        _FeeRate = element(9, Entry),
+        TimeAdded = element(10, Entry),
+        HeightAdded = element(11, Entry),
+        AncestorCount = element(12, Entry),
+        AncestorSize = element(13, Entry),
+        AncestorFee = element(14, Entry),
+        DescCount = element(15, Entry),
+        DescSize = element(16, Entry),
+        DescFee = element(17, Entry),
+        _SpendsCoinbase = element(18, Entry),
+        Bip125 = element(19, Entry),
+        #{
+            <<"vsize">> => Vsize,
+            <<"weight">> => Weight,
+            <<"fee">> => satoshi_to_btc(Fee),
+            <<"modifiedfee">> => satoshi_to_btc(Fee),
+            <<"time">> => TimeAdded,
+            <<"height">> => HeightAdded,
+            <<"descendantcount">> => DescCount,
+            <<"descendantsize">> => DescSize,
+            <<"descendantfees">> => DescFee,
+            <<"ancestorcount">> => AncestorCount,
+            <<"ancestorsize">> => AncestorSize,
+            <<"ancestorfees">> => AncestorFee,
+            <<"depends">> => [],
+            <<"spentby">> => [],
+            <<"bip125-replaceable">> => Bip125,
+            <<"fees">> => #{
+                <<"base">> => satoshi_to_btc(Fee),
+                <<"modified">> => satoshi_to_btc(Fee),
+                <<"ancestor">> => satoshi_to_btc(AncestorFee),
+                <<"descendant">> => satoshi_to_btc(DescFee)
+            }
+        }
+    catch
+        _:_ ->
+            #{<<"error">> => <<"failed to format entry">>}
+    end.
