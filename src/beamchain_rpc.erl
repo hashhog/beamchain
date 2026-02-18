@@ -291,9 +291,16 @@ handle_method(<<"help">>, Params) -> rpc_help(Params);
 handle_method(<<"stop">>, _) -> rpc_stop();
 handle_method(<<"uptime">>, _) -> rpc_uptime();
 
-%% -- Blockchain (basic) --
+%% -- Blockchain --
 handle_method(<<"getblockcount">>, _) -> rpc_getblockcount();
 handle_method(<<"getbestblockhash">>, _) -> rpc_getbestblockhash();
+handle_method(<<"getblockchaininfo">>, _) -> rpc_getblockchaininfo();
+handle_method(<<"getblockhash">>, P) -> rpc_getblockhash(P);
+handle_method(<<"getblock">>, P) -> rpc_getblock(P);
+handle_method(<<"getblockheader">>, P) -> rpc_getblockheader(P);
+handle_method(<<"getdifficulty">>, _) -> rpc_getdifficulty();
+handle_method(<<"getchaintips">>, _) -> rpc_getchaintips();
+handle_method(<<"verifychain">>, _) -> rpc_verifychain();
 
 handle_method(Method, _) ->
     {error, ?RPC_METHOD_NOT_FOUND,
@@ -374,7 +381,7 @@ rpc_uptime() ->
     {ok, Now - StartTime}.
 
 %%% ===================================================================
-%%% Blockchain methods (basic)
+%%% Blockchain methods
 %%% ===================================================================
 
 rpc_getblockcount() ->
@@ -389,6 +396,165 @@ rpc_getbestblockhash() ->
             {ok, hash_to_hex(Hash)};
         not_found ->
             {error, ?RPC_MISC_ERROR, <<"No blocks yet">>}
+    end.
+
+rpc_getblockchaininfo() ->
+    Network = beamchain_config:network(),
+    case beamchain_chainstate:get_tip() of
+        {ok, {TipHash, TipHeight}} ->
+            MTP = beamchain_chainstate:get_mtp(),
+            Synced = beamchain_chainstate:is_synced(),
+            %% Get chainwork and timestamp from block index
+            {Chainwork, BlockTime} = case beamchain_db:get_block_index(TipHeight) of
+                {ok, #{chainwork := CW, header := Hdr}} ->
+                    {CW, Hdr#block_header.timestamp};
+                _ ->
+                    {<<0:256>>, 0}
+            end,
+            Difficulty = tip_difficulty(),
+            {ok, #{
+                <<"chain">> => network_name(Network),
+                <<"blocks">> => TipHeight,
+                <<"headers">> => TipHeight,
+                <<"bestblockhash">> => hash_to_hex(TipHash),
+                <<"difficulty">> => Difficulty,
+                <<"time">> => BlockTime,
+                <<"mediantime">> => MTP,
+                <<"verificationprogress">> => case Synced of
+                    true -> 1.0;
+                    false -> 0.999
+                end,
+                <<"initialblockdownload">> => not Synced,
+                <<"chainwork">> => beamchain_serialize:hex_encode(Chainwork),
+                <<"pruned">> => false,
+                <<"warnings">> => <<>>
+            }};
+        not_found ->
+            {ok, #{
+                <<"chain">> => network_name(Network),
+                <<"blocks">> => 0,
+                <<"headers">> => 0,
+                <<"bestblockhash">> => <<>>,
+                <<"difficulty">> => 0,
+                <<"time">> => 0,
+                <<"mediantime">> => 0,
+                <<"verificationprogress">> => 0.0,
+                <<"initialblockdownload">> => true,
+                <<"chainwork">> => <<"0000000000000000000000000000000000000000000000000000000000000000">>,
+                <<"pruned">> => false,
+                <<"warnings">> => <<>>
+            }}
+    end.
+
+rpc_getblockhash([Height]) when is_integer(Height), Height >= 0 ->
+    case beamchain_db:get_block_index(Height) of
+        {ok, #{hash := Hash}} ->
+            {ok, hash_to_hex(Hash)};
+        not_found ->
+            {error, ?RPC_INVALID_PARAMETER,
+             <<"Block height out of range">>}
+    end;
+rpc_getblockhash(_) ->
+    {error, ?RPC_INVALID_PARAMS, <<"Usage: getblockhash height">>}.
+
+rpc_getblock([HashHex]) ->
+    rpc_getblock([HashHex, 1]);
+rpc_getblock([HashHex, Verbosity]) when is_binary(HashHex) ->
+    Hash = hex_to_internal_hash(HashHex),
+    case beamchain_db:get_block(Hash) of
+        {ok, Block} ->
+            case Verbosity of
+                0 ->
+                    %% Raw hex
+                    Hex = beamchain_serialize:hex_encode(
+                        beamchain_serialize:encode_block(Block)),
+                    {ok, Hex};
+                1 ->
+                    %% JSON with txids
+                    {ok, format_block_json(Block, Hash, false)};
+                2 ->
+                    %% JSON with decoded txs
+                    {ok, format_block_json(Block, Hash, true)};
+                _ ->
+                    {error, ?RPC_INVALID_PARAMETER,
+                     <<"Invalid verbosity value">>}
+            end;
+        not_found ->
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY, <<"Block not found">>}
+    end;
+rpc_getblock(_) ->
+    {error, ?RPC_INVALID_PARAMS, <<"Usage: getblock \"hash\" ( verbosity )">>}.
+
+rpc_getblockheader([HashHex]) ->
+    rpc_getblockheader([HashHex, true]);
+rpc_getblockheader([HashHex, Verbose]) when is_binary(HashHex) ->
+    Hash = hex_to_internal_hash(HashHex),
+    case beamchain_db:get_block_index_by_hash(Hash) of
+        {ok, #{height := Height, header := Header, chainwork := Chainwork}} ->
+            case Verbose of
+                false ->
+                    Hex = beamchain_serialize:hex_encode(
+                        beamchain_serialize:encode_block_header(Header)),
+                    {ok, Hex};
+                _ ->
+                    %% Get next block hash if it exists
+                    NextHash = case beamchain_db:get_block_index(Height + 1) of
+                        {ok, #{hash := NH}} -> hash_to_hex(NH);
+                        not_found -> null
+                    end,
+                    Bits = Header#block_header.bits,
+                    {ok, #{
+                        <<"hash">> => hash_to_hex(Hash),
+                        <<"confirmations">> => confirmations(Height),
+                        <<"height">> => Height,
+                        <<"version">> => Header#block_header.version,
+                        <<"versionHex">> => beamchain_serialize:hex_encode(
+                            <<(Header#block_header.version):32/big>>),
+                        <<"merkleroot">> => hash_to_hex(
+                            Header#block_header.merkle_root),
+                        <<"time">> => Header#block_header.timestamp,
+                        <<"mediantime">> => block_mtp(Height),
+                        <<"nonce">> => Header#block_header.nonce,
+                        <<"bits">> => beamchain_serialize:hex_encode(
+                            <<Bits:32/big>>),
+                        <<"difficulty">> => bits_to_difficulty(Bits),
+                        <<"chainwork">> => beamchain_serialize:hex_encode(
+                            Chainwork),
+                        <<"nTx">> => count_block_txs(Hash),
+                        <<"previousblockhash">> => hash_to_hex(
+                            Header#block_header.prev_hash),
+                        <<"nextblockhash">> => NextHash
+                    }}
+            end;
+        not_found ->
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY, <<"Block not found">>}
+    end;
+rpc_getblockheader(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: getblockheader \"hash\" ( verbose )">>}.
+
+rpc_getdifficulty() ->
+    {ok, tip_difficulty()}.
+
+rpc_getchaintips() ->
+    %% We only track the active chain, so return one tip
+    case beamchain_chainstate:get_tip() of
+        {ok, {Hash, Height}} ->
+            {ok, [#{
+                <<"height">> => Height,
+                <<"hash">> => hash_to_hex(Hash),
+                <<"branchlen">> => 0,
+                <<"status">> => <<"active">>
+            }]};
+        not_found ->
+            {ok, []}
+    end.
+
+rpc_verifychain() ->
+    %% Simplified: return true if we have a chain tip
+    case beamchain_chainstate:get_tip() of
+        {ok, _} -> {ok, true};
+        not_found -> {ok, true}
     end.
 
 %%% ===================================================================
@@ -412,9 +578,226 @@ hash_to_hex(Hash) when byte_size(Hash) =:= 32 ->
 hash_to_hex(_) ->
     <<"0000000000000000000000000000000000000000000000000000000000000000">>.
 
+%% Convert display-order hex hash to internal byte order.
+hex_to_internal_hash(HexStr) ->
+    beamchain_serialize:reverse_bytes(
+        beamchain_serialize:hex_decode(HexStr)).
+
 network_name(mainnet)  -> <<"main">>;
 network_name(testnet)  -> <<"test">>;
 network_name(testnet4) -> <<"testnet4">>;
 network_name(regtest)  -> <<"regtest">>;
 network_name(signet)   -> <<"signet">>;
 network_name(N)        -> atom_to_binary(N, utf8).
+
+%% Compute difficulty from compact bits.
+%% difficulty = max_target / current_target
+bits_to_difficulty(Bits) ->
+    Target = beamchain_pow:bits_to_target(Bits),
+    case Target of
+        0 -> 0.0;
+        _ ->
+            MaxTarget = beamchain_pow:bits_to_target(16#1d00ffff),
+            MaxTarget / Target
+    end.
+
+%% Current tip difficulty.
+tip_difficulty() ->
+    case beamchain_chainstate:get_tip() of
+        {ok, {_Hash, Height}} ->
+            case beamchain_db:get_block_index(Height) of
+                {ok, #{header := Hdr}} ->
+                    bits_to_difficulty(Hdr#block_header.bits);
+                _ -> 0.0
+            end;
+        _ -> 0.0
+    end.
+
+%% Number of confirmations for a block at the given height.
+confirmations(BlockHeight) ->
+    case beamchain_chainstate:get_tip() of
+        {ok, {_, TipHeight}} -> TipHeight - BlockHeight + 1;
+        not_found -> 0
+    end.
+
+%% Median time past for a specific block height.
+block_mtp(Height) when Height < 11 ->
+    %% Not enough blocks for full MTP, just use block's own timestamp
+    case beamchain_db:get_block_index(Height) of
+        {ok, #{header := Hdr}} -> Hdr#block_header.timestamp;
+        _ -> 0
+    end;
+block_mtp(Height) ->
+    Timestamps = lists:filtermap(fun(H) ->
+        case beamchain_db:get_block_index(H) of
+            {ok, #{header := Hdr}} -> {true, Hdr#block_header.timestamp};
+            _ -> false
+        end
+    end, lists:seq(Height - 10, Height)),
+    case Timestamps of
+        [] -> 0;
+        Ts ->
+            Sorted = lists:sort(Ts),
+            lists:nth((length(Sorted) div 2) + 1, Sorted)
+    end.
+
+%% Count transactions in a block.
+count_block_txs(Hash) ->
+    case beamchain_db:get_block(Hash) of
+        {ok, #block{transactions = Txs}} -> length(Txs);
+        _ -> 0
+    end.
+
+%% Format a block as JSON (verbosity 1 or 2).
+format_block_json(#block{header = Header, transactions = Txs} = Block,
+                  Hash, DecodeTxs) ->
+    Height = case beamchain_db:get_block_index_by_hash(Hash) of
+        {ok, #{height := H}} -> H;
+        _ -> Block#block.height
+    end,
+    Chainwork = case beamchain_db:get_block_index_by_hash(Hash) of
+        {ok, #{chainwork := CW}} -> CW;
+        _ -> <<0:256>>
+    end,
+    NextHash = case beamchain_db:get_block_index(Height + 1) of
+        {ok, #{hash := NH}} -> hash_to_hex(NH);
+        not_found -> null
+    end,
+    Bits = Header#block_header.bits,
+    %% Compute block size and weight
+    BlockBin = beamchain_serialize:encode_block(Block),
+    Size = byte_size(BlockBin),
+    Weight = block_weight(Block),
+    %% Transaction list
+    TxList = case DecodeTxs of
+        true ->
+            [format_tx_json(Tx) || Tx <- Txs];
+        false ->
+            [hash_to_hex(beamchain_serialize:tx_hash(Tx)) || Tx <- Txs]
+    end,
+    #{
+        <<"hash">> => hash_to_hex(Hash),
+        <<"confirmations">> => confirmations(Height),
+        <<"height">> => Height,
+        <<"version">> => Header#block_header.version,
+        <<"versionHex">> => beamchain_serialize:hex_encode(
+            <<(Header#block_header.version):32/big>>),
+        <<"merkleroot">> => hash_to_hex(Header#block_header.merkle_root),
+        <<"time">> => Header#block_header.timestamp,
+        <<"mediantime">> => block_mtp(Height),
+        <<"nonce">> => Header#block_header.nonce,
+        <<"bits">> => beamchain_serialize:hex_encode(<<Bits:32/big>>),
+        <<"difficulty">> => bits_to_difficulty(Bits),
+        <<"chainwork">> => beamchain_serialize:hex_encode(Chainwork),
+        <<"nTx">> => length(Txs),
+        <<"previousblockhash">> => hash_to_hex(
+            Header#block_header.prev_hash),
+        <<"nextblockhash">> => NextHash,
+        <<"size">> => Size,
+        <<"weight">> => Weight,
+        <<"strippedsize">> => stripped_size(Block),
+        <<"tx">> => TxList
+    }.
+
+%% Format a transaction as JSON (for getblock verbosity=2).
+format_tx_json(#transaction{} = Tx) ->
+    Txid = beamchain_serialize:tx_hash(Tx),
+    Wtxid = beamchain_serialize:wtx_hash(Tx),
+    TxBin = beamchain_serialize:encode_transaction(Tx),
+    #{
+        <<"txid">> => hash_to_hex(Txid),
+        <<"hash">> => hash_to_hex(Wtxid),
+        <<"version">> => Tx#transaction.version,
+        <<"size">> => byte_size(TxBin),
+        <<"vsize">> => beamchain_serialize:tx_vsize(Tx),
+        <<"weight">> => beamchain_serialize:tx_weight(Tx),
+        <<"locktime">> => Tx#transaction.locktime,
+        <<"vin">> => [format_vin(In) || In <- Tx#transaction.inputs],
+        <<"vout">> => format_vouts(Tx#transaction.outputs, 0),
+        <<"hex">> => beamchain_serialize:hex_encode(TxBin)
+    }.
+
+format_vin(#tx_in{prev_out = #outpoint{hash = <<0:256>>,
+                                        index = 16#ffffffff},
+                  script_sig = ScriptSig, sequence = Seq}) ->
+    %% Coinbase
+    #{<<"coinbase">> => beamchain_serialize:hex_encode(ScriptSig),
+      <<"sequence">> => Seq};
+format_vin(#tx_in{prev_out = #outpoint{hash = Hash, index = Idx},
+                  script_sig = ScriptSig, sequence = Seq,
+                  witness = Witness}) ->
+    Base = #{
+        <<"txid">> => hash_to_hex(Hash),
+        <<"vout">> => Idx,
+        <<"scriptSig">> => #{
+            <<"hex">> => beamchain_serialize:hex_encode(ScriptSig)
+        },
+        <<"sequence">> => Seq
+    },
+    case Witness of
+        W when is_list(W), W =/= [] ->
+            Base#{<<"txinwitness">> =>
+                [beamchain_serialize:hex_encode(Item) || Item <- W]};
+        _ ->
+            Base
+    end.
+
+format_vouts([], _N) -> [];
+format_vouts([#tx_out{value = Value, script_pubkey = Script} | Rest], N) ->
+    Network = beamchain_config:network(),
+    NetType = case Network of
+        mainnet -> mainnet;
+        _ -> testnet
+    end,
+    Type = beamchain_address:classify_script(Script),
+    Address = beamchain_address:script_to_address(Script, NetType),
+    Vout = #{
+        <<"value">> => satoshi_to_btc(Value),
+        <<"n">> => N,
+        <<"scriptPubKey">> => #{
+            <<"hex">> => beamchain_serialize:hex_encode(Script),
+            <<"type">> => script_type_name(Type),
+            <<"address">> => case Address of
+                unknown -> null;
+                "OP_RETURN" -> null;
+                Addr -> iolist_to_binary(Addr)
+            end
+        }
+    },
+    [Vout | format_vouts(Rest, N + 1)].
+
+script_type_name(p2pkh)     -> <<"pubkeyhash">>;
+script_type_name(p2sh)      -> <<"scripthash">>;
+script_type_name(p2wpkh)    -> <<"witness_v0_keyhash">>;
+script_type_name(p2wsh)     -> <<"witness_v0_scripthash">>;
+script_type_name(p2tr)      -> <<"witness_v1_taproot">>;
+script_type_name(op_return)  -> <<"nulldata">>;
+script_type_name({witness, V, _}) ->
+    iolist_to_binary(io_lib:format("witness_v~B", [V]));
+script_type_name(_)          -> <<"nonstandard">>.
+
+satoshi_to_btc(Satoshis) ->
+    Satoshis / 100000000.0.
+
+%% Approximate block weight.
+block_weight(#block{transactions = Txs} = Block) ->
+    %% Header weight: 80 * 4 = 320
+    HeaderWeight = 80 * ?WITNESS_SCALE_FACTOR,
+    %% Each tx weight
+    TxWeights = lists:sum([beamchain_serialize:tx_weight(Tx) || Tx <- Txs]),
+    %% Varint for tx count (approximate)
+    VarintWeight = byte_size(beamchain_serialize:encode_varint(
+        length(Block#block.transactions))) * ?WITNESS_SCALE_FACTOR,
+    HeaderWeight + VarintWeight + TxWeights.
+
+%% Block size without witness data.
+stripped_size(#block{} = Block) ->
+    %% Encode without witness
+    NoWitness = beamchain_serialize:encode_block(
+        Block#block{transactions =
+            [strip_witness(Tx) || Tx <- Block#block.transactions]}),
+    byte_size(NoWitness).
+
+strip_witness(#transaction{inputs = Inputs} = Tx) ->
+    Tx#transaction{inputs =
+        [In#tx_in{witness = []} || In <- Inputs]}.
