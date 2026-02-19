@@ -314,6 +314,25 @@ handle_method(<<"getmempoolinfo">>, _) -> rpc_getmempoolinfo();
 handle_method(<<"getrawmempool">>, P) -> rpc_getrawmempool(P);
 handle_method(<<"getmempoolentry">>, P) -> rpc_getmempoolentry(P);
 
+%% -- Network --
+handle_method(<<"getnetworkinfo">>, _) -> rpc_getnetworkinfo();
+handle_method(<<"getpeerinfo">>, _) -> rpc_getpeerinfo();
+handle_method(<<"getconnectioncount">>, _) -> rpc_getconnectioncount();
+handle_method(<<"addnode">>, P) -> rpc_addnode(P);
+handle_method(<<"disconnectnode">>, P) -> rpc_disconnectnode(P);
+
+%% -- Mining --
+handle_method(<<"getmininginfo">>, _) -> rpc_getmininginfo();
+handle_method(<<"getblocktemplate">>, P) -> rpc_getblocktemplate(P);
+handle_method(<<"submitblock">>, P) -> rpc_submitblock(P);
+
+%% -- Fee estimation --
+handle_method(<<"estimatesmartfee">>, P) -> rpc_estimatesmartfee(P);
+
+%% -- Utility --
+handle_method(<<"validateaddress">>, P) -> rpc_validateaddress(P);
+handle_method(<<"decodescript">>, P) -> rpc_decodescript(P);
+
 handle_method(Method, _) ->
     {error, ?RPC_METHOD_NOT_FOUND,
      <<"Method not found: ", Method/binary>>}.
@@ -759,6 +778,312 @@ rpc_getmempoolentry(_) ->
      <<"Usage: getmempoolentry \"txid\"">>}.
 
 %%% ===================================================================
+%%% Network methods
+%%% ===================================================================
+
+rpc_getnetworkinfo() ->
+    Connections = beamchain_peer_manager:peer_count(),
+    {ok, #{
+        <<"version">> => 260000,
+        <<"subversion">> => <<"/beamchain:0.1.0/">>,
+        <<"protocolversion">> => ?PROTOCOL_VERSION,
+        <<"localservices">> => <<"0000000000000009">>,
+        <<"localservicesnames">> => [<<"NETWORK">>, <<"WITNESS">>],
+        <<"localrelay">> => true,
+        <<"timeoffset">> => 0,
+        <<"networkactive">> => true,
+        <<"connections">> => Connections,
+        <<"connections_in">> => beamchain_peer_manager:inbound_count(),
+        <<"connections_out">> => beamchain_peer_manager:outbound_count(),
+        <<"networks">> => [#{
+            <<"name">> => <<"ipv4">>,
+            <<"limited">> => false,
+            <<"reachable">> => true,
+            <<"proxy">> => <<>>,
+            <<"proxy_randomize_credentials">> => false
+        }],
+        <<"relayfee">> => ?DEFAULT_MIN_RELAY_TX_FEE / 100000.0,
+        <<"incrementalfee">> => 0.00001,
+        <<"localaddresses">> => [],
+        <<"warnings">> => <<>>
+    }}.
+
+rpc_getpeerinfo() ->
+    Peers = beamchain_peer_manager:get_peers(),
+    PeerInfoList = lists:map(fun(#{pid := _Pid, address := {IP, Port},
+                                   direction := Dir, connected := _Conn,
+                                   info := Info}) ->
+        Now = erlang:system_time(second),
+        #{
+            <<"id">> => erlang:phash2({IP, Port}),
+            <<"addr">> => format_addr(IP, Port),
+            <<"addrbind">> => <<>>,
+            <<"services">> => beamchain_serialize:hex_encode(
+                <<(maps:get(services, Info, 0)):64/big>>),
+            <<"servicesnames">> => services_to_names(
+                maps:get(services, Info, 0)),
+            <<"lastsend">> => Now,
+            <<"lastrecv">> => Now,
+            <<"last_transaction">> => 0,
+            <<"last_block">> => 0,
+            <<"bytessent">> => 0,
+            <<"bytesrecv">> => 0,
+            <<"conntime">> => maps:get(connect_time, Info, Now),
+            <<"timeoffset">> => 0,
+            <<"pingtime">> => maps:get(ping_time, Info, 0.0),
+            <<"version">> => maps:get(version, Info, 0),
+            <<"subver">> => maps:get(user_agent, Info, <<"/unknown/">>),
+            <<"inbound">> => Dir =:= inbound,
+            <<"bip152_hb_to">> => false,
+            <<"bip152_hb_from">> => false,
+            <<"startingheight">> => maps:get(start_height, Info, 0),
+            <<"presynced_headers">> => 0,
+            <<"synced_headers">> => -1,
+            <<"synced_blocks">> => -1,
+            <<"connection_type">> => case Dir of
+                outbound -> <<"outbound-full-relay">>;
+                inbound -> <<"inbound">>
+            end
+        }
+    end, Peers),
+    {ok, PeerInfoList}.
+
+rpc_getconnectioncount() ->
+    {ok, beamchain_peer_manager:peer_count()}.
+
+rpc_addnode([NodeStr, CommandStr]) when is_binary(NodeStr),
+                                        is_binary(CommandStr) ->
+    case CommandStr of
+        <<"add">> ->
+            case parse_node_addr(NodeStr) of
+                {ok, IP, Port} ->
+                    case beamchain_peer_manager:connect_to(IP, Port) of
+                        {ok, _Pid} -> {ok, null};
+                        {error, Reason} ->
+                            {error, ?RPC_MISC_ERROR,
+                             iolist_to_binary(io_lib:format("~p", [Reason]))}
+                    end;
+                {error, Msg} ->
+                    {error, ?RPC_INVALID_PARAMETER, Msg}
+            end;
+        <<"remove">> ->
+            %% Find and disconnect
+            case parse_node_addr(NodeStr) of
+                {ok, IP, Port} ->
+                    Peers = beamchain_peer_manager:get_peers(),
+                    case lists:filter(fun(#{address := {PIP, PPort}}) ->
+                        PIP =:= IP andalso PPort =:= Port
+                    end, Peers) of
+                        [#{pid := Pid} | _] ->
+                            beamchain_peer_manager:disconnect_peer(Pid),
+                            {ok, null};
+                        [] ->
+                            {error, ?RPC_MISC_ERROR, <<"Node not found">>}
+                    end;
+                {error, Msg} ->
+                    {error, ?RPC_INVALID_PARAMETER, Msg}
+            end;
+        <<"onetry">> ->
+            case parse_node_addr(NodeStr) of
+                {ok, IP, Port} ->
+                    beamchain_peer_manager:connect_to(IP, Port),
+                    {ok, null};
+                {error, Msg} ->
+                    {error, ?RPC_INVALID_PARAMETER, Msg}
+            end;
+        _ ->
+            {error, ?RPC_INVALID_PARAMETER,
+             <<"Command must be add, remove, or onetry">>}
+    end;
+rpc_addnode(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: addnode \"node\" \"command\"">>}.
+
+rpc_disconnectnode([Address]) when is_binary(Address) ->
+    case parse_node_addr(Address) of
+        {ok, IP, Port} ->
+            Peers = beamchain_peer_manager:get_peers(),
+            case lists:filter(fun(#{address := {PIP, PPort}}) ->
+                PIP =:= IP andalso PPort =:= Port
+            end, Peers) of
+                [#{pid := Pid} | _] ->
+                    beamchain_peer_manager:disconnect_peer(Pid),
+                    {ok, null};
+                [] ->
+                    {error, ?RPC_MISC_ERROR, <<"Node not connected">>}
+            end;
+        {error, Msg} ->
+            {error, ?RPC_INVALID_PARAMETER, Msg}
+    end;
+rpc_disconnectnode(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: disconnectnode \"address\"">>}.
+
+%%% ===================================================================
+%%% Mining methods
+%%% ===================================================================
+
+rpc_getmininginfo() ->
+    Network = beamchain_config:network(),
+    {Blocks, Difficulty} = case beamchain_chainstate:get_tip() of
+        {ok, {_Hash, Height}} ->
+            {Height, tip_difficulty()};
+        not_found ->
+            {0, 0.0}
+    end,
+    PooledTx = length(beamchain_mempool:get_all_txids()),
+    {ok, #{
+        <<"blocks">> => Blocks,
+        <<"difficulty">> => Difficulty,
+        <<"networkhashps">> => 0,
+        <<"pooledtx">> => PooledTx,
+        <<"chain">> => network_name(Network),
+        <<"warnings">> => <<>>
+    }}.
+
+rpc_getblocktemplate([]) ->
+    rpc_getblocktemplate([#{}]);
+rpc_getblocktemplate([TemplateRequest]) when is_map(TemplateRequest) ->
+    %% Use a default coinbase script (OP_TRUE) for template generation
+    DefaultScript = <<16#51>>,
+    CoinbaseScript = maps:get(<<"coinbasescript">>, TemplateRequest,
+                               DefaultScript),
+    case beamchain_miner:create_block_template(CoinbaseScript) of
+        {ok, Template} ->
+            %% Strip internal fields (prefixed with _)
+            Public = maps:filter(fun(<<"_", _/binary>>, _) -> false;
+                                     (_, _) -> true
+                                 end, Template),
+            {ok, Public};
+        {error, Reason} ->
+            {error, ?RPC_MISC_ERROR,
+             iolist_to_binary(io_lib:format("~p", [Reason]))}
+    end;
+rpc_getblocktemplate(_) ->
+    rpc_getblocktemplate([#{}]).
+
+rpc_submitblock([HexData]) when is_binary(HexData) ->
+    case beamchain_miner:submit_block(HexData) of
+        ok ->
+            {ok, null};
+        {error, Reason} ->
+            {error, ?RPC_VERIFY_ERROR,
+             iolist_to_binary(io_lib:format("~p", [Reason]))}
+    end;
+rpc_submitblock(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: submitblock \"hexdata\"">>}.
+
+%%% ===================================================================
+%%% Fee estimation
+%%% ===================================================================
+
+rpc_estimatesmartfee([ConfTarget | _]) when is_integer(ConfTarget) ->
+    case beamchain_fee_estimator:estimate_fee(ConfTarget) of
+        {ok, FeeRate} ->
+            %% Convert sat/vB to BTC/kvB
+            BtcPerKvB = FeeRate * 1000.0 / 100000000.0,
+            {ok, #{
+                <<"feerate">> => BtcPerKvB,
+                <<"blocks">> => ConfTarget,
+                <<"errors">> => []
+            }};
+        {error, _Reason} ->
+            {ok, #{
+                <<"errors">> => [<<"Insufficient data">>],
+                <<"blocks">> => ConfTarget
+            }}
+    end;
+rpc_estimatesmartfee(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: estimatesmartfee conf_target">>}.
+
+%%% ===================================================================
+%%% Utility methods
+%%% ===================================================================
+
+rpc_validateaddress([Address]) when is_binary(Address) ->
+    AddrStr = binary_to_list(Address),
+    Network = beamchain_config:network(),
+    NetType = case Network of mainnet -> mainnet; _ -> testnet end,
+    case beamchain_address:address_to_script(AddrStr, NetType) of
+        {ok, Script} ->
+            Type = beamchain_address:classify_script(Script),
+            IsWitness = case Type of
+                p2wpkh -> true;
+                p2wsh -> true;
+                p2tr -> true;
+                {witness, _, _} -> true;
+                _ -> false
+            end,
+            IsScript = case Type of
+                p2sh -> true;
+                p2wsh -> true;
+                _ -> false
+            end,
+            {ok, #{
+                <<"isvalid">> => true,
+                <<"address">> => Address,
+                <<"scriptPubKey">> => beamchain_serialize:hex_encode(Script),
+                <<"isscript">> => IsScript,
+                <<"iswitness">> => IsWitness,
+                <<"witness_version">> => case Type of
+                    p2wpkh -> 0;
+                    p2wsh -> 0;
+                    p2tr -> 1;
+                    {witness, V, _} -> V;
+                    _ -> null
+                end,
+                <<"witness_program">> => case Script of
+                    <<_WitVer:8, Len:8, Prog:Len/binary>> when IsWitness ->
+                        beamchain_serialize:hex_encode(Prog);
+                    _ -> null
+                end
+            }};
+        {error, _} ->
+            {ok, #{
+                <<"isvalid">> => false,
+                <<"address">> => Address
+            }}
+    end;
+rpc_validateaddress(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: validateaddress \"address\"">>}.
+
+rpc_decodescript([HexStr]) when is_binary(HexStr) ->
+    try
+        Script = beamchain_serialize:hex_decode(HexStr),
+        Type = beamchain_address:classify_script(Script),
+        Network = beamchain_config:network(),
+        NetType = case Network of mainnet -> mainnet; _ -> testnet end,
+        Address = beamchain_address:script_to_address(Script, NetType),
+        %% P2SH address of this script
+        ScriptHash = beamchain_crypto:hash160(Script),
+        P2SHScript = <<16#a9, 16#14, ScriptHash/binary, 16#87>>,
+        P2SH = beamchain_address:script_to_address(P2SHScript, NetType),
+        {ok, #{
+            <<"asm">> => beamchain_serialize:hex_encode(Script),
+            <<"type">> => script_type_name(Type),
+            <<"address">> => case Address of
+                unknown -> null;
+                "OP_RETURN" -> null;
+                Addr -> iolist_to_binary(Addr)
+            end,
+            <<"p2sh">> => case P2SH of
+                unknown -> null;
+                Addr2 -> iolist_to_binary(Addr2)
+            end
+        }}
+    catch
+        _:_ ->
+            {error, ?RPC_DESERIALIZATION_ERROR,
+             <<"Script decode failed">>}
+    end;
+rpc_decodescript(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: decodescript \"hexstring\"">>}.
+
+%%% ===================================================================
 %%% Internal helpers
 %%% ===================================================================
 
@@ -1062,6 +1387,53 @@ format_utxo_result(Value, Script, Confirmations, IsCoinbase) ->
         },
         <<"coinbase">> => IsCoinbase
     }.
+
+%% Format IP:Port as binary string.
+format_addr({A, B, C, D}, Port) ->
+    iolist_to_binary(io_lib:format("~B.~B.~B.~B:~B", [A, B, C, D, Port]));
+format_addr(IP, Port) ->
+    iolist_to_binary(io_lib:format("~p:~B", [IP, Port])).
+
+%% Parse "host:port" into {ok, IP, Port} or {error, Msg}.
+parse_node_addr(Str) when is_binary(Str) ->
+    parse_node_addr(binary_to_list(Str));
+parse_node_addr(Str) when is_list(Str) ->
+    Params = beamchain_config:network_params(),
+    DefaultPort = Params#network_params.default_port,
+    case string:split(Str, ":") of
+        [Host, PortStr] ->
+            case catch list_to_integer(PortStr) of
+                Port when is_integer(Port) ->
+                    resolve_host(Host, Port);
+                _ ->
+                    {error, <<"Invalid port">>}
+            end;
+        [Host] ->
+            resolve_host(Host, DefaultPort);
+        _ ->
+            {error, <<"Invalid address format">>}
+    end.
+
+resolve_host(Host, Port) ->
+    case inet:parse_address(Host) of
+        {ok, IP} ->
+            {ok, IP, Port};
+        {error, _} ->
+            case inet:getaddr(Host, inet) of
+                {ok, IP} -> {ok, IP, Port};
+                {error, _} -> {error, <<"Could not resolve host">>}
+            end
+    end.
+
+%% Convert service flags to names.
+services_to_names(Services) ->
+    Flags = [
+        {?NODE_NETWORK, <<"NETWORK">>},
+        {?NODE_BLOOM, <<"BLOOM">>},
+        {?NODE_WITNESS, <<"WITNESS">>},
+        {?NODE_NETWORK_LIMITED, <<"NETWORK_LIMITED">>}
+    ],
+    [Name || {Flag, Name} <- Flags, (Services band Flag) =/= 0].
 
 %% Format a mempool entry for getrawmempool verbose / getmempoolentry.
 %% Note: mempool_entry is a record defined in beamchain_mempool,
