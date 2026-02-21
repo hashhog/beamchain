@@ -10,7 +10,8 @@
         beamchain_mempool,
         beamchain_fee_estimator,
         beamchain_peer_manager,
-        beamchain_sync
+        beamchain_sync,
+        beamchain_rpc
     ]},
     {mod, {beamchain_app, []}},
     {applications, [
@@ -19,7 +20,9 @@
         crypto,
         ssl,
         inets,
-        rocksdb
+        rocksdb,
+        jsx,
+        cowboy
     ]},
     {env, [
         {network, mainnet},
