@@ -25,8 +25,8 @@ init([]) ->
         child_spec(beamchain_header_sync, worker),
         child_spec(beamchain_block_sync, worker),
         child_spec(beamchain_sync, worker),
-        child_spec(beamchain_miner, worker)
-        %% beamchain_rpc will be added when cowboy is wired up
+        child_spec(beamchain_miner, worker),
+        child_spec(beamchain_rpc, worker)
     ],
     {ok, {SupFlags, Children}}.
 
