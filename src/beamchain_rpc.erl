@@ -49,6 +49,15 @@
     start_time :: non_neg_integer()
 }).
 
+%% Re-define mempool_entry record (internal to beamchain_mempool).
+-record(mempool_entry, {
+    txid, wtxid, tx, fee, size, vsize, weight, fee_rate,
+    time_added, height_added,
+    ancestor_count, ancestor_size, ancestor_fee,
+    descendant_count, descendant_size, descendant_fee,
+    spends_coinbase, rbf_signaling
+}).
+
 %%% ===================================================================
 %%% API
 %%% ===================================================================
@@ -1436,54 +1445,35 @@ services_to_names(Services) ->
     [Name || {Flag, Name} <- Flags, (Services band Flag) =/= 0].
 
 %% Format a mempool entry for getrawmempool verbose / getmempoolentry.
-%% Note: mempool_entry is a record defined in beamchain_mempool,
-%% but we access it via get_entry which returns the record.
-format_mempool_entry(Entry) ->
-    %% Entry is a mempool_entry record; use element access
-    %% since we don't have the record definition imported.
-    %% Fields: txid, wtxid, tx, fee, size, vsize, weight, fee_rate,
-    %%   time_added, height_added, ancestor_count, ancestor_size,
-    %%   ancestor_fee, descendant_count, descendant_size, descendant_fee,
-    %%   spends_coinbase, rbf_signaling
-    try
-        Fee = element(5, Entry),
-        Vsize = element(7, Entry),
-        Weight = element(8, Entry),
-        _FeeRate = element(9, Entry),
-        TimeAdded = element(10, Entry),
-        HeightAdded = element(11, Entry),
-        AncestorCount = element(12, Entry),
-        AncestorSize = element(13, Entry),
-        AncestorFee = element(14, Entry),
-        DescCount = element(15, Entry),
-        DescSize = element(16, Entry),
-        DescFee = element(17, Entry),
-        _SpendsCoinbase = element(18, Entry),
-        Bip125 = element(19, Entry),
-        #{
-            <<"vsize">> => Vsize,
-            <<"weight">> => Weight,
-            <<"fee">> => satoshi_to_btc(Fee),
-            <<"modifiedfee">> => satoshi_to_btc(Fee),
-            <<"time">> => TimeAdded,
-            <<"height">> => HeightAdded,
-            <<"descendantcount">> => DescCount,
-            <<"descendantsize">> => DescSize,
-            <<"descendantfees">> => DescFee,
-            <<"ancestorcount">> => AncestorCount,
-            <<"ancestorsize">> => AncestorSize,
-            <<"ancestorfees">> => AncestorFee,
-            <<"depends">> => [],
-            <<"spentby">> => [],
-            <<"bip125-replaceable">> => Bip125,
-            <<"fees">> => #{
-                <<"base">> => satoshi_to_btc(Fee),
-                <<"modified">> => satoshi_to_btc(Fee),
-                <<"ancestor">> => satoshi_to_btc(AncestorFee),
-                <<"descendant">> => satoshi_to_btc(DescFee)
-            }
+format_mempool_entry(#mempool_entry{fee = Fee, vsize = Vsize,
+        weight = Weight, time_added = TimeAdded,
+        height_added = HeightAdded,
+        ancestor_count = AncCount, ancestor_size = AncSize,
+        ancestor_fee = AncFee,
+        descendant_count = DescCount, descendant_size = DescSize,
+        descendant_fee = DescFee, rbf_signaling = Bip125}) ->
+    #{
+        <<"vsize">> => Vsize,
+        <<"weight">> => Weight,
+        <<"fee">> => satoshi_to_btc(Fee),
+        <<"modifiedfee">> => satoshi_to_btc(Fee),
+        <<"time">> => TimeAdded,
+        <<"height">> => HeightAdded,
+        <<"descendantcount">> => DescCount,
+        <<"descendantsize">> => DescSize,
+        <<"descendantfees">> => DescFee,
+        <<"ancestorcount">> => AncCount,
+        <<"ancestorsize">> => AncSize,
+        <<"ancestorfees">> => AncFee,
+        <<"depends">> => [],
+        <<"spentby">> => [],
+        <<"bip125-replaceable">> => Bip125,
+        <<"fees">> => #{
+            <<"base">> => satoshi_to_btc(Fee),
+            <<"modified">> => satoshi_to_btc(Fee),
+            <<"ancestor">> => satoshi_to_btc(AncFee),
+            <<"descendant">> => satoshi_to_btc(DescFee)
         }
-    catch
-        _:_ ->
-            #{<<"error">> => <<"failed to format entry">>}
-    end.
+    };
+format_mempool_entry(_) ->
+    #{<<"error">> => <<"failed to format entry">>}.
