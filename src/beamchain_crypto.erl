@@ -3,6 +3,9 @@
 %% Signature verification (NIF-backed)
 -export([ecdsa_verify/3, schnorr_verify/3]).
 
+%% Signing (NIF-backed)
+-export([ecdsa_sign/2, schnorr_sign/3, seckey_tweak_add/2]).
+
 %% Public key operations (NIF-backed)
 -export([pubkey_from_privkey/1, pubkey_tweak_add/2,
          pubkey_compress/1, pubkey_decompress/1,
@@ -80,6 +83,15 @@ pubkey_decompress_nif(_PubKey) ->
 pubkey_combine_nif(_PubKeys) ->
     erlang:nif_error(nif_not_loaded).
 
+ecdsa_sign_nif(_Msg, _SecKey) ->
+    erlang:nif_error(nif_not_loaded).
+
+schnorr_sign_nif(_Msg, _SecKey, _AuxRand) ->
+    erlang:nif_error(nif_not_loaded).
+
+seckey_tweak_add_nif(_SecKey, _Tweak) ->
+    erlang:nif_error(nif_not_loaded).
+
 %%% -------------------------------------------------------------------
 %%% Signature verification
 %%% -------------------------------------------------------------------
@@ -103,6 +115,42 @@ schnorr_verify(Msg, Sig, PubKey) when byte_size(Msg) =:= 32,
         false -> false;
         {error, _} -> false
     end.
+
+%%% -------------------------------------------------------------------
+%%% Signing
+%%% -------------------------------------------------------------------
+
+%% @doc ECDSA sign: returns DER-encoded signature with low-S enforced.
+-spec ecdsa_sign(Msg :: binary(), SecKey :: binary()) ->
+    {ok, binary()} | {error, term()}.
+ecdsa_sign(Msg, SecKey) when byte_size(Msg) =:= 32,
+                              byte_size(SecKey) =:= 32 ->
+    case ecdsa_sign_nif(Msg, SecKey) of
+        {ok, DerSig} ->
+            %% enforce low-S (BIP 62)
+            {ok, {R, S}} = decode_der_signature(DerSig),
+            S2 = normalize_s(S),
+            {ok, encode_der_signature(R, S2)};
+        {error, _} = Err ->
+            Err
+    end.
+
+%% @doc Schnorr sign (BIP 340): returns 64-byte signature.
+-spec schnorr_sign(Msg :: binary(), SecKey :: binary(),
+                   AuxRand :: binary()) ->
+    {ok, binary()} | {error, term()}.
+schnorr_sign(Msg, SecKey, AuxRand) when byte_size(Msg) =:= 32,
+                                         byte_size(SecKey) =:= 32,
+                                         byte_size(AuxRand) =:= 32 ->
+    schnorr_sign_nif(Msg, SecKey, AuxRand).
+
+%% @doc Add tweak to secret key: result = (seckey + tweak) mod n.
+%% Used for BIP 32 child key derivation.
+-spec seckey_tweak_add(SecKey :: binary(), Tweak :: binary()) ->
+    {ok, binary()} | {error, term()}.
+seckey_tweak_add(SecKey, Tweak) when byte_size(SecKey) =:= 32,
+                                      byte_size(Tweak) =:= 32 ->
+    seckey_tweak_add_nif(SecKey, Tweak).
 
 %%% -------------------------------------------------------------------
 %%% Public key operations
