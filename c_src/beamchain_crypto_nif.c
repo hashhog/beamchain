@@ -292,6 +292,81 @@ static ERL_NIF_TERM pubkey_combine_nif(ErlNifEnv *env, int argc,
 }
 
 /* ------------------------------------------------------------------ */
+/* ecdsa_sign_nif(Msg32, SecKey32) -> {ok, DerSig} | {error, reason}   */
+/* ------------------------------------------------------------------ */
+
+static ERL_NIF_TERM ecdsa_sign_nif(ErlNifEnv *env, int argc,
+                                    const ERL_NIF_TERM argv[])
+{
+    ErlNifBinary msg, seckey;
+
+    if (!enif_inspect_binary(env, argv[0], &msg) || msg.size != 32 ||
+        !enif_inspect_binary(env, argv[1], &seckey) || seckey.size != 32)
+        return enif_make_badarg(env);
+
+    secp256k1_ecdsa_signature sig;
+    if (!secp256k1_ecdsa_sign(ctx, &sig, msg.data, seckey.data, NULL, NULL))
+        return make_error(env, "signing_failed");
+
+    unsigned char der[72];
+    size_t der_len = 72;
+    secp256k1_ecdsa_signature_serialize_der(ctx, der, &der_len, &sig);
+
+    return make_ok_binary(env, der, der_len);
+}
+
+/* ------------------------------------------------------------------ */
+/* schnorr_sign_nif(Msg32, SecKey32, AuxRand32)                        */
+/*   -> {ok, Sig64} | {error, reason}                                  */
+/* ------------------------------------------------------------------ */
+
+static ERL_NIF_TERM schnorr_sign_nif(ErlNifEnv *env, int argc,
+                                      const ERL_NIF_TERM argv[])
+{
+    ErlNifBinary msg, seckey, aux_rand;
+
+    if (!enif_inspect_binary(env, argv[0], &msg) || msg.size != 32 ||
+        !enif_inspect_binary(env, argv[1], &seckey) || seckey.size != 32 ||
+        !enif_inspect_binary(env, argv[2], &aux_rand) || aux_rand.size != 32)
+        return enif_make_badarg(env);
+
+    secp256k1_keypair keypair;
+    if (!secp256k1_keypair_create(ctx, &keypair, seckey.data))
+        return make_error(env, "invalid_seckey");
+
+    unsigned char sig[64];
+    if (!secp256k1_schnorrsig_sign32(ctx, sig, msg.data, &keypair,
+                                      aux_rand.data))
+        return make_error(env, "signing_failed");
+
+    return make_ok_binary(env, sig, 64);
+}
+
+/* ------------------------------------------------------------------ */
+/* seckey_tweak_add_nif(SecKey32, Tweak32)                             */
+/*   -> {ok, TweakedKey32} | {error, reason}                           */
+/* ------------------------------------------------------------------ */
+
+static ERL_NIF_TERM seckey_tweak_add_nif(ErlNifEnv *env, int argc,
+                                          const ERL_NIF_TERM argv[])
+{
+    ErlNifBinary seckey, tweak;
+
+    if (!enif_inspect_binary(env, argv[0], &seckey) || seckey.size != 32 ||
+        !enif_inspect_binary(env, argv[1], &tweak) || tweak.size != 32)
+        return enif_make_badarg(env);
+
+    /* copy seckey — secp256k1_ec_seckey_tweak_add modifies in place */
+    unsigned char result[32];
+    memcpy(result, seckey.data, 32);
+
+    if (!secp256k1_ec_seckey_tweak_add(ctx, result, tweak.data))
+        return make_error(env, "tweak_failed");
+
+    return make_ok_binary(env, result, 32);
+}
+
+/* ------------------------------------------------------------------ */
 /* NIF table                                                           */
 /* ------------------------------------------------------------------ */
 
@@ -311,6 +386,12 @@ static ErlNifFunc nif_funcs[] = {
     {"pubkey_decompress_nif",      1, pubkey_decompress_nif,
         ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"pubkey_combine_nif",         1, pubkey_combine_nif,
+        ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"ecdsa_sign_nif",             2, ecdsa_sign_nif,
+        ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"schnorr_sign_nif",           3, schnorr_sign_nif,
+        ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"seckey_tweak_add_nif",       2, seckey_tweak_add_nif,
         ERL_NIF_DIRTY_JOB_CPU_BOUND},
 };
 
