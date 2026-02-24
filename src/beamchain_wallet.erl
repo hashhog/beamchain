@@ -35,6 +35,10 @@
          pubkey_to_p2tr/2,
          pubkey_to_p2pkh/2]).
 
+%% Transaction signing
+-export([sign_transaction/3,
+         build_transaction/3]).
+
 -define(SERVER, ?MODULE).
 -define(HARDENED, 16#80000000).
 
@@ -378,6 +382,188 @@ bech32_hrp(testnet)  -> "tb";
 bech32_hrp(testnet4) -> "tb";
 bech32_hrp(signet)   -> "tb";
 bech32_hrp(regtest)  -> "bcrt".
+
+%%% ===================================================================
+%%% Transaction building
+%%% ===================================================================
+
+%% @doc Build an unsigned transaction from inputs and outputs.
+%% Inputs: [{Txid, Vout, Utxo}] where Utxo is #utxo{}.
+%% Outputs: [{Address, Amount}] where Address is a string.
+-spec build_transaction([{binary(), non_neg_integer(), #utxo{}}],
+                        [{string(), non_neg_integer()}],
+                        atom()) ->
+    {ok, #transaction{}} | {error, term()}.
+build_transaction(Inputs, Outputs, Network) ->
+    TxIns = lists:map(fun({Txid, Vout, _Utxo}) ->
+        #tx_in{
+            prev_out  = #outpoint{hash = Txid, index = Vout},
+            script_sig = <<>>,
+            sequence  = 16#fffffffd,  %% signal RBF
+            witness   = []
+        }
+    end, Inputs),
+    TxOuts = lists:map(fun({Address, Amount}) ->
+        {ok, Script} = beamchain_address:address_to_script(Address, Network),
+        #tx_out{value = Amount, script_pubkey = Script}
+    end, Outputs),
+    Tx = #transaction{
+        version  = 2,
+        inputs   = TxIns,
+        outputs  = TxOuts,
+        locktime = 0
+    },
+    {ok, Tx}.
+
+%%% ===================================================================
+%%% Transaction signing
+%%% ===================================================================
+
+%% @doc Sign a transaction given private keys and the UTXOs being spent.
+%% PrivKeys must be ordered to match inputs.
+%% InputUtxos: [#utxo{}] — the UTXOs being spent by each input.
+-spec sign_transaction(#transaction{}, [#utxo{}], [binary()]) ->
+    {ok, #transaction{}}.
+sign_transaction(Tx, InputUtxos, PrivKeys) ->
+    NumInputs = length(Tx#transaction.inputs),
+    NumInputs = length(InputUtxos),
+    NumInputs = length(PrivKeys),
+    %% Build prev_outs list for taproot sighash (needs all amounts + scripts)
+    PrevOuts = [{U#utxo.value, U#utxo.script_pubkey} || U <- InputUtxos],
+    SignedInputs = lists:map(fun(Idx) ->
+        Input = lists:nth(Idx + 1, Tx#transaction.inputs),
+        Utxo = lists:nth(Idx + 1, InputUtxos),
+        PrivKey = lists:nth(Idx + 1, PrivKeys),
+        sign_input(Tx, Idx, Input, Utxo, PrivKey, PrevOuts)
+    end, lists:seq(0, NumInputs - 1)),
+    {ok, Tx#transaction{inputs = SignedInputs}}.
+
+%% Sign a single input based on the scriptPubKey type.
+sign_input(Tx, InputIndex, Input, Utxo, PrivKey, PrevOuts) ->
+    ScriptPubKey = Utxo#utxo.script_pubkey,
+    case beamchain_address:classify_script(ScriptPubKey) of
+        p2wpkh ->
+            sign_p2wpkh(Tx, InputIndex, Input, Utxo, PrivKey);
+        p2pkh ->
+            sign_p2pkh(Tx, InputIndex, Input, Utxo, PrivKey);
+        p2tr ->
+            sign_p2tr(Tx, InputIndex, Input, PrivKey, PrevOuts);
+        p2sh ->
+            %% P2SH-P2WPKH (wrapped segwit)
+            sign_p2sh_p2wpkh(Tx, InputIndex, Input, Utxo, PrivKey);
+        _Other ->
+            error({unsupported_script_type, _Other})
+    end.
+
+%% --- P2WPKH signing ---
+sign_p2wpkh(Tx, InputIndex, Input, Utxo, PrivKey) ->
+    PubKey = privkey_to_pubkey(PrivKey),
+    %% scriptCode for P2WPKH: OP_DUP OP_HASH160 <20-byte-hash> OP_EQUALVERIFY OP_CHECKSIG
+    PkHash = beamchain_crypto:hash160(PubKey),
+    ScriptCode = <<16#76, 16#a9, 20, PkHash/binary, 16#88, 16#ac>>,
+    %% BIP 143 sighash
+    SigHash = beamchain_script:sighash_witness_v0(
+        Tx, InputIndex, ScriptCode, Utxo#utxo.value, ?SIGHASH_ALL),
+    {ok, DerSig} = beamchain_crypto:ecdsa_sign(SigHash, PrivKey),
+    %% Witness: [sig || sighash_type, pubkey]
+    SigWithType = <<DerSig/binary, ?SIGHASH_ALL>>,
+    Input#tx_in{
+        script_sig = <<>>,
+        witness    = [SigWithType, PubKey]
+    }.
+
+%% --- P2PKH signing ---
+sign_p2pkh(Tx, InputIndex, Input, _Utxo, PrivKey) ->
+    PubKey = privkey_to_pubkey(PrivKey),
+    PkHash = beamchain_crypto:hash160(PubKey),
+    ScriptCode = <<16#76, 16#a9, 20, PkHash/binary, 16#88, 16#ac>>,
+    %% Legacy sighash
+    SigHash = beamchain_script:sighash_legacy(
+        Tx, InputIndex, ScriptCode, ?SIGHASH_ALL),
+    {ok, DerSig} = beamchain_crypto:ecdsa_sign(SigHash, PrivKey),
+    SigWithType = <<DerSig/binary, ?SIGHASH_ALL>>,
+    %% scriptSig: <sig> <pubkey>
+    ScriptSig = push_data(SigWithType, <<(push_data(PubKey, <<>>))/binary>>),
+    Input#tx_in{
+        script_sig = ScriptSig,
+        witness    = []
+    }.
+
+%% --- P2TR key-path signing ---
+sign_p2tr(Tx, InputIndex, Input, PrivKey, PrevOuts) ->
+    %% Taproot sighash (BIP 341)
+    SigHash = beamchain_script:sighash_taproot(
+        Tx, InputIndex, PrevOuts, ?SIGHASH_DEFAULT,
+        undefined, undefined, 16#ffffffff),
+    %% For key-path spending, we need to tweak the private key
+    %% with the same TapTweak used to create the output key
+    TweakedPrivKey = taproot_tweak_privkey(PrivKey),
+    AuxRand = crypto:strong_rand_bytes(32),
+    {ok, SchnorrSig} = beamchain_crypto:schnorr_sign(
+        SigHash, TweakedPrivKey, AuxRand),
+    %% Witness: [schnorr_sig (64 bytes for DEFAULT, 65 bytes otherwise)]
+    %% SIGHASH_DEFAULT → 64 byte sig (no trailing byte)
+    Input#tx_in{
+        script_sig = <<>>,
+        witness    = [SchnorrSig]
+    }.
+
+%% --- P2SH-P2WPKH signing (wrapped segwit) ---
+sign_p2sh_p2wpkh(Tx, InputIndex, Input, Utxo, PrivKey) ->
+    PubKey = privkey_to_pubkey(PrivKey),
+    PkHash = beamchain_crypto:hash160(PubKey),
+    %% Redeem script: OP_0 <20-byte-hash> (P2WPKH witness program)
+    RedeemScript = <<0, 20, PkHash/binary>>,
+    %% scriptCode for BIP 143: same as P2WPKH
+    ScriptCode = <<16#76, 16#a9, 20, PkHash/binary, 16#88, 16#ac>>,
+    SigHash = beamchain_script:sighash_witness_v0(
+        Tx, InputIndex, ScriptCode, Utxo#utxo.value, ?SIGHASH_ALL),
+    {ok, DerSig} = beamchain_crypto:ecdsa_sign(SigHash, PrivKey),
+    SigWithType = <<DerSig/binary, ?SIGHASH_ALL>>,
+    %% scriptSig: just push the redeem script
+    ScriptSig = push_data(RedeemScript, <<>>),
+    Input#tx_in{
+        script_sig = ScriptSig,
+        witness    = [SigWithType, PubKey]
+    }.
+
+%%% ===================================================================
+%%% Signing helpers
+%%% ===================================================================
+
+%% Apply the BIP 341 TapTweak to a private key for key-path spending.
+taproot_tweak_privkey(PrivKey) ->
+    {ok, <<Prefix:8, XOnly:32/binary>>} =
+        beamchain_crypto:pubkey_from_privkey(PrivKey),
+    Tweak = beamchain_crypto:tagged_hash(<<"TapTweak">>, XOnly),
+    %% If the public key has odd Y, negate the private key first
+    PrivKey2 = case Prefix of
+        16#02 -> PrivKey;  %% even Y, no negation needed
+        16#03 -> negate_privkey(PrivKey)
+    end,
+    {ok, TweakedPriv} = beamchain_crypto:seckey_tweak_add(PrivKey2, Tweak),
+    TweakedPriv.
+
+%% Negate a private key: result = N - key (mod N)
+negate_privkey(PrivKey) ->
+    N = 16#FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141,
+    KeyInt = binary:decode_unsigned(PrivKey, big),
+    Negated = N - KeyInt,
+    <<Negated:256/big>>.
+
+%% Push data onto a script: creates proper push opcode
+push_data(Data, Acc) ->
+    Len = byte_size(Data),
+    if
+        Len =< 75 ->
+            <<Acc/binary, Len, Data/binary>>;
+        Len =< 255 ->
+            <<Acc/binary, 16#4c, Len:8, Data/binary>>;
+        Len =< 65535 ->
+            <<Acc/binary, 16#4d, Len:16/little, Data/binary>>;
+        true ->
+            <<Acc/binary, 16#4e, Len:32/little, Data/binary>>
+    end.
 
 %%% ===================================================================
 %%% Wallet persistence
