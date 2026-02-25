@@ -47,6 +47,9 @@
          encode_psbt/1,
          decode_psbt/1]).
 
+%% Coin selection
+-export([select_coins/3]).
+
 -define(SERVER, ?MODULE).
 -define(HARDENED, 16#80000000).
 
@@ -872,6 +875,109 @@ decode_output_map(Pairs) ->
 
 replace_nth(1, Elem, [_ | Rest]) -> [Elem | Rest];
 replace_nth(N, Elem, [H | Rest]) -> [H | replace_nth(N - 1, Elem, Rest)].
+
+%%% ===================================================================
+%%% Coin selection
+%%% ===================================================================
+
+%% Estimated input weight for fee calculation
+-define(P2WPKH_INPUT_WEIGHT, 272).   %% ~68 vbytes
+-define(P2TR_INPUT_WEIGHT, 230).     %% ~57.5 vbytes
+-define(P2PKH_INPUT_WEIGHT, 592).    %% ~148 vbytes
+
+%% @doc Select coins to cover the target amount plus fees.
+%% FeeRate is in sat/vByte. Available is a list of
+%% {Txid, Vout, #utxo{}} tuples.
+-spec select_coins(Target :: non_neg_integer(),
+                   FeeRate :: number(),
+                   Available :: [{binary(), non_neg_integer(), #utxo{}}]) ->
+    {ok, Selected :: [{binary(), non_neg_integer(), #utxo{}}],
+         Change :: non_neg_integer()} |
+    {error, insufficient_funds}.
+select_coins(Target, FeeRate, Available) ->
+    %% Sort by value descending for knapsack
+    Sorted = lists:sort(fun({_, _, A}, {_, _, B}) ->
+        A#utxo.value >= B#utxo.value
+    end, Available),
+    %% Try branch-and-bound first (exact match, no change)
+    case bnb_select(Target, FeeRate, Sorted) of
+        {ok, _, _} = Result ->
+            Result;
+        no_match ->
+            %% Fallback to knapsack selection
+            knapsack_select(Target, FeeRate, Sorted)
+    end.
+
+%% Branch-and-Bound: try to find exact match (within dust threshold)
+%% to avoid creating change output.
+bnb_select(Target, FeeRate, Utxos) ->
+    %% Cost of spending each UTXO
+    CostPerInput = round(FeeRate * ?P2WPKH_INPUT_WEIGHT / 4),
+    %% Target with base tx fee (header + 1 output, no change)
+    BaseFee = round(FeeRate * 40),  %% ~40 vbytes for tx overhead + one output
+    EffTarget = Target + BaseFee,
+    %% Dust threshold — if we can get within this range, skip change
+    DustLimit = 546,
+    bnb_search(Utxos, EffTarget, CostPerInput, DustLimit, 0, [], 0).
+
+bnb_search([], Target, _CostPerInput, DustLimit, Accumulated, Selected, _Depth) ->
+    Diff = Accumulated - Target,
+    if
+        Diff >= 0 andalso Diff =< DustLimit ->
+            {ok, lists:reverse(Selected), 0};
+        true ->
+            no_match
+    end;
+bnb_search(_Utxos, _Target, _CostPerInput, _DustLimit, _Acc, _Selected, Depth)
+  when Depth > 20 ->
+    %% Limit search depth to avoid exponential blowup
+    no_match;
+bnb_search([{_Txid, _Vout, Utxo} = Coin | Rest], Target, CostPerInput,
+           DustLimit, Accumulated, Selected, Depth) ->
+    EffValue = Utxo#utxo.value - CostPerInput,
+    case EffValue > 0 of
+        true ->
+            NewAcc = Accumulated + EffValue,
+            %% Include this coin
+            case bnb_search(Rest, Target, CostPerInput, DustLimit,
+                            NewAcc, [Coin | Selected], Depth + 1) of
+                {ok, _, _} = Found ->
+                    Found;
+                no_match ->
+                    %% Exclude this coin, try next
+                    bnb_search(Rest, Target, CostPerInput, DustLimit,
+                               Accumulated, Selected, Depth + 1)
+            end;
+        false ->
+            %% Input costs more than it's worth, skip
+            bnb_search(Rest, Target, CostPerInput, DustLimit,
+                       Accumulated, Selected, Depth + 1)
+    end.
+
+%% Knapsack: pick smallest UTXOs that cover target + fees + change output.
+knapsack_select(Target, FeeRate, Sorted) ->
+    CostPerInput = round(FeeRate * ?P2WPKH_INPUT_WEIGHT / 4),
+    %% Base fee includes change output (~31 vbytes for P2WPKH change)
+    BaseFee = round(FeeRate * 71),  %% ~40 overhead + ~31 change output
+    EffTarget = Target + BaseFee,
+    %% Reverse to pick smallest first (Sorted is desc)
+    SmallFirst = lists:reverse(Sorted),
+    accumulate_coins(SmallFirst, EffTarget, CostPerInput, 0, []).
+
+accumulate_coins([], _Target, _CostPerInput, _Acc, _Selected) ->
+    {error, insufficient_funds};
+accumulate_coins([{_Txid, _Vout, Utxo} = Coin | Rest], Target, CostPerInput,
+                 Accumulated, Selected) ->
+    EffValue = Utxo#utxo.value - CostPerInput,
+    NewAcc = Accumulated + max(EffValue, 0),
+    NewSelected = [Coin | Selected],
+    case NewAcc >= Target of
+        true ->
+            Change = NewAcc - Target,
+            {ok, lists:reverse(NewSelected), Change};
+        false ->
+            accumulate_coins(Rest, Target, CostPerInput, NewAcc, NewSelected)
+    end.
 
 %%% ===================================================================
 %%% Wallet persistence
