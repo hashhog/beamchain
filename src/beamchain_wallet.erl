@@ -39,6 +39,14 @@
 -export([sign_transaction/3,
          build_transaction/3]).
 
+%% PSBT (BIP 174/370)
+-export([create_psbt/2,
+         add_witness_utxo/3,
+         sign_psbt/2,
+         finalize_psbt/1,
+         encode_psbt/1,
+         decode_psbt/1]).
+
 -define(SERVER, ?MODULE).
 -define(HARDENED, 16#80000000).
 
@@ -564,6 +572,306 @@ push_data(Data, Acc) ->
         true ->
             <<Acc/binary, 16#4e, Len:32/little, Data/binary>>
     end.
+
+%%% ===================================================================
+%%% PSBT (BIP 174/370)
+%%% ===================================================================
+
+%% PSBT magic bytes: "psbt" + 0xff
+-define(PSBT_MAGIC, <<16#70, 16#73, 16#62, 16#74, 16#ff>>).
+
+%% Key types for global map
+-define(PSBT_GLOBAL_UNSIGNED_TX, 16#00).
+-define(PSBT_GLOBAL_XPUB,       16#01).
+-define(PSBT_GLOBAL_VERSION,    16#fb).
+
+%% Key types for input map
+-define(PSBT_IN_NON_WITNESS_UTXO, 16#00).
+-define(PSBT_IN_WITNESS_UTXO,     16#01).
+-define(PSBT_IN_PARTIAL_SIG,      16#02).
+-define(PSBT_IN_SIGHASH_TYPE,     16#03).
+-define(PSBT_IN_REDEEM_SCRIPT,    16#04).
+-define(PSBT_IN_WITNESS_SCRIPT,   16#05).
+-define(PSBT_IN_BIP32_DERIVATION, 16#06).
+-define(PSBT_IN_FINAL_SCRIPTSIG,  16#07).
+-define(PSBT_IN_FINAL_WITNESS,    16#08).
+-define(PSBT_IN_TAP_KEY_SIG,      16#13).
+-define(PSBT_IN_TAP_INTERNAL_KEY, 16#17).
+
+%% Key types for output map
+-define(PSBT_OUT_REDEEM_SCRIPT,    16#00).
+-define(PSBT_OUT_WITNESS_SCRIPT,   16#01).
+-define(PSBT_OUT_BIP32_DERIVATION, 16#02).
+
+-record(psbt, {
+    unsigned_tx :: #transaction{},
+    inputs      :: [map()],    %% list of input key-value maps
+    outputs     :: [map()]     %% list of output key-value maps
+}).
+
+%% @doc Create a new PSBT from inputs and outputs.
+%% Inputs: [{Txid, Vout}], Outputs: [{ScriptPubKey, Amount}]
+-spec create_psbt([{binary(), non_neg_integer()}],
+                  [{binary(), non_neg_integer()}]) -> #psbt{}.
+create_psbt(Inputs, Outputs) ->
+    TxIns = lists:map(fun({Txid, Vout}) ->
+        #tx_in{
+            prev_out  = #outpoint{hash = Txid, index = Vout},
+            script_sig = <<>>,
+            sequence  = 16#fffffffd,
+            witness   = []
+        }
+    end, Inputs),
+    TxOuts = lists:map(fun({ScriptPubKey, Amount}) ->
+        #tx_out{value = Amount, script_pubkey = ScriptPubKey}
+    end, Outputs),
+    Tx = #transaction{
+        version  = 2,
+        inputs   = TxIns,
+        outputs  = TxOuts,
+        locktime = 0
+    },
+    #psbt{
+        unsigned_tx = Tx,
+        inputs  = [#{} || _ <- Inputs],
+        outputs = [#{} || _ <- Outputs]
+    }.
+
+%% @doc Add witness UTXO information to a PSBT input.
+add_witness_utxo(Psbt, InputIndex, Utxo) ->
+    Inputs = Psbt#psbt.inputs,
+    InputMap = lists:nth(InputIndex + 1, Inputs),
+    UtxoData = beamchain_serialize:encode_tx_out(
+        #tx_out{value = Utxo#utxo.value,
+                script_pubkey = Utxo#utxo.script_pubkey}),
+    NewMap = InputMap#{witness_utxo => UtxoData,
+                       utxo_record => Utxo},
+    NewInputs = replace_nth(InputIndex + 1, NewMap, Inputs),
+    Psbt#psbt{inputs = NewInputs}.
+
+%% @doc Sign a PSBT with the given private keys.
+%% PrivKeys: [{InputIndex, PrivKey}] — only sign specified inputs.
+-spec sign_psbt(#psbt{}, [{non_neg_integer(), binary()}]) -> #psbt{}.
+sign_psbt(Psbt, PrivKeyPairs) ->
+    lists:foldl(fun({InputIndex, PrivKey}, Acc) ->
+        sign_psbt_input(Acc, InputIndex, PrivKey)
+    end, Psbt, PrivKeyPairs).
+
+sign_psbt_input(Psbt, InputIndex, PrivKey) ->
+    Tx = Psbt#psbt.unsigned_tx,
+    InputMap = lists:nth(InputIndex + 1, Psbt#psbt.inputs),
+    %% Determine script type from witness_utxo or the tx output
+    Utxo = maps:get(utxo_record, InputMap, undefined),
+    case Utxo of
+        undefined ->
+            %% Can't sign without UTXO info
+            Psbt;
+        _ ->
+            ScriptPubKey = Utxo#utxo.script_pubkey,
+            PubKey = privkey_to_pubkey(PrivKey),
+            NewMap = case beamchain_address:classify_script(ScriptPubKey) of
+                p2wpkh ->
+                    PkHash = beamchain_crypto:hash160(PubKey),
+                    ScriptCode = <<16#76, 16#a9, 20, PkHash/binary, 16#88, 16#ac>>,
+                    SigHash = beamchain_script:sighash_witness_v0(
+                        Tx, InputIndex, ScriptCode, Utxo#utxo.value,
+                        ?SIGHASH_ALL),
+                    {ok, DerSig} = beamchain_crypto:ecdsa_sign(SigHash, PrivKey),
+                    SigWithType = <<DerSig/binary, ?SIGHASH_ALL>>,
+                    InputMap#{partial_sigs =>
+                        maps:put(PubKey, SigWithType,
+                                 maps:get(partial_sigs, InputMap, #{}))};
+                p2tr ->
+                    PrevOuts = build_prevouts(Psbt),
+                    SigHash = beamchain_script:sighash_taproot(
+                        Tx, InputIndex, PrevOuts, ?SIGHASH_DEFAULT,
+                        undefined, undefined, 16#ffffffff),
+                    TweakedPrivKey = taproot_tweak_privkey(PrivKey),
+                    AuxRand = crypto:strong_rand_bytes(32),
+                    {ok, SchnorrSig} = beamchain_crypto:schnorr_sign(
+                        SigHash, TweakedPrivKey, AuxRand),
+                    InputMap#{tap_key_sig => SchnorrSig};
+                p2pkh ->
+                    PkHash = beamchain_crypto:hash160(PubKey),
+                    ScriptCode = <<16#76, 16#a9, 20, PkHash/binary, 16#88, 16#ac>>,
+                    SigHash = beamchain_script:sighash_legacy(
+                        Tx, InputIndex, ScriptCode, ?SIGHASH_ALL),
+                    {ok, DerSig} = beamchain_crypto:ecdsa_sign(SigHash, PrivKey),
+                    SigWithType = <<DerSig/binary, ?SIGHASH_ALL>>,
+                    InputMap#{partial_sigs =>
+                        maps:put(PubKey, SigWithType,
+                                 maps:get(partial_sigs, InputMap, #{}))}
+            end,
+            NewInputs = replace_nth(InputIndex + 1, NewMap, Psbt#psbt.inputs),
+            Psbt#psbt{inputs = NewInputs}
+    end.
+
+build_prevouts(Psbt) ->
+    lists:map(fun(InputMap) ->
+        case maps:get(utxo_record, InputMap, undefined) of
+            undefined -> {0, <<>>};
+            U -> {U#utxo.value, U#utxo.script_pubkey}
+        end
+    end, Psbt#psbt.inputs).
+
+%% @doc Finalize a PSBT — convert partial sigs into final scriptSig/witness.
+-spec finalize_psbt(#psbt{}) -> {ok, #transaction{}} | {error, term()}.
+finalize_psbt(Psbt) ->
+    Tx = Psbt#psbt.unsigned_tx,
+    try
+        FinalInputs = lists:map(fun({Input, InputMap}) ->
+            Utxo = maps:get(utxo_record, InputMap, undefined),
+            case Utxo of
+                undefined ->
+                    error(missing_utxo_info);
+                _ ->
+                    finalize_input(Input, InputMap, Utxo)
+            end
+        end, lists:zip(Tx#transaction.inputs, Psbt#psbt.inputs)),
+        FinalTx = Tx#transaction{inputs = FinalInputs},
+        {ok, FinalTx}
+    catch
+        error:Reason ->
+            {error, Reason}
+    end.
+
+finalize_input(Input, InputMap, Utxo) ->
+    ScriptPubKey = Utxo#utxo.script_pubkey,
+    case beamchain_address:classify_script(ScriptPubKey) of
+        p2wpkh ->
+            PartialSigs = maps:get(partial_sigs, InputMap, #{}),
+            case maps:to_list(PartialSigs) of
+                [{PubKey, Sig}] ->
+                    Input#tx_in{script_sig = <<>>,
+                                witness = [Sig, PubKey]};
+                _ ->
+                    error(incomplete_signatures)
+            end;
+        p2tr ->
+            case maps:get(tap_key_sig, InputMap, undefined) of
+                undefined -> error(missing_taproot_sig);
+                Sig -> Input#tx_in{script_sig = <<>>,
+                                   witness = [Sig]}
+            end;
+        p2pkh ->
+            PartialSigs = maps:get(partial_sigs, InputMap, #{}),
+            case maps:to_list(PartialSigs) of
+                [{PubKey, Sig}] ->
+                    ScriptSig = push_data(Sig,
+                        <<(push_data(PubKey, <<>>))/binary>>),
+                    Input#tx_in{script_sig = ScriptSig, witness = []};
+                _ ->
+                    error(incomplete_signatures)
+            end
+    end.
+
+%% @doc Encode a PSBT to its binary format (BIP 174).
+-spec encode_psbt(#psbt{}) -> binary().
+encode_psbt(Psbt) ->
+    %% Magic bytes
+    Global = encode_psbt_global(Psbt),
+    InputMaps = lists:map(fun encode_psbt_input/1, Psbt#psbt.inputs),
+    OutputMaps = lists:map(fun encode_psbt_output/1, Psbt#psbt.outputs),
+    iolist_to_binary([?PSBT_MAGIC, Global | InputMaps ++ OutputMaps]).
+
+encode_psbt_global(Psbt) ->
+    %% Unsigned tx: key=0x00, value=serialized tx (no witness)
+    TxBin = beamchain_serialize:encode_transaction(
+        Psbt#psbt.unsigned_tx, no_witness),
+    encode_kv(<<0>>, TxBin, <<0>>).
+
+encode_psbt_input(InputMap) ->
+    Entries = lists:flatten([
+        case maps:get(witness_utxo, InputMap, undefined) of
+            undefined -> [];
+            WU -> [encode_kv(<<1>>, WU, <<>>)]
+        end,
+        case maps:get(partial_sigs, InputMap, undefined) of
+            undefined -> [];
+            Sigs ->
+                maps:fold(fun(PubKey, Sig, Acc) ->
+                    [encode_kv(<<2, PubKey/binary>>, Sig, <<>>) | Acc]
+                end, [], Sigs)
+        end,
+        case maps:get(tap_key_sig, InputMap, undefined) of
+            undefined -> [];
+            TapSig -> [encode_kv(<<16#13>>, TapSig, <<>>)]
+        end
+    ]),
+    iolist_to_binary(Entries ++ [<<0>>]).  %% separator
+
+encode_psbt_output(_OutputMap) ->
+    <<0>>.  %% empty output map, just separator
+
+encode_kv(Key, Value, _Extra) ->
+    KeyLen = beamchain_serialize:encode_varint(byte_size(Key)),
+    ValLen = beamchain_serialize:encode_varint(byte_size(Value)),
+    <<KeyLen/binary, Key/binary, ValLen/binary, Value/binary>>.
+
+%% @doc Decode a PSBT from its binary format.
+-spec decode_psbt(binary()) -> #psbt{} | {error, term()}.
+decode_psbt(<<16#70, 16#73, 16#62, 16#74, 16#ff, Rest/binary>>) ->
+    {GlobalPairs, Rest1} = decode_psbt_map(Rest),
+    %% Extract unsigned tx from global
+    UnsignedTx = case proplists:get_value(<<0>>, GlobalPairs) of
+        undefined -> error(missing_unsigned_tx);
+        TxBin ->
+            {Tx, _} = beamchain_serialize:decode_transaction(TxBin),
+            Tx
+    end,
+    NumInputs = length(UnsignedTx#transaction.inputs),
+    NumOutputs = length(UnsignedTx#transaction.outputs),
+    {InputMaps, Rest2} = decode_n_maps(Rest1, NumInputs),
+    {OutputMaps, _Rest3} = decode_n_maps(Rest2, NumOutputs),
+    Inputs = lists:map(fun decode_input_map/1, InputMaps),
+    Outputs = lists:map(fun decode_output_map/1, OutputMaps),
+    #psbt{
+        unsigned_tx = UnsignedTx,
+        inputs      = Inputs,
+        outputs     = Outputs
+    };
+decode_psbt(_) ->
+    {error, invalid_psbt_magic}.
+
+decode_psbt_map(Bin) ->
+    decode_psbt_map(Bin, []).
+
+decode_psbt_map(<<0, Rest/binary>>, Acc) ->
+    {lists:reverse(Acc), Rest};
+decode_psbt_map(Bin, Acc) ->
+    {KeyLen, Rest1} = beamchain_serialize:decode_varint(Bin),
+    <<Key:KeyLen/binary, Rest2/binary>> = Rest1,
+    {ValLen, Rest3} = beamchain_serialize:decode_varint(Rest2),
+    <<Value:ValLen/binary, Rest4/binary>> = Rest3,
+    decode_psbt_map(Rest4, [{Key, Value} | Acc]).
+
+decode_n_maps(Bin, 0) ->
+    {[], Bin};
+decode_n_maps(Bin, N) ->
+    {Pairs, Rest} = decode_psbt_map(Bin),
+    {MoreMaps, Rest2} = decode_n_maps(Rest, N - 1),
+    {[Pairs | MoreMaps], Rest2}.
+
+decode_input_map(Pairs) ->
+    lists:foldl(fun({Key, Value}, Acc) ->
+        case Key of
+            <<1>> ->
+                Acc#{witness_utxo => Value};
+            <<2, PubKey/binary>> ->
+                Sigs = maps:get(partial_sigs, Acc, #{}),
+                Acc#{partial_sigs => Sigs#{PubKey => Value}};
+            <<16#13>> ->
+                Acc#{tap_key_sig => Value};
+            _ ->
+                Acc#{Key => Value}
+        end
+    end, #{}, Pairs).
+
+decode_output_map(Pairs) ->
+    maps:from_list(Pairs).
+
+replace_nth(1, Elem, [_ | Rest]) -> [Elem | Rest];
+replace_nth(N, Elem, [H | Rest]) -> [H | replace_nth(N - 1, Elem, Rest)].
 
 %%% ===================================================================
 %%% Wallet persistence
