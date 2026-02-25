@@ -26,6 +26,7 @@ init([]) ->
         child_spec(beamchain_block_sync, worker),
         child_spec(beamchain_sync, worker),
         child_spec(beamchain_miner, worker),
+        child_spec(beamchain_wallet, worker),
         child_spec(beamchain_rpc, worker)
     ],
     {ok, {SupFlags, Children}}.
