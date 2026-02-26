@@ -8,6 +8,15 @@
 
 -define(VERSION, "0.1.0").
 
+%% Spinner frames (braille pattern dots)
+-define(SPINNER, ["\xe2\xa0\x8b", "\xe2\xa0\x99", "\xe2\xa0\xb9",
+                  "\xe2\xa0\xb8", "\xe2\xa0\xbc", "\xe2\xa0\xb4",
+                  "\xe2\xa0\xa6", "\xe2\xa0\xa7", "\xe2\xa0\x87",
+                  "\xe2\xa0\x8f"]).
+
+%% Progress bar width (in characters)
+-define(BAR_WIDTH, 25).
+
 %%% ===================================================================
 %%% Escript entry point
 %%% ===================================================================
@@ -158,46 +167,490 @@ print_usage() ->
          dim("options:")]).
 
 %%% ===================================================================
-%%% Stub commands (filled in next commits)
+%%% start command — launch node and block
 %%% ===================================================================
 
-start_node(_Opts) ->
-    io:format("start_node: not yet implemented~n"),
-    halt(1).
+start_node(Opts) ->
+    apply_opts(Opts),
+    case start_app() of
+        ok ->
+            print_banner(),
+            io:format("~s~n", [green("node started, press Ctrl-C to stop")]),
+            %% Block forever — the OTP app runs in the background
+            block_forever();
+        {error, Reason} ->
+            io:format(standard_error, "~s failed to start: ~p~n",
+                      [red("error:"), Reason]),
+            halt(1)
+    end.
 
-sync_blockchain(_Opts) ->
-    io:format("sync: not yet implemented~n"),
-    halt(1).
+%%% ===================================================================
+%%% sync command — start node and show sync progress
+%%% ===================================================================
 
-show_status(_Opts) ->
-    io:format("status: not yet implemented~n"),
-    halt(1).
+sync_blockchain(Opts) ->
+    apply_opts(Opts),
+    case start_app() of
+        ok ->
+            Network = beamchain_config:network(),
+            DataDir = beamchain_config:datadir(),
+            io:format("~s~n", [bold("beamchain sync — " ++
+                                     atom_to_list(Network))]),
+            io:format("~s ~s~n~n", [dim("data:"), DataDir]),
+            StartTime = erlang:monotonic_time(second),
+            sync_loop(0, StartTime);
+        {error, Reason} ->
+            io:format(standard_error, "~s failed to start: ~p~n",
+                      [red("error:"), Reason]),
+            halt(1)
+    end.
 
-stop_node(_Opts) ->
-    io:format("stop: not yet implemented~n"),
-    halt(1).
+sync_loop(Frame, StartTime) ->
+    timer:sleep(1000),
+    SyncStatus = try beamchain_sync:get_sync_status()
+                 catch _:_ -> #{phase => idle} end,
+    Phase = maps:get(phase, SyncStatus, idle),
+    HeaderInfo = maps:get(header_sync, SyncStatus, #{}),
+    BlockInfo = maps:get(block_sync, SyncStatus, #{}),
+    NextFrame = (Frame + 1) rem length(?SPINNER),
+    Spinner = lists:nth(NextFrame + 1, ?SPINNER),
 
-get_balance(_Opts) ->
-    io:format("getbalance: not yet implemented~n"),
-    halt(1).
+    %% Header progress line
+    draw_header_progress(Spinner, HeaderInfo),
+    %% Block progress line
+    draw_block_progress(Spinner, BlockInfo),
+
+    case Phase of
+        complete ->
+            %% Clear the progress lines
+            io:format("\r\e[K\e[1A\r\e[K"),
+            Elapsed = erlang:monotonic_time(second) - StartTime,
+            {ok, {_Hash, Height}} = beamchain_chainstate:get_tip(),
+            AvgRate = case Elapsed of
+                0 -> 0.0;
+                _ -> Height / Elapsed
+            end,
+            io:format("~s synced to ~B in ~s (avg ~.1f blk/s)~n",
+                      [green("✓"), Height, format_duration(Elapsed),
+                       AvgRate]),
+            halt(0);
+        _ ->
+            %% Move cursor up 2 lines for redraw
+            io:format("\e[2A"),
+            sync_loop(NextFrame, StartTime)
+    end.
+
+draw_header_progress(Spinner, Info) ->
+    Status = maps:get(status, Info, idle),
+    case Status of
+        idle ->
+            io:format("\r\e[K  ~s ~s~n",
+                      [Spinner, dim("waiting for peers...")]);
+        not_running ->
+            io:format("\r\e[K  ~s ~s~n",
+                      [Spinner, dim("starting...")]);
+        syncing ->
+            Current = maps:get(tip_height, Info, 0),
+            Estimated = maps:get(estimated_tip, Info, 0),
+            Peers = maps:get(peer_count, Info, 0),
+            {Pct, Bar} = case Estimated of
+                0 -> {0.0, progress_bar(0.0)};
+                E ->
+                    P = min(100.0, Current / E * 100),
+                    {P, progress_bar(P / 100)}
+            end,
+            io:format("\r\e[K  ~s ~s ~s ~3.0f%  ~s / ~s  ~s~n",
+                      [Spinner, cyan("Headers"), Bar, Pct,
+                       format_count(Current), format_count(Estimated),
+                       dim(io_lib:format("~B peers", [Peers]))]);
+        complete ->
+            Current = maps:get(tip_height, Info, 0),
+            io:format("\r\e[K  ~s ~s ~s~n",
+                      [green("✓"), "Headers",
+                       dim(io_lib:format("~B", [Current]))])
+    end.
+
+draw_block_progress(Spinner, Info) ->
+    Status = maps:get(status, Info, idle),
+    case Status of
+        idle ->
+            io:format("\r\e[K  ~s ~s~n",
+                      [Spinner, dim("blocks: waiting for headers...")]);
+        not_running ->
+            io:format("\r\e[K  ~s ~s~n",
+                      [Spinner, dim("blocks: waiting...")]);
+        syncing ->
+            Current = maps:get(next_to_validate, Info, 0),
+            Target = maps:get(target_height, Info, 0),
+            Validated = maps:get(blocks_validated, Info, 0),
+            Peers = maps:get(peer_count, Info, 0),
+            {Pct, Bar} = case Target of
+                0 -> {0.0, progress_bar(0.0)};
+                T ->
+                    P = min(100.0, Current / T * 100),
+                    {P, progress_bar(P / 100)}
+            end,
+            %% Compute blocks per second from validated count
+            Rate = block_rate(Validated),
+            ETA = case {Target - Current, Rate} of
+                {Remaining, R} when R > 0 ->
+                    format_duration(round(Remaining / R));
+                _ -> "?"
+            end,
+            io:format("\r\e[K  ~s ~s ~s ~3.0f%  ~s / ~s  ~s  ~s  ~s~n",
+                      [Spinner, cyan("Blocks "), Bar, Pct,
+                       format_count(Current), format_count(Target),
+                       dim(io_lib:format("~.1f blk/s", [Rate])),
+                       dim("ETA " ++ ETA),
+                       dim(io_lib:format("~B peers", [Peers]))]);
+        complete ->
+            Current = maps:get(next_to_validate, Info, 0),
+            io:format("\r\e[K  ~s ~s ~s~n",
+                      [green("✓"), "Blocks ",
+                       dim(io_lib:format("~B", [Current]))])
+    end.
+
+%%% ===================================================================
+%%% status command — query running node via RPC
+%%% ===================================================================
+
+show_status(Opts) ->
+    {Host, Port} = rpc_endpoint(Opts),
+    case rpc_call(Host, Port, <<"getblockchaininfo">>, [], Opts) of
+        {ok, Info} ->
+            Chain = maps:get(<<"chain">>, Info, <<"?">>),
+            Blocks = maps:get(<<"blocks">>, Info, 0),
+            Headers = maps:get(<<"headers">>, Info, 0),
+            IBD = maps:get(<<"initialblockdownload">>, Info, true),
+            BestHash = maps:get(<<"bestblockhash">>, Info, <<>>),
+            io:format("~s~n", [bold("beamchain status")]),
+            io:format("  network:     ~s~n", [Chain]),
+            io:format("  blocks:      ~B~n", [Blocks]),
+            io:format("  headers:     ~B~n", [Headers]),
+            io:format("  best block:  ~s~n", [truncate_hash(BestHash)]),
+            io:format("  synced:      ~s~n",
+                      [case IBD of true -> yellow("no"); false -> green("yes") end]),
+            %% Peer info
+            case rpc_call(Host, Port, <<"getnetworkinfo">>, [], Opts) of
+                {ok, NetInfo} ->
+                    Conns = maps:get(<<"connections">>, NetInfo, 0),
+                    io:format("  peers:       ~B~n", [Conns]);
+                _ -> ok
+            end,
+            %% Mempool info
+            case rpc_call(Host, Port, <<"getmempoolinfo">>, [], Opts) of
+                {ok, MemInfo} ->
+                    MemSize = maps:get(<<"size">>, MemInfo, 0),
+                    io:format("  mempool:     ~B txs~n", [MemSize]);
+                _ -> ok
+            end,
+            halt(0);
+        {error, Reason} ->
+            io:format(standard_error,
+                      "~s could not connect to node at ~s:~B~n"
+                      "  ~p~n",
+                      [red("error:"), Host, Port, Reason]),
+            halt(1)
+    end.
+
+%%% ===================================================================
+%%% stop command — tell running node to shut down
+%%% ===================================================================
+
+stop_node(Opts) ->
+    {Host, Port} = rpc_endpoint(Opts),
+    case rpc_call(Host, Port, <<"stop">>, [], Opts) of
+        {ok, Msg} ->
+            io:format("~s~n", [Msg]),
+            halt(0);
+        {error, Reason} ->
+            io:format(standard_error,
+                      "~s could not stop node at ~s:~B — ~p~n",
+                      [red("error:"), Host, Port, Reason]),
+            halt(1)
+    end.
+
+%%% ===================================================================
+%%% getbalance command — query address balance via RPC
+%%% ===================================================================
+
+get_balance(Opts) ->
+    case maps:get(address, Opts, undefined) of
+        undefined ->
+            io:format(standard_error, "~s address required~n"
+                      "  usage: beamchain getbalance <address>~n",
+                      [red("error:")]),
+            halt(1);
+        Address ->
+            {Host, Port} = rpc_endpoint(Opts),
+            Params = [list_to_binary(Address)],
+            case rpc_call(Host, Port, <<"getbalance">>, Params, Opts) of
+                {ok, Balance} when is_number(Balance) ->
+                    io:format("~.8f BTC~n", [Balance]),
+                    halt(0);
+                {ok, Other} ->
+                    io:format("~p~n", [Other]),
+                    halt(0);
+                {error, Reason} ->
+                    io:format(standard_error, "~s ~p~n",
+                              [red("error:"), Reason]),
+                    halt(1)
+            end
+    end.
+
+%%% ===================================================================
+%%% Application lifecycle
+%%% ===================================================================
+
+apply_opts(Opts) ->
+    %% Set network in application env before starting
+    case maps:get(network, Opts, undefined) of
+        undefined -> ok;
+        Net -> application:set_env(beamchain, network, Net)
+    end,
+    case maps:get(datadir, Opts, undefined) of
+        undefined -> ok;
+        Dir -> application:set_env(beamchain, datadir, Dir)
+    end,
+    case maps:get(rpc_port, Opts, undefined) of
+        undefined -> ok;
+        RpcPort -> application:set_env(beamchain, rpcport, RpcPort)
+    end,
+    case maps:get(p2p_port, Opts, undefined) of
+        undefined -> ok;
+        P2pPort -> application:set_env(beamchain, p2pport, P2pPort)
+    end,
+    case maps:get(debug, Opts, false) of
+        true ->
+            logger:set_primary_config(level, debug);
+        false ->
+            logger:set_primary_config(level, info)
+    end,
+    ok.
+
+start_app() ->
+    %% Ensure all dependency applications are started
+    ensure_started(crypto),
+    ensure_started(asn1),
+    ensure_started(public_key),
+    ensure_started(ssl),
+    ensure_started(inets),
+    ensure_started(ranch),
+    ensure_started(cowlib),
+    ensure_started(cowboy),
+    ensure_started(jsx),
+    case application:ensure_all_started(beamchain) of
+        {ok, _Apps} -> ok;
+        {error, _} = Err -> Err
+    end.
+
+ensure_started(App) ->
+    case application:ensure_all_started(App) of
+        {ok, _} -> ok;
+        {error, {already_started, _}} -> ok;
+        {error, _Reason} -> ok  %% best effort
+    end.
+
+print_banner() ->
+    Network = beamchain_config:network(),
+    DataDir = beamchain_config:datadir(),
+    Params = beamchain_config:network_params(),
+    P2PPort = Params#network_params.default_port,
+    RPCPort = Params#network_params.rpc_port,
+    io:format("~n"),
+    io:format("  ~s~n", [bold("beamchain " ++ ?VERSION)]),
+    io:format("  ~s~n", [dim("bitcoin full node in erlang/otp")]),
+    io:format("~n"),
+    io:format("  network:   ~s~n", [atom_to_list(Network)]),
+    io:format("  datadir:   ~s~n", [DataDir]),
+    io:format("  p2p port:  ~B~n", [P2PPort]),
+    io:format("  rpc port:  ~B~n", [RPCPort]),
+    io:format("~n").
+
+block_forever() ->
+    process_flag(trap_exit, true),
+    receive
+        {'EXIT', _Pid, _Reason} ->
+            io:format("~n~s~n", [dim("shutting down...")]),
+            application:stop(beamchain),
+            halt(0);
+        _ ->
+            block_forever()
+    end.
+
+%%% ===================================================================
+%%% RPC client (for status/stop/getbalance against running node)
+%%% ===================================================================
+
+rpc_endpoint(Opts) ->
+    Host = "127.0.0.1",
+    Port = case maps:get(rpc_port, Opts, undefined) of
+        undefined ->
+            %% Guess default port from network
+            case maps:get(network, Opts, mainnet) of
+                mainnet  -> 8332;
+                testnet  -> 18332;
+                testnet4 -> 48332;
+                regtest  -> 18443;
+                signet   -> 38332;
+                _        -> 8332
+            end;
+        P -> P
+    end,
+    {Host, Port}.
+
+rpc_call(Host, Port, Method, Params, Opts) ->
+    %% Read auth cookie from datadir
+    Auth = read_auth_cookie(Opts),
+    Url = "http://" ++ Host ++ ":" ++ integer_to_list(Port) ++ "/",
+    Body = jsx:encode(#{
+        <<"jsonrpc">> => <<"1.0">>,
+        <<"id">> => <<"beamchain-cli">>,
+        <<"method">> => Method,
+        <<"params">> => Params
+    }),
+    Headers = [{"Content-Type", "application/json"}] ++
+              case Auth of
+                  undefined -> [];
+                  AuthStr -> [{"Authorization", "Basic " ++ AuthStr}]
+              end,
+    case httpc:request(post,
+                       {Url, Headers, "application/json", Body},
+                       [{timeout, 5000}, {connect_timeout, 2000}],
+                       [{body_format, binary}]) of
+        {ok, {{_, 200, _}, _RespHeaders, RespBody}} ->
+            decode_rpc_response(RespBody);
+        {ok, {{_, 401, _}, _, _}} ->
+            {error, unauthorized};
+        {ok, {{_, 403, _}, _, _}} ->
+            {error, forbidden};
+        {ok, {{_, Code, _}, _, RespBody}} ->
+            case decode_rpc_response(RespBody) of
+                {error, _} = E -> E;
+                _ -> {error, {http_error, Code}}
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+decode_rpc_response(Body) ->
+    try
+        Map = jsx:decode(Body, [return_maps]),
+        case maps:get(<<"error">>, Map, null) of
+            null -> {ok, maps:get(<<"result">>, Map, null)};
+            ErrorMap when is_map(ErrorMap) ->
+                {error, maps:get(<<"message">>, ErrorMap, <<"unknown error">>)};
+            _ -> {ok, maps:get(<<"result">>, Map, null)}
+        end
+    catch
+        _:_ -> {error, {bad_response, Body}}
+    end.
+
+read_auth_cookie(Opts) ->
+    DataDir = case maps:get(datadir, Opts, undefined) of
+        undefined ->
+            Home = os:getenv("HOME", "/tmp"),
+            BaseDir = filename:join(Home, ".beamchain"),
+            case maps:get(network, Opts, mainnet) of
+                mainnet -> BaseDir;
+                Net -> filename:join(BaseDir, atom_to_list(Net))
+            end;
+        Dir -> Dir
+    end,
+    CookieFile = filename:join(DataDir, ".cookie"),
+    case file:read_file(CookieFile) of
+        {ok, Cookie} ->
+            base64:encode_to_string(binary_to_list(string:trim(Cookie)));
+        {error, _} ->
+            undefined
+    end.
+
+%%% ===================================================================
+%%% Progress bar rendering
+%%% ===================================================================
+
+%% @doc Render a progress bar. Fraction is 0.0 to 1.0.
+progress_bar(Frac) ->
+    Filled = round(Frac * ?BAR_WIDTH),
+    Empty = ?BAR_WIDTH - Filled,
+    "[" ++ green(lists:duplicate(Filled, $█)) ++
+    dim(lists:duplicate(Empty, $░)) ++ "]".
+
+%% @doc Approximate block rate — uses process dictionary for simplicity.
+%% Stores {LastValidated, LastTime} and computes instantaneous rate.
+block_rate(Validated) ->
+    Now = erlang:monotonic_time(millisecond),
+    case get(last_block_rate) of
+        {PrevValidated, PrevTime} when Now > PrevTime ->
+            DeltaBlocks = Validated - PrevValidated,
+            DeltaMs = Now - PrevTime,
+            put(last_block_rate, {Validated, Now}),
+            case DeltaMs of
+                0 -> 0.0;
+                _ -> DeltaBlocks / (DeltaMs / 1000.0)
+            end;
+        _ ->
+            put(last_block_rate, {Validated, Now}),
+            0.0
+    end.
+
+%%% ===================================================================
+%%% Formatting helpers
+%%% ===================================================================
+
+format_count(N) when N >= 1000000 ->
+    io_lib:format("~.1fM", [N / 1000000.0]);
+format_count(N) when N >= 1000 ->
+    io_lib:format("~.1fK", [N / 1000.0]);
+format_count(N) ->
+    integer_to_list(N).
+
+format_duration(Secs) when Secs >= 3600 ->
+    H = Secs div 3600,
+    M = (Secs rem 3600) div 60,
+    io_lib:format("~Bh ~Bm", [H, M]);
+format_duration(Secs) when Secs >= 60 ->
+    M = Secs div 60,
+    S = Secs rem 60,
+    io_lib:format("~Bm ~Bs", [M, S]);
+format_duration(Secs) ->
+    io_lib:format("~Bs", [Secs]).
+
+truncate_hash(Hash) when is_binary(Hash), byte_size(Hash) > 16 ->
+    <<Front:8/binary, _/binary>> = Hash,
+    Rest = binary:part(Hash, byte_size(Hash), -8),
+    <<Front/binary, "...", Rest/binary>>;
+truncate_hash(Hash) ->
+    Hash.
 
 %%% ===================================================================
 %%% ANSI color helpers
 %%% ===================================================================
 
-header(Text) -> color("1", Text).    %% bold
-dim(Text)    -> color("2", Text).    %% dim
+bold(Text)   -> color("1", Text).
+header(Text) -> color("1", Text).
+dim(Text)    -> color("2", Text).
+green(Text)  -> color("32", Text).
+yellow(Text) -> color("33", Text).
+red(Text)    -> color("31", Text).
+cyan(Text)   -> color("36", Text).
 
 color(Code, Text) ->
     case is_tty() of
-        true  -> "\e[" ++ Code ++ "m" ++ Text ++ "\e[0m";
-        false -> Text
+        true  -> "\e[" ++ Code ++ "m" ++ flatten(Text) ++ "\e[0m";
+        false -> flatten(Text)
     end.
+
+flatten(Text) when is_list(Text) ->
+    lists:flatten(Text);
+flatten(Text) when is_binary(Text) ->
+    binary_to_list(Text);
+flatten(Text) ->
+    io_lib:format("~s", [Text]).
 
 is_tty() ->
     case os:getenv("NO_COLOR") of
         false ->
-            %% heuristic: assume tty unless piped
             case os:type() of
                 {unix, _} -> true;
                 _ -> false
