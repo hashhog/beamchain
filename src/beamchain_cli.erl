@@ -164,7 +164,7 @@ print_usage() ->
         "~n"
         "~s~n"
         "  --network=<net>   network: mainnet, testnet, testnet4, regtest, signet~n"
-        "  --datadir=<dir>   data directory (default: ~/.beamchain)~n"
+        "  --datadir=<dir>   data directory (default: ~~/.beamchain)~n"
         "  --rpc-port=<n>    rpc port override~n"
         "  --p2p-port=<n>    p2p port override~n"
         "  --debug           enable debug logging~n"
@@ -172,13 +172,13 @@ print_usage() ->
         "  --limit=<n>       limit sync to n blocks~n"
         "  -h, --help        show this help~n"
         "  -v, --version     show version~n",
-        [header("beamchain " ++ ?VERSION ++ " — bitcoin full node in erlang/otp"),
+        [header("beamchain " ++ ?VERSION ++ " - bitcoin full node in erlang/otp"),
          dim("usage:"),
          dim("commands:"),
          dim("options:")]).
 
 %%% ===================================================================
-%%% start command — launch node and block
+%%% start command -- launch node and block
 %%% ===================================================================
 
 start_node(Opts) ->
@@ -187,7 +187,7 @@ start_node(Opts) ->
         ok ->
             print_banner(),
             io:format("~s~n", [green("node started, press Ctrl-C to stop")]),
-            %% Block forever — the OTP app runs in the background
+            %% Block forever -the OTP app runs in the background
             block_forever();
         {error, Reason} ->
             io:format(standard_error, "~s failed to start: ~p~n",
@@ -196,7 +196,7 @@ start_node(Opts) ->
     end.
 
 %%% ===================================================================
-%%% sync command — start node and show sync progress
+%%% sync command -- start node and show sync progress
 %%% ===================================================================
 
 sync_blockchain(Opts) ->
@@ -208,7 +208,7 @@ sync_blockchain(Opts) ->
             process_flag(trap_exit, true),
             Network = beamchain_config:network(),
             DataDir = beamchain_config:datadir(),
-            io:format("~s~n", [bold("beamchain sync — " ++
+            io:format("~s~n", [bold("beamchain sync - " ++
                                      atom_to_list(Network))]),
             io:format("~s ~s~n~n", [dim("data:"), DataDir]),
             StartTime = erlang:monotonic_time(second),
@@ -333,7 +333,7 @@ draw_block_progress(Spinner, Info) ->
     end.
 
 %%% ===================================================================
-%%% status command — query running node via RPC
+%%% status command -- query running node via RPC
 %%% ===================================================================
 
 show_status(Opts) ->
@@ -383,7 +383,7 @@ show_status(Opts) ->
     end.
 
 %%% ===================================================================
-%%% stop command — tell running node to shut down
+%%% stop command -- tell running node to shut down
 %%% ===================================================================
 
 stop_node(Opts) ->
@@ -394,13 +394,13 @@ stop_node(Opts) ->
             halt(0);
         {error, Reason} ->
             io:format(standard_error,
-                      "~s could not stop node at ~s:~B — ~p~n",
+                      "~s could not stop node at ~s:~B -~p~n",
                       [red("error:"), Host, Port, Reason]),
             halt(1)
     end.
 
 %%% ===================================================================
-%%% getbalance command — query address balance via RPC
+%%% getbalance command -- query address balance via RPC
 %%% ===================================================================
 
 get_balance(Opts) ->
@@ -507,7 +507,7 @@ block_forever() ->
             block_forever()
     end.
 
-%% @doc Graceful shutdown — flush state and stop cleanly.
+%% @doc Graceful shutdown -flush state and stop cleanly.
 graceful_shutdown() ->
     %% Flush UTXO cache to disk
     try beamchain_chainstate:flush()
@@ -648,7 +648,7 @@ progress_bar(Frac) ->
     "[" ++ green(lists:duplicate(Filled, $█)) ++
     dim(lists:duplicate(Empty, $░)) ++ "]".
 
-%% @doc Approximate block rate — uses process dictionary for simplicity.
+%% @doc Approximate block rate -uses process dictionary for simplicity.
 %% Stores {LastValidated, LastTime} and computes instantaneous rate.
 block_rate(Validated) ->
     Now = erlang:monotonic_time(millisecond),
