@@ -45,15 +45,26 @@ run_command(start, Opts) ->
 run_command(sync, Opts) ->
     sync_blockchain(Opts);
 run_command(status, Opts) ->
+    ensure_httpc(),
     show_status(Opts);
 run_command(stop, Opts) ->
+    ensure_httpc(),
     stop_node(Opts);
 run_command(getbalance, Opts) ->
+    ensure_httpc(),
     get_balance(Opts);
 run_command(Unknown, _Opts) ->
     io:format(standard_error, "unknown command: ~s~n~n", [Unknown]),
     print_usage(),
     halt(1).
+
+%% Make sure inets/ssl/crypto are started for httpc RPC calls
+ensure_httpc() ->
+    ensure_started(crypto),
+    ensure_started(asn1),
+    ensure_started(public_key),
+    ensure_started(ssl),
+    inets:start().
 
 %%% ===================================================================
 %%% Argument parsing
@@ -190,8 +201,11 @@ start_node(Opts) ->
 
 sync_blockchain(Opts) ->
     apply_opts(Opts),
+    maybe_reset(Opts),
     case start_app() of
         ok ->
+            %% Trap exits for graceful Ctrl-C handling
+            process_flag(trap_exit, true),
             Network = beamchain_config:network(),
             DataDir = beamchain_config:datadir(),
             io:format("~s~n", [bold("beamchain sync — " ++
@@ -206,7 +220,14 @@ sync_blockchain(Opts) ->
     end.
 
 sync_loop(Frame, StartTime) ->
-    timer:sleep(1000),
+    %% Check for exit signals (Ctrl-C)
+    receive
+        {'EXIT', _Pid, _Reason} ->
+            io:format("~n~s~n", [dim("interrupted, shutting down...")]),
+            graceful_shutdown(),
+            halt(0)
+    after 1000 -> ok
+    end,
     SyncStatus = try beamchain_sync:get_sync_status()
                  catch _:_ -> #{phase => idle} end,
     Phase = maps:get(phase, SyncStatus, idle),
@@ -233,6 +254,7 @@ sync_loop(Frame, StartTime) ->
             io:format("~s synced to ~B in ~s (avg ~.1f blk/s)~n",
                       [green("✓"), Height, format_duration(Elapsed),
                        AvgRate]),
+            graceful_shutdown(),
             halt(0);
         _ ->
             %% Move cursor up 2 lines for redraw
@@ -342,6 +364,13 @@ show_status(Opts) ->
                 {ok, MemInfo} ->
                     MemSize = maps:get(<<"size">>, MemInfo, 0),
                     io:format("  mempool:     ~B txs~n", [MemSize]);
+                _ -> ok
+            end,
+            %% Uptime
+            case rpc_call(Host, Port, <<"uptime">>, [], Opts) of
+                {ok, Uptime} when is_integer(Uptime) ->
+                    io:format("  uptime:      ~s~n",
+                              [format_duration(Uptime)]);
                 _ -> ok
             end,
             halt(0);
@@ -472,11 +501,54 @@ block_forever() ->
     receive
         {'EXIT', _Pid, _Reason} ->
             io:format("~n~s~n", [dim("shutting down...")]),
-            application:stop(beamchain),
+            graceful_shutdown(),
             halt(0);
         _ ->
             block_forever()
     end.
+
+%% @doc Graceful shutdown — flush state and stop cleanly.
+graceful_shutdown() ->
+    %% Flush UTXO cache to disk
+    try beamchain_chainstate:flush()
+    catch _:_ -> ok end,
+    %% Stop the application (closes DB, disconnects peers)
+    application:stop(beamchain),
+    ok.
+
+%% @doc Handle --reset flag: wipe chain data before syncing.
+maybe_reset(#{reset := true}) ->
+    %% We need config to know the datadir, but the app isn't started yet.
+    %% Determine datadir manually from env/defaults.
+    Network = case os:getenv("BEAMCHAIN_NETWORK") of
+        false ->
+            case application:get_env(beamchain, network) of
+                {ok, N} -> N;
+                _ -> mainnet
+            end;
+        NS -> list_to_atom(NS)
+    end,
+    BaseDir = case os:getenv("BEAMCHAIN_DATADIR") of
+        false ->
+            case application:get_env(beamchain, datadir) of
+                {ok, D} when D =/= undefined -> D;
+                _ ->
+                    Home = os:getenv("HOME", "/tmp"),
+                    filename:join(Home, ".beamchain")
+            end;
+        D -> D
+    end,
+    DataDir = case Network of
+        mainnet -> BaseDir;
+        _ -> filename:join(BaseDir, atom_to_list(Network))
+    end,
+    %% Remove the RocksDB data subdirectory
+    DbDir = filename:join(DataDir, "chaindata"),
+    io:format("~s ~s~n", [yellow("resetting"), DbDir]),
+    os:cmd("rm -rf " ++ DbDir),
+    ok;
+maybe_reset(_) ->
+    ok.
 
 %%% ===================================================================
 %%% RPC client (for status/stop/getbalance against running node)
