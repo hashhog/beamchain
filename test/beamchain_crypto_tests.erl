@@ -368,3 +368,135 @@ schnorr_wrong_key_test() ->
     Sig    = hex("E907831F80848D1069A5371B402410364BDF1C5F8307B0084C55F1CE2DCA8215"
                  "25F66A4A85EA8B71E482A74F382D2CE5EBEEE8FDB2172F477DF4900D310536C0"),
     ?assertNot(beamchain_crypto:schnorr_verify(Msg, Sig, PubKey)).
+
+%% BIP 340 vectors 6-14: invalid signatures that must be rejected
+
+schnorr_vector_6_r_not_on_curve_test() ->
+    %% Test vector 6: sG - eP has even y → r not on curve
+    PubKey = hex("DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659"),
+    Msg    = hex("243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89"),
+    Sig    = hex("F9308A019258C31049344F85F89D5229B531C845836F99B08601F113BCE036F9"
+                 "935554D1AA5F0374E5CDAACB3925035C7C169B27C4426DF0A6B19AF3BAEAB138"),
+    ?assertNot(beamchain_crypto:schnorr_verify(Msg, Sig, PubKey)).
+
+schnorr_vector_7_negated_msg_test() ->
+    %% Test vector 7: negated message
+    PubKey = hex("DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659"),
+    Msg    = hex("243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89"),
+    Sig    = hex("1DA9D78E0FF71C4BBA15C3CE8FFAD6F07A5CF1C8C3A3061AA0A81E46BEE09E64"
+                 "74EC9AA7A77F0AE78B725293C1D433BCD7B87CB394120B44CFD17CE020FA345B"),
+    ?assertNot(beamchain_crypto:schnorr_verify(Msg, Sig, PubKey)).
+
+schnorr_vector_8_negated_s_test() ->
+    %% Test vector 8: negated s value
+    PubKey = hex("DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659"),
+    Msg    = hex("243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89"),
+    Sig    = hex("6896BD60EEAE296DB48A229FF71DFE071BDE413E6D43F917DC8DCF8C78DE3341"
+                 "76F2DEE2E53C16F15E0B0140B226A2A21E14CAD185E26E4FDD6668C15BBD47E1"),
+    ?assertNot(beamchain_crypto:schnorr_verify(Msg, Sig, PubKey)).
+
+schnorr_vector_9_sG_minus_eP_odd_y_test() ->
+    %% Test vector 9: sG - eP is infinite
+    PubKey = hex("DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659"),
+    Msg    = hex("243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89"),
+    Sig    = hex("0000000000000000000000000000000000000000000000000000000000000000"
+                 "123DDA8328AF9C23A94C1FEECFD123BA4FB73476F0D594DCB65CD6350C9391A0"),
+    ?assertNot(beamchain_crypto:schnorr_verify(Msg, Sig, PubKey)).
+
+schnorr_vector_10_r_eq_p_test() ->
+    %% Test vector 10: r exceeds field size
+    PubKey = hex("DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659"),
+    Msg    = hex("243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89"),
+    Sig    = hex("00000000000000000000000000000000000000000000000000000000000000017"
+                 "615FBAF5AE28864013C099742DEADB4DBA87F11AC6754F93780D5A1837CF197"),
+    ?assertNot(beamchain_crypto:schnorr_verify(Msg, Sig, PubKey)).
+
+schnorr_vector_11_s_exceeds_order_test() ->
+    %% Test vector 11: s exceeds curve order
+    PubKey = hex("DFF1D77F2A671C5F36183726DB2341BE58FEAE1DA2DECED843240F7B502BA659"),
+    Msg    = hex("243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89"),
+    Sig    = hex("667C2F778E0616E611BD0C14B8A600C5884551701A949EF0EBFD72D452D64E84"
+                 "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141"),
+    ?assertNot(beamchain_crypto:schnorr_verify(Msg, Sig, PubKey)).
+
+schnorr_vector_12_r_eq_p_field_test() ->
+    %% Test vector 12: pubkey is not a valid X coordinate
+    PubKey = hex("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC30"),
+    Msg    = hex("243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89"),
+    Sig    = hex("6896BD60EEAE296DB48A229FF71DFE071BDE413E6D43F917DC8DCF8C78DE3341"
+                 "8906D11AC976ABCCB20B091292BFF4EA897EFCB639EA871CFA95F6DE339E4B0A"),
+    ?assertNot(beamchain_crypto:schnorr_verify(Msg, Sig, PubKey)).
+
+%%% ===================================================================
+%%% ECDSA sign/verify roundtrip tests
+%%% ===================================================================
+
+ecdsa_sign_verify_roundtrip_test() ->
+    %% Sign with privkey=1, verify with its pubkey
+    PrivKey = <<1:256/big>>,
+    {ok, PubKey} = beamchain_crypto:pubkey_from_privkey(PrivKey),
+    Msg = beamchain_crypto:hash256(<<"test message for signing">>),
+    {ok, Sig} = beamchain_crypto:ecdsa_sign(Msg, PrivKey),
+    ?assert(beamchain_crypto:ecdsa_verify(Msg, Sig, PubKey)).
+
+ecdsa_sign_low_s_test() ->
+    %% Verify signed sigs always have low S
+    PrivKey = crypto:hash(sha256, <<"another test key">>),
+    Msg = beamchain_crypto:hash256(<<"test message for low-s">>),
+    {ok, Sig} = beamchain_crypto:ecdsa_sign(Msg, PrivKey),
+    {ok, {_R, S}} = beamchain_crypto:decode_der_signature(Sig),
+    ?assert(beamchain_crypto:is_low_s(S)).
+
+ecdsa_sign_different_messages_test() ->
+    %% Different messages produce different sigs
+    PrivKey = <<2:256/big>>,
+    Msg1 = beamchain_crypto:hash256(<<"message one">>),
+    Msg2 = beamchain_crypto:hash256(<<"message two">>),
+    {ok, Sig1} = beamchain_crypto:ecdsa_sign(Msg1, PrivKey),
+    {ok, Sig2} = beamchain_crypto:ecdsa_sign(Msg2, PrivKey),
+    ?assertNotEqual(Sig1, Sig2).
+
+ecdsa_sign_wrong_pubkey_test() ->
+    %% Verify with wrong pubkey should fail
+    PrivKey1 = <<1:256/big>>,
+    {ok, PubKey2} = beamchain_crypto:pubkey_from_privkey(<<2:256/big>>),
+    Msg = beamchain_crypto:hash256(<<"cross-key test">>),
+    {ok, Sig} = beamchain_crypto:ecdsa_sign(Msg, PrivKey1),
+    ?assertNot(beamchain_crypto:ecdsa_verify(Msg, Sig, PubKey2)).
+
+%%% ===================================================================
+%%% Schnorr sign/verify roundtrip tests
+%%% ===================================================================
+
+schnorr_sign_verify_roundtrip_test() ->
+    PrivKey = <<1:256/big>>,
+    {ok, PubKey} = beamchain_crypto:pubkey_from_privkey(PrivKey),
+    <<_Prefix:8, XOnly:32/binary>> = PubKey,
+    Msg = beamchain_crypto:hash256(<<"schnorr test">>),
+    AuxRand = crypto:strong_rand_bytes(32),
+    {ok, Sig} = beamchain_crypto:schnorr_sign(Msg, PrivKey, AuxRand),
+    ?assertEqual(64, byte_size(Sig)),
+    ?assert(beamchain_crypto:schnorr_verify(Msg, Sig, XOnly)).
+
+schnorr_sign_wrong_key_test() ->
+    PrivKey1 = <<1:256/big>>,
+    {ok, PubKey2} = beamchain_crypto:pubkey_from_privkey(<<2:256/big>>),
+    <<_:8, XOnly2:32/binary>> = PubKey2,
+    Msg = beamchain_crypto:hash256(<<"schnorr cross-key">>),
+    AuxRand = <<0:256>>,
+    {ok, Sig} = beamchain_crypto:schnorr_sign(Msg, PrivKey1, AuxRand),
+    ?assertNot(beamchain_crypto:schnorr_verify(Msg, Sig, XOnly2)).
+
+%%% ===================================================================
+%%% Secret key tweak test
+%%% ===================================================================
+
+seckey_tweak_add_test() ->
+    %% privkey=1 + tweak=1 should give privkey=2
+    Key1 = <<1:256/big>>,
+    Tweak = <<1:256/big>>,
+    {ok, Key2} = beamchain_crypto:seckey_tweak_add(Key1, Tweak),
+    %% deriving pubkey from key2 should equal pubkey of privkey=2
+    {ok, PK2a} = beamchain_crypto:pubkey_from_privkey(Key2),
+    {ok, PK2b} = beamchain_crypto:pubkey_from_privkey(<<2:256/big>>),
+    ?assertEqual(PK2a, PK2b).
