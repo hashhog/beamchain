@@ -591,3 +591,182 @@ pushdata2_test() ->
 pushdata4_test() ->
     %% OP_PUSHDATA4 with 1 byte of data
     {ok, [<<16#42>>]} = eval(<<16#4e, 1, 0, 0, 0, 16#42>>).
+
+%%% -------------------------------------------------------------------
+%%% OP_CHECKMULTISIG tests
+%%% -------------------------------------------------------------------
+
+op_checkmultisig_pattern_test() ->
+    %% 1-of-1 multisig with mock sig checker
+    %% OP_0 <sig> OP_1 <pubkey> OP_1 OP_CHECKMULTISIG
+    FakeSig = <<16#30, 16#06, 16#02, 16#01, 16#01, 16#02, 16#01, 16#01, 16#01>>,
+    FakePK = <<16#02, 0:256>>,
+    SigChecker = #{
+        check_ecdsa_sig => fun(_, _, _) -> true end,
+        compute_sighash => fun(_, _) -> <<0:256>> end
+    },
+    Script = <<
+        16#00,                           %% OP_0 (dummy)
+        (byte_size(FakeSig)), FakeSig/binary,   %% sig
+        16#51,                           %% OP_1 (m = 1)
+        (byte_size(FakePK)), FakePK/binary,     %% pubkey
+        16#51,                           %% OP_1 (n = 1)
+        16#ae                            %% OP_CHECKMULTISIG
+    >>,
+    {ok, [<<1>>]} = beamchain_script:eval_script(Script, [], 0, SigChecker, base).
+
+op_checkmultisig_2of3_pattern_test() ->
+    %% 2-of-3 multisig with mock sig checker
+    FakeSig = <<16#30, 16#06, 16#02, 16#01, 16#01, 16#02, 16#01, 16#01, 16#01>>,
+    FakePK1 = <<16#02, 1:256>>,
+    FakePK2 = <<16#02, 2:256>>,
+    FakePK3 = <<16#02, 3:256>>,
+    SigChecker = #{
+        check_ecdsa_sig => fun(_, _, _) -> true end,
+        compute_sighash => fun(_, _) -> <<0:256>> end
+    },
+    Script = <<
+        16#00,                           %% OP_0 (dummy element)
+        (byte_size(FakeSig)), FakeSig/binary,   %% sig1
+        (byte_size(FakeSig)), FakeSig/binary,   %% sig2
+        16#52,                           %% OP_2 (m = 2)
+        (byte_size(FakePK1)), FakePK1/binary,
+        (byte_size(FakePK2)), FakePK2/binary,
+        (byte_size(FakePK3)), FakePK3/binary,
+        16#53,                           %% OP_3 (n = 3)
+        16#ae                            %% OP_CHECKMULTISIG
+    >>,
+    {ok, [<<1>>]} = beamchain_script:eval_script(Script, [], 0, SigChecker, base).
+
+%%% -------------------------------------------------------------------
+%%% NULLDUMMY flag enforcement test
+%%% -------------------------------------------------------------------
+
+nulldummy_enforcement_test() ->
+    %% NULLDUMMY flag requires the dummy element in CHECKMULTISIG to be empty
+    FakeSig = <<16#30, 16#06, 16#02, 16#01, 16#01, 16#02, 16#01, 16#01, 16#01>>,
+    FakePK = <<16#02, 0:256>>,
+    SigChecker = #{
+        check_ecdsa_sig => fun(_, _, _) -> true end,
+        compute_sighash => fun(_, _) -> <<0:256>> end
+    },
+    %% Non-empty dummy: push byte 0x42 instead of OP_0
+    Script = <<
+        1, 16#42,                        %% non-empty dummy
+        (byte_size(FakeSig)), FakeSig/binary,
+        16#51,
+        (byte_size(FakePK)), FakePK/binary,
+        16#51,
+        16#ae
+    >>,
+    %% Without NULLDUMMY flag, should succeed
+    {ok, [<<1>>]} = beamchain_script:eval_script(Script, [], 0, SigChecker, base),
+    %% With NULLDUMMY flag, should fail
+    {error, _} = beamchain_script:eval_script(
+        Script, [], ?SCRIPT_VERIFY_NULLDUMMY, SigChecker, base).
+
+%%% -------------------------------------------------------------------
+%%% OP_CHECKSIGADD test (tapscript)
+%%% -------------------------------------------------------------------
+
+op_checksigadd_empty_sig_test() ->
+    %% Empty sig should push n unchanged (no increment, no sigops cost)
+    SigChecker = #{
+        check_schnorr_sig => fun(_, _, _) -> true end,
+        compute_sighash => fun(_, _) -> <<0:256>> end
+    },
+    FakePK = <<0:256>>,
+    Script = <<
+        16#00,                                  %% OP_0 (empty sig)
+        16#53,                                  %% OP_3 (n = 3)
+        (byte_size(FakePK)), FakePK/binary,
+        16#ba
+    >>,
+    %% empty sig doesn't consume sigops budget, so budget=0 is fine
+    {ok, [<<3>>]} = beamchain_script:eval_script(
+        Script, [], 0, SigChecker, tapscript).
+
+%%% -------------------------------------------------------------------
+%%% OP_CHECKMULTISIG disabled in tapscript
+%%% -------------------------------------------------------------------
+
+checkmultisig_disabled_in_tapscript_test() ->
+    %% OP_CHECKMULTISIG (0xae) must fail in tapscript
+    {error, _} = beamchain_script:eval_script(
+        <<16#00, 16#51, 16#51, 16#ae>>, [], 0, #{}, tapscript).
+
+%%% -------------------------------------------------------------------
+%%% Op count limit test
+%%% -------------------------------------------------------------------
+
+op_count_limit_test() ->
+    %% MAX_OPS_PER_SCRIPT = 201, check is `> 201`
+    %% so 202 NOPs should fail
+    Script202 = binary:copy(<<16#61>>, 202),
+    {error, _} = eval(Script202).
+
+op_count_at_limit_test() ->
+    %% Exactly 201 OP_NOPs should succeed (the limit)
+    Script201 = binary:copy(<<16#61>>, 201),
+    {ok, []} = eval(Script201).
+
+%%% -------------------------------------------------------------------
+%%% Stack size limit test
+%%% -------------------------------------------------------------------
+
+max_stack_size_test() ->
+    %% push 1000 items onto the stack — should be at the limit
+    %% OP_1 = 0x51, each pushes one element
+    Script1000 = binary:copy(<<16#51>>, 1000),
+    {ok, Stack} = eval(Script1000),
+    ?assertEqual(1000, length(Stack)).
+
+%%% -------------------------------------------------------------------
+%%% Negative zero in script numbers
+%%% -------------------------------------------------------------------
+
+script_num_negative_zero_test() ->
+    %% 0x80 is negative zero, decode_script_num should give 0
+    ?assertEqual({ok, 0}, beamchain_script:decode_script_num(<<16#80>>, 4)).
+
+%%% -------------------------------------------------------------------
+%%% OP_NUMEQUAL with negative values
+%%% -------------------------------------------------------------------
+
+op_numequal_negative_test() ->
+    %% push -1, push -1, OP_NUMEQUAL -> [1]
+    {ok, [<<1>>]} = eval(<<1, 16#81, 1, 16#81, 16#9c>>).
+
+%%% -------------------------------------------------------------------
+%%% OP_IF/NOTIF with MINIMALIF enforcement
+%%% -------------------------------------------------------------------
+
+minimalif_enforcement_test() ->
+    %% With MINIMALIF flag, IF condition must be exactly OP_0 or OP_1
+    %% push 2 bytes <<1, 0>> then OP_IF — truthy but not minimal
+    Script = <<2, 1, 0, 16#63, 16#51, 16#68>>,  %% <01 00> OP_IF OP_1 OP_ENDIF
+    %% Without MINIMALIF, should succeed (<<1, 0>> is truthy)
+    {ok, [<<1>>]} = beamchain_script:eval_script(Script, [], 0, #{}, base),
+    %% With MINIMALIF, should fail
+    {error, _} = beamchain_script:eval_script(
+        Script, [], ?SCRIPT_VERIFY_MINIMALIF, #{}, base).
+
+%%% -------------------------------------------------------------------
+%%% Multiple OP_SUCCESS codes in tapscript
+%%% -------------------------------------------------------------------
+
+op_success_codes_test_() ->
+    %% Various OP_SUCCESS codes should all succeed in tapscript
+    Codes = [16#50, 16#62, 16#89, 16#8a, 16#bb, 16#fe],
+    [fun() ->
+        {ok, _} = beamchain_script:eval_script(<<Code>>, [], 0, #{}, tapscript)
+    end || Code <- Codes].
+
+%%% -------------------------------------------------------------------
+%%% OP_CODESEPARATOR test
+%%% -------------------------------------------------------------------
+
+op_codeseparator_test() ->
+    %% OP_1 OP_CODESEPARATOR OP_1 -> [1, 1]
+    %% OP_CODESEPARATOR just updates the code separator position
+    {ok, [<<1>>, <<1>>]} = eval(<<16#51, 16#ab, 16#51>>).
