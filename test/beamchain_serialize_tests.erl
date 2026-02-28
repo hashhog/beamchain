@@ -358,6 +358,10 @@ hex_roundtrip_test() ->
 hex_decode_string_test() ->
     ?assertEqual(<<255, 0>>, beamchain_serialize:hex_decode("ff00")).
 
+hex_empty_test() ->
+    ?assertEqual(<<>>, beamchain_serialize:hex_decode(<<>>)),
+    ?assertEqual(<<>>, beamchain_serialize:hex_encode(<<>>)).
+
 %%% ===================================================================
 %%% Reverse bytes
 %%% ===================================================================
@@ -402,3 +406,82 @@ genesis_coinbase_tx_test() ->
     ?assertEqual(
         <<"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b">>,
         DisplayTxid).
+
+%%% ===================================================================
+%%% Witness commitment computation
+%%% ===================================================================
+
+witness_commitment_basic_test() ->
+    %% coinbase wtxid is always 32 zero bytes
+    CoinbaseWtxid = <<0:256>>,
+    TxWtxid = <<1:256>>,
+    WitnessNonce = <<0:256>>,
+    Result = beamchain_serialize:compute_witness_commitment(
+        [CoinbaseWtxid, TxWtxid], WitnessNonce),
+    ?assertEqual(32, byte_size(Result)).
+
+witness_commitment_deterministic_test() ->
+    Wtxids = [<<0:256>>, <<1:256>>, <<2:256>>],
+    Nonce = <<0:256>>,
+    R1 = beamchain_serialize:compute_witness_commitment(Wtxids, Nonce),
+    R2 = beamchain_serialize:compute_witness_commitment(Wtxids, Nonce),
+    ?assertEqual(R1, R2).
+
+witness_commitment_different_nonce_test() ->
+    Wtxids = [<<0:256>>, <<1:256>>],
+    R1 = beamchain_serialize:compute_witness_commitment(Wtxids, <<0:256>>),
+    R2 = beamchain_serialize:compute_witness_commitment(Wtxids, <<1:256>>),
+    ?assertNotEqual(R1, R2).
+
+%%% ===================================================================
+%%% Merkle root with 4 elements (power of 2)
+%%% ===================================================================
+
+merkle_four_elements_test() ->
+    A = <<1:256>>, B = <<2:256>>, C = <<3:256>>, D = <<4:256>>,
+    AB = beamchain_serialize:hash256(<<A/binary, B/binary>>),
+    CD = beamchain_serialize:hash256(<<C/binary, D/binary>>),
+    Expected = beamchain_serialize:hash256(<<AB/binary, CD/binary>>),
+    ?assertEqual(Expected, beamchain_serialize:compute_merkle_root([A, B, C, D])).
+
+%%% ===================================================================
+%%% Multi-output transaction test
+%%% ===================================================================
+
+multi_output_tx_test() ->
+    Tx = #transaction{
+        version = 1,
+        inputs = [#tx_in{
+            prev_out = #outpoint{hash = <<0:256>>, index = 16#ffffffff},
+            script_sig = <<4, 1, 0, 0, 0>>,
+            sequence = 16#ffffffff,
+            witness = []
+        }],
+        outputs = [
+            #tx_out{value = 2500000000, script_pubkey = <<16#76, 16#a9, 16#14, 0:160, 16#88, 16#ac>>},
+            #tx_out{value = 2500000000, script_pubkey = <<16#a9, 16#14, 0:160, 16#87>>}
+        ],
+        locktime = 0
+    },
+    Encoded = beamchain_serialize:encode_transaction(Tx, no_witness),
+    {Decoded, <<>>} = beamchain_serialize:decode_transaction(Encoded),
+    ?assertEqual(2, length(Decoded#transaction.outputs)),
+    [Out1, Out2] = Decoded#transaction.outputs,
+    ?assertEqual(2500000000, Out1#tx_out.value),
+    ?assertEqual(2500000000, Out2#tx_out.value).
+
+%%% ===================================================================
+%%% Varint boundary precision
+%%% ===================================================================
+
+varint_boundary_exact_test() ->
+    %% test exact boundaries between encoding sizes
+    %% 252 -> 1 byte, 253 -> 3 bytes
+    ?assertEqual(1, byte_size(beamchain_serialize:encode_varint(252))),
+    ?assertEqual(3, byte_size(beamchain_serialize:encode_varint(253))),
+    %% 65535 -> 3 bytes, 65536 -> 5 bytes
+    ?assertEqual(3, byte_size(beamchain_serialize:encode_varint(65535))),
+    ?assertEqual(5, byte_size(beamchain_serialize:encode_varint(65536))),
+    %% 2^32-1 -> 5 bytes, 2^32 -> 9 bytes
+    ?assertEqual(5, byte_size(beamchain_serialize:encode_varint(4294967295))),
+    ?assertEqual(9, byte_size(beamchain_serialize:encode_varint(4294967296))).
