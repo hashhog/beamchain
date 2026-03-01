@@ -190,6 +190,188 @@ legacy_sigops_with_push_test() ->
     ?assertEqual(1, beamchain_validation:count_legacy_sigops(Script)).
 
 %%% ===================================================================
+%%% is_coinbase_tx tests
+%%% ===================================================================
+
+is_coinbase_test() ->
+    Cb = make_coinbase_tx(<<4, 1, 0, 0, 0>>, 5000000000),
+    ?assert(beamchain_validation:is_coinbase_tx(Cb)).
+
+is_not_coinbase_test() ->
+    Tx = make_regular_tx(
+        [{<<1:256>>, 0}],
+        [{1000, <<16#6a>>}]
+    ),
+    ?assertNot(beamchain_validation:is_coinbase_tx(Tx)).
+
+%%% ===================================================================
+%%% block_subsidy tests
+%%% ===================================================================
+
+subsidy_at_genesis_test() ->
+    ?assertEqual(5000000000, beamchain_chain_params:block_subsidy(0, mainnet)).
+
+subsidy_first_halving_test() ->
+    %% at height 210000, subsidy halves to 25 BTC
+    ?assertEqual(2500000000, beamchain_chain_params:block_subsidy(210000, mainnet)).
+
+subsidy_just_before_halving_test() ->
+    %% at height 209999, still 50 BTC
+    ?assertEqual(5000000000, beamchain_chain_params:block_subsidy(209999, mainnet)).
+
+subsidy_second_halving_test() ->
+    ?assertEqual(1250000000, beamchain_chain_params:block_subsidy(420000, mainnet)).
+
+subsidy_third_halving_test() ->
+    ?assertEqual(625000000, beamchain_chain_params:block_subsidy(630000, mainnet)).
+
+subsidy_after_64_halvings_test() ->
+    %% 64 halvings = height 64 * 210000 = 13,440,000
+    ?assertEqual(0, beamchain_chain_params:block_subsidy(13440000, mainnet)).
+
+subsidy_at_very_high_height_test() ->
+    %% well past all halvings
+    ?assertEqual(0, beamchain_chain_params:block_subsidy(100000000, mainnet)).
+
+subsidy_regtest_halving_interval_test() ->
+    %% regtest halves every 150 blocks
+    ?assertEqual(5000000000, beamchain_chain_params:block_subsidy(0, regtest)),
+    ?assertEqual(5000000000, beamchain_chain_params:block_subsidy(149, regtest)),
+    ?assertEqual(2500000000, beamchain_chain_params:block_subsidy(150, regtest)),
+    ?assertEqual(1250000000, beamchain_chain_params:block_subsidy(300, regtest)).
+
+%%% ===================================================================
+%%% Genesis block tests across networks
+%%% ===================================================================
+
+testnet4_genesis_valid_test() ->
+    Params = beamchain_chain_params:params(testnet4),
+    Genesis = beamchain_chain_params:genesis_block(testnet4),
+    ?assertEqual(ok, beamchain_validation:check_block(Genesis, Params)).
+
+signet_genesis_valid_test() ->
+    Params = beamchain_chain_params:params(signet),
+    Genesis = beamchain_chain_params:genesis_block(signet),
+    ?assertEqual(ok, beamchain_validation:check_block(Genesis, Params)).
+
+%% verify genesis hashes match expected values
+mainnet_genesis_hash_test() ->
+    Genesis = beamchain_chain_params:genesis_block(mainnet),
+    DisplayHash = beamchain_serialize:hex_encode(
+        beamchain_serialize:reverse_bytes(Genesis#block.hash)),
+    ?assertEqual(
+        <<"000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f">>,
+        DisplayHash).
+
+regtest_genesis_hash_test() ->
+    Genesis = beamchain_chain_params:genesis_block(regtest),
+    DisplayHash = beamchain_serialize:hex_encode(
+        beamchain_serialize:reverse_bytes(Genesis#block.hash)),
+    ?assertEqual(
+        <<"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206">>,
+        DisplayHash).
+
+testnet4_genesis_hash_test() ->
+    Genesis = beamchain_chain_params:genesis_block(testnet4),
+    DisplayHash = beamchain_serialize:hex_encode(
+        beamchain_serialize:reverse_bytes(Genesis#block.hash)),
+    ?assertEqual(
+        <<"00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043">>,
+        DisplayHash).
+
+%%% ===================================================================
+%%% chain params tests
+%%% ===================================================================
+
+params_mainnet_test() ->
+    P = beamchain_chain_params:params(mainnet),
+    ?assertEqual(mainnet, maps:get(network, P)),
+    ?assertEqual(8333, maps:get(default_port, P)),
+    ?assertEqual(8332, maps:get(rpc_port, P)),
+    ?assertEqual("bc", maps:get(bech32_hrp, P)),
+    ?assertEqual(0, maps:get(pubkey_prefix, P)),
+    ?assertEqual(5, maps:get(script_prefix, P)).
+
+params_testnet4_test() ->
+    P = beamchain_chain_params:params(testnet4),
+    ?assertEqual(testnet4, maps:get(network, P)),
+    ?assertEqual(48333, maps:get(default_port, P)),
+    ?assertEqual(48332, maps:get(rpc_port, P)),
+    ?assertEqual("tb", maps:get(bech32_hrp, P)),
+    %% testnet4 has all BIPs active from block 1
+    ?assertEqual(1, maps:get(bip34_height, P)),
+    ?assertEqual(1, maps:get(segwit_height, P)),
+    ?assertEqual(1, maps:get(taproot_height, P)).
+
+params_regtest_test() ->
+    P = beamchain_chain_params:params(regtest),
+    ?assertEqual(regtest, maps:get(network, P)),
+    ?assertEqual(18444, maps:get(default_port, P)),
+    ?assertEqual(true, maps:get(pow_no_retargeting, P)),
+    ?assertEqual(150, maps:get(subsidy_halving_interval, P)),
+    ?assertEqual("bcrt", maps:get(bech32_hrp, P)).
+
+params_signet_test() ->
+    P = beamchain_chain_params:params(signet),
+    ?assertEqual(signet, maps:get(network, P)),
+    ?assertEqual(38333, maps:get(default_port, P)),
+    ?assertEqual("tb", maps:get(bech32_hrp, P)).
+
+%%% ===================================================================
+%%% Negative value output test
+%%% ===================================================================
+
+negative_output_test() ->
+    %% output value of 0 should be ok (e.g. OP_RETURN outputs)
+    Tx = make_regular_tx(
+        [{<<1:256>>, 0}],
+        [{0, <<16#6a, 4, "test">>}]
+    ),
+    ?assertEqual(ok, beamchain_validation:check_transaction(Tx)).
+
+%%% ===================================================================
+%%% Multiple sigops counting
+%%% ===================================================================
+
+legacy_sigops_multiple_test() ->
+    %% OP_CHECKSIG OP_CHECKSIG OP_CHECKMULTISIG = 1 + 1 + 20 = 22
+    Script = <<16#ac, 16#ac, 16#ae>>,
+    ?assertEqual(22, beamchain_validation:count_legacy_sigops(Script)).
+
+%%% ===================================================================
+%%% Block weight enforcement (check_block rejects oversized)
+%%% ===================================================================
+
+overweight_block_test() ->
+    %% create a block with a huge transaction that exceeds MAX_BLOCK_WEIGHT
+    %% A single output with a very large scriptPubKey
+    BigScript = binary:copy(<<16#6a>>, 1100000),  %% ~1.1MB of OP_RETURN
+    Tx = #transaction{
+        version = 1,
+        inputs = [#tx_in{
+            prev_out = #outpoint{hash = <<0:256>>, index = 16#ffffffff},
+            script_sig = <<4, 1, 0, 0, 0>>,
+            sequence = 16#ffffffff,
+            witness = []
+        }],
+        outputs = [#tx_out{value = 5000000000, script_pubkey = BigScript}],
+        locktime = 0
+    },
+    Merkle = beamchain_serialize:tx_hash(Tx),
+    Header = #block_header{
+        version = 1,
+        prev_hash = <<0:256>>,
+        merkle_root = Merkle,
+        timestamp = 1296688602,
+        bits = 16#207fffff,
+        nonce = 0
+    },
+    Block = #block{header = Header, transactions = [Tx]},
+    Params = beamchain_chain_params:params(regtest),
+    Result = beamchain_validation:check_block(Block, Params),
+    ?assertMatch({error, _}, Result).
+
+%%% ===================================================================
 %%% Helper functions
 %%% ===================================================================
 
