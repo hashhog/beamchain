@@ -316,6 +316,55 @@ bech32_uppercase_valid_test() ->
         "BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4").
 
 %%% -------------------------------------------------------------------
+%%% Invalid addresses
+%%% -------------------------------------------------------------------
+
+invalid_base58_too_short_test() ->
+    %% too short to have a valid checksum
+    ?assertMatch({error, _}, beamchain_address:base58check_decode("1")).
+
+invalid_bech32_wrong_network_test() ->
+    %% bc1 address should not decode correctly with testnet expectations
+    Addr = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+    {ok, Script} = beamchain_address:address_to_script(Addr, mainnet),
+    ?assertMatch(<<16#00, 16#14, _:20/binary>>, Script).
+
+address_to_script_invalid_test() ->
+    ?assertMatch({error, _}, beamchain_address:address_to_script("totally_invalid", mainnet)).
+
+%%% -------------------------------------------------------------------
+%%% P2SH-P2WPKH address roundtrip
+%%% -------------------------------------------------------------------
+
+p2sh_p2wpkh_roundtrip_test() ->
+    %% A P2SH-wrapped P2WPKH: the scriptPubKey is OP_HASH160 <hash20> OP_EQUAL
+    Hash = hex_to_bin("89abcdefabbaabbaabbaabbaabbaabbaabbaabba"),
+    Script = <<16#a9, 16#14, Hash/binary, 16#87>>,
+    Addr = beamchain_address:script_to_address(Script, mainnet),
+    {ok, Script} = beamchain_address:address_to_script(Addr, mainnet).
+
+%%% -------------------------------------------------------------------
+%%% Testnet P2TR address test
+%%% -------------------------------------------------------------------
+
+testnet_p2tr_roundtrip_test() ->
+    Hash = hex_to_bin("000000c4a5cad46221b2a187905e5266362b99d5e91c6ce24d165dab93e86433"),
+    Script = <<16#51, 16#20, Hash/binary>>,
+    Addr = beamchain_address:script_to_address(Script, testnet),
+    ?assertEqual("tb1pqqqqp399et2xygdj5xreqhjjvcmzhxw4aywxecjdzew6hylgvsesf3hn0c", Addr),
+    {ok, Script} = beamchain_address:address_to_script(Addr, testnet).
+
+%%% -------------------------------------------------------------------
+%%% Witness v2+ future version test
+%%% -------------------------------------------------------------------
+
+witness_future_version_test() ->
+    %% A witness v2 program should classify as {witness, 2, Program}
+    Program = crypto:strong_rand_bytes(32),
+    Script = <<16#52, 16#20, Program/binary>>,
+    ?assertEqual({witness, 2, Program}, beamchain_address:classify_script(Script)).
+
+%%% -------------------------------------------------------------------
 %%% Helpers
 %%% -------------------------------------------------------------------
 

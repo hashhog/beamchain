@@ -141,6 +141,206 @@ sorted_by_fee_test_() ->
      end}.
 
 %%% ===================================================================
+%%% Outpoint tracking tests
+%%% ===================================================================
+
+outpoint_tracking_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             %% Insert a tx and register its outpoints
+             Txid = <<10:256>>,
+             Tx = make_tx([{<<50:256>>, 0}], [{2000, p2pkh_script()}]),
+             Entry = make_entry_with_tx(Txid, 8.0, Tx),
+             ets:insert(mempool_txs, {Txid, Entry}),
+             %% Register outpoint: {prev_hash, prev_index} -> spending_txid
+             ets:insert(mempool_outpoints, {{<<50:256>>, 0}, Txid}),
+             ?assertEqual([{{<<50:256>>, 0}, Txid}],
+                          ets:lookup(mempool_outpoints, {<<50:256>>, 0})),
+             %% Non-existent outpoint
+             ?assertEqual([], ets:lookup(mempool_outpoints, {<<99:256>>, 0}))
+         end]
+     end}.
+
+%%% ===================================================================
+%%% get_entry tests
+%%% ===================================================================
+
+get_entry_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             ?assertEqual(not_found, beamchain_mempool:get_entry(<<1:256>>)),
+             Tx = make_tx([{<<5:256>>, 0}], [{1000, p2pkh_script()}]),
+             Entry = make_entry_with_tx(<<1:256>>, 5.0, Tx),
+             ets:insert(mempool_txs, {<<1:256>>, Entry}),
+             {ok, Got} = beamchain_mempool:get_entry(<<1:256>>),
+             ?assertEqual(<<1:256>>, Got#mempool_entry.txid),
+             ?assertEqual(5.0, Got#mempool_entry.fee_rate)
+         end]
+     end}.
+
+%%% ===================================================================
+%%% Sorted by fee with many entries
+%%% ===================================================================
+
+sorted_by_fee_many_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             %% Insert 10 entries with fee rates 1.0 through 10.0
+             lists:foreach(fun(N) ->
+                 Txid = <<N:256>>,
+                 FeeRate = float(N),
+                 E = make_entry(Txid, FeeRate),
+                 ets:insert(mempool_txs, {Txid, E}),
+                 ets:insert(mempool_by_fee, {{FeeRate, Txid}})
+             end, lists:seq(1, 10)),
+             Sorted = beamchain_mempool:get_sorted_by_fee(),
+             ?assertEqual(10, length(Sorted)),
+             %% Verify descending order
+             Rates = [E#mempool_entry.fee_rate || E <- Sorted],
+             ?assertEqual([10.0, 9.0, 8.0, 7.0, 6.0,
+                           5.0, 4.0, 3.0, 2.0, 1.0], Rates)
+         end]
+     end}.
+
+%%% ===================================================================
+%%% Single entry sorted
+%%% ===================================================================
+
+sorted_by_fee_single_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             E = make_entry(<<1:256>>, 42.0),
+             ets:insert(mempool_txs, {<<1:256>>, E}),
+             ets:insert(mempool_by_fee, {{42.0, <<1:256>>}}),
+             Sorted = beamchain_mempool:get_sorted_by_fee(),
+             ?assertEqual(1, length(Sorted)),
+             ?assertEqual(42.0, (hd(Sorted))#mempool_entry.fee_rate)
+         end]
+     end}.
+
+%%% ===================================================================
+%%% Mempool UTXO with various script types
+%%% ===================================================================
+
+mempool_utxo_script_types_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             %% P2TR output in mempool
+             P2trScript = <<16#51, 16#20, 0:256>>,
+             Tx = make_tx([{<<5:256>>, 0}],
+                          [{10000, P2trScript}]),
+             Entry = make_entry_with_tx(<<1:256>>, 15.0, Tx),
+             ets:insert(mempool_txs, {<<1:256>>, Entry}),
+             {ok, Utxo} = beamchain_mempool:get_mempool_utxo(<<1:256>>, 0),
+             ?assertEqual(10000, Utxo#utxo.value),
+             ?assertEqual(P2trScript, Utxo#utxo.script_pubkey),
+             ?assertEqual(false, Utxo#utxo.is_coinbase),
+             ?assertEqual(0, Utxo#utxo.height)  %% unconfirmed
+         end]
+     end}.
+
+%%% ===================================================================
+%%% RBF signaling detection
+%%% ===================================================================
+
+rbf_signaling_test() ->
+    %% sequence < 0xfffffffe signals RBF
+    TxRbf = make_tx([{<<1:256>>, 0}], [{1000, p2pkh_script()}]),
+    %% our make_tx helper uses 0xfffffffe, so it's NOT signaling RBF
+    %% (sequence must be < 0xfffffffe to signal)
+    [Input] = TxRbf#transaction.inputs,
+    ?assertEqual(16#fffffffe, Input#tx_in.sequence),
+    %% Modify to signal RBF
+    RbfInput = Input#tx_in{sequence = 16#fffffffd},
+    ?assert(RbfInput#tx_in.sequence < 16#fffffffe),
+    %% Final sequence (0xffffffff) does not signal RBF
+    FinalInput = Input#tx_in{sequence = 16#ffffffff},
+    ?assertNot(FinalInput#tx_in.sequence < 16#fffffffe).
+
+%%% ===================================================================
+%%% Multiple outputs mempool UTXO test
+%%% ===================================================================
+
+mempool_utxo_multiple_outputs_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             P2wsh = <<16#00, 16#20, 0:256>>,
+             OpReturn = <<16#6a, 4, "test">>,
+             Tx = make_tx([{<<5:256>>, 0}],
+                          [{8000, p2pkh_script()},
+                           {4000, p2wpkh_script()},
+                           {2000, P2wsh},
+                           {0, OpReturn}]),
+             Entry = make_entry_with_tx(<<7:256>>, 20.0, Tx),
+             ets:insert(mempool_txs, {<<7:256>>, Entry}),
+             %% Check each output
+             {ok, U0} = beamchain_mempool:get_mempool_utxo(<<7:256>>, 0),
+             ?assertEqual(8000, U0#utxo.value),
+             {ok, U1} = beamchain_mempool:get_mempool_utxo(<<7:256>>, 1),
+             ?assertEqual(4000, U1#utxo.value),
+             {ok, U2} = beamchain_mempool:get_mempool_utxo(<<7:256>>, 2),
+             ?assertEqual(2000, U2#utxo.value),
+             {ok, U3} = beamchain_mempool:get_mempool_utxo(<<7:256>>, 3),
+             ?assertEqual(0, U3#utxo.value),
+             ?assertEqual(OpReturn, U3#utxo.script_pubkey),
+             %% index 4 out of range
+             ?assertEqual(not_found, beamchain_mempool:get_mempool_utxo(<<7:256>>, 4))
+         end]
+     end}.
+
+%%% ===================================================================
+%%% Entry field consistency tests
+%%% ===================================================================
+
+entry_fields_test() ->
+    Entry = make_entry(<<42:256>>, 7.5),
+    ?assertEqual(<<42:256>>, Entry#mempool_entry.txid),
+    ?assertEqual(7.5, Entry#mempool_entry.fee_rate),
+    %% fee = fee_rate * vsize = 7.5 * 200 = 1500
+    ?assertEqual(1500, Entry#mempool_entry.fee),
+    ?assertEqual(200, Entry#mempool_entry.vsize),
+    ?assertEqual(800, Entry#mempool_entry.weight),  %% vsize * 4
+    %% initial ancestor/descendant counts
+    ?assertEqual(1, Entry#mempool_entry.ancestor_count),
+    ?assertEqual(200, Entry#mempool_entry.ancestor_size),
+    ?assertEqual(1500, Entry#mempool_entry.ancestor_fee),
+    ?assertEqual(1, Entry#mempool_entry.descendant_count),
+    ?assertEqual(200, Entry#mempool_entry.descendant_size),
+    ?assertEqual(1500, Entry#mempool_entry.descendant_fee),
+    ?assertEqual(false, Entry#mempool_entry.spends_coinbase),
+    ?assertEqual(true, Entry#mempool_entry.rbf_signaling).
+
+%%% ===================================================================
+%%% Orphan pool ETS tests
+%%% ===================================================================
+
+orphan_pool_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             %% Orphan pool starts empty
+             ?assertEqual(0, ets:info(mempool_orphans, size)),
+             %% Insert an orphan
+             Txid = <<1:256>>,
+             Tx = make_tx([{<<99:256>>, 0}], [{1000, p2pkh_script()}]),
+             Expiry = erlang:system_time(second) + 1200,
+             ets:insert(mempool_orphans, {Txid, Tx, Expiry}),
+             ?assertEqual(1, ets:info(mempool_orphans, size)),
+             %% Can look it up
+             [{Txid, _, _}] = ets:lookup(mempool_orphans, Txid),
+             %% Delete it
+             ets:delete(mempool_orphans, Txid),
+             ?assertEqual(0, ets:info(mempool_orphans, size))
+         end]
+     end}.
+
+%%% ===================================================================
 %%% Test helpers
 %%% ===================================================================
 

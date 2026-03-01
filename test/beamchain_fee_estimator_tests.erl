@@ -231,6 +231,73 @@ full_scenario_test_() ->
      end}.
 
 %%% ===================================================================
+%%% Edge case: empty bucket data
+%%% ===================================================================
+
+empty_bucket_data_test() ->
+    BD = #bucket_data{total = 0.0, in_mempool = 0.0, confirmed = #{}},
+    %% Decay of zero stays at zero
+    Decayed = decay_test_bucket(BD, 0.998),
+    ?assertEqual(0.0, Decayed#bucket_data.total),
+    ?assertEqual(0.0, Decayed#bucket_data.in_mempool),
+    ?assertEqual(#{}, Decayed#bucket_data.confirmed).
+
+%%% ===================================================================
+%%% Success rate edge cases
+%%% ===================================================================
+
+success_rate_all_confirmed_test() ->
+    %% Everything confirmed within 1 block: perfect success rate
+    BD = #bucket_data{
+        total = 100.0,
+        in_mempool = 0.0,
+        confirmed = #{1 => 100.0}
+    },
+    Resolved = BD#bucket_data.total - BD#bucket_data.in_mempool,
+    ConfWithin1 = sum_test_confirmed(1, BD#bucket_data.confirmed),
+    Rate = ConfWithin1 / Resolved,
+    ?assertEqual(1.0, Rate).
+
+success_rate_none_confirmed_test() ->
+    %% Nothing confirmed: 0% success rate
+    BD = #bucket_data{
+        total = 100.0,
+        in_mempool = 100.0,
+        confirmed = #{}
+    },
+    Resolved = BD#bucket_data.total - BD#bucket_data.in_mempool,
+    %% All still in mempool, resolved = 0
+    ?assertEqual(0.0, Resolved).
+
+%%% ===================================================================
+%%% Bucket boundary tests
+%%% ===================================================================
+
+find_bucket_at_boundaries_test() ->
+    Buckets = generate_test_buckets(),
+    %% Fee rate below minimum should be in bucket 0
+    ?assertEqual(0, find_bucket(0.5, Buckets)),
+    ?assertEqual(0, find_bucket(0.001, Buckets)),
+    %% Fee rate exactly at 1.0 (first bucket) should be bucket 0
+    ?assertEqual(0, find_bucket(1.0, Buckets)).
+
+%%% ===================================================================
+%%% Decay preserves relative proportions
+%%% ===================================================================
+
+decay_preserves_ratio_test() ->
+    BD = #bucket_data{
+        total = 200.0,
+        in_mempool = 100.0,
+        confirmed = #{1 => 60.0, 5 => 40.0}
+    },
+    Decayed = decay_test_bucket(BD, 0.998),
+    %% Ratio of in_mempool to total should be preserved
+    OrigRatio = BD#bucket_data.in_mempool / BD#bucket_data.total,
+    NewRatio = Decayed#bucket_data.in_mempool / Decayed#bucket_data.total,
+    ?assert(abs(OrigRatio - NewRatio) < 0.0001).
+
+%%% ===================================================================
 %%% Test helpers — reimplementations of internal functions
 %%% ===================================================================
 
