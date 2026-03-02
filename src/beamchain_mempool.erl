@@ -191,9 +191,11 @@ get_mempool_utxo(Txid, Vout) ->
 init([]) ->
     %% Create ETS tables
     ets:new(?MEMPOOL_TXS, [set, public, named_table,
-                            {read_concurrency, true}]),
+                            {read_concurrency, true},
+                            {write_concurrency, true}]),
     ets:new(?MEMPOOL_BY_FEE, [ordered_set, public, named_table]),
-    ets:new(?MEMPOOL_OUTPOINTS, [set, public, named_table]),
+    ets:new(?MEMPOOL_OUTPOINTS, [set, public, named_table,
+                                  {write_concurrency, true}]),
     ets:new(?MEMPOOL_ORPHANS, [set, public, named_table]),
 
     %% Schedule periodic orphan expiry
