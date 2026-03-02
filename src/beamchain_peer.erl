@@ -133,7 +133,8 @@ init({outbound, {IP, Port} = Addr, Handler, _Opts}) ->
     },
     case gen_tcp:connect(IP, Port,
                          [binary, {active, false}, {packet, raw},
-                          {nodelay, true}, {send_timeout, 5000}],
+                          {nodelay, true}, {send_timeout, 5000},
+                          {recbuf, 262144}, {sndbuf, 262144}],
                          ?CONNECT_TIMEOUT) of
         {ok, Socket} ->
             inet:setopts(Socket, [{active, once}]),
@@ -150,7 +151,8 @@ init({inbound, Socket, Addr, Handler}) ->
     Nonce = generate_nonce(),
     Magic = beamchain_config:magic(),
     MonRef = erlang:monitor(process, Handler),
-    inet:setopts(Socket, [{active, once}]),
+    inet:setopts(Socket, [{active, once},
+                           {recbuf, 262144}, {sndbuf, 262144}]),
     Data = #peer_data{
         socket = Socket,
         address = Addr,
