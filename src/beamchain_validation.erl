@@ -706,15 +706,16 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
         BlockHash = beamchain_serialize:block_hash(Header),
         SkipScripts = AssumeValid =/= <<0:256>> andalso BlockHash =:= AssumeValid,
 
-        %% 4. validate each transaction
+        %% 4. validate each transaction (sequential: UTXO checks)
+        %% Script verification is deferred and run in parallel below.
         [CoinbaseTx | _RegularTxs] = Txs,
-        {TotalFees, AllUndoData, TotalSigopCost} = lists:foldl(
-            fun(Tx, {FeesAcc, UndoAcc, SigopsAcc}) ->
+        {TotalFees, AllUndoData, TotalSigopCost, ScriptJobs} = lists:foldl(
+            fun(Tx, {FeesAcc, UndoAcc, SigopsAcc, JobsAcc}) ->
                 IsCoinbase = is_coinbase_tx(Tx),
                 case IsCoinbase of
                     true ->
                         %% coinbase: no inputs to validate
-                        {FeesAcc, UndoAcc, SigopsAcc};
+                        {FeesAcc, UndoAcc, SigopsAcc, JobsAcc};
                     false ->
                         %% a. verify all inputs exist in UTXO set
                         InputCoins = fetch_input_coins(Tx),
@@ -749,12 +750,10 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
                         NewSigops =< ?MAX_BLOCK_SIGOPS_COST
                             orelse throw(bad_blk_sigops),
 
-                        %% g. verify scripts (unless assumevalid)
-                        case SkipScripts of
-                            true -> ok;
-                            false ->
-                                verify_tx_scripts(Tx, InputCoins, Height,
-                                                  Flags)
+                        %% g. collect script verification job (deferred)
+                        NewJobs = case SkipScripts of
+                            true -> JobsAcc;
+                            false -> [{Tx, InputCoins} | JobsAcc]
                         end,
 
                         Fee = TotalIn - TotalOut,
@@ -763,11 +762,18 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
                              #tx_in{prev_out = #outpoint{hash = H, index = I}}
                              <- Tx#transaction.inputs],
                             InputCoins),
-                        {FeesAcc + Fee, UndoAcc ++ SpentCoins, NewSigops}
+                        {FeesAcc + Fee, UndoAcc ++ SpentCoins, NewSigops,
+                         NewJobs}
                 end
             end,
-            {0, [], 0},
+            {0, [], 0, []},
             Txs),
+
+        %% 4b. verify scripts in parallel (one process per tx)
+        case ScriptJobs of
+            [] -> ok;
+            _ -> verify_scripts_parallel(ScriptJobs, Flags)
+        end,
 
         %% Also count coinbase legacy sigops in the total
         CbSigops = count_legacy_sigops_tx(CoinbaseTx) * ?WITNESS_SCALE_FACTOR,
@@ -904,6 +910,40 @@ verify_tx_scripts(Tx, InputCoins, _Height, Flags) ->
         Idx + 1
     end, 0, lists:zip(Inputs, InputCoins)),
     ok.
+
+%% @doc Verify scripts for multiple transactions in parallel.
+%% Spawns one process per transaction. Each process verifies all inputs.
+%% If any verification fails, throws the error.
+verify_scripts_parallel(Jobs, Flags) ->
+    %% Spawn a worker per transaction
+    Workers = lists:map(fun({Tx, InputCoins}) ->
+        spawn_monitor(fun() ->
+            verify_tx_scripts(Tx, InputCoins, 0, Flags)
+        end)
+    end, Jobs),
+    %% Collect results — all workers must complete normally
+    collect_script_results(Workers).
+
+collect_script_results([]) ->
+    ok;
+collect_script_results([{Pid, Ref} | Rest]) ->
+    receive
+        {'DOWN', Ref, process, Pid, normal} ->
+            collect_script_results(Rest);
+        {'DOWN', Ref, process, Pid, {script_verify_failed, _} = Reason} ->
+            %% Kill remaining workers
+            kill_remaining(Rest),
+            throw(Reason);
+        {'DOWN', Ref, process, Pid, Reason} ->
+            kill_remaining(Rest),
+            throw({script_verify_failed, Reason})
+    end.
+
+kill_remaining([]) -> ok;
+kill_remaining([{Pid, Ref} | Rest]) ->
+    erlang:demonitor(Ref, [flush]),
+    exit(Pid, kill),
+    kill_remaining(Rest).
 
 %% @doc Encode undo data (list of {outpoint, utxo} pairs) to binary.
 encode_undo_data(SpentCoins) ->
