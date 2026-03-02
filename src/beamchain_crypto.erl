@@ -3,6 +3,9 @@
 %% Signature verification (NIF-backed)
 -export([ecdsa_verify/3, schnorr_verify/3]).
 
+%% Cached verification (checks sig cache before calling NIF)
+-export([ecdsa_verify_cached/3, schnorr_verify_cached/3]).
+
 %% Signing (NIF-backed)
 -export([ecdsa_sign/2, schnorr_sign/3, seckey_tweak_add/2]).
 
@@ -114,6 +117,46 @@ schnorr_verify(Msg, Sig, PubKey) when byte_size(Msg) =:= 32,
         true  -> true;
         false -> false;
         {error, _} -> false
+    end.
+
+%%% -------------------------------------------------------------------
+%%% Cached signature verification
+%%%
+%%% Checks the sig cache before hitting the NIF. On cache hit we skip
+%%% the expensive secp256k1 call entirely. On successful verify the
+%%% result is added to the cache for future lookups.
+%%% -------------------------------------------------------------------
+
+-spec ecdsa_verify_cached(Msg :: binary(), Sig :: binary(),
+                          PubKey :: binary()) -> boolean().
+ecdsa_verify_cached(Msg, Sig, PubKey) when byte_size(Msg) =:= 32 ->
+    case beamchain_sig_cache:lookup(Msg, PubKey, Sig) of
+        true -> true;
+        false ->
+            case ecdsa_verify(Msg, Sig, PubKey) of
+                true ->
+                    beamchain_sig_cache:insert(Msg, PubKey, Sig),
+                    true;
+                false ->
+                    false
+            end
+    end.
+
+-spec schnorr_verify_cached(Msg :: binary(), Sig :: binary(),
+                            PubKey :: binary()) -> boolean().
+schnorr_verify_cached(Msg, Sig, PubKey) when byte_size(Msg) =:= 32,
+                                              byte_size(Sig) =:= 64,
+                                              byte_size(PubKey) =:= 32 ->
+    case beamchain_sig_cache:lookup(Msg, PubKey, Sig) of
+        true -> true;
+        false ->
+            case schnorr_verify(Msg, Sig, PubKey) of
+                true ->
+                    beamchain_sig_cache:insert(Msg, PubKey, Sig),
+                    true;
+                false ->
+                    false
+            end
     end.
 
 %%% -------------------------------------------------------------------
