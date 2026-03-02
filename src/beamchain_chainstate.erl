@@ -35,8 +35,9 @@
 -define(CHAIN_META, beamchain_chain_meta).
 
 %% Flush tuning
--define(DEFAULT_MAX_CACHE_MB, 100).
--define(IBD_FLUSH_INTERVAL, 1000).
+-define(DEFAULT_MAX_CACHE_MB, 200).
+-define(IBD_MAX_CACHE_MB, 1024).
+-define(IBD_FLUSH_INTERVAL, 10000).
 
 -record(state, {
     %% Current chain tip
@@ -202,11 +203,17 @@ spend_utxo(Txid, Vout) ->
 
 init([]) ->
     %% Create ETS tables
+    %% UTXO cache: read_concurrency for parallel reads during validation
     ets:new(?UTXO_CACHE, [set, public, named_table,
+                           {read_concurrency, true},
+                           {write_concurrency, true}]),
+    %% Dirty/spent: write_concurrency since many processes update these
+    ets:new(?UTXO_DIRTY, [set, public, named_table,
+                           {write_concurrency, true}]),
+    ets:new(?UTXO_SPENT, [set, public, named_table,
+                           {write_concurrency, true}]),
+    ets:new(?CHAIN_META, [set, public, named_table,
                            {read_concurrency, true}]),
-    ets:new(?UTXO_DIRTY, [set, public, named_table]),
-    ets:new(?UTXO_SPENT, [set, public, named_table]),
-    ets:new(?CHAIN_META, [set, public, named_table]),
 
     %% Load network params
     Network = beamchain_config:network(),
@@ -222,8 +229,10 @@ init([]) ->
     %% Load MTP sliding window (last 11 timestamps)
     MTPTimestamps = load_mtp_timestamps(TipHeight),
 
-    MaxCacheMB = ?DEFAULT_MAX_CACHE_MB,
-    logger:info("chainstate: initialized at height ~B", [TipHeight]),
+    %% Start with large cache for IBD, shrink when caught up
+    MaxCacheMB = ?IBD_MAX_CACHE_MB,
+    logger:info("chainstate: initialized at height ~B (cache ~BMB)",
+                [TipHeight, MaxCacheMB]),
 
     {ok, #state{
         tip_hash = TipHash,
@@ -382,9 +391,15 @@ maybe_check_ibd(#state{ibd = true, mtp_timestamps = Ts} = State) ->
     Now = erlang:system_time(second),
     case (Now - Latest) < 3600 of
         true ->
-            logger:info("chainstate: leaving IBD at height ~B",
-                        [State#state.tip_height]),
-            State#state{ibd = false};
+            logger:info("chainstate: leaving IBD at height ~B, "
+                        "shrinking cache to ~BMB",
+                        [State#state.tip_height, ?DEFAULT_MAX_CACHE_MB]),
+            %% Flush and shrink cache for normal operation
+            State2 = do_flush(State),
+            State2#state{
+                ibd = false,
+                max_cache_bytes = ?DEFAULT_MAX_CACHE_MB * 1024 * 1024
+            };
         false ->
             State
     end;
