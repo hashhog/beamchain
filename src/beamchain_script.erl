@@ -2001,9 +2001,21 @@ check_hash_type(HT) ->
                     non_neg_integer(), term()) -> boolean().
 verify_script(ScriptSig, ScriptPubKey, Witness, Flags, SigChecker) ->
     try
-        do_verify_script(ScriptSig, ScriptPubKey, Witness, Flags, SigChecker)
+        Result = do_verify_script(ScriptSig, ScriptPubKey, Witness, Flags, SigChecker),
+        case Result of
+            false ->
+                logger:error("verify_script returned false for ~s",
+                             [binary:encode_hex(ScriptPubKey)]);
+            _ -> ok
+        end,
+        Result
     catch
-        _:_ -> false
+        Class:Reason:Stack ->
+            logger:error("verify_script exception: ~p:~p stack=~p "
+                         "scriptPubKey=~s",
+                         [Class, Reason, lists:sublist(Stack, 3),
+                          binary:encode_hex(ScriptPubKey)]),
+            false
     end.
 
 do_verify_script(ScriptSig, ScriptPubKey, Witness, Flags, SigChecker) ->
@@ -2023,6 +2035,7 @@ do_verify_script(ScriptSig, ScriptPubKey, Witness, Flags, SigChecker) ->
             %% Step 2: Execute ScriptPubKey with resulting stack
             case eval_script(ScriptPubKey, Stack1, Flags, SigChecker, base) of
                 {ok, []} ->
+                    logger:debug("verify: scriptPubKey left empty stack"),
                     false;
                 {ok, Stack2} ->
                     [Top | _] = Stack2,
@@ -2074,11 +2087,16 @@ do_verify_script(ScriptSig, ScriptPubKey, Witness, Flags, SigChecker) ->
                                         false ->
                                             true
                                     end;
-                                {error, _} ->
+                                {error, WE} ->
+                                    logger:error("verify: witness error=~p "
+                                                 "scriptPubKey=~s",
+                                                 [WE, binary:encode_hex(ScriptPubKey)]),
                                     false
                             end
                     end;
-                {error, _} ->
+                {error, SPKErr} ->
+                    logger:error("verify: scriptPubKey eval error=~p",
+                                 [SPKErr]),
                     false
             end;
         {error, _} ->
@@ -2106,8 +2124,13 @@ verify_witness_program(0, Program, Witness, Flags, SigChecker)
                         true -> {ok, [Top]};
                         false -> {error, witness_program_failed}
                     end;
-                {ok, _} -> {error, witness_cleanstack};
-                {error, _} = E -> E
+                {ok, S} ->
+                    logger:error("P2WPKH: unexpected stack len=~B", [length(S)]),
+                    {error, witness_cleanstack};
+                {error, E} ->
+                    logger:error("P2WPKH eval failed: ~p pubkey=~s",
+                                 [E, binary:encode_hex(PubKey)]),
+                    {error, E}
             end;
         _ ->
             {error, witness_program_mismatch}
