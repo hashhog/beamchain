@@ -344,7 +344,7 @@ do_connect_block(#block{header = Header} = Block,
               chainwork => <<0:256>>, status => 2};
         false ->
             case beamchain_db:get_block_index(TipHeight) of
-                {ok, PI} -> PI#{height => TipHeight};
+                {ok, PI} -> PI;
                 not_found -> error({missing_prev_index, TipHeight})
             end
     end,

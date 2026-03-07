@@ -205,7 +205,7 @@ do_create_template(CoinbaseScriptPubKey, _Opts,
 
 get_prev_index(TipHeight) ->
     case beamchain_db:get_block_index(TipHeight) of
-        {ok, PI} -> PI#{height => TipHeight};
+        {ok, PI} -> PI;
         not_found -> error({missing_block_index, TipHeight})
     end.
 

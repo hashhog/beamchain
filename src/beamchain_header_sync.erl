@@ -231,8 +231,17 @@ pick_sync_peer_and_start(#state{peer_heights = PeerHeights,
             },
             send_getheaders(State2);
         none ->
-            logger:debug("header_sync: no suitable peer to sync from"),
-            State#state{status = idle}
+            %% No peer ahead of us. If we have any peers, we're caught up.
+            case maps:size(PeerHeights) > 0 andalso TipHeight > 0 of
+                true ->
+                    logger:info("header_sync: already at tip ~B, marking complete",
+                                [TipHeight]),
+                    beamchain_sync:notify_headers_complete(TipHeight),
+                    State#state{status = complete, sync_peer = undefined};
+                false ->
+                    logger:debug("header_sync: no suitable peer to sync from"),
+                    State#state{status = idle}
+            end
     end.
 
 %% Select the connected peer with the most work (highest announced height).
@@ -274,10 +283,11 @@ send_getheaders(#state{sync_peer = Peer, tip_height = TipHeight,
 %% [tip, tip-1, tip-2, tip-4, tip-8, ..., genesis]
 -spec build_block_locator(integer(), binary()) -> [binary()].
 build_block_locator(Height, _TipHash) when Height < 0 ->
-    %% No headers at all, use genesis
+    %% No headers at all, use genesis hash in internal byte order
     Network = beamchain_config:network(),
     Params = beamchain_chain_params:params(Network),
-    [maps:get(genesis_hash, Params)];
+    Genesis = maps:get(genesis_block, Params),
+    [beamchain_serialize:block_hash(Genesis#block.header)];
 build_block_locator(Height, TipHash) ->
     build_locator_hashes(Height, TipHash, 1, []).
 
@@ -437,7 +447,7 @@ validate_one_header(Header, #state{tip_height = TipHeight,
                                              NewCW, 1),
 
         %% 10. Update chain tip in DB
-        ok = beamchain_db:set_chain_tip(BlockHash, NewHeight),
+        ok = beamchain_db:set_header_tip(BlockHash, NewHeight),
 
         %% 11. Update MTP window
         NewMTPWindow = update_mtp_window(MTPWindow, NewHeight,
@@ -506,7 +516,9 @@ check_checkpoint(Height, BlockHash, Params) ->
     Checkpoints = maps:get(checkpoints, Params, #{}),
     case maps:find(Height, Checkpoints) of
         {ok, ExpectedHash} ->
-            case BlockHash =:= ExpectedHash of
+            %% Config checkpoint hashes are in display byte order,
+            %% but BlockHash is in internal byte order. Reverse to compare.
+            case BlockHash =:= beamchain_serialize:reverse_bytes(ExpectedHash) of
                 true -> ok;
                 false -> throw(checkpoint_mismatch)
             end;
@@ -529,7 +541,7 @@ check_bip94(Height, Header, #state{params = Params} = State) ->
                 true ->
                     PrevHeader = prev_header(State),
                     Header#block_header.timestamp >=
-                        PrevHeader#block_header.timestamp
+                        PrevHeader#block_header.timestamp - 600
                         orelse throw(bip94_timestamp);
                 false ->
                     ok
@@ -545,7 +557,7 @@ check_bip94(Height, Header, #state{params = Params} = State) ->
 %% Load the current chain tip from the database.
 %% Returns {Height, Hash, Chainwork, MTPWindow}.
 load_chain_tip(Params) ->
-    case beamchain_db:get_chain_tip() of
+    case beamchain_db:get_header_tip() of
         {ok, #{hash := Hash, height := Height}} ->
             %% Load the chainwork from block_index
             Chainwork = case beamchain_db:get_block_index(Height) of
@@ -562,12 +574,14 @@ load_chain_tip(Params) ->
 %% Initialize the block index with the genesis block.
 init_genesis(Params) ->
     Genesis = maps:get(genesis_block, Params),
-    GenesisHash = maps:get(genesis_hash, Params),
     GenesisHeader = Genesis#block.header,
+    %% Compute the hash from the header (internal byte order) rather than
+    %% using the config's genesis_hash which is in display byte order.
+    GenesisHash = beamchain_serialize:block_hash(GenesisHeader),
     GenesisWork = beamchain_pow:compute_work(GenesisHeader#block_header.bits),
     CW = chainwork_to_binary(GenesisWork),
     ok = beamchain_db:store_block_index(0, GenesisHash, GenesisHeader, CW, 1),
-    ok = beamchain_db:set_chain_tip(GenesisHash, 0),
+    ok = beamchain_db:set_header_tip(GenesisHash, 0),
     MTPWindow = [{0, GenesisHeader#block_header.timestamp}],
     {0, GenesisHash, CW, MTPWindow}.
 

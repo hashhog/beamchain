@@ -15,8 +15,11 @@
 %% Block index
 -export([store_block_index/5, get_block_index/1, get_block_index_by_hash/1]).
 
-%% Chain tip
+%% Chain tip (fully validated blocks)
 -export([get_chain_tip/0, set_chain_tip/2]).
+
+%% Header tip (headers-only sync progress)
+-export([get_header_tip/0, set_header_tip/2]).
 
 %% Transaction index
 -export([store_tx_index/4, get_tx_location/1]).
@@ -135,7 +138,17 @@ get_chain_tip() ->
 %% @doc Set the chain tip
 -spec set_chain_tip(binary(), non_neg_integer()) -> ok.
 set_chain_tip(Hash, Height) when byte_size(Hash) =:= 32 ->
-    gen_server:call(?SERVER, {set_chain_tip, Hash, Height}).
+    gen_server:call(?SERVER, {set_chain_tip, Hash, Height}, 30000).
+
+%% @doc Get the current header tip (headers-only sync progress)
+-spec get_header_tip() -> {ok, #{hash => binary(), height => integer()}} | not_found.
+get_header_tip() ->
+    gen_server:call(?SERVER, get_header_tip).
+
+%% @doc Set the header tip
+-spec set_header_tip(binary(), non_neg_integer()) -> ok.
+set_header_tip(Hash, Height) when byte_size(Hash) =:= 32 ->
+    gen_server:call(?SERVER, {set_header_tip, Hash, Height}).
 
 %% @doc Store transaction index entry
 -spec store_tx_index(binary(), binary(), non_neg_integer(),
@@ -231,16 +244,13 @@ init([]) ->
     end.
 
 %% Block storage
-handle_call({store_block, Block, Height}, _From,
-            #state{db_handle = Db, cf_blocks = CF,
-                   cf_block_idx = IdxCF} = State) ->
+handle_call({store_block, Block, _Height}, _From,
+            #state{db_handle = Db, cf_blocks = CF} = State) ->
     Hash = block_hash(Block),
     BlockBin = beamchain_serialize:encode_block(Block),
-    %% Store block data keyed by hash
+    %% Store block data keyed by hash only.
+    %% Height→hash mapping is handled by store_block_index.
     Result = rocksdb:put(Db, CF, Hash, BlockBin, []),
-    %% Store height -> hash in block_index for height lookup
-    HeightKey = encode_height(Height),
-    rocksdb:put(Db, IdxCF, HeightKey, Hash, []),
     {reply, Result, State};
 
 handle_call({get_block, Hash}, _From,
@@ -261,7 +271,10 @@ handle_call({get_block_by_height, Height}, _From,
                    cf_block_idx = IdxCF} = State) ->
     HeightKey = encode_height(Height),
     Result = case rocksdb:get(Db, IdxCF, HeightKey, []) of
-        {ok, Hash} ->
+        {ok, Bin} ->
+            %% Block index entries contain: hash(32) | header(80) | ...
+            %% Extract the hash from the first 32 bytes
+            <<Hash:32/binary, _/binary>> = Bin,
             case rocksdb:get(Db, BlocksCF, Hash, []) of
                 {ok, BlockBin} ->
                     {Block, <<>>} = beamchain_serialize:decode_block(BlockBin),
@@ -338,7 +351,8 @@ handle_call({get_block_index, Height}, _From,
     HeightKey = encode_height(Height),
     Result = case rocksdb:get(Db, CF, HeightKey, []) of
         {ok, Bin} ->
-            {ok, decode_block_index_entry(Bin)};
+            Entry = decode_block_index_entry(Bin),
+            {ok, Entry#{height => Height}};
         not_found ->
             not_found
     end,
@@ -378,6 +392,23 @@ handle_call({set_chain_tip, Hash, Height}, _From,
             #state{db_handle = Db, cf_meta = CF} = State) ->
     Value = <<Hash:32/binary, Height:64/big>>,
     Result = rocksdb:put(Db, CF, <<"chain_tip">>, Value, []),
+    {reply, Result, State};
+
+%% Header tip metadata
+handle_call(get_header_tip, _From,
+            #state{db_handle = Db, cf_meta = CF} = State) ->
+    Result = case rocksdb:get(Db, CF, <<"header_tip">>, []) of
+        {ok, <<Hash:32/binary, Height:64/big>>} ->
+            {ok, #{hash => Hash, height => Height}};
+        not_found ->
+            not_found
+    end,
+    {reply, Result, State};
+
+handle_call({set_header_tip, Hash, Height}, _From,
+            #state{db_handle = Db, cf_meta = CF} = State) ->
+    Value = <<Hash:32/binary, Height:64/big>>,
+    Result = rocksdb:put(Db, CF, <<"header_tip">>, Value, []),
     {reply, Result, State};
 
 %% Transaction index
