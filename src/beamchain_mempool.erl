@@ -598,12 +598,13 @@ classify_output(_) ->
 verify_scripts(Tx, InputCoins) ->
     Flags = all_standard_flags(),
     Inputs = Tx#transaction.inputs,
+    AllPrevOuts = [{C#utxo.value, C#utxo.script_pubkey} || C <- InputCoins],
     lists:foldl(fun({Input, Coin}, Idx) ->
         ScriptSig = Input#tx_in.script_sig,
         ScriptPubKey = Coin#utxo.script_pubkey,
         Witness = Input#tx_in.witness,
         Amount = Coin#utxo.value,
-        SigChecker = {Tx, Idx, Amount},
+        SigChecker = {Tx, Idx, Amount, AllPrevOuts},
         case beamchain_script:verify_script(
                 ScriptSig, ScriptPubKey, Witness, Flags, SigChecker) of
             true -> ok;
