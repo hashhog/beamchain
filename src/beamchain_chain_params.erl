@@ -146,6 +146,7 @@ params(testnet4) ->
         taproot_height => 1,
 
         min_chainwork => <<0:256>>,
+        %% Disabled — verify all scripts during sync
         assume_valid => <<0:256>>,
         checkpoints => #{},
 

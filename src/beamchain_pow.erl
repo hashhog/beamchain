@@ -157,7 +157,13 @@ calculate_retarget(PrevIndex, Params) ->
     ActualTimespan = min(TargetTimespan * 4, ActualTimespan1),
 
     %% new_target = old_target * actual_timespan / target_timespan
-    OldTarget = bits_to_target(PrevHeader#block_header.bits),
+    %% BIP94 (testnet4): use the first block of the period's bits for OldTarget
+    %% because the first block cannot use the min-difficulty exception.
+    IsBIP94 = maps:get(network, Params, mainnet) =:= testnet4,
+    OldTarget = case IsBIP94 of
+        true  -> bits_to_target(FirstHeader#block_header.bits);
+        false -> bits_to_target(PrevHeader#block_header.bits)
+    end,
     NewTarget0 = (OldTarget * ActualTimespan) div TargetTimespan,
 
     %% clamp to pow_limit

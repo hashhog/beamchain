@@ -85,7 +85,8 @@
 -spec connect({inet:ip_address(), inet:port_number()}, pid(), map()) ->
     {ok, pid()} | {error, term()}.
 connect(Address, Handler, Opts) ->
-    gen_statem:start_link(?MODULE, {outbound, Address, Handler, Opts}, []).
+    %% Use start (not start_link) so connection failures don't crash the caller
+    gen_statem:start(?MODULE, {outbound, Address, Handler, Opts}, []).
 
 %% @doc Accept an inbound peer connection on an existing socket.
 -spec accept(gen_tcp:socket(), {inet:ip_address(), inet:port_number()}, pid()) ->
@@ -171,7 +172,13 @@ init({inbound, Socket, Addr, Handler}) ->
 %%% -------------------------------------------------------------------
 
 connecting(enter, _OldState, _Data) ->
-    {keep_state_and_data, [{next_event, internal, send_version}]};
+    %% Cannot use next_event from enter callbacks in state_enter mode.
+    %% Use state_timeout with 0ms to trigger immediately.
+    {keep_state_and_data, [{state_timeout, 0, send_version}]};
+
+connecting(state_timeout, send_version, Data) ->
+    Data2 = do_send_version(Data),
+    {next_state, handshaking, Data2};
 
 connecting(internal, send_version, Data) ->
     Data2 = do_send_version(Data),
