@@ -37,7 +37,7 @@
 %% Flush tuning
 -define(DEFAULT_MAX_CACHE_MB, 200).
 -define(IBD_MAX_CACHE_MB, 1024).
--define(IBD_FLUSH_INTERVAL, 10000).
+-define(IBD_FLUSH_INTERVAL, 2000).
 
 -record(state, {
     %% Current chain tip
@@ -90,7 +90,7 @@ is_synced() ->
 %% Validates the block, updates UTXOs, and advances the tip.
 -spec connect_block(#block{}) -> ok | {error, term()}.
 connect_block(Block) ->
-    gen_server:call(?SERVER, {connect_block, Block}, 60000).
+    gen_server:call(?SERVER, {connect_block, Block}, 300000).
 
 %% @doc Disconnect the current tip block.
 %% Restores spent UTXOs from undo data and moves the tip back one.

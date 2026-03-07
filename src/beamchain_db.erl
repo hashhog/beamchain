@@ -72,7 +72,7 @@ stop() ->
 %% @doc Store a block with its height
 -spec store_block(#block{}, non_neg_integer()) -> ok | {error, term()}.
 store_block(Block, Height) ->
-    gen_server:call(?SERVER, {store_block, Block, Height}).
+    gen_server:call(?SERVER, {store_block, Block, Height}, 30000).
 
 %% @doc Get a block by hash
 -spec get_block(binary()) -> {ok, #block{}} | not_found.
@@ -114,21 +114,21 @@ has_utxo(Txid, Vout) when byte_size(Txid) =:= 32 ->
                         binary(), integer()) -> ok.
 store_block_index(Height, Hash, Header, Chainwork, Status) ->
     gen_server:call(?SERVER, {store_block_index, Height, Hash, Header,
-                              Chainwork, Status}).
+                              Chainwork, Status}, 30000).
 
 %% @doc Get block index by height
 -spec get_block_index(non_neg_integer()) ->
     {ok, #{hash => binary(), header => #block_header{},
            chainwork => binary(), status => integer()}} | not_found.
 get_block_index(Height) ->
-    gen_server:call(?SERVER, {get_block_index, Height}).
+    gen_server:call(?SERVER, {get_block_index, Height}, 30000).
 
 %% @doc Get block index by hash (reverse lookup)
 -spec get_block_index_by_hash(binary()) ->
     {ok, #{height => integer(), header => #block_header{},
            chainwork => binary(), status => integer()}} | not_found.
 get_block_index_by_hash(Hash) when byte_size(Hash) =:= 32 ->
-    gen_server:call(?SERVER, {get_block_index_by_hash, Hash}).
+    gen_server:call(?SERVER, {get_block_index_by_hash, Hash}, 30000).
 
 %% @doc Get the current chain tip
 -spec get_chain_tip() -> {ok, #{hash => binary(), height => integer()}} | not_found.
@@ -154,7 +154,7 @@ set_header_tip(Hash, Height) when byte_size(Hash) =:= 32 ->
 -spec store_tx_index(binary(), binary(), non_neg_integer(),
                      non_neg_integer()) -> ok.
 store_tx_index(Txid, BlockHash, Height, Position) ->
-    gen_server:call(?SERVER, {store_tx_index, Txid, BlockHash, Height, Position}).
+    gen_server:call(?SERVER, {store_tx_index, Txid, BlockHash, Height, Position}, 30000).
 
 %% @doc Get transaction location (which block, height, position)
 -spec get_tx_location(binary()) ->
@@ -178,17 +178,17 @@ get_undo(BlockHash) when byte_size(BlockHash) =:= 32 ->
 %% CF is one of: blocks, block_index, chainstate, tx_index, meta, undo
 -spec write_batch([tuple()]) -> ok | {error, term()}.
 write_batch(Ops) ->
-    gen_server:call(?SERVER, {write_batch, Ops}).
+    gen_server:call(?SERVER, {write_batch, Ops}, infinity).
 
 %% @doc Get a value from the meta column family
 -spec get_meta(binary()) -> {ok, binary()} | not_found.
 get_meta(Key) when is_binary(Key) ->
-    gen_server:call(?SERVER, {get_meta, Key}).
+    gen_server:call(?SERVER, {get_meta, Key}, 30000).
 
 %% @doc Put a value in the meta column family
 -spec put_meta(binary(), binary()) -> ok.
 put_meta(Key, Value) when is_binary(Key), is_binary(Value) ->
-    gen_server:call(?SERVER, {put_meta, Key, Value}).
+    gen_server:call(?SERVER, {put_meta, Key, Value}, 60000).
 
 %% @doc Get database statistics
 -spec get_db_stats() -> map().

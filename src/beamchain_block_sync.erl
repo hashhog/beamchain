@@ -36,15 +36,18 @@
 -define(MAX_PER_PEER, 16).
 
 %% Stall detection
--define(INITIAL_TIMEOUT_MS, 5000).
--define(MAX_TIMEOUT_MS, 64000).
--define(STALL_CHECK_INTERVAL, 5000).
+-define(INITIAL_TIMEOUT_MS, 30000).
+-define(MAX_TIMEOUT_MS, 120000).
+-define(STALL_CHECK_INTERVAL, 15000).
 
 %% UTXO batch flush every N blocks during IBD
 -define(UTXO_FLUSH_INTERVAL, 1000).
 
 %% Memory cap: max blocks downloaded ahead of validation
 -define(MAX_DOWNLOADED_AHEAD, 1000).
+
+%% Max blocks to validate per gen_server iteration (yield to process messages)
+-define(MAX_VALIDATE_BATCH, 50).
 
 %% Progress reporting interval
 -define(PROGRESS_INTERVAL, 1000).
@@ -161,7 +164,12 @@ get_status() ->
 init([]) ->
     Network = beamchain_config:network(),
     Params = beamchain_chain_params:params(Network),
-    AssumeValid = maps:get(assume_valid, Params, <<0:256>>),
+    AssumeValidDisplay = maps:get(assume_valid, Params, <<0:256>>),
+    %% Convert from display byte order to internal byte order
+    AssumeValid = case AssumeValidDisplay of
+        <<0:256>> -> <<0:256>>;
+        _ -> beamchain_serialize:reverse_bytes(AssumeValidDisplay)
+    end,
     %% Cache the height of the assumevalid block
     AVHeight = lookup_assume_valid_height(AssumeValid),
     {ok, #state{params = Params, assume_valid = AssumeValid,
@@ -308,6 +316,12 @@ handle_info(progress_tick, #state{status = syncing} = State) ->
 handle_info(progress_tick, State) ->
     {noreply, State#state{progress_timer = undefined}};
 
+handle_info(continue_validation, #state{status = syncing} = State) ->
+    %% Continue validating downloaded blocks after yielding
+    State2 = validate_sequential(State),
+    State3 = fill_pipeline(State2),
+    {noreply, State3};
+
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -320,26 +334,13 @@ terminate(_Reason, State) ->
 %%% ===================================================================
 
 %% Find the height to start downloading from.
-%% Look at block_index status: status=2 means fully validated,
-%% status=1 means headers-only.
+%% Use the chainstate tip (last connected block) as the authoritative source.
 find_start_height() ->
-    case beamchain_db:get_chain_tip() of
-        {ok, #{height := TipHeight}} ->
-            %% Walk back to find the last fully validated block
-            find_last_validated(TipHeight);
-        not_found ->
-            0
-    end.
-
-find_last_validated(Height) when Height =< 0 ->
-    0;
-find_last_validated(Height) ->
-    case beamchain_db:get_block_index(Height) of
-        {ok, #{status := 2}} ->
-            %% This block is fully validated, start after it
-            Height + 1;
+    case beamchain_chainstate:get_tip() of
+        {ok, {_Hash, TipHeight}} when TipHeight >= 0 ->
+            TipHeight + 1;
         _ ->
-            find_last_validated(Height - 1)
+            0
     end.
 
 %% Gather currently connected peers from peer_manager.
@@ -456,7 +457,7 @@ request_batch(Peer, BatchSize,
                 fun(Height, {ItemsAcc, IFAcc, H2HAcc, SkipAcc}) ->
                     case beamchain_db:get_block_index(Height) of
                         {ok, #{hash := Hash}} ->
-                            Item = {?MSG_WITNESS_BLOCK, Hash},
+                            Item = #{type => ?MSG_WITNESS_BLOCK, hash => Hash},
                             IF = maps:put(Height, {Peer, Now, Hash}, IFAcc),
                             H2HNew = maps:put(Hash, Height, H2HAcc),
                             {[Item | ItemsAcc], IF, H2HNew, SkipAcc};
@@ -572,8 +573,18 @@ update_peer_block_received(Peer, ResponseMs, AllStats) ->
     maps:put(Peer, Stats2, AllStats).
 
 %% Validate blocks sequentially starting from next_to_validate.
+%% Limits to MAX_VALIDATE_BATCH blocks per call to avoid blocking
+%% the gen_server loop (which would prevent stall checks and new blocks).
+validate_sequential(State) ->
+    validate_sequential(State, ?MAX_VALIDATE_BATCH).
+
+validate_sequential(State, 0) ->
+    %% Batch limit reached — schedule continuation to yield to gen_server.
+    %% Refresh in-flight timestamps so validation time isn't counted as stall.
+    self() ! continue_validation,
+    refresh_in_flight_timestamps(State);
 validate_sequential(#state{next_to_validate = NextH,
-                            downloaded = Downloaded} = State) ->
+                            downloaded = Downloaded} = State, Remaining) ->
     case maps:find(NextH, Downloaded) of
         {ok, Block} ->
             case validate_and_connect(NextH, Block, State) of
@@ -586,7 +597,7 @@ validate_sequential(#state{next_to_validate = NextH,
                         blocks_validated = State2#state.blocks_validated + 1
                     },
                     %% Continue validating the next one
-                    validate_sequential(State3);
+                    validate_sequential(State3, Remaining - 1);
                 {error, Reason} ->
                     logger:error("block_sync: validation failed at height ~B: ~p",
                                  [NextH, Reason]),
@@ -639,7 +650,7 @@ validate_and_connect(Height, Block,
         %% 6. Log checkpoint every UTXO_FLUSH_INTERVAL blocks
         SkipScripts = AssumeValid =/= <<0:256>> andalso
                       AVHeight > 0 andalso Height =< AVHeight,
-        case Height rem ?UTXO_FLUSH_INTERVAL =:= 0 of
+        case Height rem 1000 =:= 0 of
             true ->
                 logger:info("block_sync: checkpoint at height ~B "
                             "(~s scripts)",
@@ -655,6 +666,10 @@ validate_and_connect(Height, Block,
         {ok, State}
     catch
         throw:Reason -> {error, Reason};
+        exit:Reason ->
+            logger:error("block_sync: exit at height ~B: ~p",
+                         [Height, Reason]),
+            {error, Reason};
         error:Reason:Stack ->
             logger:error("block_sync: error at height ~B: ~p~n~p",
                          [Height, Reason, Stack]),
@@ -678,6 +693,15 @@ store_tx_index(#block{header = Header, transactions = Txs}, Height) ->
         beamchain_db:store_tx_index(Txid, BlockHash, Height, Pos),
         Pos + 1
     end, 0, Txs).
+
+%% Reset in-flight request timestamps so validation time isn't counted
+%% as network stall time. Called after a batch of validation completes.
+refresh_in_flight_timestamps(#state{in_flight = InFlight} = State) ->
+    Now = erlang:monotonic_time(millisecond),
+    InFlight2 = maps:map(fun(_Height, {Peer, _OldTime, Hash}) ->
+        {Peer, Now, Hash}
+    end, InFlight),
+    State#state{in_flight = InFlight2}.
 
 %%% ===================================================================
 %%% Internal: stall detection
