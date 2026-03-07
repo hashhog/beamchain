@@ -2603,33 +2603,20 @@ flags_for_height(Height, mainnet) ->
         true -> F5 bor ?SCRIPT_VERIFY_TAPROOT;
         false -> F5
     end,
-    %% always-on flags (after respective activations are well past)
-    F6 bor ?SCRIPT_VERIFY_STRICTENC
-       bor ?SCRIPT_VERIFY_MINIMALDATA
-       bor ?SCRIPT_VERIFY_NULLDUMMY
-       bor ?SCRIPT_VERIFY_LOW_S
-       bor ?SCRIPT_VERIFY_CLEANSTACK
-       bor ?SCRIPT_VERIFY_NULLFAIL
-       bor ?SCRIPT_VERIFY_MINIMALIF
-       bor ?SCRIPT_VERIFY_WITNESS_PUBKEYTYPE
-       bor ?SCRIPT_VERIFY_CONST_SCRIPTCODE
-       bor ?SCRIPT_VERIFY_SIGPUSHONLY;
+    %% NULLDUMMY is consensus since segwit activation
+    case Height >= 481824 of
+        true -> F6 bor ?SCRIPT_VERIFY_NULLDUMMY;
+        false -> F6
+    end;
 
 flags_for_height(_Height, _Network) ->
-    %% testnet/regtest: all flags active
+    %% testnet/regtest: all consensus flags active from genesis
+    %% Only consensus flags here — policy flags (CLEANSTACK, SIGPUSHONLY,
+    %% LOW_S, STRICTENC, MINIMALDATA, etc.) are NOT consensus.
     ?SCRIPT_VERIFY_P2SH
     bor ?SCRIPT_VERIFY_DERSIG
     bor ?SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY
     bor ?SCRIPT_VERIFY_CHECKSEQUENCEVERIFY
     bor ?SCRIPT_VERIFY_WITNESS
-    bor ?SCRIPT_VERIFY_TAPROOT
-    bor ?SCRIPT_VERIFY_STRICTENC
-    bor ?SCRIPT_VERIFY_MINIMALDATA
     bor ?SCRIPT_VERIFY_NULLDUMMY
-    bor ?SCRIPT_VERIFY_LOW_S
-    bor ?SCRIPT_VERIFY_CLEANSTACK
-    bor ?SCRIPT_VERIFY_NULLFAIL
-    bor ?SCRIPT_VERIFY_MINIMALIF
-    bor ?SCRIPT_VERIFY_WITNESS_PUBKEYTYPE
-    bor ?SCRIPT_VERIFY_CONST_SCRIPTCODE
-    bor ?SCRIPT_VERIFY_SIGPUSHONLY.
+    bor ?SCRIPT_VERIFY_TAPROOT.
