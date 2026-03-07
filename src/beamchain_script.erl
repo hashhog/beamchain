@@ -1868,35 +1868,126 @@ pop_n(N, State) when N > 0 ->
 
 check_ecdsa_sig(#{check_ecdsa_sig := Fun}, Sig, PubKey, SigHash) ->
     Fun(Sig, PubKey, SigHash);
+check_ecdsa_sig({_Tx, _Idx, _Amt, _PrevOuts}, Sig, PubKey, SigHash) ->
+    beamchain_crypto:ecdsa_verify_cached(SigHash, Sig, PubKey);
+check_ecdsa_sig({_Tx, _Idx, _Amt}, Sig, PubKey, SigHash) ->
+    beamchain_crypto:ecdsa_verify_cached(SigHash, Sig, PubKey);
 check_ecdsa_sig(_, _Sig, _PubKey, _SigHash) ->
     false.
 
 check_schnorr_sig(#{check_schnorr_sig := Fun}, Sig, PubKey, SigHash) ->
     Fun(Sig, PubKey, SigHash);
+check_schnorr_sig({_Tx, _Idx, _Amt, _PrevOuts}, Sig, PubKey, SigHash) ->
+    beamchain_crypto:schnorr_verify_cached(SigHash, Sig, PubKey);
+check_schnorr_sig({_Tx, _Idx, _Amt}, Sig, PubKey, SigHash) ->
+    beamchain_crypto:schnorr_verify_cached(SigHash, Sig, PubKey);
 check_schnorr_sig(_, _Sig, _PubKey, _SigHash) ->
     false.
 
 check_locktime(#{check_locktime := Fun}, LockTime) ->
     Fun(LockTime);
+check_locktime({Tx, InputIndex, _Amt, _PrevOuts}, LockTime) ->
+    check_locktime_impl(Tx, InputIndex, LockTime);
+check_locktime({Tx, InputIndex, _Amt}, LockTime) ->
+    check_locktime_impl(Tx, InputIndex, LockTime);
 check_locktime(_, _LockTime) ->
     false.
 
+check_locktime_impl(Tx, InputIndex, LockTime) ->
+    TxLockTime = Tx#transaction.locktime,
+    %% Locktime type must match (both height or both time)
+    SameType = (LockTime < ?LOCKTIME_THRESHOLD andalso TxLockTime < ?LOCKTIME_THRESHOLD) orelse
+               (LockTime >= ?LOCKTIME_THRESHOLD andalso TxLockTime >= ?LOCKTIME_THRESHOLD),
+    case SameType of
+        false -> false;
+        true ->
+            case LockTime > TxLockTime of
+                true -> false;
+                false ->
+                    %% nSequence must not be 0xffffffff (which disables locktime)
+                    Input = lists:nth(InputIndex + 1, Tx#transaction.inputs),
+                    Input#tx_in.sequence =/= 16#ffffffff
+            end
+    end.
+
 check_sequence(#{check_sequence := Fun}, Sequence) ->
     Fun(Sequence);
+check_sequence({Tx, InputIndex, _Amt, _PrevOuts}, Sequence) ->
+    check_sequence_impl(Tx, InputIndex, Sequence);
+check_sequence({Tx, InputIndex, _Amt}, Sequence) ->
+    check_sequence_impl(Tx, InputIndex, Sequence);
 check_sequence(_, _Sequence) ->
     false.
 
-compute_sig_hash(#script_state{sig_checker = Checker}, HashType, CodeSepPos) ->
-    case Checker of
-        #{compute_sighash := Fun} -> Fun(HashType, CodeSepPos);
-        _ -> <<0:256>>
+check_sequence_impl(Tx, InputIndex, Sequence) ->
+    %% BIP 112: tx version must be >= 2
+    case Tx#transaction.version < 2 of
+        true -> false;
+        false ->
+            Input = lists:nth(InputIndex + 1, Tx#transaction.inputs),
+            TxSeq = Input#tx_in.sequence,
+            %% Input sequence disable flag must NOT be set
+            case (TxSeq band ?SEQUENCE_LOCKTIME_DISABLE_FLAG) =/= 0 of
+                true -> false;
+                false ->
+                    %% Type flags must match
+                    SeqType = Sequence band ?SEQUENCE_LOCKTIME_TYPE_FLAG,
+                    TxType = TxSeq band ?SEQUENCE_LOCKTIME_TYPE_FLAG,
+                    case SeqType =:= TxType of
+                        false -> false;
+                        true ->
+                            %% Compare masked values
+                            SeqVal = Sequence band ?SEQUENCE_LOCKTIME_MASK,
+                            TxVal = TxSeq band ?SEQUENCE_LOCKTIME_MASK,
+                            SeqVal =< TxVal
+                    end
+            end
     end.
 
-compute_taproot_sig_hash(#script_state{sig_checker = Checker}, HashType, CodeSepPos) ->
-    case Checker of
-        #{compute_taproot_sighash := Fun} -> Fun(HashType, CodeSepPos);
-        _ -> <<0:256>>
-    end.
+compute_sig_hash(#script_state{sig_checker = #{compute_sighash := Fun}},
+                 HashType, CodeSepPos) ->
+    Fun(HashType, CodeSepPos);
+compute_sig_hash(#script_state{sig_checker = {Tx, InputIndex, Amount, _PrevOuts},
+                               sig_version = SigVersion,
+                               script = Script,
+                               codesep_pos = CodesepPos},
+                 HashType, _Pos) ->
+    ScriptCode = subscript_from_codesep(Script, CodesepPos),
+    case SigVersion of
+        witness_v0 ->
+            sighash_witness_v0(Tx, InputIndex, ScriptCode, Amount, HashType);
+        _ ->
+            sighash_legacy(Tx, InputIndex, ScriptCode, HashType)
+    end;
+compute_sig_hash(#script_state{sig_checker = {Tx, InputIndex, Amount},
+                               sig_version = SigVersion,
+                               script = Script,
+                               codesep_pos = CodesepPos},
+                 HashType, _Pos) ->
+    ScriptCode = subscript_from_codesep(Script, CodesepPos),
+    case SigVersion of
+        witness_v0 ->
+            sighash_witness_v0(Tx, InputIndex, ScriptCode, Amount, HashType);
+        _ ->
+            sighash_legacy(Tx, InputIndex, ScriptCode, HashType)
+    end;
+compute_sig_hash(_, _, _) ->
+    <<0:256>>.
+
+compute_taproot_sig_hash(#script_state{sig_checker = #{compute_taproot_sighash := Fun}},
+                         HashType, CodeSepPos) ->
+    Fun(HashType, CodeSepPos);
+compute_taproot_sig_hash(#script_state{sig_checker = {Tx, InputIndex, _Amount, PrevOuts},
+                                       script = Script,
+                                       codesep_pos = CodesepPos},
+                         HashType, _Pos) ->
+    %% For tapscript, compute leaf hash from the executing script
+    LeafHash = beamchain_crypto:tagged_hash(
+        <<"TapLeaf">>,
+        <<16#c0, (encode_compact_size(byte_size(Script)))/binary, Script/binary>>),
+    sighash_taproot(Tx, InputIndex, PrevOuts, HashType, undefined, LeafHash, CodesepPos);
+compute_taproot_sig_hash(_, _, _) ->
+    <<0:256>>.
 
 check_hash_type(HT) ->
     Base = HT band (bnot ?SIGHASH_ANYONECANPAY),
@@ -2294,6 +2385,20 @@ is_push_only(<<Op, Rest/binary>>) when Op >= ?OP_1, Op =< ?OP_16 ->
     is_push_only(Rest);
 is_push_only(_) ->
     false.
+
+%%% -------------------------------------------------------------------
+%%% Script code extraction for sighash
+%%% -------------------------------------------------------------------
+
+%% @doc Extract the subscript starting from after the last OP_CODESEPARATOR.
+%% CodesepPos 0 means no codeseparator was hit, use full script.
+subscript_from_codesep(Script, 0) ->
+    Script;
+subscript_from_codesep(Script, CodesepPos) ->
+    case CodesepPos =< byte_size(Script) of
+        true -> binary:part(Script, CodesepPos, byte_size(Script) - CodesepPos);
+        false -> Script
+    end.
 
 %%% -------------------------------------------------------------------
 %%% Sighash computation
