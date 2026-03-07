@@ -1,0 +1,14 @@
+#!/bin/bash
+# beamchain CLI wrapper
+# Suppresses Erlang PROGRESS/SASL reports for clean terminal output
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+exec erl \
+    -pa "$SCRIPT_DIR/_build/default/lib/"/*/ebin \
+    -noshell \
+    -kernel logger_level notice \
+    -kernel error_logger silent \
+    -sasl sasl_error_logger false \
+    -eval "beamchain_cli:main(init:get_plain_arguments())." \
+    -extra "$@"

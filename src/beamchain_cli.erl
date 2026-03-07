@@ -17,6 +17,11 @@
 %% Progress bar width (in characters)
 -define(BAR_WIDTH, 25).
 
+%% UTF-8 byte sequences for Unicode glyphs (matches spinner encoding)
+-define(CHECK, "\xe2\x9c\x93").       %% ✓ U+2713
+-define(BLOCK_FULL, "\xe2\x96\x88").  %% █ U+2588
+-define(BLOCK_LIGHT, "\xe2\x96\x91"). %% ░ U+2591
+
 %%% ===================================================================
 %%% Escript entry point
 %%% ===================================================================
@@ -252,7 +257,7 @@ sync_loop(Frame, StartTime) ->
                 _ -> Height / Elapsed
             end,
             io:format("~s synced to ~B in ~s (avg ~.1f blk/s)~n",
-                      [green("✓"), Height, format_duration(Elapsed),
+                      [green(?CHECK), Height, format_duration(Elapsed),
                        AvgRate]),
             graceful_shutdown(),
             halt(0);
@@ -288,7 +293,7 @@ draw_header_progress(Spinner, Info) ->
         complete ->
             Current = maps:get(tip_height, Info, 0),
             io:format("\r\e[K  ~s ~s ~s~n",
-                      [green("✓"), "Headers",
+                      [green(?CHECK), "Headers",
                        dim(io_lib:format("~B", [Current]))])
     end.
 
@@ -328,7 +333,7 @@ draw_block_progress(Spinner, Info) ->
         complete ->
             Current = maps:get(next_to_validate, Info, 0),
             io:format("\r\e[K  ~s ~s ~s~n",
-                      [green("✓"), "Blocks ",
+                      [green(?CHECK), "Blocks ",
                        dim(io_lib:format("~B", [Current]))])
     end.
 
@@ -645,8 +650,8 @@ read_auth_cookie(Opts) ->
 progress_bar(Frac) ->
     Filled = round(Frac * ?BAR_WIDTH),
     Empty = ?BAR_WIDTH - Filled,
-    "[" ++ green(lists:duplicate(Filled, $█)) ++
-    dim(lists:duplicate(Empty, $░)) ++ "]".
+    "[" ++ green(lists:flatten(lists:duplicate(Filled, ?BLOCK_FULL))) ++
+    dim(lists:flatten(lists:duplicate(Empty, ?BLOCK_LIGHT))) ++ "]".
 
 %% @doc Approximate block rate -uses process dictionary for simplicity.
 %% Stores {LastValidated, LastTime} and computes instantaneous rate.
