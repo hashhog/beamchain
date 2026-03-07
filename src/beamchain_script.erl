@@ -1343,8 +1343,17 @@ do_checksig_ecdsa(Rest, Pos, State) ->
                                 _ -> {error, sig_encoding}
                             end;
                         true ->
-                            SigChecker = State1#script_state.sig_checker,
-                            SigHash = compute_sig_hash(State1, HashTypeByte, Pos),
+                            %% FindAndDelete: for legacy scripts, remove the
+                            %% signature from the scriptCode before computing sighash
+                            State2 = case State1#script_state.sig_version of
+                                base ->
+                                    S2 = find_and_delete(State1#script_state.script, Sig),
+                                    State1#script_state{script = S2};
+                                _ ->
+                                    State1
+                            end,
+                            SigChecker = State2#script_state.sig_checker,
+                            SigHash = compute_sig_hash(State2, HashTypeByte, Pos),
                             Valid = check_ecdsa_sig(SigChecker, SigBody, PubKey, SigHash),
                             case Valid of
                                 true ->
@@ -1489,9 +1498,17 @@ do_checksig_result(State, Pos) ->
                     SigLen = byte_size(Sig),
                     HashTypeByte = binary:at(Sig, SigLen - 1),
                     SigBody = binary:part(Sig, 0, SigLen - 1),
-                    SigHash = compute_sig_hash(State1, HashTypeByte, Pos),
+                    %% FindAndDelete for legacy scripts
+                    State2 = case State1#script_state.sig_version of
+                        base ->
+                            S2 = find_and_delete(State1#script_state.script, Sig),
+                            State1#script_state{script = S2};
+                        _ ->
+                            State1
+                    end,
+                    SigHash = compute_sig_hash(State2, HashTypeByte, Pos),
                     Valid = check_ecdsa_sig(
-                        State1#script_state.sig_checker, SigBody, PubKey, SigHash),
+                        State2#script_state.sig_checker, SigBody, PubKey, SigHash),
                     Flags = State1#script_state.flags,
                     case Valid of
                         false when (Flags band ?SCRIPT_VERIFY_NULLFAIL) =/= 0 ->
@@ -1522,74 +1539,18 @@ execute_checkmultisig(Rest, Pos, State) ->
                             %% OP_CHECKMULTISIG disabled in tapscript
                             {error, checkmultisig_in_tapscript};
                         _ ->
-                            do_checkmultisig(Rest, Pos, State1)
+                            case do_checkmultisig_eval(State1, Pos) of
+                                {ok, true, State2} ->
+                                    execute(Rest, Pos, push(script_true(), State2));
+                                {ok, false, State2} ->
+                                    execute(Rest, Pos, push(script_false(), State2));
+                                {error, _} = E -> E
+                            end
                     end
             end;
         Error -> Error
     end.
 
-do_checkmultisig(Rest, Pos, State) ->
-    %% pop nkeys
-    case pop_num(State) of
-        {ok, NKeys, State1} when NKeys >= 0, NKeys =< ?MAX_PUBKEYS_PER_MULTISIG ->
-            %% add nkeys to op_count
-            NewOpCount = State1#script_state.op_count + NKeys,
-            case NewOpCount > ?MAX_OPS_PER_SCRIPT andalso
-                 State1#script_state.sig_version =/= tapscript of
-                true -> {error, op_count_exceeded};
-                false ->
-                    State2 = State1#script_state{op_count = NewOpCount},
-                    %% pop public keys
-                    case pop_n(NKeys, State2) of
-                        {ok, PubKeys, State3} ->
-                            %% pop nsigs
-                            case pop_num(State3) of
-                                {ok, NSigs, State4} when NSigs >= 0, NSigs =< NKeys ->
-                                    %% pop signatures
-                                    case pop_n(NSigs, State4) of
-                                        {ok, Sigs, State5} ->
-                                            %% pop the off-by-one dummy element
-                                            case pop(State5) of
-                                                {ok, Dummy, State6} ->
-                                                    Flags = State6#script_state.flags,
-                                                    %% NULLDUMMY check
-                                                    case (Flags band ?SCRIPT_VERIFY_NULLDUMMY) =/= 0 andalso
-                                                         Dummy =/= <<>> of
-                                                        true -> {error, nulldummy_failed};
-                                                        false ->
-                                                            do_multisig_verify(
-                                                                PubKeys, Sigs,
-                                                                Rest, Pos, State6)
-                                                    end;
-                                                Error -> Error
-                                            end;
-                                        Error -> Error
-                                    end;
-                                {ok, _, _} -> {error, invalid_multisig};
-                                Error -> Error
-                            end;
-                        Error -> Error
-                    end
-            end;
-        {ok, _, _} -> {error, invalid_multisig_key_count};
-        Error -> Error
-    end.
-
-do_multisig_verify(PubKeys, Sigs, Rest, Pos, State) ->
-    %% sequential matching: each sig must match a pubkey in order
-    Result = verify_multisig_sigs(PubKeys, Sigs, State, Pos),
-    Flags = State#script_state.flags,
-    case Result of
-        true ->
-            execute(Rest, Pos, push(script_true(), State));
-        false ->
-            %% NULLFAIL: if any sig is non-empty and verification failed, error
-            case (Flags band ?SCRIPT_VERIFY_NULLFAIL) =/= 0 andalso
-                 lists:any(fun(S) -> S =/= <<>> end, Sigs) of
-                true -> {error, nullfail};
-                false -> execute(Rest, Pos, push(script_false(), State))
-            end
-    end.
 
 verify_multisig_sigs(_PubKeys, [], _State, _Pos) ->
     true;
@@ -1598,7 +1559,7 @@ verify_multisig_sigs([], [_ | _], _State, _Pos) ->
 verify_multisig_sigs([PK | PKRest], [Sig | SigRest] = Sigs, State, Pos) ->
     case Sig of
         <<>> ->
-            %% empty sig - try next pubkey? No, empty sig always fails
+            %% empty sig always fails, try next pubkey
             verify_multisig_sigs(PKRest, Sigs, State, Pos);
         _ ->
             SigLen = byte_size(Sig),
@@ -1607,11 +1568,8 @@ verify_multisig_sigs([PK | PKRest], [Sig | SigRest] = Sigs, State, Pos) ->
             SigHash = compute_sig_hash(State, HashTypeByte, Pos),
             case check_ecdsa_sig(State#script_state.sig_checker, SigBody, PK, SigHash) of
                 true ->
-                    %% matched, advance both
                     verify_multisig_sigs(PKRest, SigRest, State, Pos);
                 false ->
-                    %% sig didn't match this key, try next key
-                    %% but only if remaining keys >= remaining sigs
                     case length(PKRest) >= length(Sigs) of
                         true ->
                             verify_multisig_sigs(PKRest, Sigs, State, Pos);
@@ -1631,27 +1589,80 @@ execute_checkmultisigverify(Rest, Pos, State) ->
                         tapscript ->
                             {error, checkmultisig_in_tapscript};
                         _ ->
-                            %% Run multisig, then verify
-                            case do_checkmultisig_result(Rest, Pos, State1) of
-                                {ok, State2} ->
-                                    case pop(State2) of
-                                        {ok, Top, State3} ->
-                                            case script_bool(Top) of
-                                                true -> execute(Rest, Pos, State3);
-                                                false -> {error, checkmultisigverify_failed}
-                                            end;
-                                        Error -> Error
-                                    end;
-                                Error -> Error
+                            case do_checkmultisig_eval(State1, Pos) of
+                                {ok, true, State2} ->
+                                    execute(Rest, Pos, State2);
+                                {ok, false, _State2} ->
+                                    {error, checkmultisigverify_failed};
+                                {error, _} = E -> E
                             end
                     end
             end;
         Error -> Error
     end.
 
-do_checkmultisig_result(Rest, Pos, State) ->
-    %% This duplicates do_checkmultisig but returns state
-    do_checkmultisig(Rest, Pos, State).
+do_checkmultisig_eval(State, Pos) ->
+    %% Evaluate multisig and return {ok, true/false, State} without calling execute.
+    %% pop nkeys
+    case pop_num(State) of
+        {ok, NKeys, State1} when NKeys >= 0, NKeys =< ?MAX_PUBKEYS_PER_MULTISIG ->
+            NewOpCount = State1#script_state.op_count + NKeys,
+            case NewOpCount > ?MAX_OPS_PER_SCRIPT andalso
+                 State1#script_state.sig_version =/= tapscript of
+                true -> {error, op_count_exceeded};
+                false ->
+                    State2 = State1#script_state{op_count = NewOpCount},
+                    case pop_n(NKeys, State2) of
+                        {ok, PubKeys, State3} ->
+                            case pop_num(State3) of
+                                {ok, NSigs, State4} when NSigs >= 0, NSigs =< NKeys ->
+                                    case pop_n(NSigs, State4) of
+                                        {ok, Sigs, State5} ->
+                                            case pop(State5) of
+                                                {ok, Dummy, State6} ->
+                                                    Flags = State6#script_state.flags,
+                                                    case (Flags band ?SCRIPT_VERIFY_NULLDUMMY) =/= 0 andalso
+                                                         Dummy =/= <<>> of
+                                                        true -> {error, nulldummy_failed};
+                                                        false ->
+                                                            %% FindAndDelete: for legacy scripts, remove
+                                                            %% all sigs from the scriptCode before verifying
+                                                            State7 = case State6#script_state.sig_version of
+                                                                base ->
+                                                                    CleanedScript = lists:foldl(
+                                                                        fun(S, Sc) -> find_and_delete(Sc, S) end,
+                                                                        State6#script_state.script,
+                                                                        Sigs),
+                                                                    State6#script_state{script = CleanedScript};
+                                                                _ ->
+                                                                    State6
+                                                            end,
+                                                            Result = verify_multisig_sigs(
+                                                                PubKeys, Sigs, State7, Pos),
+                                                            case Result of
+                                                                true ->
+                                                                    {ok, true, State6};
+                                                                false ->
+                                                                    case (Flags band ?SCRIPT_VERIFY_NULLFAIL) =/= 0 andalso
+                                                                         lists:any(fun(S) -> S =/= <<>> end, Sigs) of
+                                                                        true -> {error, nullfail};
+                                                                        false -> {ok, false, State6}
+                                                                    end
+                                                            end
+                                                    end;
+                                                Error -> Error
+                                            end;
+                                        Error -> Error
+                                    end;
+                                {ok, _, _} -> {error, invalid_multisig};
+                                Error -> Error
+                            end;
+                        Error -> Error
+                    end
+            end;
+        {ok, _, _} -> {error, invalid_multisig_key_count};
+        Error -> Error
+    end.
 
 %%% -------------------------------------------------------------------
 %%% OP_CHECKSIGADD (tapscript only, BIP 342)
@@ -2380,6 +2391,39 @@ remove_codesep(<<?OP_PUSHDATA2, Len:16/little, Rest/binary>>, Acc) ->
     end;
 remove_codesep(<<B, Rest/binary>>, Acc) ->
     remove_codesep(Rest, <<Acc/binary, B>>).
+
+%% @doc FindAndDelete: remove all occurrences of a push-encoded signature
+%% from the scriptCode. Used for legacy (SigVersion::BASE) CHECKSIG and
+%% CHECKMULTISIG. The pattern is the signature bytes push-encoded as a
+%% script data push (e.g., <push_len><sig_bytes>).
+-spec find_and_delete(binary(), binary()) -> binary().
+find_and_delete(Script, Sig) ->
+    Pattern = push_encode(Sig),
+    find_and_delete_pattern(Script, Pattern).
+
+%% Push-encode a data item as a minimal script push operation.
+push_encode(Data) ->
+    Len = byte_size(Data),
+    if
+        Len =< 16#4b ->
+            <<Len, Data/binary>>;
+        Len =< 16#ff ->
+            <<?OP_PUSHDATA1, Len:8, Data/binary>>;
+        Len =< 16#ffff ->
+            <<?OP_PUSHDATA2, Len:16/little, Data/binary>>;
+        true ->
+            <<?OP_PUSHDATA4, Len:32/little, Data/binary>>
+    end.
+
+%% Remove all occurrences of Pattern from Script.
+find_and_delete_pattern(Script, Pattern) ->
+    case binary:match(Script, Pattern) of
+        nomatch -> Script;
+        {Pos, Len} ->
+            Before = binary:part(Script, 0, Pos),
+            After = binary:part(Script, Pos + Len, byte_size(Script) - Pos - Len),
+            find_and_delete_pattern(<<Before/binary, After/binary>>, Pattern)
+    end.
 
 -spec sighash_witness_v0(#transaction{}, non_neg_integer(),
                          binary(), non_neg_integer(),
