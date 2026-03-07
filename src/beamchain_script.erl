@@ -21,7 +21,7 @@
     altstack = []     :: [binary()],
     exec_stack = []   :: [boolean()],   %% IF/ELSE nesting
     op_count = 0      :: non_neg_integer(),
-    codesep_pos = 0   :: non_neg_integer(),
+    codesep_pos = 16#ffffffff :: non_neg_integer(),
     flags = 0         :: non_neg_integer(),
     sig_checker       :: term(),
     sig_version = base :: base | witness_v0 | tapscript,
@@ -620,12 +620,10 @@ execute(<<?OP_VERIFY, Rest/binary>>, Pos, State) ->
     end;
 
 %% --- OP_RETURN ---
-execute(<<?OP_RETURN, _Rest/binary>>, _Pos, State) ->
+execute(<<?OP_RETURN, Rest/binary>>, Pos, State) ->
     case executing(State) of
         true -> {error, op_return};
-        false ->
-            %% still need to parse the rest for IF nesting
-            {error, op_return}
+        false -> execute(Rest, Pos + 1, State)
     end;
 
 %% --- Stack operations ---
@@ -1307,8 +1305,9 @@ do_checksig(Rest, Pos, State) ->
     do_checksig_ecdsa(Rest, Pos, State).
 
 do_checksig_ecdsa(Rest, Pos, State) ->
+    %% pop2 returns {ok, deeper, top, State} — deeper=Sig, top=PubKey
     case pop2(State) of
-        {ok, PubKey, Sig, State1} ->
+        {ok, Sig, PubKey, State1} ->
             case Sig of
                 <<>> ->
                     %% empty sig = push false (no NULLFAIL issue with empty)
@@ -1365,8 +1364,9 @@ do_checksig_ecdsa(Rest, Pos, State) ->
     end.
 
 do_checksig_tapscript(Rest, Pos, State) ->
+    %% pop2 returns {ok, deeper, top, State} — deeper=Sig, top=PubKey
     case pop2(State) of
-        {ok, PubKey, Sig, State1} ->
+        {ok, Sig, PubKey, State1} ->
             case PubKey of
                 <<>> ->
                     {error, tapscript_empty_pubkey};
@@ -1443,8 +1443,9 @@ execute_checksigverify(Rest, Pos, State) ->
     end.
 
 do_checksig_result(#script_state{sig_version = tapscript} = State, Pos) ->
+    %% pop2 returns {ok, deeper, top, State} — deeper=Sig, top=PubKey
     case pop2(State) of
-        {ok, PubKey, Sig, State1} ->
+        {ok, Sig, PubKey, State1} ->
             case PubKey of
                 <<>> ->
                     {error, tapscript_empty_pubkey};
@@ -1479,8 +1480,9 @@ do_checksig_result(#script_state{sig_version = tapscript} = State, Pos) ->
         Error -> Error
     end;
 do_checksig_result(State, Pos) ->
+    %% pop2 returns {ok, deeper, top, State} — deeper=Sig, top=PubKey
     case pop2(State) of
-        {ok, PubKey, Sig, State1} ->
+        {ok, Sig, PubKey, State1} ->
             case Sig of
                 <<>> -> {ok, false, State1};
                 _ ->
