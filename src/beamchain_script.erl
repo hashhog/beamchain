@@ -2098,7 +2098,9 @@ verify_witness_program(0, Program, Witness, Flags, SigChecker)
             Script = <<?OP_DUP, ?OP_HASH160,
                        20, Program/binary,
                        ?OP_EQUALVERIFY, ?OP_CHECKSIG>>,
-            case eval_script(Script, [Sig, PubKey], Flags, SigChecker, witness_v0) of
+            %% Stack: PubKey on top (HEAD), Sig below — matches P2PKH expectations
+            P2WPKHResult = eval_script(Script, [PubKey, Sig], Flags, SigChecker, witness_v0),
+            case P2WPKHResult of
                 {ok, [Top]} ->
                     case script_bool(Top) of
                         true -> {ok, [Top]};
@@ -2125,7 +2127,9 @@ verify_witness_program(0, Program, Witness, Flags, SigChecker)
                     case byte_size(WitnessScript) > ?MAX_SCRIPT_SIZE of
                         true -> {error, witness_script_too_large};
                         false ->
-                            case eval_script(WitnessScript, StackItems,
+                            %% Reverse stack items: wire order is bottom-to-top,
+                            %% but our list HEAD = top of stack
+                            case eval_script(WitnessScript, lists:reverse(StackItems),
                                            Flags, SigChecker, witness_v0) of
                                 {ok, [Top]} ->
                                     case script_bool(Top) of
@@ -2165,6 +2169,16 @@ verify_witness_program(1, Program, _Witness, Flags, _SigChecker)
        (Flags band ?SCRIPT_VERIFY_TAPROOT) =:= 0 ->
     %% taproot not active yet, succeed
     {ok, [script_true()]};
+
+verify_witness_program(1, Program, _Witness, Flags, _SigChecker)
+  when byte_size(Program) =/= 32,
+       (Flags band ?SCRIPT_VERIFY_TAPROOT) =/= 0 ->
+    %% BIP 341: v1 witness programs that are NOT 32 bytes are reserved
+    %% for future extensions and succeed unconditionally (unencumbered).
+    case (Flags band ?SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM) =/= 0 of
+        true -> {error, discourage_upgradable_witness_program};
+        false -> {ok, [script_true()]}
+    end;
 
 verify_witness_program(_, _, _, _, _) ->
     {error, witness_program_wrong_length}.
@@ -2210,8 +2224,14 @@ verify_taproot_key_path(OutputKey, Sig, _Flags, SigChecker) ->
             {error, invalid_schnorr_sig_size};
         _ ->
             SigHash = case SigChecker of
-                #{compute_taproot_sighash := Fun} -> Fun(HashType, 16#ffffffff);
-                _ -> <<0:256>>
+                #{compute_taproot_sighash := Fun} ->
+                    Fun(HashType, 16#ffffffff);
+                {Tx, InputIndex, _Amt, PrevOuts} ->
+                    %% Key path: no leaf hash, no annex
+                    sighash_taproot(Tx, InputIndex, PrevOuts, HashType,
+                                    undefined, undefined, 16#ffffffff);
+                _ ->
+                    <<0:256>>
             end,
             case check_schnorr_sig(SigChecker, SigBytes, OutputKey, SigHash) of
                 true -> {ok, [script_true()]};
@@ -2227,7 +2247,9 @@ verify_taproot_script_path(OutputKey, Script, ControlBlock,
         false ->
             {error, invalid_control_block};
         true ->
-            <<LeafVersion:8, InternalKey:32/binary, MerklePath/binary>> = ControlBlock,
+            <<LeafVersionByte:8, InternalKey:32/binary, MerklePath/binary>> = ControlBlock,
+            %% BIP 341: leaf version = c[0] & 0xFE (strip output key parity bit)
+            LeafVersion = LeafVersionByte band 16#fe,
             %% Compute leaf hash
             ScriptLen = byte_size(Script),
             LeafData = <<LeafVersion, (encode_compact_size(ScriptLen))/binary, Script/binary>>,
@@ -2244,7 +2266,7 @@ verify_taproot_script_path(OutputKey, Script, ControlBlock,
                     case TweakedKey =:= OutputKey of
                         true ->
                             %% Execute script in tapscript mode
-                            TapLeafVer = LeafVersion band 16#fe,
+                            TapLeafVer = LeafVersion,
                             case TapLeafVer of
                                 16#c0 ->
                                     %% Known leaf version (tapscript)
@@ -2252,8 +2274,10 @@ verify_taproot_script_path(OutputKey, Script, ControlBlock,
                                         fun(W, Acc) -> Acc + byte_size(W) end,
                                         0, ScriptArgs),
                                     Budget = WitnessSize,
-                                    eval_tapscript(Script, ScriptArgs, Budget,
-                                                  Flags, SigChecker);
+                                    %% Reverse: wire order is bottom-to-top,
+                                    %% our list HEAD = top of stack
+                                    eval_tapscript(Script, lists:reverse(ScriptArgs),
+                                                  Budget, Flags, SigChecker);
                                 _ ->
                                     case (Flags band ?SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION) =/= 0 of
                                         true ->
@@ -2612,14 +2636,11 @@ sighash_taproot(Tx, InputIndex, PrevOuts, HashType, AnnexHash,
     %% epoch
     Epoch = <<0>>,
 
-    %% hash_type byte
+    %% OutputType controls which data sections are included (outputs, etc.)
+    %% SIGHASH_DEFAULT behaves like SIGHASH_ALL for data inclusion.
     OutputType = case BaseType of
         ?SIGHASH_DEFAULT -> ?SIGHASH_ALL;
         _ -> BaseType
-    end,
-    ActualHashType = case AnyoneCanPay of
-        true -> OutputType bor ?SIGHASH_ANYONECANPAY;
-        false -> OutputType
     end,
 
     %% Common data
@@ -2707,8 +2728,11 @@ sighash_taproot(Tx, InputIndex, PrevOuts, HashType, AnnexHash,
     end,
 
     %% Compose the tagged hash preimage
+    %% BIP 341: write the ORIGINAL hash_type (0x00 for DEFAULT), not the
+    %% remapped value.  OutputType is only used to decide which data to
+    %% include (outputs, sequences, etc.).
     Preimage = <<Epoch/binary,
-                 ActualHashType:8,
+                 HashType:8,
                  Version/binary,
                  LockTime/binary,
                  CommonPrevouts/binary,
