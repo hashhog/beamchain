@@ -130,6 +130,9 @@ check_block(#block{header = Header, transactions = Txs}, Params) ->
 %% PrevIndex is a map with keys: height, header, chainwork, status.
 -spec contextual_check_block_header(#block_header{}, map(), map()) ->
     ok | {error, atom()}.
+contextual_check_block_header(_Header, #{height := -1}, _Params) ->
+    %% Genesis block has no previous context to validate against
+    ok;
 contextual_check_block_header(Header, PrevIndex, Params) ->
     try
         PrevHeight = maps:get(height, PrevIndex),
@@ -275,11 +278,13 @@ check_coinbase_height(#transaction{inputs = [#tx_in{script_sig = ScriptSig}]},
             end
     end.
 
-%% Calculate minimum bytes needed to encode a height in little-endian
-height_byte_len(N) when N =< 16#ff -> 1;
-height_byte_len(N) when N =< 16#ffff -> 2;
-height_byte_len(N) when N =< 16#ffffff -> 3;
-height_byte_len(N) when N =< 16#ffffffff -> 4;
+%% Calculate minimum bytes needed to encode a height in CScriptNum encoding.
+%% Script numbers use the MSB as a sign bit. If the high bit of the MSByte
+%% would be set, an extra 0x00 byte is needed to keep the number positive.
+height_byte_len(N) when N =< 16#7f -> 1;
+height_byte_len(N) when N =< 16#7fff -> 2;
+height_byte_len(N) when N =< 16#7fffff -> 3;
+height_byte_len(N) when N =< 16#7fffffff -> 4;
 height_byte_len(_) -> 5.
 
 %% Decode a little-endian unsigned integer from bytes
@@ -833,7 +838,10 @@ fetch_input_coins(#transaction{inputs = Inputs}) ->
     lists:map(fun(#tx_in{prev_out = #outpoint{hash = H, index = I}}) ->
         case beamchain_chainstate:get_utxo(H, I) of
             {ok, Coin} -> Coin;
-            not_found -> throw(missing_inputs)
+            not_found ->
+                logger:error("missing_inputs: txid=~s vout=~B",
+                             [binary:encode_hex(beamchain_serialize:reverse_bytes(H)), I]),
+                throw(missing_inputs)
         end
     end, Inputs).
 
@@ -907,20 +915,43 @@ verify_tx_scripts(Tx, InputCoins, _Height, Flags) ->
         case beamchain_script:verify_script(
                 ScriptSig, ScriptPubKey, Witness, Flags, SigChecker) of
             true -> ok;
-            false -> throw({script_verify_failed, Idx})
+            false ->
+                Txid = beamchain_serialize:tx_hash(Tx),
+                ScriptType = classify_script(ScriptPubKey),
+                logger:error("script_verify_failed: txid=~s input=~B type=~s "
+                             "scriptPubKey=~s scriptSig=~s witness_items=~B",
+                             [binary:encode_hex(Txid), Idx, ScriptType,
+                              binary:encode_hex(ScriptPubKey),
+                              binary:encode_hex(ScriptSig),
+                              length(Witness)]),
+                throw({script_verify_failed, Idx})
         end,
         Idx + 1
     end, 0, lists:zip(Inputs, InputCoins)),
     ok.
 
+%% Classify a scriptPubKey for diagnostic logging.
+classify_script(<<16#76, 16#a9, 16#14, _:20/binary, 16#88, 16#ac>>) -> <<"p2pkh">>;
+classify_script(<<16#a9, 16#14, _:20/binary, 16#87>>) -> <<"p2sh">>;
+classify_script(<<16#00, 16#14, _:20/binary>>) -> <<"p2wpkh">>;
+classify_script(<<16#00, 16#20, _:32/binary>>) -> <<"p2wsh">>;
+classify_script(<<16#51, 16#20, _:32/binary>>) -> <<"p2tr">>;
+classify_script(_) -> <<"other">>.
+
 %% @doc Verify scripts for multiple transactions in parallel.
 %% Spawns one process per transaction. Each process verifies all inputs.
 %% If any verification fails, throws the error.
 verify_scripts_parallel(Jobs, Flags) ->
-    %% Spawn a worker per transaction
+    %% Spawn a worker per transaction.
+    %% Wrap in try/catch so that throw exits with the reason directly
+    %% (otherwise throw becomes {nocatch, Reason} which breaks pattern matching).
     Workers = lists:map(fun({Tx, InputCoins}) ->
         spawn_monitor(fun() ->
-            verify_tx_scripts(Tx, InputCoins, 0, Flags)
+            try
+                verify_tx_scripts(Tx, InputCoins, 0, Flags)
+            catch
+                throw:Reason -> exit(Reason)
+            end
         end)
     end, Jobs),
     %% Collect results — all workers must complete normally
