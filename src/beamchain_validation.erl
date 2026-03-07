@@ -706,10 +706,31 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
         Network = maps:get(network, Params, mainnet),
         Flags = beamchain_script:flags_for_height(Height, Network),
 
-        %% get assume_valid hash
-        AssumeValid = maps:get(assume_valid, Params, <<0:256>>),
+        %% get assume_valid hash (convert from display to internal byte order)
+        AssumeValidDisplay = maps:get(assume_valid, Params, <<0:256>>),
+        AssumeValid = case AssumeValidDisplay of
+            <<0:256>> -> <<0:256>>;
+            _ -> beamchain_serialize:reverse_bytes(AssumeValidDisplay)
+        end,
         BlockHash = beamchain_serialize:block_hash(Header),
-        SkipScripts = AssumeValid =/= <<0:256>> andalso BlockHash =:= AssumeValid,
+        %% Skip script verification for all blocks up to the assume_valid block.
+        %% Cache the assume_valid height in process dictionary to avoid
+        %% repeated DB lookups.
+        SkipScripts = case AssumeValid of
+            <<0:256>> -> false;
+            _ ->
+                AVHeight = case get(assume_valid_height) of
+                    undefined ->
+                        H = case beamchain_db:get_block_index_by_hash(AssumeValid) of
+                            {ok, #{height := HH}} -> HH;
+                            not_found -> -1
+                        end,
+                        put(assume_valid_height, H),
+                        H;
+                    Cached -> Cached
+                end,
+                Height =< AVHeight
+        end,
 
         %% 4. validate each transaction (sequential: UTXO checks)
         %% Script verification is deferred and run in parallel below.
@@ -767,6 +788,26 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
                              #tx_in{prev_out = #outpoint{hash = H, index = I}}
                              <- Tx#transaction.inputs],
                             InputCoins),
+
+                        %% Apply UTXO changes immediately so subsequent
+                        %% transactions in this block can spend these outputs.
+                        %% Spend inputs
+                        lists:foreach(fun(#tx_in{prev_out = #outpoint{hash = HH, index = II}}) ->
+                            beamchain_chainstate:spend_utxo(HH, II)
+                        end, Tx#transaction.inputs),
+                        %% Create outputs
+                        Txid2 = beamchain_serialize:tx_hash(Tx),
+                        lists:foldl(fun(#tx_out{value = V2, script_pubkey = SPK2}, Idx) ->
+                            Utxo = #utxo{
+                                value = V2,
+                                script_pubkey = SPK2,
+                                is_coinbase = false,
+                                height = Height
+                            },
+                            beamchain_chainstate:add_utxo(Txid2, Idx, Utxo),
+                            Idx + 1
+                        end, 0, Tx#transaction.outputs),
+
                         {FeesAcc + Fee, UndoAcc ++ SpentCoins, NewSigops,
                          NewJobs}
                 end
@@ -775,10 +816,16 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
             Txs),
 
         %% 4b. verify scripts in parallel (one process per tx)
+        %% Save undo info in process dictionary so we can roll back on failure.
+        %% AllUndoData has the spent coins; Txs has the added outputs.
+        put(connect_block_undo, {Txs, AllUndoData}),
+
         case ScriptJobs of
             [] -> ok;
             _ -> verify_scripts_parallel(ScriptJobs, Flags)
         end,
+
+        erase(connect_block_undo),
 
         %% Also count coinbase legacy sigops in the total
         CbSigops = count_legacy_sigops_tx(CoinbaseTx) * ?WITNESS_SCALE_FACTOR,
@@ -791,46 +838,70 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
                               0, CoinbaseTx#transaction.outputs),
         CbValue =< Subsidy + TotalFees orelse throw(bad_cb_amount),
 
-        %% 6. apply UTXO changes
-
-        %% 6a. spend inputs (remove from UTXO set)
-        lists:foreach(fun(Tx) ->
-            case is_coinbase_tx(Tx) of
-                true -> ok;
-                false ->
-                    lists:foreach(fun(#tx_in{prev_out = #outpoint{hash = H, index = I}}) ->
-                        beamchain_chainstate:spend_utxo(H, I)
-                    end, Tx#transaction.inputs)
-            end
-        end, Txs),
-
-        %% 6b. create outputs (add to UTXO set)
-        lists:foreach(fun(Tx) ->
-            Txid = beamchain_serialize:tx_hash(Tx),
-            IsCb = is_coinbase_tx(Tx),
-            lists:foldl(fun(#tx_out{value = V, script_pubkey = SPK}, Idx) ->
-                Utxo = #utxo{
-                    value = V,
-                    script_pubkey = SPK,
-                    is_coinbase = IsCb,
-                    height = Height
-                },
-                beamchain_chainstate:add_utxo(Txid, Idx, Utxo),
-                Idx + 1
-            end, 0, Tx#transaction.outputs)
-        end, Txs),
+        %% 6. add coinbase outputs to UTXO set
+        CbTxid = beamchain_serialize:tx_hash(CoinbaseTx),
+        lists:foldl(fun(#tx_out{value = V, script_pubkey = SPK}, Idx) ->
+            Utxo = #utxo{
+                value = V,
+                script_pubkey = SPK,
+                is_coinbase = true,
+                height = Height
+            },
+            beamchain_chainstate:add_utxo(CbTxid, Idx, Utxo),
+            Idx + 1
+        end, 0, CoinbaseTx#transaction.outputs),
 
         %% 7. store undo data
         UndoBin = encode_undo_data(AllUndoData),
         beamchain_db:store_undo(BlockHash, UndoBin),
 
-        %% 8. update chain tip
-        beamchain_db:set_chain_tip(BlockHash, Height),
+        %% Chain tip is updated in ETS by chainstate:do_connect_block.
+        %% The RocksDB chain_tip is written during flush (atomically with
+        %% UTXO changes) to avoid tip/UTXO mismatch on crash.
 
         ok
     catch
-        throw:Reason -> {error, Reason}
+        throw:Reason ->
+            %% Roll back UTXO changes from the failed block
+            case erase(connect_block_undo) of
+                {UndoTxs, UndoCoins} ->
+                    rollback_block_utxos(UndoTxs, UndoCoins);
+                _ -> ok
+            end,
+            {error, Reason};
+        error:Reason2:_Stack ->
+            case erase(connect_block_undo) of
+                {UndoTxs2, UndoCoins2} ->
+                    rollback_block_utxos(UndoTxs2, UndoCoins2);
+                _ -> ok
+            end,
+            {error, {internal_error, Reason2}}
     end.
+
+%% Roll back UTXO changes from a failed block validation.
+%% Removes outputs added by non-coinbase txs and restores spent inputs.
+rollback_block_utxos(Txs, UndoCoins) ->
+    %% Collect txids of transactions in this block (for intra-block filtering)
+    BlockTxids = sets:from_list(
+        [beamchain_serialize:tx_hash(Tx) || Tx <- Txs]),
+    %% Remove outputs added by ALL txs including coinbase
+    lists:foreach(fun(Tx) ->
+        Txid = beamchain_serialize:tx_hash(Tx),
+        NumOutputs = length(Tx#transaction.outputs),
+        lists:foreach(fun(Idx) ->
+            beamchain_chainstate:spend_utxo(Txid, Idx)
+        end, lists:seq(0, NumOutputs - 1))
+    end, Txs),
+    %% Restore spent inputs from undo data, but skip coins that were
+    %% created within this same block (intra-block spends). Those
+    %% outputs were already removed above and shouldn't be restored.
+    lists:foreach(fun({#outpoint{hash = H, index = I}, Coin}) ->
+        case sets:is_element(H, BlockTxids) of
+            true -> ok;  %% intra-block coin, don't restore
+            false -> beamchain_chainstate:add_utxo(H, I, Coin)
+        end
+    end, UndoCoins),
+    ok.
 
 %% @doc Fetch UTXO coins for all inputs of a transaction.
 %% Uses the chainstate ETS cache with RocksDB fallback.
