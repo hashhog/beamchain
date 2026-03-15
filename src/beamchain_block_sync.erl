@@ -686,13 +686,19 @@ lookup_assume_valid_height(Hash) ->
     end.
 
 %% Store transaction index entries for all txs in a block.
+%% Only stores if txindex is enabled in config.
 store_tx_index(#block{header = Header, transactions = Txs}, Height) ->
-    BlockHash = beamchain_serialize:block_hash(Header),
-    lists:foldl(fun(Tx, Pos) ->
-        Txid = beamchain_serialize:tx_hash(Tx),
-        beamchain_db:store_tx_index(Txid, BlockHash, Height, Pos),
-        Pos + 1
-    end, 0, Txs).
+    case beamchain_config:txindex_enabled() of
+        true ->
+            BlockHash = beamchain_serialize:block_hash(Header),
+            lists:foldl(fun(Tx, Pos) ->
+                Txid = beamchain_serialize:tx_hash(Tx),
+                beamchain_db:store_tx_index(Txid, BlockHash, Height, Pos),
+                Pos + 1
+            end, 0, Txs);
+        false ->
+            ok
+    end.
 
 %% Reset in-flight request timestamps so validation time isn't counted
 %% as network stall time. Called after a batch of validation completes.
