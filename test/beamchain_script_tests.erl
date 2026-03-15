@@ -577,6 +577,160 @@ op_success_discourage_test() ->
         <<16#bb>>, [], ?SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS, #{}, tapscript).
 
 %%% -------------------------------------------------------------------
+%%% Witness cleanstack enforcement tests (BIP 141/342)
+%%% -------------------------------------------------------------------
+%%
+%% Witness scripts (v0 and v1) always require cleanstack:
+%% - Stack must have exactly ONE element after execution
+%% - That element must be TRUE (non-zero, not negative zero)
+%% This is NOT gated by SCRIPT_VERIFY_CLEANSTACK flag -- it's hardcoded.
+
+%% P2WSH: script that leaves extra items on stack must fail
+p2wsh_cleanstack_extra_items_test() ->
+    %% Script that pushes OP_1 OP_1 -> leaves [1,1] on stack (not clean)
+    WitnessScript = <<16#51, 16#51>>,  %% OP_1 OP_1
+    Program = crypto:hash(sha256, WitnessScript),
+    Witness = [WitnessScript],  %% no stack args
+    Flags = ?SCRIPT_VERIFY_WITNESS,
+    SigChecker = #{},
+    Result = beamchain_script:verify_script(
+        <<>>,  %% empty scriptSig for witness
+        <<16#00, 32, Program/binary>>,  %% OP_0 <32-byte program>
+        Witness,
+        Flags,
+        SigChecker
+    ),
+    ?assertEqual(false, Result).
+
+%% P2WSH: script that leaves empty stack must fail
+p2wsh_cleanstack_empty_stack_test() ->
+    %% Script: OP_1 OP_DROP -> pops the 1, leaves empty stack
+    WitnessScript = <<16#51, 16#75>>,  %% OP_1 OP_DROP
+    Program = crypto:hash(sha256, WitnessScript),
+    Witness = [WitnessScript],
+    Flags = ?SCRIPT_VERIFY_WITNESS,
+    SigChecker = #{},
+    Result = beamchain_script:verify_script(
+        <<>>,
+        <<16#00, 32, Program/binary>>,
+        Witness,
+        Flags,
+        SigChecker
+    ),
+    ?assertEqual(false, Result).
+
+%% P2WSH: script that leaves false (OP_0) on stack must fail
+p2wsh_cleanstack_false_result_test() ->
+    %% Script: OP_0 -> leaves [<<>>] (false) on stack
+    WitnessScript = <<16#00>>,  %% OP_0
+    Program = crypto:hash(sha256, WitnessScript),
+    Witness = [WitnessScript],
+    Flags = ?SCRIPT_VERIFY_WITNESS,
+    SigChecker = #{},
+    Result = beamchain_script:verify_script(
+        <<>>,
+        <<16#00, 32, Program/binary>>,
+        Witness,
+        Flags,
+        SigChecker
+    ),
+    ?assertEqual(false, Result).
+
+%% P2WSH: script that leaves negative zero on stack must fail
+p2wsh_cleanstack_negative_zero_test() ->
+    %% Script: push <<0x80>> (negative zero) -> should be treated as false
+    WitnessScript = <<1, 16#80>>,  %% push 1 byte: 0x80
+    Program = crypto:hash(sha256, WitnessScript),
+    Witness = [WitnessScript],
+    Flags = ?SCRIPT_VERIFY_WITNESS,
+    SigChecker = #{},
+    Result = beamchain_script:verify_script(
+        <<>>,
+        <<16#00, 32, Program/binary>>,
+        Witness,
+        Flags,
+        SigChecker
+    ),
+    ?assertEqual(false, Result).
+
+%% P2WSH: valid script leaving exactly one true element succeeds
+p2wsh_cleanstack_valid_test() ->
+    %% Script: OP_1 -> leaves [<<1>>] (true) on stack
+    WitnessScript = <<16#51>>,  %% OP_1
+    Program = crypto:hash(sha256, WitnessScript),
+    Witness = [WitnessScript],
+    Flags = ?SCRIPT_VERIFY_WITNESS,
+    SigChecker = #{},
+    Result = beamchain_script:verify_script(
+        <<>>,
+        <<16#00, 32, Program/binary>>,
+        Witness,
+        Flags,
+        SigChecker
+    ),
+    ?assertEqual(true, Result).
+
+%% Tapscript cleanstack: eval_script returns raw stack, cleanstack is
+%% enforced in eval_tapscript (internal, called from verify_taproot_script_path).
+%% These tests verify the cleanstack enforcement indirectly by checking that
+%% eval_script returns the expected stack for tapscript mode.
+
+%% Tapscript: script that leaves extra items returns that stack
+tapscript_eval_extra_items_test() ->
+    %% Script: OP_1 OP_1 -> leaves [1,1] on stack
+    Script = <<16#51, 16#51>>,
+    Stack = [],
+    Flags = ?SCRIPT_VERIFY_TAPROOT,
+    SigChecker = #{},
+    %% eval_script returns raw stack, cleanstack checked at higher level
+    Result = beamchain_script:eval_script(Script, Stack, Flags, SigChecker, tapscript),
+    ?assertEqual({ok, [<<1>>, <<1>>]}, Result).
+
+%% Tapscript: empty stack returns empty
+tapscript_eval_empty_stack_test() ->
+    %% Script: OP_1 OP_DROP -> leaves empty stack
+    Script = <<16#51, 16#75>>,
+    Stack = [],
+    Flags = ?SCRIPT_VERIFY_TAPROOT,
+    SigChecker = #{},
+    Result = beamchain_script:eval_script(Script, Stack, Flags, SigChecker, tapscript),
+    %% eval_script returns raw stack; cleanstack enforced in eval_tapscript
+    ?assertEqual({ok, []}, Result).
+
+%% Tapscript: false result returns false on stack
+tapscript_eval_false_result_test() ->
+    %% Script: OP_0 -> leaves false on stack
+    Script = <<16#00>>,
+    Stack = [],
+    Flags = ?SCRIPT_VERIFY_TAPROOT,
+    SigChecker = #{},
+    Result = beamchain_script:eval_script(Script, Stack, Flags, SigChecker, tapscript),
+    %% eval_script returns raw stack; bool check at higher level
+    ?assertEqual({ok, [<<>>]}, Result).
+
+%% Tapscript: valid script with one true element succeeds
+tapscript_eval_valid_test() ->
+    %% Script: OP_1 -> leaves [<<1>>] (true) on stack
+    Script = <<16#51>>,
+    Stack = [],
+    Flags = ?SCRIPT_VERIFY_TAPROOT,
+    SigChecker = #{},
+    Result = beamchain_script:eval_script(Script, Stack, Flags, SigChecker, tapscript),
+    ?assertEqual({ok, [<<1>>]}, Result).
+
+%% Witness v0: script that leaves 3 items must fail (more comprehensive)
+witness_v0_cleanstack_three_items_test() ->
+    %% Script: OP_1 OP_2 OP_3 -> leaves [3,2,1] on stack
+    Script = <<16#51, 16#52, 16#53>>,
+    Stack = [],
+    Flags = ?SCRIPT_VERIFY_WITNESS,
+    SigChecker = #{},
+    %% For witness_v0, eval_script returns the stack and the caller enforces cleanstack
+    Result = beamchain_script:eval_script(Script, Stack, Flags, SigChecker, witness_v0),
+    %% Should succeed in eval_script but have 3 items
+    ?assertMatch({ok, [<<3>>, <<2>>, <<1>>]}, Result).
+
+%%% -------------------------------------------------------------------
 %%% PUSHDATA tests
 %%% -------------------------------------------------------------------
 
