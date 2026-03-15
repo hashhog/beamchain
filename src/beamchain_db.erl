@@ -40,6 +40,12 @@
 %% Pruning
 -export([prune_block_files/0, is_block_pruned/1, trigger_pruning/1]).
 
+%% Block height/time indexes
+-export([get_hash_by_height/1, get_blocks_in_time_range/2]).
+-export([store_block_stats/2, get_block_stats/1]).
+-export([get_cumulative_tx_count/1, store_cumulative_tx_count/2]).
+-export([index_block/3, unindex_block/2]).
+
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2]).
@@ -58,6 +64,11 @@
 %% Flat file constants
 -define(MAX_BLOCKFILE_SIZE, 134217728).  %% 128 MB
 -define(BLOCK_INDEX_ETS, beamchain_block_index).
+
+%% Block index ETS tables
+-define(HEIGHT_TO_HASH_ETS, beamchain_height_to_hash).
+-define(TIME_INDEX_ETS, beamchain_time_index).
+-define(BLOCK_STATS_ETS, beamchain_block_stats).
 
 %% Pruning constants
 -define(MIN_PRUNE_TARGET_MB, 550).  %% Minimum disk usage in MB
@@ -303,6 +314,30 @@ init([]) ->
             case ets:info(?BLOCK_INDEX_ETS) of
                 undefined ->
                     ets:new(?BLOCK_INDEX_ETS, [named_table, set, public,
+                                                {read_concurrency, true}]);
+                _ -> ok
+            end,
+
+            %% Initialize height-to-hash ETS table
+            case ets:info(?HEIGHT_TO_HASH_ETS) of
+                undefined ->
+                    ets:new(?HEIGHT_TO_HASH_ETS, [named_table, set, public,
+                                                   {read_concurrency, true}]);
+                _ -> ok
+            end,
+
+            %% Initialize time index ETS table (ordered_set for range queries)
+            case ets:info(?TIME_INDEX_ETS) of
+                undefined ->
+                    ets:new(?TIME_INDEX_ETS, [named_table, ordered_set, public,
+                                               {read_concurrency, true}]);
+                _ -> ok
+            end,
+
+            %% Initialize block stats ETS table
+            case ets:info(?BLOCK_STATS_ETS) of
+                undefined ->
+                    ets:new(?BLOCK_STATS_ETS, [named_table, set, public,
                                                 {read_concurrency, true}]);
                 _ -> ok
             end,
@@ -1209,4 +1244,88 @@ mark_blocks_pruned(FileNums) ->
     (_, Acc) ->
         Acc
     end, ok, ?BLOCK_INDEX_ETS),
+    ok.
+
+%%% ===================================================================
+%%% Block height/time index functions
+%%% ===================================================================
+
+%% @doc Get block hash by height using ETS lookup.
+%% Falls back to RocksDB if not in ETS.
+-spec get_hash_by_height(non_neg_integer()) -> {ok, binary()} | not_found.
+get_hash_by_height(Height) ->
+    case ets:lookup(?HEIGHT_TO_HASH_ETS, Height) of
+        [{Height, Hash}] ->
+            {ok, Hash};
+        [] ->
+            %% Fall back to block_index in RocksDB
+            case get_block_index(Height) of
+                {ok, #{hash := Hash}} ->
+                    %% Cache it for future lookups
+                    ets:insert(?HEIGHT_TO_HASH_ETS, {Height, Hash}),
+                    {ok, Hash};
+                not_found ->
+                    not_found
+            end
+    end.
+
+%% @doc Get all block hashes within a time range (inclusive).
+%% Returns list of {Timestamp, Height, Hash} tuples sorted by timestamp.
+-spec get_blocks_in_time_range(non_neg_integer(), non_neg_integer()) ->
+    [{non_neg_integer(), non_neg_integer(), binary()}].
+get_blocks_in_time_range(FromTime, ToTime) ->
+    %% Use ETS select on ordered_set for efficient range query
+    MatchSpec = [{{{'$1', '$2'}, '$3'},
+                  [{'>=', '$1', FromTime}, {'=<', '$1', ToTime}],
+                  [{{'$1', '$2', '$3'}}]}],
+    ets:select(?TIME_INDEX_ETS, MatchSpec).
+
+%% @doc Store block statistics in ETS cache.
+%% Stats is a map with keys like txcount, total_weight, total_fee, etc.
+-spec store_block_stats(binary(), map()) -> ok.
+store_block_stats(Hash, Stats) when byte_size(Hash) =:= 32 ->
+    ets:insert(?BLOCK_STATS_ETS, {Hash, Stats}),
+    ok.
+
+%% @doc Get cached block statistics.
+-spec get_block_stats(binary()) -> {ok, map()} | not_found.
+get_block_stats(Hash) when byte_size(Hash) =:= 32 ->
+    case ets:lookup(?BLOCK_STATS_ETS, Hash) of
+        [{Hash, Stats}] -> {ok, Stats};
+        [] -> not_found
+    end.
+
+%% @doc Get cumulative transaction count up to a given height.
+%% Stored in meta CF for persistence.
+-spec get_cumulative_tx_count(non_neg_integer()) -> {ok, non_neg_integer()} | not_found.
+get_cumulative_tx_count(Height) ->
+    Key = <<"cumtx:", (integer_to_binary(Height))/binary>>,
+    case get_meta(Key) of
+        {ok, <<Count:64/big>>} -> {ok, Count};
+        not_found -> not_found
+    end.
+
+%% @doc Store cumulative transaction count for a height.
+-spec store_cumulative_tx_count(non_neg_integer(), non_neg_integer()) -> ok.
+store_cumulative_tx_count(Height, Count) ->
+    Key = <<"cumtx:", (integer_to_binary(Height))/binary>>,
+    Value = <<Count:64/big>>,
+    put_meta(Key, Value).
+
+%% @doc Update height and time indexes when connecting a block.
+%% Called by chainstate during block connection.
+-spec index_block(non_neg_integer(), binary(), non_neg_integer()) -> ok.
+index_block(Height, Hash, Timestamp) ->
+    %% Update height -> hash mapping
+    ets:insert(?HEIGHT_TO_HASH_ETS, {Height, Hash}),
+    %% Update time index: {Timestamp, Height} -> Hash
+    ets:insert(?TIME_INDEX_ETS, {{Timestamp, Height}, Hash}),
+    ok.
+
+%% @doc Remove height and time indexes when disconnecting a block.
+%% Called by chainstate during block disconnection.
+-spec unindex_block(non_neg_integer(), non_neg_integer()) -> ok.
+unindex_block(Height, Timestamp) ->
+    ets:delete(?HEIGHT_TO_HASH_ETS, Height),
+    ets:delete(?TIME_INDEX_ETS, {Timestamp, Height}),
     ok.
