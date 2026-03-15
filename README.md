@@ -33,6 +33,7 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] BIP9 versionbits soft fork deployment tracking
 - [x] Checkpoint enforcement (mainnet checkpoints)
 - [x] Peer misbehavior scoring and banning
+- [x] Pre-handshake connection rejection (ban/limit checks before handshake)
 - [ ] Wallet (HD keys, signing)
 - [ ] Compact block relay (BIP152)
 
