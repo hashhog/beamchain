@@ -35,6 +35,7 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] Peer misbehavior scoring and banning
 - [x] Pre-handshake connection rejection (ban/limit checks before handshake)
 - [x] Inv trickling (privacy-preserving tx relay with Poisson delays)
+- [x] Eclipse attack protections (bucket-based addrman, netgroup limits, anchor connections)
 - [ ] Wallet (HD keys, signing)
 - [ ] Compact block relay (BIP152)
 
@@ -62,7 +63,8 @@ src/
 ├── beamchain_crypto.erl       secp256k1 NIF bindings
 ├── beamchain_p2p_msg.erl      P2P message encoding
 ├── beamchain_peer.erl         Connection handling
-├── beamchain_peer_manager.erl Peer lifecycle and banning
+├── beamchain_peer_manager.erl Peer lifecycle, banning, eclipse protections
+├── beamchain_addrman.erl      Address manager with bucket-based storage
 ├── beamchain_header_sync.erl  Header-first sync with anti-DoS
 ├── beamchain_block_sync.erl   Block download
 ├── beamchain_chainstate.erl   UTXO management
@@ -84,6 +86,7 @@ test/
 ├── beamchain_mempool_tests.erl        Mempool and limit tests
 ├── beamchain_peer_tests.erl           Inv trickling and relay tests
 ├── beamchain_peer_manager_tests.erl   Misbehavior and banning tests
+├── beamchain_addrman_tests.erl        Bucket assignment and netgroup tests
 ├── beamchain_pow_tests.erl            PoW and difficulty adjustment tests
 ├── beamchain_versionbits_tests.erl    BIP9 state machine tests
 └── beamchain_validation_tests.erl     Consensus rule tests
