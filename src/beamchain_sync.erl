@@ -189,6 +189,25 @@ route_message(_Peer, inv, _Payload, State) ->
     %% TODO: handle block announcements via inv
     State;
 
+%% BIP152 compact block messages
+route_message(Peer, cmpctblock, Payload, State) ->
+    case beamchain_p2p_msg:decode_payload(cmpctblock, Payload) of
+        {ok, CmpctBlock} ->
+            beamchain_block_sync:handle_cmpctblock(Peer, CmpctBlock);
+        _Error ->
+            beamchain_peer:add_misbehavior(Peer, 20)
+    end,
+    State;
+
+route_message(Peer, blocktxn, Payload, State) ->
+    case beamchain_p2p_msg:decode_payload(blocktxn, Payload) of
+        {ok, BlockTxn} ->
+            beamchain_block_sync:handle_blocktxn(Peer, BlockTxn);
+        _Error ->
+            beamchain_peer:add_misbehavior(Peer, 20)
+    end,
+    State;
+
 route_message(_Peer, _Command, _Payload, State) ->
     State.
 
