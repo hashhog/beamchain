@@ -919,3 +919,158 @@ nullfail_checkmultisigverify_nonempty_sig_test() ->
     %% With NULLFAIL flag, should fail with nullfail error
     {error, nullfail} = beamchain_script:eval_script(
         Script, [], ?SCRIPT_VERIFY_NULLFAIL, SigChecker, base).
+
+%%% -------------------------------------------------------------------
+%%% WITNESS_PUBKEYTYPE tests (BIP 141)
+%%% -------------------------------------------------------------------
+
+%% Test that compressed pubkeys (0x02 prefix) are accepted in witness v0
+witness_pubkeytype_compressed_02_test() ->
+    %% 33-byte compressed pubkey with 0x02 prefix
+    CompressedPK = <<16#02, 1:256>>,
+    ValidSig = <<16#30, 16#06, 16#02, 16#01, 16#01, 16#02, 16#01, 16#01, 16#01>>,
+    SigChecker = #{
+        check_ecdsa_sig => fun(_, _, _) -> true end,
+        compute_sighash => fun(_, _) -> <<0:256>> end
+    },
+    Script = <<
+        (byte_size(ValidSig)), ValidSig/binary,
+        (byte_size(CompressedPK)), CompressedPK/binary,
+        16#ac  %% OP_CHECKSIG
+    >>,
+    %% Should succeed with WITNESS_PUBKEYTYPE flag in witness_v0
+    {ok, [<<1>>]} = beamchain_script:eval_script(
+        Script, [], ?SCRIPT_VERIFY_WITNESS_PUBKEYTYPE, SigChecker, witness_v0).
+
+%% Test that compressed pubkeys (0x03 prefix) are accepted in witness v0
+witness_pubkeytype_compressed_03_test() ->
+    %% 33-byte compressed pubkey with 0x03 prefix
+    CompressedPK = <<16#03, 1:256>>,
+    ValidSig = <<16#30, 16#06, 16#02, 16#01, 16#01, 16#02, 16#01, 16#01, 16#01>>,
+    SigChecker = #{
+        check_ecdsa_sig => fun(_, _, _) -> true end,
+        compute_sighash => fun(_, _) -> <<0:256>> end
+    },
+    Script = <<
+        (byte_size(ValidSig)), ValidSig/binary,
+        (byte_size(CompressedPK)), CompressedPK/binary,
+        16#ac  %% OP_CHECKSIG
+    >>,
+    %% Should succeed with WITNESS_PUBKEYTYPE flag in witness_v0
+    {ok, [<<1>>]} = beamchain_script:eval_script(
+        Script, [], ?SCRIPT_VERIFY_WITNESS_PUBKEYTYPE, SigChecker, witness_v0).
+
+%% Test that uncompressed pubkeys (0x04 prefix, 65 bytes) are rejected in witness v0
+witness_pubkeytype_uncompressed_04_rejected_test() ->
+    %% 65-byte uncompressed pubkey with 0x04 prefix
+    UncompressedPK = <<16#04, 1:256, 2:256>>,
+    ValidSig = <<16#30, 16#06, 16#02, 16#01, 16#01, 16#02, 16#01, 16#01, 16#01>>,
+    SigChecker = #{
+        check_ecdsa_sig => fun(_, _, _) -> true end,
+        compute_sighash => fun(_, _) -> <<0:256>> end
+    },
+    Script = <<
+        (byte_size(ValidSig)), ValidSig/binary,
+        (byte_size(UncompressedPK)), UncompressedPK/binary,
+        16#ac  %% OP_CHECKSIG
+    >>,
+    %% Should fail with witness_pubkeytype error
+    {error, witness_pubkeytype} = beamchain_script:eval_script(
+        Script, [], ?SCRIPT_VERIFY_WITNESS_PUBKEYTYPE, SigChecker, witness_v0).
+
+%% Test that uncompressed pubkeys ARE allowed when WITNESS_PUBKEYTYPE flag is not set
+witness_pubkeytype_uncompressed_allowed_without_flag_test() ->
+    %% 65-byte uncompressed pubkey with 0x04 prefix
+    UncompressedPK = <<16#04, 1:256, 2:256>>,
+    ValidSig = <<16#30, 16#06, 16#02, 16#01, 16#01, 16#02, 16#01, 16#01, 16#01>>,
+    SigChecker = #{
+        check_ecdsa_sig => fun(_, _, _) -> true end,
+        compute_sighash => fun(_, _) -> <<0:256>> end
+    },
+    Script = <<
+        (byte_size(ValidSig)), ValidSig/binary,
+        (byte_size(UncompressedPK)), UncompressedPK/binary,
+        16#ac  %% OP_CHECKSIG
+    >>,
+    %% Should succeed without WITNESS_PUBKEYTYPE flag (even in witness_v0)
+    {ok, [<<1>>]} = beamchain_script:eval_script(
+        Script, [], 0, SigChecker, witness_v0).
+
+%% Test that uncompressed pubkeys are allowed in legacy scripts (sig_version=base)
+witness_pubkeytype_legacy_uncompressed_allowed_test() ->
+    %% 65-byte uncompressed pubkey with 0x04 prefix
+    UncompressedPK = <<16#04, 1:256, 2:256>>,
+    ValidSig = <<16#30, 16#06, 16#02, 16#01, 16#01, 16#02, 16#01, 16#01, 16#01>>,
+    SigChecker = #{
+        check_ecdsa_sig => fun(_, _, _) -> true end,
+        compute_sighash => fun(_, _) -> <<0:256>> end
+    },
+    Script = <<
+        (byte_size(ValidSig)), ValidSig/binary,
+        (byte_size(UncompressedPK)), UncompressedPK/binary,
+        16#ac  %% OP_CHECKSIG
+    >>,
+    %% Should succeed in legacy mode even with WITNESS_PUBKEYTYPE flag
+    %% (flag only applies to witness v0)
+    {ok, [<<1>>]} = beamchain_script:eval_script(
+        Script, [], ?SCRIPT_VERIFY_WITNESS_PUBKEYTYPE, SigChecker, base).
+
+%% Test WITNESS_PUBKEYTYPE enforcement in CHECKSIGVERIFY
+witness_pubkeytype_checksigverify_rejected_test() ->
+    %% 65-byte uncompressed pubkey
+    UncompressedPK = <<16#04, 1:256, 2:256>>,
+    ValidSig = <<16#30, 16#06, 16#02, 16#01, 16#01, 16#02, 16#01, 16#01, 16#01>>,
+    SigChecker = #{
+        check_ecdsa_sig => fun(_, _, _) -> true end,
+        compute_sighash => fun(_, _) -> <<0:256>> end
+    },
+    Script = <<
+        (byte_size(ValidSig)), ValidSig/binary,
+        (byte_size(UncompressedPK)), UncompressedPK/binary,
+        16#ad  %% OP_CHECKSIGVERIFY
+    >>,
+    %% Should fail with witness_pubkeytype error
+    {error, witness_pubkeytype} = beamchain_script:eval_script(
+        Script, [], ?SCRIPT_VERIFY_WITNESS_PUBKEYTYPE, SigChecker, witness_v0).
+
+%% Test WITNESS_PUBKEYTYPE enforcement in CHECKMULTISIG
+witness_pubkeytype_checkmultisig_rejected_test() ->
+    %% 65-byte uncompressed pubkey
+    UncompressedPK = <<16#04, 1:256, 2:256>>,
+    ValidSig = <<16#30, 16#06, 16#02, 16#01, 16#01, 16#02, 16#01, 16#01, 16#01>>,
+    SigChecker = #{
+        check_ecdsa_sig => fun(_, _, _) -> true end,
+        compute_sighash => fun(_, _) -> <<0:256>> end
+    },
+    Script = <<
+        16#00,                                   %% OP_0 (dummy)
+        (byte_size(ValidSig)), ValidSig/binary,
+        16#51,                                   %% OP_1 (m = 1)
+        (byte_size(UncompressedPK)), UncompressedPK/binary,
+        16#51,                                   %% OP_1 (n = 1)
+        16#ae                                    %% OP_CHECKMULTISIG
+    >>,
+    %% Should fail with witness_pubkeytype error
+    {error, witness_pubkeytype} = beamchain_script:eval_script(
+        Script, [], ?SCRIPT_VERIFY_WITNESS_PUBKEYTYPE, SigChecker, witness_v0).
+
+%% Test that CHECKMULTISIG with compressed pubkeys succeeds
+witness_pubkeytype_checkmultisig_compressed_test() ->
+    %% 33-byte compressed pubkey
+    CompressedPK = <<16#02, 1:256>>,
+    ValidSig = <<16#30, 16#06, 16#02, 16#01, 16#01, 16#02, 16#01, 16#01, 16#01>>,
+    SigChecker = #{
+        check_ecdsa_sig => fun(_, _, _) -> true end,
+        compute_sighash => fun(_, _) -> <<0:256>> end
+    },
+    Script = <<
+        16#00,                                   %% OP_0 (dummy)
+        (byte_size(ValidSig)), ValidSig/binary,
+        16#51,                                   %% OP_1 (m = 1)
+        (byte_size(CompressedPK)), CompressedPK/binary,
+        16#51,                                   %% OP_1 (n = 1)
+        16#ae                                    %% OP_CHECKMULTISIG
+    >>,
+    %% Should succeed with WITNESS_PUBKEYTYPE flag
+    {ok, [<<1>>]} = beamchain_script:eval_script(
+        Script, [], ?SCRIPT_VERIFY_WITNESS_PUBKEYTYPE, SigChecker, witness_v0).
