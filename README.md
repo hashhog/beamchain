@@ -62,6 +62,7 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] Output descriptors (BIP380-386: pkh, wpkh, sh, wsh, multi, tr, addr, raw)
 - [x] Miniscript policy compiler (type checking, script compilation, satisfaction)
 - [x] BIP330 Erlay transaction reconciliation (sendtxrcncl handshake, set reconciliation)
+- [x] assumeUTXO snapshot-based sync (loadtxoutset RPC, background validation)
 
 ## Quick start
 
@@ -92,7 +93,9 @@ src/
 ├── beamchain_header_sync.erl  Header-first sync with anti-DoS
 ├── beamchain_block_sync.erl   Block download and compact block relay
 ├── beamchain_compact_block.erl BIP152 compact block reconstruction
-├── beamchain_chainstate.erl   UTXO management
+├── beamchain_chainstate.erl   UTXO management with assumeUTXO
+├── beamchain_chainstate_sup.erl Chainstate supervisor (snapshot/background)
+├── beamchain_snapshot.erl     UTXO snapshot loading and verification
 ├── beamchain_mempool.erl      Transaction pool with cluster linearization
 ├── beamchain_miner.erl        Block template construction
 ├── beamchain_pow.erl          Proof of work and difficulty
@@ -129,7 +132,8 @@ test/
 ├── beamchain_descriptor_tests.erl     Output descriptor tests
 ├── beamchain_miniscript_tests.erl     Miniscript parsing, compilation, satisfaction
 ├── beamchain_transport_v2_tests.erl   BIP324 v2 transport tests
-└── beamchain_erlay_tests.erl          BIP330 Erlay reconciliation tests
+├── beamchain_erlay_tests.erl          BIP330 Erlay reconciliation tests
+└── beamchain_snapshot_tests.erl       assumeUTXO snapshot tests
 ```
 
 ## Running tests
