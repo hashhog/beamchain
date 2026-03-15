@@ -54,7 +54,7 @@ command_roundtrip_test_() ->
     Commands = [version, verack, ping, pong, addr, getaddr, inv, getdata,
                 notfound, getheaders, headers, getblocks, block, tx,
                 mempool, sendheaders, feefilter, sendcmpct, cmpctblock,
-                getblocktxn, blocktxn, wtxidrelay, sendaddrv2],
+                getblocktxn, blocktxn, wtxidrelay, sendaddrv2, addrv2],
     [?_assertEqual(Cmd, beamchain_p2p_msg:command_atom(
                             beamchain_p2p_msg:command_name(Cmd)))
      || Cmd <- Commands].
@@ -552,3 +552,166 @@ multiple_messages_stream_test() ->
     {ok, ping, _, Rest1} = beamchain_p2p_msg:decode_msg(Stream),
     {ok, pong, _, Rest2} = beamchain_p2p_msg:decode_msg(Rest1),
     {ok, verack, _, <<>>} = beamchain_p2p_msg:decode_msg(Rest2).
+
+%%% ===================================================================
+%%% BIP155 ADDRv2 tests
+%%% ===================================================================
+
+%% Test addrv2 with IPv4 address
+addrv2_ipv4_roundtrip_test() ->
+    Addrs = [
+        #{timestamp => 1702000000, services => ?NODE_NETWORK,
+          network_id => 1, ip => {93, 184, 216, 34}, port => 8333}
+    ],
+    Bin = beamchain_p2p_msg:encode_payload(addrv2, #{addrs => Addrs}),
+    {ok, #{addrs := Decoded}} = beamchain_p2p_msg:decode_payload(addrv2, Bin),
+    ?assertEqual(1, length(Decoded)),
+    [Entry] = Decoded,
+    ?assertEqual(1, maps:get(network_id, Entry)),
+    ?assertEqual({93, 184, 216, 34}, maps:get(ip, Entry)),
+    ?assertEqual(8333, maps:get(port, Entry)),
+    ?assertEqual(?NODE_NETWORK, maps:get(services, Entry)).
+
+%% Test addrv2 with IPv6 address
+addrv2_ipv6_roundtrip_test() ->
+    IPv6 = {8193, 3512, 0, 0, 0, 0, 0, 1},  %% 2001:db8::1
+    Addrs = [
+        #{timestamp => 1702000000, services => ?NODE_WITNESS,
+          network_id => 2, ip => IPv6, port => 8333}
+    ],
+    Bin = beamchain_p2p_msg:encode_payload(addrv2, #{addrs => Addrs}),
+    {ok, #{addrs := Decoded}} = beamchain_p2p_msg:decode_payload(addrv2, Bin),
+    ?assertEqual(1, length(Decoded)),
+    [Entry] = Decoded,
+    ?assertEqual(2, maps:get(network_id, Entry)),
+    ?assertEqual(IPv6, maps:get(ip, Entry)),
+    ?assertEqual(8333, maps:get(port, Entry)).
+
+%% Test addrv2 with TorV3 address (32 bytes)
+addrv2_torv3_roundtrip_test() ->
+    %% TorV3: 32-byte ed25519 public key
+    TorV3Addr = crypto:strong_rand_bytes(32),
+    Addrs = [
+        #{timestamp => 1702000000, services => ?NODE_NETWORK,
+          network => torv3, network_id => 4, address => TorV3Addr, port => 9050}
+    ],
+    Bin = beamchain_p2p_msg:encode_payload(addrv2, #{addrs => Addrs}),
+    {ok, #{addrs := Decoded}} = beamchain_p2p_msg:decode_payload(addrv2, Bin),
+    ?assertEqual(1, length(Decoded)),
+    [Entry] = Decoded,
+    ?assertEqual(4, maps:get(network_id, Entry)),
+    ?assertEqual(TorV3Addr, maps:get(address, Entry)),
+    ?assertEqual(9050, maps:get(port, Entry)),
+    ?assertEqual(torv3, maps:get(network, Entry)).
+
+%% Test addrv2 with I2P address (32 bytes)
+addrv2_i2p_roundtrip_test() ->
+    %% I2P: 32-byte SHA256 destination hash
+    I2PAddr = crypto:strong_rand_bytes(32),
+    Addrs = [
+        #{timestamp => 1702000000, services => ?NODE_NETWORK,
+          network => i2p, network_id => 5, address => I2PAddr, port => 0}
+    ],
+    Bin = beamchain_p2p_msg:encode_payload(addrv2, #{addrs => Addrs}),
+    {ok, #{addrs := Decoded}} = beamchain_p2p_msg:decode_payload(addrv2, Bin),
+    ?assertEqual(1, length(Decoded)),
+    [Entry] = Decoded,
+    ?assertEqual(5, maps:get(network_id, Entry)),
+    ?assertEqual(I2PAddr, maps:get(address, Entry)),
+    ?assertEqual(i2p, maps:get(network, Entry)).
+
+%% Test addrv2 with CJDNS address (16 bytes starting with 0xFC)
+addrv2_cjdns_roundtrip_test() ->
+    %% CJDNS: 16-byte address starting with 0xFC
+    CJDNSAddr = <<16#FC, (crypto:strong_rand_bytes(15))/binary>>,
+    Addrs = [
+        #{timestamp => 1702000000, services => ?NODE_NETWORK,
+          network => cjdns, network_id => 6, address => CJDNSAddr, port => 8333}
+    ],
+    Bin = beamchain_p2p_msg:encode_payload(addrv2, #{addrs => Addrs}),
+    {ok, #{addrs := Decoded}} = beamchain_p2p_msg:decode_payload(addrv2, Bin),
+    ?assertEqual(1, length(Decoded)),
+    [Entry] = Decoded,
+    ?assertEqual(6, maps:get(network_id, Entry)),
+    ?assertEqual(CJDNSAddr, maps:get(address, Entry)),
+    ?assertEqual(cjdns, maps:get(network, Entry)).
+
+%% Test addrv2 with multiple network types
+addrv2_mixed_networks_test() ->
+    TorV3Addr = crypto:strong_rand_bytes(32),
+    I2PAddr = crypto:strong_rand_bytes(32),
+    Addrs = [
+        #{timestamp => 1702000000, services => ?NODE_NETWORK,
+          network_id => 1, ip => {192, 168, 1, 1}, port => 8333},
+        #{timestamp => 1702000100, services => ?NODE_WITNESS,
+          network_id => 2, ip => {8193, 3512, 0, 0, 0, 0, 0, 1}, port => 8333},
+        #{timestamp => 1702000200, services => 0,
+          network => torv3, network_id => 4, address => TorV3Addr, port => 9050},
+        #{timestamp => 1702000300, services => ?NODE_NETWORK,
+          network => i2p, network_id => 5, address => I2PAddr, port => 0}
+    ],
+    Bin = beamchain_p2p_msg:encode_payload(addrv2, #{addrs => Addrs}),
+    {ok, #{addrs := Decoded}} = beamchain_p2p_msg:decode_payload(addrv2, Bin),
+    ?assertEqual(4, length(Decoded)),
+    %% Check network IDs
+    NetworkIds = [maps:get(network_id, E) || E <- Decoded],
+    ?assertEqual([1, 2, 4, 5], NetworkIds).
+
+%% Test addrv2 empty message
+addrv2_empty_test() ->
+    Bin = beamchain_p2p_msg:encode_payload(addrv2, #{addrs => []}),
+    {ok, #{addrs := []}} = beamchain_p2p_msg:decode_payload(addrv2, Bin).
+
+%% Test addrv2 entry encoding/decoding
+addrv2_entry_roundtrip_test() ->
+    Entry = #{timestamp => 1702000000, services => 1033,
+              network_id => 1, ip => {10, 0, 0, 1}, port => 8333},
+    Bin = beamchain_p2p_msg:encode_addrv2_entry(Entry),
+    {Decoded, <<>>} = beamchain_p2p_msg:decode_addrv2_entry(Bin),
+    ?assertEqual(1702000000, maps:get(timestamp, Decoded)),
+    ?assertEqual(1033, maps:get(services, Decoded)),
+    ?assertEqual(1, maps:get(network_id, Decoded)),
+    ?assertEqual({10, 0, 0, 1}, maps:get(ip, Decoded)),
+    ?assertEqual(8333, maps:get(port, Decoded)).
+
+%% Test network_id helper functions
+network_id_helpers_test() ->
+    ?assertEqual(1, beamchain_p2p_msg:network_id(#{ip => {1, 2, 3, 4}})),
+    ?assertEqual(2, beamchain_p2p_msg:network_id(#{ip => {1, 2, 3, 4, 5, 6, 7, 8}})),
+    ?assertEqual(4, beamchain_p2p_msg:network_id(#{network_id => 4})),
+    ?assertEqual(ipv4, beamchain_p2p_msg:network_id_to_atom(1)),
+    ?assertEqual(ipv6, beamchain_p2p_msg:network_id_to_atom(2)),
+    ?assertEqual(torv3, beamchain_p2p_msg:network_id_to_atom(4)),
+    ?assertEqual(i2p, beamchain_p2p_msg:network_id_to_atom(5)),
+    ?assertEqual(cjdns, beamchain_p2p_msg:network_id_to_atom(6)),
+    ?assertEqual(4, beamchain_p2p_msg:addr_size_for_network(1)),
+    ?assertEqual(16, beamchain_p2p_msg:addr_size_for_network(2)),
+    ?assertEqual(32, beamchain_p2p_msg:addr_size_for_network(4)),
+    ?assertEqual(32, beamchain_p2p_msg:addr_size_for_network(5)),
+    ?assertEqual(16, beamchain_p2p_msg:addr_size_for_network(6)).
+
+%% Test addrv2 CompactSize services encoding
+addrv2_compactsize_services_test() ->
+    %% Large services value that requires CompactSize encoding
+    LargeSvc = 16#FFFFFFFF,
+    Entry = #{timestamp => 1702000000, services => LargeSvc,
+              network_id => 1, ip => {1, 2, 3, 4}, port => 8333},
+    Bin = beamchain_p2p_msg:encode_addrv2_entry(Entry),
+    {Decoded, <<>>} = beamchain_p2p_msg:decode_addrv2_entry(Bin),
+    ?assertEqual(LargeSvc, maps:get(services, Decoded)).
+
+%% Test full pipeline: addrv2 encode payload -> frame -> decode frame -> decode payload
+full_pipeline_addrv2_test() ->
+    Magic = ?MAINNET_MAGIC,
+    TorV3Addr = crypto:strong_rand_bytes(32),
+    Addrs = [
+        #{timestamp => 1702000000, services => ?NODE_NETWORK,
+          network_id => 1, ip => {192, 168, 1, 1}, port => 8333},
+        #{timestamp => 1702000100, services => ?NODE_NETWORK,
+          network => torv3, network_id => 4, address => TorV3Addr, port => 9050}
+    ],
+    Payload = beamchain_p2p_msg:encode_payload(addrv2, #{addrs => Addrs}),
+    Framed = beamchain_p2p_msg:encode_msg(Magic, addrv2, Payload),
+    {ok, addrv2, RawPayload, <<>>} = beamchain_p2p_msg:decode_msg(Framed),
+    {ok, #{addrs := DecodedAddrs}} = beamchain_p2p_msg:decode_payload(addrv2, RawPayload),
+    ?assertEqual(2, length(DecodedAddrs)).
