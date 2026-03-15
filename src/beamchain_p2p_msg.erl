@@ -100,7 +100,14 @@ command_name(getblocktxn) -> <<"getblocktxn">>;
 command_name(blocktxn)    -> <<"blocktxn">>;
 command_name(wtxidrelay)  -> <<"wtxidrelay">>;
 command_name(sendaddrv2)  -> <<"sendaddrv2">>;
-command_name(addrv2)      -> <<"addrv2">>.
+command_name(addrv2)      -> <<"addrv2">>;
+%% BIP330 Erlay transaction reconciliation
+command_name(sendtxrcncl) -> <<"sendtxrcncl">>;
+command_name(reqrecon)    -> <<"reqrecon">>;
+command_name(sketch)      -> <<"sketch">>;
+command_name(reconcildiff) -> <<"reconcildiff">>;
+command_name(reqsketchext) -> <<"reqsketchext">>;
+command_name(reqtx)       -> <<"reqtx">>.
 
 -spec command_atom(binary()) -> atom().
 command_atom(<<"version">>)     -> version;
@@ -127,6 +134,13 @@ command_atom(<<"blocktxn">>)    -> blocktxn;
 command_atom(<<"wtxidrelay">>)  -> wtxidrelay;
 command_atom(<<"sendaddrv2">>)  -> sendaddrv2;
 command_atom(<<"addrv2">>)      -> addrv2;
+%% BIP330 Erlay transaction reconciliation
+command_atom(<<"sendtxrcncl">>) -> sendtxrcncl;
+command_atom(<<"reqrecon">>)    -> reqrecon;
+command_atom(<<"sketch">>)      -> sketch;
+command_atom(<<"reconcildiff">>) -> reconcildiff;
+command_atom(<<"reqsketchext">>) -> reqsketchext;
+command_atom(<<"reqtx">>)       -> reqtx;
 command_atom(Other)             -> binary_to_atom(Other, utf8).
 
 %%% ===================================================================
@@ -249,7 +263,40 @@ encode_payload(blocktxn, #{block_hash := Hash, transactions := Txs}) ->
     Count = beamchain_serialize:encode_varint(length(Txs)),
     TxsBin = << <<(beamchain_serialize:encode_transaction(T))/binary>>
                 || T <- Txs >>,
-    <<Hash:32/binary, Count/binary, TxsBin/binary>>.
+    <<Hash:32/binary, Count/binary, TxsBin/binary>>;
+
+%% -- BIP330 Erlay transaction reconciliation -------------------------------
+
+%% sendtxrcncl: version(4) + salt(8)
+encode_payload(sendtxrcncl, #{version := V, salt := Salt}) ->
+    <<V:32/little, Salt:64/little>>;
+
+%% reqrecon: peer_set_size(2) + q(2)
+%% q = coefficient for estimating expected difference
+encode_payload(reqrecon, #{set_size := SetSize, q := Q}) ->
+    <<SetSize:16/little, Q:16/little>>;
+
+%% sketch: sketch_data (variable length)
+encode_payload(sketch, #{sketch := SketchData}) ->
+    SketchData;
+
+%% reconcildiff: success(1) + short_ids (if success)
+encode_payload(reconcildiff, #{success := true, short_ids := ShortIds}) ->
+    Count = beamchain_serialize:encode_varint(length(ShortIds)),
+    IdsBin = << <<Id:32/little>> || Id <- ShortIds >>,
+    <<1:8, Count/binary, IdsBin/binary>>;
+encode_payload(reconcildiff, #{success := false}) ->
+    <<0:8>>;
+
+%% reqsketchext: extension capacity request
+encode_payload(reqsketchext, _) ->
+    <<>>;
+
+%% reqtx: request missing transactions by short txid
+encode_payload(reqtx, #{short_ids := ShortIds}) ->
+    Count = beamchain_serialize:encode_varint(length(ShortIds)),
+    IdsBin = << <<Id:32/little>> || Id <- ShortIds >>,
+    <<Count/binary, IdsBin/binary>>.
 
 %%% ===================================================================
 %%% Payload decoding
@@ -367,7 +414,33 @@ decode_payload(getblocktxn, <<Hash:32/binary, Rest/binary>>) ->
 decode_payload(blocktxn, <<Hash:32/binary, Rest/binary>>) ->
     {Count, Rest2} = beamchain_serialize:decode_varint(Rest),
     {Txs, _} = decode_txs(Count, Rest2, []),
-    {ok, #{block_hash => Hash, transactions => Txs}}.
+    {ok, #{block_hash => Hash, transactions => Txs}};
+
+%% -- BIP330 Erlay transaction reconciliation -------------------------------
+
+decode_payload(sendtxrcncl, <<V:32/little, Salt:64/little>>) ->
+    {ok, #{version => V, salt => Salt}};
+
+decode_payload(reqrecon, <<SetSize:16/little, Q:16/little>>) ->
+    {ok, #{set_size => SetSize, q => Q}};
+
+decode_payload(sketch, SketchData) ->
+    {ok, #{sketch => SketchData}};
+
+decode_payload(reconcildiff, <<1:8, Rest/binary>>) ->
+    {Count, Rest2} = beamchain_serialize:decode_varint(Rest),
+    {ShortIds, _} = decode_erlay_short_ids(Count, Rest2, []),
+    {ok, #{success => true, short_ids => ShortIds}};
+decode_payload(reconcildiff, <<0:8>>) ->
+    {ok, #{success => false, short_ids => []}};
+
+decode_payload(reqsketchext, <<>>) ->
+    {ok, #{}};
+
+decode_payload(reqtx, Bin) ->
+    {Count, Rest} = beamchain_serialize:decode_varint(Bin),
+    {ShortIds, _} = decode_erlay_short_ids(Count, Rest, []),
+    {ok, #{short_ids => ShortIds}}.
 
 %%% ===================================================================
 %%% Version message decoding
@@ -481,6 +554,11 @@ decode_prefilled_txns(N, Bin, Acc) ->
 decode_short_ids(0, Rest, Acc) -> {lists:reverse(Acc), Rest};
 decode_short_ids(N, <<SID:6/binary, Rest/binary>>, Acc) ->
     decode_short_ids(N - 1, Rest, [SID | Acc]).
+
+%% Erlay short txids (32-bit, little-endian)
+decode_erlay_short_ids(0, Rest, Acc) -> {lists:reverse(Acc), Rest};
+decode_erlay_short_ids(N, <<Id:32/little, Rest/binary>>, Acc) ->
+    decode_erlay_short_ids(N - 1, Rest, [Id | Acc]).
 
 %% Differentially-encoded indexes for getblocktxn.
 %% Each index is encoded as the difference from the previous index minus one.
