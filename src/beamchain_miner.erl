@@ -11,6 +11,7 @@
 -export([start_link/0]).
 -export([create_block_template/1, create_block_template/2]).
 -export([submit_block/1]).
+-export([generate_blocks/3, generate_block_with_txs/3]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -59,6 +60,21 @@ create_block_template(CoinbaseScriptPubKey, Opts) ->
 submit_block(HexBlock) ->
     gen_server:call(?SERVER, {submit_block, HexBlock}, 60000).
 
+%% @doc Generate N blocks with coinbase paying to given scriptPubKey.
+%% Only works on regtest. Returns list of block hashes (hex strings).
+-spec generate_blocks(binary(), non_neg_integer(), non_neg_integer()) ->
+    {ok, [binary()]} | {error, term()}.
+generate_blocks(CoinbaseScript, NumBlocks, MaxTries) ->
+    gen_server:call(?SERVER, {generate_blocks, CoinbaseScript, NumBlocks, MaxTries},
+                    NumBlocks * 60000 + 30000).
+
+%% @doc Generate a single block with specific transactions.
+%% Only works on regtest. Returns {hash, hex} if submit=false, else just {hash}.
+-spec generate_block_with_txs(binary(), [#transaction{}], boolean()) ->
+    {ok, map()} | {error, term()}.
+generate_block_with_txs(CoinbaseScript, Txs, Submit) ->
+    gen_server:call(?SERVER, {generate_block_with_txs, CoinbaseScript, Txs, Submit}, 60000).
+
 %%% ===================================================================
 %%% gen_server callbacks
 %%% ===================================================================
@@ -90,6 +106,28 @@ handle_call({submit_block, HexBlock}, _From, State) ->
         _ -> State
     end,
     {reply, Result, State2};
+
+handle_call({generate_blocks, CoinbaseScript, NumBlocks, MaxTries}, _From, State) ->
+    %% Only allowed on regtest
+    case State#state.network of
+        regtest ->
+            Result = do_generate_blocks(CoinbaseScript, NumBlocks, MaxTries, State),
+            State2 = State#state{template = undefined},
+            {reply, Result, State2};
+        _ ->
+            {reply, {error, not_regtest}, State}
+    end;
+
+handle_call({generate_block_with_txs, CoinbaseScript, Txs, Submit}, _From, State) ->
+    %% Only allowed on regtest
+    case State#state.network of
+        regtest ->
+            Result = do_generate_block_with_txs(CoinbaseScript, Txs, Submit, State),
+            State2 = State#state{template = undefined},
+            {reply, Result, State2};
+        _ ->
+            {reply, {error, not_regtest}, State}
+    end;
 
 handle_call(_Request, _From, State) ->
     {reply, {error, not_implemented}, State}.
@@ -607,3 +645,201 @@ le_minimal_acc(0, Acc) -> Acc;
 le_minimal_acc(N, Acc) ->
     Byte = N band 16#ff,
     le_minimal_acc(N bsr 8, <<Acc/binary, Byte:8>>).
+
+%%% ===================================================================
+%%% Internal: regtest block generation
+%%% ===================================================================
+
+%% Generate multiple blocks sequentially.
+do_generate_blocks(CoinbaseScript, NumBlocks, MaxTries, State) ->
+    do_generate_blocks_loop(CoinbaseScript, NumBlocks, MaxTries, State, []).
+
+do_generate_blocks_loop(_CoinbaseScript, 0, _MaxTries, _State, Acc) ->
+    {ok, lists:reverse(Acc)};
+do_generate_blocks_loop(CoinbaseScript, N, MaxTries, State, Acc) ->
+    case do_generate_one_block(CoinbaseScript, MaxTries, State) of
+        {ok, BlockHashHex} ->
+            do_generate_blocks_loop(CoinbaseScript, N - 1, MaxTries, State,
+                                    [BlockHashHex | Acc]);
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% Generate a single block using the current chain state.
+do_generate_one_block(CoinbaseScript, MaxTries, #state{params = Params}) ->
+    case create_block_template(CoinbaseScript) of
+        {ok, Template} ->
+            Header = maps:get(<<"_header">>, Template),
+            AllTxs = maps:get(<<"_all_txs">>, Template),
+            PowLimit = maps:get(pow_limit, Params),
+
+            case mine_block(Header, AllTxs, MaxTries, PowLimit) of
+                {ok, MinedBlock, BlockHash} ->
+                    %% Submit the mined block
+                    HexBlock = beamchain_serialize:hex_encode(
+                        beamchain_serialize:encode_block(MinedBlock)),
+                    case do_submit_block(HexBlock) of
+                        ok ->
+                            BlockHashHex = beamchain_serialize:hex_encode(
+                                beamchain_serialize:reverse_bytes(BlockHash)),
+                            {ok, BlockHashHex};
+                        {error, Reason} ->
+                            {error, Reason}
+                    end;
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% Generate a block with specific transactions.
+do_generate_block_with_txs(CoinbaseScript, Txs, Submit,
+                           #state{params = Params, network = Network}) ->
+    case beamchain_chainstate:get_tip() of
+        {ok, {TipHash, TipHeight}} ->
+            Height = TipHeight + 1,
+            MTP = beamchain_chainstate:get_mtp(),
+
+            %% Get difficulty for regtest (use pow_limit)
+            PowLimit = maps:get(pow_limit, Params),
+            PowLimitInt = binary:decode_unsigned(PowLimit, big),
+            Bits = beamchain_pow:target_to_bits(PowLimitInt),
+
+            %% Check if any tx has witness data
+            HasWitnessTx = lists:any(fun(Tx) -> has_witness(Tx) end, Txs),
+
+            %% Block subsidy (no fees from provided txs for simplicity)
+            Subsidy = beamchain_chain_params:block_subsidy(Height, Network),
+            TotalFees = lists:foldl(fun(_Tx, Sum) ->
+                %% In a real impl, would compute fee from inputs-outputs
+                %% For generateblock, caller is responsible for valid txs
+                Sum
+            end, 0, Txs),
+            CoinbaseValue = Subsidy + TotalFees,
+
+            %% Build coinbase with empty selected entries (no mempool deps)
+            CoinbaseTx = build_coinbase_for_txs(Height, CoinbaseScript,
+                                                 CoinbaseValue, HasWitnessTx, Txs),
+
+            %% All transactions
+            AllTxs = [CoinbaseTx | Txs],
+
+            %% Compute merkle root
+            TxHashes = [beamchain_serialize:tx_hash(Tx) || Tx <- AllTxs],
+            MerkleRoot = beamchain_serialize:compute_merkle_root(TxHashes),
+
+            %% Timestamp
+            Now = erlang:system_time(second),
+            Timestamp = max(MTP + 1, Now),
+
+            %% Header
+            Header = #block_header{
+                version = 16#20000000,
+                prev_hash = TipHash,
+                merkle_root = MerkleRoot,
+                timestamp = Timestamp,
+                bits = Bits,
+                nonce = 0
+            },
+
+            case mine_block(Header, AllTxs, 1000000, PowLimit) of
+                {ok, MinedBlock, BlockHash} ->
+                    BlockHashHex = beamchain_serialize:hex_encode(
+                        beamchain_serialize:reverse_bytes(BlockHash)),
+                    HexBlock = beamchain_serialize:hex_encode(
+                        beamchain_serialize:encode_block(MinedBlock)),
+
+                    case Submit of
+                        true ->
+                            case do_submit_block(HexBlock) of
+                                ok ->
+                                    {ok, #{<<"hash">> => BlockHashHex}};
+                                {error, Reason} ->
+                                    {error, Reason}
+                            end;
+                        false ->
+                            {ok, #{<<"hash">> => BlockHashHex,
+                                   <<"hex">> => HexBlock}}
+                    end;
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        not_found ->
+            {error, no_chain_tip}
+    end.
+
+%% Build coinbase for generateblock (without mempool entry tracking).
+build_coinbase_for_txs(Height, CoinbaseScriptPubKey, CoinbaseValue,
+                       HasWitnessTx, Txs) ->
+    HeightScript = encode_coinbase_height(Height),
+    ExtraNonce = <<0, 0, 0, 0, 0, 0, 0, 0>>,
+    ScriptSig = <<HeightScript/binary, ExtraNonce/binary>>,
+
+    CbInput = #tx_in{
+        prev_out = #outpoint{hash = <<0:256>>, index = 16#ffffffff},
+        script_sig = ScriptSig,
+        sequence = 16#fffffffe,
+        witness = case HasWitnessTx of
+            true -> [<<0:256>>];
+            false -> []
+        end
+    },
+
+    PayoutOutput = #tx_out{
+        value = CoinbaseValue,
+        script_pubkey = CoinbaseScriptPubKey
+    },
+
+    Outputs = case HasWitnessTx of
+        true ->
+            CommitOutput = witness_commitment_for_txs(Txs, CbInput),
+            [PayoutOutput, CommitOutput];
+        false ->
+            [PayoutOutput]
+    end,
+
+    Locktime = case Height of
+        0 -> 0;
+        _ -> Height - 1
+    end,
+
+    #transaction{
+        version = 2,
+        inputs = [CbInput],
+        outputs = Outputs,
+        locktime = Locktime
+    }.
+
+%% Witness commitment for generateblock (with explicit tx list).
+witness_commitment_for_txs(Txs, CbInput) ->
+    Wtxids = [<<0:256>> | [beamchain_serialize:wtx_hash(Tx) || Tx <- Txs]],
+    [WitnessNonce | _] = CbInput#tx_in.witness,
+    Commitment = beamchain_serialize:compute_witness_commitment(
+        Wtxids, WitnessNonce),
+    Script = <<16#6a, 16#24, 16#aa, 16#21, 16#a9, 16#ed, Commitment/binary>>,
+    #tx_out{value = 0, script_pubkey = Script}.
+
+%% Mine a block by iterating the nonce until PoW is valid.
+%% For regtest, this typically succeeds on the first try since
+%% pow_limit is nearly the maximum value (all hashes are valid).
+mine_block(Header, Txs, MaxTries, PowLimit) ->
+    mine_block_loop(Header, Txs, MaxTries, PowLimit, 0).
+
+mine_block_loop(_Header, _Txs, 0, _PowLimit, _Nonce) ->
+    {error, max_tries_exceeded};
+mine_block_loop(_Header, _Txs, _TriesLeft, _PowLimit, Nonce) when Nonce > 16#ffffffff ->
+    %% Nonce exhausted, would need to modify timestamp or extra nonce
+    {error, nonce_exhausted};
+mine_block_loop(Header, Txs, TriesLeft, PowLimit, Nonce) ->
+    Header2 = Header#block_header{nonce = Nonce},
+    BlockHash = beamchain_serialize:block_hash(Header2),
+    Bits = Header#block_header.bits,
+
+    case beamchain_pow:check_pow(BlockHash, Bits, PowLimit) of
+        true ->
+            Block = #block{header = Header2, transactions = Txs},
+            {ok, Block, BlockHash};
+        false ->
+            mine_block_loop(Header, Txs, TriesLeft - 1, PowLimit, Nonce + 1)
+    end.
