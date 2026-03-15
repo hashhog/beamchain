@@ -296,6 +296,13 @@ is_op_success(Op) when Op >= 16#95, Op =< 16#99 -> true;
 is_op_success(Op) when Op >= 16#bb, Op =< 16#fe -> true;
 is_op_success(_) -> false.
 
+%% @doc Check if a public key is a valid compressed key (33 bytes, 0x02 or 0x03 prefix).
+%% Used for SCRIPT_VERIFY_WITNESS_PUBKEYTYPE enforcement in witness v0.
+-spec is_compressed_pubkey(binary()) -> boolean().
+is_compressed_pubkey(<<16#02, _:32/binary>>) -> true;
+is_compressed_pubkey(<<16#03, _:32/binary>>) -> true;
+is_compressed_pubkey(_) -> false.
+
 %%% -------------------------------------------------------------------
 %%% Execution state helpers
 %%% -------------------------------------------------------------------
@@ -1336,7 +1343,17 @@ do_checksig_ecdsa(Rest, Pos, State) ->
                         _ -> check_hash_type(HashTypeByte) andalso
                              beamchain_crypto:validate_pubkey(PubKey)
                     end,
-                    case DerOk andalso LowSOk andalso StrictEncOk of
+                    %% BIP 141: WITNESS_PUBKEYTYPE requires compressed pubkeys in witness v0
+                    WitnessPubKeyTypeOk = case State1#script_state.sig_version of
+                        witness_v0 ->
+                            (Flags band ?SCRIPT_VERIFY_WITNESS_PUBKEYTYPE) =:= 0 orelse
+                            is_compressed_pubkey(PubKey);
+                        _ -> true
+                    end,
+                    case DerOk andalso LowSOk andalso StrictEncOk andalso WitnessPubKeyTypeOk of
+                        false when not WitnessPubKeyTypeOk ->
+                            %% WITNESS_PUBKEYTYPE failure is always an error
+                            {error, witness_pubkeytype};
                         false ->
                             case Flags band ?SCRIPT_VERIFY_NULLFAIL of
                                 0 -> execute(Rest, Pos, push(script_false(), State1));
@@ -1492,29 +1509,41 @@ do_checksig_result(State, Pos) ->
     %% pop2 returns {ok, deeper, top, State} — deeper=Sig, top=PubKey
     case pop2(State) of
         {ok, Sig, PubKey, State1} ->
-            case Sig of
-                <<>> -> {ok, false, State1};
-                _ ->
-                    SigLen = byte_size(Sig),
-                    HashTypeByte = binary:at(Sig, SigLen - 1),
-                    SigBody = binary:part(Sig, 0, SigLen - 1),
-                    %% FindAndDelete for legacy scripts
-                    State2 = case State1#script_state.sig_version of
-                        base ->
-                            S2 = find_and_delete(State1#script_state.script, Sig),
-                            State1#script_state{script = S2};
+            Flags = State1#script_state.flags,
+            %% BIP 141: WITNESS_PUBKEYTYPE requires compressed pubkeys in witness v0
+            WitnessPubKeyTypeOk = case State1#script_state.sig_version of
+                witness_v0 ->
+                    (Flags band ?SCRIPT_VERIFY_WITNESS_PUBKEYTYPE) =:= 0 orelse
+                    is_compressed_pubkey(PubKey);
+                _ -> true
+            end,
+            case WitnessPubKeyTypeOk of
+                false ->
+                    {error, witness_pubkeytype};
+                true ->
+                    case Sig of
+                        <<>> -> {ok, false, State1};
                         _ ->
-                            State1
-                    end,
-                    SigHash = compute_sig_hash(State2, HashTypeByte, Pos),
-                    Valid = check_ecdsa_sig(
-                        State2#script_state.sig_checker, SigBody, PubKey, SigHash),
-                    Flags = State1#script_state.flags,
-                    case Valid of
-                        false when (Flags band ?SCRIPT_VERIFY_NULLFAIL) =/= 0 ->
-                            {error, nullfail};
-                        _ ->
-                            {ok, Valid, State1}
+                            SigLen = byte_size(Sig),
+                            HashTypeByte = binary:at(Sig, SigLen - 1),
+                            SigBody = binary:part(Sig, 0, SigLen - 1),
+                            %% FindAndDelete for legacy scripts
+                            State2 = case State1#script_state.sig_version of
+                                base ->
+                                    S2 = find_and_delete(State1#script_state.script, Sig),
+                                    State1#script_state{script = S2};
+                                _ ->
+                                    State1
+                            end,
+                            SigHash = compute_sig_hash(State2, HashTypeByte, Pos),
+                            Valid = check_ecdsa_sig(
+                                State2#script_state.sig_checker, SigBody, PubKey, SigHash),
+                            case Valid of
+                                false when (Flags band ?SCRIPT_VERIFY_NULLFAIL) =/= 0 ->
+                                    {error, nullfail};
+                                _ ->
+                                    {ok, Valid, State1}
+                            end
                     end
             end;
         Error -> Error
@@ -1614,13 +1643,23 @@ do_checkmultisig_eval(State, Pos) ->
                     State2 = State1#script_state{op_count = NewOpCount},
                     case pop_n(NKeys, State2) of
                         {ok, PubKeys, State3} ->
+                            Flags = State3#script_state.flags,
+                            %% BIP 141: WITNESS_PUBKEYTYPE requires compressed pubkeys in witness v0
+                            WitnessPubKeyTypeOk = case State3#script_state.sig_version of
+                                witness_v0 when (Flags band ?SCRIPT_VERIFY_WITNESS_PUBKEYTYPE) =/= 0 ->
+                                    lists:all(fun is_compressed_pubkey/1, PubKeys);
+                                _ -> true
+                            end,
+                            case WitnessPubKeyTypeOk of
+                                false ->
+                                    {error, witness_pubkeytype};
+                                true ->
                             case pop_num(State3) of
                                 {ok, NSigs, State4} when NSigs >= 0, NSigs =< NKeys ->
                                     case pop_n(NSigs, State4) of
                                         {ok, Sigs, State5} ->
                                             case pop(State5) of
                                                 {ok, Dummy, State6} ->
-                                                    Flags = State6#script_state.flags,
                                                     case (Flags band ?SCRIPT_VERIFY_NULLDUMMY) =/= 0 andalso
                                                          Dummy =/= <<>> of
                                                         true -> {error, nulldummy_failed};
@@ -1656,6 +1695,7 @@ do_checkmultisig_eval(State, Pos) ->
                                     end;
                                 {ok, _, _} -> {error, invalid_multisig};
                                 Error -> Error
+                            end
                             end;
                         Error -> Error
                     end
@@ -2112,25 +2152,32 @@ verify_witness_program(0, Program, Witness, Flags, SigChecker)
     %% P2WPKH
     case Witness of
         [Sig, PubKey] ->
-            %% construct P2PKH script from the 20-byte program
-            Script = <<?OP_DUP, ?OP_HASH160,
-                       20, Program/binary,
-                       ?OP_EQUALVERIFY, ?OP_CHECKSIG>>,
-            %% Stack: PubKey on top (HEAD), Sig below — matches P2PKH expectations
-            P2WPKHResult = eval_script(Script, [PubKey, Sig], Flags, SigChecker, witness_v0),
-            case P2WPKHResult of
-                {ok, [Top]} ->
-                    case script_bool(Top) of
-                        true -> {ok, [Top]};
-                        false -> {error, witness_program_failed}
-                    end;
-                {ok, S} ->
-                    logger:error("P2WPKH: unexpected stack len=~B", [length(S)]),
-                    {error, witness_cleanstack};
-                {error, E} ->
-                    logger:error("P2WPKH eval failed: ~p pubkey=~s",
-                                 [E, binary:encode_hex(PubKey)]),
-                    {error, E}
+            %% BIP 141: WITNESS_PUBKEYTYPE requires compressed pubkeys in witness v0
+            case (Flags band ?SCRIPT_VERIFY_WITNESS_PUBKEYTYPE) =/= 0 andalso
+                 not is_compressed_pubkey(PubKey) of
+                true ->
+                    {error, witness_pubkeytype};
+                false ->
+                    %% construct P2PKH script from the 20-byte program
+                    Script = <<?OP_DUP, ?OP_HASH160,
+                               20, Program/binary,
+                               ?OP_EQUALVERIFY, ?OP_CHECKSIG>>,
+                    %% Stack: PubKey on top (HEAD), Sig below — matches P2PKH expectations
+                    P2WPKHResult = eval_script(Script, [PubKey, Sig], Flags, SigChecker, witness_v0),
+                    case P2WPKHResult of
+                        {ok, [Top]} ->
+                            case script_bool(Top) of
+                                true -> {ok, [Top]};
+                                false -> {error, witness_program_failed}
+                            end;
+                        {ok, S} ->
+                            logger:error("P2WPKH: unexpected stack len=~B", [length(S)]),
+                            {error, witness_cleanstack};
+                        {error, E} ->
+                            logger:error("P2WPKH eval failed: ~p pubkey=~s",
+                                         [E, binary:encode_hex(PubKey)]),
+                            {error, E}
+                    end
             end;
         _ ->
             {error, witness_program_mismatch}
@@ -2801,9 +2848,10 @@ flags_for_height(Height, mainnet) ->
         true -> F5 bor ?SCRIPT_VERIFY_TAPROOT;
         false -> F5
     end,
-    %% NULLDUMMY and NULLFAIL are consensus since segwit activation (BIP 141/146)
+    %% NULLDUMMY, NULLFAIL, and WITNESS_PUBKEYTYPE are consensus since segwit activation (BIP 141/143/146)
     case Height >= 481824 of
-        true -> F6 bor ?SCRIPT_VERIFY_NULLDUMMY bor ?SCRIPT_VERIFY_NULLFAIL;
+        true -> F6 bor ?SCRIPT_VERIFY_NULLDUMMY bor ?SCRIPT_VERIFY_NULLFAIL
+                   bor ?SCRIPT_VERIFY_WITNESS_PUBKEYTYPE;
         false -> F6
     end;
 
@@ -2818,4 +2866,5 @@ flags_for_height(_Height, _Network) ->
     bor ?SCRIPT_VERIFY_WITNESS
     bor ?SCRIPT_VERIFY_NULLDUMMY
     bor ?SCRIPT_VERIFY_NULLFAIL
+    bor ?SCRIPT_VERIFY_WITNESS_PUBKEYTYPE
     bor ?SCRIPT_VERIFY_TAPROOT.
