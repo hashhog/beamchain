@@ -448,3 +448,121 @@ trigger_pruning_short_chain() ->
     %% Nothing should be pruned
     {ok, Count} = beamchain_db:prune_block_files(),
     ?assertEqual(0, Count).
+
+%%% ===================================================================
+%%% Block height/time index tests
+%%% ===================================================================
+
+block_index_ets_test_() ->
+    {setup,
+     fun setup/0,
+     fun teardown/1,
+     fun(_) ->
+         [
+          {"get_hash_by_height returns not_found for missing height",
+           fun hash_by_height_not_found/0},
+          {"get_hash_by_height returns hash after store_block_index",
+           fun hash_by_height_after_store/0},
+          {"index_block and unindex_block work correctly",
+           fun index_unindex_block/0},
+          {"get_blocks_in_time_range returns empty for no blocks",
+           fun time_range_empty/0},
+          {"get_blocks_in_time_range returns blocks in range",
+           fun time_range_with_blocks/0},
+          {"store and get block_stats",
+           fun block_stats_roundtrip/0},
+          {"get_block_stats returns not_found for missing",
+           fun block_stats_not_found/0},
+          {"cumulative_tx_count store and get",
+           fun cumulative_tx_count/0}
+         ]
+     end}.
+
+hash_by_height_not_found() ->
+    %% Query a height that doesn't exist
+    ?assertEqual(not_found, beamchain_db:get_hash_by_height(999999)).
+
+hash_by_height_after_store() ->
+    %% Store a block index entry
+    Hash = crypto:strong_rand_bytes(32),
+    Header = #block_header{
+        version = 1,
+        prev_hash = <<0:256>>,
+        merkle_root = crypto:strong_rand_bytes(32),
+        timestamp = 1234567890,
+        bits = 16#1d00ffff,
+        nonce = 42
+    },
+    ok = beamchain_db:store_block_index(500, Hash, Header, <<0:64>>, 1),
+    %% Should be able to retrieve it
+    {ok, RetrievedHash} = beamchain_db:get_hash_by_height(500),
+    ?assertEqual(Hash, RetrievedHash).
+
+index_unindex_block() ->
+    %% Index a block
+    Hash = crypto:strong_rand_bytes(32),
+    Height = 600,
+    Timestamp = 1234567890,
+    ok = beamchain_db:index_block(Height, Hash, Timestamp),
+    %% Verify we can find it
+    Blocks = beamchain_db:get_blocks_in_time_range(Timestamp - 1, Timestamp + 1),
+    ?assert(length(Blocks) >= 1),
+    {FoundTs, FoundHeight, FoundHash} = lists:keyfind(Height, 2, Blocks),
+    ?assertEqual(Timestamp, FoundTs),
+    ?assertEqual(Height, FoundHeight),
+    ?assertEqual(Hash, FoundHash),
+    %% Unindex it
+    ok = beamchain_db:unindex_block(Height, Timestamp),
+    %% Should be gone from time index
+    Blocks2 = beamchain_db:get_blocks_in_time_range(Timestamp - 1, Timestamp + 1),
+    ?assertNot(lists:keymember(Height, 2, Blocks2)).
+
+time_range_empty() ->
+    %% Query a time range with no blocks
+    Blocks = beamchain_db:get_blocks_in_time_range(1, 100),
+    ?assert(is_list(Blocks)).
+
+time_range_with_blocks() ->
+    %% Index several blocks at different times
+    Hash1 = crypto:strong_rand_bytes(32),
+    Hash2 = crypto:strong_rand_bytes(32),
+    Hash3 = crypto:strong_rand_bytes(32),
+    ok = beamchain_db:index_block(701, Hash1, 1000),
+    ok = beamchain_db:index_block(702, Hash2, 1500),
+    ok = beamchain_db:index_block(703, Hash3, 2000),
+    %% Query range that includes all
+    All = beamchain_db:get_blocks_in_time_range(900, 2100),
+    ?assert(length(All) >= 3),
+    %% Query range that includes only middle
+    Middle = beamchain_db:get_blocks_in_time_range(1400, 1600),
+    ?assertEqual(1, length(Middle)),
+    [{1500, 702, _}] = Middle,
+    %% Clean up
+    ok = beamchain_db:unindex_block(701, 1000),
+    ok = beamchain_db:unindex_block(702, 1500),
+    ok = beamchain_db:unindex_block(703, 2000).
+
+block_stats_roundtrip() ->
+    Hash = crypto:strong_rand_bytes(32),
+    Stats = #{
+        <<"txs">> => 100,
+        <<"total_weight">> => 4000000,
+        <<"totalfee">> => 500000
+    },
+    ok = beamchain_db:store_block_stats(Hash, Stats),
+    {ok, Retrieved} = beamchain_db:get_block_stats(Hash),
+    ?assertEqual(100, maps:get(<<"txs">>, Retrieved)),
+    ?assertEqual(4000000, maps:get(<<"total_weight">>, Retrieved)),
+    ?assertEqual(500000, maps:get(<<"totalfee">>, Retrieved)).
+
+block_stats_not_found() ->
+    FakeHash = crypto:strong_rand_bytes(32),
+    ?assertEqual(not_found, beamchain_db:get_block_stats(FakeHash)).
+
+cumulative_tx_count() ->
+    %% Store cumulative tx count
+    ok = beamchain_db:store_cumulative_tx_count(800, 50000),
+    {ok, Count} = beamchain_db:get_cumulative_tx_count(800),
+    ?assertEqual(50000, Count),
+    %% Non-existent height
+    ?assertEqual(not_found, beamchain_db:get_cumulative_tx_count(999999)).
