@@ -500,3 +500,140 @@ seckey_tweak_add_test() ->
     {ok, PK2a} = beamchain_crypto:pubkey_from_privkey(Key2),
     {ok, PK2b} = beamchain_crypto:pubkey_from_privkey(<<2:256/big>>),
     ?assertEqual(PK2a, PK2b).
+
+%%% ===================================================================
+%%% NIF SHA-256 tests (hardware-accelerated)
+%%% ===================================================================
+
+%% Verify NIF sha256 matches pure Erlang crypto module
+sha256_nif_matches_crypto_test() ->
+    TestData = <<"test data for sha256">>,
+    Expected = crypto:hash(sha256, TestData),
+    ?assertEqual(Expected, beamchain_crypto:sha256(TestData)).
+
+sha256_nif_empty_test() ->
+    %% SHA256 of empty string
+    Expected = hex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+    ?assertEqual(Expected, beamchain_crypto:sha256(<<>>)).
+
+sha256_nif_large_data_test() ->
+    %% Test with data larger than one block (64 bytes)
+    LargeData = binary:copy(<<"x">>, 1000),
+    Expected = crypto:hash(sha256, LargeData),
+    ?assertEqual(Expected, beamchain_crypto:sha256(LargeData)).
+
+sha256_nif_exactly_64_bytes_test() ->
+    %% Exactly one block boundary
+    Data64 = binary:copy(<<$a>>, 64),
+    Expected = crypto:hash(sha256, Data64),
+    ?assertEqual(Expected, beamchain_crypto:sha256(Data64)).
+
+sha256_nif_55_bytes_test() ->
+    %% 55 bytes: fits in single block with padding
+    Data55 = binary:copy(<<$b>>, 55),
+    Expected = crypto:hash(sha256, Data55),
+    ?assertEqual(Expected, beamchain_crypto:sha256(Data55)).
+
+sha256_nif_56_bytes_test() ->
+    %% 56 bytes: needs two blocks for padding
+    Data56 = binary:copy(<<$c>>, 56),
+    Expected = crypto:hash(sha256, Data56),
+    ?assertEqual(Expected, beamchain_crypto:sha256(Data56)).
+
+double_sha256_nif_test() ->
+    %% Verify double SHA256 (Bitcoin hash256)
+    TestData = <<"test data for double sha256">>,
+    Expected = crypto:hash(sha256, crypto:hash(sha256, TestData)),
+    ?assertEqual(Expected, beamchain_crypto:hash256(TestData)).
+
+double_sha256_nif_empty_test() ->
+    %% hash256 of empty string
+    Expected = hex("5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456"),
+    ?assertEqual(Expected, beamchain_crypto:hash256(<<>>)).
+
+%%% ===================================================================
+%%% Batch verification tests
+%%% ===================================================================
+
+batch_ecdsa_verify_empty_test() ->
+    ?assertEqual([], beamchain_crypto:batch_ecdsa_verify([])).
+
+batch_ecdsa_verify_single_test() ->
+    PrivKey = <<1:256/big>>,
+    {ok, PubKey} = beamchain_crypto:pubkey_from_privkey(PrivKey),
+    Msg = beamchain_crypto:hash256(<<"batch test message">>),
+    {ok, Sig} = beamchain_crypto:ecdsa_sign(Msg, PrivKey),
+    ?assertEqual([true], beamchain_crypto:batch_ecdsa_verify([{Msg, Sig, PubKey}])).
+
+batch_ecdsa_verify_multiple_test() ->
+    %% Create multiple signatures
+    PrivKey1 = <<1:256/big>>,
+    PrivKey2 = <<2:256/big>>,
+    {ok, PubKey1} = beamchain_crypto:pubkey_from_privkey(PrivKey1),
+    {ok, PubKey2} = beamchain_crypto:pubkey_from_privkey(PrivKey2),
+    Msg1 = beamchain_crypto:hash256(<<"message one">>),
+    Msg2 = beamchain_crypto:hash256(<<"message two">>),
+    {ok, Sig1} = beamchain_crypto:ecdsa_sign(Msg1, PrivKey1),
+    {ok, Sig2} = beamchain_crypto:ecdsa_sign(Msg2, PrivKey2),
+
+    %% All valid
+    ?assertEqual([true, true],
+                 beamchain_crypto:batch_ecdsa_verify([{Msg1, Sig1, PubKey1},
+                                                       {Msg2, Sig2, PubKey2}])).
+
+batch_ecdsa_verify_mixed_test() ->
+    %% Mix of valid and invalid signatures
+    PrivKey1 = <<1:256/big>>,
+    {ok, PubKey1} = beamchain_crypto:pubkey_from_privkey(PrivKey1),
+    {ok, PubKey2} = beamchain_crypto:pubkey_from_privkey(<<2:256/big>>),
+    Msg1 = beamchain_crypto:hash256(<<"valid message">>),
+    {ok, Sig1} = beamchain_crypto:ecdsa_sign(Msg1, PrivKey1),
+
+    %% First is valid, second uses wrong pubkey
+    ?assertEqual([true, false],
+                 beamchain_crypto:batch_ecdsa_verify([{Msg1, Sig1, PubKey1},
+                                                       {Msg1, Sig1, PubKey2}])).
+
+batch_schnorr_verify_empty_test() ->
+    ?assertEqual([], beamchain_crypto:batch_schnorr_verify([])).
+
+batch_schnorr_verify_single_test() ->
+    PrivKey = <<1:256/big>>,
+    {ok, PubKey} = beamchain_crypto:pubkey_from_privkey(PrivKey),
+    <<_:8, XOnly:32/binary>> = PubKey,
+    Msg = beamchain_crypto:hash256(<<"schnorr batch test">>),
+    AuxRand = <<0:256>>,
+    {ok, Sig} = beamchain_crypto:schnorr_sign(Msg, PrivKey, AuxRand),
+    ?assertEqual([true], beamchain_crypto:batch_schnorr_verify([{Msg, Sig, XOnly}])).
+
+batch_schnorr_verify_multiple_test() ->
+    PrivKey1 = <<1:256/big>>,
+    PrivKey2 = <<2:256/big>>,
+    {ok, PubKey1} = beamchain_crypto:pubkey_from_privkey(PrivKey1),
+    {ok, PubKey2} = beamchain_crypto:pubkey_from_privkey(PrivKey2),
+    <<_:8, XOnly1:32/binary>> = PubKey1,
+    <<_:8, XOnly2:32/binary>> = PubKey2,
+    Msg1 = beamchain_crypto:hash256(<<"schnorr msg 1">>),
+    Msg2 = beamchain_crypto:hash256(<<"schnorr msg 2">>),
+    AuxRand = <<0:256>>,
+    {ok, Sig1} = beamchain_crypto:schnorr_sign(Msg1, PrivKey1, AuxRand),
+    {ok, Sig2} = beamchain_crypto:schnorr_sign(Msg2, PrivKey2, AuxRand),
+
+    ?assertEqual([true, true],
+                 beamchain_crypto:batch_schnorr_verify([{Msg1, Sig1, XOnly1},
+                                                         {Msg2, Sig2, XOnly2}])).
+
+batch_schnorr_verify_mixed_test() ->
+    PrivKey1 = <<1:256/big>>,
+    {ok, PubKey1} = beamchain_crypto:pubkey_from_privkey(PrivKey1),
+    {ok, PubKey2} = beamchain_crypto:pubkey_from_privkey(<<2:256/big>>),
+    <<_:8, XOnly1:32/binary>> = PubKey1,
+    <<_:8, XOnly2:32/binary>> = PubKey2,
+    Msg = beamchain_crypto:hash256(<<"schnorr mixed">>),
+    AuxRand = <<0:256>>,
+    {ok, Sig} = beamchain_crypto:schnorr_sign(Msg, PrivKey1, AuxRand),
+
+    %% First valid, second wrong key
+    ?assertEqual([true, false],
+                 beamchain_crypto:batch_schnorr_verify([{Msg, Sig, XOnly1},
+                                                         {Msg, Sig, XOnly2}])).
