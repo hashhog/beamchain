@@ -15,7 +15,8 @@ init([]) ->
         intensity => 5,
         period => 10
     },
-    Children = [
+    %% Core children always started
+    CoreChildren = [
         child_spec(beamchain_db, worker),
         child_spec(beamchain_sig_cache, worker),
         child_spec(beamchain_chainstate_sup, supervisor),
@@ -32,6 +33,12 @@ init([]) ->
         child_spec(beamchain_rpc, worker),
         child_spec(beamchain_rest, worker)
     ],
+    %% Optional ZMQ notifications (only if configured)
+    ZmqChildren = case beamchain_config:zmq_enabled() of
+        true -> [child_spec(beamchain_zmq, worker)];
+        false -> []
+    end,
+    Children = CoreChildren ++ ZmqChildren,
     {ok, {SupFlags, Children}}.
 
 child_spec(Module, Type) ->
