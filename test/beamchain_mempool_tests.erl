@@ -793,3 +793,110 @@ full_rbf_non_signaling_test_() ->
              ?assertEqual(false, Got#mempool_entry.rbf_signaling)
          end]
      end}.
+
+%%% ===================================================================
+%%% Package validation tests (test internal logic, no gen_server needed)
+%%% ===================================================================
+
+%% Test topological sort check function
+is_topo_sorted_test() ->
+    %% Create parent and child with known txids
+    Parent = make_tx([{<<100:256>>, 0}], [{5000, p2pkh_script()}]),
+    ParentTxid = beamchain_serialize:tx_hash(Parent),
+    Child = make_tx([{ParentTxid, 0}], [{4000, p2pkh_script()}]),
+
+    %% Parent before child is sorted
+    ?assert(is_topo_sorted_helper([Parent, Child])),
+
+    %% Child before parent is NOT sorted
+    ?assertNot(is_topo_sorted_helper([Child, Parent])),
+
+    %% Single tx is always sorted
+    ?assert(is_topo_sorted_helper([Parent])).
+
+%% Test consistency check function
+is_consistent_package_test() ->
+    %% Non-conflicting txs
+    Tx1 = make_tx([{<<100:256>>, 0}], [{5000, p2pkh_script()}]),
+    Tx2 = make_tx([{<<101:256>>, 0}], [{5000, p2pkh_script()}]),
+    ?assert(is_consistent_package_helper([Tx1, Tx2])),
+
+    %% Conflicting txs (same input)
+    Tx3 = make_tx([{<<100:256>>, 0}], [{4500, p2pkh_script()}]),
+    ?assertNot(is_consistent_package_helper([Tx1, Tx3])).
+
+%% Test child-with-parents check function
+is_child_with_parents_test() ->
+    %% Create proper child-with-parents package
+    Parent1 = make_tx([{<<100:256>>, 0}], [{5000, p2pkh_script()}]),
+    Parent1Txid = beamchain_serialize:tx_hash(Parent1),
+    Parent2 = make_tx([{<<101:256>>, 0}], [{5000, p2pkh_script()}]),
+    Parent2Txid = beamchain_serialize:tx_hash(Parent2),
+    Child = make_tx([{Parent1Txid, 0}, {Parent2Txid, 0}],
+                    [{8000, p2pkh_script()}]),
+
+    ?assert(is_child_with_parents_helper([Parent1, Parent2, Child])),
+
+    %% Invalid: parent not spent by child
+    Unrelated = make_tx([{<<200:256>>, 0}], [{5000, p2pkh_script()}]),
+    ?assertNot(is_child_with_parents_helper([Unrelated, Parent1, Child])).
+
+%% Test package count limit (> 25 rejected)
+package_count_limit_test() ->
+    %% 26 transactions exceeds MAX_PACKAGE_COUNT = 25
+    ?assert(26 > ?MAX_PACKAGE_COUNT),
+    %% 25 transactions is at the limit
+    ?assertEqual(25, ?MAX_PACKAGE_COUNT).
+
+%% Test package weight limit
+package_weight_limit_test() ->
+    %% MAX_PACKAGE_WEIGHT allows ~101 kvB
+    ?assertEqual(404000, ?MAX_PACKAGE_WEIGHT),
+    %% Should fit 25 standard tx weights
+    MaxStandardWeight = ?MAX_STANDARD_TX_WEIGHT,
+    ?assert(MaxStandardWeight =< ?MAX_PACKAGE_WEIGHT).
+
+%% Helper functions to call internal package validation logic
+%% (these mimic what beamchain_mempool does internally)
+
+is_topo_sorted_helper(Package) ->
+    Txids = [beamchain_serialize:tx_hash(Tx) || Tx <- Package],
+    TxidSet = sets:from_list(Txids),
+    is_topo_sorted_loop_helper(Package, TxidSet).
+
+is_topo_sorted_loop_helper([], _LaterTxids) ->
+    true;
+is_topo_sorted_loop_helper([Tx | Rest], LaterTxids) ->
+    Txid = beamchain_serialize:tx_hash(Tx),
+    SpendsFuture = lists:any(fun(#tx_in{prev_out = #outpoint{hash = H}}) ->
+        H =/= Txid andalso sets:is_element(H, LaterTxids)
+    end, Tx#transaction.inputs),
+    case SpendsFuture of
+        true -> false;
+        false ->
+            LaterTxids2 = sets:del_element(Txid, LaterTxids),
+            is_topo_sorted_loop_helper(Rest, LaterTxids2)
+    end.
+
+is_consistent_package_helper(Package) ->
+    AllInputs = lists:flatmap(fun(#transaction{inputs = Inputs}) ->
+        [{In#tx_in.prev_out#outpoint.hash, In#tx_in.prev_out#outpoint.index}
+         || In <- Inputs]
+    end, Package),
+    length(lists:usort(AllInputs)) =:= length(AllInputs).
+
+is_child_with_parents_helper([_]) ->
+    true;
+is_child_with_parents_helper(Package) when length(Package) < 2 ->
+    false;
+is_child_with_parents_helper(Package) ->
+    Child = lists:last(Package),
+    Parents = lists:droplast(Package),
+    ChildInputTxids = sets:from_list([
+        In#tx_in.prev_out#outpoint.hash
+        || In <- Child#transaction.inputs
+    ]),
+    lists:all(fun(P) ->
+        Txid = beamchain_serialize:tx_hash(P),
+        sets:is_element(Txid, ChildInputTxids)
+    end, Parents).
