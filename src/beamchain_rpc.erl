@@ -401,6 +401,12 @@ handle_method(<<"encryptwallet">>, P) -> rpc_encryptwallet(P);
 handle_method(<<"walletpassphrase">>, P) -> rpc_walletpassphrase(P);
 handle_method(<<"walletlock">>, _) -> rpc_walletlock();
 
+%% -- PSBT --
+handle_method(<<"createpsbt">>, P) -> rpc_createpsbt(P);
+handle_method(<<"decodepsbt">>, P) -> rpc_decodepsbt(P);
+handle_method(<<"combinepsbt">>, P) -> rpc_combinepsbt(P);
+handle_method(<<"finalizepsbt">>, P) -> rpc_finalizepsbt(P);
+
 handle_method(Method, _) ->
     {error, ?RPC_METHOD_NOT_FOUND,
      <<"Method not found: ", Method/binary>>}.
@@ -455,8 +461,12 @@ rpc_help_list() ->
         <<"setban \"subnet\" \"command\" ( bantime )">>,
         <<"">>,
         <<"== Rawtransactions ==">>,
+        <<"combinepsbt [\"psbt\",...]">>,
+        <<"createpsbt [{\"txid\":\"hex\",\"vout\":n},...] [{\"address\":amount},...] ( locktime )">>,
         <<"decoderawtransaction \"hexstring\"">>,
+        <<"decodepsbt \"psbt\"">>,
         <<"decodescript \"hexstring\"">>,
+        <<"finalizepsbt \"psbt\" ( extract )">>,
         <<"getrawtransaction \"txid\" ( verbose \"blockhash\" )">>,
         <<"sendrawtransaction \"hexstring\"">>,
         <<"testmempoolaccept [\"rawtx\"]">>,
@@ -2700,3 +2710,284 @@ btc_to_satoshi(Btc) when is_float(Btc) ->
     round(Btc * 100000000);
 btc_to_satoshi(Btc) when is_integer(Btc) ->
     Btc * 100000000.
+
+%%% ===================================================================
+%%% PSBT methods (BIP 174)
+%%% ===================================================================
+
+%% @doc Create a PSBT from inputs and outputs.
+%% createpsbt [{"txid":"hex","vout":n},...] [{"address":amount},...] (locktime)
+rpc_createpsbt([Inputs, Outputs]) ->
+    rpc_createpsbt([Inputs, Outputs, 0]);
+rpc_createpsbt([Inputs, Outputs, Locktime]) when is_list(Inputs),
+                                                   is_list(Outputs) ->
+    try
+        Network = beamchain_config:network(),
+        %% Build transaction inputs
+        TxIns = lists:map(fun(InputObj) ->
+            TxidHex = maps:get(<<"txid">>, InputObj),
+            Vout = maps:get(<<"vout">>, InputObj),
+            Txid = hex_to_internal_hash(TxidHex),
+            Seq = maps:get(<<"sequence">>, InputObj, 16#fffffffd),
+            #tx_in{
+                prev_out = #outpoint{hash = Txid, index = Vout},
+                script_sig = <<>>,
+                sequence = Seq,
+                witness = []
+            }
+        end, Inputs),
+        %% Build transaction outputs
+        TxOuts = lists:flatmap(fun(OutputObj) ->
+            maps:fold(fun(AddrBin, Amount, Acc) ->
+                Address = binary_to_list(AddrBin),
+                {ok, Script} = beamchain_address:address_to_script(Address, Network),
+                Satoshis = btc_to_satoshi(Amount),
+                [#tx_out{value = Satoshis, script_pubkey = Script} | Acc]
+            end, [], OutputObj)
+        end, Outputs),
+        %% Create unsigned transaction
+        Tx = #transaction{
+            version = 2,
+            inputs = TxIns,
+            outputs = TxOuts,
+            locktime = Locktime
+        },
+        %% Create PSBT
+        case beamchain_psbt:create(Tx) of
+            {ok, Psbt} ->
+                PsbtBin = beamchain_psbt:encode(Psbt),
+                PsbtB64 = base64:encode(PsbtBin),
+                {ok, PsbtB64};
+            {error, Reason} ->
+                {error, ?RPC_MISC_ERROR,
+                 iolist_to_binary(io_lib:format("PSBT creation failed: ~p", [Reason]))}
+        end
+    catch
+        _:Err ->
+            {error, ?RPC_INVALID_PARAMS,
+             iolist_to_binary(io_lib:format("Invalid parameters: ~p", [Err]))}
+    end;
+rpc_createpsbt(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"createpsbt [{\"txid\":\"hex\",\"vout\":n},...] [{\"address\":amount},...] (locktime)">>}.
+
+%% @doc Decode a PSBT and return its structure.
+rpc_decodepsbt([PsbtB64]) when is_binary(PsbtB64) ->
+    try
+        PsbtBin = base64:decode(PsbtB64),
+        case beamchain_psbt:decode(PsbtBin) of
+            {ok, Psbt} ->
+                {ok, format_psbt_decode(Psbt)};
+            {error, Reason} ->
+                {error, ?RPC_DESERIALIZATION_ERROR,
+                 iolist_to_binary(io_lib:format("PSBT decode failed: ~p", [Reason]))}
+        end
+    catch
+        error:badarg ->
+            {error, ?RPC_DESERIALIZATION_ERROR, <<"Invalid base64 encoding">>};
+        _:Err ->
+            {error, ?RPC_DESERIALIZATION_ERROR,
+             iolist_to_binary(io_lib:format("Decode error: ~p", [Err]))}
+    end;
+rpc_decodepsbt(_) ->
+    {error, ?RPC_INVALID_PARAMS, <<"decodepsbt \"psbt\"">>}.
+
+%% @doc Combine multiple PSBTs into one.
+rpc_combinepsbt([Psbts]) when is_list(Psbts) ->
+    try
+        DecodedPsbts = lists:map(fun(PsbtB64) ->
+            PsbtBin = base64:decode(PsbtB64),
+            case beamchain_psbt:decode(PsbtBin) of
+                {ok, P} -> P;
+                {error, R} -> throw({decode_error, R})
+            end
+        end, Psbts),
+        case beamchain_psbt:combine(DecodedPsbts) of
+            {ok, Combined} ->
+                CombinedBin = beamchain_psbt:encode(Combined),
+                {ok, base64:encode(CombinedBin)};
+            {error, CombineReason} ->
+                {error, ?RPC_MISC_ERROR,
+                 iolist_to_binary(io_lib:format("Combine failed: ~p", [CombineReason]))}
+        end
+    catch
+        throw:{decode_error, DecodeReason} ->
+            {error, ?RPC_DESERIALIZATION_ERROR,
+             iolist_to_binary(io_lib:format("PSBT decode failed: ~p", [DecodeReason]))};
+        error:badarg ->
+            {error, ?RPC_DESERIALIZATION_ERROR, <<"Invalid base64 encoding">>};
+        _:Err ->
+            {error, ?RPC_MISC_ERROR,
+             iolist_to_binary(io_lib:format("Error: ~p", [Err]))}
+    end;
+rpc_combinepsbt(_) ->
+    {error, ?RPC_INVALID_PARAMS, <<"combinepsbt [\"psbt\",...]">>}.
+
+%% @doc Finalize a PSBT and optionally extract the final transaction.
+rpc_finalizepsbt([PsbtB64]) ->
+    rpc_finalizepsbt([PsbtB64, true]);
+rpc_finalizepsbt([PsbtB64, Extract]) when is_binary(PsbtB64) ->
+    try
+        PsbtBin = base64:decode(PsbtB64),
+        case beamchain_psbt:decode(PsbtBin) of
+            {ok, Psbt} ->
+                case beamchain_psbt:finalize(Psbt) of
+                    {ok, FinalizedPsbt} ->
+                        FinalizedBin = beamchain_psbt:encode(FinalizedPsbt),
+                        FinalizedB64 = base64:encode(FinalizedBin),
+                        case Extract of
+                            true ->
+                                case beamchain_psbt:extract(FinalizedPsbt) of
+                                    {ok, Tx} ->
+                                        TxHex = beamchain_serialize:hex_encode(
+                                            beamchain_serialize:encode_transaction(Tx)),
+                                        {ok, #{
+                                            <<"hex">> => TxHex,
+                                            <<"complete">> => true
+                                        }};
+                                    {error, _} ->
+                                        {ok, #{
+                                            <<"psbt">> => FinalizedB64,
+                                            <<"complete">> => false
+                                        }}
+                                end;
+                            _ ->
+                                {ok, #{
+                                    <<"psbt">> => FinalizedB64,
+                                    <<"complete">> => true
+                                }}
+                        end;
+                    {error, Reason} ->
+                        %% Return incomplete PSBT
+                        {ok, #{
+                            <<"psbt">> => PsbtB64,
+                            <<"complete">> => false,
+                            <<"error">> => iolist_to_binary(
+                                io_lib:format("~p", [Reason]))
+                        }}
+                end;
+            {error, Reason} ->
+                {error, ?RPC_DESERIALIZATION_ERROR,
+                 iolist_to_binary(io_lib:format("PSBT decode failed: ~p", [Reason]))}
+        end
+    catch
+        error:badarg ->
+            {error, ?RPC_DESERIALIZATION_ERROR, <<"Invalid base64 encoding">>};
+        _:Err ->
+            {error, ?RPC_MISC_ERROR,
+             iolist_to_binary(io_lib:format("Error: ~p", [Err]))}
+    end;
+rpc_finalizepsbt(_) ->
+    {error, ?RPC_INVALID_PARAMS, <<"finalizepsbt \"psbt\" (extract)">>}.
+
+%% Helper: Format PSBT for decodepsbt RPC
+format_psbt_decode(Psbt) ->
+    Tx = beamchain_psbt:get_unsigned_tx(Psbt),
+    #{
+        <<"tx">> => format_tx_json(Tx),
+        <<"global_xpubs">> => [],  %% Simplified
+        <<"psbt_version">> => beamchain_psbt:get_version(Psbt),
+        <<"proprietary">> => [],
+        <<"unknown">> => #{},
+        <<"inputs">> => format_psbt_inputs(Psbt),
+        <<"outputs">> => format_psbt_outputs(Psbt),
+        <<"fee">> => null  %% Would need UTXO lookup
+    }.
+
+format_psbt_inputs(Psbt) ->
+    Tx = beamchain_psbt:get_unsigned_tx(Psbt),
+    lists:zipwith(fun(Input, Idx) ->
+        InputMap = beamchain_psbt:get_input(Psbt, Idx),
+        format_psbt_input(Input, InputMap)
+    end, Tx#transaction.inputs, lists:seq(0, length(Tx#transaction.inputs) - 1)).
+
+format_psbt_input(_Input, InputMap) ->
+    Base = #{},
+    %% Witness UTXO
+    B1 = case maps:get(witness_utxo, InputMap, undefined) of
+        {Value, ScriptPubKey} ->
+            Base#{<<"witness_utxo">> => #{
+                <<"amount">> => Value / 100000000.0,
+                <<"scriptPubKey">> => #{
+                    <<"hex">> => beamchain_serialize:hex_encode(ScriptPubKey)
+                }
+            }};
+        _ -> Base
+    end,
+    %% Partial sigs
+    B2 = case maps:get(partial_sigs, InputMap, undefined) of
+        undefined -> B1;
+        Sigs when map_size(Sigs) > 0 ->
+            SigList = maps:fold(fun(PubKey, Sig, Acc) ->
+                [#{<<"pubkey">> => beamchain_serialize:hex_encode(PubKey),
+                   <<"signature">> => beamchain_serialize:hex_encode(Sig)} | Acc]
+            end, [], Sigs),
+            B1#{<<"partial_signatures">> => SigList};
+        _ -> B1
+    end,
+    %% Sighash type
+    B3 = case maps:get(sighash_type, InputMap, undefined) of
+        undefined -> B2;
+        SH -> B2#{<<"sighash">> => sighash_name(SH)}
+    end,
+    %% Redeem script
+    B4 = case maps:get(redeem_script, InputMap, undefined) of
+        undefined -> B3;
+        RS -> B3#{<<"redeem_script">> => #{
+            <<"hex">> => beamchain_serialize:hex_encode(RS)
+        }}
+    end,
+    %% Witness script
+    B5 = case maps:get(witness_script, InputMap, undefined) of
+        undefined -> B4;
+        WS -> B4#{<<"witness_script">> => #{
+            <<"hex">> => beamchain_serialize:hex_encode(WS)
+        }}
+    end,
+    %% Final scriptsig
+    B6 = case maps:get(final_script_sig, InputMap, undefined) of
+        undefined -> B5;
+        FSS -> B5#{<<"final_scriptSig">> => #{
+            <<"hex">> => beamchain_serialize:hex_encode(FSS)
+        }}
+    end,
+    %% Final witness
+    B7 = case maps:get(final_script_witness, InputMap, undefined) of
+        undefined -> B6;
+        FSW -> B6#{<<"final_scriptwitness">> =>
+            [beamchain_serialize:hex_encode(W) || W <- FSW]}
+    end,
+    B7.
+
+format_psbt_outputs(Psbt) ->
+    Tx = beamchain_psbt:get_unsigned_tx(Psbt),
+    lists:zipwith(fun(_Output, Idx) ->
+        OutputMap = beamchain_psbt:get_output(Psbt, Idx),
+        format_psbt_output(OutputMap)
+    end, Tx#transaction.outputs, lists:seq(0, length(Tx#transaction.outputs) - 1)).
+
+format_psbt_output(OutputMap) ->
+    Base = #{},
+    B1 = case maps:get(redeem_script, OutputMap, undefined) of
+        undefined -> Base;
+        RS -> Base#{<<"redeem_script">> => #{
+            <<"hex">> => beamchain_serialize:hex_encode(RS)
+        }}
+    end,
+    B2 = case maps:get(witness_script, OutputMap, undefined) of
+        undefined -> B1;
+        WS -> B1#{<<"witness_script">> => #{
+            <<"hex">> => beamchain_serialize:hex_encode(WS)
+        }}
+    end,
+    B2.
+
+sighash_name(?SIGHASH_ALL) -> <<"ALL">>;
+sighash_name(?SIGHASH_NONE) -> <<"NONE">>;
+sighash_name(?SIGHASH_SINGLE) -> <<"SINGLE">>;
+sighash_name(?SIGHASH_DEFAULT) -> <<"DEFAULT">>;
+sighash_name(N) when N band ?SIGHASH_ANYONECANPAY =/= 0 ->
+    Base = sighash_name(N band 16#1f),
+    <<Base/binary, "|ANYONECANPAY">>;
+sighash_name(N) ->
+    iolist_to_binary(io_lib:format("UNKNOWN(~B)", [N])).
