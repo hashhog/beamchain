@@ -20,6 +20,15 @@
 %% Block connection / disconnection
 -export([connect_block/1, disconnect_block/0, reorganize/1]).
 
+%% Block invalidation / reconsideration
+-export([invalidate_block/1, reconsider_block/1]).
+
+%% Block status constants (from beamchain_db)
+-define(BLOCK_VALID_SCRIPTS, 5).
+-define(BLOCK_HAVE_DATA, 8).
+-define(BLOCK_HAVE_UNDO, 16).
+-define(BLOCK_FAILED_VALID, 32).
+
 %% Flush
 -export([flush/0]).
 
@@ -152,6 +161,23 @@ reorganize(NewBlocks) ->
 -spec flush() -> ok.
 flush() ->
     gen_server:call(?SERVER, flush, 60000).
+
+%%% ===================================================================
+%%% Block invalidation / reconsideration API
+%%% ===================================================================
+
+%% @doc Mark a block and all its descendants as invalid.
+%% If the block is on the active chain, disconnect blocks back to just
+%% before the invalidated block and switch to the next-best valid chain.
+-spec invalidate_block(binary()) -> ok | {error, term()}.
+invalidate_block(Hash) when byte_size(Hash) =:= 32 ->
+    gen_server:call(?SERVER, {invalidate_block, Hash}, 300000).
+
+%% @doc Clear the invalid status from a block and all its descendants.
+%% If the reconsidered chain has more work than the current tip, switch to it.
+-spec reconsider_block(binary()) -> ok | {error, term()}.
+reconsider_block(Hash) when byte_size(Hash) =:= 32 ->
+    gen_server:call(?SERVER, {reconsider_block, Hash}, 300000).
 
 %%% ===================================================================
 %%% assumeUTXO API
@@ -453,6 +479,24 @@ handle_call(get_snapshot_base_height, _From,
 
 handle_call(get_tip_height, _From, #state{tip_height = Height} = State) ->
     {reply, {ok, Height}, State};
+
+%% Block invalidation
+handle_call({invalidate_block, Hash}, _From, State) ->
+    case do_invalidate_block(Hash, State) of
+        {ok, State2} ->
+            {reply, ok, State2};
+        {error, Reason} ->
+            {reply, {error, Reason}, State}
+    end;
+
+%% Block reconsideration
+handle_call({reconsider_block, Hash}, _From, State) ->
+    case do_reconsider_block(Hash, State) of
+        {ok, State2} ->
+            {reply, ok, State2};
+        {error, Reason} ->
+            {reply, {error, Reason}, State}
+    end;
 
 handle_call(_Request, _From, State) ->
     {reply, {error, not_implemented}, State}.
@@ -984,4 +1028,355 @@ start_background_validation() ->
             logger:warning("chainstate: failed to start background validation: ~p",
                            [Reason]),
             {error, Reason}
+    end.
+
+%%% ===================================================================
+%%% Internal: Block invalidation and reconsideration
+%%% ===================================================================
+
+%% @doc Invalidate a block and all its descendants.
+%% Disconnects the block from the active chain if present, marks it invalid,
+%% and switches to the best valid alternative chain.
+do_invalidate_block(Hash, State) ->
+    %% Look up the block
+    case beamchain_db:get_block_index_by_hash(Hash) of
+        {ok, #{height := BlockHeight, status := Status}} ->
+            %% Genesis block cannot be invalidated
+            case BlockHeight of
+                0 ->
+                    {error, cannot_invalidate_genesis};
+                _ ->
+                    %% Check if already invalidated
+                    case (Status band ?BLOCK_FAILED_VALID) =/= 0 of
+                        true ->
+                            %% Already invalid, nothing to do
+                            {ok, State};
+                        false ->
+                            do_invalidate_block_impl(Hash, BlockHeight, State)
+                    end
+            end;
+        not_found ->
+            {error, block_not_found}
+    end.
+
+do_invalidate_block_impl(Hash, BlockHeight, #state{tip_height = TipHeight} = State) ->
+    %% Step 1: Disconnect blocks from tip back to block's parent if needed
+    State2 = case TipHeight >= BlockHeight of
+        true ->
+            %% Block might be on the active chain; disconnect to just before it
+            disconnect_to_height(BlockHeight - 1, State);
+        false ->
+            %% Block is not on the active chain (or ahead of tip)
+            State
+    end,
+
+    %% Step 2: Mark the block and all its descendants as invalid
+    mark_block_invalid(Hash, BlockHeight),
+
+    %% Step 3: Find and switch to the best valid chain
+    case find_best_valid_chain(State2) of
+        {ok, BestChain} when BestChain =/= [] ->
+            %% Connect the new best chain
+            connect_blocks(BestChain, State2);
+        {ok, []} ->
+            %% No better chain found, stay at current tip
+            {ok, State2};
+        {error, Reason} ->
+            %% Failed to find alternative chain
+            logger:error("chainstate: failed to find alternative chain: ~p", [Reason]),
+            {ok, State2}
+    end.
+
+%% Disconnect blocks until tip is at TargetHeight
+disconnect_to_height(TargetHeight, #state{tip_height = TipHeight} = State)
+  when TipHeight =< TargetHeight ->
+    State;
+disconnect_to_height(TargetHeight, State) ->
+    case do_disconnect_block(State) of
+        {ok, State2} ->
+            disconnect_to_height(TargetHeight, State2);
+        {error, Reason} ->
+            logger:error("chainstate: disconnect failed during invalidation: ~p", [Reason]),
+            State
+    end.
+
+%% Mark a block and all its descendants as invalid in the block index
+mark_block_invalid(Hash, BlockHeight) ->
+    %% Get the block's current status and mark it invalid
+    case beamchain_db:get_block_index_by_hash(Hash) of
+        {ok, #{status := Status}} ->
+            NewStatus = Status bor ?BLOCK_FAILED_VALID,
+            ok = beamchain_db:update_block_status(Hash, NewStatus),
+            logger:info("chainstate: marked block at height ~B as invalid", [BlockHeight]),
+
+            %% Mark all descendants as invalid
+            mark_descendants_invalid(Hash, BlockHeight);
+        not_found ->
+            ok
+    end.
+
+%% Mark all descendants of a block as invalid
+mark_descendants_invalid(ParentHash, ParentHeight) ->
+    %% Get all block indexes to find descendants
+    case beamchain_db:get_all_block_indexes() of
+        {ok, AllBlocks} ->
+            %% Find blocks at height > ParentHeight that descend from ParentHash
+            Descendants = find_descendants(AllBlocks, ParentHash, ParentHeight),
+            lists:foreach(fun(#{hash := DescHash, status := Status}) ->
+                case (Status band ?BLOCK_FAILED_VALID) =:= 0 of
+                    true ->
+                        NewStatus = Status bor ?BLOCK_FAILED_VALID,
+                        beamchain_db:update_block_status(DescHash, NewStatus);
+                    false ->
+                        ok  %% Already marked invalid
+                end
+            end, Descendants),
+            ok;
+        {error, _} ->
+            ok
+    end.
+
+%% Find all blocks that are descendants of a given block
+find_descendants(AllBlocks, AncestorHash, AncestorHeight) ->
+    %% Filter blocks at greater height that have AncestorHash as an ancestor
+    [Block || Block = #{height := H, header := Hdr} <- AllBlocks,
+              H > AncestorHeight,
+              is_descendant_of(Hdr, AncestorHash, AllBlocks)].
+
+%% Check if a block is a descendant of AncestorHash by walking back the chain
+is_descendant_of(#block_header{prev_hash = PrevHash}, AncestorHash, _AllBlocks)
+  when PrevHash =:= AncestorHash ->
+    true;
+is_descendant_of(#block_header{prev_hash = PrevHash}, AncestorHash, AllBlocks) ->
+    case lists:keyfind(PrevHash, 2, [{maps:get(hash, B), B} || B <- AllBlocks]) of
+        {_, #{header := ParentHdr}} ->
+            is_descendant_of(ParentHdr, AncestorHash, AllBlocks);
+        false ->
+            false
+    end.
+
+%% Find the best valid chain (most cumulative work among non-invalid blocks)
+find_best_valid_chain(#state{tip_hash = TipHash}) ->
+    case beamchain_db:get_all_block_indexes() of
+        {ok, AllBlocks} ->
+            %% Filter to valid blocks only
+            ValidBlocks = [B || B = #{status := S} <- AllBlocks,
+                               (S band ?BLOCK_FAILED_VALID) =:= 0],
+            %% Find the block with most cumulative work
+            case ValidBlocks of
+                [] ->
+                    {ok, []};
+                _ ->
+                    BestBlock = lists:foldl(fun(B, Acc) ->
+                        case compare_work(B, Acc) of
+                            greater -> B;
+                            _ -> Acc
+                        end
+                    end, hd(ValidBlocks), tl(ValidBlocks)),
+
+                    %% If best block is current tip, no change needed
+                    case maps:get(hash, BestBlock) =:= TipHash of
+                        true ->
+                            {ok, []};
+                        false ->
+                            %% Build the chain from fork point to best block
+                            build_chain_to_block(BestBlock, ValidBlocks, TipHash)
+                    end
+            end;
+        Error ->
+            Error
+    end.
+
+%% Compare cumulative work of two blocks
+compare_work(#{chainwork := W1}, #{chainwork := W2}) ->
+    %% Chainwork is stored as big-endian binary
+    W1Int = binary:decode_unsigned(W1),
+    W2Int = binary:decode_unsigned(W2),
+    if
+        W1Int > W2Int -> greater;
+        W1Int < W2Int -> less;
+        true -> equal
+    end.
+
+%% Build a list of blocks from fork point to target block
+build_chain_to_block(TargetBlock, AllBlocks, CurrentTipHash) ->
+    %% Walk back from target to find fork point with current chain
+    #{hash := TargetHash, height := _TargetHeight} = TargetBlock,
+    case find_fork_point(TargetHash, CurrentTipHash, AllBlocks) of
+        {ok, _ForkHash, ForkHeight} ->
+            %% Collect blocks from fork_height+1 to target
+            Blocks = collect_chain_blocks(TargetHash, ForkHeight, AllBlocks, []),
+            {ok, Blocks};
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% Find the common ancestor of two chains
+find_fork_point(Hash1, Hash2, AllBlocks) when Hash1 =:= Hash2 ->
+    case lists:keyfind(Hash1, 2, [{maps:get(hash, B), B} || B <- AllBlocks]) of
+        {_, #{height := H}} -> {ok, Hash1, H};
+        false -> {error, hash_not_found}
+    end;
+find_fork_point(Hash1, Hash2, AllBlocks) ->
+    %% Get heights of both blocks
+    Block1 = find_block_by_hash(Hash1, AllBlocks),
+    Block2 = find_block_by_hash(Hash2, AllBlocks),
+    case {Block1, Block2} of
+        {undefined, _} -> {error, {hash_not_found, Hash1}};
+        {_, undefined} -> {error, {hash_not_found, Hash2}};
+        {#{height := H1, header := Hdr1}, #{height := H2, header := Hdr2}} ->
+            %% Walk the higher chain down to same height, then walk both
+            find_fork_point_impl(Hash1, H1, Hdr1, Hash2, H2, Hdr2, AllBlocks)
+    end.
+
+find_fork_point_impl(_Hash1, H1, Hdr1, Hash2, H2, Hdr2, AllBlocks) when H1 > H2 ->
+    %% Walk Hash1 back one step
+    PrevHash = Hdr1#block_header.prev_hash,
+    case find_block_by_hash(PrevHash, AllBlocks) of
+        undefined -> {error, {broken_chain, PrevHash}};
+        #{header := PrevHdr} ->
+            find_fork_point_impl(PrevHash, H1 - 1, PrevHdr, Hash2, H2, Hdr2, AllBlocks)
+    end;
+find_fork_point_impl(Hash1, H1, Hdr1, _Hash2, H2, Hdr2, AllBlocks) when H2 > H1 ->
+    %% Walk Hash2 back one step
+    PrevHash = Hdr2#block_header.prev_hash,
+    case find_block_by_hash(PrevHash, AllBlocks) of
+        undefined -> {error, {broken_chain, PrevHash}};
+        #{header := PrevHdr} ->
+            find_fork_point_impl(Hash1, H1, Hdr1, PrevHash, H2 - 1, PrevHdr, AllBlocks)
+    end;
+find_fork_point_impl(Hash1, H1, _Hdr1, Hash2, _H2, _Hdr2, _AllBlocks) when Hash1 =:= Hash2 ->
+    %% Found the fork point
+    {ok, Hash1, H1};
+find_fork_point_impl(_Hash1, H1, Hdr1, _Hash2, H2, Hdr2, AllBlocks) ->
+    %% Same height but different hashes, walk both back
+    PrevHash1 = Hdr1#block_header.prev_hash,
+    PrevHash2 = Hdr2#block_header.prev_hash,
+    case {find_block_by_hash(PrevHash1, AllBlocks),
+          find_block_by_hash(PrevHash2, AllBlocks)} of
+        {undefined, _} -> {error, {broken_chain, PrevHash1}};
+        {_, undefined} -> {error, {broken_chain, PrevHash2}};
+        {#{header := PrevHdr1}, #{header := PrevHdr2}} ->
+            find_fork_point_impl(PrevHash1, H1 - 1, PrevHdr1,
+                                 PrevHash2, H2 - 1, PrevHdr2, AllBlocks)
+    end.
+
+find_block_by_hash(Hash, AllBlocks) ->
+    case [B || B = #{hash := H} <- AllBlocks, H =:= Hash] of
+        [Block | _] -> Block;
+        [] -> undefined
+    end.
+
+%% Collect block data from fork_height+1 to target
+collect_chain_blocks(TargetHash, ForkHeight, AllBlocks, Acc) ->
+    case find_block_by_hash(TargetHash, AllBlocks) of
+        #{height := H} when H =< ForkHeight ->
+            %% Reached or passed fork point, return accumulated blocks
+            Acc;
+        #{height := H, header := Hdr} ->
+            %% Load the actual block data
+            case beamchain_db:get_block(TargetHash) of
+                {ok, Block} ->
+                    PrevHash = Hdr#block_header.prev_hash,
+                    collect_chain_blocks(PrevHash, ForkHeight, AllBlocks, [Block | Acc]);
+                not_found ->
+                    %% Block data not available, can't switch to this chain
+                    logger:warning("chainstate: block data not found for ~s at height ~B",
+                                   [hash_hex(TargetHash), H]),
+                    Acc
+            end;
+        undefined ->
+            Acc
+    end.
+
+%% @doc Reconsider a previously invalidated block.
+%% Clears the invalid flag from the block and all its descendants/ancestors,
+%% then checks if it should become the new best chain.
+do_reconsider_block(Hash, State) ->
+    case beamchain_db:get_block_index_by_hash(Hash) of
+        {ok, #{height := BlockHeight, status := Status}} ->
+            %% Check if the block is actually marked invalid
+            case (Status band ?BLOCK_FAILED_VALID) =/= 0 of
+                true ->
+                    do_reconsider_block_impl(Hash, BlockHeight, State);
+                false ->
+                    %% Not invalid, nothing to do
+                    {ok, State}
+            end;
+        not_found ->
+            {error, block_not_found}
+    end.
+
+do_reconsider_block_impl(Hash, BlockHeight, State) ->
+    %% Step 1: Clear invalid flag from this block and all related blocks
+    clear_invalid_flags(Hash, BlockHeight),
+
+    %% Step 2: Find the best chain and switch to it if needed
+    case find_best_valid_chain(State) of
+        {ok, BestChain} when BestChain =/= [] ->
+            logger:info("chainstate: reconsidering block at height ~B, "
+                        "switching to better chain (~B blocks)",
+                        [BlockHeight, length(BestChain)]),
+            connect_blocks(BestChain, State);
+        {ok, []} ->
+            %% Current chain is still best
+            {ok, State};
+        {error, Reason} ->
+            logger:error("chainstate: reconsider failed to find best chain: ~p", [Reason]),
+            {ok, State}
+    end.
+
+%% Clear invalid flags from a block and all its ancestors/descendants
+clear_invalid_flags(Hash, BlockHeight) ->
+    case beamchain_db:get_all_block_indexes() of
+        {ok, AllBlocks} ->
+            %% Clear flag on ancestors (blocks that are ancestors of Hash)
+            lists:foreach(fun(#{hash := BHash, height := BHeight, status := Status}) ->
+                case BHeight < BlockHeight andalso
+                     is_ancestor_of(BHash, Hash, AllBlocks) andalso
+                     (Status band ?BLOCK_FAILED_VALID) =/= 0 of
+                    true ->
+                        NewStatus = Status band (bnot ?BLOCK_FAILED_VALID),
+                        beamchain_db:update_block_status(BHash, NewStatus);
+                    false ->
+                        ok
+                end
+            end, AllBlocks),
+
+            %% Clear flag on the block itself
+            case find_block_by_hash(Hash, AllBlocks) of
+                #{status := BlockStatus} ->
+                    ClearedStatus = BlockStatus band (bnot ?BLOCK_FAILED_VALID),
+                    beamchain_db:update_block_status(Hash, ClearedStatus);
+                undefined ->
+                    ok
+            end,
+
+            %% Clear flag on descendants
+            Descendants = find_descendants(AllBlocks, Hash, BlockHeight),
+            lists:foreach(fun(#{hash := DescHash, status := DescStatus}) ->
+                case (DescStatus band ?BLOCK_FAILED_VALID) =/= 0 of
+                    true ->
+                        ClearedDescStatus = DescStatus band (bnot ?BLOCK_FAILED_VALID),
+                        beamchain_db:update_block_status(DescHash, ClearedDescStatus);
+                    false ->
+                        ok
+                end
+            end, Descendants),
+            ok;
+        {error, _} ->
+            ok
+    end.
+
+%% Check if BlockHash is an ancestor of DescendantHash
+is_ancestor_of(BlockHash, DescendantHash, _AllBlocks) when BlockHash =:= DescendantHash ->
+    false;  %% A block is not its own ancestor
+is_ancestor_of(BlockHash, DescendantHash, AllBlocks) ->
+    case find_block_by_hash(DescendantHash, AllBlocks) of
+        #{header := #block_header{prev_hash = PrevHash}} when PrevHash =:= BlockHash ->
+            true;
+        #{header := #block_header{prev_hash = PrevHash}} ->
+            is_ancestor_of(BlockHash, PrevHash, AllBlocks);
+        undefined ->
+            false
     end.
