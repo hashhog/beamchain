@@ -27,6 +27,9 @@
 %% Utility
 -export([is_coinbase_tx/1]).
 
+%% Undo data serialization (exported for testing)
+-export([encode_undo_data/1, decode_undo_data/1]).
+
 %%% -------------------------------------------------------------------
 %%% Context-free block header validation
 %%% -------------------------------------------------------------------
@@ -1136,8 +1139,8 @@ disconnect_block(#block{header = Header, transactions = Txs},
         PrevHeight = Height - 1,
         beamchain_db:set_chain_tip(PrevHash, PrevHeight),
 
-        %% 4. delete undo data
-        %% (we keep it for now; could add a delete_undo function later)
+        %% 4. delete undo data (no longer needed after successful disconnect)
+        beamchain_db:delete_undo(BlockHash),
 
         ok
     catch
