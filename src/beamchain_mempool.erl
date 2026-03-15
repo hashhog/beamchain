@@ -313,8 +313,12 @@ do_add_transaction(Tx, State) ->
         check_descendant_limits(Tx),
 
         %% 12. check coinbase maturity for mempool spending
-        {ok, {_, TipHeight}} = beamchain_chainstate:get_tip(),
+        {ok, {TipHash, TipHeight}} = beamchain_chainstate:get_tip(),
         check_mempool_coinbase_maturity(InputCoins, TipHeight + 1),
+
+        %% 12b. BIP 68 sequence lock check
+        %% For mempool, check if tx would satisfy locks in the next block
+        check_mempool_sequence_locks(Tx, InputCoins, TipHash, TipHeight + 1),
 
         %% 13. build entry
         Now = erlang:system_time(second),
@@ -647,6 +651,37 @@ check_mempool_coinbase_maturity(InputCoins, NextHeight) ->
             false -> ok
         end
     end, InputCoins).
+
+%%% ===================================================================
+%%% Internal: BIP 68 sequence lock check for mempool
+%%% ===================================================================
+
+%% @doc Check BIP 68 sequence locks for mempool acceptance.
+%% For mempool, we check if the tx would satisfy sequence locks in the next block.
+check_mempool_sequence_locks(#transaction{version = Version}, _InputCoins,
+                             _TipHash, _NextHeight) when Version < 2 ->
+    %% BIP 68 only applies to tx version >= 2
+    ok;
+check_mempool_sequence_locks(Tx, InputCoins, TipHash, NextHeight) ->
+    %% Get the tip block index to compute MTP
+    TipIndex = case beamchain_db:get_block_index_by_hash(TipHash) of
+        {ok, TI} -> TI;
+        not_found -> throw(missing_tip_index)
+    end,
+    %% Calculate sequence lock pair for the next block
+    {MinHeight, MinTime} = beamchain_validation:calculate_sequence_lock_pair(
+        Tx, InputCoins, TipIndex),
+    %% Get the MTP of the current tip (which is pprev for the next block)
+    MTP = beamchain_validation:median_time_past(TipIndex),
+    %% Check if locks are satisfied for the next block
+    case MinHeight >= NextHeight of
+        true -> throw(sequence_lock_not_met);
+        false -> ok
+    end,
+    case MinTime >= MTP of
+        true -> throw(sequence_lock_not_met);
+        false -> ok
+    end.
 
 %%% ===================================================================
 %%% Internal: ancestor / descendant tracking
