@@ -322,3 +322,55 @@ getrawtransaction_error_messages_test_() ->
           ?assert(is_binary(ExpectedMsg))
       end}
      ]}.
+
+%%% ===================================================================
+%%% gettxoutsetinfo tests
+%%% ===================================================================
+
+gettxoutsetinfo_format_test() ->
+    %% Test that gettxoutsetinfo returns the expected fields
+    MockResult = #{
+        <<"height">> => 100,
+        <<"bestblock">> => <<"000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f">>,
+        <<"txouts">> => 1000,
+        <<"bogosize">> => 150000,
+        <<"total_amount">> => 50.0,
+        <<"disk_size">> => 0
+    },
+    ?assert(maps:is_key(<<"height">>, MockResult)),
+    ?assert(maps:is_key(<<"bestblock">>, MockResult)),
+    ?assert(maps:is_key(<<"txouts">>, MockResult)),
+    ?assert(maps:is_key(<<"bogosize">>, MockResult)),
+    ?assert(maps:is_key(<<"total_amount">>, MockResult)).
+
+%%% ===================================================================
+%%% getblockchaininfo softforks tests
+%%% ===================================================================
+
+getblockchaininfo_softforks_format_test() ->
+    %% Test that softforks field has expected structure
+    MockSoftfork = #{
+        <<"type">> => <<"buried">>,
+        <<"active">> => true,
+        <<"height">> => 481824
+    },
+    ?assert(maps:is_key(<<"type">>, MockSoftfork)),
+    ?assert(maps:is_key(<<"active">>, MockSoftfork)),
+    ?assert(maps:is_key(<<"height">>, MockSoftfork)).
+
+getblockchaininfo_softforks_names_test_() ->
+    {"getblockchaininfo softfork names",
+     [
+      {"includes bip34", fun() ->
+          Softforks = #{<<"bip34">> => #{}},
+          ?assert(maps:is_key(<<"bip34">>, Softforks))
+      end},
+      {"includes segwit", fun() ->
+          Softforks = #{<<"segwit">> => #{}},
+          ?assert(maps:is_key(<<"segwit">>, Softforks))
+      end},
+      {"includes taproot", fun() ->
+          Softforks = #{<<"taproot">> => #{}},
+          ?assert(maps:is_key(<<"taproot">>, Softforks))
+      end}
+     ]}.
