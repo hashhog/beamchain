@@ -37,6 +37,9 @@
 %% TRUC (v3 transaction) policy checks - exported for testing
 -export([check_truc_rules/3]).
 
+%% Ephemeral anchor policy - exported for testing
+-export([check_dust/2, find_ephemeral_anchor/2]).
+
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2]).
@@ -64,6 +67,7 @@
 -define(MEMPOOL_OUTPOINTS, mempool_outpoints). %% {txid, vout} -> spending_txid
 -define(MEMPOOL_ORPHANS, mempool_orphans).   %% txid -> {tx, expiry}
 -define(MEMPOOL_CLUSTERS, mempool_clusters). %% cluster_id -> cluster_data
+-define(MEMPOOL_EPHEMERAL, mempool_ephemeral). %% {parent_txid, anchor_index} -> child_txid
 
 %%% -------------------------------------------------------------------
 %%% Mempool entry record
@@ -248,6 +252,7 @@ init([]) ->
     ets:new(?MEMPOOL_ORPHANS, [set, public, named_table]),
     ets:new(?MEMPOOL_CLUSTERS, [set, public, named_table,
                                  {read_concurrency, true}]),
+    ets:new(?MEMPOOL_EPHEMERAL, [set, public, named_table]),
 
     %% Schedule periodic orphan expiry
     erlang:send_after(60000, self(), expire_orphans),
@@ -368,11 +373,19 @@ do_add_transaction(Tx, State) ->
         Size = byte_size(beamchain_serialize:encode_transaction(Tx)),
         FeeRate = Fee / max(1, VSize),
 
-        %% 8. check minimum relay fee (1 sat/vB)
-        FeeRate >= 1.0 orelse throw(mempool_min_fee_not_met),
+        %% 8. check dust outputs (with ephemeral anchor support)
+        %% This returns {has_ephemeral, Index} if tx is an ephemeral anchor parent
+        EphemeralInfo = check_dust(Tx, Fee),
 
-        %% 9. check dust outputs
-        check_dust(Tx),
+        %% 9. check minimum relay fee (1 sat/vB)
+        %% Ephemeral anchor parents are allowed to have 0 fee, but need package
+        case EphemeralInfo of
+            {has_ephemeral, _} ->
+                %% Zero-fee tx with ephemeral anchor - must be spent in package
+                throw(ephemeral_anchor_needs_spending);
+            none ->
+                FeeRate >= 1.0 orelse throw(mempool_min_fee_not_met)
+        end,
 
         %% 10. verify scripts
         verify_scripts(Tx, InputCoins),
@@ -618,6 +631,10 @@ try_individual_accept([{Txid, Tx} | Rest], State, AcceptedAcc, DeferredAcc) ->
                     %% Missing inputs - defer for package (parent may be earlier in pkg)
                     try_individual_accept(Rest, State, AcceptedAcc,
                                           [{Txid, Tx} | DeferredAcc]);
+                {error, ephemeral_anchor_needs_spending} ->
+                    %% Ephemeral anchor parent - must be spent by child in package
+                    try_individual_accept(Rest, State, AcceptedAcc,
+                                          [{Txid, Tx} | DeferredAcc]);
                 {error, Reason} ->
                     %% Non-recoverable failure - abort entire package
                     throw({tx_failed, Txid, Reason})
@@ -640,6 +657,9 @@ evaluate_package_cpfp(DeferredTxs, AlreadyAccepted, State) ->
     %% Check against minimum relay fee (1 sat/vB)
     PackageFeeRate >= 1.0 orelse throw(package_fee_too_low),
 
+    %% Check ephemeral anchor spends - all dust must be spent by children
+    EphemeralDeps = check_ephemeral_spends(TxEntries, PackageTxMap),
+
     %% Check for package RBF
     AllConflicts = find_all_package_conflicts(DeferredTxs),
     case AllConflicts of
@@ -650,7 +670,7 @@ evaluate_package_cpfp(DeferredTxs, AlreadyAccepted, State) ->
     end,
 
     %% Accept all deferred transactions
-    State2 = accept_package_txs(TxEntries, State),
+    State2 = accept_package_txs(TxEntries, EphemeralDeps, State),
 
     AcceptedTxids = AlreadyAccepted ++ [Txid || {Txid, _} <- DeferredTxs],
     logger:debug("mempool: accepted package of ~B txs (pkg_fee_rate=~.1f sat/vB)",
@@ -707,6 +727,45 @@ compute_package_metrics(TxPairs, PackageTxMap, _State) ->
 
         {FeeAcc + Fee, VSizeAcc + VSize, [{Txid, Tx, Entry, InputCoins} | EntriesAcc]}
     end, {0, 0, []}, TxPairs).
+
+%% @doc Check that all ephemeral anchor dust is spent by children in the package.
+%% Returns a list of {ParentTxid, AnchorIndex, ChildTxid} tuples for tracking.
+check_ephemeral_spends(TxEntries, PackageTxMap) ->
+    %% Build a map of txid -> Entry for fee lookup
+    EntryMap = maps:from_list([{Txid, Entry} || {Txid, _Tx, Entry, _Coins} <- TxEntries]),
+
+    %% For each tx in package, check if its parents have dust that needs spending
+    lists:foldl(fun({Txid, Tx, _Entry, _Coins}, DepsAcc) ->
+        %% Get all inputs (outpoints this tx spends)
+        InputOutpoints = [{In#tx_in.prev_out#outpoint.hash,
+                           In#tx_in.prev_out#outpoint.index}
+                          || In <- Tx#transaction.inputs],
+
+        %% For each parent in package, check for unspent dust
+        ParentTxids = lists:usort([H || {H, _I} <- InputOutpoints,
+                                        maps:is_key(H, PackageTxMap)]),
+
+        lists:foldl(fun(ParentTxid, InnerAcc) ->
+            ParentTx = maps:get(ParentTxid, PackageTxMap),
+            ParentFee = case maps:get(ParentTxid, EntryMap, undefined) of
+                undefined -> undefined;
+                E -> E#mempool_entry.fee
+            end,
+            %% Find ephemeral anchors in parent
+            case find_ephemeral_anchor(ParentTx, ParentFee) of
+                {has_ephemeral, AnchorIdx} ->
+                    %% Check if this child spends the anchor
+                    case lists:member({ParentTxid, AnchorIdx}, InputOutpoints) of
+                        true ->
+                            [{ParentTxid, AnchorIdx, Txid} | InnerAcc];
+                        false ->
+                            throw({ephemeral_anchor_not_spent, ParentTxid, AnchorIdx, Txid})
+                    end;
+                none ->
+                    InnerAcc
+            end
+        end, DepsAcc, ParentTxids)
+    end, [], TxEntries).
 
 %% Look up inputs for a package transaction.
 %% Checks UTXO set, mempool, then package outputs.
@@ -787,9 +846,16 @@ do_package_rbf(_TxPairs, TotalFee, TotalVSize, ConflictTxids) ->
     end,
 
     %% Collect all descendants of conflicting txs
-    AllEvictTxids = lists:usort(lists:flatmap(fun(Cid) ->
+    DescendantsAndSelf = lists:usort(lists:flatmap(fun(Cid) ->
         [Cid | get_all_descendants(Cid)]
     end, ConflictTxids)),
+
+    %% Also include ephemeral anchor parents whose dust is no longer spent
+    EphemeralParents = lists:usort(lists:flatmap(fun(EvictTxid) ->
+        find_orphaned_ephemeral_parents(EvictTxid)
+    end, DescendantsAndSelf)),
+
+    AllEvictTxids = lists:usort(DescendantsAndSelf ++ EphemeralParents),
     length(AllEvictTxids) =< ?MAX_RBF_EVICTIONS
         orelse throw(rbf_too_many_evictions),
 
@@ -827,9 +893,15 @@ do_package_rbf(_TxPairs, TotalFee, TotalVSize, ConflictTxids) ->
     ok.
 
 %% Accept all package transactions (after CPFP validation passed).
-accept_package_txs(TxEntries, State) ->
+accept_package_txs(TxEntries, EphemeralDeps, State) ->
     %% Build package map for TRUC checks
     PackageTxMap = [{Txid, Tx} || {Txid, Tx, _Entry, _Coins} <- TxEntries],
+
+    %% Register ephemeral anchor dependencies
+    %% EphemeralDeps = [{ParentTxid, AnchorIndex, ChildTxid}, ...]
+    lists:foreach(fun({ParentTxid, AnchorIdx, ChildTxid}) ->
+        ets:insert(?MEMPOOL_EPHEMERAL, {{ParentTxid, AnchorIdx}, ChildTxid})
+    end, EphemeralDeps),
 
     lists:foldl(fun({Txid, Tx, Entry, InputCoins}, St) ->
         %% Verify scripts
@@ -979,9 +1051,16 @@ do_rbf(NewTx, ConflictTxids) ->
 
     %% 3. collect all descendants of conflicting txs (Rule 5)
     %% Max 100 transactions can be evicted (conflicting txs + descendants)
-    AllEvictTxids = lists:usort(lists:flatmap(fun(Cid) ->
+    DescendantsAndSelf = lists:usort(lists:flatmap(fun(Cid) ->
         [Cid | get_all_descendants(Cid)]
     end, ConflictTxids)),
+
+    %% Also include ephemeral anchor parents whose dust is no longer spent
+    EphemeralParents = lists:usort(lists:flatmap(fun(EvictTxid) ->
+        find_orphaned_ephemeral_parents(EvictTxid)
+    end, DescendantsAndSelf)),
+
+    AllEvictTxids = lists:usort(DescendantsAndSelf ++ EphemeralParents),
     length(AllEvictTxids) =< ?MAX_RBF_EVICTIONS
         orelse throw(rbf_too_many_evictions),
 
@@ -1161,23 +1240,68 @@ find_children(ParentTxid) ->
 %%% Internal: dust check
 %%% ===================================================================
 
-check_dust(#transaction{outputs = Outputs}) ->
+%% @doc Check dust policy for a transaction.
+%% Ephemeral anchors: zero-value P2A outputs are allowed if fee == 0.
+%% The ephemeral anchor MUST be spent by a child in the same package.
+%% Fee can be 'undefined' to skip ephemeral anchor checks.
+check_dust(#transaction{outputs = Outputs} = Tx, Fee) ->
     %% First, check for P2A policy violations
     check_p2a_policy(Outputs),
+    %% Check for ephemeral anchor (zero-value P2A with zero fee)
+    EphemeralInfo = find_ephemeral_anchor(Tx, Fee),
     %% Then check regular dust rules
     lists:foreach(fun(#tx_out{value = Value, script_pubkey = SPK}) ->
         %% OP_RETURN outputs are allowed to be zero value
         case SPK of
             <<16#6a, _/binary>> -> ok;
             _ ->
-                Threshold = dust_threshold(SPK),
-                Value >= Threshold orelse throw(dust)
+                %% Skip dust check for ephemeral anchor P2A output
+                case is_ephemeral_anchor_output(SPK, Value, EphemeralInfo) of
+                    true -> ok;
+                    false ->
+                        Threshold = dust_threshold(SPK),
+                        Value >= Threshold orelse throw(dust)
+                end
         end
-    end, Outputs).
+    end, Outputs),
+    EphemeralInfo.
+
+%% @doc Check if this output is an allowed ephemeral anchor.
+is_ephemeral_anchor_output(SPK, Value, {has_ephemeral, _}) ->
+    %% In ephemeral anchor mode, only the zero-value P2A is exempt
+    Value =:= 0 andalso beamchain_script:is_pay_to_anchor(SPK);
+is_ephemeral_anchor_output(_, _, none) ->
+    false.
+
+%% @doc Find ephemeral anchor in transaction.
+%% Returns {has_ephemeral, Index} if tx has zero fee and exactly one zero-value P2A,
+%% or 'none' otherwise.
+find_ephemeral_anchor(#transaction{outputs = Outputs}, Fee) when Fee =:= 0 ->
+    %% Find all zero-value P2A outputs
+    ZeroP2A = [{Idx, O} || {Idx, #tx_out{value = 0, script_pubkey = SPK} = O}
+                          <- lists:zip(lists:seq(0, length(Outputs) - 1), Outputs),
+                          beamchain_script:is_pay_to_anchor(SPK)],
+    case ZeroP2A of
+        [{AnchorIdx, _}] -> {has_ephemeral, AnchorIdx};
+        [] -> none;
+        _ -> throw(multiple_ephemeral_anchors)  %% only 1 allowed
+    end;
+find_ephemeral_anchor(#transaction{outputs = Outputs}, Fee) when Fee =/= undefined ->
+    %% Non-zero fee: reject any zero-value P2A outputs (they must be dust)
+    HasZeroP2A = lists:any(fun(#tx_out{value = 0, script_pubkey = SPK}) ->
+        beamchain_script:is_pay_to_anchor(SPK);
+    (_) -> false
+    end, Outputs),
+    case HasZeroP2A of
+        true -> throw(ephemeral_dust_requires_zero_fee);
+        false -> none
+    end;
+find_ephemeral_anchor(_, undefined) ->
+    %% Fee not yet computed, skip ephemeral check
+    none.
 
 %% @doc Check Pay-to-Anchor (P2A) policy rules.
 %% - Max 1 P2A output per transaction
-%% P2A outputs must have value >= dust threshold (240 satoshis) like any other output.
 check_p2a_policy(Outputs) ->
     P2aCount = length([O || #tx_out{script_pubkey = SPK} = O <- Outputs,
                             beamchain_script:is_pay_to_anchor(SPK)]),
@@ -1483,12 +1607,35 @@ remove_entry(Txid) ->
             update_ancestors_for_removed_tx(Tx, VSize, Fee),
             ets:delete(?MEMPOOL_BY_FEE, {FeeRate, Txid}),
             lists:foreach(fun(#tx_in{prev_out = #outpoint{hash = H, index = I}}) ->
-                ets:delete(?MEMPOOL_OUTPOINTS, {H, I})
+                ets:delete(?MEMPOOL_OUTPOINTS, {H, I}),
+                %% Also remove ephemeral anchor dependency if this tx was spending one
+                ets:delete(?MEMPOOL_EPHEMERAL, {H, I})
             end, Tx#transaction.inputs),
             ets:delete(?MEMPOOL_TXS, Txid),
             Entry;
         [] ->
             not_found
+    end.
+
+%% @doc Find parents that have ephemeral anchors no longer spent by this child.
+%% Returns list of parent txids that should be removed because their dust is unspent.
+find_orphaned_ephemeral_parents(Txid) ->
+    case ets:lookup(?MEMPOOL_TXS, Txid) of
+        [{Txid, Entry}] ->
+            Tx = Entry#mempool_entry.tx,
+            %% Find all inputs that were spending ephemeral anchors
+            lists:filtermap(fun(#tx_in{prev_out = #outpoint{hash = ParentTxid, index = Idx}}) ->
+                %% Check if this was an ephemeral anchor dependency
+                case ets:lookup(?MEMPOOL_EPHEMERAL, {ParentTxid, Idx}) of
+                    [{_, Txid}] ->
+                        %% Yes, this tx was spending the ephemeral anchor
+                        {true, ParentTxid};
+                    _ ->
+                        false
+                end
+            end, Tx#transaction.inputs);
+        [] ->
+            []
     end.
 
 %%% ===================================================================
@@ -1598,7 +1745,12 @@ do_trim_to_size(MaxBytes, State) ->
                             TailTxid = lists:last(Linearization),
                             %% Also remove any descendants
                             Desc = get_all_descendants(TailTxid),
-                            AllRemove = [TailTxid | Desc],
+                            DescAndSelf = [TailTxid | Desc],
+                            %% Also remove ephemeral parents whose dust is unspent
+                            EphParents = lists:usort(lists:flatmap(fun(ETxid) ->
+                                find_orphaned_ephemeral_parents(ETxid)
+                            end, DescAndSelf)),
+                            AllRemove = lists:usort(DescAndSelf ++ EphParents),
                             {RemovedBytes, RemovedCount, State2} = lists:foldl(
                                 fun(RTxid, {Bytes, Count, St}) ->
                                     case remove_entry(RTxid) of
