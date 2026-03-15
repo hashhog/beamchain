@@ -1,153 +1,68 @@
 # beamchain
 
-Bitcoin full node implementation in Erlang/OTP.
+A Bitcoin full node in Erlang/OTP.
 
-Syncs the blockchain, validates blocks and transactions with full consensus rule enforcement including SegWit and Taproot, connects to the P2P network, and maintains a UTXO set backed by RocksDB.
+## What is it?
 
-## Prerequisites
+Maybe you've wondered what it takes to validate a Bitcoin transaction from scratch.
+beamchain is a from-scratch Bitcoin full node written in Erlang that does exactly that.
+It syncs the blockchain, validates blocks with full consensus rules (including SegWit
+and Taproot), and maintains a UTXO set backed by RocksDB.
 
-- **Erlang/OTP 26+**
-- **rebar3**
-- **C compiler** (gcc or clang) for the secp256k1 NIF
-- **CMake** for building RocksDB
+## Current status
 
-On Fedora / RHEL:
+- [x] P2P networking and peer management
+- [x] Header-first sync with full validation
+- [x] Block download and storage (RocksDB)
+- [x] Script interpreter (all opcodes)
+- [x] Legacy sighash (FindAndDelete, OP_CODESEPARATOR)
+- [x] SegWit v0 (P2WPKH, P2WSH) with BIP143 sighash
+- [x] Taproot (key path and script path) with BIP341 sighash
+- [x] UTXO set management and chainstate
+- [x] Mempool with fee-based ordering
+- [x] JSON-RPC interface
+- [ ] Wallet (HD keys, signing)
+- [ ] Compact block relay (BIP152)
+
+## Quick start
 
 ```bash
-sudo dnf install erlang rebar3 gcc gcc-c++ cmake snappy-devel
-```
-
-On Ubuntu / Debian:
-
-```bash
-sudo apt install erlang rebar3 gcc g++ cmake libsnappy-dev
-```
-
-## Build
-
-```bash
-git clone https://github.com/hashhog/beamchain.git
-cd beamchain
+# Build
 rebar3 compile
-```
 
-## Usage
-
-Start syncing testnet4 with a live progress display:
-
-```bash
+# Sync testnet4
 BEAMCHAIN_NETWORK=testnet4 ./beamchain sync
+
+# Or run directly with erl
+BEAMCHAIN_NETWORK=testnet4 erl -pa _build/default/lib/*/ebin \
+  -eval "application:ensure_all_started(beamchain)."
 ```
 
-```
-beamchain sync - testnet4
-data: ~/.beamchain/testnet4
-
-  ⠹ Headers [████████████░░░░░░░░░░░░░]  48%  60.2K / 125.2K  3 peers
-  ⠹ Blocks  [██████░░░░░░░░░░░░░░░░░░░]  22%  27.8K / 125.2K  42.1 blk/s  ETA 38m 30s  3 peers
-```
-
-Start the node as a background service:
-
-```bash
-BEAMCHAIN_NETWORK=testnet4 ./beamchain start
-```
-
-Query a running node:
-
-```bash
-./beamchain status --network=testnet4
-./beamchain getbalance <address> --network=testnet4
-./beamchain stop --network=testnet4
-```
-
-### All options
+## Project structure
 
 ```
-  --network=<net>   mainnet, testnet, testnet4, regtest, signet (default: mainnet)
-  --datadir=<dir>   data directory (default: ~/.beamchain)
-  --rpc-port=<n>    RPC port override
-  --p2p-port=<n>    P2P port override
-  --debug           enable debug logging
-  --reset           wipe chain data before sync
-  --limit=<n>       limit sync to n blocks
+src/
+├── beamchain_script.erl       Script interpreter (~2800 lines)
+├── beamchain_validation.erl   Block/tx consensus rules
+├── beamchain_serialize.erl    Tx encoding (legacy + segwit)
+├── beamchain_crypto.erl       secp256k1 NIF bindings
+├── beamchain_p2p_msg.erl      P2P message encoding
+├── beamchain_peer.erl         Connection handling
+├── beamchain_block_sync.erl   Block download
+├── beamchain_chainstate.erl   UTXO management
+├── beamchain_mempool.erl      Transaction pool
+├── beamchain_db.erl           RocksDB wrapper
+└── beamchain_rpc.erl          JSON-RPC server
+
+c_src/
+└── beamchain_crypto_nif.c     libsecp256k1 bindings
+
+test/
+└── beamchain_script_tests.erl Script and sighash tests
 ```
 
-### Alternative: run directly with erl
-
-If you prefer the Erlang shell or need more control:
-
-```bash
-BEAMCHAIN_NETWORK=testnet4 erl -pa _build/default/lib/*/ebin -sname beamchain -eval \
-  "logger:set_primary_config(level, info), application:ensure_all_started(beamchain)."
-```
-
-## JSON-RPC
-
-The node exposes a Bitcoin Core-compatible JSON-RPC interface (default ports: mainnet 8332, testnet4 48332).
-
-```bash
-curl -s -X POST http://127.0.0.1:48332/ \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"1.0","method":"getblockchaininfo","params":[]}' | python3 -m json.tool
-```
-
-## Networks
-
-| Network    | P2P Port | RPC Port | Data Directory             |
-|------------|----------|----------|----------------------------|
-| `mainnet`  | 8333     | 8332     | `~/.beamchain/`            |
-| `testnet`  | 18333    | 18332    | `~/.beamchain/testnet/`    |
-| `testnet4` | 48333    | 48332    | `~/.beamchain/testnet4/`   |
-| `signet`   | 38333    | 38332    | `~/.beamchain/signet/`     |
-| `regtest`  | 18444    | 18443    | `~/.beamchain/regtest/`    |
-
-## Architecture
-
-```
-beamchain_sup                    top-level supervisor
-├── beamchain_config             network parameters and runtime config
-└── beamchain_node_sup           node supervisor
-    ├── beamchain_db             RocksDB storage (blocks, UTXO index, metadata)
-    ├── beamchain_sig_cache      signature verification cache
-    ├── beamchain_chainstate     UTXO set and chain tip management
-    ├── beamchain_mempool        unconfirmed transaction pool
-    ├── beamchain_fee_estimator  fee rate estimation
-    ├── beamchain_addrman        peer address manager
-    ├── beamchain_peer_manager   P2P connection management
-    ├── beamchain_header_sync    header-first sync
-    ├── beamchain_block_sync     block download and validation
-    ├── beamchain_sync           sync coordinator
-    ├── beamchain_miner          block template and mining
-    ├── beamchain_wallet         key management and signing
-    └── beamchain_rpc            JSON-RPC server (cowboy)
-```
-
-Key modules outside the supervision tree:
-
-- `beamchain_script` — full Script interpreter (P2PKH, P2SH, P2WPKH, P2WSH, P2TR)
-- `beamchain_validation` — block and transaction consensus validation
-- `beamchain_serialize` — transaction serialization/deserialization (legacy + segwit)
-- `beamchain_crypto` — secp256k1 NIF bindings (ECDSA, Schnorr, SHA256, HASH160)
-- `beamchain_pow` — proof-of-work validation and difficulty adjustment
-- `beamchain_p2p_msg` — Bitcoin P2P protocol message encoding/decoding
-
-## Consensus
-
-Full validation of all consensus rules through the current block height:
-
-- **Script verification** — all opcodes, including `OP_CHECKSIG`, `OP_CHECKMULTISIG`, `OP_CHECKLOCKTIMEVERIFY`, `OP_CHECKSEQUENCEVERIFY`
-- **SegWit** — witness v0 (P2WPKH, P2WSH), witness v1 (Taproot key path and script path), witness cleanstack enforcement
-- **Soft fork activation** — P2SH (including push-only scriptSig), DERSIG, CLTV, CSV, SegWit, NULLDUMMY, NULLFAIL, WITNESS_PUBKEYTYPE, Taproot
-- **Difficulty adjustment** — retarget every 2016 blocks, BIP94 rules for testnet4
-- **Coinbase maturity**, **block subsidy halving**, **transaction locktime**
-
-## Tests
+## Running tests
 
 ```bash
 rebar3 eunit
 ```
-
-## License
-
-MIT
