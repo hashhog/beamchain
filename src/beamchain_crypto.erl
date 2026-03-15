@@ -14,6 +14,9 @@
          pubkey_compress/1, pubkey_decompress/1,
          pubkey_combine/1, xonly_pubkey_tweak_add/2]).
 
+%% ElligatorSwift operations (BIP324 v2 transport)
+-export([ellswift_create/2, ellswift_xdh/4]).
+
 %% Hashing
 -export([sha256/1, hash256/1, hash160/1,
          tagged_hash/2, hmac_sha512/2]).
@@ -96,6 +99,12 @@ schnorr_sign_nif(_Msg, _SecKey, _AuxRand) ->
     erlang:nif_error(nif_not_loaded).
 
 seckey_tweak_add_nif(_SecKey, _Tweak) ->
+    erlang:nif_error(nif_not_loaded).
+
+ellswift_create_nif(_SecKey, _AuxRand) ->
+    erlang:nif_error(nif_not_loaded).
+
+ellswift_xdh_nif(_EllA, _EllB, _SecKey, _Party) ->
     erlang:nif_error(nif_not_loaded).
 
 %%% -------------------------------------------------------------------
@@ -227,6 +236,32 @@ pubkey_decompress(PubKey) ->
 -spec pubkey_combine([binary()]) -> {ok, binary()} | {error, term()}.
 pubkey_combine(PubKeys) when is_list(PubKeys), length(PubKeys) >= 2 ->
     pubkey_combine_nif(PubKeys).
+
+%%% -------------------------------------------------------------------
+%%% ElligatorSwift operations (BIP324)
+%%% -------------------------------------------------------------------
+
+%% @doc Create a 64-byte ElligatorSwift-encoded public key from a private key.
+%% The encoding is indistinguishable from random bytes.
+-spec ellswift_create(SecKey :: binary(), AuxRand :: binary()) ->
+    {ok, binary()} | {error, term()}.
+ellswift_create(SecKey, AuxRand) when byte_size(SecKey) =:= 32,
+                                        byte_size(AuxRand) =:= 32 ->
+    ellswift_create_nif(SecKey, AuxRand).
+
+%% @doc Compute BIP324 ECDH shared secret from ElligatorSwift-encoded pubkeys.
+%% EllA: 64-byte ElligatorSwift pubkey of party A (initiator)
+%% EllB: 64-byte ElligatorSwift pubkey of party B (responder)
+%% SecKey: 32-byte private key of this party
+%% Party: 0 if we are party A (initiator), 1 if party B (responder)
+-spec ellswift_xdh(EllA :: binary(), EllB :: binary(),
+                    SecKey :: binary(), Party :: 0 | 1) ->
+    {ok, binary()} | {error, term()}.
+ellswift_xdh(EllA, EllB, SecKey, Party) when byte_size(EllA) =:= 64,
+                                               byte_size(EllB) =:= 64,
+                                               byte_size(SecKey) =:= 32,
+                                               (Party =:= 0 orelse Party =:= 1) ->
+    ellswift_xdh_nif(EllA, EllB, SecKey, Party).
 
 %%% -------------------------------------------------------------------
 %%% Hashing

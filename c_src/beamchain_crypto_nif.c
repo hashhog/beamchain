@@ -12,6 +12,7 @@
 #include <secp256k1_schnorrsig.h>
 #include <secp256k1_extrakeys.h>
 #include <secp256k1_recovery.h>
+#include <secp256k1_ellswift.h>
 
 static secp256k1_context *ctx = NULL;
 
@@ -367,6 +368,60 @@ static ERL_NIF_TERM seckey_tweak_add_nif(ErlNifEnv *env, int argc,
 }
 
 /* ------------------------------------------------------------------ */
+/* ellswift_create_nif(SecKey32, AuxRand32)                            */
+/*   -> {ok, EllSwift64} | {error, reason}                             */
+/* Creates a 64-byte ElligatorSwift-encoded public key from a private  */
+/* key. Used for BIP324 v2 transport key exchange.                     */
+/* ------------------------------------------------------------------ */
+
+static ERL_NIF_TERM ellswift_create_nif(ErlNifEnv *env, int argc,
+                                         const ERL_NIF_TERM argv[])
+{
+    ErlNifBinary seckey, auxrand;
+
+    if (!enif_inspect_binary(env, argv[0], &seckey) || seckey.size != 32 ||
+        !enif_inspect_binary(env, argv[1], &auxrand) || auxrand.size != 32)
+        return enif_make_badarg(env);
+
+    unsigned char ell64[64];
+    if (!secp256k1_ellswift_create(ctx, ell64, seckey.data, auxrand.data))
+        return make_error(env, "invalid_seckey");
+
+    return make_ok_binary(env, ell64, 64);
+}
+
+/* ------------------------------------------------------------------ */
+/* ellswift_xdh_nif(EllA64, EllB64, SecKey32, Party)                   */
+/*   -> {ok, SharedSecret32} | {error, reason}                         */
+/* Computes ECDH shared secret using ElligatorSwift pubkeys.           */
+/* Party: 0 if we are party A (initiator), 1 if party B (responder).  */
+/* Uses BIP324 hash function for key derivation.                       */
+/* ------------------------------------------------------------------ */
+
+static ERL_NIF_TERM ellswift_xdh_nif(ErlNifEnv *env, int argc,
+                                      const ERL_NIF_TERM argv[])
+{
+    ErlNifBinary ell_a, ell_b, seckey;
+    int party;
+
+    if (!enif_inspect_binary(env, argv[0], &ell_a) || ell_a.size != 64 ||
+        !enif_inspect_binary(env, argv[1], &ell_b) || ell_b.size != 64 ||
+        !enif_inspect_binary(env, argv[2], &seckey) || seckey.size != 32 ||
+        !enif_get_int(env, argv[3], &party))
+        return enif_make_badarg(env);
+
+    unsigned char output[32];
+    if (!secp256k1_ellswift_xdh(ctx, output,
+                                ell_a.data, ell_b.data,
+                                seckey.data, party,
+                                secp256k1_ellswift_xdh_hash_function_bip324,
+                                NULL))
+        return make_error(env, "ecdh_failed");
+
+    return make_ok_binary(env, output, 32);
+}
+
+/* ------------------------------------------------------------------ */
 /* NIF table                                                           */
 /* ------------------------------------------------------------------ */
 
@@ -392,6 +447,10 @@ static ErlNifFunc nif_funcs[] = {
     {"schnorr_sign_nif",           3, schnorr_sign_nif,
         ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"seckey_tweak_add_nif",       2, seckey_tweak_add_nif,
+        ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"ellswift_create_nif",        2, ellswift_create_nif,
+        ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"ellswift_xdh_nif",           4, ellswift_xdh_nif,
         ERL_NIF_DIRTY_JOB_CPU_BOUND},
 };
 
