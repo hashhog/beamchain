@@ -13,6 +13,9 @@
 -export([sighash_legacy/4, sighash_witness_v0/5, sighash_taproot/7]).
 -export([find_and_delete/2]).  %% Exported for testing
 
+%% Pay-to-Anchor (P2A) detection
+-export([is_pay_to_anchor/1]).
+
 %%% -------------------------------------------------------------------
 %%% Script execution state
 %%% -------------------------------------------------------------------
@@ -148,6 +151,19 @@
 
 %% Tapscript
 -define(OP_CHECKSIGADD, 16#ba).
+
+%%% -------------------------------------------------------------------
+%%% Pay-to-Anchor (P2A) detection
+%%% -------------------------------------------------------------------
+
+%% @doc Check if a scriptPubKey is a Pay-to-Anchor (P2A) output.
+%% P2A is a witness v1 program with a 2-byte program: 0x4e73.
+%% Script format: OP_1 OP_PUSHBYTES_2 0x4e73
+%% Bytes: <<0x51, 0x02, 0x4e, 0x73>> (4 bytes total)
+%% P2A outputs are anyone-can-spend and used for anchor outputs in Lightning.
+-spec is_pay_to_anchor(binary()) -> boolean().
+is_pay_to_anchor(<<16#51, 16#02, 16#4e, 16#73>>) -> true;
+is_pay_to_anchor(_) -> false.
 
 %%% -------------------------------------------------------------------
 %%% Script number encoding (CScriptNum)
@@ -2250,11 +2266,18 @@ verify_witness_program(1, Program, _Witness, Flags, _SigChecker)
     %% taproot not active yet, succeed
     {ok, [script_true()]};
 
+verify_witness_program(1, <<16#4e, 16#73>>, _Witness, _Flags, _SigChecker) ->
+    %% Pay-to-Anchor (P2A): witness v1 with 2-byte program 0x4e73.
+    %% P2A outputs are anyone-can-spend and succeed unconditionally.
+    %% This is NOT gated by DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM per BIP (policy exception).
+    {ok, [script_true()]};
+
 verify_witness_program(1, Program, _Witness, Flags, _SigChecker)
   when byte_size(Program) =/= 32,
        (Flags band ?SCRIPT_VERIFY_TAPROOT) =/= 0 ->
     %% BIP 341: v1 witness programs that are NOT 32 bytes are reserved
     %% for future extensions and succeed unconditionally (unencumbered).
+    %% Note: P2A (0x4e73) is handled above and bypasses DISCOURAGE flag.
     case (Flags band ?SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM) =/= 0 of
         true -> {error, discourage_upgradable_witness_program};
         false -> {ok, [script_true()]}
