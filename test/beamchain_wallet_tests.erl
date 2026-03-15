@@ -344,6 +344,62 @@ derive_encryption_key_passphrase_matters_test() ->
     ?assertNotEqual(Key1, Key2).
 
 %%% -------------------------------------------------------------------
+%%% Multi-wallet tests
+%%% -------------------------------------------------------------------
+
+%% Test wallet supervisor list function (empty when no supervisor running)
+wallet_sup_list_empty_test() ->
+    %% Without supervisor running, list should return empty
+    Wallets = beamchain_wallet_sup:list_wallets(),
+    ?assertEqual([], Wallets).
+
+%% Test wallet name in state record
+wallet_name_in_state_test() ->
+    %% Start a wallet directly with a name
+    {ok, Pid} = beamchain_wallet:start_link(<<"testwallet">>),
+    {ok, Info} = beamchain_wallet:get_wallet_info(Pid),
+    ?assertEqual(<<"testwallet">>, maps:get(wallet_name, Info)),
+    gen_server:stop(Pid).
+
+%% Test default wallet name (empty binary)
+wallet_default_name_test() ->
+    {ok, Pid} = beamchain_wallet:start_link(<<>>),
+    {ok, Info} = beamchain_wallet:get_wallet_info(Pid),
+    ?assertEqual(<<>>, maps:get(wallet_name, Info)),
+    gen_server:stop(Pid).
+
+%% Test get_new_address with pid
+wallet_get_address_with_pid_test() ->
+    {ok, Pid} = beamchain_wallet:start_link(<<"addrtest">>),
+    %% Need to create wallet first
+    Seed = crypto:strong_rand_bytes(32),
+    {ok, _} = gen_server:call(Pid, {create, Seed, undefined}),
+    %% Get address via pid
+    {ok, Addr} = beamchain_wallet:get_new_address(Pid, p2wpkh),
+    ?assert(is_list(Addr)),
+    gen_server:stop(Pid).
+
+%% Test get_balance with pid
+wallet_get_balance_with_pid_test() ->
+    {ok, Pid} = beamchain_wallet:start_link(<<"baltest">>),
+    Seed = crypto:strong_rand_bytes(32),
+    {ok, _} = gen_server:call(Pid, {create, Seed, undefined}),
+    %% Balance should be 0 for new wallet
+    {ok, Balance} = beamchain_wallet:get_balance(Pid),
+    ?assertEqual(0, Balance),
+    gen_server:stop(Pid).
+
+%% Test is_locked with pid
+wallet_is_locked_with_pid_test() ->
+    {ok, Pid} = beamchain_wallet:start_link(<<"locktest">>),
+    Seed = crypto:strong_rand_bytes(32),
+    {ok, _} = gen_server:call(Pid, {create, Seed, undefined}),
+    %% New wallet should not be locked
+    IsLocked = beamchain_wallet:is_locked(Pid),
+    ?assertEqual(false, IsLocked),
+    gen_server:stop(Pid).
+
+%%% -------------------------------------------------------------------
 %%% Helper functions
 %%% -------------------------------------------------------------------
 
