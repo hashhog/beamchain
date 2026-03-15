@@ -18,6 +18,9 @@
 -export([sha256/1, hash256/1, hash160/1,
          tagged_hash/2, hmac_sha512/2]).
 
+%% SipHash-2-4 (for BIP152 compact blocks)
+-export([siphash/3, siphash_uint256/3]).
+
 %% DER signature handling
 -export([decode_der_signature/1, encode_der_signature/2,
          check_strict_der/1, is_low_s/1, normalize_s/1]).
@@ -381,3 +384,147 @@ encode_der_int(Bin) ->
         _ -> Bin
     end,
     <<16#02, (byte_size(Padded)):8, Padded/binary>>.
+
+%%% -------------------------------------------------------------------
+%%% SipHash-2-4 (for BIP152 compact blocks)
+%%%
+%%% Based on the reference implementation from:
+%%% https://github.com/veorq/SipHash
+%%% SipHash-2-4 with 128-bit key and 64-bit output.
+%%% -------------------------------------------------------------------
+
+%% SipHash initialization constants
+-define(SIP_C0, 16#736f6d6570736575).
+-define(SIP_C1, 16#646f72616e646f6d).
+-define(SIP_C2, 16#6c7967656e657261).
+-define(SIP_C3, 16#7465646279746573).
+
+%% @doc Compute SipHash-2-4 of arbitrary binary data with 128-bit key.
+%% K0, K1 are the two 64-bit key halves (little-endian from the key).
+-spec siphash(K0 :: non_neg_integer(), K1 :: non_neg_integer(),
+              Data :: binary()) -> non_neg_integer().
+siphash(K0, K1, Data) ->
+    %% Initialize state
+    V0 = ?SIP_C0 bxor K0,
+    V1 = ?SIP_C1 bxor K1,
+    V2 = ?SIP_C2 bxor K0,
+    V3 = ?SIP_C3 bxor K1,
+    %% Process full 8-byte blocks
+    {V0a, V1a, V2a, V3a} = siphash_blocks(V0, V1, V2, V3, Data),
+    %% Finalize with remaining bytes + length
+    Len = byte_size(Data),
+    siphash_finalize(V0a, V1a, V2a, V3a, Data, Len).
+
+%% @doc SipHash-2-4 optimized for a 32-byte input (uint256).
+%% This is the hot path for BIP152 short txid computation.
+-spec siphash_uint256(K0 :: non_neg_integer(), K1 :: non_neg_integer(),
+                      Data32 :: binary()) -> non_neg_integer().
+siphash_uint256(K0, K1, <<D0:64/little, D1:64/little,
+                          D2:64/little, D3:64/little>>) ->
+    %% Initialize state
+    V0 = ?SIP_C0 bxor K0,
+    V1 = ?SIP_C1 bxor K1,
+    V2 = ?SIP_C2 bxor K0,
+    V3 = ?SIP_C3 bxor K1,
+
+    %% Process D0
+    V3a = V3 bxor D0,
+    {V0b, V1b, V2b, V3b} = sipround(sipround({V0, V1, V2, V3a})),
+    V0c = V0b bxor D0,
+
+    %% Process D1
+    V3c = V3b bxor D1,
+    {V0d, V1d, V2d, V3d} = sipround(sipround({V0c, V1b, V2b, V3c})),
+    V0e = V0d bxor D1,
+
+    %% Process D2
+    V3e = V3d bxor D2,
+    {V0f, V1f, V2f, V3f} = sipround(sipround({V0e, V1d, V2d, V3e})),
+    V0g = V0f bxor D2,
+
+    %% Process D3
+    V3g = V3f bxor D3,
+    {V0h, V1h, V2h, V3h} = sipround(sipround({V0g, V1f, V2f, V3g})),
+    V0i = V0h bxor D3,
+
+    %% Final block: length byte (32 = 0x20) in high byte position
+    %% For 32 bytes: B = 32 << 56 = 0x2000000000000000
+    B = 32 bsl 56,
+    V3i = V3h bxor B,
+    {V0j, V1j, V2j, V3j} = sipround(sipround({V0i, V1h, V2h, V3i})),
+    V0k = V0j bxor B,
+
+    %% Finalization: 4 rounds
+    V2k = V2j bxor 16#ff,
+    {V0l, V1l, V2l, V3l} = sipround(sipround(sipround(sipround(
+        {V0k, V1j, V2k, V3j})))),
+    (V0l bxor V1l bxor V2l bxor V3l) band 16#ffffffffffffffff;
+siphash_uint256(K0, K1, Data) when byte_size(Data) =:= 32 ->
+    %% Fallback for non-aligned data
+    siphash(K0, K1, Data).
+
+%% Process full 8-byte blocks
+siphash_blocks(V0, V1, V2, V3, <<M:64/little, Rest/binary>>) ->
+    V3a = V3 bxor M,
+    {V0b, V1b, V2b, V3b} = sipround(sipround({V0, V1, V2, V3a})),
+    V0c = V0b bxor M,
+    siphash_blocks(V0c, V1b, V2b, V3b, Rest);
+siphash_blocks(V0, V1, V2, V3, _Remainder) ->
+    {V0, V1, V2, V3}.
+
+%% Finalize: pack remaining bytes with length in high byte
+siphash_finalize(V0, V1, V2, V3, Data, Len) ->
+    Offset = (Len div 8) * 8,
+    Remaining = binary:part(Data, Offset, Len - Offset),
+    B = pack_remaining(Remaining, Len),
+    V3a = V3 bxor B,
+    {V0b, V1b, V2b, V3b} = sipround(sipround({V0, V1, V2, V3a})),
+    V0c = V0b bxor B,
+    %% Finalization: XOR 0xff into v2, then 4 rounds
+    V2c = V2b bxor 16#ff,
+    {V0d, V1d, V2d, V3d} = sipround(sipround(sipround(sipround(
+        {V0c, V1b, V2c, V3b})))),
+    (V0d bxor V1d bxor V2d bxor V3d) band 16#ffffffffffffffff.
+
+%% Pack remaining bytes (0-7) with length in high byte
+pack_remaining(<<>>, Len) ->
+    Len bsl 56;
+pack_remaining(<<B0>>, Len) ->
+    (Len bsl 56) bor B0;
+pack_remaining(<<B0, B1>>, Len) ->
+    (Len bsl 56) bor (B1 bsl 8) bor B0;
+pack_remaining(<<B0, B1, B2>>, Len) ->
+    (Len bsl 56) bor (B2 bsl 16) bor (B1 bsl 8) bor B0;
+pack_remaining(<<B0, B1, B2, B3>>, Len) ->
+    (Len bsl 56) bor (B3 bsl 24) bor (B2 bsl 16) bor (B1 bsl 8) bor B0;
+pack_remaining(<<B0, B1, B2, B3, B4>>, Len) ->
+    (Len bsl 56) bor (B4 bsl 32) bor (B3 bsl 24) bor (B2 bsl 16) bor
+        (B1 bsl 8) bor B0;
+pack_remaining(<<B0, B1, B2, B3, B4, B5>>, Len) ->
+    (Len bsl 56) bor (B5 bsl 40) bor (B4 bsl 32) bor (B3 bsl 24) bor
+        (B2 bsl 16) bor (B1 bsl 8) bor B0;
+pack_remaining(<<B0, B1, B2, B3, B4, B5, B6>>, Len) ->
+    (Len bsl 56) bor (B6 bsl 48) bor (B5 bsl 40) bor (B4 bsl 32) bor
+        (B3 bsl 24) bor (B2 bsl 16) bor (B1 bsl 8) bor B0.
+
+%% SipHash round function
+sipround({V0, V1, V2, V3}) ->
+    V0a = (V0 + V1) band 16#ffffffffffffffff,
+    V1a = rotl64(V1, 13),
+    V1b = V1a bxor V0a,
+    V0b = rotl64(V0a, 32),
+    V2a = (V2 + V3) band 16#ffffffffffffffff,
+    V3a = rotl64(V3, 16),
+    V3b = V3a bxor V2a,
+    V0c = (V0b + V3b) band 16#ffffffffffffffff,
+    V3c = rotl64(V3b, 21),
+    V3d = V3c bxor V0c,
+    V2b = (V2a + V1b) band 16#ffffffffffffffff,
+    V1c = rotl64(V1b, 17),
+    V1d = V1c bxor V2b,
+    V2c = rotl64(V2b, 32),
+    {V0c, V1d, V2c, V3d}.
+
+%% 64-bit left rotate
+rotl64(X, N) ->
+    ((X bsl N) bor (X bsr (64 - N))) band 16#ffffffffffffffff.
