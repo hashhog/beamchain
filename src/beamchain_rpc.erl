@@ -395,6 +395,9 @@ handle_method(<<"dumpprivkey">>, P) -> rpc_dumpprivkey(P);
 handle_method(<<"sendtoaddress">>, P) -> rpc_sendtoaddress(P);
 handle_method(<<"listunspent">>, P) -> rpc_listunspent(P);
 handle_method(<<"listtransactions">>, P) -> rpc_listtransactions(P);
+handle_method(<<"encryptwallet">>, P) -> rpc_encryptwallet(P);
+handle_method(<<"walletpassphrase">>, P) -> rpc_walletpassphrase(P);
+handle_method(<<"walletlock">>, _) -> rpc_walletlock();
 
 handle_method(Method, _) ->
     {error, ?RPC_METHOD_NOT_FOUND,
@@ -461,6 +464,7 @@ rpc_help_list() ->
         <<"== Wallet ==">>,
         <<"createwallet">>,
         <<"dumpprivkey \"address\"">>,
+        <<"encryptwallet \"passphrase\"">>,
         <<"getbalance">>,
         <<"getnewaddress ( \"label\" \"address_type\" )">>,
         <<"getrawchangeaddress ( \"address_type\" )">>,
@@ -470,7 +474,9 @@ rpc_help_list() ->
         <<"listtransactions ( \"label\" count skip )">>,
         <<"listunspent ( minconf maxconf )">>,
         <<"loadwallet \"filename\"">>,
-        <<"sendtoaddress \"address\" amount ( \"comment\" )">>
+        <<"sendtoaddress \"address\" amount ( \"comment\" )">>,
+        <<"walletlock">>,
+        <<"walletpassphrase \"passphrase\" timeout">>
     ],
     {ok, iolist_to_binary(lists:join(<<"\n">>, Lines))}.
 
@@ -1998,7 +2004,9 @@ rpc_getwalletinfo() ->
                 {ok, B} -> B;
                 _ -> 0
             end,
-            {ok, #{
+            Encrypted = maps:get(encrypted, Info, false),
+            Locked = maps:get(locked, Info, false),
+            BaseInfo = #{
                 <<"walletname">> => <<"default">>,
                 <<"walletversion">> => 1,
                 <<"format">> => <<"json">>,
@@ -2011,7 +2019,20 @@ rpc_getwalletinfo() ->
                 <<"private_keys_enabled">> => true,
                 <<"avoid_reuse">> => false,
                 <<"scanning">> => false
-            }};
+            },
+            %% Add encryption status fields
+            InfoWithEncryption = case Encrypted of
+                true ->
+                    BaseInfo#{
+                        <<"unlocked_until">> => case Locked of
+                            true -> 0;
+                            false -> 9999999999  %% Placeholder for actual expiry time
+                        end
+                    };
+                false ->
+                    BaseInfo
+            end,
+            {ok, InfoWithEncryption};
         {error, Reason} ->
             {error, ?RPC_MISC_ERROR, iolist_to_binary(
                 io_lib:format("~p", [Reason]))}
@@ -2026,6 +2047,9 @@ rpc_dumpprivkey([Address]) when is_binary(Address) ->
         {error, not_found} ->
             {error, ?RPC_INVALID_ADDRESS_OR_KEY,
              <<"Private key for address not found">>};
+        {error, wallet_locked} ->
+            {error, ?RPC_MISC_ERROR,
+             <<"Error: Please enter the wallet passphrase with walletpassphrase first.">>};
         {error, Reason} ->
             {error, ?RPC_MISC_ERROR, iolist_to_binary(
                 io_lib:format("~p", [Reason]))}
@@ -2141,6 +2165,56 @@ rpc_listtransactions([_Label, _Count, _Skip]) ->
 rpc_listtransactions(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"listtransactions ( \"label\" count skip )">>}.
+
+%% @doc Encrypt the wallet with a passphrase (encryptwallet).
+%% After encryption, the wallet will be locked and require walletpassphrase to unlock.
+rpc_encryptwallet([Passphrase]) when is_binary(Passphrase) ->
+    case beamchain_wallet:encryptwallet(Passphrase) of
+        ok ->
+            {ok, <<"wallet encrypted; The keypool has been flushed and a new HD seed "
+                   "was generated. You need to make a new backup.">>};
+        {error, no_wallet} ->
+            {error, ?RPC_MISC_ERROR, <<"No wallet loaded">>};
+        {error, already_encrypted} ->
+            {error, ?RPC_MISC_ERROR, <<"Wallet is already encrypted">>};
+        {error, Reason} ->
+            {error, ?RPC_MISC_ERROR, iolist_to_binary(
+                io_lib:format("Failed to encrypt wallet: ~p", [Reason]))}
+    end;
+rpc_encryptwallet(_) ->
+    {error, ?RPC_INVALID_PARAMS, <<"encryptwallet \"passphrase\"">>}.
+
+%% @doc Unlock the wallet for the specified timeout in seconds (walletpassphrase).
+rpc_walletpassphrase([Passphrase, Timeout]) when is_binary(Passphrase), is_integer(Timeout) ->
+    case beamchain_wallet:walletpassphrase(Passphrase, Timeout) of
+        ok ->
+            {ok, null};
+        {error, not_encrypted} ->
+            {error, ?RPC_MISC_ERROR,
+             <<"Error: running with an unencrypted wallet, but walletpassphrase was called.">>};
+        {error, already_unlocked} ->
+            {ok, null};  %% Already unlocked is not an error
+        {error, wrong_passphrase} ->
+            {error, ?RPC_INVALID_PARAMS, <<"Error: The wallet passphrase entered was incorrect.">>};
+        {error, Reason} ->
+            {error, ?RPC_MISC_ERROR, iolist_to_binary(
+                io_lib:format("Failed to unlock wallet: ~p", [Reason]))}
+    end;
+rpc_walletpassphrase(_) ->
+    {error, ?RPC_INVALID_PARAMS, <<"walletpassphrase \"passphrase\" timeout">>}.
+
+%% @doc Lock the wallet immediately (walletlock).
+rpc_walletlock() ->
+    case beamchain_wallet:walletlock() of
+        ok ->
+            {ok, null};
+        {error, not_encrypted} ->
+            {error, ?RPC_MISC_ERROR,
+             <<"Error: running with an unencrypted wallet, but walletlock was called.">>};
+        {error, Reason} ->
+            {error, ?RPC_MISC_ERROR, iolist_to_binary(
+                io_lib:format("Failed to lock wallet: ~p", [Reason]))}
+    end.
 
 %% Helper: Convert RPC address type to atom
 address_type_from_rpc(Type) when is_binary(Type) ->
