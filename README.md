@@ -23,7 +23,7 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] Accurate sigop counting (legacy, P2SH, witness)
 - [x] UTXO set management and chainstate
 - [x] Undo data for block disconnection (reorg support)
-- [x] Mempool with fee-based ordering
+- [x] Mempool with fee-based ordering and ancestor/descendant limits
 - [x] BIP68 relative lock-time (sequence locks)
 - [x] JSON-RPC interface
 - [x] Block template construction (getblocktemplate)
@@ -79,6 +79,7 @@ test/
 ├── beamchain_script_tests.erl         Script and sighash tests
 ├── beamchain_chainstate_tests.erl     Undo data and disconnect tests
 ├── beamchain_miner_tests.erl          Block template and witness tests
+├── beamchain_mempool_tests.erl        Mempool and limit tests
 ├── beamchain_peer_manager_tests.erl   Misbehavior and banning tests
 ├── beamchain_pow_tests.erl            PoW and difficulty adjustment tests
 ├── beamchain_versionbits_tests.erl    BIP9 state machine tests
