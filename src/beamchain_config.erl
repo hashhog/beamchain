@@ -13,7 +13,8 @@
          network/0,
          network_params/0,
          datadir/0,
-         magic/0]).
+         magic/0,
+         txindex_enabled/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -67,6 +68,24 @@ datadir() ->
 -spec magic() -> binary().
 magic() ->
     (get(network_params))#network_params.magic.
+
+%% @doc Check if transaction index is enabled.
+%% Reads from config file (txindex=1) or env var (BEAMCHAIN_TXINDEX=1).
+%% Defaults to true (enabled).
+-spec txindex_enabled() -> boolean().
+txindex_enabled() ->
+    case os:getenv("BEAMCHAIN_TXINDEX") of
+        "0" -> false;
+        "false" -> false;
+        _ ->
+            case get(txindex, "1") of
+                "0" -> false;
+                "false" -> false;
+                0 -> false;
+                false -> false;
+                _ -> true  %% Default to enabled
+            end
+    end.
 
 %%% ===================================================================
 %%% gen_server callbacks
