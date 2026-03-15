@@ -357,6 +357,8 @@ handle_method(<<"getchaintips">>, _, _W) -> rpc_getchaintips();
 handle_method(<<"getblockstats">>, P, _W) -> rpc_getblockstats(P);
 handle_method(<<"getchaintxstats">>, P, _W) -> rpc_getchaintxstats(P);
 handle_method(<<"verifychain">>, _, _W) -> rpc_verifychain();
+handle_method(<<"invalidateblock">>, P, _W) -> rpc_invalidateblock(P);
+handle_method(<<"reconsiderblock">>, P, _W) -> rpc_reconsiderblock(P);
 
 %% -- Transactions --
 handle_method(<<"getrawtransaction">>, P, _W) -> rpc_getrawtransaction(P);
@@ -456,6 +458,8 @@ rpc_help_list() ->
         <<"getchaintxstats ( nblocks \"blockhash\" )">>,
         <<"getdifficulty">>,
         <<"gettxoutsetinfo ( \"hash_type\" )">>,
+        <<"invalidateblock \"blockhash\"">>,
+        <<"reconsiderblock \"blockhash\"">>,
         <<"verifychain ( checklevel nblocks )">>,
         <<"">>,
         <<"== Control ==">>,
@@ -722,6 +726,58 @@ rpc_verifychain() ->
         {ok, _} -> {ok, true};
         not_found -> {ok, true}
     end.
+
+%% @doc invalidateblock - mark a block and all its descendants as invalid
+%% If the block is on the active chain, rewinds to just before it and switches
+%% to the next-best valid chain.
+rpc_invalidateblock([HashHex]) when is_binary(HashHex) ->
+    try
+        Hash = hex_to_internal_hash(HashHex),
+        case beamchain_chainstate:invalidate_block(Hash) of
+            ok ->
+                {ok, null};
+            {error, cannot_invalidate_genesis} ->
+                {error, ?RPC_INVALID_PARAMETER,
+                 <<"Cannot invalidate genesis block">>};
+            {error, block_not_found} ->
+                {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+                 <<"Block not found">>};
+            {error, Reason} ->
+                {error, ?RPC_DATABASE_ERROR,
+                 iolist_to_binary(io_lib:format("Failed to invalidate block: ~p", [Reason]))}
+        end
+    catch
+        _:_ ->
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+             <<"Invalid block hash">>}
+    end;
+rpc_invalidateblock(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: invalidateblock \"blockhash\"">>}.
+
+%% @doc reconsiderblock - remove invalid status from a block and its descendants
+%% Clears the invalid flag and switches to the reconsidered chain if it has more work.
+rpc_reconsiderblock([HashHex]) when is_binary(HashHex) ->
+    try
+        Hash = hex_to_internal_hash(HashHex),
+        case beamchain_chainstate:reconsider_block(Hash) of
+            ok ->
+                {ok, null};
+            {error, block_not_found} ->
+                {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+                 <<"Block not found">>};
+            {error, Reason} ->
+                {error, ?RPC_DATABASE_ERROR,
+                 iolist_to_binary(io_lib:format("Failed to reconsider block: ~p", [Reason]))}
+        end
+    catch
+        _:_ ->
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+             <<"Invalid block hash">>}
+    end;
+rpc_reconsiderblock(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: reconsiderblock \"blockhash\"">>}.
 
 %% @doc getblockstats - compute per-block statistics
 rpc_getblockstats([HashOrHeight]) ->
