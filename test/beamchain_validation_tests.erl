@@ -339,6 +339,89 @@ legacy_sigops_multiple_test() ->
     ?assertEqual(22, beamchain_validation:count_legacy_sigops(Script)).
 
 %%% ===================================================================
+%%% Accurate sigops counting (for P2SH and witness scripts)
+%%% ===================================================================
+
+%% empty script has 0 sigops
+accurate_sigops_empty_test() ->
+    ?assertEqual(0, beamchain_validation:count_sigops_accurate(<<>>)).
+
+%% OP_CHECKSIG counts as 1
+accurate_sigops_checksig_test() ->
+    ?assertEqual(1, beamchain_validation:count_sigops_accurate(<<16#ac>>)).
+
+%% OP_CHECKSIGVERIFY counts as 1
+accurate_sigops_checksigverify_test() ->
+    ?assertEqual(1, beamchain_validation:count_sigops_accurate(<<16#ad>>)).
+
+%% OP_CHECKMULTISIG with OP_2 preceding counts as 2
+accurate_sigops_2of2_multisig_test() ->
+    %% OP_2 OP_CHECKMULTISIG (2-of-2 multisig)
+    Script = <<16#52, 16#ae>>,
+    ?assertEqual(2, beamchain_validation:count_sigops_accurate(Script)).
+
+%% OP_CHECKMULTISIG with OP_3 preceding counts as 3
+accurate_sigops_2of3_multisig_test() ->
+    %% OP_2 <pubkey1> <pubkey2> <pubkey3> OP_3 OP_CHECKMULTISIG
+    %% Only the OP_3 preceding CHECKMULTISIG matters for sigop count
+    Pk = binary:copy(<<1>>, 33),  %% 33-byte pubkey
+    Script = <<16#52, 33, Pk/binary, 33, Pk/binary, 33, Pk/binary, 16#53, 16#ae>>,
+    ?assertEqual(3, beamchain_validation:count_sigops_accurate(Script)).
+
+%% OP_CHECKMULTISIG with OP_16 preceding counts as 16
+accurate_sigops_16_multisig_test() ->
+    %% OP_16 OP_CHECKMULTISIG
+    Script = <<16#60, 16#ae>>,
+    ?assertEqual(16, beamchain_validation:count_sigops_accurate(Script)).
+
+%% OP_CHECKMULTISIG with OP_0 preceding counts as 0
+accurate_sigops_0_multisig_test() ->
+    %% OP_0 OP_CHECKMULTISIG (0-of-0 multisig, edge case)
+    Script = <<16#00, 16#ae>>,
+    ?assertEqual(0, beamchain_validation:count_sigops_accurate(Script)).
+
+%% OP_CHECKMULTISIG without valid preceding OP_N uses max (20)
+accurate_sigops_invalid_preceding_test() ->
+    %% OP_DUP OP_CHECKMULTISIG (no OP_N preceding)
+    Script = <<16#76, 16#ae>>,
+    ?assertEqual(20, beamchain_validation:count_sigops_accurate(Script)).
+
+%% OP_CHECKMULTISIGVERIFY with OP_5 preceding counts as 5
+accurate_sigops_5of5_multisigverify_test() ->
+    %% OP_5 OP_CHECKMULTISIGVERIFY
+    Script = <<16#55, 16#af>>,
+    ?assertEqual(5, beamchain_validation:count_sigops_accurate(Script)).
+
+%% Multiple multisig operations in one script
+accurate_sigops_multiple_multisig_test() ->
+    %% OP_2 OP_CHECKMULTISIG OP_3 OP_CHECKMULTISIG = 2 + 3 = 5
+    Script = <<16#52, 16#ae, 16#53, 16#ae>>,
+    ?assertEqual(5, beamchain_validation:count_sigops_accurate(Script)).
+
+%% Mixed checksig and checkmultisig
+accurate_sigops_mixed_test() ->
+    %% OP_CHECKSIG OP_3 OP_CHECKMULTISIG OP_CHECKSIGVERIFY = 1 + 3 + 1 = 5
+    Script = <<16#ac, 16#53, 16#ae, 16#ad>>,
+    ?assertEqual(5, beamchain_validation:count_sigops_accurate(Script)).
+
+%% Data push followed by CHECKMULTISIG uses max (push opcodes aren't OP_N)
+accurate_sigops_push_before_multisig_test() ->
+    %% push 2 bytes, then OP_CHECKMULTISIG
+    %% The push opcode (0x02) is NOT OP_2 (0x52), so it uses max
+    Script = <<2, 1, 2, 16#ae>>,
+    ?assertEqual(20, beamchain_validation:count_sigops_accurate(Script)).
+
+%% Compare accurate vs legacy for 2-of-3 multisig
+sigops_accurate_vs_legacy_test() ->
+    %% OP_2 <pk1> <pk2> <pk3> OP_3 OP_CHECKMULTISIG
+    Pk = binary:copy(<<1>>, 33),
+    Script = <<16#52, 33, Pk/binary, 33, Pk/binary, 33, Pk/binary, 16#53, 16#ae>>,
+    %% Legacy always counts 20 for CHECKMULTISIG
+    ?assertEqual(20, beamchain_validation:count_legacy_sigops(Script)),
+    %% Accurate counts the actual key count (3)
+    ?assertEqual(3, beamchain_validation:count_sigops_accurate(Script)).
+
+%%% ===================================================================
 %%% Block weight enforcement (check_block rejects oversized)
 %%% ===================================================================
 
