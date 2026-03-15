@@ -64,6 +64,7 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] BIP330 Erlay transaction reconciliation (sendtxrcncl handshake, set reconciliation)
 - [x] assumeUTXO snapshot-based sync (loadtxoutset RPC, background validation)
 - [x] Pay-to-Anchor (P2A) outputs (witness v1 anyone-can-spend for Lightning anchors)
+- [x] Ephemeral anchor dust policy (zero-value P2A in zero-fee packages)
 
 ## Quick start
 
