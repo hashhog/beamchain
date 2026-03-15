@@ -27,7 +27,8 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] Undo data for block disconnection (reorg support)
 - [x] Mempool with fee-based ordering and ancestor/descendant limits
 - [x] BIP68 relative lock-time (sequence locks)
-- [x] JSON-RPC interface (complete core RPCs including getblockchaininfo, getblock, gettxoutsetinfo)
+- [x] JSON-RPC interface (core RPCs including getblock, gettxoutsetinfo, getblockstats)
+- [x] Block statistics RPCs (getblockstats, getchaintxstats)
 - [x] Batch JSON-RPC support (parallel request processing)
 - [x] Block template construction (getblocktemplate)
 - [x] Witness commitment (BIP141)
@@ -86,7 +87,7 @@ src/
 ├── beamchain_pow.erl          Proof of work and difficulty
 ├── beamchain_versionbits.erl  BIP9 deployment tracking
 ├── beamchain_chain_params.erl Network parameters and checkpoints
-├── beamchain_db.erl           RocksDB wrapper, flat file storage, pruning
+├── beamchain_db.erl           RocksDB wrapper, flat file storage, block indexes
 ├── beamchain_rpc.erl          JSON-RPC server
 └── beamchain_wallet.erl       HD wallet, PSBT, coin selection
 
