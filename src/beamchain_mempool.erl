@@ -1162,6 +1162,9 @@ find_children(ParentTxid) ->
 %%% ===================================================================
 
 check_dust(#transaction{outputs = Outputs}) ->
+    %% First, check for P2A policy violations
+    check_p2a_policy(Outputs),
+    %% Then check regular dust rules
     lists:foreach(fun(#tx_out{value = Value, script_pubkey = SPK}) ->
         %% OP_RETURN outputs are allowed to be zero value
         case SPK of
@@ -1171,6 +1174,15 @@ check_dust(#transaction{outputs = Outputs}) ->
                 Value >= Threshold orelse throw(dust)
         end
     end, Outputs).
+
+%% @doc Check Pay-to-Anchor (P2A) policy rules.
+%% - Max 1 P2A output per transaction
+%% P2A outputs must have value >= dust threshold (240 satoshis) like any other output.
+check_p2a_policy(Outputs) ->
+    P2aCount = length([O || #tx_out{script_pubkey = SPK} = O <- Outputs,
+                            beamchain_script:is_pay_to_anchor(SPK)]),
+    P2aCount =< 1 orelse throw(multiple_p2a_outputs),
+    ok.
 
 %% dust = (output_size + spend_input_size) * dust_relay_fee / 1000
 dust_threshold(SPK) ->
@@ -1185,6 +1197,8 @@ spend_input_size(SPK) ->
         p2wpkh    -> 68;
         p2wsh     -> 68;
         p2tr      -> 58;
+        p2a       -> 67;   %% P2A uses standard witness input size (67 bytes)
+                           %% Dust = (13 + 67) * 3000 / 1000 = 240 satoshis
         _unknown  -> 148
     end.
 
@@ -1198,6 +1212,8 @@ classify_output(<<16#00, 16#20, _:32/binary>>) ->
     p2wsh;
 classify_output(<<16#51, 16#20, _:32/binary>>) ->
     p2tr;
+classify_output(<<16#51, 16#02, 16#4e, 16#73>>) ->
+    p2a;  %% Pay-to-Anchor: OP_1 OP_PUSHBYTES_2 0x4e73
 classify_output(_) ->
     unknown.
 
