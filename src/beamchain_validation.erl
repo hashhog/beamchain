@@ -20,7 +20,7 @@
 -export([connect_block/4, disconnect_block/3]).
 
 %% Sigops counting
--export([count_legacy_sigops/1]).
+-export([count_legacy_sigops/1, count_sigops_accurate/1]).
 -export([count_p2sh_sigops/2, count_witness_sigops/2]).
 -export([get_tx_sigop_cost/3]).
 
@@ -490,6 +490,70 @@ count_legacy_sigops(<<16#af:8, Rest/binary>>, Count) ->
 count_legacy_sigops(<<_:8, Rest/binary>>, Count) ->
     count_legacy_sigops(Rest, Count).
 
+%% @doc Count sigops in a script with accurate mode.
+%% In accurate mode, OP_CHECKMULTISIG(VERIFY) counts as the actual number
+%% of pubkeys (from preceding OP_N), not MAX_PUBKEYS_PER_MULTISIG (20).
+%% This is used for P2SH redeem scripts and witness scripts.
+%% Reference: Bitcoin Core script.cpp GetSigOpCount(fAccurate=true)
+-spec count_sigops_accurate(binary()) -> non_neg_integer().
+count_sigops_accurate(Script) ->
+    count_sigops_accurate(Script, none, 0).
+
+%% Internal: tracks last opcode to decode pubkey count for CHECKMULTISIG
+count_sigops_accurate(<<>>, _LastOp, Count) -> Count;
+%% data push: 1-75 bytes
+count_sigops_accurate(<<N:8, Rest/binary>>, _LastOp, Count) when N >= 1, N =< 75 ->
+    case Rest of
+        <<_:N/binary, Rest2/binary>> ->
+            count_sigops_accurate(Rest2, N, Count);
+        _ -> Count  %% truncated script
+    end;
+%% OP_PUSHDATA1
+count_sigops_accurate(<<16#4c:8, Len:8, Rest/binary>>, _LastOp, Count) ->
+    case Rest of
+        <<_:Len/binary, Rest2/binary>> ->
+            count_sigops_accurate(Rest2, 16#4c, Count);
+        _ -> Count
+    end;
+%% OP_PUSHDATA2
+count_sigops_accurate(<<16#4d:8, Len:16/little, Rest/binary>>, _LastOp, Count) ->
+    case Rest of
+        <<_:Len/binary, Rest2/binary>> ->
+            count_sigops_accurate(Rest2, 16#4d, Count);
+        _ -> Count
+    end;
+%% OP_PUSHDATA4
+count_sigops_accurate(<<16#4e:8, Len:32/little, Rest/binary>>, _LastOp, Count) ->
+    case Rest of
+        <<_:Len/binary, Rest2/binary>> ->
+            count_sigops_accurate(Rest2, 16#4e, Count);
+        _ -> Count
+    end;
+%% OP_CHECKSIG, OP_CHECKSIGVERIFY
+count_sigops_accurate(<<16#ac:8, Rest/binary>>, _LastOp, Count) ->
+    count_sigops_accurate(Rest, 16#ac, Count + 1);
+count_sigops_accurate(<<16#ad:8, Rest/binary>>, _LastOp, Count) ->
+    count_sigops_accurate(Rest, 16#ad, Count + 1);
+%% OP_CHECKMULTISIG, OP_CHECKMULTISIGVERIFY: decode pubkey count from LastOp
+count_sigops_accurate(<<16#ae:8, Rest/binary>>, LastOp, Count) ->
+    N = decode_op_n(LastOp),
+    count_sigops_accurate(Rest, 16#ae, Count + N);
+count_sigops_accurate(<<16#af:8, Rest/binary>>, LastOp, Count) ->
+    N = decode_op_n(LastOp),
+    count_sigops_accurate(Rest, 16#af, Count + N);
+%% any other opcode
+count_sigops_accurate(<<Op:8, Rest/binary>>, _LastOp, Count) ->
+    count_sigops_accurate(Rest, Op, Count).
+
+%% @doc Decode OP_N (OP_1 through OP_16) to integer.
+%% Returns MAX_PUBKEYS_PER_MULTISIG (20) for invalid/non-number opcodes.
+%% OP_0 (0x00) decodes to 0, OP_1..OP_16 (0x51..0x60) decode to 1..16.
+%% Reference: Bitcoin Core script.h DecodeOP_N
+-spec decode_op_n(integer() | none) -> non_neg_integer().
+decode_op_n(16#00) -> 0;  %% OP_0
+decode_op_n(Op) when Op >= 16#51, Op =< 16#60 -> Op - 16#50;  %% OP_1..OP_16
+decode_op_n(_) -> ?MAX_PUBKEYS_PER_MULTISIG.  %% invalid: use max
+
 %% @doc Check for merkle tree malleation (CVE-2012-2459).
 %% At each level of the merkle tree, if the count is odd and the last
 %% two entries are equal, the tree can be mutated.
@@ -528,7 +592,8 @@ merkle_pairs_check([A, B | Rest]) ->
 
 %% @doc Count P2SH sigops for a transaction.
 %% For each P2SH input, deserializes the redeem script from scriptSig
-%% and counts sigops in it.
+%% and counts sigops in it using accurate mode.
+%% Reference: Bitcoin Core script.cpp GetSigOpCount(scriptSig)
 -spec count_p2sh_sigops(#transaction{}, [#utxo{}]) -> non_neg_integer().
 count_p2sh_sigops(#transaction{inputs = Inputs}, InputCoins) ->
     lists:foldl(fun({Input, Coin}, Acc) ->
@@ -537,7 +602,8 @@ count_p2sh_sigops(#transaction{inputs = Inputs}, InputCoins) ->
                 %% get the redeem script (last push in scriptSig)
                 case get_last_push(Input#tx_in.script_sig) of
                     {ok, RedeemScript} ->
-                        Acc + count_legacy_sigops(RedeemScript, 0);
+                        %% P2SH uses accurate sigop counting
+                        Acc + count_sigops_accurate(RedeemScript);
                     error ->
                         Acc
                 end;
@@ -596,16 +662,17 @@ get_tx_sigop_cost(Tx, InputCoins, Flags) ->
     (LegacySigops + P2shSigops) * ?WITNESS_SCALE_FACTOR + WitnessSigops.
 
 %% Count sigops for a witness program
+%% Reference: Bitcoin Core interpreter.cpp WitnessSigOps
 witness_sigops_for_program(0, Program, _Witness) when byte_size(Program) =:= 20 ->
     %% P2WPKH: 1 sigop
     1;
 witness_sigops_for_program(0, Program, Witness) when byte_size(Program) =:= 32 ->
-    %% P2WSH: count sigops in the witness script (last item)
+    %% P2WSH: count sigops in the witness script (last item) using accurate mode
     case Witness of
         [] -> 0;
         _ ->
             WitnessScript = lists:last(Witness),
-            count_legacy_sigops(WitnessScript, 0)
+            count_sigops_accurate(WitnessScript)
     end;
 witness_sigops_for_program(_Version, _Program, _Witness) ->
     %% unknown witness version: 0 sigops
