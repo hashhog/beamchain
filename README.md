@@ -27,6 +27,7 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] Undo data for block disconnection (reorg support)
 - [x] Mempool with fee-based ordering and ancestor/descendant limits
 - [x] Full RBF (Replace-by-Fee) transaction replacement
+- [x] Package acceptance (CPFP within packages, package RBF)
 - [x] BIP68 relative lock-time (sequence locks)
 - [x] JSON-RPC interface (core RPCs including getblock, gettxoutsetinfo, getblockstats)
 - [x] Block statistics RPCs (getblockstats, getchaintxstats)
