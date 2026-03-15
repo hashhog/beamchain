@@ -900,3 +900,238 @@ is_child_with_parents_helper(Package) ->
         Txid = beamchain_serialize:tx_hash(P),
         sets:is_element(Txid, ChildInputTxids)
     end, Parents).
+
+%%% ===================================================================
+%%% TRUC (v3 transaction) policy tests
+%%% ===================================================================
+
+%% Test TRUC version constant
+truc_version_test() ->
+    ?assertEqual(3, ?TRUC_VERSION).
+
+%% Test TRUC limits constants
+truc_limits_test() ->
+    ?assertEqual(2, ?TRUC_ANCESTOR_LIMIT),
+    ?assertEqual(2, ?TRUC_DESCENDANT_LIMIT),
+    ?assertEqual(10000, ?TRUC_MAX_VSIZE),
+    ?assertEqual(1000, ?TRUC_CHILD_MAX_VSIZE).
+
+%% Test v3 transaction creation
+make_v3_tx_test() ->
+    Tx = make_v3_tx([{<<1:256>>, 0}], [{1000, p2pkh_script()}]),
+    ?assertEqual(3, Tx#transaction.version).
+
+%% Test non-v3 tx cannot spend unconfirmed v3 output
+non_truc_spends_truc_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             %% Create v3 parent in mempool
+             ParentTxid = <<1:256>>,
+             ParentTx = make_v3_tx([{<<100:256>>, 0}], [{5000, p2pkh_script()}]),
+             ParentEntry = make_entry_with_tx_and_version(ParentTxid, 5.0, ParentTx, 3),
+             ets:insert(mempool_txs, {ParentTxid, ParentEntry}),
+
+             %% Non-v3 child tries to spend v3 parent - should fail
+             Result = beamchain_mempool:check_truc_rules(
+                 make_tx([{ParentTxid, 0}], [{4000, p2pkh_script()}]),  %% v2 tx
+                 200,  %% vsize
+                 [ParentTxid]  %% mempool parents
+             ),
+             ?assertMatch({error, {truc_violation, non_truc_spends_truc}}, Result)
+         end]
+     end}.
+
+%% Test v3 tx cannot spend non-v3 unconfirmed output
+truc_spends_non_truc_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             %% Create v2 parent in mempool
+             ParentTxid = <<1:256>>,
+             ParentTx = make_tx([{<<100:256>>, 0}], [{5000, p2pkh_script()}]),
+             ParentEntry = make_entry_with_tx(ParentTxid, 5.0, ParentTx),
+             ets:insert(mempool_txs, {ParentTxid, ParentEntry}),
+
+             %% v3 child tries to spend v2 parent - should fail
+             V3Child = make_v3_tx([{ParentTxid, 0}], [{4000, p2pkh_script()}]),
+             Result = beamchain_mempool:check_truc_rules(
+                 V3Child,
+                 200,  %% vsize
+                 [ParentTxid]  %% mempool parents
+             ),
+             ?assertMatch({error, {truc_violation, truc_spends_non_truc}}, Result)
+         end]
+     end}.
+
+%% Test v3 tx with no mempool parents (standalone) passes
+truc_standalone_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             %% v3 tx with no mempool parents should pass
+             V3Tx = make_v3_tx([{<<100:256>>, 0}], [{5000, p2pkh_script()}]),
+             Result = beamchain_mempool:check_truc_rules(
+                 V3Tx,
+                 200,  %% vsize (well under 10000 limit)
+                 []    %% no mempool parents
+             ),
+             ?assertEqual(ok, Result)
+         end]
+     end}.
+
+%% Test v3 child with v3 parent passes
+truc_valid_parent_child_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             %% Create v3 parent in mempool
+             ParentTxid = <<1:256>>,
+             ParentTx = make_v3_tx([{<<100:256>>, 0}], [{5000, p2pkh_script()}]),
+             ParentEntry = make_entry_with_tx_and_version(ParentTxid, 5.0, ParentTx, 3),
+             ets:insert(mempool_txs, {ParentTxid, ParentEntry}),
+
+             %% v3 child spending v3 parent should pass
+             V3Child = make_v3_tx([{ParentTxid, 0}], [{4000, p2pkh_script()}]),
+             Result = beamchain_mempool:check_truc_rules(
+                 V3Child,
+                 500,  %% vsize (under 1000 child limit)
+                 [ParentTxid]
+             ),
+             ?assertEqual(ok, Result)
+         end]
+     end}.
+
+%% Test v3 child size limit (1000 vB)
+truc_child_size_limit_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             %% Create v3 parent in mempool
+             ParentTxid = <<1:256>>,
+             ParentTx = make_v3_tx([{<<100:256>>, 0}], [{5000, p2pkh_script()}]),
+             ParentEntry = make_entry_with_tx_and_version(ParentTxid, 5.0, ParentTx, 3),
+             ets:insert(mempool_txs, {ParentTxid, ParentEntry}),
+
+             %% v3 child > 1000 vB should fail
+             V3Child = make_v3_tx([{ParentTxid, 0}], [{4000, p2pkh_script()}]),
+             Result = beamchain_mempool:check_truc_rules(
+                 V3Child,
+                 1001,  %% vsize exceeds TRUC_CHILD_MAX_VSIZE
+                 [ParentTxid]
+             ),
+             ?assertMatch({error, {truc_violation, {child_too_large, 1001, 1000}}}, Result)
+         end]
+     end}.
+
+%% Test v3 tx size limit (10000 vB)
+truc_tx_size_limit_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             %% v3 tx > 10000 vB should fail (even without parents)
+             V3Tx = make_v3_tx([{<<100:256>>, 0}], [{5000, p2pkh_script()}]),
+             Result = beamchain_mempool:check_truc_rules(
+                 V3Tx,
+                 10001,  %% vsize exceeds TRUC_MAX_VSIZE
+                 []
+             ),
+             ?assertMatch({error, {truc_violation, {tx_too_large, 10001, 10000}}}, Result)
+         end]
+     end}.
+
+%% Test v3 can have at most 1 unconfirmed parent
+truc_ancestor_limit_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             %% Create two v3 parents in mempool
+             Parent1Txid = <<1:256>>,
+             Parent1Tx = make_v3_tx([{<<100:256>>, 0}], [{5000, p2pkh_script()}]),
+             Parent1Entry = make_entry_with_tx_and_version(Parent1Txid, 5.0, Parent1Tx, 3),
+             ets:insert(mempool_txs, {Parent1Txid, Parent1Entry}),
+
+             Parent2Txid = <<2:256>>,
+             Parent2Tx = make_v3_tx([{<<101:256>>, 0}], [{5000, p2pkh_script()}]),
+             Parent2Entry = make_entry_with_tx_and_version(Parent2Txid, 5.0, Parent2Tx, 3),
+             ets:insert(mempool_txs, {Parent2Txid, Parent2Entry}),
+
+             %% v3 child with 2 mempool parents should fail
+             V3Child = make_v3_tx([{Parent1Txid, 0}, {Parent2Txid, 0}],
+                                  [{8000, p2pkh_script()}]),
+             Result = beamchain_mempool:check_truc_rules(
+                 V3Child,
+                 500,
+                 [Parent1Txid, Parent2Txid]
+             ),
+             ?assertMatch({error, {truc_violation, too_many_ancestors}}, Result)
+         end]
+     end}.
+
+%% Test v3 parent can have at most 1 child - triggers sibling eviction
+truc_descendant_limit_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             %% Create v3 parent in mempool with 1 child already
+             ParentTxid = <<1:256>>,
+             ParentTx = make_v3_tx([{<<100:256>>, 0}], [{5000, p2pkh_script()}]),
+             ParentEntry = (make_entry_with_tx_and_version(ParentTxid, 5.0, ParentTx, 3))#mempool_entry{
+                 descendant_count = 2,  %% already has 1 child
+                 descendant_size = 400,
+                 descendant_fee = 1000
+             },
+             ets:insert(mempool_txs, {ParentTxid, ParentEntry}),
+
+             %% Existing child
+             Child1Txid = <<2:256>>,
+             Child1Tx = make_v3_tx([{ParentTxid, 0}], [{4000, p2pkh_script()}]),
+             Child1Entry = make_entry_with_tx_and_version(Child1Txid, 5.0, Child1Tx, 3),
+             ets:insert(mempool_txs, {Child1Txid, Child1Entry}),
+             ets:insert(mempool_outpoints, {{ParentTxid, 0}, Child1Txid}),
+
+             %% New v3 child trying to also spend parent - should trigger sibling eviction
+             V3Child2 = make_v3_tx([{ParentTxid, 0}], [{3500, p2pkh_script()}]),
+             Result = beamchain_mempool:check_truc_rules(
+                 V3Child2,
+                 500,
+                 [ParentTxid]
+             ),
+             ?assertMatch({sibling_eviction, Child1Txid}, Result)
+         end]
+     end}.
+
+%% Test non-v3 tx without v3 parents passes
+non_truc_no_v3_parents_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             %% Create v2 parent in mempool
+             ParentTxid = <<1:256>>,
+             ParentTx = make_tx([{<<100:256>>, 0}], [{5000, p2pkh_script()}]),
+             ParentEntry = make_entry_with_tx(ParentTxid, 5.0, ParentTx),
+             ets:insert(mempool_txs, {ParentTxid, ParentEntry}),
+
+             %% Non-v3 child spending v2 parent should pass
+             V2Child = make_tx([{ParentTxid, 0}], [{4000, p2pkh_script()}]),
+             Result = beamchain_mempool:check_truc_rules(
+                 V2Child,
+                 200,
+                 [ParentTxid]
+             ),
+             ?assertEqual(ok, Result)
+         end]
+     end}.
+
+%%% ===================================================================
+%%% TRUC test helpers
+%%% ===================================================================
+
+make_v3_tx(Inputs, Outputs) ->
+    Tx = make_tx(Inputs, Outputs),
+    Tx#transaction{version = 3}.
+
+make_entry_with_tx_and_version(Txid, FeeRate, Tx, Version) ->
+    Entry = make_entry_with_tx(Txid, FeeRate, Tx),
+    UpdatedTx = Tx#transaction{version = Version},
+    Entry#mempool_entry{tx = UpdatedTx}.
