@@ -346,6 +346,8 @@ handle_method(<<"getblock">>, P) -> rpc_getblock(P);
 handle_method(<<"getblockheader">>, P) -> rpc_getblockheader(P);
 handle_method(<<"getdifficulty">>, _) -> rpc_getdifficulty();
 handle_method(<<"getchaintips">>, _) -> rpc_getchaintips();
+handle_method(<<"getblockstats">>, P) -> rpc_getblockstats(P);
+handle_method(<<"getchaintxstats">>, P) -> rpc_getchaintxstats(P);
 handle_method(<<"verifychain">>, _) -> rpc_verifychain();
 
 %% -- Transactions --
@@ -420,7 +422,9 @@ rpc_help_list() ->
         <<"getblockcount">>,
         <<"getblockhash height">>,
         <<"getblockheader \"blockhash\" ( verbose )">>,
+        <<"getblockstats \"hash_or_height\" ( stats )">>,
         <<"getchaintips">>,
+        <<"getchaintxstats ( nblocks \"blockhash\" )">>,
         <<"getdifficulty">>,
         <<"gettxoutsetinfo ( \"hash_type\" )">>,
         <<"verifychain ( checklevel nblocks )">>,
@@ -674,6 +678,448 @@ rpc_verifychain() ->
         {ok, _} -> {ok, true};
         not_found -> {ok, true}
     end.
+
+%% @doc getblockstats - compute per-block statistics
+rpc_getblockstats([HashOrHeight]) ->
+    rpc_getblockstats([HashOrHeight, []]);
+rpc_getblockstats([HashOrHeight, Stats]) when is_list(Stats) ->
+    case resolve_block_hash_or_height(HashOrHeight) of
+        {ok, Hash, Height} ->
+            calculate_and_format_blockstats(Hash, Height, Stats);
+        {error, Code, Msg} ->
+            {error, Code, Msg}
+    end;
+rpc_getblockstats(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: getblockstats \"hash_or_height\" ( stats )">>}.
+
+%% @doc getchaintxstats - compute chain transaction statistics
+rpc_getchaintxstats([]) ->
+    %% Default: ~1 month (4320 blocks at 10 min/block for mainnet)
+    DefaultBlocks = 4320,
+    case beamchain_chainstate:get_tip() of
+        {ok, {Hash, Height}} ->
+            NBlocks = min(DefaultBlocks, Height),
+            calculate_and_format_chaintxstats(Hash, Height, NBlocks);
+        not_found ->
+            {error, ?RPC_MISC_ERROR, <<"Chain not found">>}
+    end;
+rpc_getchaintxstats([NBlocks]) when is_integer(NBlocks) ->
+    case beamchain_chainstate:get_tip() of
+        {ok, {Hash, Height}} ->
+            calculate_and_format_chaintxstats(Hash, Height, NBlocks);
+        not_found ->
+            {error, ?RPC_MISC_ERROR, <<"Chain not found">>}
+    end;
+rpc_getchaintxstats([NBlocks, BlockHashHex]) when is_integer(NBlocks), is_binary(BlockHashHex) ->
+    BlockHash = hex_to_internal_hash(BlockHashHex),
+    case beamchain_db:get_block_index_by_hash(BlockHash) of
+        {ok, #{height := Height}} ->
+            %% Verify block is in active chain
+            case is_block_in_active_chain(BlockHash) of
+                true ->
+                    calculate_and_format_chaintxstats(BlockHash, Height, NBlocks);
+                false ->
+                    {error, ?RPC_INVALID_PARAMETER, <<"Block is not in main chain">>}
+            end;
+        not_found ->
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY, <<"Block not found">>}
+    end;
+rpc_getchaintxstats(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: getchaintxstats ( nblocks \"blockhash\" )">>}.
+
+%% Helper: resolve hash or height to {ok, Hash, Height} or {error, ...}
+resolve_block_hash_or_height(Height) when is_integer(Height), Height >= 0 ->
+    case beamchain_db:get_block_index(Height) of
+        {ok, #{hash := Hash}} ->
+            {ok, Hash, Height};
+        not_found ->
+            {error, ?RPC_INVALID_PARAMETER, <<"Block height out of range">>}
+    end;
+resolve_block_hash_or_height(HashHex) when is_binary(HashHex) ->
+    Hash = hex_to_internal_hash(HashHex),
+    case beamchain_db:get_block_index_by_hash(Hash) of
+        {ok, #{height := Height}} ->
+            {ok, Hash, Height};
+        not_found ->
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY, <<"Block not found">>}
+    end;
+resolve_block_hash_or_height(_) ->
+    {error, ?RPC_INVALID_PARAMETER, <<"Invalid hash or height">>}.
+
+%% Calculate and format block statistics
+calculate_and_format_blockstats(Hash, Height, RequestedStats) ->
+    %% Check if we have cached stats
+    case beamchain_db:get_block_stats(Hash) of
+        {ok, CachedStats} ->
+            filter_stats(CachedStats, RequestedStats, Hash, Height);
+        not_found ->
+            %% Need to compute stats from block data
+            case beamchain_db:get_block(Hash) of
+                {ok, Block} ->
+                    Stats = compute_block_stats(Block, Height),
+                    %% Cache for future queries
+                    beamchain_db:store_block_stats(Hash, Stats),
+                    filter_stats(Stats, RequestedStats, Hash, Height);
+                not_found ->
+                    {error, ?RPC_MISC_ERROR, <<"Block data not found (pruned?)">>}
+            end
+    end.
+
+%% Filter stats to only include requested fields
+filter_stats(AllStats, [], Hash, Height) ->
+    %% Return all stats if none specifically requested
+    Result = AllStats#{
+        <<"blockhash">> => hash_to_hex(Hash),
+        <<"height">> => Height,
+        <<"mediantime">> => block_mtp(Height)
+    },
+    {ok, Result};
+filter_stats(AllStats, RequestedStats, Hash, Height) ->
+    %% Only return requested stats
+    RequestedBins = [to_bin(S) || S <- RequestedStats],
+    AllStatsWithMeta = AllStats#{
+        <<"blockhash">> => hash_to_hex(Hash),
+        <<"height">> => Height,
+        <<"mediantime">> => block_mtp(Height)
+    },
+    Result = maps:filter(fun(K, _V) ->
+        lists:member(K, RequestedBins)
+    end, AllStatsWithMeta),
+    case maps:size(Result) of
+        0 ->
+            %% No valid stats requested
+            {error, ?RPC_INVALID_PARAMETER, <<"Invalid selected statistics">>};
+        _ ->
+            {ok, Result}
+    end.
+
+%% Compute block statistics from block data
+compute_block_stats(#block{transactions = Txs, header = Header}, Height) ->
+    %% Initialize accumulators
+    InitAcc = #{
+        txs => length(Txs),
+        inputs => 0,
+        outputs => 0,
+        total_size => 0,
+        total_weight => 0,
+        total_out => 0,
+        totalfee => 0,
+        swtxs => 0,
+        swtotal_size => 0,
+        swtotal_weight => 0,
+        fees => [],
+        feerates => [],
+        txsizes => []
+    },
+
+    %% Process each transaction
+    {_Idx, FinalAcc} = lists:foldl(fun(Tx, {Idx, Acc}) ->
+        {Idx + 1, process_tx_for_stats(Tx, Idx, Acc)}
+    end, {0, InitAcc}, Txs),
+
+    %% Calculate derived statistics
+    #{txs := TxCount, inputs := Ins, outputs := Outs,
+      total_size := TotalSize, total_weight := TotalWeight,
+      total_out := TotalOut, totalfee := TotalFee,
+      swtxs := SwTxs, swtotal_size := SwTotalSize, swtotal_weight := SwTotalWeight,
+      fees := Fees, feerates := FeeRates, txsizes := TxSizes} = FinalAcc,
+
+    %% Non-coinbase tx count for averages
+    NonCoinbaseCount = max(1, TxCount - 1),
+
+    %% Compute median values
+    MedianFee = truncated_median(Fees),
+    MedianTxSize = truncated_median(TxSizes),
+
+    %% Compute fee rate percentiles (weighted by transaction weight)
+    FeeRatePercentiles = calculate_feerate_percentiles(FeeRates, TotalWeight),
+
+    %% Min/max values
+    {MinFee, MaxFee} = case Fees of
+        [] -> {0, 0};
+        _ -> {lists:min(Fees), lists:max(Fees)}
+    end,
+    {MinFeeRate, MaxFeeRate} = case FeeRates of
+        [] -> {0, 0};
+        _ ->
+            FeeRatesOnly = [F || {F, _W} <- FeeRates],
+            {lists:min(FeeRatesOnly), lists:max(FeeRatesOnly)}
+    end,
+    {MinTxSize, MaxTxSize} = case TxSizes of
+        [] -> {0, 0};
+        _ -> {lists:min(TxSizes), lists:max(TxSizes)}
+    end,
+
+    %% Block subsidy
+    Subsidy = block_subsidy(Height),
+
+    #{
+        <<"avgfee">> => TotalFee div NonCoinbaseCount,
+        <<"avgfeerate">> => avg_feerate(TotalFee, TotalWeight),
+        <<"avgtxsize">> => TotalSize div NonCoinbaseCount,
+        <<"feerate_percentiles">> => FeeRatePercentiles,
+        <<"ins">> => Ins,
+        <<"maxfee">> => MaxFee,
+        <<"maxfeerate">> => MaxFeeRate,
+        <<"maxtxsize">> => MaxTxSize,
+        <<"medianfee">> => MedianFee,
+        <<"mediantxsize">> => MedianTxSize,
+        <<"minfee">> => MinFee,
+        <<"minfeerate">> => MinFeeRate,
+        <<"mintxsize">> => MinTxSize,
+        <<"outs">> => Outs,
+        <<"subsidy">> => Subsidy,
+        <<"swtotal_size">> => SwTotalSize,
+        <<"swtotal_weight">> => SwTotalWeight,
+        <<"swtxs">> => SwTxs,
+        <<"time">> => Header#block_header.timestamp,
+        <<"total_out">> => TotalOut,
+        <<"total_size">> => TotalSize,
+        <<"total_weight">> => TotalWeight,
+        <<"totalfee">> => TotalFee,
+        <<"txs">> => TxCount,
+        <<"utxo_increase">> => Outs - Ins,
+        <<"utxo_size_inc">> => 0  %% Simplified: would need actual UTXO size tracking
+    }.
+
+%% Process a single transaction for statistics accumulation
+process_tx_for_stats(Tx, Idx, Acc) ->
+    #transaction{inputs = Inputs, outputs = Outputs} = Tx,
+
+    OutputCount = length(Outputs),
+    TxWeight = beamchain_serialize:tx_weight(Tx),
+    TxSize = beamchain_serialize:tx_size(Tx),
+    TotalOut = lists:sum([V || #tx_out{value = V} <- Outputs]),
+    HasWitness = tx_has_witness(Tx),
+
+    %% Update outputs count
+    Acc2 = Acc#{outputs => maps:get(outputs, Acc) + OutputCount},
+
+    %% Skip coinbase for most stats (Idx == 0 is coinbase)
+    case Idx of
+        0 ->
+            %% Coinbase: only count outputs
+            Acc2;
+        _ ->
+            InputCount = length(Inputs),
+
+            %% Calculate fee by looking up input values
+            InputTotal = sum_input_values(Inputs),
+            Fee = max(0, InputTotal - TotalOut),
+
+            %% Fee rate in satoshis per virtual byte
+            FeeRate = case TxWeight of
+                0 -> 0;
+                _ -> (Fee * 4) div TxWeight  %% sat/vB = (fee * 4) / weight
+            end,
+
+            %% Update accumulators
+            Acc3 = Acc2#{
+                inputs => maps:get(inputs, Acc2) + InputCount,
+                total_size => maps:get(total_size, Acc2) + TxSize,
+                total_weight => maps:get(total_weight, Acc2) + TxWeight,
+                total_out => maps:get(total_out, Acc2) + TotalOut,
+                totalfee => maps:get(totalfee, Acc2) + Fee,
+                fees => [Fee | maps:get(fees, Acc2)],
+                feerates => [{FeeRate, TxWeight} | maps:get(feerates, Acc2)],
+                txsizes => [TxSize | maps:get(txsizes, Acc2)]
+            },
+
+            %% SegWit stats
+            case HasWitness of
+                true ->
+                    Acc3#{
+                        swtxs => maps:get(swtxs, Acc3) + 1,
+                        swtotal_size => maps:get(swtotal_size, Acc3) + TxSize,
+                        swtotal_weight => maps:get(swtotal_weight, Acc3) + TxWeight
+                    };
+                false ->
+                    Acc3
+            end
+    end.
+
+%% Check if transaction has witness data
+tx_has_witness(#transaction{inputs = Inputs}) ->
+    lists:any(fun(#tx_in{witness = W}) ->
+        W =/= [] andalso W =/= undefined
+    end, Inputs).
+
+%% Sum input values (lookup UTXOs)
+sum_input_values(Inputs) ->
+    lists:foldl(fun(#tx_in{prev_out = #outpoint{hash = H, index = I}}, Acc) ->
+        case beamchain_chainstate:get_utxo(H, I) of
+            {ok, #utxo{value = V}} -> Acc + V;
+            not_found ->
+                %% May be in mempool or missing
+                case beamchain_mempool:get_mempool_utxo(H, I) of
+                    {ok, #utxo{value = V}} -> Acc + V;
+                    not_found -> Acc
+                end
+        end
+    end, 0, Inputs).
+
+%% Calculate truncated median (Bitcoin Core style)
+truncated_median([]) -> 0;
+truncated_median(Values) ->
+    Sorted = lists:sort(Values),
+    Size = length(Sorted),
+    case Size rem 2 of
+        0 ->
+            %% Even: average of two middle values (truncated)
+            Mid = Size div 2,
+            (lists:nth(Mid, Sorted) + lists:nth(Mid + 1, Sorted)) div 2;
+        1 ->
+            %% Odd: middle value
+            lists:nth((Size div 2) + 1, Sorted)
+    end.
+
+%% Calculate average fee rate (sat/vB)
+avg_feerate(_, 0) -> 0;
+avg_feerate(TotalFee, TotalWeight) ->
+    (TotalFee * 4) div TotalWeight.
+
+%% Calculate fee rate percentiles weighted by transaction weight
+%% Returns [10th, 25th, 50th, 75th, 90th] percentiles
+calculate_feerate_percentiles([], _TotalWeight) ->
+    [0, 0, 0, 0, 0];
+calculate_feerate_percentiles(_FeeRates, TotalWeight) when TotalWeight =< 0 ->
+    [0, 0, 0, 0, 0];
+calculate_feerate_percentiles(FeeRates, TotalWeight) ->
+    %% Sort by fee rate
+    Sorted = lists:sort(fun({A, _}, {B, _}) -> A =< B end, FeeRates),
+
+    %% Target weights for percentiles
+    Targets = [
+        TotalWeight / 10,        %% 10th
+        TotalWeight / 4,         %% 25th
+        TotalWeight / 2,         %% 50th
+        TotalWeight * 3 / 4,     %% 75th
+        TotalWeight * 9 / 10     %% 90th
+    ],
+
+    calculate_percentiles_helper(Sorted, Targets, 0, []).
+
+calculate_percentiles_helper(_Sorted, [], _CumWeight, Acc) ->
+    lists:reverse(Acc);
+calculate_percentiles_helper([], [_|RestTargets], _CumWeight, Acc) ->
+    %% Fill remaining with last value or 0
+    LastVal = case Acc of [] -> 0; [V|_] -> V end,
+    calculate_percentiles_helper([], RestTargets, 0, [LastVal | Acc]);
+calculate_percentiles_helper([{FeeRate, Weight} | RestRates], [Target | RestTargets] = Targets,
+                             CumWeight, Acc) ->
+    NewCumWeight = CumWeight + Weight,
+    case NewCumWeight >= Target of
+        true ->
+            %% This fee rate covers this percentile
+            calculate_percentiles_helper([{FeeRate, Weight} | RestRates], RestTargets,
+                                          CumWeight, [FeeRate | Acc]);
+        false ->
+            %% Need more weight
+            calculate_percentiles_helper(RestRates, Targets, NewCumWeight, Acc)
+    end.
+
+%% Calculate block subsidy
+block_subsidy(Height) ->
+    Params = beamchain_config:network_params(),
+    HalvingInterval = maps:get(subsidy_halving, Params, 210000),
+    Halvings = Height div HalvingInterval,
+    case Halvings >= 64 of
+        true -> 0;
+        false -> (50 * 100000000) bsr Halvings  %% 50 BTC in satoshis
+    end.
+
+%% Calculate and format chain transaction statistics
+calculate_and_format_chaintxstats(BlockHash, Height, NBlocks) ->
+    %% Validate nblocks
+    case NBlocks < 0 orelse (NBlocks > 0 andalso NBlocks >= Height) of
+        true ->
+            {error, ?RPC_INVALID_PARAMETER,
+             <<"Invalid block count: should be between 0 and the block's height - 1">>};
+        false ->
+            %% Get block header for timestamp
+            case beamchain_db:get_block_index_by_hash(BlockHash) of
+                {ok, #{header := Header}} ->
+                    %% Get window start block
+                    StartHeight = Height - NBlocks,
+                    case beamchain_db:get_block_index(StartHeight) of
+                        {ok, #{header := StartHeader}} ->
+                            format_chaintxstats(BlockHash, Height, Header,
+                                                StartHeight, StartHeader, NBlocks);
+                        not_found ->
+                            {error, ?RPC_MISC_ERROR, <<"Start block not found">>}
+                    end;
+                not_found ->
+                    {error, ?RPC_MISC_ERROR, <<"Block not found">>}
+            end
+    end.
+
+format_chaintxstats(BlockHash, Height, Header, StartHeight, _StartHeader, NBlocks) ->
+    %% Use median time past for time calculations
+    EndMTP = block_mtp(Height),
+    StartMTP = block_mtp(StartHeight),
+    TimeDiff = EndMTP - StartMTP,
+
+    %% Get cumulative tx counts if available
+    TxCount = get_cumulative_txcount_for_height(Height),
+    StartTxCount = get_cumulative_txcount_for_height(StartHeight),
+
+    Result = #{
+        <<"time">> => Header#block_header.timestamp,
+        <<"window_final_block_hash">> => hash_to_hex(BlockHash),
+        <<"window_final_block_height">> => Height,
+        <<"window_block_count">> => NBlocks
+    },
+
+    %% Add txcount if known
+    Result2 = case TxCount of
+        undefined -> Result;
+        _ -> Result#{<<"txcount">> => TxCount}
+    end,
+
+    %% Add window stats if nblocks > 0
+    Result3 = case NBlocks > 0 of
+        true ->
+            R = Result2#{<<"window_interval">> => TimeDiff},
+            case {TxCount, StartTxCount} of
+                {undefined, _} -> R;
+                {_, undefined} -> R;
+                {End, Start} when End > 0, Start >= 0 ->
+                    WindowTxCount = End - Start,
+                    R2 = R#{<<"window_tx_count">> => WindowTxCount},
+                    case TimeDiff > 0 of
+                        true ->
+                            TxRate = WindowTxCount / TimeDiff,
+                            R2#{<<"txrate">> => TxRate};
+                        false ->
+                            R2
+                    end;
+                _ -> R
+            end;
+        false ->
+            Result2
+    end,
+
+    {ok, Result3}.
+
+%% Get cumulative tx count for a height (estimate if not stored)
+get_cumulative_txcount_for_height(Height) ->
+    case beamchain_db:get_cumulative_tx_count(Height) of
+        {ok, Count} ->
+            Count;
+        not_found ->
+            %% Estimate by counting tx in blocks (expensive, so only do for recent blocks)
+            estimate_cumulative_txcount(Height)
+    end.
+
+%% Estimate cumulative tx count by counting backwards
+estimate_cumulative_txcount(Height) when Height =< 0 ->
+    0;
+estimate_cumulative_txcount(_Height) ->
+    %% For now, return undefined if not stored
+    %% A full implementation would scan blocks and cache results
+    undefined.
 
 %%% ===================================================================
 %%% Transaction methods
