@@ -2,12 +2,16 @@
 -behaviour(gen_server).
 
 -include("beamchain.hrl").
+-include_lib("kernel/include/file.hrl").
 
 %% API
 -export([start_link/0, stop/0]).
 
 %% Block storage
 -export([store_block/2, get_block/1, get_block_by_height/1, has_block/1]).
+
+%% Flat file block storage
+-export([write_block/2, read_block/1, get_block_file_info/0]).
 
 %% UTXO set
 -export([get_utxo/2, store_utxo/3, spend_utxo/2, has_utxo/2]).
@@ -48,6 +52,10 @@
 -define(CF_META, "meta").
 -define(CF_UNDO, "undo").
 
+%% Flat file constants
+-define(MAX_BLOCKFILE_SIZE, 134217728).  %% 128 MB
+-define(BLOCK_INDEX_ETS, beamchain_block_index).
+
 -record(state, {
     db_handle   :: rocksdb:db_handle() | undefined,
     cf_blocks   :: rocksdb:cf_handle() | undefined,
@@ -56,7 +64,13 @@
     cf_tx_index :: rocksdb:cf_handle() | undefined,
     cf_meta     :: rocksdb:cf_handle() | undefined,
     cf_undo     :: rocksdb:cf_handle() | undefined,
-    data_dir    :: string()
+    data_dir    :: string(),
+    %% Flat file state
+    blocks_dir  :: string() | undefined,
+    current_file :: non_neg_integer(),
+    current_pos  :: non_neg_integer(),
+    write_fd    :: file:fd() | undefined,
+    network_magic :: binary()
 }).
 
 %%% ===================================================================
@@ -200,6 +214,25 @@ put_meta(Key, Value) when is_binary(Key), is_binary(Value) ->
 get_db_stats() ->
     gen_server:call(?SERVER, get_db_stats).
 
+%% @doc Write a block to flat file storage.
+%% Returns {ok, {FileNum, Offset, Size}} on success.
+%% The block is prefixed with network magic (4 bytes) and size (4 bytes LE).
+-spec write_block(#block{}, non_neg_integer()) ->
+    {ok, {non_neg_integer(), non_neg_integer(), non_neg_integer()}} | {error, term()}.
+write_block(Block, Height) ->
+    gen_server:call(?SERVER, {write_block_flat, Block, Height}, 30000).
+
+%% @doc Read a block from flat file storage by hash.
+%% Looks up the block index to find file/offset, then reads from disk.
+-spec read_block(binary()) -> {ok, #block{}} | not_found | {error, term()}.
+read_block(Hash) when byte_size(Hash) =:= 32 ->
+    gen_server:call(?SERVER, {read_block_flat, Hash}).
+
+%% @doc Get current flat file info (for debugging/monitoring).
+-spec get_block_file_info() -> map().
+get_block_file_info() ->
+    gen_server:call(?SERVER, get_block_file_info).
+
 %%% ===================================================================
 %%% gen_server callbacks
 %%% ===================================================================
@@ -207,7 +240,9 @@ get_db_stats() ->
 init([]) ->
     DataDir = beamchain_config:datadir(),
     DbPath = filename:join(DataDir, "chaindata"),
+    BlocksDir = filename:join(DataDir, "blocks"),
     ok = filelib:ensure_dir(filename:join(DbPath, "dummy")),
+    ok = filelib:ensure_dir(filename:join(BlocksDir, "dummy")),
 
     DbOpts = [
         {create_if_missing, true},
@@ -231,6 +266,32 @@ init([]) ->
     case rocksdb:open(DbPath, DbOpts, CFDescriptors) of
         {ok, DbHandle, [_DefaultCF, BlocksCF, BlockIdxCF,
                          ChainstateCF, TxIndexCF, MetaCF, UndoCF]} ->
+            %% Initialize flat file block index ETS table
+            case ets:info(?BLOCK_INDEX_ETS) of
+                undefined ->
+                    ets:new(?BLOCK_INDEX_ETS, [named_table, set, public,
+                                                {read_concurrency, true}]);
+                _ -> ok
+            end,
+
+            %% Load block index from disk if it exists
+            BlockIndexPath = filename:join(BlocksDir, "block_index.ets"),
+            case filelib:is_regular(BlockIndexPath) of
+                true ->
+                    case ets:file2tab(BlockIndexPath) of
+                        {ok, _} -> ok;
+                        {error, Reason} ->
+                            logger:warning("Failed to load block index: ~p", [Reason])
+                    end;
+                false -> ok
+            end,
+
+            %% Determine current file number and position
+            {CurrentFile, CurrentPos} = find_current_blockfile(BlocksDir),
+
+            %% Get network magic
+            NetworkMagic = beamchain_config:magic(),
+
             State = #state{
                 db_handle = DbHandle,
                 cf_blocks = BlocksCF,
@@ -239,9 +300,15 @@ init([]) ->
                 cf_tx_index = TxIndexCF,
                 cf_meta = MetaCF,
                 cf_undo = UndoCF,
-                data_dir = DbPath
+                data_dir = DbPath,
+                blocks_dir = BlocksDir,
+                current_file = CurrentFile,
+                current_pos = CurrentPos,
+                write_fd = undefined,
+                network_magic = NetworkMagic
             },
-            logger:info("beamchain_db: opened rocksdb at ~s", [DbPath]),
+            logger:info("beamchain_db: opened rocksdb at ~s, blocks at ~s (file ~p, pos ~p)",
+                        [DbPath, BlocksDir, CurrentFile, CurrentPos]),
             {ok, State};
         {error, Reason} ->
             logger:error("beamchain_db: failed to open rocksdb: ~p", [Reason]),
@@ -485,6 +552,31 @@ handle_call(get_db_stats, _From,
     },
     {reply, Stats, State};
 
+%% Flat file block storage
+handle_call({write_block_flat, Block, _Height}, _From, State) ->
+    case do_write_block_flat(Block, State) of
+        {ok, Location, NewState} ->
+            {reply, {ok, Location}, NewState};
+        {error, Reason} ->
+            {reply, {error, Reason}, State}
+    end;
+
+handle_call({read_block_flat, Hash}, _From, State) ->
+    Result = do_read_block_flat(Hash, State),
+    {reply, Result, State};
+
+handle_call(get_block_file_info, _From,
+            #state{blocks_dir = BlocksDir, current_file = CurrentFile,
+                   current_pos = CurrentPos} = State) ->
+    Info = #{
+        blocks_dir => BlocksDir,
+        current_file => CurrentFile,
+        current_pos => CurrentPos,
+        max_file_size => ?MAX_BLOCKFILE_SIZE,
+        index_size => ets:info(?BLOCK_INDEX_ETS, size)
+    },
+    {reply, Info, State};
+
 handle_call(_Request, _From, State) ->
     {reply, {error, not_implemented}, State}.
 
@@ -496,8 +588,19 @@ handle_info(_Info, State) ->
 
 terminate(_Reason, #state{db_handle = undefined}) ->
     ok;
-terminate(_Reason, #state{db_handle = DbHandle}) ->
+terminate(_Reason, #state{db_handle = DbHandle, write_fd = WriteFd,
+                          blocks_dir = BlocksDir}) ->
     logger:info("beamchain_db: closing rocksdb"),
+    %% Close write file descriptor
+    case WriteFd of
+        undefined -> ok;
+        Fd -> file:close(Fd)
+    end,
+    %% Persist block index to disk
+    case BlocksDir of
+        undefined -> ok;
+        _ -> persist_block_index(BlocksDir)
+    end,
     rocksdb:close(DbHandle),
     ok.
 
@@ -566,3 +669,192 @@ cf_handle(chainstate, #state{cf_chainstate = H}) -> H;
 cf_handle(tx_index, #state{cf_tx_index = H}) -> H;
 cf_handle(meta, #state{cf_meta = H}) -> H;
 cf_handle(undo, #state{cf_undo = H}) -> H.
+
+%%% ===================================================================
+%%% Flat file block storage helpers
+%%% ===================================================================
+
+%% @doc Find current blockfile number and write position.
+%% Scans for existing blk*.dat files and returns the highest file
+%% number and its current size. If no files exist, returns {0, 0}.
+-spec find_current_blockfile(string()) ->
+    {non_neg_integer(), non_neg_integer()}.
+find_current_blockfile(BlocksDir) ->
+    %% Find all blk*.dat files
+    Pattern = filename:join(BlocksDir, "blk*.dat"),
+    Files = filelib:wildcard(Pattern),
+    case Files of
+        [] ->
+            {0, 0};
+        _ ->
+            %% Extract file numbers and find max
+            FileNums = lists:filtermap(fun(Path) ->
+                Basename = filename:basename(Path, ".dat"),
+                case Basename of
+                    "blk" ++ NumStr ->
+                        case catch list_to_integer(NumStr) of
+                            N when is_integer(N) -> {true, N};
+                            _ -> false
+                        end;
+                    _ -> false
+                end
+            end, Files),
+            case FileNums of
+                [] -> {0, 0};
+                _ ->
+                    MaxFile = lists:max(FileNums),
+                    FilePath = blockfile_path(BlocksDir, MaxFile),
+                    case file:read_file_info(FilePath) of
+                        {ok, #file_info{size = Size}} -> {MaxFile, Size};
+                        _ -> {MaxFile, 0}
+                    end
+            end
+    end.
+
+%% @doc Generate path to a block file.
+-spec blockfile_path(string(), non_neg_integer()) -> string().
+blockfile_path(BlocksDir, FileNum) ->
+    Filename = io_lib:format("blk~5..0B.dat", [FileNum]),
+    filename:join(BlocksDir, lists:flatten(Filename)).
+
+%% @doc Write a block to flat file storage.
+%% Format: <<Magic:4/binary, Size:32/little, BlockData/binary>>
+-spec do_write_block_flat(#block{}, #state{}) ->
+    {ok, {non_neg_integer(), non_neg_integer(), non_neg_integer()}, #state{}} |
+    {error, term()}.
+do_write_block_flat(Block, #state{blocks_dir = BlocksDir,
+                                   current_file = CurrentFile,
+                                   current_pos = CurrentPos,
+                                   write_fd = WriteFd0,
+                                   network_magic = Magic} = State) ->
+    Hash = block_hash(Block),
+    BlockData = beamchain_serialize:encode_block(Block),
+    BlockSize = byte_size(BlockData),
+    %% Header: 4-byte magic + 4-byte size (little-endian)
+    HeaderSize = 8,
+    TotalSize = HeaderSize + BlockSize,
+
+    %% Check if we need to start a new file
+    {FileNum, WritePos, WriteFd1, State1} =
+        case CurrentPos + TotalSize > ?MAX_BLOCKFILE_SIZE of
+            true ->
+                %% Close current file, open new one
+                case WriteFd0 of
+                    undefined -> ok;
+                    OldFd -> file:close(OldFd)
+                end,
+                NewFileNum = CurrentFile + 1,
+                {NewFileNum, 0, undefined,
+                 State#state{current_file = NewFileNum, current_pos = 0,
+                             write_fd = undefined}};
+            false ->
+                {CurrentFile, CurrentPos, WriteFd0, State}
+        end,
+
+    %% Ensure we have an open file descriptor
+    case WriteFd1 of
+        undefined ->
+            FilePath = blockfile_path(BlocksDir, FileNum),
+            case file:open(FilePath, [raw, binary, append]) of
+                {ok, NewFd} ->
+                    write_block_data(NewFd, Magic, BlockSize, BlockData, Hash,
+                                     FileNum, WritePos, State1);
+                {error, Reason} ->
+                    {error, {open_failed, Reason}}
+            end;
+        ExistingFd ->
+            write_block_data(ExistingFd, Magic, BlockSize, BlockData, Hash,
+                             FileNum, WritePos, State1)
+    end.
+
+%% @doc Helper to actually write block data and update state.
+-spec write_block_data(file:fd(), binary(), non_neg_integer(), binary(),
+                        binary(), non_neg_integer(), non_neg_integer(),
+                        #state{}) ->
+    {ok, {non_neg_integer(), non_neg_integer(), non_neg_integer()}, #state{}} |
+    {error, term()}.
+write_block_data(Fd, Magic, BlockSize, BlockData, Hash, FileNum, WritePos, State) ->
+    %% Write header: magic + size (little-endian)
+    Header = <<Magic:4/binary, BlockSize:32/little>>,
+    case file:write(Fd, Header) of
+        ok ->
+            case file:write(Fd, BlockData) of
+                ok ->
+                    TotalSize = 8 + BlockSize,
+                    %% Store in ETS index: Hash -> {FileNum, Offset, Size}
+                    %% Offset points to start of block data (after header)
+                    DataOffset = WritePos + 8,
+                    ets:insert(?BLOCK_INDEX_ETS, {Hash, {FileNum, DataOffset, BlockSize}}),
+                    NewPos = WritePos + TotalSize,
+                    Location = {FileNum, DataOffset, BlockSize},
+                    {ok, Location, State#state{current_pos = NewPos, write_fd = Fd}};
+                {error, Reason} ->
+                    {error, {write_failed, Reason}}
+            end;
+        {error, Reason} ->
+            {error, {write_header_failed, Reason}}
+    end.
+
+%% @doc Read a block from flat file storage by hash.
+-spec do_read_block_flat(binary(), #state{}) ->
+    {ok, #block{}} | not_found | {error, term()}.
+do_read_block_flat(Hash, #state{blocks_dir = BlocksDir, network_magic = Magic}) ->
+    case ets:lookup(?BLOCK_INDEX_ETS, Hash) of
+        [{Hash, {FileNum, Offset, Size}}] ->
+            FilePath = blockfile_path(BlocksDir, FileNum),
+            case file:open(FilePath, [raw, binary, read]) of
+                {ok, Fd} ->
+                    Result = try
+                        %% Read block data from offset
+                        case file:pread(Fd, Offset, Size) of
+                            {ok, BlockData} when byte_size(BlockData) =:= Size ->
+                                %% Verify magic by reading header (offset - 8)
+                                case file:pread(Fd, Offset - 8, 8) of
+                                    {ok, <<ReadMagic:4/binary, ReadSize:32/little>>} ->
+                                        case ReadMagic =:= Magic andalso ReadSize =:= Size of
+                                            true ->
+                                                {Block, <<>>} = beamchain_serialize:decode_block(BlockData),
+                                                {ok, Block};
+                                            false ->
+                                                {error, {magic_mismatch, ReadMagic, Magic}}
+                                        end;
+                                    {ok, _} ->
+                                        {error, invalid_header};
+                                    eof ->
+                                        {error, unexpected_eof};
+                                    {error, Reason} ->
+                                        {error, {pread_header_failed, Reason}}
+                                end;
+                            {ok, _} ->
+                                {error, size_mismatch};
+                            eof ->
+                                {error, unexpected_eof};
+                            {error, Reason} ->
+                                {error, {pread_failed, Reason}}
+                        end
+                    catch
+                        _:Err ->
+                            {error, {decode_failed, Err}}
+                    after
+                        file:close(Fd)
+                    end,
+                    Result;
+                {error, Reason} ->
+                    {error, {open_failed, Reason}}
+            end;
+        [] ->
+            not_found
+    end.
+
+%% @doc Persist block index ETS table to disk.
+-spec persist_block_index(string()) -> ok | {error, term()}.
+persist_block_index(BlocksDir) ->
+    IndexPath = filename:join(BlocksDir, "block_index.ets"),
+    case ets:tab2file(?BLOCK_INDEX_ETS, IndexPath) of
+        ok ->
+            logger:info("beamchain_db: persisted block index to ~s", [IndexPath]),
+            ok;
+        {error, Reason} ->
+            logger:error("beamchain_db: failed to persist block index: ~p", [Reason]),
+            {error, Reason}
+    end.
