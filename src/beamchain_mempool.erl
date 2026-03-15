@@ -442,7 +442,9 @@ find_mempool_conflicts(#transaction{inputs = Inputs}) ->
         end,
         Inputs)).
 
-%% @doc Replace-by-fee (BIP 125).
+%% @doc Replace-by-fee (BIP 125 + Full RBF).
+%% Full RBF (Bitcoin Core 28.0+): allows replacement of any unconfirmed tx
+%% regardless of BIP125 opt-in signaling, when mempoolfullrbf=1.
 do_rbf(NewTx, ConflictTxids) ->
     %% gather all conflicting entries
     ConflictEntries = lists:filtermap(fun(Cid) ->
@@ -452,12 +454,21 @@ do_rbf(NewTx, ConflictTxids) ->
         end
     end, ConflictTxids),
 
-    %% 1. all conflicting txs must signal RBF
-    lists:foreach(fun(E) ->
-        E#mempool_entry.rbf_signaling orelse throw(rbf_not_signaled)
-    end, ConflictEntries),
+    %% 1. Check RBF signaling (unless full RBF is enabled)
+    FullRbfEnabled = beamchain_config:mempool_full_rbf(),
+    case FullRbfEnabled of
+        true ->
+            ok;  %% Full RBF: no signaling required
+        false ->
+            %% BIP 125: all conflicting txs must signal RBF
+            lists:foreach(fun(E) ->
+                E#mempool_entry.rbf_signaling orelse throw(rbf_not_signaled)
+            end, ConflictEntries)
+    end,
 
-    %% 2. new tx must not add new unconfirmed parents
+    %% 2. new tx must not add new unconfirmed parents (Rule 2)
+    %% The replacement transaction may only include an unconfirmed input
+    %% if that input was included in one of the original transactions.
     NewParents = get_parent_txids(NewTx),
     OldParents = lists:usort(lists:flatmap(fun(E) ->
         get_parent_txids(E#mempool_entry.tx)
@@ -465,7 +476,8 @@ do_rbf(NewTx, ConflictTxids) ->
     NewUnconfirmed = NewParents -- OldParents -- ConflictTxids,
     NewUnconfirmed =:= [] orelse throw(rbf_new_unconfirmed_inputs),
 
-    %% 3. collect all descendants of conflicting txs
+    %% 3. collect all descendants of conflicting txs (Rule 5)
+    %% Max 100 transactions can be evicted (conflicting txs + descendants)
     AllEvictTxids = lists:usort(lists:flatmap(fun(Cid) ->
         [Cid | get_all_descendants(Cid)]
     end, ConflictTxids)),
@@ -479,7 +491,7 @@ do_rbf(NewTx, ConflictTxids) ->
         end
     end, AllEvictTxids),
 
-    %% 4. new tx fee must exceed sum of all evicted fees
+    %% 4. new tx fee must be >= sum of all evicted fees (Rule 3)
     EvictedFeeTotal = lists:foldl(fun(E, Acc) ->
         Acc + E#mempool_entry.fee
     end, 0, AllEvictEntries),
@@ -489,20 +501,31 @@ do_rbf(NewTx, ConflictTxids) ->
     NewTotalOut = lists:foldl(fun(#tx_out{value = V}, A) -> A + V end,
                                0, NewTx#transaction.outputs),
     NewFee = NewTotalIn - NewTotalOut,
-    NewFee > EvictedFeeTotal orelse throw(rbf_insufficient_fee),
+    NewFee >= EvictedFeeTotal orelse throw(rbf_insufficient_fee),
 
-    %% 5. additional fee must cover min relay fee for the new tx
+    %% 5. additional fee must cover incremental relay fee for new tx (Rule 4)
+    %% additional_fees >= relay_fee * new_tx_vsize
+    %% incremental relay fee = 1 sat/vB
     NewVSize = beamchain_serialize:tx_vsize(NewTx),
-    MinAdditionalFee = NewVSize,
+    MinAdditionalFee = NewVSize,  %% 1 sat/vB * vsize
     (NewFee - EvictedFeeTotal) >= MinAdditionalFee
         orelse throw(rbf_insufficient_additional_fee),
+
+    %% 6. new tx fee rate must be higher than all directly conflicting txs
+    %% (additional check for fee rate, not just absolute fee)
+    NewFeeRate = NewFee / max(1, NewVSize),
+    lists:foreach(fun(E) ->
+        NewFeeRate > E#mempool_entry.fee_rate
+            orelse throw(rbf_insufficient_fee_rate)
+    end, ConflictEntries),
 
     %% evict all conflicting txs + descendants
     lists:foreach(fun(EvictTxid) ->
         remove_entry(EvictTxid)
     end, AllEvictTxids),
 
-    logger:debug("mempool: rbf evicted ~B txs", [length(AllEvictTxids)]),
+    logger:debug("mempool: rbf evicted ~B txs (fullrbf=~p)",
+                 [length(AllEvictTxids), FullRbfEnabled]),
     ok.
 
 %% Sum the input values for a transaction (UTXO set + mempool).
