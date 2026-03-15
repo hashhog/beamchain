@@ -13,6 +13,7 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 
 - [x] P2P networking and peer management
 - [x] Header-first sync with full validation
+- [x] Header sync anti-DoS (PoW validation, unconnecting limits, deep fork protection)
 - [x] Block download and storage (RocksDB)
 - [x] Script interpreter (all opcodes)
 - [x] Legacy sighash (FindAndDelete, OP_CODESEPARATOR)
@@ -30,6 +31,7 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] CPFP-aware tx selection (ancestor fee rate)
 - [x] Difficulty adjustment algorithm (retarget every 2016 blocks)
 - [x] BIP9 versionbits soft fork deployment tracking
+- [x] Checkpoint enforcement (mainnet checkpoints)
 - [ ] Wallet (HD keys, signing)
 - [ ] Compact block relay (BIP152)
 
@@ -57,12 +59,14 @@ src/
 ├── beamchain_crypto.erl       secp256k1 NIF bindings
 ├── beamchain_p2p_msg.erl      P2P message encoding
 ├── beamchain_peer.erl         Connection handling
+├── beamchain_header_sync.erl  Header-first sync with anti-DoS
 ├── beamchain_block_sync.erl   Block download
 ├── beamchain_chainstate.erl   UTXO management
 ├── beamchain_mempool.erl      Transaction pool
 ├── beamchain_miner.erl        Block template construction
 ├── beamchain_pow.erl          Proof of work and difficulty
 ├── beamchain_versionbits.erl  BIP9 deployment tracking
+├── beamchain_chain_params.erl Network parameters and checkpoints
 ├── beamchain_db.erl           RocksDB wrapper
 └── beamchain_rpc.erl          JSON-RPC server
 
