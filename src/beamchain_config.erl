@@ -16,7 +16,8 @@
          magic/0,
          txindex_enabled/0,
          prune_enabled/0,
-         prune_target/0]).
+         prune_target/0,
+         mempool_full_rbf/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -124,6 +125,26 @@ prune_target() ->
         0 -> 0;
         _ when Target < 550 -> 550;
         _ -> Target
+    end.
+
+%% @doc Check if full RBF is enabled.
+%% Reads from config file (mempoolfullrbf=1) or env var (BEAMCHAIN_FULLRBF=1).
+%% Defaults to true (enabled) since Bitcoin Core 28.0 behavior.
+-spec mempool_full_rbf() -> boolean().
+mempool_full_rbf() ->
+    case os:getenv("BEAMCHAIN_FULLRBF") of
+        "0" -> false;
+        "false" -> false;
+        false ->
+            %% No env var, check config
+            case get(mempoolfullrbf, "1") of
+                "0" -> false;
+                "false" -> false;
+                0 -> false;
+                false -> false;
+                _ -> true  %% Default to enabled (Bitcoin Core 28.0+)
+            end;
+        _ -> true
     end.
 
 %%% ===================================================================
