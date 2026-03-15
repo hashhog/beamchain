@@ -372,8 +372,133 @@ overweight_block_test() ->
     ?assertMatch({error, _}, Result).
 
 %%% ===================================================================
+%%% BIP 68 sequence lock tests
+%%% ===================================================================
+
+%% Test that version 1 transactions skip sequence lock checks
+sequence_lock_version_1_test() ->
+    %% Version 1 tx should not be affected by sequence locks
+    Tx = #transaction{
+        version = 1,
+        inputs = [#tx_in{
+            prev_out = #outpoint{hash = <<1:256>>, index = 0},
+            script_sig = <<>>,
+            sequence = 10,  %% would be 10-block lock if enforced
+            witness = []
+        }],
+        outputs = [#tx_out{value = 1000, script_pubkey = <<16#6a>>}],
+        locktime = 0
+    },
+    InputCoins = [#utxo{
+        value = 2000,
+        script_pubkey = <<>>,
+        is_coinbase = false,
+        height = 100
+    }],
+    %% For version 1, should return {-1, -1} regardless of sequence
+    ?assertEqual({-1, -1},
+                 beamchain_validation:calculate_sequence_lock_pair(
+                     Tx, InputCoins, #{})).
+
+%% Test that disable flag skips sequence lock for that input
+sequence_lock_disable_flag_test() ->
+    %% Bit 31 set = disable sequence lock
+    DisableSeq = 16#80000010,  %% disable flag + 16 blocks
+    Tx = make_tx_with_sequence([DisableSeq]),
+    InputCoins = [#utxo{
+        value = 2000,
+        script_pubkey = <<>>,
+        is_coinbase = false,
+        height = 100
+    }],
+    %% Disable flag means no lock constraint
+    ?assertEqual({-1, -1},
+                 beamchain_validation:calculate_sequence_lock_pair(
+                     Tx, InputCoins, #{})).
+
+%% Test height-based sequence lock calculation
+sequence_lock_height_based_test() ->
+    %% 10 blocks relative lock (no type flag = height-based)
+    Seq = 10,
+    Tx = make_tx_with_sequence([Seq]),
+    InputCoins = [#utxo{
+        value = 2000,
+        script_pubkey = <<>>,
+        is_coinbase = false,
+        height = 100
+    }],
+    %% MinHeight should be coinHeight + value - 1 = 100 + 10 - 1 = 109
+    {MinH, MinT} = beamchain_validation:calculate_sequence_lock_pair(
+        Tx, InputCoins, #{}),
+    ?assertEqual(109, MinH),
+    ?assertEqual(-1, MinT).
+
+%% Test multiple inputs with height-based locks (takes max)
+sequence_lock_height_multiple_inputs_test() ->
+    %% Two inputs with different height locks
+    Seq1 = 5,   %% 5 blocks
+    Seq2 = 15,  %% 15 blocks
+    Tx = make_tx_with_sequence([Seq1, Seq2]),
+    InputCoins = [
+        #utxo{value = 1000, script_pubkey = <<>>, is_coinbase = false, height = 100},
+        #utxo{value = 1000, script_pubkey = <<>>, is_coinbase = false, height = 110}
+    ],
+    %% MinHeight = max(100 + 5 - 1, 110 + 15 - 1) = max(104, 124) = 124
+    {MinH, MinT} = beamchain_validation:calculate_sequence_lock_pair(
+        Tx, InputCoins, #{}),
+    ?assertEqual(124, MinH),
+    ?assertEqual(-1, MinT).
+
+%% Test mixed inputs: one disabled, one with height lock
+sequence_lock_mixed_inputs_test() ->
+    DisableSeq = 16#80000020,  %% disabled
+    HeightSeq = 8,              %% 8 blocks
+    Tx = make_tx_with_sequence([DisableSeq, HeightSeq]),
+    InputCoins = [
+        #utxo{value = 1000, script_pubkey = <<>>, is_coinbase = false, height = 50},
+        #utxo{value = 1000, script_pubkey = <<>>, is_coinbase = false, height = 200}
+    ],
+    %% Only the second input contributes: 200 + 8 - 1 = 207
+    {MinH, MinT} = beamchain_validation:calculate_sequence_lock_pair(
+        Tx, InputCoins, #{}),
+    ?assertEqual(207, MinH),
+    ?assertEqual(-1, MinT).
+
+%% Test sequence lock mask (only lower 16 bits matter)
+sequence_lock_mask_test() ->
+    %% Set some bits above the mask, but only low 16 bits count
+    Seq = 16#00010005,  %% upper bits set, but lock is only 5 blocks
+    Tx = make_tx_with_sequence([Seq]),
+    InputCoins = [#utxo{
+        value = 2000,
+        script_pubkey = <<>>,
+        is_coinbase = false,
+        height = 100
+    }],
+    {MinH, _} = beamchain_validation:calculate_sequence_lock_pair(
+        Tx, InputCoins, #{}),
+    ?assertEqual(104, MinH).  %% 100 + 5 - 1 = 104
+
+%%% ===================================================================
 %%% Helper functions
 %%% ===================================================================
+
+%% Create a version 2 transaction with specified sequence numbers
+make_tx_with_sequence(Sequences) ->
+    Inputs = lists:map(fun({Seq, Idx}) ->
+        #tx_in{
+            prev_out = #outpoint{hash = <<Idx:256>>, index = 0},
+            script_sig = <<>>,
+            sequence = Seq,
+            witness = []
+        }
+    end, lists:zip(Sequences, lists:seq(1, length(Sequences)))),
+    #transaction{
+        version = 2,
+        inputs = Inputs,
+        outputs = [#tx_out{value = 1000, script_pubkey = <<16#6a>>}],
+        locktime = 0
+    }.
 
 make_coinbase_tx(ScriptSig, Value) ->
     #transaction{
