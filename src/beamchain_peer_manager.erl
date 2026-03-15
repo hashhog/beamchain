@@ -6,6 +6,11 @@
 %% Maintains an ETS table of active peers indexed by pid and address.
 %% Monitors all peer processes and cleans up on exit. Acts as the
 %% handler for peer callbacks (peer_connected, peer_disconnected, etc).
+%%
+%% Eclipse attack protections (Bitcoin Core parity):
+%% - Strict outbound netgroup diversity: max 1 outbound per netgroup
+%% - Anchor connections: persist 2 block-relay-only peers across restarts
+%% - Inbound eviction: evict least-useful peer when at capacity
 
 -include("beamchain.hrl").
 -include("beamchain_protocol.hrl").
@@ -47,6 +52,7 @@
 
 %% Connection limits (matches Bitcoin Core)
 -define(MAX_INBOUND_DEFAULT, 125).
+-define(MAX_ANCHOR_CONNECTIONS, 2).
 
 %% Misbehavior score values (Bitcoin Core compatible)
 -define(MISBEHAVIOR_INVALID_BLOCK, 100).       %% instant ban
@@ -59,14 +65,27 @@
 -define(CONNECT_INTERVAL_SLOW, 10000). %% 10s when at target count
 -define(CONNECT_INTERVAL_FAST, 3000).  %% 3s when below minimum
 
+%% Inbound eviction: number of peers to protect per category
+-define(EVICTION_PROTECT_BY_NETGROUP, 4).
+-define(EVICTION_PROTECT_BY_PING, 8).
+-define(EVICTION_PROTECT_BY_TX_TIME, 4).
+-define(EVICTION_PROTECT_BY_BLOCK_TIME, 4).
+
 -record(peer_entry, {
     pid         :: pid(),
     address     :: {inet:ip_address(), inet:port_number()},
     direction   :: inbound | outbound,
+    conn_type   :: full_relay | block_relay,  %% for outbound peers
     mon_ref     :: reference(),
     connected   :: boolean(),    %% true after handshake complete
+    connect_time :: non_neg_integer(),  %% connection start time
     info = #{}  :: map(),        %% version, services, user_agent, etc
-    misbehavior_score = 0 :: non_neg_integer()  %% accumulated misbehavior score
+    misbehavior_score = 0 :: non_neg_integer(),  %% accumulated misbehavior score
+    %% Eviction metrics
+    min_ping_time = infinity :: number() | infinity,
+    last_block_time = 0 :: non_neg_integer(),
+    last_tx_time = 0 :: non_neg_integer(),
+    keyed_netgroup = 0 :: non_neg_integer()  %% hash of netgroup
 }).
 
 -record(state, {
@@ -81,13 +100,20 @@
     %% Connection loop timer reference
     connect_timer :: reference() | undefined,
     %% Set of /16 netgroups we're connected to (for diversity)
-    netgroups = sets:new([{version, 2}]) :: sets:set(term()),
+    %% For outbound: strict 1 per netgroup
+    outbound_netgroups = sets:new([{version, 2}]) :: sets:set(term()),
     %% Listening socket for inbound connections
     listen_socket :: gen_tcp:socket() | undefined,
     %% Acceptor process
     acceptor :: pid() | undefined,
     %% Max inbound connections (default 125, like Bitcoin Core)
-    max_inbound :: non_neg_integer()
+    max_inbound :: non_neg_integer(),
+    %% Anchor connections: addresses to connect to on startup
+    anchors = [] :: [{inet:ip_address(), inet:port_number()}],
+    %% Secret for keyed netgroup hashing
+    netgroup_secret :: binary(),
+    %% Data directory for anchor file
+    datadir :: string()
 }).
 
 %%% ===================================================================
@@ -234,6 +260,11 @@ init([]) ->
             ok  %% table already exists (e.g., from tests)
     end,
     Nonce = generate_nonce(),
+    DataDir = beamchain_config:datadir(),
+    %% Generate or load netgroup secret
+    NetgroupSecret = load_or_generate_netgroup_secret(DataDir),
+    %% Load anchor connections
+    Anchors = load_anchors(DataDir),
     %% Start listening for inbound connections
     {ListenSock, Acceptor} = start_listener(),
     %% Kick off DNS seed resolution
@@ -245,7 +276,8 @@ init([]) ->
     MaxInbound = beamchain_config:get(max_inbound, ?MAX_INBOUND_DEFAULT),
     {ok, #state{our_nonce = Nonce, connect_timer = Timer,
                 listen_socket = ListenSock, acceptor = Acceptor,
-                max_inbound = MaxInbound}}.
+                max_inbound = MaxInbound, anchors = Anchors,
+                netgroup_secret = NetgroupSecret, datadir = DataDir}}.
 
 handle_call({connect_to, IP, Port}, _From, State) ->
     Address = {IP, Port},
@@ -257,18 +289,9 @@ handle_call({connect_to, IP, Port}, _From, State) ->
                 {ok, _Pid} ->
                     {reply, {error, already_connected}, State};
                 error ->
-                    case do_connect(Address) of
-                        {ok, Pid} ->
-                            MonRef = erlang:monitor(process, Pid),
-                            Entry = #peer_entry{
-                                pid = Pid,
-                                address = Address,
-                                direction = outbound,
-                                mon_ref = MonRef,
-                                connected = false
-                            },
-                            ets:insert(?PEER_TABLE, Entry),
-                            {reply, {ok, Pid}, State};
+                    case do_connect(Address, full_relay, State) of
+                        {ok, Pid, State2} ->
+                            {reply, {ok, Pid}, State2};
                         {error, Reason} ->
                             {reply, {error, Reason}, State}
                     end
@@ -282,7 +305,7 @@ handle_call({check_inbound, {IP, _Port} = Address}, _From, State) ->
     %% Pre-handshake rejection check following Bitcoin Core AcceptConnection logic:
     %% 1. Check if banned (unless whitelisted)
     %% 2. Check if already connected
-    %% 3. Check max inbound limit
+    %% 3. Check max inbound limit (with eviction)
     Whitelisted = is_whitelisted(IP),
     Result = case Whitelisted of
         true ->
@@ -358,29 +381,36 @@ handle_cast(_Msg, State) ->
 %% Peer handshake completed
 handle_info({peer_connected, Pid, Info}, State) ->
     case ets:lookup(?PEER_TABLE, Pid) of
-        [#peer_entry{address = Addr} = Entry] ->
+        [#peer_entry{address = Addr, direction = Dir} = Entry] ->
             Entry2 = Entry#peer_entry{
                 connected = true,
-                info = Info
+                info = Info,
+                keyed_netgroup = calculate_keyed_netgroup(Addr, State)
             },
             ets:insert(?PEER_TABLE, Entry2),
             %% Mark as tried in addrman
             beamchain_addrman:mark_tried(Addr),
-            %% Track netgroup
-            NG = netgroup(Addr),
-            Netgroups2 = sets:add_element(NG, State#state.netgroups),
+            %% Track outbound netgroup
+            State2 = case Dir of
+                outbound ->
+                    NG = beamchain_addrman:netgroup(Addr),
+                    NGs = sets:add_element(NG, State#state.outbound_netgroups),
+                    State#state{outbound_netgroups = NGs};
+                inbound ->
+                    State
+            end,
             logger:info("peer manager: ~p connected (~s)",
                         [Addr, maps:get(user_agent, Info, <<"unknown">>)]),
             %% Notify sync coordinator about the new peer
             beamchain_sync:notify_peer_connected(Pid, Info),
             %% Request addresses from new outbound peers
-            case Entry#peer_entry.direction of
+            case Dir of
                 outbound ->
                     beamchain_peer:send_message(Pid, {getaddr, #{}});
                 inbound ->
                     ok
             end,
-            {noreply, State#state{netgroups = Netgroups2}};
+            {noreply, State2};
         [] ->
             %% Unknown peer, ignore
             {noreply, State}
@@ -405,6 +435,8 @@ handle_info({peer_banned, Pid, Address}, State) ->
 
 %% Bootstrap: resolve DNS seeds and load from addrman on first start
 handle_info(bootstrap, State) ->
+    %% First try anchor connections
+    State2 = try_anchor_connections(State),
     %% Check if addrman has enough addresses
     case beamchain_addrman:count() of
         {New, Tried} when New + Tried < 10 ->
@@ -413,7 +445,7 @@ handle_info(bootstrap, State) ->
         _ ->
             ok
     end,
-    {noreply, State};
+    {noreply, State2};
 
 %% Connection maintenance tick
 handle_info(connect_tick, State) ->
@@ -442,6 +474,40 @@ handle_info({dns_seeds_resolved, Addrs}, State) ->
 %% Peer messages (forwarded from peer process)
 handle_info({peer_message, Pid, Command, Payload}, State) ->
     handle_peer_message(Pid, Command, Payload, State);
+
+%% Update peer metrics
+handle_info({peer_ping, Pid, PingTime}, State) ->
+    case ets:lookup(?PEER_TABLE, Pid) of
+        [#peer_entry{min_ping_time = OldMin} = Entry] ->
+            NewMin = case OldMin of
+                infinity -> PingTime;
+                _ -> min(OldMin, PingTime)
+            end,
+            ets:insert(?PEER_TABLE, Entry#peer_entry{min_ping_time = NewMin});
+        [] ->
+            ok
+    end,
+    {noreply, State};
+
+handle_info({peer_block, Pid}, State) ->
+    Now = erlang:system_time(second),
+    case ets:lookup(?PEER_TABLE, Pid) of
+        [Entry] ->
+            ets:insert(?PEER_TABLE, Entry#peer_entry{last_block_time = Now});
+        [] ->
+            ok
+    end,
+    {noreply, State};
+
+handle_info({peer_tx, Pid}, State) ->
+    Now = erlang:system_time(second),
+    case ets:lookup(?PEER_TABLE, Pid) of
+        [Entry] ->
+            ets:insert(?PEER_TABLE, Entry#peer_entry{last_tx_time = Now});
+        [] ->
+            ok
+    end,
+    {noreply, State};
 
 %% Inbound connection accepted
 handle_info({accepted, Socket, Address}, State) ->
@@ -485,6 +551,8 @@ handle_info(_Info, State) ->
     {noreply, State}.
 
 terminate(_Reason, State) ->
+    %% Save anchor connections (block-relay-only outbound peers)
+    save_anchors(State),
     %% Close listen socket
     case State#state.listen_socket of
         undefined -> ok;
@@ -495,6 +563,89 @@ terminate(_Reason, State) ->
         catch beamchain_peer:disconnect(Pid)
     end, ok, ?PEER_TABLE),
     ok.
+
+%%% ===================================================================
+%%% Internal: anchor connections
+%%% ===================================================================
+
+load_anchors(DataDir) ->
+    AnchorFile = filename:join(DataDir, "anchors.dat"),
+    case file:read_file(AnchorFile) of
+        {ok, Bin} ->
+            try binary_to_term(Bin) of
+                Anchors when is_list(Anchors) ->
+                    logger:info("peer manager: loaded ~B anchor connections",
+                                [length(Anchors)]),
+                    Anchors;
+                _ ->
+                    []
+            catch
+                _:_ -> []
+            end;
+        {error, _} ->
+            []
+    end.
+
+save_anchors(#state{datadir = DataDir}) ->
+    %% Save block-relay-only outbound peers as anchors
+    Anchors = ets:foldl(fun
+        (#peer_entry{address = Addr, direction = outbound,
+                     conn_type = block_relay, connected = true}, Acc) ->
+            [Addr | Acc];
+        (_, Acc) ->
+            Acc
+    end, [], ?PEER_TABLE),
+    %% Keep at most MAX_ANCHOR_CONNECTIONS
+    ToSave = lists:sublist(Anchors, ?MAX_ANCHOR_CONNECTIONS),
+    case ToSave of
+        [] ->
+            ok;
+        _ ->
+            AnchorFile = filename:join(DataDir, "anchors.dat"),
+            ok = filelib:ensure_dir(AnchorFile),
+            ok = file:write_file(AnchorFile, term_to_binary(ToSave)),
+            logger:info("peer manager: saved ~B anchor connections",
+                        [length(ToSave)])
+    end.
+
+try_anchor_connections(#state{anchors = []} = State) ->
+    State;
+try_anchor_connections(#state{anchors = Anchors} = State) ->
+    %% Try to connect to anchor addresses first
+    lists:foldl(fun(Address, S) ->
+        case can_connect(Address, S) of
+            true ->
+                case do_connect(Address, block_relay, S) of
+                    {ok, _Pid, S2} ->
+                        logger:info("peer manager: connected to anchor ~p", [Address]),
+                        S2;
+                    {error, _} ->
+                        S
+                end;
+            false ->
+                S
+        end
+    end, State#state{anchors = []}, Anchors).
+
+%%% ===================================================================
+%%% Internal: netgroup secret and keyed netgroup
+%%% ===================================================================
+
+load_or_generate_netgroup_secret(DataDir) ->
+    SecretFile = filename:join(DataDir, "netgroup_secret"),
+    case file:read_file(SecretFile) of
+        {ok, <<Secret:32/binary>>} ->
+            Secret;
+        _ ->
+            Secret = crypto:strong_rand_bytes(32),
+            ok = filelib:ensure_dir(SecretFile),
+            ok = file:write_file(SecretFile, Secret),
+            Secret
+    end.
+
+calculate_keyed_netgroup(Address, #state{netgroup_secret = Secret}) ->
+    NG = beamchain_addrman:netgroup(Address),
+    erlang:phash2({Secret, NG}).
 
 %%% ===================================================================
 %%% Internal: outbound connection logic
@@ -511,10 +662,19 @@ maybe_open_connection(State) ->
     end.
 
 try_connect_one(State) ->
+    %% Determine what type of connection we need
+    FullRelayCount = count_outbound_by_type(full_relay),
+    BlockRelayCount = count_outbound_by_type(block_relay),
+    ConnType = case {FullRelayCount < ?MAX_OUTBOUND_FULL_RELAY,
+                     BlockRelayCount < ?MAX_BLOCK_RELAY_ONLY} of
+        {true, _} -> full_relay;
+        {false, true} -> block_relay;
+        {false, false} -> full_relay  %% shouldn't happen
+    end,
     %% First try addrman
     case beamchain_addrman:select_address() of
         {ok, Address} ->
-            attempt_connection(Address, State);
+            attempt_connection(Address, ConnType, State);
         empty ->
             %% Fall back to discovered DNS addresses
             case State#state.discovered of
@@ -529,27 +689,18 @@ try_connect_one(State) ->
                     State;
                 [Address | Rest] ->
                     State2 = State#state{discovered = Rest},
-                    attempt_connection(Address, State2)
+                    attempt_connection(Address, ConnType, State2)
             end
     end.
 
-attempt_connection(Address, State) ->
+attempt_connection(Address, ConnType, State) ->
     case can_connect(Address, State) of
         true ->
-            case do_connect(Address) of
-                {ok, Pid} ->
-                    MonRef = erlang:monitor(process, Pid),
-                    Entry = #peer_entry{
-                        pid = Pid,
-                        address = Address,
-                        direction = outbound,
-                        mon_ref = MonRef,
-                        connected = false
-                    },
-                    ets:insert(?PEER_TABLE, Entry),
+            case do_connect(Address, ConnType, State) of
+                {ok, _Pid, State2} ->
                     %% Also add to addrman so it knows about this addr
                     beamchain_addrman:add_address(Address, 0, dns),
-                    State;
+                    State2;
                 {error, Reason} ->
                     logger:debug("failed to connect to ~p: ~p",
                                  [Address, Reason]),
@@ -566,25 +717,161 @@ can_connect(Address, State) ->
         andalso find_peer_by_address(Address) =:= error
         andalso has_netgroup_diversity(Address, State).
 
-%% Ensure we don't connect to too many peers in the same /16 subnet
-has_netgroup_diversity(Address, #state{netgroups = _NGs}) ->
-    NG = netgroup(Address),
-    %% Allow up to 2 peers per netgroup
-    Count = ets:foldl(fun(#peer_entry{address = A, direction = outbound}, C) ->
-        case netgroup(A) =:= NG of
-            true  -> C + 1;
-            false -> C
-        end;
-    (_, C) -> C
-    end, 0, ?PEER_TABLE),
-    Count < 2.
+%% Ensure we don't connect to more than 1 outbound peer per netgroup
+%% (strict diversity for eclipse protection)
+has_netgroup_diversity(Address, #state{outbound_netgroups = NGs}) ->
+    NG = beamchain_addrman:netgroup(Address),
+    not sets:is_element(NG, NGs).
 
-%% /16 netgroup for IPv4
-netgroup({{A, B, _, _}, _Port}) -> {A, B};
-netgroup({_IPv6Addr, _Port}) -> other.
+count_outbound_by_type(Type) ->
+    ets:foldl(fun
+        (#peer_entry{direction = outbound, conn_type = T}, C) when T =:= Type ->
+            C + 1;
+        (_, C) ->
+            C
+    end, 0, ?PEER_TABLE).
 
-do_connect(Address) ->
-    beamchain_peer:connect(Address, self(), #{}).
+do_connect(Address, ConnType, State) ->
+    case beamchain_peer:connect(Address, self(), #{}) of
+        {ok, Pid} ->
+            MonRef = erlang:monitor(process, Pid),
+            Now = erlang:system_time(second),
+            Entry = #peer_entry{
+                pid = Pid,
+                address = Address,
+                direction = outbound,
+                conn_type = ConnType,
+                mon_ref = MonRef,
+                connected = false,
+                connect_time = Now,
+                keyed_netgroup = calculate_keyed_netgroup(Address, State)
+            },
+            ets:insert(?PEER_TABLE, Entry),
+            %% Track netgroup for diversity (before connection completes)
+            NG = beamchain_addrman:netgroup(Address),
+            NGs = sets:add_element(NG, State#state.outbound_netgroups),
+            {ok, Pid, State#state{outbound_netgroups = NGs}};
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%%% ===================================================================
+%%% Internal: inbound eviction (Bitcoin Core parity)
+%%% ===================================================================
+
+%% @doc Select a peer to evict when we're at inbound capacity.
+%% Returns {ok, Pid} if a peer should be evicted, or none if all are protected.
+select_peer_to_evict() ->
+    %% Collect all inbound peers as eviction candidates
+    Candidates = ets:foldl(fun
+        (#peer_entry{direction = inbound, connected = true} = E, Acc) ->
+            [E | Acc];
+        (_, Acc) ->
+            Acc
+    end, [], ?PEER_TABLE),
+
+    case Candidates of
+        [] ->
+            none;
+        _ ->
+            %% Apply Bitcoin Core's eviction protection algorithm
+            select_eviction_victim(Candidates)
+    end.
+
+select_eviction_victim(Candidates) ->
+    %% Step 1: Protect 4 peers by netgroup (deterministically)
+    C1 = protect_by_netgroup(Candidates, ?EVICTION_PROTECT_BY_NETGROUP),
+
+    %% Step 2: Protect 8 peers with lowest ping time
+    C2 = protect_by_ping(C1, ?EVICTION_PROTECT_BY_PING),
+
+    %% Step 3: Protect 4 peers that most recently sent transactions
+    C3 = protect_by_tx_time(C2, ?EVICTION_PROTECT_BY_TX_TIME),
+
+    %% Step 4: Protect 4 peers that most recently sent blocks
+    C4 = protect_by_block_time(C3, ?EVICTION_PROTECT_BY_BLOCK_TIME),
+
+    case C4 of
+        [] ->
+            none;
+        _ ->
+            %% Evict from the netgroup with the most connections
+            %% Select the newest peer from that netgroup
+            evict_from_largest_netgroup(C4)
+    end.
+
+protect_by_netgroup(Candidates, N) ->
+    %% Sort by keyed netgroup, take first N (protect), return rest
+    Sorted = lists:sort(fun(#peer_entry{keyed_netgroup = A},
+                            #peer_entry{keyed_netgroup = B}) ->
+        A =< B
+    end, Candidates),
+    drop_first_n(Sorted, N).
+
+protect_by_ping(Candidates, N) ->
+    %% Sort by ping time (lowest first), protect first N
+    Sorted = lists:sort(fun(#peer_entry{min_ping_time = A},
+                            #peer_entry{min_ping_time = B}) ->
+        compare_ping(A, B)
+    end, Candidates),
+    drop_first_n(Sorted, N).
+
+compare_ping(infinity, infinity) -> true;
+compare_ping(infinity, _) -> false;
+compare_ping(_, infinity) -> true;
+compare_ping(A, B) -> A =< B.
+
+protect_by_tx_time(Candidates, N) ->
+    %% Sort by last tx time (most recent first), protect first N
+    Sorted = lists:sort(fun(#peer_entry{last_tx_time = A},
+                            #peer_entry{last_tx_time = B}) ->
+        A >= B
+    end, Candidates),
+    drop_first_n(Sorted, N).
+
+protect_by_block_time(Candidates, N) ->
+    %% Sort by last block time (most recent first), protect first N
+    Sorted = lists:sort(fun(#peer_entry{last_block_time = A},
+                            #peer_entry{last_block_time = B}) ->
+        A >= B
+    end, Candidates),
+    drop_first_n(Sorted, N).
+
+drop_first_n(List, N) when N >= length(List) -> [];
+drop_first_n(List, N) -> lists:nthtail(N, List).
+
+evict_from_largest_netgroup(Candidates) ->
+    %% Group by keyed netgroup
+    Groups = lists:foldl(fun(#peer_entry{keyed_netgroup = NG} = E, Acc) ->
+        maps:update_with(NG, fun(L) -> [E | L] end, [E], Acc)
+    end, #{}, Candidates),
+
+    %% Find the largest group
+    {_LargestNG, LargestGroup} = maps:fold(fun(NG, Peers, {BestNG, BestPeers}) ->
+        case length(Peers) > length(BestPeers) of
+            true -> {NG, Peers};
+            false -> {BestNG, BestPeers}
+        end
+    end, {undefined, []}, Groups),
+
+    case LargestGroup of
+        [] ->
+            none;
+        _ ->
+            %% Evict the newest peer from this group (most recently connected)
+            Newest = lists:foldl(fun
+                (#peer_entry{connect_time = T} = E, #peer_entry{connect_time = BT}) when T > BT ->
+                    E;
+                (#peer_entry{} = E, undefined) ->
+                    E;
+                (_, Best) ->
+                    Best
+            end, undefined, LargestGroup),
+            case Newest of
+                undefined -> none;
+                #peer_entry{pid = Pid} -> {ok, Pid}
+            end
+    end.
 
 %%% ===================================================================
 %%% Internal: peer registry helpers
@@ -592,22 +879,21 @@ do_connect(Address) ->
 
 remove_peer_and_update(Pid, State) ->
     case ets:lookup(?PEER_TABLE, Pid) of
-        [#peer_entry{address = _Addr, mon_ref = MonRef}] ->
+        [#peer_entry{address = Addr, direction = Dir, mon_ref = MonRef}] ->
             erlang:demonitor(MonRef, [flush]),
             ets:delete(?PEER_TABLE, Pid),
-            %% Rebuild netgroups (simpler than tracking removal)
-            NGs = rebuild_netgroups(),
-            State#state{netgroups = NGs};
+            %% Update outbound netgroups if needed
+            case Dir of
+                outbound ->
+                    NG = beamchain_addrman:netgroup(Addr),
+                    NGs = sets:del_element(NG, State#state.outbound_netgroups),
+                    State#state{outbound_netgroups = NGs};
+                inbound ->
+                    State
+            end;
         [] ->
             State
     end.
-
-rebuild_netgroups() ->
-    ets:foldl(fun(#peer_entry{address = A, direction = outbound,
-                               connected = true}, Acc) ->
-        sets:add_element(netgroup(A), Acc);
-    (_, Acc) -> Acc
-    end, sets:new([{version, 2}]), ?PEER_TABLE).
 
 find_peer_by_address(Address) ->
     case ets:match_object(?PEER_TABLE,
@@ -625,9 +911,9 @@ count_by_direction(Dir) ->
     end, 0, ?PEER_TABLE).
 
 entry_to_map(#peer_entry{pid = Pid, address = Addr, direction = Dir,
-                         connected = Conn, info = Info}) ->
+                         connected = Conn, info = Info, conn_type = ConnType}) ->
     #{pid => Pid, address => Addr, direction => Dir,
-      connected => Conn, info => Info}.
+      connected => Conn, info => Info, conn_type => ConnType}.
 
 %%% ===================================================================
 %%% Internal: message handling
@@ -784,7 +1070,7 @@ handle_misbehaving(Pid, Score, Reason, State) ->
 %%% ===================================================================
 
 %% @doc Internal check for inbound connection acceptance (after ban check).
-%% Checks already_connected and max inbound limits.
+%% Checks already_connected and max inbound limits (with eviction).
 check_inbound_internal(Address, #state{max_inbound = MaxInbound}) ->
     case find_peer_by_address(Address) of
         {ok, _Pid} ->
@@ -793,11 +1079,18 @@ check_inbound_internal(Address, #state{max_inbound = MaxInbound}) ->
             Inbound = inbound_count(),
             case Inbound >= MaxInbound of
                 true ->
-                    %% At capacity - could implement eviction here (like Bitcoin Core)
-                    %% For now, just reject. Eviction is complex and involves:
-                    %% - Preferring to evict peers from over-represented netgroups
-                    %% - Protecting peers with recent activity, long connections, etc.
-                    {reject, too_many_inbound};
+                    %% At capacity - try to evict a peer
+                    case select_peer_to_evict() of
+                        {ok, EvictPid} ->
+                            %% Evict and accept new connection
+                            logger:debug("peer manager: evicting ~p to accept new inbound",
+                                         [EvictPid]),
+                            beamchain_peer:disconnect(EvictPid),
+                            {ok, accept};
+                        none ->
+                            %% All peers are protected
+                            {reject, too_many_inbound}
+                    end;
                 false ->
                     {ok, accept}
             end
@@ -917,13 +1210,17 @@ handle_inbound(Socket, Address, State) ->
         {ok, Pid} ->
             %% Transfer socket ownership to peer process
             gen_tcp:controlling_process(Socket, Pid),
+            Now = erlang:system_time(second),
             MonRef = erlang:monitor(process, Pid),
             Entry = #peer_entry{
                 pid = Pid,
                 address = Address,
                 direction = inbound,
+                conn_type = full_relay,
                 mon_ref = MonRef,
-                connected = false
+                connected = false,
+                connect_time = Now,
+                keyed_netgroup = calculate_keyed_netgroup(Address, State)
             },
             ets:insert(?PEER_TABLE, Entry),
             logger:debug("accepted inbound from ~p", [Address]),
