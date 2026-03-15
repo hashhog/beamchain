@@ -23,7 +23,10 @@ chainstate_test_() ->
           {"cache miss falls through to RocksDB", fun test_cache_miss/0},
           {"FRESH optimization: spend before flush skips DB", fun test_fresh_optimization/0},
           {"flush persists dirty entries to RocksDB", fun test_flush_persistence/0},
-          {"cache stats reports correct counts", fun test_cache_stats/0}
+          {"cache stats reports correct counts", fun test_cache_stats/0},
+          %% assumeUTXO tests
+          {"UTXO hash computation", fun test_utxo_hash_computation/0},
+          {"snapshot role detection", fun test_snapshot_role_detection/0}
          ]
      end}.
 
@@ -401,3 +404,40 @@ test_cache_stats() ->
     %% Clean up
     beamchain_chainstate:spend_utxo(Txid1, 0),
     beamchain_chainstate:spend_utxo(Txid2, 0).
+
+%%% ===================================================================
+%%% assumeUTXO tests
+%%% ===================================================================
+
+test_utxo_hash_computation() ->
+    %% Add some UTXOs and compute hash
+    Txid1 = <<16#1234:256>>,
+    Txid2 = <<16#5678:256>>,
+    Utxo1 = #utxo{value = 100000, script_pubkey = <<16#51>>,
+                  is_coinbase = false, height = 100},
+    Utxo2 = #utxo{value = 200000, script_pubkey = <<16#52>>,
+                  is_coinbase = true, height = 0},
+
+    beamchain_chainstate:add_utxo(Txid1, 0, Utxo1),
+    beamchain_chainstate:add_utxo(Txid2, 0, Utxo2),
+
+    %% Compute hash
+    Hash1 = beamchain_chainstate:compute_utxo_hash(),
+
+    %% Hash should be 32 bytes
+    ?assertEqual(32, byte_size(Hash1)),
+
+    %% Computing again should give same result (deterministic)
+    Hash2 = beamchain_chainstate:compute_utxo_hash(),
+    ?assertEqual(Hash1, Hash2),
+
+    %% Clean up
+    beamchain_chainstate:spend_utxo(Txid1, 0),
+    beamchain_chainstate:spend_utxo(Txid2, 0).
+
+test_snapshot_role_detection() ->
+    %% Main chainstate should not be a snapshot chainstate
+    ?assertEqual(false, beamchain_chainstate:is_snapshot_chainstate()),
+
+    %% Snapshot base height should return not_snapshot for main chainstate
+    ?assertEqual(not_snapshot, beamchain_chainstate:get_snapshot_base_height()).
