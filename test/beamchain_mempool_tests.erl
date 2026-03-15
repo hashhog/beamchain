@@ -392,3 +392,183 @@ p2pkh_script() ->
 
 p2wpkh_script() ->
     <<16#00, 16#14, 0:160>>.
+
+%%% ===================================================================
+%%% Ancestor/Descendant limit tests
+%%% ===================================================================
+
+%% Test ancestor count limit (max 25 ancestors)
+ancestor_count_limit_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             %% Create a chain of 24 transactions (within limit)
+             %% Then verify the 25th would still be OK (at limit)
+             %% And 26th would exceed
+             Entry1 = make_entry_with_ancestors(<<1:256>>, 5.0, 1, 200),
+             ets:insert(mempool_txs, {<<1:256>>, Entry1}),
+
+             Entry2 = make_entry_with_ancestors(<<2:256>>, 5.0, 25, 5000),
+             ets:insert(mempool_txs, {<<2:256>>, Entry2}),
+
+             %% 25 ancestors is at the limit
+             ?assertEqual(25, Entry2#mempool_entry.ancestor_count),
+
+             Entry3 = make_entry_with_ancestors(<<3:256>>, 5.0, 26, 5200),
+             ets:insert(mempool_txs, {<<3:256>>, Entry3}),
+
+             %% 26 ancestors exceeds limit
+             ?assert(Entry3#mempool_entry.ancestor_count > ?MAX_ANCESTOR_COUNT)
+         end]
+     end}.
+
+%% Test ancestor size limit (max 101000 vbytes)
+ancestor_size_limit_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             %% Entry at size limit
+             EntryOk = make_entry_with_ancestors(<<1:256>>, 5.0, 10, 101000),
+             ets:insert(mempool_txs, {<<1:256>>, EntryOk}),
+             ?assertEqual(101000, EntryOk#mempool_entry.ancestor_size),
+
+             %% Entry exceeding size limit
+             EntryBad = make_entry_with_ancestors(<<2:256>>, 5.0, 10, 101001),
+             ets:insert(mempool_txs, {<<2:256>>, EntryBad}),
+             ?assert(EntryBad#mempool_entry.ancestor_size > ?MAX_ANCESTOR_SIZE)
+         end]
+     end}.
+
+%% Test descendant count tracking in entry
+descendant_count_tracking_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             %% Create parent entry with 1 descendant (itself)
+             Parent = make_entry(<<1:256>>, 5.0),
+             ?assertEqual(1, Parent#mempool_entry.descendant_count),
+
+             %% Simulate adding descendants by updating the entry
+             Updated = Parent#mempool_entry{
+                 descendant_count = 25,
+                 descendant_size = 5000,
+                 descendant_fee = 25000
+             },
+             ets:insert(mempool_txs, {<<1:256>>, Updated}),
+
+             {ok, Got} = beamchain_mempool:get_entry(<<1:256>>),
+             ?assertEqual(25, Got#mempool_entry.descendant_count),
+             ?assertEqual(5000, Got#mempool_entry.descendant_size)
+         end]
+     end}.
+
+%% Test descendant size limit (max 101000 vbytes)
+descendant_size_limit_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             %% Entry at descendant size limit
+             Entry = make_entry(<<1:256>>, 5.0),
+             Updated = Entry#mempool_entry{
+                 descendant_count = 20,
+                 descendant_size = 101000,
+                 descendant_fee = 101000
+             },
+             ets:insert(mempool_txs, {<<1:256>>, Updated}),
+
+             {ok, Got} = beamchain_mempool:get_entry(<<1:256>>),
+             ?assertEqual(101000, Got#mempool_entry.descendant_size),
+             ?assertEqual(?MAX_DESCENDANT_SIZE, Got#mempool_entry.descendant_size)
+         end]
+     end}.
+
+%% Test that tx counts itself as 1 ancestor/descendant
+self_counting_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             Entry = make_entry(<<1:256>>, 5.0),
+             %% A new tx with no mempool parents has:
+             %% - ancestor_count = 1 (itself)
+             %% - descendant_count = 1 (itself)
+             ?assertEqual(1, Entry#mempool_entry.ancestor_count),
+             ?assertEqual(1, Entry#mempool_entry.descendant_count),
+             %% ancestor_size/descendant_size = own vsize
+             ?assertEqual(Entry#mempool_entry.vsize, Entry#mempool_entry.ancestor_size),
+             ?assertEqual(Entry#mempool_entry.vsize, Entry#mempool_entry.descendant_size)
+         end]
+     end}.
+
+%% Test boundary conditions for limits
+boundary_limits_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             %% Exactly at MAX_ANCESTOR_COUNT (25)
+             ?assertEqual(25, ?MAX_ANCESTOR_COUNT),
+             ?assertEqual(25, ?MAX_DESCENDANT_COUNT),
+             ?assertEqual(101000, ?MAX_ANCESTOR_SIZE),
+             ?assertEqual(101000, ?MAX_DESCENDANT_SIZE),
+
+             %% Entry at exact ancestor limit
+             EntryAtLimit = make_entry_with_ancestors(<<1:256>>, 5.0, 25, 5000),
+             ?assertEqual(25, EntryAtLimit#mempool_entry.ancestor_count),
+             ?assert(EntryAtLimit#mempool_entry.ancestor_count =< ?MAX_ANCESTOR_COUNT)
+         end]
+     end}.
+
+%% Test outpoint index for child tracking
+outpoint_child_tracking_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             %% Parent creates output
+             ParentTxid = <<1:256>>,
+             ParentTx = make_tx([{<<99:256>>, 0}], [{5000, p2pkh_script()}]),
+             ParentEntry = make_entry_with_tx(ParentTxid, 5.0, ParentTx),
+             ets:insert(mempool_txs, {ParentTxid, ParentEntry}),
+
+             %% Child spends parent's output
+             ChildTxid = <<2:256>>,
+             ChildTx = make_tx([{ParentTxid, 0}], [{4000, p2pkh_script()}]),
+             ChildEntry = make_entry_with_tx(ChildTxid, 6.0, ChildTx),
+             ets:insert(mempool_txs, {ChildTxid, ChildEntry}),
+
+             %% Register the outpoint spending relationship
+             ets:insert(mempool_outpoints, {{ParentTxid, 0}, ChildTxid}),
+
+             %% Verify we can find the child from outpoints
+             [{_, FoundChild}] = ets:lookup(mempool_outpoints, {ParentTxid, 0}),
+             ?assertEqual(ChildTxid, FoundChild)
+         end]
+     end}.
+
+%%% ===================================================================
+%%% Extended test helpers
+%%% ===================================================================
+
+make_entry_with_ancestors(Txid, FeeRate, AncCount, AncSize) ->
+    VSize = 200,
+    Fee = round(FeeRate * VSize),
+    AncFee = round(FeeRate * AncSize),
+    Tx = make_tx([{<<99:256>>, 0}], [{1000, p2pkh_script()}]),
+    #mempool_entry{
+        txid = Txid,
+        wtxid = Txid,
+        tx = Tx,
+        fee = Fee,
+        size = VSize,
+        vsize = VSize,
+        weight = VSize * 4,
+        fee_rate = FeeRate,
+        time_added = erlang:system_time(second),
+        height_added = 800000,
+        ancestor_count = AncCount,
+        ancestor_size = AncSize,
+        ancestor_fee = AncFee,
+        descendant_count = 1,
+        descendant_size = VSize,
+        descendant_fee = Fee,
+        spends_coinbase = false,
+        rbf_signaling = true
+    }.
