@@ -27,6 +27,9 @@
 %% Utility
 -export([is_coinbase_tx/1]).
 
+%% Coinbase maturity (exported for testing)
+-export([check_coinbase_maturity/2]).
+
 %% BIP 68 sequence locks
 -export([calculate_sequence_lock_pair/3]).
 
