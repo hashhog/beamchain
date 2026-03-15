@@ -15,6 +15,7 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] Header-first sync with full validation
 - [x] Header sync anti-DoS (PoW validation, unconnecting limits, deep fork protection)
 - [x] Block download and storage (RocksDB)
+- [x] Flat file block storage (blk*.dat files, Bitcoin Core compatible format)
 - [x] Script interpreter (all opcodes)
 - [x] Legacy sighash (FindAndDelete, OP_CODESEPARATOR)
 - [x] SegWit v0 (P2WPKH, P2WSH) with BIP143 sighash
