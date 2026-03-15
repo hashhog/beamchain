@@ -23,6 +23,8 @@
          handle_notfound/2,
          handle_peer_connected/2,
          handle_peer_disconnected/1,
+         handle_cmpctblock/2,
+         handle_blocktxn/2,
          get_status/0]).
 
 %% gen_server callbacks
@@ -110,7 +112,15 @@
     %% Assumevalid: block hash below which we skip scripts
     assume_valid = <<0:256>> :: binary(),
     %% Cached height of the assumevalid block (avoids repeated DB lookups)
-    assume_valid_height = -1 :: integer()
+    assume_valid_height = -1 :: integer(),
+
+    %% BIP152 compact block state
+    %% Hash -> {CompactState, RequestedAt, Peer} for partial compact blocks
+    pending_compact = #{}    :: #{binary() => {term(), integer(), pid()}},
+    %% Recently seen transactions for compact block reconstruction
+    recent_txns = []         :: [#transaction{}],
+    %% Max recent txns to keep
+    max_recent_txns = 100    :: non_neg_integer()
 }).
 
 %%% ===================================================================
@@ -151,6 +161,16 @@ handle_peer_connected(Peer, Info) ->
 -spec handle_peer_disconnected(pid()) -> ok.
 handle_peer_disconnected(Peer) ->
     gen_server:cast(?SERVER, {peer_disconnected, Peer}).
+
+%% @doc Handle a BIP152 compact block message.
+-spec handle_cmpctblock(pid(), map()) -> ok.
+handle_cmpctblock(Peer, CmpctBlock) ->
+    gen_server:cast(?SERVER, {cmpctblock, Peer, CmpctBlock}).
+
+%% @doc Handle a BIP152 blocktxn response.
+-spec handle_blocktxn(pid(), map()) -> ok.
+handle_blocktxn(Peer, BlockTxn) ->
+    gen_server:cast(?SERVER, {blocktxn, Peer, BlockTxn}).
 
 %% @doc Get current block sync status.
 -spec get_status() -> map().
@@ -291,6 +311,20 @@ handle_cast({peer_connected, Peer, Info}, State) ->
 handle_cast({peer_disconnected, Peer}, State) ->
     State2 = handle_peer_disconnect(Peer, State),
     {noreply, State2};
+
+%% BIP152 compact block received
+handle_cast({cmpctblock, Peer, CmpctBlock}, #state{status = syncing} = State) ->
+    State2 = handle_cmpctblock_received(Peer, CmpctBlock, State),
+    {noreply, State2};
+handle_cast({cmpctblock, _Peer, _CmpctBlock}, State) ->
+    {noreply, State};
+
+%% BIP152 blocktxn response
+handle_cast({blocktxn, Peer, BlockTxn}, #state{status = syncing} = State) ->
+    State2 = handle_blocktxn_received(Peer, BlockTxn, State),
+    {noreply, State2};
+handle_cast({blocktxn, _Peer, _BlockTxn}, State) ->
+    {noreply, State};
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -802,6 +836,126 @@ handle_notfound_items(Peer, Items, State) ->
                 AccState
         end
     end, State, Items).
+
+%%% ===================================================================
+%%% Internal: BIP152 compact block handling
+%%% ===================================================================
+
+%% Handle a compact block message.
+%% Try to reconstruct the full block using mempool transactions.
+%% If successful, process it like a regular block.
+%% If missing transactions, send getblocktxn request.
+handle_cmpctblock_received(Peer, CmpctBlock, State) ->
+    #{header := Header} = CmpctBlock,
+    BlockHash = beamchain_serialize:block_hash(Header),
+
+    %% Check if we requested this block
+    case maps:find(BlockHash, State#state.hash_to_height) of
+        {ok, Height} ->
+            do_handle_cmpctblock(Peer, CmpctBlock, BlockHash, Height, State);
+        error ->
+            %% Unsolicited compact block (maybe high-bandwidth mode)
+            %% For now, ignore unsolicited compact blocks during IBD
+            logger:debug("block_sync: unsolicited cmpctblock ~s from ~p",
+                         [hash_hex(BlockHash), Peer]),
+            State
+    end.
+
+do_handle_cmpctblock(Peer, CmpctBlock, BlockHash, Height, State) ->
+    case beamchain_compact_block:init_compact_block(CmpctBlock) of
+        {ok, CompactState} ->
+            %% Try to reconstruct using mempool + recent transactions
+            RecentTxns = State#state.recent_txns,
+            case beamchain_compact_block:try_reconstruct(CompactState,
+                                                         RecentTxns) of
+                {ok, Block} ->
+                    %% Full reconstruction successful
+                    logger:debug("block_sync: reconstructed compact block "
+                                 "at height ~B from mempool", [Height]),
+                    handle_block_received(Peer, Block, State);
+
+                {partial, PartialState} ->
+                    %% Need to request missing transactions
+                    MissingIdxs = beamchain_compact_block:get_missing_indices(
+                        PartialState),
+                    logger:debug("block_sync: compact block at ~B missing ~B "
+                                 "txns, requesting", [Height, length(MissingIdxs)]),
+                    %% Send getblocktxn request
+                    send_getblocktxn(Peer, BlockHash, MissingIdxs),
+                    %% Store pending compact block state
+                    Now = erlang:monotonic_time(millisecond),
+                    PendingCompact = maps:put(BlockHash,
+                                               {PartialState, Now, Peer},
+                                               State#state.pending_compact),
+                    State#state{pending_compact = PendingCompact};
+
+                {error, Reason} ->
+                    logger:warning("block_sync: compact block init failed: ~p",
+                                   [Reason]),
+                    %% Fall back to full block request
+                    request_full_block(Peer, BlockHash, State)
+            end;
+        {error, Reason} ->
+            logger:warning("block_sync: invalid compact block: ~p", [Reason]),
+            beamchain_peer:add_misbehavior(Peer, 20),
+            State
+    end.
+
+%% Handle blocktxn response (missing transactions for a compact block)
+handle_blocktxn_received(Peer, BlockTxn, State) ->
+    #{block_hash := BlockHash, transactions := Txns} = BlockTxn,
+
+    case maps:find(BlockHash, State#state.pending_compact) of
+        {ok, {PartialState, _RequestedAt, _RequestPeer}} ->
+            %% Try to fill in the block
+            case beamchain_compact_block:fill_block(PartialState, Txns) of
+                {ok, Block} ->
+                    %% Remove from pending
+                    PendingCompact = maps:remove(BlockHash,
+                                                  State#state.pending_compact),
+                    State2 = State#state{pending_compact = PendingCompact},
+                    %% Add received transactions to recent_txns cache
+                    State3 = add_recent_txns(Txns, State2),
+                    %% Process like a regular block
+                    handle_block_received(Peer, Block, State3);
+
+                {error, Reason} ->
+                    logger:warning("block_sync: blocktxn fill failed: ~p",
+                                   [Reason]),
+                    %% Request full block instead
+                    PendingCompact = maps:remove(BlockHash,
+                                                  State#state.pending_compact),
+                    State2 = State#state{pending_compact = PendingCompact},
+                    request_full_block(Peer, BlockHash, State2)
+            end;
+
+        error ->
+            %% No pending compact block for this hash
+            logger:debug("block_sync: unexpected blocktxn for ~s",
+                         [hash_hex(BlockHash)]),
+            State
+    end.
+
+%% Send getblocktxn request for missing transactions
+send_getblocktxn(Peer, BlockHash, MissingIdxs) ->
+    Msg = {getblocktxn, #{block_hash => BlockHash, indexes => MissingIdxs}},
+    beamchain_peer:send_message(Peer, Msg).
+
+%% Request full block (fallback from compact block)
+request_full_block(Peer, BlockHash, State) ->
+    Item = #{type => ?MSG_WITNESS_BLOCK, hash => BlockHash},
+    beamchain_peer:send_message(Peer, {getdata, #{items => [Item]}}),
+    State.
+
+%% Add transactions to the recent transactions cache
+add_recent_txns(Txns, #state{recent_txns = Recent,
+                              max_recent_txns = MaxRecent} = State) ->
+    NewRecent = Txns ++ Recent,
+    Trimmed = case length(NewRecent) > MaxRecent of
+        true -> lists:sublist(NewRecent, MaxRecent);
+        false -> NewRecent
+    end,
+    State#state{recent_txns = Trimmed}.
 
 %%% ===================================================================
 %%% Internal: peer disconnect handling
