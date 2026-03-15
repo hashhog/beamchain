@@ -28,6 +28,12 @@
 %% UTXO lookups (called externally from validation)
 -export([get_mempool_utxo/2]).
 
+%% Cluster mempool API
+-export([get_cluster/1, get_cluster_txids/1, get_cluster_linearization/1]).
+-export([get_mining_order/0, get_all_clusters/0]).
+-export([linearize_cluster/1]).  %% Exported for testing
+-export([uf_union/3, uf_get_cluster_members/2]).  %% Union-find utilities for debugging
+
 %% TRUC (v3 transaction) policy checks - exported for testing
 -export([check_truc_rules/3]).
 
@@ -47,6 +53,7 @@
 -define(MAX_ORPHAN_TXS, 100).
 -define(ORPHAN_TX_EXPIRE_TIME, 1200).      % 20 minutes
 -define(MAX_RBF_EVICTIONS, 100).
+-define(MAX_CLUSTER_SIZE, 100).            % Max transactions per cluster
 
 %%% -------------------------------------------------------------------
 %%% ETS table names
@@ -56,6 +63,7 @@
 -define(MEMPOOL_BY_FEE, mempool_by_fee).     %% ordered {fee_rate, txid}
 -define(MEMPOOL_OUTPOINTS, mempool_outpoints). %% {txid, vout} -> spending_txid
 -define(MEMPOOL_ORPHANS, mempool_orphans).   %% txid -> {tx, expiry}
+-define(MEMPOOL_CLUSTERS, mempool_clusters). %% cluster_id -> cluster_data
 
 %%% -------------------------------------------------------------------
 %%% Mempool entry record
@@ -83,13 +91,30 @@
 }).
 
 %%% -------------------------------------------------------------------
+%%% Cluster mempool data structures
+%%% -------------------------------------------------------------------
+
+%% Cluster data stored in ETS: cluster_id -> cluster_data record
+-record(cluster_data, {
+    id            :: binary(),             %% cluster identifier (txid of first tx)
+    txids         :: [binary()],           %% list of txids in this cluster
+    total_fee     :: non_neg_integer(),    %% sum of all fees
+    total_vsize   :: non_neg_integer(),    %% sum of all vsizes
+    linearization :: [binary()],           %% ordered txids (highest feerate prefix first)
+    fee_rate      :: float()               %% aggregate fee rate (total_fee / total_vsize)
+}).
+
+%%% -------------------------------------------------------------------
 %%% gen_server state
 %%% -------------------------------------------------------------------
 
 -record(state, {
     max_size       :: non_neg_integer(),   %% max mempool bytes
     total_bytes    :: non_neg_integer(),   %% current total vbytes
-    total_count    :: non_neg_integer()    %% number of transactions
+    total_count    :: non_neg_integer(),   %% number of transactions
+    %% Union-find: txid -> cluster_id (root txid of cluster)
+    union_find     :: map(),               %% txid -> parent_txid (for find)
+    cluster_count  :: non_neg_integer()    %% number of clusters
 }).
 
 %%% ===================================================================
@@ -221,6 +246,8 @@ init([]) ->
     ets:new(?MEMPOOL_OUTPOINTS, [set, public, named_table,
                                   {write_concurrency, true}]),
     ets:new(?MEMPOOL_ORPHANS, [set, public, named_table]),
+    ets:new(?MEMPOOL_CLUSTERS, [set, public, named_table,
+                                 {read_concurrency, true}]),
 
     %% Schedule periodic orphan expiry
     erlang:send_after(60000, self(), expire_orphans),
@@ -229,7 +256,9 @@ init([]) ->
     {ok, #state{
         max_size = ?DEFAULT_MAX_MEMPOOL_SIZE,
         total_bytes = 0,
-        total_count = 0
+        total_count = 0,
+        union_find = #{},
+        cluster_count = 0
     }}.
 
 handle_call({add_tx, Tx}, _From, State) ->
@@ -268,6 +297,15 @@ handle_call({trim_to_size, MaxBytes}, _From, State) ->
 handle_call(expire_old, _From, State) ->
     {Count, State2} = do_expire_old(State),
     {reply, Count, State2};
+
+handle_call({get_cluster, Txid}, _From, #state{union_find = UF} = State) ->
+    case maps:is_key(Txid, UF) of
+        true ->
+            {Root, UF2} = uf_find(Txid, UF),
+            {reply, {ok, Root}, State#state{union_find = UF2}};
+        false ->
+            {reply, not_found, State}
+    end;
 
 handle_call(_Request, _From, State) ->
     {reply, {error, not_implemented}, State}.
@@ -313,7 +351,8 @@ do_add_transaction(Tx, State) ->
         {InputCoins, SpendsCoinbase} = lookup_inputs(Tx),
 
         %% 5. check for double-spends in mempool (+ RBF)
-        check_mempool_conflicts(Tx, InputCoins),
+        %% Returns {ok, EvictedTxids, EvictedVBytes} - store for cluster cleanup later
+        {ok, RbfEvictedTxids, RbfEvictedVBytes} = check_mempool_conflicts(Tx, InputCoins),
 
         %% 6. compute fee
         TotalIn = lists:foldl(fun(C, A) -> A + C#utxo.value end,
@@ -340,13 +379,13 @@ do_add_transaction(Tx, State) ->
 
         %% 10b. TRUC (v3 transaction) policy checks
         MempoolParentTxids = get_parent_txids(Tx),
-        case check_truc_rules(Tx, VSize, MempoolParentTxids) of
+        {TrucEvictedTxids, TrucEvictedVBytes} = case check_truc_rules(Tx, VSize, MempoolParentTxids) of
             ok ->
-                ok;
+                {[], 0};
             {sibling_eviction, SiblingTxid} ->
                 %% v3 sibling eviction - new child replaces existing child
                 case do_truc_sibling_eviction(SiblingTxid, Tx, Fee) of
-                    ok -> ok;
+                    {ok, Evicted, EvictedVB} -> {Evicted, EvictedVB};
                     {error, TrucErr} -> throw(TrucErr)
                 end;
             {error, TrucErr} ->
@@ -400,18 +439,28 @@ do_add_transaction(Tx, State) ->
         %% 15. update ancestor descendant stats
         update_ancestors_for_new_tx(Tx, VSize, Fee),
 
-        %% 16. update state
-        State2 = State#state{
-            total_bytes = State#state.total_bytes + VSize,
-            total_count = State#state.total_count + 1
+        %% 16. clean up clusters for evicted transactions (RBF + TRUC sibling)
+        AllEvictedTxids = RbfEvictedTxids ++ TrucEvictedTxids,
+        AllEvictedVBytes = RbfEvictedVBytes + TrucEvictedVBytes,
+        State2 = lists:foldl(fun(EvictedTxid, St) ->
+            cluster_remove_tx(EvictedTxid, St)
+        end, State, AllEvictedTxids),
+
+        %% 17. update cluster membership for new tx
+        State3 = cluster_add_tx(Txid, Tx, Fee, VSize, State2),
+
+        %% 18. update state totals (subtract evicted vbytes, add new tx)
+        State4 = State3#state{
+            total_bytes = State3#state.total_bytes + VSize - AllEvictedVBytes,
+            total_count = State3#state.total_count + 1 - length(AllEvictedTxids)
         },
 
-        %% 17. check if any orphans now have parents
+        %% 19. check if any orphans now have parents
         reprocess_orphans(Txid),
 
         logger:debug("mempool: accepted ~s (fee_rate=~.1f sat/vB, ~B vB)",
                      [short_hex(Txid), FeeRate, VSize]),
-        {ok, Txid, State2}
+        {ok, Txid, State4}
     catch
         throw:{validation, Reason} ->
             {error, Reason};
@@ -814,12 +863,15 @@ accept_package_txs(TxEntries, State) ->
         %% Update ancestors
         update_ancestors_for_new_tx(Tx, VSize, Fee),
 
+        %% Update cluster membership
+        St2 = cluster_add_tx(Txid, Tx, Fee, VSize, St),
+
         %% Reprocess orphans
         reprocess_orphans(Txid),
 
-        St#state{
-            total_bytes = St#state.total_bytes + VSize,
-            total_count = St#state.total_count + 1
+        St2#state{
+            total_bytes = St2#state.total_bytes + VSize,
+            total_count = St2#state.total_count + 1
         }
     end, State, lists:reverse(TxEntries)).
 
@@ -873,9 +925,10 @@ check_standard(#transaction{version = V} = Tx) ->
 check_mempool_conflicts(Tx, _InputCoins) ->
     case find_mempool_conflicts(Tx) of
         [] ->
-            ok;
+            {ok, [], 0};
         ConflictTxids ->
             %% attempt RBF (BIP 125)
+            %% Returns {ok, EvictedTxids, EvictedVBytes} or throws error
             do_rbf(Tx, ConflictTxids)
     end.
 
@@ -967,14 +1020,22 @@ do_rbf(NewTx, ConflictTxids) ->
             orelse throw(rbf_insufficient_fee_rate)
     end, ConflictEntries),
 
+    %% 7. cluster-based RBF check: new tx's diagram must dominate old cluster's diagram
+    %% This ensures the replacement improves the mempool's fee-rate quality
+    check_cluster_rbf_diagram(NewFee, NewVSize, AllEvictTxids),
+
     %% evict all conflicting txs + descendants
-    lists:foreach(fun(EvictTxid) ->
-        remove_entry(EvictTxid)
-    end, AllEvictTxids),
+    %% Collect vbytes before removal for state update
+    EvictedVBytes = lists:foldl(fun(EvictTxid, Acc) ->
+        case remove_entry(EvictTxid) of
+            #mempool_entry{vsize = VS} -> Acc + VS;
+            not_found -> Acc
+        end
+    end, 0, AllEvictTxids),
 
     logger:debug("mempool: rbf evicted ~B txs (fullrbf=~p)",
                  [length(AllEvictTxids), FullRbfEnabled]),
-    ok.
+    {ok, AllEvictTxids, EvictedVBytes}.
 
 %% Sum the input values for a transaction (UTXO set + mempool).
 compute_tx_input_value(#transaction{inputs = Inputs}) ->
@@ -989,6 +1050,80 @@ compute_tx_input_value(#transaction{inputs = Inputs}) ->
                     end
             end
         end, 0, Inputs).
+
+%% @doc Check that the new tx's fee-rate diagram dominates the old cluster's diagram.
+%% A diagram dominates if at every cumulative vsize point, it has >= cumulative fee.
+%% This ensures the replacement improves mempool quality.
+check_cluster_rbf_diagram(NewFee, NewVSize, OldTxids) ->
+    %% Build the old fee-rate diagram (cumulative vsize -> cumulative fee)
+    OldDiagram = build_feerate_diagram(OldTxids),
+    %% Build the new diagram (just the single replacement tx for now)
+    NewDiagram = [{NewVSize, NewFee}],
+    %% Check dominance: at each point in the old diagram, the new diagram
+    %% must have >= cumulative fee at that cumulative vsize
+    case diagram_dominates(NewDiagram, OldDiagram) of
+        true ->
+            ok;
+        false ->
+            throw(rbf_cluster_diagram_not_dominated)
+    end.
+
+%% @doc Build a fee-rate diagram from a list of txids.
+%% Returns a list of {cumulative_vsize, cumulative_fee} points, sorted by fee rate.
+build_feerate_diagram(Txids) ->
+    %% Get fee and vsize for each txid, compute fee rate, sort by descending fee rate
+    Entries = lists:filtermap(fun(Txid) ->
+        case ets:lookup(?MEMPOOL_TXS, Txid) of
+            [{_, E}] -> {true, {E#mempool_entry.fee, E#mempool_entry.vsize,
+                                E#mempool_entry.fee_rate}};
+            [] -> false
+        end
+    end, Txids),
+    %% Sort by descending fee rate (best first)
+    Sorted = lists:sort(fun({_, _, R1}, {_, _, R2}) -> R1 >= R2 end, Entries),
+    %% Build cumulative diagram
+    {Diagram, _, _} = lists:foldl(
+        fun({Fee, VSize, _Rate}, {Acc, CumFee, CumVSize}) ->
+            NewCumFee = CumFee + Fee,
+            NewCumVSize = CumVSize + VSize,
+            {[{NewCumVSize, NewCumFee} | Acc], NewCumFee, NewCumVSize}
+        end,
+        {[], 0, 0},
+        Sorted),
+    lists:reverse(Diagram).
+
+%% @doc Check if diagram A dominates diagram B (A >= B at all points).
+%% Both diagrams are lists of {cumulative_vsize, cumulative_fee}.
+diagram_dominates(NewDiagram, OldDiagram) ->
+    %% For each point in OldDiagram, find the cumulative fee at that vsize in NewDiagram
+    %% The new diagram dominates if NewFee >= OldFee at each point
+    lists:all(
+        fun({OldVSize, OldFee}) ->
+            NewFee = interpolate_diagram(NewDiagram, OldVSize),
+            NewFee >= OldFee
+        end,
+        OldDiagram).
+
+%% @doc Interpolate the cumulative fee at a given vsize in a diagram.
+%% Uses linear interpolation between diagram points.
+interpolate_diagram([], _VSize) ->
+    0;
+interpolate_diagram([{V, F}], VSize) when VSize >= V ->
+    F;
+interpolate_diagram([{V, F} | _], VSize) when VSize =< V ->
+    %% Linear interpolation from origin to first point
+    (F * VSize) div max(1, V);
+interpolate_diagram([{V1, F1}, {V2, F2} | Rest], VSize) when VSize > V1 ->
+    case VSize =< V2 of
+        true ->
+            %% Linear interpolation between V1 and V2
+            F1 + ((F2 - F1) * (VSize - V1)) div max(1, (V2 - V1));
+        false ->
+            interpolate_diagram([{V2, F2} | Rest], VSize)
+    end;
+interpolate_diagram([{_V, F} | _], _VSize) ->
+    %% VSize is before this point - interpolate from origin
+    F.
 
 %% Get all descendant txids for a given mempool tx.
 get_all_descendants(Txid) ->
@@ -1345,22 +1480,23 @@ remove_entry(Txid) ->
 %%% ===================================================================
 
 do_remove_for_block(Txids, State) ->
-    %% 1. remove confirmed transactions
-    {RemovedBytes, RemovedCount} = lists:foldl(
-        fun(Txid, {Bytes, Count}) ->
+    %% 1. remove confirmed transactions and update clusters
+    {RemovedBytes, RemovedCount, State2} = lists:foldl(
+        fun(Txid, {Bytes, Count, St}) ->
             case remove_entry(Txid) of
                 #mempool_entry{vsize = VSize} ->
-                    {Bytes + VSize, Count + 1};
+                    St2 = cluster_remove_tx(Txid, St),
+                    {Bytes + VSize, Count + 1, St2};
                 not_found ->
-                    {Bytes, Count}
+                    {Bytes, Count, St}
             end
         end,
-        {0, 0},
+        {0, 0, State},
         Txids),
 
     %% 2. remove any mempool txs that conflict with the block
     %%    (their inputs were spent by block transactions)
-    {ConflictBytes, ConflictCount} = remove_block_conflicts(Txids),
+    {ConflictBytes, ConflictCount, State3} = remove_block_conflicts(Txids, State2),
 
     TotalBytes = RemovedBytes + ConflictBytes,
     TotalCount = RemovedCount + ConflictCount,
@@ -1370,24 +1506,24 @@ do_remove_for_block(Txids, State) ->
                          "~B conflicts)", [TotalCount, RemovedCount, ConflictCount]);
         false -> ok
     end,
-    State#state{
-        total_bytes = max(0, State#state.total_bytes - TotalBytes),
-        total_count = max(0, State#state.total_count - TotalCount)
+    State3#state{
+        total_bytes = max(0, State3#state.total_bytes - TotalBytes),
+        total_count = max(0, State3#state.total_count - TotalCount)
     }.
 
 %% After confirming block transactions, check if any remaining mempool
 %% transactions now double-spend a confirmed output. Remove them.
-remove_block_conflicts(ConfirmedTxids) ->
+remove_block_conflicts(ConfirmedTxids, State) ->
     %% Build set of outpoints spent by confirmed txs
     %% For each confirmed txid, its outputs are now in the UTXO set,
     %% and any mempool tx spending the same inputs as a confirmed tx
     %% is now invalid.
     ConfSet = sets:from_list(ConfirmedTxids),
     AllEntries = ets:tab2list(?MEMPOOL_TXS),
-    lists:foldl(fun({Txid, Entry}, {Bytes, Count}) ->
+    lists:foldl(fun({Txid, Entry}, {Bytes, Count, St}) ->
         %% skip if we already removed it
         case sets:is_element(Txid, ConfSet) of
-            true -> {Bytes, Count};
+            true -> {Bytes, Count, St};
             false ->
                 %% check if any input's previous output was just confirmed
                 HasConflict = lists:any(
@@ -1400,67 +1536,111 @@ remove_block_conflicts(ConfirmedTxids) ->
                         %% remove this tx and its descendants
                         Desc = get_all_descendants(Txid),
                         AllRemove = [Txid | Desc],
-                        lists:foldl(fun(RTxid, {B, C}) ->
+                        lists:foldl(fun(RTxid, {B, C, St2}) ->
                             case remove_entry(RTxid) of
-                                #mempool_entry{vsize = VS} -> {B + VS, C + 1};
-                                not_found -> {B, C}
+                                #mempool_entry{vsize = VS} ->
+                                    St3 = cluster_remove_tx(RTxid, St2),
+                                    {B + VS, C + 1, St3};
+                                not_found -> {B, C, St2}
                             end
-                        end, {Bytes, Count}, AllRemove);
+                        end, {Bytes, Count, St}, AllRemove);
                     false ->
-                        {Bytes, Count}
+                        {Bytes, Count, St}
                 end
         end
-    end, {0, 0}, AllEntries).
+    end, {0, 0, State}, AllEntries).
 
 %%% ===================================================================
-%%% Internal: trimming / eviction (stub)
+%%% Internal: trimming / eviction (cluster-based)
 %%% ===================================================================
 
-%% Remove lowest fee-rate transactions until total size fits.
+%% Remove transactions from the worst cluster linearization tails until
+%% total size fits within MaxBytes.
 do_trim_to_size(MaxBytes, State) ->
     case State#state.total_bytes =< MaxBytes of
         true ->
             State;
         false ->
-            case ets:first(?MEMPOOL_BY_FEE) of
-                '$end_of_table' ->
+            %% Find the worst cluster (lowest aggregate fee rate)
+            case find_worst_cluster() of
+                not_found ->
                     State;
-                {_FeeRate, Txid} ->
-                    %% remove this tx and all its descendants
-                    Desc = get_all_descendants(Txid),
-                    AllRemove = [Txid | Desc],
-                    {RemovedBytes, RemovedCount} = lists:foldl(
-                        fun(RTxid, {Bytes, Count}) ->
-                            case remove_entry(RTxid) of
-                                #mempool_entry{vsize = VSize} ->
-                                    {Bytes + VSize, Count + 1};
-                                not_found ->
-                                    {Bytes, Count}
-                            end
-                        end, {0, 0}, AllRemove),
-                    State2 = State#state{
-                        total_bytes = max(0, State#state.total_bytes - RemovedBytes),
-                        total_count = max(0, State#state.total_count - RemovedCount)
-                    },
-                    do_trim_to_size(MaxBytes, State2)
+                {ClusterId, ClusterData} ->
+                    %% Evict from the tail of this cluster's linearization
+                    Linearization = ClusterData#cluster_data.linearization,
+                    case Linearization of
+                        [] ->
+                            %% Empty cluster - remove it and try again
+                            ets:delete(?MEMPOOL_CLUSTERS, ClusterId),
+                            State2 = State#state{
+                                cluster_count = max(0, State#state.cluster_count - 1)
+                            },
+                            do_trim_to_size(MaxBytes, State2);
+                        _ ->
+                            %% Remove the last transaction in the linearization
+                            %% (lowest priority within this cluster)
+                            TailTxid = lists:last(Linearization),
+                            %% Also remove any descendants
+                            Desc = get_all_descendants(TailTxid),
+                            AllRemove = [TailTxid | Desc],
+                            {RemovedBytes, RemovedCount, State2} = lists:foldl(
+                                fun(RTxid, {Bytes, Count, St}) ->
+                                    case remove_entry(RTxid) of
+                                        #mempool_entry{vsize = VSize} ->
+                                            St2 = cluster_remove_tx(RTxid, St),
+                                            {Bytes + VSize, Count + 1, St2};
+                                        not_found ->
+                                            {Bytes, Count, St}
+                                    end
+                                end, {0, 0, State}, AllRemove),
+                            State3 = State2#state{
+                                total_bytes = max(0, State2#state.total_bytes - RemovedBytes),
+                                total_count = max(0, State2#state.total_count - RemovedCount)
+                            },
+                            do_trim_to_size(MaxBytes, State3)
+                    end
             end
+    end.
+
+%% @doc Find the cluster with the lowest aggregate fee rate.
+find_worst_cluster() ->
+    AllClusters = ets:tab2list(?MEMPOOL_CLUSTERS),
+    case AllClusters of
+        [] ->
+            not_found;
+        _ ->
+            lists:foldl(
+                fun({Id, Data}, Worst) ->
+                    case Worst of
+                        not_found ->
+                            {Id, Data};
+                        {_, WorstData} ->
+                            case Data#cluster_data.fee_rate < WorstData#cluster_data.fee_rate of
+                                true -> {Id, Data};
+                                false -> Worst
+                            end
+                    end
+                end,
+                not_found,
+                AllClusters)
     end.
 
 %% Expire transactions older than 14 days (336 hours).
 do_expire_old(State) ->
     CutoffTime = erlang:system_time(second) - (?MEMPOOL_EXPIRY_HOURS * 3600),
     AllEntries = ets:tab2list(?MEMPOOL_TXS),
-    {ExpiredCount, ExpiredBytes} = lists:foldl(
-        fun({Txid, Entry}, {Count, Bytes}) ->
+    {ExpiredCount, ExpiredBytes, State2} = lists:foldl(
+        fun({Txid, Entry}, {Count, Bytes, St}) ->
             case Entry#mempool_entry.time_added < CutoffTime of
                 true ->
                     remove_entry(Txid),
-                    {Count + 1, Bytes + Entry#mempool_entry.vsize};
+                    St2 = cluster_remove_tx(Txid, St),
+                    {Count + 1, Bytes + Entry#mempool_entry.vsize, St2};
                 false ->
-                    {Count, Bytes}
+                    {Count, Bytes, St}
             end
         end,
-        {0, 0},
+        {0, 0, State},
         AllEntries),
     case ExpiredCount > 0 of
         true ->
@@ -1468,11 +1648,11 @@ do_expire_old(State) ->
                          [ExpiredCount, ExpiredBytes]);
         false -> ok
     end,
-    State2 = State#state{
-        total_bytes = max(0, State#state.total_bytes - ExpiredBytes),
-        total_count = max(0, State#state.total_count - ExpiredCount)
+    State3 = State2#state{
+        total_bytes = max(0, State2#state.total_bytes - ExpiredBytes),
+        total_count = max(0, State2#state.total_count - ExpiredCount)
     },
-    {ExpiredCount, State2}.
+    {ExpiredCount, State3}.
 
 do_expire_orphans() ->
     Now = erlang:system_time(second),
@@ -1620,9 +1800,9 @@ find_truc_sibling_in_outputs(ParentTxid, Idx, NumOutputs) ->
     end.
 
 %% @doc Perform sibling eviction for v3 transactions.
-%% Evicts the existing sibling and returns ok if successful.
+%% Evicts the existing sibling and returns {ok, EvictedTxids, EvictedVBytes} if successful.
 -spec do_truc_sibling_eviction(binary(), #transaction{}, non_neg_integer()) ->
-    ok | {error, term()}.
+    {ok, [binary()], non_neg_integer()} | {error, term()}.
 do_truc_sibling_eviction(SiblingTxid, NewTx, NewFee) ->
     case ets:lookup(?MEMPOOL_TXS, SiblingTxid) of
         [{_, SiblingEntry}] ->
@@ -1636,16 +1816,21 @@ do_truc_sibling_eviction(SiblingTxid, NewTx, NewFee) ->
                     %% Evict sibling and its descendants
                     Descendants = get_all_descendants(SiblingTxid),
                     AllEvict = [SiblingTxid | Descendants],
-                    lists:foreach(fun(Txid) -> remove_entry(Txid) end, AllEvict),
+                    EvictedVBytes = lists:foldl(fun(Txid, Acc) ->
+                        case remove_entry(Txid) of
+                            #mempool_entry{vsize = VS} -> Acc + VS;
+                            not_found -> Acc
+                        end
+                    end, 0, AllEvict),
                     logger:debug("mempool: truc sibling eviction ~s + ~B descendants",
                                  [short_hex(SiblingTxid), length(Descendants)]),
-                    ok;
+                    {ok, AllEvict, EvictedVBytes};
                 false ->
                     {error, {truc_violation, sibling_eviction_insufficient_fee}}
             end;
         [] ->
             %% Sibling already removed
-            ok
+            {ok, [], 0}
     end.
 
 %% @doc Check TRUC rules for package transactions.
@@ -1803,6 +1988,675 @@ check_truc_v3_package_siblings(ParentTxid, ChildTxid, PackageTxMap, MempoolParen
                     ok
             end
     end.
+
+%%% ===================================================================
+%%% Cluster mempool public API
+%%% ===================================================================
+
+%% @doc Get the cluster ID for a transaction.
+-spec get_cluster(binary()) -> {ok, binary()} | not_found.
+get_cluster(Txid) ->
+    gen_server:call(?SERVER, {get_cluster, Txid}).
+
+%% @doc Get all txids in a cluster.
+-spec get_cluster_txids(binary()) -> {ok, [binary()]} | not_found.
+get_cluster_txids(ClusterId) ->
+    case ets:lookup(?MEMPOOL_CLUSTERS, ClusterId) of
+        [{ClusterId, ClusterData}] ->
+            {ok, ClusterData#cluster_data.txids};
+        [] ->
+            not_found
+    end.
+
+%% @doc Get the linearization (optimal ordering) for a cluster.
+-spec get_cluster_linearization(binary()) -> {ok, [binary()]} | not_found.
+get_cluster_linearization(ClusterId) ->
+    case ets:lookup(?MEMPOOL_CLUSTERS, ClusterId) of
+        [{ClusterId, ClusterData}] ->
+            {ok, ClusterData#cluster_data.linearization};
+        [] ->
+            not_found
+    end.
+
+%% @doc Get all transactions in mining order (best fee-rate prefixes first).
+%% Returns a list of txids ordered for optimal block construction.
+-spec get_mining_order() -> [binary()].
+get_mining_order() ->
+    %% Collect all clusters with their linearizations and aggregate fee rates
+    AllClusters = ets:tab2list(?MEMPOOL_CLUSTERS),
+    %% Sort clusters by fee rate (descending)
+    SortedClusters = lists:sort(
+        fun({_, A}, {_, B}) ->
+            A#cluster_data.fee_rate >= B#cluster_data.fee_rate
+        end,
+        AllClusters),
+    %% Flatten linearizations in order
+    lists:flatmap(
+        fun({_, ClusterData}) ->
+            ClusterData#cluster_data.linearization
+        end,
+        SortedClusters).
+
+%% @doc Get all cluster IDs.
+-spec get_all_clusters() -> [binary()].
+get_all_clusters() ->
+    [Id || {Id, _} <- ets:tab2list(?MEMPOOL_CLUSTERS)].
+
+%%% ===================================================================
+%%% Internal: Union-Find for cluster tracking
+%%% ===================================================================
+
+%% @doc Find the root (cluster ID) for a txid with path compression.
+%% Returns {Root, UpdatedUnionFind} where Root is the cluster ID.
+-spec uf_find(binary(), map()) -> {binary(), map()}.
+uf_find(Txid, UnionFind) ->
+    case maps:get(Txid, UnionFind, Txid) of
+        Txid ->
+            %% Txid is its own root
+            {Txid, UnionFind};
+        Parent ->
+            %% Recursively find root with path compression
+            {Root, UF2} = uf_find(Parent, UnionFind),
+            %% Path compression: point directly to root
+            {Root, maps:put(Txid, Root, UF2)}
+    end.
+
+%% @doc Union two sets (clusters) by their txids.
+%% Returns {NewRoot, UpdatedUnionFind}.
+-spec uf_union(binary(), binary(), map()) -> {binary(), map()}.
+uf_union(Txid1, Txid2, UnionFind) ->
+    {Root1, UF1} = uf_find(Txid1, UnionFind),
+    {Root2, UF2} = uf_find(Txid2, UF1),
+    case Root1 =:= Root2 of
+        true ->
+            %% Already in the same cluster
+            {Root1, UF2};
+        false ->
+            %% Merge: make Root1 the parent of Root2
+            %% (arbitrary choice, could use rank heuristic)
+            {Root1, maps:put(Root2, Root1, UF2)}
+    end.
+
+%% @doc Get all txids in the same cluster as Txid.
+-spec uf_get_cluster_members(binary(), map()) -> [binary()].
+uf_get_cluster_members(Txid, UnionFind) ->
+    {Root, _} = uf_find(Txid, UnionFind),
+    %% Find all txids that have this root
+    [T || T <- maps:keys(UnionFind),
+          element(1, uf_find(T, UnionFind)) =:= Root].
+
+%%% ===================================================================
+%%% Internal: Cluster linearization (chunking algorithm)
+%%% ===================================================================
+
+%% @doc Build a dependency graph for transactions in a cluster.
+%% Returns a map: txid -> {parents, children, fee, vsize}
+-spec build_dep_graph([binary()]) -> map().
+build_dep_graph(Txids) ->
+    TxidSet = sets:from_list(Txids),
+    lists:foldl(
+        fun(Txid, Graph) ->
+            case ets:lookup(?MEMPOOL_TXS, Txid) of
+                [{Txid, Entry}] ->
+                    Tx = Entry#mempool_entry.tx,
+                    Fee = Entry#mempool_entry.fee,
+                    VSize = Entry#mempool_entry.vsize,
+                    %% Find parents (inputs that are in this cluster)
+                    Parents = lists:filtermap(
+                        fun(#tx_in{prev_out = #outpoint{hash = H}}) ->
+                            case sets:is_element(H, TxidSet) of
+                                true -> {true, H};
+                                false -> false
+                            end
+                        end,
+                        Tx#transaction.inputs),
+                    maps:put(Txid, #{parents => Parents, children => [],
+                                     fee => Fee, vsize => VSize}, Graph);
+                [] ->
+                    Graph
+            end
+        end,
+        #{},
+        Txids),
+    %% Second pass: populate children from parents
+    Graph = lists:foldl(
+        fun(Txid, G) ->
+            case maps:get(Txid, G, undefined) of
+                undefined -> G;
+                TxData ->
+                    Parents = maps:get(parents, TxData),
+                    lists:foldl(
+                        fun(ParentTxid, G2) ->
+                            case maps:get(ParentTxid, G2, undefined) of
+                                undefined -> G2;
+                                ParentData ->
+                                    Children = maps:get(children, ParentData),
+                                    maps:put(ParentTxid,
+                                             ParentData#{children => [Txid | Children]},
+                                             G2)
+                            end
+                        end,
+                        G,
+                        Parents)
+            end
+        end,
+        build_dep_graph_initial(Txids),
+        Txids),
+    Graph.
+
+build_dep_graph_initial(Txids) ->
+    TxidSet = sets:from_list(Txids),
+    lists:foldl(
+        fun(Txid, Graph) ->
+            case ets:lookup(?MEMPOOL_TXS, Txid) of
+                [{Txid, Entry}] ->
+                    Tx = Entry#mempool_entry.tx,
+                    Fee = Entry#mempool_entry.fee,
+                    VSize = Entry#mempool_entry.vsize,
+                    Parents = lists:filtermap(
+                        fun(#tx_in{prev_out = #outpoint{hash = H}}) ->
+                            case sets:is_element(H, TxidSet) of
+                                true -> {true, H};
+                                false -> false
+                            end
+                        end,
+                        Tx#transaction.inputs),
+                    maps:put(Txid, #{parents => Parents, children => [],
+                                     fee => Fee, vsize => VSize}, Graph);
+                [] ->
+                    Graph
+            end
+        end,
+        #{},
+        Txids).
+
+%% @doc Linearize a cluster using the greedy chunking algorithm.
+%% This implements a simplified version of the SFL algorithm:
+%% Repeatedly find the highest fee-rate connected subset and place it first.
+-spec linearize_cluster([binary()]) -> {[binary()], non_neg_integer(), non_neg_integer()}.
+linearize_cluster([]) ->
+    {[], 0, 0};
+linearize_cluster([SingleTxid]) ->
+    case ets:lookup(?MEMPOOL_TXS, SingleTxid) of
+        [{SingleTxid, Entry}] ->
+            {[SingleTxid], Entry#mempool_entry.fee, Entry#mempool_entry.vsize};
+        [] ->
+            {[], 0, 0}
+    end;
+linearize_cluster(Txids) ->
+    DepGraph = build_dep_graph(Txids),
+    linearize_with_graph(Txids, DepGraph).
+
+%% @doc Linearize using dependency graph with greedy chunking.
+%% The algorithm:
+%% 1. Find all transactions with no unplaced parents (ready set)
+%% 2. For each ready transaction, calculate its "chunk" - the highest
+%%    fee-rate set that can be mined together
+%% 3. Place the best chunk first, mark as placed, repeat
+-spec linearize_with_graph([binary()], map()) -> {[binary()], non_neg_integer(), non_neg_integer()}.
+linearize_with_graph(Txids, DepGraph) ->
+    Remaining = sets:from_list(Txids),
+    linearize_loop(Remaining, DepGraph, [], 0, 0).
+
+linearize_loop(Remaining, DepGraph, Acc, TotalFee, TotalVSize) ->
+    case sets:size(Remaining) of
+        0 ->
+            {lists:reverse(Acc), TotalFee, TotalVSize};
+        _ ->
+            %% Find ready transactions (no unplaced parents)
+            Ready = find_ready_txids(Remaining, DepGraph),
+            case Ready of
+                [] ->
+                    %% Shouldn't happen with valid DAG, but handle gracefully
+                    %% Just take any remaining tx
+                    [AnyTxid | _] = sets:to_list(Remaining),
+                    TxData = maps:get(AnyTxid, DepGraph, #{fee => 0, vsize => 1}),
+                    Fee = maps:get(fee, TxData, 0),
+                    VSize = maps:get(vsize, TxData, 1),
+                    Remaining2 = sets:del_element(AnyTxid, Remaining),
+                    linearize_loop(Remaining2, DepGraph, [AnyTxid | Acc],
+                                   TotalFee + Fee, TotalVSize + VSize);
+                _ ->
+                    %% Find the best chunk among ready transactions
+                    BestChunk = find_best_chunk(Ready, Remaining, DepGraph),
+                    %% Add chunk to linearization
+                    {ChunkTxids, ChunkFee, ChunkVSize} = BestChunk,
+                    Remaining2 = lists:foldl(fun sets:del_element/2, Remaining, ChunkTxids),
+                    linearize_loop(Remaining2, DepGraph, lists:reverse(ChunkTxids) ++ Acc,
+                                   TotalFee + ChunkFee, TotalVSize + ChunkVSize)
+            end
+    end.
+
+%% @doc Find transactions that are ready to be placed (all parents already placed).
+-spec find_ready_txids(sets:set(), map()) -> [binary()].
+find_ready_txids(Remaining, DepGraph) ->
+    lists:filter(
+        fun(Txid) ->
+            case maps:get(Txid, DepGraph, undefined) of
+                undefined -> false;
+                TxData ->
+                    Parents = maps:get(parents, TxData, []),
+                    %% Ready if no parents are in remaining set
+                    not lists:any(fun(P) -> sets:is_element(P, Remaining) end, Parents)
+            end
+        end,
+        sets:to_list(Remaining)).
+
+%% @doc Find the best (highest fee-rate) chunk starting from ready transactions.
+%% A chunk is a topologically valid subset that can be mined together.
+-spec find_best_chunk([binary()], sets:set(), map()) -> {[binary()], non_neg_integer(), non_neg_integer()}.
+find_best_chunk(ReadyTxids, Remaining, DepGraph) ->
+    %% For each ready tx, calculate the best chunk starting from it
+    Chunks = lists:map(
+        fun(StartTxid) ->
+            build_chunk(StartTxid, Remaining, DepGraph)
+        end,
+        ReadyTxids),
+    %% Return the chunk with highest fee rate
+    lists:foldl(
+        fun({_Txids, Fee, VSize} = Chunk, {_, BestFee, BestVSize} = Best) ->
+            ChunkRate = Fee / max(1, VSize),
+            BestRate = BestFee / max(1, BestVSize),
+            case ChunkRate > BestRate of
+                true -> Chunk;
+                false -> Best
+            end
+        end,
+        {[], 0, 0},
+        Chunks).
+
+%% @doc Build a chunk starting from a transaction.
+%% Uses greedy absorption: include descendants if they increase the chunk fee rate.
+-spec build_chunk(binary(), sets:set(), map()) -> {[binary()], non_neg_integer(), non_neg_integer()}.
+build_chunk(StartTxid, Remaining, DepGraph) ->
+    TxData = maps:get(StartTxid, DepGraph, #{fee => 0, vsize => 1}),
+    StartFee = maps:get(fee, TxData, 0),
+    StartVSize = maps:get(vsize, TxData, 1),
+    %% Start with just this transaction
+    Chunk = [StartTxid],
+    %% Try to absorb children greedily
+    absorb_children(Chunk, StartFee, StartVSize, Remaining, DepGraph).
+
+%% @doc Try to absorb children into the chunk if it improves fee rate.
+absorb_children(Chunk, ChunkFee, ChunkVSize, Remaining, DepGraph) ->
+    ChunkSet = sets:from_list(Chunk),
+    ChunkRate = ChunkFee / max(1, ChunkVSize),
+    %% Find children of chunk members that are in remaining and ready
+    Candidates = find_absorbable_children(ChunkSet, Remaining, DepGraph),
+    case Candidates of
+        [] ->
+            %% No more candidates, return current chunk (topo-sorted)
+            {topo_sort_chunk(Chunk, DepGraph), ChunkFee, ChunkVSize};
+        _ ->
+            %% Try each candidate and pick the best absorption
+            BestAbsorption = lists:foldl(
+                fun(CandTxid, Best) ->
+                    TxData = maps:get(CandTxid, DepGraph, #{fee => 0, vsize => 1}),
+                    CandFee = maps:get(fee, TxData, 0),
+                    CandVSize = maps:get(vsize, TxData, 1),
+                    NewFee = ChunkFee + CandFee,
+                    NewVSize = ChunkVSize + CandVSize,
+                    NewRate = NewFee / max(1, NewVSize),
+                    case NewRate >= ChunkRate of
+                        true ->
+                            %% Absorption improves or maintains rate
+                            case Best of
+                                none -> {CandTxid, NewFee, NewVSize, NewRate};
+                                {_, _, _, BestRate} when NewRate > BestRate ->
+                                    {CandTxid, NewFee, NewVSize, NewRate};
+                                _ -> Best
+                            end;
+                        false ->
+                            Best
+                    end
+                end,
+                none,
+                Candidates),
+            case BestAbsorption of
+                none ->
+                    %% No beneficial absorption found
+                    {topo_sort_chunk(Chunk, DepGraph), ChunkFee, ChunkVSize};
+                {BestCand, NewFee, NewVSize, _} ->
+                    %% Absorb and continue
+                    absorb_children([BestCand | Chunk], NewFee, NewVSize, Remaining, DepGraph)
+            end
+    end.
+
+%% @doc Find children that can be absorbed (all parents in chunk or already placed).
+find_absorbable_children(ChunkSet, Remaining, DepGraph) ->
+    AllChildren = lists:usort(lists:flatmap(
+        fun(Txid) ->
+            TxData = maps:get(Txid, DepGraph, #{children => []}),
+            maps:get(children, TxData, [])
+        end,
+        sets:to_list(ChunkSet))),
+    %% Filter to those in Remaining and whose parents are all in ChunkSet
+    lists:filter(
+        fun(ChildTxid) ->
+            sets:is_element(ChildTxid, Remaining) andalso
+            not sets:is_element(ChildTxid, ChunkSet) andalso
+            begin
+                TxData = maps:get(ChildTxid, DepGraph, #{parents => []}),
+                Parents = maps:get(parents, TxData, []),
+                lists:all(fun(P) ->
+                    sets:is_element(P, ChunkSet) orelse not sets:is_element(P, Remaining)
+                end, Parents)
+            end
+        end,
+        AllChildren).
+
+%% @doc Topologically sort the chunk (parents before children).
+topo_sort_chunk(Chunk, DepGraph) ->
+    ChunkSet = sets:from_list(Chunk),
+    topo_sort_loop(Chunk, ChunkSet, DepGraph, []).
+
+topo_sort_loop([], _, _, Acc) ->
+    lists:reverse(Acc);
+topo_sort_loop(Remaining, ChunkSet, DepGraph, Acc) ->
+    %% Find a tx with no unplaced parents in chunk
+    PlacedSet = sets:from_list(Acc),
+    Ready = lists:filter(
+        fun(Txid) ->
+            TxData = maps:get(Txid, DepGraph, #{parents => []}),
+            Parents = maps:get(parents, TxData, []),
+            InChunkParents = [P || P <- Parents, sets:is_element(P, ChunkSet)],
+            lists:all(fun(P) -> sets:is_element(P, PlacedSet) end, InChunkParents)
+        end,
+        Remaining),
+    case Ready of
+        [] ->
+            %% Should not happen, but handle gracefully
+            lists:reverse(Acc) ++ Remaining;
+        [First | _] ->
+            topo_sort_loop(Remaining -- [First], ChunkSet, DepGraph, [First | Acc])
+    end.
+
+%%% ===================================================================
+%%% Internal: Cluster management operations
+%%% ===================================================================
+
+%% @doc Add a transaction to the cluster system.
+%% Creates a new cluster or merges with existing cluster(s).
+-spec cluster_add_tx(binary(), #transaction{}, non_neg_integer(), non_neg_integer(), #state{}) -> #state{}.
+cluster_add_tx(Txid, Tx, Fee, VSize, State) ->
+    %% Find all mempool parents of this transaction
+    ParentTxids = get_parent_txids(Tx),
+
+    case ParentTxids of
+        [] ->
+            %% No mempool parents - create new singleton cluster
+            create_singleton_cluster(Txid, Fee, VSize, State);
+        _ ->
+            %% Has mempool parents - find their clusters and merge
+            merge_into_clusters(Txid, Fee, VSize, ParentTxids, State)
+    end.
+
+%% @doc Create a new singleton cluster for a transaction.
+create_singleton_cluster(Txid, Fee, VSize, #state{union_find = UF, cluster_count = CC} = State) ->
+    %% Add to union-find (self-referential)
+    UF2 = maps:put(Txid, Txid, UF),
+
+    %% Create cluster data
+    ClusterData = #cluster_data{
+        id = Txid,
+        txids = [Txid],
+        total_fee = Fee,
+        total_vsize = VSize,
+        linearization = [Txid],
+        fee_rate = Fee / max(1, VSize)
+    },
+    ets:insert(?MEMPOOL_CLUSTERS, {Txid, ClusterData}),
+
+    State#state{union_find = UF2, cluster_count = CC + 1}.
+
+%% @doc Merge a new transaction into existing cluster(s).
+merge_into_clusters(Txid, Fee, VSize, ParentTxids, #state{union_find = UF} = State) ->
+    %% Find all unique cluster roots for parents
+    {Roots, UF2} = lists:foldl(
+        fun(ParentTxid, {RootsAcc, UFAcc}) ->
+            case maps:is_key(ParentTxid, UFAcc) of
+                true ->
+                    {Root, UFAcc2} = uf_find(ParentTxid, UFAcc),
+                    {[Root | RootsAcc], UFAcc2};
+                false ->
+                    {RootsAcc, UFAcc}
+            end
+        end,
+        {[], UF},
+        ParentTxids),
+
+    UniqueRoots = lists:usort(Roots),
+
+    case UniqueRoots of
+        [] ->
+            %% All parents confirmed - create singleton
+            create_singleton_cluster(Txid, Fee, VSize, State#state{union_find = UF2});
+        [SingleRoot] ->
+            %% Single cluster - add to it
+            add_to_cluster(Txid, Fee, VSize, SingleRoot, State#state{union_find = UF2});
+        _ ->
+            %% Multiple clusters - merge them all
+            merge_clusters_and_add(Txid, Fee, VSize, UniqueRoots, State#state{union_find = UF2})
+    end.
+
+%% @doc Add a transaction to an existing cluster.
+add_to_cluster(Txid, _Fee, _VSize, ClusterId, #state{union_find = UF} = State) ->
+    %% Add to union-find
+    UF2 = maps:put(Txid, ClusterId, UF),
+
+    %% Update cluster
+    recompute_cluster(ClusterId, UF2),
+
+    State#state{union_find = UF2}.
+
+%% @doc Merge multiple clusters and add a new transaction.
+merge_clusters_and_add(Txid, _Fee, _VSize, ClusterIds, #state{union_find = UF, cluster_count = CC} = State) ->
+    [FirstCluster | RestClusters] = ClusterIds,
+
+    %% Merge all clusters into the first one
+    UF2 = lists:foldl(
+        fun(OtherCluster, UFAcc) ->
+            %% Get all members of OtherCluster
+            case ets:lookup(?MEMPOOL_CLUSTERS, OtherCluster) of
+                [{_, ClusterData}] ->
+                    %% Update union-find to point all members to FirstCluster
+                    lists:foldl(
+                        fun(MemberTxid, UF3) ->
+                            maps:put(MemberTxid, FirstCluster, UF3)
+                        end,
+                        UFAcc,
+                        ClusterData#cluster_data.txids);
+                [] ->
+                    UFAcc
+            end
+        end,
+        UF,
+        RestClusters),
+
+    %% Add new txid to first cluster
+    UF3 = maps:put(Txid, FirstCluster, UF2),
+
+    %% Delete merged cluster records
+    lists:foreach(fun(CId) ->
+        ets:delete(?MEMPOOL_CLUSTERS, CId)
+    end, RestClusters),
+
+    %% Recompute the merged cluster
+    recompute_cluster(FirstCluster, UF3),
+
+    %% Update cluster count (merged n clusters into 1, added new tx)
+    NewCC = CC - length(RestClusters),
+
+    State#state{union_find = UF3, cluster_count = NewCC}.
+
+%% @doc Recompute cluster data after modification.
+recompute_cluster(ClusterId, UnionFind) ->
+    %% Find all members of this cluster
+    AllTxids = [T || T <- maps:keys(UnionFind),
+                     element(1, uf_find(T, UnionFind)) =:= ClusterId],
+
+    %% Check cluster size limit
+    case length(AllTxids) > ?MAX_CLUSTER_SIZE of
+        true ->
+            %% Cluster too large - this shouldn't happen with normal mempool limits
+            %% but handle gracefully by keeping existing linearization
+            logger:warning("mempool: cluster ~s exceeds size limit (~B txs)",
+                          [short_hex(ClusterId), length(AllTxids)]),
+            ok;
+        false ->
+            %% Recompute linearization
+            {Linearization, TotalFee, TotalVSize} = linearize_cluster(AllTxids),
+
+            ClusterData = #cluster_data{
+                id = ClusterId,
+                txids = AllTxids,
+                total_fee = TotalFee,
+                total_vsize = TotalVSize,
+                linearization = Linearization,
+                fee_rate = TotalFee / max(1, TotalVSize)
+            },
+            ets:insert(?MEMPOOL_CLUSTERS, {ClusterId, ClusterData})
+    end.
+
+%% @doc Remove a transaction from the cluster system.
+%% May split a cluster if the removed tx was connecting parts.
+-spec cluster_remove_tx(binary(), #state{}) -> #state{}.
+cluster_remove_tx(Txid, #state{union_find = UF} = State) ->
+    case maps:is_key(Txid, UF) of
+        false ->
+            State;
+        true ->
+            {ClusterId, UF2} = uf_find(Txid, UF),
+
+            %% Remove txid from union-find
+            UF3 = maps:remove(Txid, UF2),
+
+            %% Get remaining cluster members
+            case ets:lookup(?MEMPOOL_CLUSTERS, ClusterId) of
+                [{_, ClusterData}] ->
+                    RemainingTxids = ClusterData#cluster_data.txids -- [Txid],
+                    handle_cluster_after_removal(ClusterId, RemainingTxids, State#state{union_find = UF3});
+                [] ->
+                    State#state{union_find = UF3}
+            end
+    end.
+
+%% @doc Handle cluster state after a transaction is removed.
+handle_cluster_after_removal(ClusterId, [], #state{cluster_count = CC} = State) ->
+    %% Cluster is now empty - delete it
+    ets:delete(?MEMPOOL_CLUSTERS, ClusterId),
+    State#state{cluster_count = CC - 1};
+handle_cluster_after_removal(ClusterId, RemainingTxids, State) ->
+    %% Check if cluster needs to be split
+    Components = find_connected_components(RemainingTxids),
+    case length(Components) of
+        1 ->
+            %% Still one connected component - just recompute
+            recompute_cluster(ClusterId, State#state.union_find),
+            State;
+        N when N > 1 ->
+            %% Split into multiple clusters
+            split_cluster(ClusterId, Components, State)
+    end.
+
+%% @doc Find connected components among a set of txids.
+find_connected_components(Txids) ->
+    TxidSet = sets:from_list(Txids),
+    find_components_loop(Txids, TxidSet, []).
+
+find_components_loop([], _, Components) ->
+    Components;
+find_components_loop([Txid | Rest], TxidSet, Components) ->
+    case sets:is_element(Txid, TxidSet) of
+        false ->
+            find_components_loop(Rest, TxidSet, Components);
+        true ->
+            %% BFS to find all connected txids
+            {Component, TxidSet2} = bfs_component([Txid], TxidSet, []),
+            find_components_loop(Rest, TxidSet2, [Component | Components])
+    end.
+
+bfs_component([], TxidSet, Component) ->
+    {Component, TxidSet};
+bfs_component([Txid | Queue], TxidSet, Component) ->
+    case sets:is_element(Txid, TxidSet) of
+        false ->
+            bfs_component(Queue, TxidSet, Component);
+        true ->
+            TxidSet2 = sets:del_element(Txid, TxidSet),
+            %% Find neighbors (parents and children in mempool)
+            Neighbors = find_mempool_neighbors(Txid, TxidSet2),
+            bfs_component(Neighbors ++ Queue, TxidSet2, [Txid | Component])
+    end.
+
+%% @doc Find mempool neighbors (parents and children) of a transaction.
+find_mempool_neighbors(Txid, TxidSet) ->
+    case ets:lookup(?MEMPOOL_TXS, Txid) of
+        [{Txid, Entry}] ->
+            Tx = Entry#mempool_entry.tx,
+            %% Find parents that are in TxidSet
+            Parents = lists:filtermap(
+                fun(#tx_in{prev_out = #outpoint{hash = H}}) ->
+                    case sets:is_element(H, TxidSet) of
+                        true -> {true, H};
+                        false -> false
+                    end
+                end,
+                Tx#transaction.inputs),
+            %% Find children that are in TxidSet
+            Children = find_children_in_set(Txid, TxidSet),
+            Parents ++ Children;
+        [] ->
+            []
+    end.
+
+%% @doc Find children of a txid that are in the given set.
+find_children_in_set(ParentTxid, TxidSet) ->
+    case ets:lookup(?MEMPOOL_TXS, ParentTxid) of
+        [{_, Entry}] ->
+            NumOutputs = length((Entry#mempool_entry.tx)#transaction.outputs),
+            lists:filtermap(fun(Vout) ->
+                case ets:lookup(?MEMPOOL_OUTPOINTS, {ParentTxid, Vout}) of
+                    [{_, ChildTxid}] ->
+                        case sets:is_element(ChildTxid, TxidSet) of
+                            true -> {true, ChildTxid};
+                            false -> false
+                        end;
+                    [] -> false
+                end
+            end, lists:seq(0, NumOutputs - 1));
+        [] ->
+            []
+    end.
+
+%% @doc Split a cluster into multiple components.
+split_cluster(OldClusterId, Components, #state{union_find = UF, cluster_count = CC} = State) ->
+    %% Delete old cluster
+    ets:delete(?MEMPOOL_CLUSTERS, OldClusterId),
+
+    %% Create new clusters for each component
+    {UF2, NewClusterCount} = lists:foldl(
+        fun(Component, {UFAcc, CountAcc}) ->
+            %% Use first txid as new cluster ID
+            [NewClusterId | _] = Component,
+            %% Update union-find for all members
+            UFAcc2 = lists:foldl(
+                fun(Txid, UF3) ->
+                    maps:put(Txid, NewClusterId, UF3)
+                end,
+                UFAcc,
+                Component),
+            %% Recompute cluster
+            recompute_cluster(NewClusterId, UFAcc2),
+            {UFAcc2, CountAcc + 1}
+        end,
+        {UF, 0},
+        Components),
+
+    %% Adjust cluster count (removed 1, added N)
+    NewCC = CC - 1 + NewClusterCount,
+
+    State#state{union_find = UF2, cluster_count = NewCC}.
 
 %%% ===================================================================
 %%% Internal: helpers
