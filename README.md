@@ -51,7 +51,7 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] Keypool with 1000-address lookahead
 - [x] Coinbase maturity enforcement (100-block rule)
 - [x] Wallet encryption (AES-256-CBC with PBKDF2 key derivation)
-- [ ] Compact block relay (BIP152)
+- [x] Compact block relay (BIP152 with SipHash-2-4)
 
 ## Quick start
 
@@ -80,7 +80,8 @@ src/
 ├── beamchain_peer_manager.erl Peer lifecycle, banning, eclipse protections
 ├── beamchain_addrman.erl      Address manager with bucket-based storage
 ├── beamchain_header_sync.erl  Header-first sync with anti-DoS
-├── beamchain_block_sync.erl   Block download
+├── beamchain_block_sync.erl   Block download and compact block relay
+├── beamchain_compact_block.erl BIP152 compact block reconstruction
 ├── beamchain_chainstate.erl   UTXO management
 ├── beamchain_mempool.erl      Transaction pool
 ├── beamchain_miner.erl        Block template construction
@@ -106,7 +107,8 @@ test/
 ├── beamchain_versionbits_tests.erl    BIP9 state machine tests
 ├── beamchain_validation_tests.erl     Consensus rule tests
 ├── beamchain_rpc_tests.erl            RPC tests (core blockchain and transaction RPCs)
-└── beamchain_wallet_tests.erl         HD wallet and coin selection tests
+├── beamchain_wallet_tests.erl         HD wallet and coin selection tests
+└── beamchain_block_sync_tests.erl     Block sync and compact block tests
 ```
 
 ## Running tests
