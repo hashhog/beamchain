@@ -6,6 +6,7 @@
 -include("beamchain_protocol.hrl").
 
 -export([bits_to_target/1, target_to_bits/1]).
+-export([compact_to_target/1, target_to_compact/1]).  %% aliases
 -export([check_pow/3, compute_work/1]).
 -export([get_next_work_required/3]).
 
@@ -201,6 +202,18 @@ pow_limit_bits(Params) ->
     PowLimit = maps:get(pow_limit, Params),
     PowLimitInt = binary:decode_unsigned(PowLimit, big),
     target_to_bits(PowLimitInt).
+
+%%% -------------------------------------------------------------------
+%%% Aliases for compact_to_target / target_to_compact
+%%% -------------------------------------------------------------------
+
+%% @doc Alias for bits_to_target/1 (convert compact nBits to 256-bit target).
+-spec compact_to_target(non_neg_integer()) -> non_neg_integer().
+compact_to_target(Bits) -> bits_to_target(Bits).
+
+%% @doc Alias for target_to_bits/1 (convert 256-bit target to compact nBits).
+-spec target_to_compact(non_neg_integer()) -> non_neg_integer().
+target_to_compact(Target) -> target_to_bits(Target).
 
 %%% -------------------------------------------------------------------
 %%% Internal helpers
