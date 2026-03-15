@@ -165,7 +165,36 @@ queue_tx_inv(Pid, Txid) when is_binary(Txid), byte_size(Txid) =:= 32 ->
 
 callback_mode() -> [state_functions, state_enter].
 
+init({outbound, {Host, Port} = Addr, Handler, _Opts}) when is_list(Host); is_binary(Host) ->
+    %% Hostname connection (for .onion, .b32.i2p, or regular hostnames)
+    %% Route through appropriate proxy based on address type
+    Nonce = generate_nonce(),
+    Magic = beamchain_config:magic(),
+    MonRef = erlang:monitor(process, Handler),
+    Data = #peer_data{
+        address = Addr,
+        direction = outbound,
+        our_nonce = Nonce,
+        magic = Magic,
+        handler = Handler,
+        handler_mon = MonRef
+    },
+    HostStr = to_string(Host),
+    ConnectOpts = #{timeout => ?CONNECT_TIMEOUT},
+    case beamchain_proxy:connect(HostStr, Port, ConnectOpts) of
+        {ok, Socket} ->
+            inet:setopts(Socket, [{active, once},
+                                   {recbuf, 262144}, {sndbuf, 262144}]),
+            Data2 = Data#peer_data{
+                socket = Socket,
+                connected_at = erlang:system_time(millisecond)
+            },
+            {ok, connecting, Data2};
+        {error, Reason} ->
+            {stop, {connection_failed, Reason}}
+    end;
 init({outbound, {IP, Port} = Addr, Handler, _Opts}) ->
+    %% Standard IP address connection (tuple IP)
     Nonce = generate_nonce(),
     Magic = beamchain_config:magic(),
     MonRef = erlang:monitor(process, Handler),
@@ -932,3 +961,7 @@ shuffle_list([X]) -> [X];
 shuffle_list(List) ->
     %% Use a simple random sort for small lists
     lists:sort(fun(_, _) -> rand:uniform() > 0.5 end, List).
+
+%% Convert binary to string for hostname handling
+to_string(S) when is_list(S) -> S;
+to_string(B) when is_binary(B) -> binary_to_list(B).
