@@ -308,9 +308,9 @@ do_add_transaction(Tx, State) ->
 
         %% 11. ancestor/descendant limits
         {AncCount, AncSize, AncFee} = compute_ancestors(Tx, Fee, VSize),
-        AncCount =< ?MAX_ANCESTOR_COUNT orelse throw(too_many_ancestors),
-        AncSize =< ?MAX_ANCESTOR_SIZE orelse throw(ancestor_size_limit),
-        check_descendant_limits(Tx),
+        AncCount =< ?MAX_ANCESTOR_COUNT orelse throw(too_long_mempool_chain),
+        AncSize =< ?MAX_ANCESTOR_SIZE orelse throw(too_long_mempool_chain),
+        check_descendant_limits(Tx, VSize),
 
         %% 12. check coinbase maturity for mempool spending
         {ok, {TipHash, TipHeight}} = beamchain_chainstate:get_tip(),
@@ -707,55 +707,75 @@ compute_ancestors(#transaction{inputs = Inputs}, Fee, VSize) ->
 %% Update each ancestor's descendant stats when a new tx is added.
 update_ancestors_for_new_tx(#transaction{inputs = Inputs}, VSize, Fee) ->
     ParentTxids = get_parent_txids_from_inputs(Inputs),
-    update_ancestor_descendants(ParentTxids, VSize, Fee, []).
+    update_ancestor_descendants(ParentTxids, VSize, Fee, add, []).
 
-update_ancestor_descendants([], _VSize, _Fee, _Visited) ->
+%% Update each ancestor's descendant stats when a tx is removed.
+update_ancestors_for_removed_tx(#transaction{inputs = Inputs}, VSize, Fee) ->
+    ParentTxids = get_parent_txids_from_inputs(Inputs),
+    update_ancestor_descendants(ParentTxids, VSize, Fee, remove, []).
+
+update_ancestor_descendants([], _VSize, _Fee, _Op, _Visited) ->
     ok;
-update_ancestor_descendants([Txid | Rest], VSize, Fee, Visited) ->
+update_ancestor_descendants([Txid | Rest], VSize, Fee, Op, Visited) ->
     case lists:member(Txid, Visited) of
         true ->
-            update_ancestor_descendants(Rest, VSize, Fee, Visited);
+            update_ancestor_descendants(Rest, VSize, Fee, Op, Visited);
         false ->
             case ets:lookup(?MEMPOOL_TXS, Txid) of
                 [{Txid, Entry}] ->
-                    Updated = Entry#mempool_entry{
-                        descendant_count = Entry#mempool_entry.descendant_count + 1,
-                        descendant_size = Entry#mempool_entry.descendant_size + VSize,
-                        descendant_fee = Entry#mempool_entry.descendant_fee + Fee
-                    },
+                    Updated = case Op of
+                        add ->
+                            Entry#mempool_entry{
+                                descendant_count = Entry#mempool_entry.descendant_count + 1,
+                                descendant_size = Entry#mempool_entry.descendant_size + VSize,
+                                descendant_fee = Entry#mempool_entry.descendant_fee + Fee
+                            };
+                        remove ->
+                            Entry#mempool_entry{
+                                descendant_count = max(1, Entry#mempool_entry.descendant_count - 1),
+                                descendant_size = max(Entry#mempool_entry.vsize,
+                                                      Entry#mempool_entry.descendant_size - VSize),
+                                descendant_fee = max(Entry#mempool_entry.fee,
+                                                     Entry#mempool_entry.descendant_fee - Fee)
+                            }
+                    end,
                     ets:insert(?MEMPOOL_TXS, {Txid, Updated}),
                     Parents = get_parent_txids(Entry#mempool_entry.tx),
-                    update_ancestor_descendants(Parents ++ Rest, VSize, Fee,
+                    update_ancestor_descendants(Parents ++ Rest, VSize, Fee, Op,
                                                 [Txid | Visited]);
                 [] ->
-                    update_ancestor_descendants(Rest, VSize, Fee, Visited)
+                    update_ancestor_descendants(Rest, VSize, Fee, Op, Visited)
             end
     end.
 
 %% Check that adding a new tx won't bust any ancestor's descendant limits.
-check_descendant_limits(#transaction{inputs = Inputs}) ->
+%% VSize is the vsize of the new transaction being added.
+check_descendant_limits(#transaction{inputs = Inputs}, VSize) ->
     ParentTxids = get_parent_txids_from_inputs(Inputs),
-    check_desc_limits_walk(ParentTxids, []).
+    check_desc_limits_walk(ParentTxids, VSize, []).
 
-check_desc_limits_walk([], _Visited) ->
+check_desc_limits_walk([], _VSize, _Visited) ->
     ok;
-check_desc_limits_walk([Txid | Rest], Visited) ->
+check_desc_limits_walk([Txid | Rest], VSize, Visited) ->
     case lists:member(Txid, Visited) of
         true ->
-            check_desc_limits_walk(Rest, Visited);
+            check_desc_limits_walk(Rest, VSize, Visited);
         false ->
             case ets:lookup(?MEMPOOL_TXS, Txid) of
                 [{_, Entry}] ->
+                    %% Check if adding this tx would exceed descendant count limit
                     (Entry#mempool_entry.descendant_count + 1) =<
                         ?MAX_DESCENDANT_COUNT
-                        orelse throw(too_many_descendants),
-                    (Entry#mempool_entry.descendant_size) =<
+                        orelse throw(too_long_mempool_chain),
+                    %% Check if adding this tx would exceed descendant size limit
+                    %% Must include the new tx's vsize in the check
+                    (Entry#mempool_entry.descendant_size + VSize) =<
                         ?MAX_DESCENDANT_SIZE
-                        orelse throw(descendant_size_limit),
+                        orelse throw(too_long_mempool_chain),
                     Parents = get_parent_txids(Entry#mempool_entry.tx),
-                    check_desc_limits_walk(Parents ++ Rest, [Txid | Visited]);
+                    check_desc_limits_walk(Parents ++ Rest, VSize, [Txid | Visited]);
                 [] ->
-                    check_desc_limits_walk(Rest, Visited)
+                    check_desc_limits_walk(Rest, VSize, Visited)
             end
     end.
 
@@ -834,7 +854,11 @@ remove_entry(Txid) ->
     case ets:lookup(?MEMPOOL_TXS, Txid) of
         [{Txid, Entry}] ->
             Tx = Entry#mempool_entry.tx,
+            VSize = Entry#mempool_entry.vsize,
+            Fee = Entry#mempool_entry.fee,
             FeeRate = Entry#mempool_entry.fee_rate,
+            %% Update ancestor descendant stats before removing
+            update_ancestors_for_removed_tx(Tx, VSize, Fee),
             ets:delete(?MEMPOOL_BY_FEE, {FeeRate, Txid}),
             lists:foreach(fun(#tx_in{prev_out = #outpoint{hash = H, index = I}}) ->
                 ets:delete(?MEMPOOL_OUTPOINTS, {H, I})
