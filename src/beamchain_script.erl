@@ -2168,8 +2168,10 @@ verify_witness_program(0, Program, Witness, Flags, SigChecker)
                     Script = <<?OP_DUP, ?OP_HASH160,
                                20, Program/binary,
                                ?OP_EQUALVERIFY, ?OP_CHECKSIG>>,
+                    %% Add MINIMALIF for witness execution (prevents third-party malleability)
+                    WitnessFlags = Flags bor ?SCRIPT_VERIFY_MINIMALIF,
                     %% Stack: PubKey on top (HEAD), Sig below — matches P2PKH expectations
-                    P2WPKHResult = eval_script(Script, [PubKey, Sig], Flags, SigChecker, witness_v0),
+                    P2WPKHResult = eval_script(Script, [PubKey, Sig], WitnessFlags, SigChecker, witness_v0),
                     case P2WPKHResult of
                         {ok, [Top]} ->
                             case script_bool(Top) of
@@ -2203,10 +2205,12 @@ verify_witness_program(0, Program, Witness, Flags, SigChecker)
                     case byte_size(WitnessScript) > ?MAX_SCRIPT_SIZE of
                         true -> {error, witness_script_too_large};
                         false ->
+                            %% Add MINIMALIF for witness execution (prevents third-party malleability)
+                            WitnessFlags = Flags bor ?SCRIPT_VERIFY_MINIMALIF,
                             %% Reverse stack items: wire order is bottom-to-top,
                             %% but our list HEAD = top of stack
                             case eval_script(WitnessScript, lists:reverse(StackItems),
-                                           Flags, SigChecker, witness_v0) of
+                                           WitnessFlags, SigChecker, witness_v0) of
                                 {ok, [Top]} ->
                                     case script_bool(Top) of
                                         true -> {ok, [Top]};
