@@ -27,6 +27,10 @@
 %% Inventory items
 -export([encode_inv_item/1, decode_inv_item/1]).
 
+%% ADDRv2 (BIP155) support
+-export([encode_addrv2_entry/1, decode_addrv2_entry/1]).
+-export([network_id/1, network_id_to_atom/1, addr_size_for_network/1]).
+
 %%% ===================================================================
 %%% Message framing
 %%% ===================================================================
@@ -95,7 +99,8 @@ command_name(cmpctblock)  -> <<"cmpctblock">>;
 command_name(getblocktxn) -> <<"getblocktxn">>;
 command_name(blocktxn)    -> <<"blocktxn">>;
 command_name(wtxidrelay)  -> <<"wtxidrelay">>;
-command_name(sendaddrv2)  -> <<"sendaddrv2">>.
+command_name(sendaddrv2)  -> <<"sendaddrv2">>;
+command_name(addrv2)      -> <<"addrv2">>.
 
 -spec command_atom(binary()) -> atom().
 command_atom(<<"version">>)     -> version;
@@ -121,6 +126,7 @@ command_atom(<<"getblocktxn">>) -> getblocktxn;
 command_atom(<<"blocktxn">>)    -> blocktxn;
 command_atom(<<"wtxidrelay">>)  -> wtxidrelay;
 command_atom(<<"sendaddrv2">>)  -> sendaddrv2;
+command_atom(<<"addrv2">>)      -> addrv2;
 command_atom(Other)             -> binary_to_atom(Other, utf8).
 
 %%% ===================================================================
@@ -212,6 +218,13 @@ encode_payload(sendcmpct, #{announce := Ann, version := V}) ->
 encode_payload(wtxidrelay, _) -> <<>>;
 
 encode_payload(sendaddrv2, _) -> <<>>;
+
+%% -- ADDRv2 (BIP155) -----------------------------------------------------
+
+encode_payload(addrv2, #{addrs := Addrs}) ->
+    Count = beamchain_serialize:encode_varint(length(Addrs)),
+    Data = << <<(encode_addrv2_entry(A))/binary>> || A <- Addrs >>,
+    <<Count/binary, Data/binary>>;
 
 %% -- Compact blocks (BIP 152) --------------------------------------------
 
@@ -326,6 +339,13 @@ decode_payload(wtxidrelay, <<>>) ->
 
 decode_payload(sendaddrv2, <<>>) ->
     {ok, #{}};
+
+%% -- ADDRv2 (BIP155) -----------------------------------------------------
+
+decode_payload(addrv2, Bin) ->
+    {Count, Rest} = beamchain_serialize:decode_varint(Bin),
+    {Addrs, _} = decode_addrv2_entries(Count, Rest, []),
+    {ok, #{addrs => Addrs}};
 
 %% -- Compact blocks (BIP 152) --------------------------------------------
 
@@ -519,3 +539,169 @@ strip_trailing_nulls(Bin) ->
 
 encode_bool(true) -> 1;
 encode_bool(false) -> 0.
+
+%%% ===================================================================
+%%% BIP155 ADDRv2 support
+%%% ===================================================================
+
+%% BIP155 Network IDs
+-define(BIP155_IPV4, 1).
+-define(BIP155_IPV6, 2).
+-define(BIP155_TORV2, 3).  %% deprecated, 10 bytes
+-define(BIP155_TORV3, 4).  %% 32 bytes (ed25519 pubkey)
+-define(BIP155_I2P, 5).    %% 32 bytes (SHA256 of destination)
+-define(BIP155_CJDNS, 6).  %% 16 bytes (starts with 0xFC)
+
+%% Address sizes per network
+-define(ADDR_IPV4_SIZE, 4).
+-define(ADDR_IPV6_SIZE, 16).
+-define(ADDR_TORV2_SIZE, 10).
+-define(ADDR_TORV3_SIZE, 32).
+-define(ADDR_I2P_SIZE, 32).
+-define(ADDR_CJDNS_SIZE, 16).
+-define(MAX_ADDRV2_SIZE, 512).
+
+%% @doc Get BIP155 network ID for an address.
+%% Returns network_id for the given address type.
+-spec network_id(map() | inet:ip_address() | binary()) -> non_neg_integer().
+network_id(#{network_id := NetId}) -> NetId;
+network_id(#{network := Network}) -> network_atom_to_id(Network);
+network_id(#{ip := IP}) -> network_id(IP);
+network_id({_, _, _, _}) -> ?BIP155_IPV4;
+network_id({_, _, _, _, _, _, _, _}) -> ?BIP155_IPV6;
+network_id(Bin) when byte_size(Bin) =:= 32 ->
+    %% Could be TorV3 or I2P - need network_id field to distinguish
+    ?BIP155_TORV3;  %% default assumption
+network_id(Bin) when byte_size(Bin) =:= 16 ->
+    case Bin of
+        <<16#FC, _:120>> -> ?BIP155_CJDNS;
+        _ -> ?BIP155_IPV6
+    end;
+network_id(Bin) when byte_size(Bin) =:= 10 -> ?BIP155_TORV2;
+network_id(_) -> ?BIP155_IPV4.
+
+%% @doc Convert network atom to BIP155 network ID.
+-spec network_atom_to_id(atom()) -> non_neg_integer().
+network_atom_to_id(ipv4)  -> ?BIP155_IPV4;
+network_atom_to_id(ipv6)  -> ?BIP155_IPV6;
+network_atom_to_id(torv2) -> ?BIP155_TORV2;
+network_atom_to_id(torv3) -> ?BIP155_TORV3;
+network_atom_to_id(i2p)   -> ?BIP155_I2P;
+network_atom_to_id(cjdns) -> ?BIP155_CJDNS;
+network_atom_to_id(_)     -> ?BIP155_IPV4.
+
+%% @doc Convert BIP155 network ID to atom.
+-spec network_id_to_atom(non_neg_integer()) -> atom().
+network_id_to_atom(?BIP155_IPV4)  -> ipv4;
+network_id_to_atom(?BIP155_IPV6)  -> ipv6;
+network_id_to_atom(?BIP155_TORV2) -> torv2;
+network_id_to_atom(?BIP155_TORV3) -> torv3;
+network_id_to_atom(?BIP155_I2P)   -> i2p;
+network_id_to_atom(?BIP155_CJDNS) -> cjdns;
+network_id_to_atom(_)             -> unknown.
+
+%% @doc Get expected address size for a BIP155 network ID.
+-spec addr_size_for_network(non_neg_integer()) -> non_neg_integer() | variable.
+addr_size_for_network(?BIP155_IPV4)  -> ?ADDR_IPV4_SIZE;
+addr_size_for_network(?BIP155_IPV6)  -> ?ADDR_IPV6_SIZE;
+addr_size_for_network(?BIP155_TORV2) -> ?ADDR_TORV2_SIZE;
+addr_size_for_network(?BIP155_TORV3) -> ?ADDR_TORV3_SIZE;
+addr_size_for_network(?BIP155_I2P)   -> ?ADDR_I2P_SIZE;
+addr_size_for_network(?BIP155_CJDNS) -> ?ADDR_CJDNS_SIZE;
+addr_size_for_network(_)             -> variable.
+
+%% @doc Encode an ADDRv2 address entry.
+%% Entry format: time(4) + services(compactsize) + network_id(1) + addr_len(compactsize) + addr + port(2)
+-spec encode_addrv2_entry(map()) -> binary().
+encode_addrv2_entry(#{timestamp := T, services := Svc} = Entry) ->
+    %% Determine network ID and address bytes
+    {NetId, AddrBytes} = encode_addrv2_address(Entry),
+    AddrLen = byte_size(AddrBytes),
+    Port = maps:get(port, Entry, 0),
+    SvcBin = beamchain_serialize:encode_varint(Svc),
+    LenBin = beamchain_serialize:encode_varint(AddrLen),
+    <<T:32/little, SvcBin/binary, NetId:8, LenBin/binary, AddrBytes/binary, Port:16/big>>.
+
+%% @doc Encode the address portion based on network type.
+-spec encode_addrv2_address(map()) -> {non_neg_integer(), binary()}.
+encode_addrv2_address(#{network_id := NetId, address := Addr}) when is_binary(Addr) ->
+    {NetId, Addr};
+encode_addrv2_address(#{network := torv3, address := Addr}) when byte_size(Addr) =:= 32 ->
+    {?BIP155_TORV3, Addr};
+encode_addrv2_address(#{network := i2p, address := Addr}) when byte_size(Addr) =:= 32 ->
+    {?BIP155_I2P, Addr};
+encode_addrv2_address(#{network := cjdns, address := Addr}) when byte_size(Addr) =:= 16 ->
+    {?BIP155_CJDNS, Addr};
+encode_addrv2_address(#{ip := {A, B, C, D}}) ->
+    {?BIP155_IPV4, <<A:8, B:8, C:8, D:8>>};
+encode_addrv2_address(#{ip := {A, B, C, D, E, F, G, H}}) ->
+    {?BIP155_IPV6, <<A:16, B:16, C:16, D:16, E:16, F:16, G:16, H:16>>};
+encode_addrv2_address(#{ip := Bin}) when byte_size(Bin) =:= 16 ->
+    {?BIP155_IPV6, Bin};
+encode_addrv2_address(#{address := Addr}) when byte_size(Addr) =:= 4 ->
+    {?BIP155_IPV4, Addr};
+encode_addrv2_address(#{address := Addr}) when byte_size(Addr) =:= 16 ->
+    %% Check if CJDNS (starts with 0xFC)
+    case Addr of
+        <<16#FC, _:120>> -> {?BIP155_CJDNS, Addr};
+        _ -> {?BIP155_IPV6, Addr}
+    end;
+encode_addrv2_address(#{address := Addr}) when byte_size(Addr) =:= 32 ->
+    %% Assume TorV3 for 32-byte addresses without explicit network
+    {?BIP155_TORV3, Addr}.
+
+%% @doc Decode an ADDRv2 address entry.
+-spec decode_addrv2_entry(binary()) -> {map(), binary()}.
+decode_addrv2_entry(<<T:32/little, Rest/binary>>) ->
+    {Svc, Rest2} = beamchain_serialize:decode_varint(Rest),
+    <<NetId:8, Rest3/binary>> = Rest2,
+    {AddrLen, Rest4} = beamchain_serialize:decode_varint(Rest3),
+    <<AddrBytes:AddrLen/binary, Port:16/big, Rest5/binary>> = Rest4,
+    Entry = decode_addrv2_address(NetId, AddrBytes, T, Svc, Port),
+    {Entry, Rest5}.
+
+%% @doc Decode address bytes based on network ID.
+-spec decode_addrv2_address(non_neg_integer(), binary(), non_neg_integer(),
+                             non_neg_integer(), non_neg_integer()) -> map().
+decode_addrv2_address(?BIP155_IPV4, <<A:8, B:8, C:8, D:8>>, T, Svc, Port) ->
+    #{timestamp => T, services => Svc, network => ipv4,
+      network_id => ?BIP155_IPV4, ip => {A, B, C, D}, port => Port};
+decode_addrv2_address(?BIP155_IPV6, AddrBytes, T, Svc, Port) when byte_size(AddrBytes) =:= 16 ->
+    %% Parse as IPv6 tuple or IPv4-mapped
+    IP = decode_ipv6_address(AddrBytes),
+    #{timestamp => T, services => Svc, network => ipv6,
+      network_id => ?BIP155_IPV6, ip => IP, port => Port};
+decode_addrv2_address(?BIP155_TORV2, AddrBytes, T, Svc, Port) when byte_size(AddrBytes) =:= 10 ->
+    %% TorV2 is deprecated but we still decode it
+    #{timestamp => T, services => Svc, network => torv2,
+      network_id => ?BIP155_TORV2, address => AddrBytes, port => Port};
+decode_addrv2_address(?BIP155_TORV3, AddrBytes, T, Svc, Port) when byte_size(AddrBytes) =:= 32 ->
+    %% TorV3: 32-byte ed25519 public key
+    #{timestamp => T, services => Svc, network => torv3,
+      network_id => ?BIP155_TORV3, address => AddrBytes, port => Port};
+decode_addrv2_address(?BIP155_I2P, AddrBytes, T, Svc, Port) when byte_size(AddrBytes) =:= 32 ->
+    %% I2P: 32-byte destination hash
+    #{timestamp => T, services => Svc, network => i2p,
+      network_id => ?BIP155_I2P, address => AddrBytes, port => Port};
+decode_addrv2_address(?BIP155_CJDNS, AddrBytes, T, Svc, Port) when byte_size(AddrBytes) =:= 16 ->
+    %% CJDNS: 16-byte address (starts with 0xFC)
+    #{timestamp => T, services => Svc, network => cjdns,
+      network_id => ?BIP155_CJDNS, address => AddrBytes, port => Port};
+decode_addrv2_address(NetId, AddrBytes, T, Svc, Port) ->
+    %% Unknown network type - store raw
+    #{timestamp => T, services => Svc, network => unknown,
+      network_id => NetId, address => AddrBytes, port => Port}.
+
+%% @doc Decode an IPv6 address, handling IPv4-mapped addresses.
+-spec decode_ipv6_address(binary()) -> inet:ip_address().
+decode_ipv6_address(<<0:80, 16#FFFF:16, A:8, B:8, C:8, D:8>>) ->
+    %% IPv4-mapped IPv6 address
+    {A, B, C, D};
+decode_ipv6_address(<<A:16, B:16, C:16, D:16, E:16, F:16, G:16, H:16>>) ->
+    {A, B, C, D, E, F, G, H}.
+
+%% @doc Decode multiple addrv2 entries.
+decode_addrv2_entries(0, Rest, Acc) -> {lists:reverse(Acc), Rest};
+decode_addrv2_entries(N, Bin, Acc) ->
+    {Entry, Rest} = decode_addrv2_entry(Bin),
+    decode_addrv2_entries(N - 1, Rest, [Entry | Acc]).
