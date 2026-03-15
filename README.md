@@ -34,6 +34,7 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] Checkpoint enforcement (mainnet checkpoints)
 - [x] Peer misbehavior scoring and banning
 - [x] Pre-handshake connection rejection (ban/limit checks before handshake)
+- [x] Inv trickling (privacy-preserving tx relay with Poisson delays)
 - [ ] Wallet (HD keys, signing)
 - [ ] Compact block relay (BIP152)
 
@@ -81,6 +82,7 @@ test/
 ├── beamchain_chainstate_tests.erl     Undo data and disconnect tests
 ├── beamchain_miner_tests.erl          Block template and witness tests
 ├── beamchain_mempool_tests.erl        Mempool and limit tests
+├── beamchain_peer_tests.erl           Inv trickling and relay tests
 ├── beamchain_peer_manager_tests.erl   Misbehavior and banning tests
 ├── beamchain_pow_tests.erl            PoW and difficulty adjustment tests
 ├── beamchain_versionbits_tests.erl    BIP9 state machine tests
