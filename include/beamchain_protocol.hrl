@@ -146,4 +146,11 @@
 -define(MAX_P2SH_SIGOPS, 15).
 -define(MAX_STANDARD_TX_SIGOPS_COST, 16000).
 
+%%% -------------------------------------------------------------------
+%%% Package relay constants
+%%% -------------------------------------------------------------------
+
+-define(MAX_PACKAGE_COUNT, 25).               %% Max transactions in a package
+-define(MAX_PACKAGE_WEIGHT, 404000).          %% Max weight (allows 101 kvB vsize)
+
 -endif.
