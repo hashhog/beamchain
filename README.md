@@ -31,7 +31,7 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] CPFP-aware tx selection (ancestor fee rate)
 - [x] Difficulty adjustment algorithm (retarget every 2016 blocks)
 - [x] BIP9 versionbits soft fork deployment tracking
-- [x] Checkpoint enforcement (mainnet checkpoints)
+- [x] Checkpoint enforcement (reject forks below checkpoints, skip scripts during IBD)
 - [x] Peer misbehavior scoring and banning
 - [x] Pre-handshake connection rejection (ban/limit checks before handshake)
 - [x] Inv trickling (privacy-preserving tx relay with Poisson delays)
