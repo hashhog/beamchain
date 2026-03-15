@@ -31,7 +31,11 @@ db_test_() ->
           {"flat file write/read roundtrip", fun flat_file_roundtrip/0},
           {"flat file multiple blocks", fun flat_file_multiple_blocks/0},
           {"flat file read not found", fun flat_file_not_found/0},
-          {"flat file info", fun flat_file_info/0}
+          {"flat file info", fun flat_file_info/0},
+          %% Pruning tests
+          {"is_block_pruned returns false initially", fun is_block_pruned_initial/0},
+          {"prune_block_files with no prune target", fun prune_disabled/0},
+          {"get_block_file_info includes prune info", fun block_file_info_prune/0}
          ]
      end}.
 
@@ -57,6 +61,8 @@ teardown({TmpDir, _ConfigPid, _DbPid}) ->
     %% Stop db and config
     catch beamchain_db:stop(),
     catch gen_server:stop(beamchain_config),
+    %% Clean up env vars
+    os:unsetenv("BEAMCHAIN_PRUNE"),
     %% Clean up temp directory
     os:cmd("rm -rf " ++ TmpDir),
     ok.
@@ -362,3 +368,83 @@ flat_file_info() ->
     ?assert(maps:is_key(max_file_size, Info)),
     ?assert(maps:is_key(index_size, Info)),
     ?assertEqual(134217728, maps:get(max_file_size, Info)).
+
+%%% ===================================================================
+%%% Pruning tests
+%%% ===================================================================
+
+is_block_pruned_initial() ->
+    %% A block that was never stored should not be considered pruned
+    FakeHash = crypto:strong_rand_bytes(32),
+    ?assertEqual(false, beamchain_db:is_block_pruned(FakeHash)),
+    %% Write a block and check it's not pruned
+    Block = make_test_block(<<0:256>>, 3000),
+    {ok, _} = beamchain_db:write_block(Block, 0),
+    ?assertEqual(false, beamchain_db:is_block_pruned(Block#block.hash)).
+
+prune_disabled() ->
+    %% With default config (prune target = 0), pruning should be disabled
+    {ok, Count} = beamchain_db:prune_block_files(),
+    ?assertEqual(0, Count).
+
+block_file_info_prune() ->
+    %% Verify prune-related fields are in block file info
+    Info = beamchain_db:get_block_file_info(),
+    ?assert(maps:is_key(prune_target_mb, Info)),
+    ?assert(maps:is_key(pruned_file_count, Info)),
+    ?assert(maps:is_key(tracked_files, Info)),
+    %% With default config, prune target should be 0
+    ?assertEqual(0, maps:get(prune_target_mb, Info)),
+    ?assertEqual(0, maps:get(pruned_file_count, Info)).
+
+%%% ===================================================================
+%%% Pruning tests with prune enabled
+%%% ===================================================================
+
+prune_enabled_test_() ->
+    {setup,
+     fun setup_with_prune/0,
+     fun teardown/1,
+     fun(_) ->
+         [
+          {"prune target is set", fun prune_target_set/0},
+          {"trigger_pruning is a no-op when chain is short", fun trigger_pruning_short_chain/0}
+         ]
+     end}.
+
+setup_with_prune() ->
+    %% Use a unique temp directory for each test run
+    TmpDir = filename:join(["/tmp", "beamchain_prune_test_" ++
+                            integer_to_list(erlang:unique_integer([positive]))]),
+    ok = filelib:ensure_dir(filename:join(TmpDir, "dummy")),
+
+    %% Set environment with pruning enabled
+    application:ensure_all_started(rocksdb),
+    application:set_env(beamchain, datadir, TmpDir),
+    application:set_env(beamchain, network, regtest),
+    %% Set prune target via env var (will be read by config)
+    os:putenv("BEAMCHAIN_PRUNE", "550"),
+
+    %% Start config (needed by db)
+    {ok, ConfigPid} = beamchain_config:start_link(),
+    %% Start db
+    {ok, DbPid} = beamchain_db:start_link(),
+
+    {TmpDir, ConfigPid, DbPid}.
+
+prune_target_set() ->
+    Info = beamchain_db:get_block_file_info(),
+    %% Prune target should be 550 MB (minimum)
+    ?assertEqual(550, maps:get(prune_target_mb, Info)).
+
+trigger_pruning_short_chain() ->
+    %% With no chain tip set, trigger_pruning should be a no-op
+    ok = beamchain_db:trigger_pruning(100),
+    %% Set a chain tip below the safety window
+    Hash = crypto:strong_rand_bytes(32),
+    ok = beamchain_db:set_chain_tip(Hash, 100),
+    %% Trigger should still be a no-op (below 288 blocks)
+    ok = beamchain_db:trigger_pruning(100),
+    %% Nothing should be pruned
+    {ok, Count} = beamchain_db:prune_block_files(),
+    ?assertEqual(0, Count).
