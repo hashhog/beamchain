@@ -17,6 +17,7 @@
 -export([has_tx/1, get_tx/1, get_entry/1]).
 -export([get_all_txids/0, get_info/0]).
 -export([get_sorted_by_fee/0]).
+-export([get_tx_fee_rate/1]).
 
 %% Block interaction
 -export([remove_for_block/1]).
@@ -130,6 +131,18 @@ get_entry(Txid) ->
     case ets:lookup(?MEMPOOL_TXS, Txid) of
         [{Txid, Entry}] -> {ok, Entry};
         [] -> not_found
+    end.
+
+%% @doc Get the fee rate for a transaction in sat/kvB (for BIP133 feefilter).
+-spec get_tx_fee_rate(binary()) -> {ok, non_neg_integer()} | not_found.
+get_tx_fee_rate(Txid) ->
+    case ets:lookup(?MEMPOOL_TXS, Txid) of
+        [{Txid, Entry}] ->
+            %% fee_rate is in sat/vB, convert to sat/kvB (* 1000)
+            FeeRateKvB = round(Entry#mempool_entry.fee_rate * 1000),
+            {ok, FeeRateKvB};
+        [] ->
+            not_found
     end.
 
 %% @doc Get all txids currently in the mempool.
