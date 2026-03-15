@@ -18,7 +18,12 @@
          prune_enabled/0,
          prune_target/0,
          mempool_full_rbf/0,
-         zmq_enabled/0]).
+         zmq_enabled/0,
+         %% Proxy configuration
+         proxy/0,
+         onion_proxy/0,
+         i2p_sam/0,
+         listen_onion/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -174,6 +179,95 @@ zmq_enabled() ->
             %% Check config file
             lists:any(fun(K) -> get(K) =/= undefined end, ZmqConfigKeys)
     end.
+
+%% @doc Get SOCKS5 proxy configuration for general outbound connections.
+%% Format: "socks5://host:port" or "host:port" (default port 9050).
+%% Set via BEAMCHAIN_PROXY env var or proxy= config option.
+-spec proxy() -> undefined | #{host := string(), port := inet:port_number()}.
+proxy() ->
+    case os:getenv("BEAMCHAIN_PROXY") of
+        false ->
+            case get(proxy) of
+                undefined -> undefined;
+                Addr -> parse_proxy_addr(Addr, 9050)
+            end;
+        Addr ->
+            parse_proxy_addr(Addr, 9050)
+    end.
+
+%% @doc Get Tor SOCKS5 proxy configuration for .onion addresses.
+%% Format: "host:port" (default 127.0.0.1:9050).
+%% Set via BEAMCHAIN_ONION env var or onion= config option.
+%% Falls back to general proxy if not set.
+-spec onion_proxy() -> undefined | #{host := string(), port := inet:port_number()}.
+onion_proxy() ->
+    case os:getenv("BEAMCHAIN_ONION") of
+        false ->
+            case get(onion) of
+                undefined -> proxy();  %% Fall back to general proxy
+                Addr -> parse_proxy_addr(Addr, 9050)
+            end;
+        Addr ->
+            parse_proxy_addr(Addr, 9050)
+    end.
+
+%% @doc Get I2P SAM bridge configuration.
+%% Format: "host:port" (default 127.0.0.1:7656).
+%% Set via BEAMCHAIN_I2PSAM env var or i2psam= config option.
+-spec i2p_sam() -> undefined | #{host := string(), port := inet:port_number()}.
+i2p_sam() ->
+    case os:getenv("BEAMCHAIN_I2PSAM") of
+        false ->
+            case get(i2psam) of
+                undefined -> undefined;
+                Addr -> parse_proxy_addr(Addr, 7656)
+            end;
+        Addr ->
+            parse_proxy_addr(Addr, 7656)
+    end.
+
+%% @doc Check if listening for inbound Tor connections is enabled.
+%% When enabled, the node will generate a Tor hidden service.
+%% Set via BEAMCHAIN_LISTENONION=1 env var or listenonion=1 config option.
+-spec listen_onion() -> boolean().
+listen_onion() ->
+    case os:getenv("BEAMCHAIN_LISTENONION") of
+        "1" -> true;
+        "true" -> true;
+        false ->
+            case get(listenonion) of
+                "1" -> true;
+                "true" -> true;
+                1 -> true;
+                true -> true;
+                _ -> false
+            end;
+        _ -> false
+    end.
+
+%% Parse proxy address string into map.
+%% Supports formats: "host:port", "socks5://host:port", "host"
+parse_proxy_addr(Addr, DefaultPort) when is_list(Addr) ->
+    %% Strip protocol prefix if present
+    Addr2 = case lists:prefix("socks5://", Addr) of
+        true -> lists:nthtail(9, Addr);
+        false -> Addr
+    end,
+    case string:split(Addr2, ":") of
+        [Host, PortStr] ->
+            case catch list_to_integer(PortStr) of
+                Port when is_integer(Port), Port > 0, Port < 65536 ->
+                    #{host => Host, port => Port};
+                _ ->
+                    #{host => Addr2, port => DefaultPort}
+            end;
+        [Host] ->
+            #{host => Host, port => DefaultPort}
+    end;
+parse_proxy_addr(Addr, DefaultPort) when is_binary(Addr) ->
+    parse_proxy_addr(binary_to_list(Addr), DefaultPort);
+parse_proxy_addr(_, _) ->
+    undefined.
 
 %%% ===================================================================
 %%% gen_server callbacks
