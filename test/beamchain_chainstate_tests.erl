@@ -17,7 +17,13 @@ chainstate_test_() ->
           {"undo data encoding/decoding roundtrip", fun undo_encode_decode/0},
           {"connect then disconnect restores UTXO state", fun connect_disconnect_roundtrip/0},
           {"undo data deleted after disconnect", fun undo_deleted_after_disconnect/0},
-          {"multiple tx block disconnect restores all UTXOs", fun multi_tx_disconnect/0}
+          {"multiple tx block disconnect restores all UTXOs", fun multi_tx_disconnect/0},
+          %% UTXO cache tests
+          {"cache hit returns cached entry", fun test_cache_hit/0},
+          {"cache miss falls through to RocksDB", fun test_cache_miss/0},
+          {"FRESH optimization: spend before flush skips DB", fun test_fresh_optimization/0},
+          {"flush persists dirty entries to RocksDB", fun test_flush_persistence/0},
+          {"cache stats reports correct counts", fun test_cache_stats/0}
          ]
      end}.
 
@@ -254,3 +260,144 @@ multi_tx_disconnect() ->
     beamchain_chainstate:spend_utxo(Txid1, 0),
     beamchain_chainstate:spend_utxo(Txid2, 0),
     beamchain_chainstate:spend_utxo(Txid3, 0).
+
+%%% ===================================================================
+%%% UTXO cache tests
+%%% ===================================================================
+
+test_cache_hit() ->
+    %% Add a UTXO to cache
+    Txid = <<16#aaa1:256>>,
+    Utxo = #utxo{value = 500000, script_pubkey = <<16#51>>,
+                 is_coinbase = false, height = 10},
+    beamchain_chainstate:add_utxo(Txid, 0, Utxo),
+
+    %% First lookup - should hit cache (entry was just added)
+    {ok, Cached1} = beamchain_chainstate:get_utxo(Txid, 0),
+    ?assertEqual(500000, Cached1#utxo.value),
+
+    %% Second lookup - still hits cache
+    {ok, Cached2} = beamchain_chainstate:get_utxo(Txid, 0),
+    ?assertEqual(500000, Cached2#utxo.value),
+    ?assertEqual(Cached1#utxo.script_pubkey, Cached2#utxo.script_pubkey),
+
+    %% Clean up
+    beamchain_chainstate:spend_utxo(Txid, 0).
+
+test_cache_miss() ->
+    %% First, add a UTXO, flush it to RocksDB, then clear cache
+    Txid = <<16#bbb2:256>>,
+    Utxo = #utxo{value = 750000, script_pubkey = <<16#52>>,
+                 is_coinbase = false, height = 20},
+
+    %% Add and flush to RocksDB
+    beamchain_chainstate:add_utxo(Txid, 0, Utxo),
+    beamchain_chainstate:flush(),
+
+    %% Clear the ETS cache directly (simulating cache eviction)
+    ets:delete(beamchain_utxo_cache, {Txid, 0}),
+
+    %% Lookup should hit RocksDB (cache miss) and re-populate cache
+    {ok, FromDb} = beamchain_chainstate:get_utxo(Txid, 0),
+    ?assertEqual(750000, FromDb#utxo.value),
+    ?assertEqual(<<16#52>>, FromDb#utxo.script_pubkey),
+
+    %% Verify it's now in cache (subsequent lookup is a hit)
+    ?assertMatch([_], ets:lookup(beamchain_utxo_cache, {Txid, 0})),
+
+    %% Clean up
+    beamchain_chainstate:spend_utxo(Txid, 0),
+    beamchain_chainstate:flush().
+
+test_fresh_optimization() ->
+    %% Test the FRESH optimization: if a UTXO is created and spent
+    %% before flush, no DB operations are needed.
+
+    Txid = <<16#ccc3:256>>,
+    Utxo = #utxo{value = 100000, script_pubkey = <<16#53>>,
+                 is_coinbase = false, height = 30},
+
+    %% Add UTXO (marked FRESH and DIRTY)
+    beamchain_chainstate:add_utxo(Txid, 0, Utxo),
+
+    %% Verify it's in the FRESH table
+    ?assert(ets:member(beamchain_utxo_fresh, {Txid, 0})),
+    ?assert(ets:member(beamchain_utxo_dirty, {Txid, 0})),
+
+    %% Spend it before flush - should use FRESH optimization
+    {ok, Spent} = beamchain_chainstate:spend_utxo(Txid, 0),
+    ?assertEqual(100000, Spent#utxo.value),
+
+    %% FRESH and DIRTY flags should be cleared
+    ?assertNot(ets:member(beamchain_utxo_fresh, {Txid, 0})),
+    ?assertNot(ets:member(beamchain_utxo_dirty, {Txid, 0})),
+
+    %% SPENT table should NOT have this entry (FRESH optimization)
+    ?assertNot(ets:member(beamchain_utxo_spent, {Txid, 0})),
+
+    %% UTXO should not be in RocksDB (never written)
+    ?assertEqual(not_found, beamchain_db:get_utxo(Txid, 0)).
+
+test_flush_persistence() ->
+    %% Verify that flush writes dirty entries to RocksDB
+
+    Txid = <<16#ddd4:256>>,
+    Utxo = #utxo{value = 200000, script_pubkey = <<16#54>>,
+                 is_coinbase = true, height = 40},
+
+    %% Add UTXO
+    beamchain_chainstate:add_utxo(Txid, 0, Utxo),
+
+    %% Verify it's dirty and fresh
+    ?assert(ets:member(beamchain_utxo_dirty, {Txid, 0})),
+    ?assert(ets:member(beamchain_utxo_fresh, {Txid, 0})),
+
+    %% Flush to RocksDB
+    beamchain_chainstate:flush(),
+
+    %% Verify dirty/fresh flags are cleared after flush
+    ?assertNot(ets:member(beamchain_utxo_dirty, {Txid, 0})),
+    ?assertNot(ets:member(beamchain_utxo_fresh, {Txid, 0})),
+
+    %% Verify it's now in RocksDB
+    {ok, DbUtxo} = beamchain_db:get_utxo(Txid, 0),
+    ?assertEqual(200000, DbUtxo#utxo.value),
+    ?assertEqual(<<16#54>>, DbUtxo#utxo.script_pubkey),
+    ?assertEqual(true, DbUtxo#utxo.is_coinbase),
+
+    %% Clean up
+    beamchain_chainstate:spend_utxo(Txid, 0),
+    beamchain_chainstate:flush().
+
+test_cache_stats() ->
+    %% Test cache_stats/0 function
+
+    %% Add a few UTXOs
+    Txid1 = <<16#eee5:256>>,
+    Txid2 = <<16#fff6:256>>,
+    Utxo = #utxo{value = 50000, script_pubkey = <<>>,
+                 is_coinbase = false, height = 50},
+
+    beamchain_chainstate:add_utxo(Txid1, 0, Utxo),
+    beamchain_chainstate:add_utxo(Txid2, 0, Utxo),
+
+    %% Get stats
+    Stats = beamchain_chainstate:cache_stats(),
+
+    %% Verify stats structure
+    ?assert(is_map(Stats)),
+    ?assert(maps:is_key(cache_entries, Stats)),
+    ?assert(maps:is_key(dirty_entries, Stats)),
+    ?assert(maps:is_key(fresh_entries, Stats)),
+    ?assert(maps:is_key(pending_deletes, Stats)),
+    ?assert(maps:is_key(memory_bytes, Stats)),
+    ?assert(maps:is_key(memory_mb, Stats)),
+
+    %% Verify counts make sense (at least 2 dirty/fresh from our adds)
+    ?assert(maps:get(dirty_entries, Stats) >= 2),
+    ?assert(maps:get(fresh_entries, Stats) >= 2),
+    ?assert(maps:get(memory_bytes, Stats) > 0),
+
+    %% Clean up
+    beamchain_chainstate:spend_utxo(Txid1, 0),
+    beamchain_chainstate:spend_utxo(Txid2, 0).
