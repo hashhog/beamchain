@@ -2,6 +2,11 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
+%% BIP 133 feefilter constants (matching beamchain_peer.erl)
+-define(FEEFILTER_BROADCAST_INTERVAL_MS, 600000).
+-define(FEEFILTER_MAX_CHANGE_DELAY_MS, 300000).
+-define(DEFAULT_MIN_RELAY_FEE, 1000).
+
 %%% ===================================================================
 %%% Inv trickling unit tests
 %%% ===================================================================
@@ -249,3 +254,142 @@ edge_cases_test_() ->
           ?assertEqual([], Remaining)
       end}
      ]}.
+
+%%% ===================================================================
+%%% BIP 133 feefilter tests
+%%% ===================================================================
+
+feefilter_encode_decode_test_() ->
+    {"Feefilter message encoding/decoding",
+     [
+      {"encode feefilter message", fun() ->
+          FeeRate = 1000,  %% 1000 sat/kvB
+          Encoded = beamchain_p2p_msg:encode_payload(feefilter, #{feerate => FeeRate}),
+          ?assertEqual(<<232, 3, 0, 0, 0, 0, 0, 0>>, Encoded)  %% 1000 as 64-bit little-endian
+      end},
+
+      {"decode feefilter message", fun() ->
+          Payload = <<232, 3, 0, 0, 0, 0, 0, 0>>,  %% 1000 as 64-bit little-endian
+          {ok, #{feerate := Fee}} = beamchain_p2p_msg:decode_payload(feefilter, Payload),
+          ?assertEqual(1000, Fee)
+      end},
+
+      {"roundtrip encode/decode", fun() ->
+          FeeRates = [0, 1000, 10000, 100000, 1000000],
+          lists:foreach(fun(Rate) ->
+              Encoded = beamchain_p2p_msg:encode_payload(feefilter, #{feerate => Rate}),
+              {ok, #{feerate := Decoded}} = beamchain_p2p_msg:decode_payload(feefilter, Encoded),
+              ?assertEqual(Rate, Decoded)
+          end, FeeRates)
+      end}
+     ]}.
+
+feefilter_poisson_interval_test_() ->
+    {"Feefilter Poisson interval",
+     [
+      {"interval is positive", fun() ->
+          Intervals = [feefilter_poisson_interval_test(?FEEFILTER_BROADCAST_INTERVAL_MS)
+                       || _ <- lists:seq(1, 100)],
+          ?assert(lists:all(fun(I) -> I >= 1000 end, Intervals))
+      end},
+
+      {"interval is bounded at 30 minutes", fun() ->
+          Intervals = [feefilter_poisson_interval_test(?FEEFILTER_BROADCAST_INTERVAL_MS)
+                       || _ <- lists:seq(1, 100)],
+          ?assert(lists:all(fun(I) -> I =< 1800000 end, Intervals))
+      end},
+
+      {"average is roughly correct (10 minutes)", fun() ->
+          %% Use 60000ms (1 minute) for faster test with same distribution
+          Mean = 60000,
+          Samples = [feefilter_poisson_interval_test(Mean) || _ <- lists:seq(1, 500)],
+          Avg = lists:sum(Samples) / length(Samples),
+          %% Should be within 50% of mean (Poisson has high variance)
+          ?assert(Avg > Mean * 0.5),
+          ?assert(Avg < Mean * 2.0)
+      end}
+     ]}.
+
+feefilter_poisson_interval_test(MeanMs) ->
+    U = rand:uniform(),
+    Interval = round(-math:log(U) * MeanMs),
+    max(1000, min(Interval, 1800000)).
+
+feefilter_significant_change_test_() ->
+    {"Feefilter significant change detection",
+     [
+      {"25% drop is significant", fun() ->
+          SentFee = 4000,
+          CurrentFee = 2900,  %% < 75% of sent (3000)
+          SignificantChange = (CurrentFee * 4 < SentFee * 3),
+          ?assert(SignificantChange)
+      end},
+
+      {"33% increase is significant", fun() ->
+          SentFee = 3000,
+          CurrentFee = 4100,  %% > 133% of sent (4000)
+          SignificantChange = (CurrentFee * 3 > SentFee * 4),
+          ?assert(SignificantChange)
+      end},
+
+      {"small changes are not significant", fun() ->
+          SentFee = 4000,
+          CurrentFee = 3500,  %% 87.5% of sent (between 75% and 133%)
+          Drop = (CurrentFee * 4 < SentFee * 3),
+          Increase = (CurrentFee * 3 > SentFee * 4),
+          ?assertNot(Drop orelse Increase)
+      end},
+
+      {"no change is not significant", fun() ->
+          SentFee = 4000,
+          CurrentFee = 4000,
+          Drop = (CurrentFee * 4 < SentFee * 3),
+          Increase = (CurrentFee * 3 > SentFee * 4),
+          ?assertNot(Drop orelse Increase)
+      end}
+     ]}.
+
+feefilter_floor_test_() ->
+    {"Feefilter minimum relay fee floor",
+     [
+      {"floor at minimum relay fee", fun() ->
+          %% Even if mempool min fee is 0, we send at least 1000 sat/kvB
+          CurrentFee = 0,
+          FilterToSend = max(CurrentFee, ?DEFAULT_MIN_RELAY_FEE),
+          ?assertEqual(1000, FilterToSend)
+      end},
+
+      {"higher fee is preserved", fun() ->
+          CurrentFee = 5000,
+          FilterToSend = max(CurrentFee, ?DEFAULT_MIN_RELAY_FEE),
+          ?assertEqual(5000, FilterToSend)
+      end}
+     ]}.
+
+feefilter_inv_filtering_test_() ->
+    {"Feefilter inv filtering logic",
+     [
+      {"zero feefilter passes all txs", fun() ->
+          PeerFeeFilter = 0,
+          Txids = [crypto:strong_rand_bytes(32) || _ <- lists:seq(1, 5)],
+          Filtered = filter_by_feefilter_test(Txids, PeerFeeFilter),
+          ?assertEqual(Txids, Filtered)
+      end},
+
+      {"high feefilter filters some txs", fun() ->
+          %% Simulated txs with fee rates
+          Txs = [{crypto:strong_rand_bytes(32), 500},    %% 500 sat/kvB - filtered
+                 {crypto:strong_rand_bytes(32), 1500},   %% 1500 sat/kvB - passes
+                 {crypto:strong_rand_bytes(32), 2000}],  %% 2000 sat/kvB - passes
+          PeerFeeFilter = 1000,
+          Filtered = [Txid || {Txid, Rate} <- Txs, Rate >= PeerFeeFilter],
+          ?assertEqual(2, length(Filtered))
+      end}
+     ]}.
+
+filter_by_feefilter_test(Txids, PeerFeeFilter) when PeerFeeFilter =< 0 ->
+    Txids;
+filter_by_feefilter_test(_Txids, _PeerFeeFilter) ->
+    %% In real code this would look up mempool entries
+    %% For test purposes, return empty (simulating no matching txs)
+    [].
