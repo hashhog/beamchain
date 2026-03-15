@@ -20,12 +20,15 @@
 %% API
 -export([start_link/0,
          add_address/3,
+         add_address/4,
          add_addresses/2,
+         add_addrv2_addresses/2,
          mark_tried/1,
          mark_failed/1,
          select_address/0,
          select_address/1,
          get_addresses/1,
+         get_addrv2_addresses/1,
          count/0,
          netgroup/1,
          get_secret/0]).
@@ -58,7 +61,7 @@
 -define(MAX_TRIED_ADDRS, (?TRIED_BUCKET_COUNT * ?BUCKET_SIZE)).
 
 -record(addr_info, {
-    address     :: {inet:ip_address(), inet:port_number()},
+    address     :: {inet:ip_address(), inet:port_number()} | {binary(), inet:port_number()},
     services = 0 :: non_neg_integer(),
     timestamp   :: non_neg_integer(),    %% last time we heard about it
     source      :: term(),               %% where we learned this addr
@@ -67,7 +70,8 @@
     last_try = 0 :: non_neg_integer(),   %% unix timestamp of last attempt
     last_success = 0 :: non_neg_integer(), %% unix timestamp of last success
     in_tried = false :: boolean(),       %% true if in tried table
-    ref_count = 0 :: non_neg_integer()   %% number of new table buckets containing this
+    ref_count = 0 :: non_neg_integer(),  %% number of new table buckets containing this
+    network_id = 1 :: non_neg_integer()  %% BIP155 network ID (1=IPv4, 2=IPv6, 4=TorV3, 5=I2P, 6=CJDNS)
 }).
 
 -record(state, {
@@ -93,17 +97,30 @@
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
-%% @doc Add a single address with its services and source.
+%% @doc Add a single address with its services and source (IPv4/IPv6).
 -spec add_address({inet:ip_address(), inet:port_number()},
                   non_neg_integer(), term()) -> ok.
 add_address(Address, Services, Source) ->
-    gen_server:cast(?SERVER, {add_address, Address, Services, Source}).
+    gen_server:cast(?SERVER, {add_address, Address, Services, Source, 1}).
+
+%% @doc Add a single address with services, source, and network ID.
+-spec add_address({inet:ip_address() | binary(), inet:port_number()},
+                  non_neg_integer(), term(), non_neg_integer()) -> ok.
+add_address(Address, Services, Source, NetworkId) ->
+    gen_server:cast(?SERVER, {add_address, Address, Services, Source, NetworkId}).
 
 %% @doc Add a batch of addr entries (from an addr message).
 %% Each entry is #{ip => IP, port => Port, services => Svc, timestamp => T}.
 -spec add_addresses([map()], term()) -> ok.
 add_addresses(Entries, Source) ->
     gen_server:cast(?SERVER, {add_addresses, Entries, Source}).
+
+%% @doc Add a batch of addrv2 entries (from an addrv2 message).
+%% Supports non-IP addresses (TorV3, I2P, CJDNS).
+%% Each entry has network_id and either ip or address field.
+-spec add_addrv2_addresses([map()], term()) -> ok.
+add_addrv2_addresses(Entries, Source) ->
+    gen_server:cast(?SERVER, {add_addrv2_addresses, Entries, Source}).
 
 %% @doc Mark an address as successfully connected (move to tried).
 -spec mark_tried({inet:ip_address(), inet:port_number()}) -> ok.
@@ -128,9 +145,16 @@ select_address(Opts) ->
     gen_server:call(?SERVER, {select_address, Opts}).
 
 %% @doc Get N random addresses (for responding to getaddr).
+%% Returns IPv4/IPv6 addresses only (legacy addr format).
 -spec get_addresses(non_neg_integer()) -> [{inet:ip_address(), inet:port_number()}].
 get_addresses(N) ->
     gen_server:call(?SERVER, {get_addresses, N}).
+
+%% @doc Get N random addresses in addrv2 format (all network types).
+%% Returns maps with network_id, suitable for addrv2 message.
+-spec get_addrv2_addresses(non_neg_integer()) -> [map()].
+get_addrv2_addresses(N) ->
+    gen_server:call(?SERVER, {get_addrv2_addresses, N}).
 
 %% @doc Return count of new and tried addresses.
 -spec count() -> {non_neg_integer(), non_neg_integer()}.
@@ -138,12 +162,33 @@ count() ->
     gen_server:call(?SERVER, count).
 
 %% @doc Get the netgroup for an address (exported for peer_manager).
-%% IPv4: /16 prefix; IPv6: /32 prefix; Tor: identity
--spec netgroup({inet:ip_address(), inet:port_number()} | inet:ip_address()) -> term().
+%% IPv4: /16 prefix; IPv6: /32 prefix
+%% TorV3/I2P/CJDNS: use first 4 bytes of address as netgroup
+-spec netgroup({inet:ip_address(), inet:port_number()} | inet:ip_address() | map() | term()) -> term().
+%% Handle addr_info maps with network_id
+netgroup(#{network_id := NetId, address := Addr}) when NetId >= 4 ->
+    %% Non-IP networks (TorV3=4, I2P=5, CJDNS=6)
+    %% Use first 4 bytes of address as netgroup
+    case Addr of
+        <<A:8, B:8, C:8, D:8, _/binary>> -> {NetId, A, B, C, D};
+        _ -> {NetId, 0, 0, 0, 0}
+    end;
+netgroup(#{ip := IP, port := Port}) ->
+    netgroup({IP, Port});
+netgroup(#{ip := IP}) ->
+    netgroup(IP);
+%% IPv4 addresses
 netgroup({{A, B, _C, _D}, _Port}) -> {ipv4, A, B};
 netgroup({A, B, _C, _D}) -> {ipv4, A, B};
+%% IPv6 addresses
 netgroup({{A, B, C, D, _E, _F, _G, _H}, _Port}) -> {ipv6, A, B, C, D};
 netgroup({A, B, C, D, _E, _F, _G, _H}) -> {ipv6, A, B, C, D};
+%% Binary address with port tuple (for non-IP addresses)
+netgroup({Addr, _Port}) when is_binary(Addr) ->
+    case Addr of
+        <<A:8, B:8, C:8, D:8, _/binary>> -> {binary, A, B, C, D};
+        _ -> {binary, 0, 0, 0, 0}
+    end;
 netgroup(_) -> other.
 
 %% @doc Get the secret key (for testing).
@@ -206,6 +251,10 @@ handle_call({get_addresses, N}, _From, State) ->
     Result = do_get_addresses(N, State),
     {reply, Result, State};
 
+handle_call({get_addrv2_addresses, N}, _From, State) ->
+    Result = do_get_addrv2_addresses(N, State),
+    {reply, Result, State};
+
 handle_call(count, _From, #state{new_count = New, tried_count = Tried} = State) ->
     {reply, {New, Tried}, State};
 
@@ -215,14 +264,20 @@ handle_call(get_secret, _From, #state{secret = Secret} = State) ->
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_request}, State}.
 
-handle_cast({add_address, Address, Services, Source}, State) ->
-    State2 = do_add_address(Address, Services, Source, State),
+handle_cast({add_address, Address, Services, Source, NetworkId}, State) ->
+    State2 = do_add_address(Address, Services, Source, NetworkId, State),
     {noreply, State2};
 
 handle_cast({add_addresses, Entries, Source}, State) ->
     State2 = lists:foldl(fun(#{ip := IP, port := Port} = Entry, S) ->
         Svc = maps:get(services, Entry, 0),
-        do_add_address({IP, Port}, Svc, Source, S)
+        do_add_address({IP, Port}, Svc, Source, 1, S)  %% 1 = IPv4
+    end, State, Entries),
+    {noreply, State2};
+
+handle_cast({add_addrv2_addresses, Entries, Source}, State) ->
+    State2 = lists:foldl(fun(Entry, S) ->
+        do_add_addrv2_entry(Entry, Source, S)
     end, State, Entries),
     {noreply, State2};
 
@@ -287,8 +342,8 @@ get_bucket_position(Address, IsNew, Bucket, Secret) ->
 %%% Internal: address management
 %%% ===================================================================
 
-do_add_address(Address, Services, Source, #state{addr_table = AddrTab,
-                                                   secret = Secret} = State) ->
+do_add_address(Address, Services, Source, NetworkId, #state{addr_table = AddrTab,
+                                                            secret = Secret} = State) ->
     Now = erlang:system_time(second),
     SourceNG = source_netgroup(Source),
 
@@ -303,10 +358,25 @@ do_add_address(Address, Services, Source, #state{addr_table = AddrTab,
             State;
         [] ->
             %% New address - add to new table
-            add_to_new(Address, Services, Now, Source, SourceNG, Secret, State)
+            add_to_new(Address, Services, Now, Source, SourceNG, NetworkId, Secret, State)
     end.
 
-add_to_new(Address, Services, Now, Source, SourceNG, Secret,
+%% @doc Add an addrv2 entry (handles all network types).
+do_add_addrv2_entry(Entry, Source, State) ->
+    Svc = maps:get(services, Entry, 0),
+    NetworkId = maps:get(network_id, Entry, 1),
+    %% Build the address key based on network type
+    Address = case maps:find(ip, Entry) of
+        {ok, IP} ->
+            {IP, maps:get(port, Entry, 0)};
+        error ->
+            %% Non-IP network (TorV3, I2P, CJDNS)
+            AddrBytes = maps:get(address, Entry),
+            {AddrBytes, maps:get(port, Entry, 0)}
+    end,
+    do_add_address(Address, Svc, Source, NetworkId, State).
+
+add_to_new(Address, Services, Now, Source, SourceNG, NetworkId, Secret,
            #state{addr_table = AddrTab, new_buckets = NewBuckets,
                   new_count = NewCount} = State) ->
     %% Calculate bucket for this address+source
@@ -322,7 +392,7 @@ add_to_new(Address, Services, Now, Source, SourceNG, Secret,
                     %% Old entry, evict
                     remove_from_new(ExistingAddr, AddrTab, NewBuckets),
                     insert_new_entry(Address, Services, Now, Source, SourceNG,
-                                      Bucket, Slot, AddrTab, NewBuckets),
+                                      NetworkId, Bucket, Slot, AddrTab, NewBuckets),
                     State#state{new_count = NewCount};  %% count stays same
                 _ ->
                     %% Too new to evict, skip
@@ -331,12 +401,12 @@ add_to_new(Address, Services, Now, Source, SourceNG, Secret,
         [] ->
             %% Slot empty, insert
             insert_new_entry(Address, Services, Now, Source, SourceNG,
-                              Bucket, Slot, AddrTab, NewBuckets),
+                              NetworkId, Bucket, Slot, AddrTab, NewBuckets),
             State#state{new_count = NewCount + 1}
     end.
 
-insert_new_entry(Address, Services, Now, Source, SourceNG, Bucket, Slot,
-                 AddrTab, NewBuckets) ->
+insert_new_entry(Address, Services, Now, Source, SourceNG, NetworkId,
+                 Bucket, Slot, AddrTab, NewBuckets) ->
     Entry = #addr_info{
         address = Address,
         services = Services,
@@ -344,7 +414,8 @@ insert_new_entry(Address, Services, Now, Source, SourceNG, Bucket, Slot,
         source = Source,
         source_netgroup = SourceNG,
         in_tried = false,
-        ref_count = 1
+        ref_count = 1,
+        network_id = NetworkId
     },
     ets:insert(AddrTab, Entry),
     ets:insert(NewBuckets, {{Bucket, Slot}, Address}).
@@ -536,9 +607,36 @@ select_random_bucket_entry(BucketTab, AddrTab, Now, NumBuckets, Attempts) ->
     end.
 
 do_get_addresses(N, #state{addr_table = AddrTab}) ->
-    %% Collect all addresses, shuffle, take N
-    All = ets:foldl(fun(#addr_info{address = A}, Acc) -> [A | Acc] end,
-                    [], AddrTab),
+    %% Collect IPv4/IPv6 addresses only (legacy format), shuffle, take N
+    %% Accept network_id 1 (IPv4), 2 (IPv6), or undefined (legacy data without network_id)
+    All = ets:foldl(fun(#addr_info{address = A, network_id = NetId}, Acc)
+                            when NetId =:= 1 orelse NetId =:= 2 orelse
+                                 NetId =:= undefined ->
+                        [A | Acc];
+                       (_, Acc) -> Acc
+                    end, [], AddrTab),
+    Shuffled = shuffle(All),
+    lists:sublist(Shuffled, N).
+
+%% @doc Get addresses in addrv2 format (all network types).
+do_get_addrv2_addresses(N, #state{addr_table = AddrTab}) ->
+    %% Collect all addresses as maps, shuffle, take N
+    Now = erlang:system_time(second),
+    All = ets:foldl(fun(#addr_info{address = {AddrOrIP, Port},
+                                   services = Svc, timestamp = T,
+                                   network_id = NetId}, Acc) ->
+        Entry = #{timestamp => min(T, Now),  %% cap to current time
+                  services => Svc,
+                  network_id => NetId,
+                  port => Port},
+        %% Add ip or address field based on network type
+        Entry2 = case NetId of
+            1 -> Entry#{ip => AddrOrIP};     %% IPv4
+            2 -> Entry#{ip => AddrOrIP};     %% IPv6
+            _ -> Entry#{address => AddrOrIP} %% TorV3, I2P, CJDNS
+        end,
+        [Entry2 | Acc]
+    end, [], AddrTab),
     Shuffled = shuffle(All),
     lists:sublist(Shuffled, N).
 
