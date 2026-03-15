@@ -22,7 +22,8 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] Taproot (key path and script path) with BIP341 sighash
 - [x] MINIMALIF enforcement for witness scripts
 - [x] Accurate sigop counting (legacy, P2SH, witness)
-- [x] UTXO set management and chainstate
+- [x] UTXO set management and chainstate with write-back cache
+- [x] UTXO cache FRESH flag optimization (like Bitcoin Core's CCoinsViewCache)
 - [x] Undo data for block disconnection (reorg support)
 - [x] Mempool with fee-based ordering and ancestor/descendant limits
 - [x] BIP68 relative lock-time (sequence locks)
