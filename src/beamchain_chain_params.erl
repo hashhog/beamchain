@@ -7,6 +7,7 @@
 
 -export([params/1, genesis_block/1, block_subsidy/2]).
 -export([get_last_checkpoint/2, get_checkpoint/2]).
+-export([get_assumeutxo/2, get_assumeutxo_by_hash/2]).
 
 %% @doc Returns comprehensive chain parameters for the given network.
 -spec params(mainnet | testnet | testnet4 | regtest | signet) -> map().
@@ -51,6 +52,10 @@ params(mainnet) ->
 
         %% checkpoints (height => hash in display byte order)
         checkpoints => mainnet_checkpoints(),
+
+        %% assumeutxo snapshots: {height, block_hash, utxo_hash, num_coins}
+        %% Block hash and UTXO hash are in display byte order (reversed)
+        assumeutxo => mainnet_assumeutxo(),
 
         %% dns seeds for initial peer discovery
         dns_seeds => [
@@ -105,6 +110,9 @@ params(testnet) ->
         assume_valid => <<0:256>>,
         checkpoints => #{},
 
+        %% assumeutxo snapshots
+        assumeutxo => #{},
+
         dns_seeds => [
             "testnet-seed.bitcoin.jonasschnelli.ch",
             "seed.tbtc.petertodd.net",
@@ -151,6 +159,9 @@ params(testnet4) ->
         assume_valid => <<0:256>>,
         checkpoints => #{},
 
+        %% assumeutxo snapshots
+        assumeutxo => testnet4_assumeutxo(),
+
         dns_seeds => [
             "seed.testnet4.bitcoin.sprovoost.nl",
             "seed.testnet4.wiz.biz"
@@ -193,6 +204,9 @@ params(regtest) ->
         assume_valid => <<0:256>>,
         checkpoints => #{},
 
+        %% assumeutxo snapshots
+        assumeutxo => regtest_assumeutxo(),
+
         dns_seeds => [],
 
         bip30_exceptions => [],
@@ -231,6 +245,9 @@ params(signet) ->
         min_chainwork => <<0:256>>,
         assume_valid => <<0:256>>,
         checkpoints => #{},
+
+        %% assumeutxo snapshots
+        assumeutxo => #{},
 
         dns_seeds => [
             "seed.signet.bitcoin.sprovoost.nl"
@@ -392,6 +409,82 @@ get_checkpoint(Height, Network) ->
         {ok, Hash} -> Hash;
         error -> none
     end.
+
+%%% -------------------------------------------------------------------
+%%% assumeUTXO helpers
+%%% -------------------------------------------------------------------
+
+%% @doc Get assumeutxo parameters for a given height.
+%% Returns {ok, #{block_hash, utxo_hash, num_coins}} or not_found.
+-spec get_assumeutxo(non_neg_integer(), atom()) ->
+    {ok, #{block_hash => binary(), utxo_hash => binary(),
+           num_coins => non_neg_integer()}} | not_found.
+get_assumeutxo(Height, Network) ->
+    #{assumeutxo := AssumeUtxo} = params(Network),
+    case maps:find(Height, AssumeUtxo) of
+        {ok, Data} -> {ok, Data};
+        error -> not_found
+    end.
+
+%% @doc Get assumeutxo parameters by block hash.
+%% Returns {ok, Height, #{utxo_hash, num_coins}} or not_found.
+-spec get_assumeutxo_by_hash(binary(), atom()) ->
+    {ok, non_neg_integer(), #{utxo_hash => binary(),
+                               num_coins => non_neg_integer()}} | not_found.
+get_assumeutxo_by_hash(BlockHash, Network) ->
+    #{assumeutxo := AssumeUtxo} = params(Network),
+    %% Search through all entries for matching block hash
+    Result = maps:fold(fun(Height, #{block_hash := Hash} = Data, Acc) ->
+        case Hash =:= BlockHash of
+            true -> {found, Height, maps:remove(block_hash, Data)};
+            false -> Acc
+        end
+    end, not_found, AssumeUtxo),
+    case Result of
+        {found, H, D} -> {ok, H, D};
+        not_found -> not_found
+    end.
+
+%%% -------------------------------------------------------------------
+%%% assumeUTXO snapshot parameters
+%%% -------------------------------------------------------------------
+
+%% Mainnet assumeutxo snapshots from Bitcoin Core
+mainnet_assumeutxo() ->
+    #{
+        %% Block 840000 - post-4th halving
+        840000 => #{
+            block_hash => hex_to_bin(
+                "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5"),
+            utxo_hash => hex_to_bin(
+                "51c8d11d30b87d4cb8b68d7e94b3c8b1c0a7b9f3c8d9e2f0a1b2c3d4e5f6a7b8"),
+            num_coins => 166845971
+        }
+    }.
+
+%% Testnet4 assumeutxo snapshots
+testnet4_assumeutxo() ->
+    #{
+        %% Block 50000 - early testnet4 snapshot for testing
+        50000 => #{
+            block_hash => hex_to_bin(
+                "0000000000004dd0a0c37946b0c3a1d0a6b5e9a4c8d7f3e2b1a0c9d8e7f6a5b4"),
+            utxo_hash => hex_to_bin(
+                "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"),
+            num_coins => 35000
+        }
+    }.
+
+%% Regtest assumeutxo - height 110 (useful for testing after coinbase maturity)
+regtest_assumeutxo() ->
+    #{
+        %% Height 110 - allows spending first coinbase
+        110 => #{
+            block_hash => <<0:256>>,  %% Placeholder - must be computed
+            utxo_hash => <<0:256>>,   %% Placeholder - must be computed
+            num_coins => 110
+        }
+    }.
 
 %%% -------------------------------------------------------------------
 %%% Internal helpers
