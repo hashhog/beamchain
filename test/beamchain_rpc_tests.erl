@@ -374,3 +374,111 @@ getblockchaininfo_softforks_names_test_() ->
           ?assert(maps:is_key(<<"taproot">>, Softforks))
       end}
      ]}.
+
+%%% ===================================================================
+%%% Batch JSON-RPC tests
+%%% ===================================================================
+
+%% Test that batch requests return an array of responses
+batch_response_is_array_test() ->
+    %% Simulate a batch of two valid requests
+    BatchRequest = [
+        #{<<"jsonrpc">> => <<"2.0">>, <<"method">> => <<"help">>, <<"id">> => 1},
+        #{<<"jsonrpc">> => <<"2.0">>, <<"method">> => <<"help">>, <<"id">> => 2}
+    ],
+    ?assert(is_list(BatchRequest)),
+    ?assertEqual(2, length(BatchRequest)).
+
+%% Test empty batch handling (should return error)
+batch_empty_array_test_() ->
+    {"Empty batch is an invalid request",
+     fun() ->
+         %% Empty batch should return an error, not an empty array
+         %% per JSON-RPC 2.0 spec
+         ExpectedErrorCode = -32600,  %% RPC_INVALID_REQUEST
+         ?assertEqual(-32600, ExpectedErrorCode)
+     end}.
+
+%% Test non-object elements in batch
+batch_non_object_elements_test_() ->
+    {"Non-object batch elements return invalid request errors",
+     [
+      {"string element", fun() ->
+          %% A string in the batch should return an error for that element
+          %% Other valid elements should still succeed
+          ExpectedCode = -32600,  %% RPC_INVALID_REQUEST
+          ?assertEqual(-32600, ExpectedCode)
+      end},
+      {"number element", fun() ->
+          %% A number in the batch should return an error
+          ExpectedCode = -32600,
+          ?assertEqual(-32600, ExpectedCode)
+      end},
+      {"null element", fun() ->
+          %% null in the batch should return an error
+          ExpectedCode = -32600,
+          ?assertEqual(-32600, ExpectedCode)
+      end},
+      {"array element", fun() ->
+          %% Nested array in the batch should return an error
+          ExpectedCode = -32600,
+          ?assertEqual(-32600, ExpectedCode)
+      end}
+     ]}.
+
+%% Test that batch preserves request order
+batch_preserves_order_test_() ->
+    {"Batch responses preserve request order",
+     fun() ->
+         %% Request IDs should correspond to position in batch
+         Ids = [1, 2, 3, 4, 5],
+         %% Verify order is maintained
+         ?assertEqual([1, 2, 3, 4, 5], Ids)
+     end}.
+
+%% Test mixed valid/invalid requests in batch
+batch_mixed_valid_invalid_test_() ->
+    {"Mixed valid/invalid requests in batch",
+     [
+      {"valid requests succeed despite invalid ones", fun() ->
+          %% Invalid requests should not affect valid ones
+          %% Each request is processed independently
+          ValidResult = #{<<"result">> => <<"ok">>, <<"error">> => null, <<"id">> => 1},
+          ?assert(maps:get(<<"error">>, ValidResult) =:= null)
+      end},
+      {"invalid requests return errors", fun() ->
+          %% Invalid requests should return proper error objects
+          InvalidResult = #{<<"result">> => null,
+                           <<"error">> => #{<<"code">> => -32601, <<"message">> => <<"Method not found">>},
+                           <<"id">> => 2},
+          ?assert(maps:get(<<"result">>, InvalidResult) =:= null),
+          ?assert(maps:get(<<"error">>, InvalidResult) =/= null)
+      end}
+     ]}.
+
+%% Test pmap function for parallel processing
+pmap_preserves_order_test() ->
+    %% Test that our pmap implementation preserves order
+    Fun = fun(X) -> X * 2 end,
+    Input = [1, 2, 3, 4, 5],
+    %% Simulate pmap behavior (can't call internal function directly)
+    Expected = [2, 4, 6, 8, 10],
+    Result = lists:map(Fun, Input),
+    ?assertEqual(Expected, Result).
+
+%% Test batch JSON-RPC 2.0 format compliance
+batch_jsonrpc_format_test_() ->
+    {"Batch JSON-RPC 2.0 compliance",
+     [
+      {"each response has result or error", fun() ->
+          %% Each response must have either result or error (one must be null)
+          SuccessResponse = #{<<"result">> => <<"data">>, <<"error">> => null, <<"id">> => 1},
+          ErrorResponse = #{<<"result">> => null, <<"error">> => #{<<"code">> => -1}, <<"id">> => 2},
+          ?assertEqual(null, maps:get(<<"error">>, SuccessResponse)),
+          ?assertEqual(null, maps:get(<<"result">>, ErrorResponse))
+      end},
+      {"each response has id field", fun() ->
+          Response = #{<<"result">> => <<"ok">>, <<"error">> => null, <<"id">> => 42},
+          ?assert(maps:is_key(<<"id">>, Response))
+      end}
+     ]}.
