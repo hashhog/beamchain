@@ -17,8 +17,29 @@ CFLAGS := -O2 -Wall -fPIC -I$(ERTS_INCLUDE) -I$(SECP256K1_DIR)/include
 LDFLAGS := -shared
 
 UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
+
+# Enable SHA-NI on x86_64 if CPU supports it (compile-time check via -march=native)
+# For cross-compilation, explicitly set -msha if targeting SHA-NI capable CPUs
+ifeq ($(UNAME_M),x86_64)
+	# Check if compiler supports SHA-NI intrinsics
+	SHA_NI_CHECK := $(shell echo 'int main(){}' | $(CC) -x c -msha -c - -o /dev/null 2>/dev/null && echo yes)
+	ifeq ($(SHA_NI_CHECK),yes)
+		CFLAGS += -msha -msse4.1
+	endif
+endif
+
+# Enable ARM SHA extensions on aarch64
+ifeq ($(UNAME_M),aarch64)
+	CFLAGS += -march=armv8-a+crypto
+endif
+
 ifeq ($(UNAME_S),Darwin)
 	LDFLAGS += -flat_namespace -undefined suppress
+	# macOS Apple Silicon (arm64) has SHA extensions
+	ifeq ($(UNAME_M),arm64)
+		CFLAGS += -march=armv8-a+crypto
+	endif
 endif
 
 NIF_SO := $(PRIVDIR)/beamchain_crypto_nif.so
