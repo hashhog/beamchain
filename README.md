@@ -72,6 +72,8 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] Tor SOCKS5 proxy (connect to .onion peers, stream isolation, v3 address generation)
 - [x] I2P SAM 3.1 support (connect to .b32.i2p peers, session management)
 - [x] invalidateblock/reconsiderblock RPCs (manual chain management)
+- [x] NIF-accelerated SHA256/double-SHA256 (with pure Erlang fallback)
+- [x] Batch signature verification (amortize NIF call overhead)
 
 ## Quick start
 
@@ -94,7 +96,8 @@ src/
 ├── beamchain_script.erl       Script interpreter (~2800 lines)
 ├── beamchain_validation.erl   Block/tx consensus rules
 ├── beamchain_serialize.erl    Tx encoding (legacy + segwit)
-├── beamchain_crypto.erl       secp256k1 NIF bindings
+├── beamchain_crypto.erl       secp256k1 and SHA256 NIF bindings
+├── beamchain_sig_cache.erl    Signature verification cache (ETS)
 ├── beamchain_p2p_msg.erl      P2P message encoding
 ├── beamchain_peer.erl         Connection handling
 ├── beamchain_peer_manager.erl Peer lifecycle, banning, eclipse protections
@@ -125,7 +128,8 @@ src/
 └── beamchain_proxy.erl        Tor SOCKS5 and I2P SAM proxy support
 
 c_src/
-└── beamchain_crypto_nif.c     libsecp256k1 bindings
+├── beamchain_crypto_nif.c     libsecp256k1 + SHA256 NIF bindings
+└── Makefile                   NIF build with SHA-NI/ARM crypto flags
 
 test/
 ├── beamchain_script_tests.erl         Script and sighash tests
