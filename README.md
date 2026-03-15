@@ -57,6 +57,7 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] Compact block relay (BIP152 with SipHash-2-4)
 - [x] BIP324 v2 encrypted transport (ElligatorSwift, ChaCha20-Poly1305)
 - [x] BIP155 ADDRv2 messages (TorV3, I2P, CJDNS address support)
+- [x] Output descriptors (BIP380-386: pkh, wpkh, sh, wsh, multi, tr, addr, raw)
 
 ## Quick start
 
@@ -97,6 +98,7 @@ src/
 ├── beamchain_rpc.erl          JSON-RPC server
 ├── beamchain_wallet.erl       HD wallet, coin selection
 ├── beamchain_psbt.erl         BIP 174 PSBT serialization and signing
+├── beamchain_descriptor.erl   Output descriptors (BIP380-386)
 └── beamchain_transport_v2.erl BIP324 v2 encrypted transport
 
 c_src/
@@ -117,6 +119,7 @@ test/
 ├── beamchain_wallet_tests.erl         HD wallet and coin selection tests
 ├── beamchain_psbt_tests.erl           BIP 174 PSBT tests
 ├── beamchain_block_sync_tests.erl     Block sync and compact block tests
+├── beamchain_descriptor_tests.erl     Output descriptor tests
 └── beamchain_transport_v2_tests.erl   BIP324 v2 transport tests
 ```
 
