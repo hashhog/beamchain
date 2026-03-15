@@ -58,6 +58,7 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] BIP324 v2 encrypted transport (ElligatorSwift, ChaCha20-Poly1305)
 - [x] BIP155 ADDRv2 messages (TorV3, I2P, CJDNS address support)
 - [x] Output descriptors (BIP380-386: pkh, wpkh, sh, wsh, multi, tr, addr, raw)
+- [x] Miniscript policy compiler (type checking, script compilation, satisfaction)
 
 ## Quick start
 
@@ -99,6 +100,7 @@ src/
 ├── beamchain_wallet.erl       HD wallet, coin selection
 ├── beamchain_psbt.erl         BIP 174 PSBT serialization and signing
 ├── beamchain_descriptor.erl   Output descriptors (BIP380-386)
+├── beamchain_miniscript.erl   Miniscript policy compiler
 └── beamchain_transport_v2.erl BIP324 v2 encrypted transport
 
 c_src/
@@ -120,6 +122,7 @@ test/
 ├── beamchain_psbt_tests.erl           BIP 174 PSBT tests
 ├── beamchain_block_sync_tests.erl     Block sync and compact block tests
 ├── beamchain_descriptor_tests.erl     Output descriptor tests
+├── beamchain_miniscript_tests.erl     Miniscript parsing, compilation, satisfaction
 └── beamchain_transport_v2_tests.erl   BIP324 v2 transport tests
 ```
 
