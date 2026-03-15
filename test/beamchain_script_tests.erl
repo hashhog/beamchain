@@ -1311,3 +1311,297 @@ witness_pubkeytype_checkmultisig_compressed_test() ->
     %% Should succeed with WITNESS_PUBKEYTYPE flag
     {ok, [<<1>>]} = beamchain_script:eval_script(
         Script, [], ?SCRIPT_VERIFY_WITNESS_PUBKEYTYPE, SigChecker, witness_v0).
+
+%%% -------------------------------------------------------------------
+%%% Legacy sighash tests (Bitcoin Core test vectors)
+%%% -------------------------------------------------------------------
+
+%% Helper to parse a raw hex transaction
+parse_tx(Hex) ->
+    Bin = hex_to_bin(Hex),
+    {Tx, _} = beamchain_serialize:decode_transaction(Bin),
+    Tx.
+
+%% Helper to convert hex string to binary
+hex_to_bin(Hex) when is_list(Hex) ->
+    hex_to_bin(list_to_binary(Hex));
+hex_to_bin(Hex) when is_binary(Hex) ->
+    beamchain_serialize:hex_decode(Hex).
+
+%% Reverse bytes (test vectors use display format which is reversed)
+reverse_bytes(Bin) ->
+    beamchain_serialize:reverse_bytes(Bin).
+
+%% Helper to convert signed 32-bit int to unsigned (hashType in test vectors)
+to_unsigned_32(N) when N < 0 ->
+    N + (1 bsl 32);
+to_unsigned_32(N) ->
+    N.
+
+%% Test vectors from Bitcoin Core's sighash.json
+%% Format: [raw_tx_hex, script_hex, input_index, hashType (signed), expected_hash_hex]
+%% Note: expected_hash_hex is in "display format" (reversed bytes, like txid)
+
+sighash_vector_1_test() ->
+    %% Vector 1: Basic test with empty scriptCode
+    TxHex = "907c2bc503ade11cc3b04eb2918b6f547b0630ab569273824748c87ea14b0696526c66ba740200000004ab65ababfd1f9bdd4ef073c7afc4ae00da8a66f429c917a0081ad1e1dabce28d373eab81d8628de802000000096aab5253ab52000052ad042b5f25efb33beec9f3364e8a9139e8439d9d7e26529c3c30b6c3fd89f8684cfd68ea0200000009ab53526500636a52ab599ac2fe02a526ed040000000008535300516352515164370e010000000003006300ab2ec229",
+    ScriptHex = "",
+    InputIndex = 2,
+    HashType = 1864164639,
+    ExpectedHex = "31af167a6cf3f9d5f6875caa4d31704ceb0eba078d132b78dab52c3b8997317e",
+    Tx = parse_tx(TxHex),
+    Script = hex_to_bin(ScriptHex),
+    UnsignedHashType = to_unsigned_32(HashType),
+    Result = beamchain_script:sighash_legacy(Tx, InputIndex, Script, UnsignedHashType),
+    %% Expected is in display format (reversed), so reverse it to match our raw hash
+    Expected = reverse_bytes(hex_to_bin(ExpectedHex)),
+    ?assertEqual(Expected, Result).
+
+sighash_vector_2_test() ->
+    %% Vector 2: Test with non-empty scriptCode
+    TxHex = "a0aa3126041621a6dea5b800141aa696daf28408959dfb2df96095db9fa425ad3f427f2f6103000000015360290e9c6063fa26912c2e7fb6a0ad80f1c5fea1771d42f12976092e7a85a4229fdb6e890000000001abc109f6e47688ac0e4682988785744602b8c87228fcef0695085edf19088af1a9db126e93000000000665516aac536affffffff8fe53e0806e12dfd05d67ac68f4768fdbe23fc48ace22a5aa8ba04c96d58e2750300000009ac51abac63ab5153650524aa680455ce7b000000000000499e50030000000008636a00ac526563ac5051ee030000000003abacabd2b6fe000000000003516563910fb6b5",
+    ScriptHex = "65",
+    InputIndex = 0,
+    HashType = -1391424484,
+    ExpectedHex = "48d6a1bd2cd9eec54eb866fc71209418a950402b5d7e52363bfb75c98e141175",
+    Tx = parse_tx(TxHex),
+    Script = hex_to_bin(ScriptHex),
+    UnsignedHashType = to_unsigned_32(HashType),
+    Result = beamchain_script:sighash_legacy(Tx, InputIndex, Script, UnsignedHashType),
+    Expected = reverse_bytes(hex_to_bin(ExpectedHex)),
+    ?assertEqual(Expected, Result).
+
+sighash_vector_3_test() ->
+    %% Vector 3: More complex scriptCode
+    TxHex = "6e7e9d4b04ce17afa1e8546b627bb8d89a6a7fefd9d892ec8a192d79c2ceafc01694a6a7e7030000000953ac6a51006353636a33bced1544f797f08ceed02f108da22cd24c9e7809a446c61eb3895914508ac91f07053a01000000055163ab516affffffff11dc54eee8f9e4ff0bcf6b1a1a35b1cd10d63389571375501af7444073bcec3c02000000046aab53514a821f0ce3956e235f71e4c69d91abe1e93fb703bd33039ac567249ed339bf0ba0883ef300000000090063ab65000065ac654bec3cc504bcf499020000000005ab6a52abac64eb060100000000076a6a5351650053bbbc130100000000056a6aab53abd6e1380100000000026a51c4e509b8",
+    ScriptHex = "acab655151",
+    InputIndex = 0,
+    HashType = 479279909,
+    ExpectedHex = "2a3d95b09237b72034b23f2d2bb29fa32a58ab5c6aa72f6aafdfa178ab1dd01c",
+    Tx = parse_tx(TxHex),
+    Script = hex_to_bin(ScriptHex),
+    UnsignedHashType = to_unsigned_32(HashType),
+    Result = beamchain_script:sighash_legacy(Tx, InputIndex, Script, UnsignedHashType),
+    Expected = reverse_bytes(hex_to_bin(ExpectedHex)),
+    ?assertEqual(Expected, Result).
+
+sighash_vector_4_test() ->
+    %% Vector 4: SIGHASH_SINGLE
+    TxHex = "73107cbd025c22ebc8c3e0a47b2a760739216a528de8d4dab5d45cbeb3051cebae73b01ca10200000007ab6353656a636affffffffe26816dffc670841e6a6c8c61c586da401df1261a330a6c6b3dd9f9a0789bc9e000000000800ac6552ac6aac51ffffffff0174a8f0010000000004ac52515100000000",
+    ScriptHex = "5163ac63635151ac",
+    InputIndex = 1,
+    HashType = 1190874345,
+    ExpectedHex = "06e328de263a87b09beabe222a21627a6ea5c7f560030da31610c4611f4a46bc",
+    Tx = parse_tx(TxHex),
+    Script = hex_to_bin(ScriptHex),
+    UnsignedHashType = to_unsigned_32(HashType),
+    Result = beamchain_script:sighash_legacy(Tx, InputIndex, Script, UnsignedHashType),
+    Expected = reverse_bytes(hex_to_bin(ExpectedHex)),
+    ?assertEqual(Expected, Result).
+
+sighash_vector_5_test() ->
+    %% Vector 5: negative hashType (becomes large positive)
+    TxHex = "e93bbf6902be872933cb987fc26ba0f914fcfc2f6ce555258554dd9939d12032a8536c8802030000000453ac5353eabb6451e074e6fef9de211347d6a45900ea5aaf2636ef7967f565dce66fa451805c5cd10000000003525253ffffffff047dc3e6020000000007516565ac656aabec9eea010000000001633e46e600000000000015080a030000000001ab00000000",
+    ScriptHex = "5300ac6a53ab6a",
+    InputIndex = 1,
+    HashType = -886562767,
+    ExpectedHex = "f03aa4fc5f97e826323d0daa03343ebf8a34ed67a1ce18631f8b88e5c992e798",
+    Tx = parse_tx(TxHex),
+    Script = hex_to_bin(ScriptHex),
+    UnsignedHashType = to_unsigned_32(HashType),
+    Result = beamchain_script:sighash_legacy(Tx, InputIndex, Script, UnsignedHashType),
+    Expected = reverse_bytes(hex_to_bin(ExpectedHex)),
+    ?assertEqual(Expected, Result).
+
+%%% -------------------------------------------------------------------
+%%% FindAndDelete tests
+%%% -------------------------------------------------------------------
+
+%% Test that FindAndDelete removes push-encoded signature from scriptCode
+find_and_delete_basic_test() ->
+    %% Script with a signature embedded
+    Sig = <<16#30, 16#06, 16#02, 16#01, 16#01, 16#02, 16#01, 16#01, 16#01>>,
+    %% Script: <sig> OP_CHECKSIG (0xac)
+    %% Push-encoded sig is: <9> <sig bytes>
+    Script = <<9, Sig/binary, 16#ac>>,
+    %% After FindAndDelete, the sig push should be removed
+    Result = beamchain_script:find_and_delete(Script, Sig),
+    %% Only OP_CHECKSIG should remain
+    ?assertEqual(<<16#ac>>, Result).
+
+find_and_delete_multiple_occurrences_test() ->
+    %% Multiple occurrences should all be removed
+    Sig = <<16#ab, 16#cd>>,
+    %% Script with sig appearing twice
+    Script = <<2, Sig/binary, 16#51, 2, Sig/binary>>,
+    Result = beamchain_script:find_and_delete(Script, Sig),
+    %% Only OP_1 should remain
+    ?assertEqual(<<16#51>>, Result).
+
+find_and_delete_no_match_test() ->
+    %% If sig not in script, script unchanged
+    Sig = <<16#de, 16#ad>>,
+    Script = <<16#51, 16#52, 16#93>>,  %% OP_1 OP_2 OP_ADD
+    Result = beamchain_script:find_and_delete(Script, Sig),
+    ?assertEqual(Script, Result).
+
+find_and_delete_empty_sig_test() ->
+    %% Empty signature should match empty push (OP_0)
+    %% Actually push_encode(<<>>) = <<0>> which is OP_0
+    Script = <<16#00, 16#51, 16#00>>,  %% OP_0 OP_1 OP_0
+    Result = beamchain_script:find_and_delete(Script, <<>>),
+    %% Both OP_0 should be removed
+    ?assertEqual(<<16#51>>, Result).
+
+%%% -------------------------------------------------------------------
+%%% OP_CODESEPARATOR handling tests
+%%% -------------------------------------------------------------------
+
+%% Test that OP_CODESEPARATOR is removed from scriptCode in legacy sighash
+remove_codeseparator_test() ->
+    %% Script with OP_CODESEPARATOR (0xab)
+    Script = <<16#51, 16#ab, 16#52, 16#ab, 16#53>>,  %% OP_1 OP_CODESEP OP_2 OP_CODESEP OP_3
+    %% Build a minimal tx
+    Tx = #transaction{
+        version = 1,
+        inputs = [#tx_in{
+            prev_out = #outpoint{hash = <<0:256>>, index = 0},
+            script_sig = <<>>,
+            sequence = 16#ffffffff,
+            witness = []
+        }],
+        outputs = [#tx_out{value = 0, script_pubkey = <<>>}],
+        locktime = 0
+    },
+    %% Compute sighash - OP_CODESEPARATOR bytes should be stripped
+    _Result = beamchain_script:sighash_legacy(Tx, 0, Script, ?SIGHASH_ALL),
+    %% The test is that it doesn't crash; actual hash verification is via vectors
+    ok.
+
+%%% -------------------------------------------------------------------
+%%% SIGHASH_NONE tests
+%%% -------------------------------------------------------------------
+
+sighash_none_zeroes_outputs_test() ->
+    %% SIGHASH_NONE should zero outputs
+    Tx = #transaction{
+        version = 1,
+        inputs = [#tx_in{
+            prev_out = #outpoint{hash = <<1:256>>, index = 0},
+            script_sig = <<>>,
+            sequence = 16#ffffffff,
+            witness = []
+        }],
+        outputs = [#tx_out{value = 100000, script_pubkey = <<16#51>>}],
+        locktime = 0
+    },
+    ScriptCode = <<16#51>>,  %% OP_1
+    %% SIGHASH_NONE = 2
+    HashNone = beamchain_script:sighash_legacy(Tx, 0, ScriptCode, ?SIGHASH_NONE),
+    %% SIGHASH_ALL = 1
+    HashAll = beamchain_script:sighash_legacy(Tx, 0, ScriptCode, ?SIGHASH_ALL),
+    %% They should be different (NONE ignores outputs)
+    ?assertNotEqual(HashNone, HashAll).
+
+%%% -------------------------------------------------------------------
+%%% SIGHASH_ANYONECANPAY tests
+%%% -------------------------------------------------------------------
+
+sighash_anyonecanpay_test() ->
+    %% SIGHASH_ANYONECANPAY should only include the signing input
+    Tx = #transaction{
+        version = 1,
+        inputs = [
+            #tx_in{
+                prev_out = #outpoint{hash = <<1:256>>, index = 0},
+                script_sig = <<>>,
+                sequence = 16#ffffffff,
+                witness = []
+            },
+            #tx_in{
+                prev_out = #outpoint{hash = <<2:256>>, index = 0},
+                script_sig = <<>>,
+                sequence = 16#ffffffff,
+                witness = []
+            }
+        ],
+        outputs = [#tx_out{value = 100000, script_pubkey = <<16#51>>}],
+        locktime = 0
+    },
+    ScriptCode = <<16#51>>,
+    %% SIGHASH_ALL | SIGHASH_ANYONECANPAY = 0x81
+    HashACP = beamchain_script:sighash_legacy(Tx, 0, ScriptCode,
+        ?SIGHASH_ALL bor ?SIGHASH_ANYONECANPAY),
+    HashAll = beamchain_script:sighash_legacy(Tx, 0, ScriptCode, ?SIGHASH_ALL),
+    %% They should be different (ANYONECANPAY only uses one input)
+    ?assertNotEqual(HashACP, HashAll).
+
+%%% -------------------------------------------------------------------
+%%% More Bitcoin Core test vectors
+%%% -------------------------------------------------------------------
+
+sighash_vector_6_test() ->
+    TxHex = "50818f4c01b464538b1e7e7f5ae4ed96ad23c68c830e78da9a845bc19b5c3b0b20bb82e5e9030000000763526a63655352ffffffff023b3f9c040000000008630051516a6a5163a83caf01000000000553ab65510000000000",
+    ScriptHex = "6aac",
+    InputIndex = 0,
+    HashType = 946795545,
+    ExpectedHex = "746306f322de2b4b58ffe7faae83f6a72433c22f88062cdde881d4dd8a5a4e2d",
+    Tx = parse_tx(TxHex),
+    Script = hex_to_bin(ScriptHex),
+    UnsignedHashType = to_unsigned_32(HashType),
+    Result = beamchain_script:sighash_legacy(Tx, InputIndex, Script, UnsignedHashType),
+    Expected = reverse_bytes(hex_to_bin(ExpectedHex)),
+    ?assertEqual(Expected, Result).
+
+sighash_vector_7_test() ->
+    TxHex = "a93e93440250f97012d466a6cc24839f572def241c814fe6ae94442cf58ea33eb0fdd9bcc1030000000600636a0065acffffffff5dee3a6e7e5ad6310dea3e5b3ddda1a56bf8de7d3b75889fc024b5e233ec10f80300000007ac53635253ab53ffffffff0160468b04000000000800526a5300ac526a00000000",
+    ScriptHex = "ac00636a53",
+    InputIndex = 1,
+    HashType = 1773442520,
+    ExpectedHex = "5c9d3a2ce9365bb72cfabbaa4579c843bb8abf200944612cf8ae4b56a908bcbd",
+    Tx = parse_tx(TxHex),
+    Script = hex_to_bin(ScriptHex),
+    UnsignedHashType = to_unsigned_32(HashType),
+    Result = beamchain_script:sighash_legacy(Tx, InputIndex, Script, UnsignedHashType),
+    Expected = reverse_bytes(hex_to_bin(ExpectedHex)),
+    ?assertEqual(Expected, Result).
+
+sighash_vector_8_test() ->
+    %% Vector with empty scriptCode
+    TxHex = "c363a70c01ab174230bbe4afe0c3efa2d7f2feaf179431359adedccf30d1f69efe0c86ed390200000002ab51558648fe0231318b04000000000151662170000000000008ac5300006a63acac00000000",
+    ScriptHex = "",
+    InputIndex = 0,
+    HashType = 2146479410,
+    ExpectedHex = "191ab180b0d753763671717d051f138d4866b7cb0d1d4811472e64de595d2c70",
+    Tx = parse_tx(TxHex),
+    Script = hex_to_bin(ScriptHex),
+    UnsignedHashType = to_unsigned_32(HashType),
+    Result = beamchain_script:sighash_legacy(Tx, InputIndex, Script, UnsignedHashType),
+    Expected = reverse_bytes(hex_to_bin(ExpectedHex)),
+    ?assertEqual(Expected, Result).
+
+sighash_vector_9_test() ->
+    TxHex = "d3b7421e011f4de0f1cea9ba7458bf3486bee722519efab711a963fa8c100970cf7488b7bb0200000003525352dcd61b300148be5d05000000000000000000",
+    ScriptHex = "535251536aac536a",
+    InputIndex = 0,
+    HashType = -1960128125,
+    ExpectedHex = "29aa6d2d752d3310eba20442770ad345b7f6a35f96161ede5f07b33e92053e2a",
+    Tx = parse_tx(TxHex),
+    Script = hex_to_bin(ScriptHex),
+    UnsignedHashType = to_unsigned_32(HashType),
+    Result = beamchain_script:sighash_legacy(Tx, InputIndex, Script, UnsignedHashType),
+    Expected = reverse_bytes(hex_to_bin(ExpectedHex)),
+    ?assertEqual(Expected, Result).
+
+sighash_vector_10_test() ->
+    TxHex = "04bac8c5033460235919a9c63c42b2db884c7c8f2ed8fcd69ff683a0a2cccd9796346a04050200000003655351fcad3a2c5a7cbadeb4ec7acc9836c3f5c3e776e5c566220f7f965cf194f8ef98efb5e3530200000007526a006552526526a2f55ba5f69699ece76692552b399ba908301907c5763d28a15b08581b23179cb01eac03000000075363ab6a516351073942c2025aa98a05000000000765006aabac65abd7ffa6030000000004516a655200000000",
+    ScriptHex = "53ac6365ac526a",
+    InputIndex = 1,
+    HashType = 764174870,
+    ExpectedHex = "bf5fdc314ded2372a0ad078568d76c5064bf2affbde0764c335009e56634481b",
+    Tx = parse_tx(TxHex),
+    Script = hex_to_bin(ScriptHex),
+    UnsignedHashType = to_unsigned_32(HashType),
+    Result = beamchain_script:sighash_legacy(Tx, InputIndex, Script, UnsignedHashType),
+    Expected = reverse_bytes(hex_to_bin(ExpectedHex)),
+    ?assertEqual(Expected, Result).
