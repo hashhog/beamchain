@@ -29,6 +29,7 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] Witness commitment (BIP141)
 - [x] CPFP-aware tx selection (ancestor fee rate)
 - [x] Difficulty adjustment algorithm (retarget every 2016 blocks)
+- [x] BIP9 versionbits soft fork deployment tracking
 - [ ] Wallet (HD keys, signing)
 - [ ] Compact block relay (BIP152)
 
@@ -61,6 +62,7 @@ src/
 ├── beamchain_mempool.erl      Transaction pool
 ├── beamchain_miner.erl        Block template construction
 ├── beamchain_pow.erl          Proof of work and difficulty
+├── beamchain_versionbits.erl  BIP9 deployment tracking
 ├── beamchain_db.erl           RocksDB wrapper
 └── beamchain_rpc.erl          JSON-RPC server
 
@@ -68,11 +70,12 @@ c_src/
 └── beamchain_crypto_nif.c     libsecp256k1 bindings
 
 test/
-├── beamchain_script_tests.erl     Script and sighash tests
-├── beamchain_chainstate_tests.erl Undo data and disconnect tests
-├── beamchain_miner_tests.erl      Block template and witness tests
-├── beamchain_pow_tests.erl        PoW and difficulty adjustment tests
-└── beamchain_validation_tests.erl Consensus rule tests
+├── beamchain_script_tests.erl       Script and sighash tests
+├── beamchain_chainstate_tests.erl   Undo data and disconnect tests
+├── beamchain_miner_tests.erl        Block template and witness tests
+├── beamchain_pow_tests.erl          PoW and difficulty adjustment tests
+├── beamchain_versionbits_tests.erl  BIP9 state machine tests
+└── beamchain_validation_tests.erl   Consensus rule tests
 ```
 
 ## Running tests
