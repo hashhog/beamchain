@@ -8,10 +8,11 @@
 -include("beamchain_protocol.hrl").
 
 %% API
--export([start_link/0]).
+-export([start_link/0, start_link/1, start_link/2]).
 
 %% Chain queries
 -export([get_tip/0, get_mtp/0, is_synced/0]).
+-export([get_tip_height/0]).
 
 %% UTXO cache — module functions (direct ETS access, no gen_server call)
 -export([get_utxo/2, has_utxo/2, add_utxo/3, spend_utxo/2]).
@@ -24,6 +25,10 @@
 
 %% Cache statistics
 -export([cache_stats/0, cache_memory_usage/0]).
+
+%% assumeUTXO support
+-export([load_snapshot/1, compute_utxo_hash/0]).
+-export([is_snapshot_chainstate/0, get_snapshot_base_height/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -71,7 +76,12 @@
     cache_usage_bytes :: non_neg_integer(),
 
     %% Whether we're in initial block download
-    ibd               :: boolean()
+    ibd               :: boolean(),
+
+    %% assumeUTXO support
+    chainstate_role   :: main | snapshot | background,
+    snapshot_base_height :: non_neg_integer() | undefined,
+    snapshot_base_hash :: binary() | undefined
 }).
 
 %%% ===================================================================
@@ -79,7 +89,17 @@
 %%% ===================================================================
 
 start_link() ->
-    gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
+    gen_server:start_link({local, ?SERVER}, ?MODULE, [main], []).
+
+%% @doc Start a named chainstate with a specific role.
+%% Role can be: main, snapshot, or background.
+start_link(Role) when Role =:= main; Role =:= background ->
+    gen_server:start_link({local, ?SERVER}, ?MODULE, [Role], []).
+
+%% @doc Start a snapshot chainstate with preloaded UTXO data.
+%% SnapshotData = #{base_hash, num_coins, coins}
+start_link(snapshot, SnapshotData) ->
+    gen_server:start_link({local, ?SERVER}, ?MODULE, [snapshot, SnapshotData], []).
 
 %% @doc Get the current chain tip.
 %% Direct ETS read — no gen_server bottleneck.
@@ -99,6 +119,14 @@ get_mtp() ->
 -spec is_synced() -> boolean().
 is_synced() ->
     gen_server:call(?SERVER, is_synced).
+
+%% @doc Get just the tip height.
+-spec get_tip_height() -> {ok, integer()} | not_found.
+get_tip_height() ->
+    case get_tip() of
+        {ok, {_Hash, Height}} -> {ok, Height};
+        not_found -> not_found
+    end.
 
 %% @doc Connect a block to the chain tip.
 %% Validates the block, updates UTXOs, and advances the tip.
@@ -124,6 +152,32 @@ reorganize(NewBlocks) ->
 -spec flush() -> ok.
 flush() ->
     gen_server:call(?SERVER, flush, 60000).
+
+%%% ===================================================================
+%%% assumeUTXO API
+%%% ===================================================================
+
+%% @doc Load a UTXO snapshot from file and activate it.
+%% Returns {ok, Height} on success where Height is the snapshot base height.
+-spec load_snapshot(string()) -> {ok, non_neg_integer()} | {error, term()}.
+load_snapshot(Path) ->
+    gen_server:call(?SERVER, {load_snapshot, Path}, infinity).
+
+%% @doc Compute the SHA256 hash of the current UTXO set.
+%% Used to verify snapshot integrity after background validation.
+-spec compute_utxo_hash() -> binary().
+compute_utxo_hash() ->
+    gen_server:call(?SERVER, compute_utxo_hash, 300000).
+
+%% @doc Check if this chainstate was loaded from a snapshot.
+-spec is_snapshot_chainstate() -> boolean().
+is_snapshot_chainstate() ->
+    gen_server:call(?SERVER, is_snapshot_chainstate).
+
+%% @doc Get the base height of the snapshot, if this is a snapshot chainstate.
+-spec get_snapshot_base_height() -> {ok, non_neg_integer()} | not_snapshot.
+get_snapshot_base_height() ->
+    gen_server:call(?SERVER, get_snapshot_base_height).
 
 %%% ===================================================================
 %%% UTXO cache (public ETS, called from any process)
@@ -242,39 +296,83 @@ spend_utxo(Txid, Vout) ->
 %%% ===================================================================
 
 init([]) ->
-    %% Create ETS tables
-    %% UTXO cache: read_concurrency for parallel reads during validation
-    ets:new(?UTXO_CACHE, [set, public, named_table,
-                           {read_concurrency, true},
-                           {write_concurrency, true}]),
-    %% Dirty/fresh/spent: write_concurrency since many processes update these
-    ets:new(?UTXO_DIRTY, [set, public, named_table,
-                           {write_concurrency, true}]),
-    ets:new(?UTXO_FRESH, [set, public, named_table,
-                           {write_concurrency, true}]),
-    ets:new(?UTXO_SPENT, [set, public, named_table,
-                           {write_concurrency, true}]),
-    ets:new(?CHAIN_META, [set, public, named_table,
-                           {read_concurrency, true}]),
+    init([main]);
+
+init([main]) ->
+    init_chainstate(main, undefined);
+
+init([background]) ->
+    init_chainstate(background, undefined);
+
+init([snapshot, SnapshotData]) ->
+    init_chainstate(snapshot, SnapshotData).
+
+%% Common initialization for all chainstate roles
+init_chainstate(Role, SnapshotData) ->
+    %% Create ETS tables (only for main chainstate, others reuse)
+    case Role of
+        main ->
+            %% UTXO cache: read_concurrency for parallel reads during validation
+            ets:new(?UTXO_CACHE, [set, public, named_table,
+                                   {read_concurrency, true},
+                                   {write_concurrency, true}]),
+            %% Dirty/fresh/spent: write_concurrency since many processes update these
+            ets:new(?UTXO_DIRTY, [set, public, named_table,
+                                   {write_concurrency, true}]),
+            ets:new(?UTXO_FRESH, [set, public, named_table,
+                                   {write_concurrency, true}]),
+            ets:new(?UTXO_SPENT, [set, public, named_table,
+                                   {write_concurrency, true}]),
+            ets:new(?CHAIN_META, [set, public, named_table,
+                                   {read_concurrency, true}]);
+        _ ->
+            %% Snapshot and background chainstates reuse the main ETS tables
+            ok
+    end,
 
     %% Load network params
     Network = beamchain_config:network(),
     Params = beamchain_chain_params:params(Network),
 
-    %% Load chain tip from DB
-    {TipHash, TipHeight} = load_chain_tip(),
-    case TipHash of
-        undefined -> ok;
-        _ -> ets:insert(?CHAIN_META, {tip, TipHash, TipHeight})
-    end,
+    %% Initialize based on role
+    {TipHash, TipHeight, SnapshotBaseHeight, SnapshotBaseHash} =
+        case {Role, SnapshotData} of
+            {snapshot, #{base_hash := BaseHash, coins := Coins}} ->
+                %% Load snapshot UTXOs into cache
+                populate_utxo_cache_from_snapshot(Coins),
+                %% Get snapshot base height from chain params
+                case beamchain_chain_params:get_assumeutxo_by_hash(BaseHash, Network) of
+                    {ok, Height, _} ->
+                        logger:info("chainstate: loading snapshot at height ~B", [Height]),
+                        {BaseHash, Height, Height, BaseHash};
+                    not_found ->
+                        logger:warning("chainstate: unknown snapshot base hash"),
+                        {BaseHash, 0, 0, BaseHash}
+                end;
+            {background, _} ->
+                %% Background chainstate starts from genesis
+                logger:info("chainstate: starting background validation from genesis"),
+                {undefined, -1, undefined, undefined};
+            {main, _} ->
+                %% Main chainstate loads from DB
+                {H, Ht} = load_chain_tip(),
+                case H of
+                    undefined -> ok;
+                    _ -> ets:insert(?CHAIN_META, {tip, H, Ht})
+                end,
+                {H, Ht, undefined, undefined}
+        end,
 
     %% Load MTP sliding window (last 11 timestamps)
-    MTPTimestamps = load_mtp_timestamps(TipHeight),
+    MTPTimestamps = case Role of
+        background -> [];
+        _ -> load_mtp_timestamps(TipHeight)
+    end,
 
     %% Start with large cache for IBD, shrink when caught up
     MaxCacheMB = ?IBD_MAX_CACHE_MB,
-    logger:info("chainstate: initialized at height ~B (cache ~BMB)",
-                [TipHeight, MaxCacheMB]),
+    logger:info("chainstate (~p): initialized at height ~B (cache ~BMB)",
+                [Role, TipHeight, MaxCacheMB]),
 
     {ok, #state{
         tip_hash = TipHash,
@@ -285,7 +383,10 @@ init([]) ->
         max_cache_bytes = MaxCacheMB * 1024 * 1024,
         max_cache_entries = ?DEFAULT_MAX_CACHE_ENTRIES,
         cache_usage_bytes = 0,
-        ibd = true
+        ibd = true,
+        chainstate_role = Role,
+        snapshot_base_height = SnapshotBaseHeight,
+        snapshot_base_hash = SnapshotBaseHash
     }}.
 
 handle_call(get_mtp, _From, #state{mtp_timestamps = Ts} = State) ->
@@ -325,6 +426,33 @@ handle_call({reorganize, NewBlocks}, _From, State) ->
 handle_call(flush, _From, State) ->
     State2 = do_flush(State),
     {reply, ok, State2};
+
+%% assumeUTXO support
+handle_call({load_snapshot, Path}, _From, State) ->
+    case do_load_snapshot(Path, State) of
+        {ok, State2, Height} ->
+            {reply, {ok, Height}, State2};
+        {error, Reason} ->
+            {reply, {error, Reason}, State}
+    end;
+
+handle_call(compute_utxo_hash, _From, State) ->
+    Hash = do_compute_utxo_hash(),
+    {reply, Hash, State};
+
+handle_call(is_snapshot_chainstate, _From,
+            #state{chainstate_role = Role} = State) ->
+    {reply, Role =:= snapshot, State};
+
+handle_call(get_snapshot_base_height, _From,
+            #state{snapshot_base_height = Height} = State) ->
+    case Height of
+        undefined -> {reply, not_snapshot, State};
+        H -> {reply, {ok, H}, State}
+    end;
+
+handle_call(get_tip_height, _From, #state{tip_height = Height} = State) ->
+    {reply, {ok, Height}, State};
 
 handle_call(_Request, _From, State) ->
     {reply, {error, not_implemented}, State}.
@@ -734,3 +862,119 @@ compute_mtp([]) ->
 compute_mtp(Timestamps) ->
     Sorted = lists:sort(Timestamps),
     lists:nth((length(Sorted) div 2) + 1, Sorted).
+
+%%% ===================================================================
+%%% Internal: assumeUTXO support
+%%% ===================================================================
+
+%% Load a UTXO snapshot from file
+do_load_snapshot(Path, State) ->
+    Network = beamchain_config:network(),
+
+    %% Parse the snapshot file
+    case beamchain_snapshot:load_snapshot(Path) of
+        {ok, #{base_hash := BaseHash, num_coins := NumCoins, coins := Coins} = SnapshotData} ->
+            %% Verify the snapshot against known parameters
+            case beamchain_snapshot:verify_snapshot(SnapshotData, Network) of
+                ok ->
+                    %% Look up the snapshot height
+                    case beamchain_chain_params:get_assumeutxo_by_hash(BaseHash, Network) of
+                        {ok, Height, _} ->
+                            logger:info("chainstate: loading ~B coins from snapshot at height ~B",
+                                        [NumCoins, Height]),
+
+                            %% Populate the UTXO cache
+                            populate_utxo_cache_from_snapshot(Coins),
+
+                            %% Update state
+                            State2 = State#state{
+                                tip_hash = BaseHash,
+                                tip_height = Height,
+                                chainstate_role = snapshot,
+                                snapshot_base_height = Height,
+                                snapshot_base_hash = BaseHash
+                            },
+
+                            %% Update ETS chain meta
+                            ets:insert(?CHAIN_META, {tip, BaseHash, Height}),
+
+                            %% Start background validation
+                            spawn(fun() -> start_background_validation() end),
+
+                            {ok, State2, Height};
+                        not_found ->
+                            {error, {unknown_snapshot_base, BaseHash}}
+                    end;
+                {error, Reason} ->
+                    {error, {snapshot_verification_failed, Reason}}
+            end;
+        {error, Reason} ->
+            {error, {snapshot_load_failed, Reason}}
+    end.
+
+%% Populate the UTXO cache from snapshot coins
+populate_utxo_cache_from_snapshot(Coins) ->
+    %% Clear existing cache entries
+    ets:delete_all_objects(?UTXO_CACHE),
+    ets:delete_all_objects(?UTXO_DIRTY),
+    ets:delete_all_objects(?UTXO_FRESH),
+    ets:delete_all_objects(?UTXO_SPENT),
+
+    %% Insert all coins from snapshot
+    lists:foreach(fun({Txid, Vout, Utxo}) ->
+        Key = {Txid, Vout},
+        ets:insert(?UTXO_CACHE, {Key, Utxo}),
+        %% Mark as DIRTY so they get flushed to RocksDB
+        ets:insert(?UTXO_DIRTY, {Key}),
+        %% Mark as FRESH since they don't exist in RocksDB yet
+        ets:insert(?UTXO_FRESH, {Key})
+    end, Coins),
+
+    NumCoins = length(Coins),
+    logger:info("chainstate: loaded ~B coins into cache", [NumCoins]),
+    ok.
+
+%% Compute the SHA256 hash of all UTXOs in the cache
+do_compute_utxo_hash() ->
+    %% Collect all UTXOs from cache in deterministic order
+    AllEntries = ets:tab2list(?UTXO_CACHE),
+
+    %% Sort by outpoint key
+    Sorted = lists:sort(fun({Key1, _}, {Key2, _}) ->
+        Key1 =< Key2
+    end, AllEntries),
+
+    %% Hash all entries
+    HashCtx = crypto:hash_init(sha256),
+    FinalCtx = lists:foldl(fun({{Txid, Vout}, Utxo}, Ctx) ->
+        CoinBin = serialize_coin_for_hash(Txid, Vout, Utxo),
+        crypto:hash_update(Ctx, CoinBin)
+    end, HashCtx, Sorted),
+
+    crypto:hash_final(FinalCtx).
+
+%% Serialize a coin for hashing (deterministic format)
+serialize_coin_for_hash(Txid, Vout, #utxo{value = Value, script_pubkey = Script,
+                                          is_coinbase = IsCoinbase, height = Height}) ->
+    CoinbaseFlag = case IsCoinbase of true -> 1; false -> 0 end,
+    <<Txid:32/binary, Vout:32/big, Value:64/little, Height:32/little,
+      CoinbaseFlag:8, Script/binary>>.
+
+%% Start background validation chainstate
+start_background_validation() ->
+    %% Wait a bit for the main chainstate to be fully initialized
+    timer:sleep(1000),
+
+    %% Start the background chainstate via supervisor
+    case beamchain_chainstate_sup:start_background_chainstate() of
+        {ok, _Pid} ->
+            logger:info("chainstate: started background validation"),
+            ok;
+        {error, {already_started, _}} ->
+            logger:info("chainstate: background validation already running"),
+            ok;
+        {error, Reason} ->
+            logger:warning("chainstate: failed to start background validation: ~p",
+                           [Reason]),
+            {error, Reason}
+    end.

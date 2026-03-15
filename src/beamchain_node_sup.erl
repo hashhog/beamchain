@@ -18,7 +18,7 @@ init([]) ->
     Children = [
         child_spec(beamchain_db, worker),
         child_spec(beamchain_sig_cache, worker),
-        child_spec(beamchain_chainstate, worker),
+        child_spec(beamchain_chainstate_sup, supervisor),
         child_spec(beamchain_mempool, worker),
         child_spec(beamchain_erlay, worker),
         child_spec(beamchain_fee_estimator, worker),
