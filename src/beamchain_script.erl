@@ -2087,6 +2087,11 @@ do_verify_script(ScriptSig, ScriptPubKey, Witness, Flags, SigChecker) ->
                                      is_p2sh(ScriptPubKey),
                             Stack3 = case IsP2SH of
                                 true ->
+                                    %% BIP 16: P2SH scriptSig must be push-only (unconditional)
+                                    case is_push_only(ScriptSig) of
+                                        false -> throw(sig_pushonly);
+                                        true -> ok
+                                    end,
                                     %% The serialized script is top of StackCopy
                                     case StackCopy of
                                         [] -> throw(p2sh_no_script);
