@@ -66,6 +66,7 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] Pay-to-Anchor (P2A) outputs (witness v1 anyone-can-spend for Lightning anchors)
 - [x] Ephemeral anchor dust policy (zero-value P2A in zero-fee packages)
 - [x] REST API (block, tx, headers, chaininfo, mempool, UTXO endpoints in JSON/binary/hex)
+- [x] ZMQ pub/sub notifications (hashblock, hashtx, rawblock, rawtx, sequence topics)
 
 ## Quick start
 
@@ -113,7 +114,8 @@ src/
 ├── beamchain_miniscript.erl   Miniscript policy compiler
 ├── beamchain_transport_v2.erl BIP324 v2 encrypted transport
 ├── beamchain_erlay.erl        BIP330 Erlay set reconciliation
-└── beamchain_minisketch.erl   Minisketch library bindings
+├── beamchain_minisketch.erl   Minisketch library bindings
+└── beamchain_zmq.erl          ZMQ notification publisher
 
 c_src/
 └── beamchain_crypto_nif.c     libsecp256k1 bindings
@@ -138,7 +140,8 @@ test/
 ├── beamchain_transport_v2_tests.erl   BIP324 v2 transport tests
 ├── beamchain_erlay_tests.erl          BIP330 Erlay reconciliation tests
 ├── beamchain_snapshot_tests.erl       assumeUTXO snapshot tests
-└── beamchain_rest_tests.erl           REST API endpoint tests
+├── beamchain_rest_tests.erl           REST API endpoint tests
+└── beamchain_zmq_tests.erl            ZMQ notification tests
 ```
 
 ## Running tests
