@@ -11,6 +11,7 @@
 
 %% Sighash computation
 -export([sighash_legacy/4, sighash_witness_v0/5, sighash_taproot/7]).
+-export([find_and_delete/2]).  %% Exported for testing
 
 %%% -------------------------------------------------------------------
 %%% Script execution state
