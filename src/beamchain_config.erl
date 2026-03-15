@@ -17,7 +17,8 @@
          txindex_enabled/0,
          prune_enabled/0,
          prune_target/0,
-         mempool_full_rbf/0]).
+         mempool_full_rbf/0,
+         zmq_enabled/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -145,6 +146,33 @@ mempool_full_rbf() ->
                 _ -> true  %% Default to enabled (Bitcoin Core 28.0+)
             end;
         _ -> true
+    end.
+
+%% @doc Check if any ZMQ notification topic is configured.
+%% Returns true if any zmqpub* env var or config option is set.
+-spec zmq_enabled() -> boolean().
+zmq_enabled() ->
+    ZmqEnvVars = [
+        "BEAMCHAIN_ZMQPUBHASHBLOCK",
+        "BEAMCHAIN_ZMQPUBHASHTX",
+        "BEAMCHAIN_ZMQPUBRAWBLOCK",
+        "BEAMCHAIN_ZMQPUBRAWTX",
+        "BEAMCHAIN_ZMQPUBSEQUENCE"
+    ],
+    ZmqConfigKeys = [
+        zmqpubhashblock,
+        zmqpubhashtx,
+        zmqpubrawblock,
+        zmqpubrawtx,
+        zmqpubsequence
+    ],
+    %% Check env vars first
+    EnvEnabled = lists:any(fun(V) -> os:getenv(V) =/= false end, ZmqEnvVars),
+    case EnvEnabled of
+        true -> true;
+        false ->
+            %% Check config file
+            lists:any(fun(K) -> get(K) =/= undefined end, ZmqConfigKeys)
     end.
 
 %%% ===================================================================
