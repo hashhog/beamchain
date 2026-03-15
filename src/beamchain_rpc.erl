@@ -1400,6 +1400,16 @@ format_mempool_error(too_long_mempool_chain, _Txid) ->
     {error, ?RPC_VERIFY_REJECTED, <<"too-long-mempool-chain">>};
 format_mempool_error(rbf_not_signaled, _Txid) ->
     {error, ?RPC_VERIFY_REJECTED, <<"txn-mempool-conflict">>};
+format_mempool_error(rbf_insufficient_fee, _Txid) ->
+    {error, ?RPC_VERIFY_REJECTED, <<"insufficient fee">>};
+format_mempool_error(rbf_insufficient_additional_fee, _Txid) ->
+    {error, ?RPC_VERIFY_REJECTED, <<"insufficient fee">>};
+format_mempool_error(rbf_insufficient_fee_rate, _Txid) ->
+    {error, ?RPC_VERIFY_REJECTED, <<"insufficient fee">>};
+format_mempool_error(rbf_too_many_evictions, _Txid) ->
+    {error, ?RPC_VERIFY_REJECTED, <<"too many potential replacements">>};
+format_mempool_error(rbf_new_unconfirmed_inputs, _Txid) ->
+    {error, ?RPC_VERIFY_REJECTED, <<"replacement-adds-unconfirmed">>};
 format_mempool_error({script_verify_failed, Idx}, _Txid) ->
     {error, ?RPC_VERIFY_ERROR,
      iolist_to_binary(io_lib:format("mandatory-script-verify-flag-failed (input ~B)", [Idx]))};
@@ -1520,7 +1530,7 @@ rpc_getmempoolinfo() ->
         <<"minrelaytxfee">> => ?DEFAULT_MIN_RELAY_TX_FEE / 100000.0,
         <<"incrementalrelayfee">> => 0.00001,
         <<"unbroadcastcount">> => 0,
-        <<"fullrbf">> => false
+        <<"fullrbf">> => beamchain_config:mempool_full_rbf()
     }}.
 
 rpc_getrawmempool([]) ->
