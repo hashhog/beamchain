@@ -50,8 +50,26 @@
 %% Coin selection
 -export([select_coins/3]).
 
+%% Wallet UTXO tracking
+-export([scan_utxos_for_script/1,
+         register_wallet_script/2,
+         is_wallet_script/1,
+         add_wallet_utxo/5,
+         spend_wallet_utxo/2,
+         get_wallet_utxos/0,
+         get_wallet_balance/0,
+         scan_block_for_wallet/1]).
+
+%% Keypool
+-export([get_keypool_size/0]).
+
 -define(SERVER, ?MODULE).
 -define(HARDENED, 16#80000000).
+
+%% ETS table for wallet UTXOs: {Txid, Vout} -> {Value, ScriptPubKey, Height}
+-define(WALLET_UTXO_TABLE, beamchain_wallet_utxos).
+%% ETS table for script -> address lookup
+-define(WALLET_SCRIPT_TABLE, beamchain_wallet_scripts).
 
 %%% -------------------------------------------------------------------
 %%% HD key record
@@ -82,8 +100,15 @@
     next_change    :: #{atom() => non_neg_integer()},
     addresses      :: [map()],              %% list of address entries
     wallet_file    :: string() | undefined,
-    passphrase     :: binary() | undefined  %% kept in memory for re-saving
+    passphrase     :: binary() | undefined, %% kept in memory for re-saving
+    keypool_size   :: non_neg_integer(),    %% lookahead pool size
+    gap_limit      :: non_neg_integer()     %% BIP 44 gap limit
 }).
+
+%% Default keypool size (1000 addresses lookahead per type)
+-define(DEFAULT_KEYPOOL_SIZE, 1000).
+%% Default gap limit (20 unused addresses before stopping lookahead)
+-define(DEFAULT_GAP_LIMIT, 20).
 
 %%% ===================================================================
 %%% gen_server API
@@ -157,6 +182,11 @@ get_private_key(Address) ->
 get_wallet_info() ->
     gen_server:call(?SERVER, get_wallet_info).
 
+%% @doc Get keypool size (number of lookahead addresses).
+-spec get_keypool_size() -> {ok, non_neg_integer()}.
+get_keypool_size() ->
+    gen_server:call(?SERVER, get_keypool_size).
+
 %%% ===================================================================
 %%% gen_server callbacks
 %%% ===================================================================
@@ -169,25 +199,49 @@ init([]) ->
         mainnet -> 0 + ?HARDENED;
         _       -> 1 + ?HARDENED
     end,
+    %% Create ETS tables for wallet UTXOs and script lookup
+    init_ets_tables(),
     {ok, #wallet_state{
         network      = Network,
         coin_type    = CoinType,
         next_receive = #{p2wpkh => 0, p2tr => 0, p2pkh => 0},
         next_change  = #{p2wpkh => 0, p2tr => 0, p2pkh => 0},
-        addresses    = []
+        addresses    = [],
+        keypool_size = ?DEFAULT_KEYPOOL_SIZE,
+        gap_limit    = ?DEFAULT_GAP_LIMIT
     }}.
+
+%% @doc Initialize ETS tables for wallet UTXO tracking.
+init_ets_tables() ->
+    case ets:whereis(?WALLET_UTXO_TABLE) of
+        undefined ->
+            ets:new(?WALLET_UTXO_TABLE, [named_table, set, public,
+                                          {read_concurrency, true}]);
+        _ -> ok
+    end,
+    case ets:whereis(?WALLET_SCRIPT_TABLE) of
+        undefined ->
+            ets:new(?WALLET_SCRIPT_TABLE, [named_table, set, public,
+                                            {read_concurrency, true}]);
+        _ -> ok
+    end,
+    ok.
 
 handle_call({create, Seed, Passphrase}, _From, State) ->
     MasterKey = master_from_seed(Seed),
     WalletDir = wallet_dir(State#wallet_state.network),
     ok = filelib:ensure_dir(WalletDir ++ "/"),
     WalletFile = WalletDir ++ "/wallet.json",
-    NewState = State#wallet_state{
+    NewState0 = State#wallet_state{
         master_key  = MasterKey,
         seed        = Seed,
         wallet_file = WalletFile,
-        passphrase  = Passphrase
+        passphrase  = Passphrase,
+        keypool_size = ?DEFAULT_KEYPOOL_SIZE,
+        gap_limit    = ?DEFAULT_GAP_LIMIT
     },
+    %% Generate initial keypool of lookahead addresses
+    NewState = generate_keypool(NewState0),
     ok = save_wallet(NewState),
     {reply, {ok, Seed}, NewState};
 
@@ -271,9 +325,15 @@ handle_call(get_wallet_info, _From, State) ->
         network    => State#wallet_state.network,
         addresses  => length(State#wallet_state.addresses),
         has_seed   => State#wallet_state.seed =/= undefined,
-        wallet_file => State#wallet_state.wallet_file
+        wallet_file => State#wallet_state.wallet_file,
+        keypool_size => State#wallet_state.keypool_size,
+        gap_limit    => State#wallet_state.gap_limit
     },
     {reply, {ok, Info}, State};
+
+handle_call(get_keypool_size, _From, State) ->
+    %% Return the actual number of addresses in the keypool
+    {reply, {ok, length(State#wallet_state.addresses)}, State};
 
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_request}, State}.
@@ -286,6 +346,73 @@ handle_info(_Info, State) ->
 
 terminate(_Reason, _State) ->
     ok.
+
+%%% ===================================================================
+%%% Keypool generation
+%%% ===================================================================
+
+%% @doc Generate a keypool of lookahead addresses for UTXO detection.
+%% Generates up to keypool_size addresses for each type (P2WPKH primary).
+-spec generate_keypool(#wallet_state{}) -> #wallet_state{}.
+generate_keypool(#wallet_state{master_key = undefined} = State) ->
+    State;
+generate_keypool(State) ->
+    %% Generate keypool for P2WPKH (native SegWit) - the primary type
+    %% For performance, only generate P2WPKH keypool by default
+    KeypoolSize = State#wallet_state.keypool_size,
+    generate_keypool_for_type(p2wpkh, receive_addr, KeypoolSize, State).
+
+%% @doc Generate keypool addresses for a specific type and direction.
+-spec generate_keypool_for_type(atom(), receive_addr | change_addr,
+                                 non_neg_integer(), #wallet_state{}) ->
+    #wallet_state{}.
+generate_keypool_for_type(_Type, _Direction, 0, State) ->
+    State;
+generate_keypool_for_type(Type, Direction, Count, State) ->
+    {_Address, NewState} = generate_address_silent(Type, Direction, State),
+    generate_keypool_for_type(Type, Direction, Count - 1, NewState).
+
+%% @doc Generate address without saving (for keypool initialization).
+%% Same as generate_address but doesn't trigger a wallet save.
+generate_address_silent(Type, Direction, State) ->
+    #wallet_state{master_key = MasterKey, coin_type = CoinType,
+                  network = Network} = State,
+    {Purpose, ChainIdx, IndexMap} = case Direction of
+        receive_addr ->
+            {purpose_for_type(Type), 0,
+             State#wallet_state.next_receive};
+        change_addr ->
+            {purpose_for_type(Type), 1,
+             State#wallet_state.next_change}
+    end,
+    Index = maps:get(Type, IndexMap, 0),
+    Path = [Purpose, CoinType, ?HARDENED, ChainIdx, Index],
+    Key = derive_path(MasterKey, Path),
+    Address = make_address(Type, Key#hd_key.public_key, Network),
+    PathStr = format_path(Path),
+    AddrEntry = #{
+        <<"address">> => list_to_binary(Address),
+        <<"path">>    => list_to_binary(PathStr),
+        <<"type">>    => atom_to_binary(Type, utf8),
+        <<"change">>  => ChainIdx =:= 1
+    },
+    %% Register the script for UTXO tracking
+    {ok, ScriptPubKey} = beamchain_address:address_to_script(Address, Network),
+    register_wallet_script(ScriptPubKey, list_to_binary(Address)),
+    NewIndexMap = IndexMap#{Type => Index + 1},
+    NewState = case Direction of
+        receive_addr ->
+            State#wallet_state{
+                next_receive = NewIndexMap,
+                addresses    = State#wallet_state.addresses ++ [AddrEntry]
+            };
+        change_addr ->
+            State#wallet_state{
+                next_change = NewIndexMap,
+                addresses   = State#wallet_state.addresses ++ [AddrEntry]
+            }
+    end,
+    {Address, NewState}.
 
 %%% ===================================================================
 %%% Address generation
@@ -314,6 +441,9 @@ generate_address(Type, Direction, State) ->
         <<"type">>    => atom_to_binary(Type, utf8),
         <<"change">>  => ChainIdx =:= 1
     },
+    %% Register the script for UTXO tracking
+    {ok, ScriptPubKey} = beamchain_address:address_to_script(Address, Network),
+    register_wallet_script(ScriptPubKey, list_to_binary(Address)),
     NewIndexMap = IndexMap#{Type => Index + 1},
     NewState = case Direction of
         receive_addr ->
@@ -1058,15 +1188,108 @@ iterate_key(Pass, Salt, N, Acc) ->
                 beamchain_crypto:sha256(<<Acc/binary, Pass/binary, Salt/binary>>)).
 
 %%% ===================================================================
-%%% UTXO scanning
+%%% UTXO scanning and tracking
 %%% ===================================================================
 
-%% Scan the UTXO set for outputs matching a given scriptPubKey.
-%% This is a simplified approach — a real wallet would maintain its own index.
-scan_utxos_for_script(_ScriptPubKey) ->
-    %% TODO: integrate with chainstate UTXO index
-    %% For now return 0; needs proper UTXO scanning from ETS/DB
-    0.
+%% @doc Scan the wallet UTXO table for outputs matching a given scriptPubKey.
+%% Returns the total value of all UTXOs matching this script.
+-spec scan_utxos_for_script(binary()) -> non_neg_integer().
+scan_utxos_for_script(ScriptPubKey) ->
+    case ets:whereis(?WALLET_UTXO_TABLE) of
+        undefined -> 0;
+        _ ->
+            ets:foldl(fun({{_Txid, _Vout}, {Value, Script, _Height}}, Acc) ->
+                case Script =:= ScriptPubKey of
+                    true -> Acc + Value;
+                    false -> Acc
+                end
+            end, 0, ?WALLET_UTXO_TABLE)
+    end.
+
+%% @doc Register a script as belonging to the wallet (for UTXO tracking).
+-spec register_wallet_script(binary(), binary()) -> ok.
+register_wallet_script(ScriptPubKey, Address) ->
+    ets:insert(?WALLET_SCRIPT_TABLE, {ScriptPubKey, Address}),
+    ok.
+
+%% @doc Check if a script belongs to this wallet.
+-spec is_wallet_script(binary()) -> boolean().
+is_wallet_script(ScriptPubKey) ->
+    case ets:whereis(?WALLET_SCRIPT_TABLE) of
+        undefined -> false;
+        _ -> ets:member(?WALLET_SCRIPT_TABLE, ScriptPubKey)
+    end.
+
+%% @doc Add a UTXO to the wallet's tracked set.
+-spec add_wallet_utxo(binary(), non_neg_integer(), non_neg_integer(),
+                       binary(), non_neg_integer()) -> ok.
+add_wallet_utxo(Txid, Vout, Value, ScriptPubKey, Height) ->
+    ets:insert(?WALLET_UTXO_TABLE, {{Txid, Vout}, {Value, ScriptPubKey, Height}}),
+    ok.
+
+%% @doc Remove a UTXO from the wallet's tracked set (when spent).
+-spec spend_wallet_utxo(binary(), non_neg_integer()) -> ok.
+spend_wallet_utxo(Txid, Vout) ->
+    ets:delete(?WALLET_UTXO_TABLE, {Txid, Vout}),
+    ok.
+
+%% @doc Get all unspent wallet UTXOs.
+-spec get_wallet_utxos() -> [{binary(), non_neg_integer(), #utxo{}}].
+get_wallet_utxos() ->
+    case ets:whereis(?WALLET_UTXO_TABLE) of
+        undefined -> [];
+        _ ->
+            ets:foldl(fun({{Txid, Vout}, {Value, ScriptPubKey, Height}}, Acc) ->
+                Utxo = #utxo{
+                    value = Value,
+                    script_pubkey = ScriptPubKey,
+                    is_coinbase = false,  %% Wallet UTXOs are typically not coinbase
+                    height = Height
+                },
+                [{Txid, Vout, Utxo} | Acc]
+            end, [], ?WALLET_UTXO_TABLE)
+    end.
+
+%% @doc Get wallet balance from tracked UTXOs.
+-spec get_wallet_balance() -> non_neg_integer().
+get_wallet_balance() ->
+    case ets:whereis(?WALLET_UTXO_TABLE) of
+        undefined -> 0;
+        _ ->
+            ets:foldl(fun({{_Txid, _Vout}, {Value, _Script, _Height}}, Acc) ->
+                Acc + Value
+            end, 0, ?WALLET_UTXO_TABLE)
+    end.
+
+%% @doc Scan a block for wallet-relevant transactions.
+%% This should be called when a new block is connected.
+-spec scan_block_for_wallet(#block{}) -> ok.
+scan_block_for_wallet(Block) ->
+    Height = Block#block.height,
+    lists:foreach(fun(Tx) ->
+        %% First, mark any spent inputs
+        lists:foreach(fun(Input) ->
+            #tx_in{prev_out = #outpoint{hash = Txid, index = Vout}} = Input,
+            spend_wallet_utxo(Txid, Vout)
+        end, Tx#transaction.inputs),
+        %% Then, add any outputs to wallet addresses
+        Txid = case Tx#transaction.txid of
+            undefined -> beamchain_serialize:txid(Tx);
+            T -> T
+        end,
+        lists:foldl(fun(Output, Idx) ->
+            ScriptPubKey = Output#tx_out.script_pubkey,
+            case is_wallet_script(ScriptPubKey) of
+                true ->
+                    add_wallet_utxo(Txid, Idx, Output#tx_out.value,
+                                     ScriptPubKey, Height);
+                false ->
+                    ok
+            end,
+            Idx + 1
+        end, 0, Tx#transaction.outputs)
+    end, Block#block.transactions),
+    ok.
 
 find_address(AddrBin, #wallet_state{addresses = Addrs}) ->
     case lists:search(fun(A) ->
