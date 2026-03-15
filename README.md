@@ -138,7 +138,7 @@ Full validation of all consensus rules through the current block height:
 
 - **Script verification** — all opcodes, including `OP_CHECKSIG`, `OP_CHECKMULTISIG`, `OP_CHECKLOCKTIMEVERIFY`, `OP_CHECKSEQUENCEVERIFY`
 - **SegWit** — witness v0 (P2WPKH, P2WSH), witness v1 (Taproot key path and script path), witness cleanstack enforcement
-- **Soft fork activation** — P2SH, DERSIG, CLTV, CSV, SegWit, NULLDUMMY, NULLFAIL, WITNESS_PUBKEYTYPE, Taproot
+- **Soft fork activation** — P2SH (including push-only scriptSig), DERSIG, CLTV, CSV, SegWit, NULLDUMMY, NULLFAIL, WITNESS_PUBKEYTYPE, Taproot
 - **Difficulty adjustment** — retarget every 2016 blocks, BIP94 rules for testnet4
 - **Coinbase maturity**, **block subsidy halving**, **transaction locktime**
 
