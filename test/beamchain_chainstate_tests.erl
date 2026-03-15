@@ -26,7 +26,12 @@ chainstate_test_() ->
           {"cache stats reports correct counts", fun test_cache_stats/0},
           %% assumeUTXO tests
           {"UTXO hash computation", fun test_utxo_hash_computation/0},
-          {"snapshot role detection", fun test_snapshot_role_detection/0}
+          {"snapshot role detection", fun test_snapshot_role_detection/0},
+          %% Block invalidation/reconsideration tests
+          {"cannot invalidate genesis block", fun test_cannot_invalidate_genesis/0},
+          {"invalidating unknown block returns error", fun test_invalidate_unknown_block/0},
+          {"block status is marked invalid", fun test_block_marked_invalid/0},
+          {"reconsider clears invalid flag", fun test_reconsider_clears_flag/0}
          ]
      end}.
 
@@ -441,3 +446,83 @@ test_snapshot_role_detection() ->
 
     %% Snapshot base height should return not_snapshot for main chainstate
     ?assertEqual(not_snapshot, beamchain_chainstate:get_snapshot_base_height()).
+
+%%% ===================================================================
+%%% Block invalidation and reconsideration tests
+%%% ===================================================================
+
+test_cannot_invalidate_genesis() ->
+    %% Get genesis block hash
+    Genesis = beamchain_chain_params:genesis_block(regtest),
+    GenesisHash = Genesis#block.hash,
+
+    %% Attempting to invalidate genesis should fail
+    Result = beamchain_chainstate:invalidate_block(GenesisHash),
+    ?assertEqual({error, cannot_invalidate_genesis}, Result).
+
+test_invalidate_unknown_block() ->
+    %% Create a random non-existent block hash
+    UnknownHash = crypto:strong_rand_bytes(32),
+
+    %% Attempting to invalidate unknown block should fail
+    Result = beamchain_chainstate:invalidate_block(UnknownHash),
+    ?assertEqual({error, block_not_found}, Result).
+
+test_block_marked_invalid() ->
+    %% Create a test block at height 1
+    Genesis = beamchain_chain_params:genesis_block(regtest),
+    GenesisHash = Genesis#block.hash,
+
+    %% Create a minimal block header for height 1
+    Header1 = #block_header{
+        version = 1,
+        prev_hash = GenesisHash,
+        merkle_root = <<0:256>>,
+        timestamp = 1296688928,
+        bits = 16#207fffff,  %% regtest difficulty
+        nonce = 0
+    },
+    BlockHash1 = beamchain_serialize:block_hash(Header1),
+
+    %% Store the block index entry
+    ok = beamchain_db:store_block_index(1, BlockHash1, Header1, <<0,0,0,2>>, 3),
+
+    %% Invalidate the block
+    ok = beamchain_chainstate:invalidate_block(BlockHash1),
+
+    %% Verify the block status is now marked invalid
+    {ok, #{status := Status}} = beamchain_db:get_block_index_by_hash(BlockHash1),
+    %% BLOCK_FAILED_VALID = 32
+    ?assertNotEqual(0, Status band 32).
+
+test_reconsider_clears_flag() ->
+    %% Create another test block at height 2
+    Genesis = beamchain_chain_params:genesis_block(regtest),
+    GenesisHash = Genesis#block.hash,
+
+    Header2 = #block_header{
+        version = 1,
+        prev_hash = GenesisHash,
+        merkle_root = <<1:256>>,
+        timestamp = 1296688930,
+        bits = 16#207fffff,
+        nonce = 1
+    },
+    BlockHash2 = beamchain_serialize:block_hash(Header2),
+
+    %% Store the block index entry as valid
+    ok = beamchain_db:store_block_index(2, BlockHash2, Header2, <<0,0,0,3>>, 3),
+
+    %% Invalidate the block
+    ok = beamchain_chainstate:invalidate_block(BlockHash2),
+
+    %% Verify it's marked invalid
+    {ok, #{status := Status1}} = beamchain_db:get_block_index_by_hash(BlockHash2),
+    ?assertNotEqual(0, Status1 band 32),
+
+    %% Reconsider the block
+    ok = beamchain_chainstate:reconsider_block(BlockHash2),
+
+    %% Verify the invalid flag is cleared
+    {ok, #{status := Status2}} = beamchain_db:get_block_index_by_hash(BlockHash2),
+    ?assertEqual(0, Status2 band 32).
