@@ -21,6 +21,8 @@
          disconnect_peer/1,
          resolve_dns_seeds/0,
          is_banned/1,
+         is_whitelisted/1,
+         check_inbound/1,
          broadcast/2,
          broadcast/3,
          request_addresses/1,
@@ -42,6 +44,9 @@
 %% Misbehavior scoring thresholds
 -define(BAN_THRESHOLD, 100).
 -define(DEFAULT_BAN_DURATION, 86400).  %% 24 hours in seconds
+
+%% Connection limits (matches Bitcoin Core)
+-define(MAX_INBOUND_DEFAULT, 125).
 
 %% Misbehavior score values (Bitcoin Core compatible)
 -define(MISBEHAVIOR_INVALID_BLOCK, 100).       %% instant ban
@@ -80,7 +85,9 @@
     %% Listening socket for inbound connections
     listen_socket :: gen_tcp:socket() | undefined,
     %% Acceptor process
-    acceptor :: pid() | undefined
+    acceptor :: pid() | undefined,
+    %% Max inbound connections (default 125, like Bitcoin Core)
+    max_inbound :: non_neg_integer()
 }).
 
 %%% ===================================================================
@@ -141,6 +148,21 @@ resolve_dns_seeds() ->
 -spec is_banned({inet:ip_address(), inet:port_number()}) -> boolean().
 is_banned(Address) ->
     gen_server:call(?SERVER, {is_banned, Address}).
+
+%% @doc Check if an IP is whitelisted.
+-spec is_whitelisted(inet:ip_address()) -> boolean().
+is_whitelisted(IP) ->
+    Whitelist = beamchain_config:get(whitelist, []),
+    check_whitelist(IP, Whitelist).
+
+%% @doc Check if an inbound connection should be accepted before handshake.
+%% Returns {ok, accept} if the connection can proceed,
+%% or {reject, Reason} if it should be rejected immediately.
+%% Checks ban list, max inbound limit, and whitelist.
+-spec check_inbound({inet:ip_address(), inet:port_number()}) ->
+    {ok, accept} | {reject, banned | too_many_inbound | already_connected}.
+check_inbound(Address) ->
+    gen_server:call(?SERVER, {check_inbound, Address}).
 
 %% @doc Broadcast a message to all ready peers.
 -spec broadcast(atom(), map()) -> ok.
@@ -220,8 +242,10 @@ init([]) ->
     Timer = erlang:send_after(?CONNECT_INTERVAL, self(), connect_tick),
     %% Schedule periodic cleanup of expired bans
     erlang:send_after(60000, self(), cleanup_expired_bans),
+    MaxInbound = beamchain_config:get(max_inbound, ?MAX_INBOUND_DEFAULT),
     {ok, #state{our_nonce = Nonce, connect_timer = Timer,
-                listen_socket = ListenSock, acceptor = Acceptor}}.
+                listen_socket = ListenSock, acceptor = Acceptor,
+                max_inbound = MaxInbound}}.
 
 handle_call({connect_to, IP, Port}, _From, State) ->
     Address = {IP, Port},
@@ -253,6 +277,26 @@ handle_call({connect_to, IP, Port}, _From, State) ->
 
 handle_call({is_banned, Address}, _From, State) ->
     {reply, is_banned_internal(Address, State), State};
+
+handle_call({check_inbound, {IP, _Port} = Address}, _From, State) ->
+    %% Pre-handshake rejection check following Bitcoin Core AcceptConnection logic:
+    %% 1. Check if banned (unless whitelisted)
+    %% 2. Check if already connected
+    %% 3. Check max inbound limit
+    Whitelisted = is_whitelisted(IP),
+    Result = case Whitelisted of
+        true ->
+            %% Whitelisted IPs bypass ban check
+            check_inbound_internal(Address, State);
+        false ->
+            case is_banned_internal(Address, State) of
+                true ->
+                    {reject, banned};
+                false ->
+                    check_inbound_internal(Address, State)
+            end
+    end,
+    {reply, Result, State};
 
 handle_call(get_ban_list, _From, State) ->
     BanList = get_ban_list_internal(),
@@ -736,6 +780,77 @@ handle_misbehaving(Pid, Score, Reason, State) ->
     end.
 
 %%% ===================================================================
+%%% Internal: pre-handshake inbound connection check
+%%% ===================================================================
+
+%% @doc Internal check for inbound connection acceptance (after ban check).
+%% Checks already_connected and max inbound limits.
+check_inbound_internal(Address, #state{max_inbound = MaxInbound}) ->
+    case find_peer_by_address(Address) of
+        {ok, _Pid} ->
+            {reject, already_connected};
+        error ->
+            Inbound = inbound_count(),
+            case Inbound >= MaxInbound of
+                true ->
+                    %% At capacity - could implement eviction here (like Bitcoin Core)
+                    %% For now, just reject. Eviction is complex and involves:
+                    %% - Preferring to evict peers from over-represented netgroups
+                    %% - Protecting peers with recent activity, long connections, etc.
+                    {reject, too_many_inbound};
+                false ->
+                    {ok, accept}
+            end
+    end.
+
+%% @doc Check if an IP is in the whitelist.
+%% Whitelist entries can be IP addresses or CIDR ranges (as strings).
+check_whitelist(_IP, []) ->
+    false;
+check_whitelist(IP, [Entry | Rest]) ->
+    case match_whitelist_entry(IP, Entry) of
+        true -> true;
+        false -> check_whitelist(IP, Rest)
+    end.
+
+%% @doc Match a single whitelist entry against an IP.
+%% Supports: IP tuples, IP strings, CIDR notation.
+match_whitelist_entry(IP, Entry) when is_tuple(Entry), is_tuple(IP) ->
+    %% Direct IP tuple comparison
+    IP =:= Entry;
+match_whitelist_entry(IP, Entry) when is_list(Entry) ->
+    %% String entry - could be IP or CIDR
+    case string:split(Entry, "/") of
+        [IPStr, MaskStr] ->
+            %% CIDR notation
+            case {inet:parse_address(IPStr), list_to_integer(MaskStr)} of
+                {{ok, NetIP}, Mask} ->
+                    ip_in_cidr(IP, NetIP, Mask);
+                _ ->
+                    false
+            end;
+        [IPStr] ->
+            %% Plain IP string
+            case inet:parse_address(IPStr) of
+                {ok, ParsedIP} -> IP =:= ParsedIP;
+                _ -> false
+            end
+    end;
+match_whitelist_entry(_, _) ->
+    false.
+
+%% @doc Check if an IP is in a CIDR range.
+ip_in_cidr({A1, A2, A3, A4}, {B1, B2, B3, B4}, Mask) when Mask >= 0, Mask =< 32 ->
+    %% Convert to 32-bit integers and compare with mask
+    IP1 = (A1 bsl 24) bor (A2 bsl 16) bor (A3 bsl 8) bor A4,
+    IP2 = (B1 bsl 24) bor (B2 bsl 16) bor (B3 bsl 8) bor B4,
+    MaskBits = (16#FFFFFFFF bsl (32 - Mask)) band 16#FFFFFFFF,
+    (IP1 band MaskBits) =:= (IP2 band MaskBits);
+ip_in_cidr(_, _, _) ->
+    %% IPv6 or invalid - not supported yet
+    false.
+
+%%% ===================================================================
 %%% Internal: inbound connections
 %%% ===================================================================
 
@@ -768,9 +883,21 @@ accept_loop(LSock, Manager) ->
     case gen_tcp:accept(LSock) of
         {ok, Socket} ->
             case inet:peername(Socket) of
-                {ok, {IP, Port}} ->
-                    %% Transfer socket ownership to manager temporarily
-                    Manager ! {accepted, Socket, {IP, Port}};
+                {ok, {IP, Port} = Address} ->
+                    %% Pre-handshake rejection check - do this BEFORE spawning
+                    %% a peer process to save resources. This matches Bitcoin Core's
+                    %% AcceptConnection behavior.
+                    case beamchain_peer_manager:check_inbound(Address) of
+                        {ok, accept} ->
+                            %% Transfer socket to manager for peer creation
+                            Manager ! {accepted, Socket, Address};
+                        {reject, Reason} ->
+                            %% Reject immediately without protocol messages.
+                            %% Just close socket (sends TCP RST).
+                            logger:debug("pre-handshake reject ~p:~B: ~p",
+                                         [IP, Port, Reason]),
+                            gen_tcp:close(Socket)
+                    end;
                 {error, _} ->
                     gen_tcp:close(Socket)
             end,
@@ -784,39 +911,29 @@ accept_loop(LSock, Manager) ->
     end.
 
 handle_inbound(Socket, Address, State) ->
-    case can_accept_inbound(Address, State) of
-        true ->
-            case beamchain_peer:accept(Socket, Address, self()) of
-                {ok, Pid} ->
-                    %% Transfer socket ownership to peer process
-                    gen_tcp:controlling_process(Socket, Pid),
-                    MonRef = erlang:monitor(process, Pid),
-                    Entry = #peer_entry{
-                        pid = Pid,
-                        address = Address,
-                        direction = inbound,
-                        mon_ref = MonRef,
-                        connected = false
-                    },
-                    ets:insert(?PEER_TABLE, Entry),
-                    logger:debug("accepted inbound from ~p", [Address]),
-                    State;
-                {error, Reason} ->
-                    logger:debug("failed to accept from ~p: ~p",
-                                 [Address, Reason]),
-                    gen_tcp:close(Socket),
-                    State
-            end;
-        false ->
+    %% Pre-handshake check was already done in accept_loop.
+    %% At this point we just spawn the peer process.
+    case beamchain_peer:accept(Socket, Address, self()) of
+        {ok, Pid} ->
+            %% Transfer socket ownership to peer process
+            gen_tcp:controlling_process(Socket, Pid),
+            MonRef = erlang:monitor(process, Pid),
+            Entry = #peer_entry{
+                pid = Pid,
+                address = Address,
+                direction = inbound,
+                mon_ref = MonRef,
+                connected = false
+            },
+            ets:insert(?PEER_TABLE, Entry),
+            logger:debug("accepted inbound from ~p", [Address]),
+            State;
+        {error, Reason} ->
+            logger:debug("failed to accept from ~p: ~p",
+                         [Address, Reason]),
             gen_tcp:close(Socket),
             State
     end.
-
-can_accept_inbound(Address, State) ->
-    Inbound = inbound_count(),
-    not is_banned_internal(Address, State)
-        andalso find_peer_by_address(Address) =:= error
-        andalso Inbound < ?MAX_INBOUND.
 
 %%% ===================================================================
 %%% Internal: DNS seed resolution
