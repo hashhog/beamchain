@@ -11,7 +11,7 @@
 -export([start_link/0]).
 
 %% Transaction submission
--export([add_transaction/1]).
+-export([add_transaction/1, accept_package/1]).
 
 %% Queries
 -export([has_tx/1, get_tx/1, get_entry/1]).
@@ -99,6 +99,14 @@ start_link() ->
 -spec add_transaction(#transaction{}) -> {ok, binary()} | {error, term()}.
 add_transaction(Tx) ->
     gen_server:call(?SERVER, {add_tx, Tx}, 30000).
+
+%% @doc Submit a package of related transactions to the mempool.
+%% Transactions must be topologically sorted (parents before children).
+%% A child can pay fees for its low-fee parent (CPFP).
+-spec accept_package([#transaction{}]) ->
+    {ok, [binary()]} | {error, term()}.
+accept_package(Package) ->
+    gen_server:call(?SERVER, {accept_package, Package}, 60000).
 
 %% @doc Check if a transaction is in the mempool.
 -spec has_tx(binary()) -> boolean().
@@ -212,6 +220,14 @@ handle_call({add_tx, Tx}, _From, State) ->
     case do_add_transaction(Tx, State) of
         {ok, Txid, State2} ->
             {reply, {ok, Txid}, State2};
+        {error, Reason} ->
+            {reply, {error, Reason}, State}
+    end;
+
+handle_call({accept_package, Package}, _From, State) ->
+    case do_accept_package(Package, State) of
+        {ok, Txids, State2} ->
+            {reply, {ok, Txids}, State2};
         {error, Reason} ->
             {reply, {error, Reason}, State}
     end;
@@ -374,6 +390,397 @@ do_add_transaction(Tx, State) ->
         throw:Reason ->
             {error, Reason}
     end.
+
+%%% ===================================================================
+%%% Internal: package acceptance
+%%% ===================================================================
+
+%% @doc Accept a package of transactions with CPFP support.
+%% Implements Bitcoin Core's AcceptPackage logic.
+do_accept_package([], _State) ->
+    {error, empty_package};
+do_accept_package(Package, State) ->
+    try
+        %% 1. Context-free package validation
+        validate_package_structure(Package),
+
+        %% 2. Compute txids for deduplication
+        TxidTxPairs = [{beamchain_serialize:tx_hash(Tx), Tx} || Tx <- Package],
+
+        %% 3. Try each transaction individually, track results
+        {AcceptedTxids, DeferredTxs, State2} =
+            try_individual_accept(TxidTxPairs, State),
+
+        %% 4. If no deferred transactions, we're done
+        case DeferredTxs of
+            [] ->
+                {ok, AcceptedTxids, State2};
+            _ ->
+                %% 5. Evaluate deferred transactions as a package (CPFP)
+                evaluate_package_cpfp(DeferredTxs, AcceptedTxids, State2)
+        end
+    catch
+        throw:Reason ->
+            {error, Reason}
+    end.
+
+%% Validate package structure (context-free checks).
+validate_package_structure(Package) when length(Package) > ?MAX_PACKAGE_COUNT ->
+    throw(package_too_many_transactions);
+validate_package_structure(Package) ->
+    %% Check total weight (only for multi-tx packages)
+    case length(Package) > 1 of
+        true ->
+            TotalWeight = lists:foldl(fun(Tx, Acc) ->
+                Acc + beamchain_serialize:tx_weight(Tx)
+            end, 0, Package),
+            TotalWeight =< ?MAX_PACKAGE_WEIGHT orelse throw(package_too_large);
+        false ->
+            ok
+    end,
+
+    %% Check for duplicate transactions
+    Txids = [beamchain_serialize:tx_hash(Tx) || Tx <- Package],
+    length(lists:usort(Txids)) =:= length(Txids)
+        orelse throw(package_contains_duplicates),
+
+    %% Check topological ordering (parents before children)
+    is_topo_sorted(Package) orelse throw(package_not_sorted),
+
+    %% Check no conflicting inputs within package
+    is_consistent_package(Package) orelse throw(conflict_in_package),
+
+    %% For multi-tx packages, verify child-with-parents structure
+    case length(Package) > 1 of
+        true ->
+            is_child_with_parents(Package) orelse throw(package_not_child_with_parents);
+        false ->
+            ok
+    end,
+
+    ok.
+
+%% Check if package is topologically sorted (parents before children).
+%% A package is topo-sorted if no transaction spends an output that appears later.
+is_topo_sorted(Package) ->
+    Txids = [beamchain_serialize:tx_hash(Tx) || Tx <- Package],
+    TxidSet = sets:from_list(Txids),
+    is_topo_sorted_loop(Package, TxidSet).
+
+is_topo_sorted_loop([], _LaterTxids) ->
+    true;
+is_topo_sorted_loop([Tx | Rest], LaterTxids) ->
+    Txid = beamchain_serialize:tx_hash(Tx),
+    %% Check if any input spends a tx that comes later
+    SpendsFuture = lists:any(fun(#tx_in{prev_out = #outpoint{hash = H}}) ->
+        H =/= Txid andalso sets:is_element(H, LaterTxids)
+    end, Tx#transaction.inputs),
+    case SpendsFuture of
+        true -> false;
+        false ->
+            %% Remove this txid from the "later" set
+            LaterTxids2 = sets:del_element(Txid, LaterTxids),
+            is_topo_sorted_loop(Rest, LaterTxids2)
+    end.
+
+%% Check that no two transactions in the package spend the same input.
+is_consistent_package(Package) ->
+    AllInputs = lists:flatmap(fun(#transaction{inputs = Inputs}) ->
+        [{In#tx_in.prev_out#outpoint.hash, In#tx_in.prev_out#outpoint.index}
+         || In <- Inputs]
+    end, Package),
+    length(lists:usort(AllInputs)) =:= length(AllInputs).
+
+%% Check if package is child-with-parents (last tx is child, all others are parents).
+%% All parent txids must be inputs to the child.
+is_child_with_parents([_]) ->
+    true;  %% Single tx is trivially valid
+is_child_with_parents(Package) when length(Package) < 2 ->
+    false;
+is_child_with_parents(Package) ->
+    %% Last tx is the child
+    Child = lists:last(Package),
+    Parents = lists:droplast(Package),
+    %% Child must spend at least one output from each parent
+    ChildInputTxids = sets:from_list([
+        In#tx_in.prev_out#outpoint.hash
+        || In <- Child#transaction.inputs
+    ]),
+    %% Every parent's txid must be in the child's input set
+    lists:all(fun(P) ->
+        Txid = beamchain_serialize:tx_hash(P),
+        sets:is_element(Txid, ChildInputTxids)
+    end, Parents).
+
+%% Try to accept each transaction individually.
+%% Returns {AcceptedTxids, DeferredTxs, UpdatedState}
+%% DeferredTxs contains {Txid, Tx} pairs that failed due to fee issues.
+try_individual_accept(TxidTxPairs, State) ->
+    try_individual_accept(TxidTxPairs, State, [], []).
+
+try_individual_accept([], State, AcceptedAcc, DeferredAcc) ->
+    {lists:reverse(AcceptedAcc), lists:reverse(DeferredAcc), State};
+try_individual_accept([{Txid, Tx} | Rest], State, AcceptedAcc, DeferredAcc) ->
+    %% Check if already in mempool
+    case ets:member(?MEMPOOL_TXS, Txid) of
+        true ->
+            %% Already in mempool, treat as accepted
+            try_individual_accept(Rest, State, [Txid | AcceptedAcc], DeferredAcc);
+        false ->
+            case do_add_transaction(Tx, State) of
+                {ok, Txid, State2} ->
+                    try_individual_accept(Rest, State2, [Txid | AcceptedAcc], DeferredAcc);
+                {error, mempool_min_fee_not_met} ->
+                    %% Defer for package evaluation (CPFP)
+                    try_individual_accept(Rest, State, AcceptedAcc,
+                                          [{Txid, Tx} | DeferredAcc]);
+                {error, orphan} ->
+                    %% Missing inputs - defer for package (parent may be earlier in pkg)
+                    try_individual_accept(Rest, State, AcceptedAcc,
+                                          [{Txid, Tx} | DeferredAcc]);
+                {error, Reason} ->
+                    %% Non-recoverable failure - abort entire package
+                    throw({tx_failed, Txid, Reason})
+            end
+    end.
+
+%% Evaluate deferred transactions as a package with CPFP.
+%% Calculates aggregate package fee rate and accepts if sufficient.
+evaluate_package_cpfp(DeferredTxs, AlreadyAccepted, State) ->
+    %% Build a map of package outputs for input lookup
+    PackageTxMap = maps:from_list(DeferredTxs),
+
+    %% Calculate total fees and vsize for the package
+    {TotalFee, TotalVSize, TxEntries} =
+        compute_package_metrics(DeferredTxs, PackageTxMap, State),
+
+    %% Calculate package fee rate
+    PackageFeeRate = TotalFee / max(1, TotalVSize),
+
+    %% Check against minimum relay fee (1 sat/vB)
+    PackageFeeRate >= 1.0 orelse throw(package_fee_too_low),
+
+    %% Check for package RBF
+    AllConflicts = find_all_package_conflicts(DeferredTxs),
+    case AllConflicts of
+        [] ->
+            ok;
+        _ ->
+            do_package_rbf(DeferredTxs, TotalFee, TotalVSize, AllConflicts)
+    end,
+
+    %% Accept all deferred transactions
+    State2 = accept_package_txs(TxEntries, State),
+
+    AcceptedTxids = AlreadyAccepted ++ [Txid || {Txid, _} <- DeferredTxs],
+    logger:debug("mempool: accepted package of ~B txs (pkg_fee_rate=~.1f sat/vB)",
+                 [length(DeferredTxs), PackageFeeRate]),
+    {ok, AcceptedTxids, State2}.
+
+%% Compute package metrics: total fee, total vsize, and entry data.
+compute_package_metrics(TxPairs, PackageTxMap, _State) ->
+    {ok, {_TipHash, TipHeight}} = beamchain_chainstate:get_tip(),
+    Now = erlang:system_time(second),
+
+    lists:foldl(fun({Txid, Tx}, {FeeAcc, VSizeAcc, EntriesAcc}) ->
+        %% Look up inputs (UTXO set + mempool + package)
+        {InputCoins, SpendsCoinbase} = lookup_inputs_with_package(Tx, PackageTxMap),
+
+        %% Compute fee
+        TotalIn = lists:foldl(fun(C, A) -> A + C#utxo.value end, 0, InputCoins),
+        TotalOut = lists:foldl(fun(#tx_out{value = V}, A) -> A + V end,
+                               0, Tx#transaction.outputs),
+        TotalIn >= TotalOut orelse throw(insufficient_fee),
+        Fee = TotalIn - TotalOut,
+
+        %% Compute size metrics
+        Weight = beamchain_serialize:tx_weight(Tx),
+        VSize = beamchain_serialize:tx_vsize(Tx),
+        Size = byte_size(beamchain_serialize:encode_transaction(Tx)),
+        FeeRate = Fee / max(1, VSize),
+
+        Wtxid = beamchain_serialize:wtx_hash(Tx),
+        RbfSignaling = lists:any(fun(#tx_in{sequence = Seq}) ->
+            Seq < 16#fffffffe
+        end, Tx#transaction.inputs),
+
+        Entry = #mempool_entry{
+            txid = Txid,
+            wtxid = Wtxid,
+            tx = Tx,
+            fee = Fee,
+            size = Size,
+            vsize = VSize,
+            weight = Weight,
+            fee_rate = FeeRate,
+            time_added = Now,
+            height_added = TipHeight,
+            ancestor_count = 1,
+            ancestor_size = VSize,
+            ancestor_fee = Fee,
+            descendant_count = 1,
+            descendant_size = VSize,
+            descendant_fee = Fee,
+            spends_coinbase = SpendsCoinbase,
+            rbf_signaling = RbfSignaling
+        },
+
+        {FeeAcc + Fee, VSizeAcc + VSize, [{Txid, Tx, Entry, InputCoins} | EntriesAcc]}
+    end, {0, 0, []}, TxPairs).
+
+%% Look up inputs for a package transaction.
+%% Checks UTXO set, mempool, then package outputs.
+lookup_inputs_with_package(#transaction{inputs = Inputs}, PackageTxMap) ->
+    {Coins, AnyMissing, AnyCoinbase} = lists:foldl(
+        fun(#tx_in{prev_out = #outpoint{hash = H, index = I}},
+            {Acc, Missing, Cb}) ->
+            case beamchain_chainstate:get_utxo(H, I) of
+                {ok, Coin} ->
+                    {[Coin | Acc], Missing, Cb orelse Coin#utxo.is_coinbase};
+                not_found ->
+                    case get_mempool_utxo(H, I) of
+                        {ok, Coin} ->
+                            {[Coin | Acc], Missing, Cb};
+                        not_found ->
+                            %% Check package outputs
+                            case get_package_utxo(H, I, PackageTxMap) of
+                                {ok, Coin} ->
+                                    {[Coin | Acc], Missing, Cb};
+                                not_found ->
+                                    {Acc, true, Cb}
+                            end
+                    end
+            end
+        end,
+        {[], false, false},
+        Inputs),
+    case AnyMissing of
+        true -> throw(missing_inputs);
+        false -> {lists:reverse(Coins), AnyCoinbase}
+    end.
+
+%% Get output from a package transaction.
+get_package_utxo(Txid, Vout, PackageTxMap) ->
+    case maps:get(Txid, PackageTxMap, undefined) of
+        undefined ->
+            not_found;
+        Tx ->
+            Outputs = Tx#transaction.outputs,
+            case Vout < length(Outputs) of
+                true ->
+                    Out = lists:nth(Vout + 1, Outputs),
+                    {ok, #utxo{
+                        value = Out#tx_out.value,
+                        script_pubkey = Out#tx_out.script_pubkey,
+                        is_coinbase = false,
+                        height = 0
+                    }};
+                false ->
+                    not_found
+            end
+    end.
+
+%% Find all mempool conflicts for the package.
+find_all_package_conflicts(TxPairs) ->
+    lists:usort(lists:flatmap(fun({_Txid, Tx}) ->
+        find_mempool_conflicts(Tx)
+    end, TxPairs)).
+
+%% Handle package RBF.
+do_package_rbf(_TxPairs, TotalFee, TotalVSize, ConflictTxids) ->
+    %% Gather all conflicting entries
+    ConflictEntries = lists:filtermap(fun(Cid) ->
+        case ets:lookup(?MEMPOOL_TXS, Cid) of
+            [{_, E}] -> {true, E};
+            [] -> false
+        end
+    end, ConflictTxids),
+
+    %% Check RBF signaling (unless full RBF is enabled)
+    FullRbfEnabled = beamchain_config:mempool_full_rbf(),
+    case FullRbfEnabled of
+        true -> ok;
+        false ->
+            lists:foreach(fun(E) ->
+                E#mempool_entry.rbf_signaling orelse throw(rbf_not_signaled)
+            end, ConflictEntries)
+    end,
+
+    %% Collect all descendants of conflicting txs
+    AllEvictTxids = lists:usort(lists:flatmap(fun(Cid) ->
+        [Cid | get_all_descendants(Cid)]
+    end, ConflictTxids)),
+    length(AllEvictTxids) =< ?MAX_RBF_EVICTIONS
+        orelse throw(rbf_too_many_evictions),
+
+    AllEvictEntries = lists:filtermap(fun(Eid) ->
+        case ets:lookup(?MEMPOOL_TXS, Eid) of
+            [{_, E}] -> {true, E};
+            [] -> false
+        end
+    end, AllEvictTxids),
+
+    %% Package fee must be >= sum of all evicted fees
+    EvictedFeeTotal = lists:foldl(fun(E, Acc) ->
+        Acc + E#mempool_entry.fee
+    end, 0, AllEvictEntries),
+    TotalFee >= EvictedFeeTotal orelse throw(rbf_insufficient_fee),
+
+    %% Additional fee must cover incremental relay fee
+    MinAdditionalFee = TotalVSize,  %% 1 sat/vB * vsize
+    (TotalFee - EvictedFeeTotal) >= MinAdditionalFee
+        orelse throw(rbf_insufficient_additional_fee),
+
+    %% Package fee rate must exceed all conflict fee rates
+    PackageFeeRate = TotalFee / max(1, TotalVSize),
+    lists:foreach(fun(E) ->
+        PackageFeeRate > E#mempool_entry.fee_rate
+            orelse throw(rbf_insufficient_fee_rate)
+    end, ConflictEntries),
+
+    %% Evict all conflicting txs + descendants
+    lists:foreach(fun(EvictTxid) ->
+        remove_entry(EvictTxid)
+    end, AllEvictTxids),
+
+    logger:debug("mempool: package rbf evicted ~B txs", [length(AllEvictTxids)]),
+    ok.
+
+%% Accept all package transactions (after CPFP validation passed).
+accept_package_txs(TxEntries, State) ->
+    lists:foldl(fun({Txid, Tx, Entry, InputCoins}, St) ->
+        %% Verify scripts
+        verify_scripts(Tx, InputCoins),
+
+        %% Check ancestor/descendant limits
+        VSize = Entry#mempool_entry.vsize,
+        Fee = Entry#mempool_entry.fee,
+        {AncCount, AncSize, AncFee} = compute_ancestors(Tx, Fee, VSize),
+        AncCount =< ?MAX_ANCESTOR_COUNT orelse throw(too_long_mempool_chain),
+        AncSize =< ?MAX_ANCESTOR_SIZE orelse throw(too_long_mempool_chain),
+        check_descendant_limits(Tx, VSize),
+
+        %% Update entry with computed ancestors
+        Entry2 = Entry#mempool_entry{
+            ancestor_count = AncCount,
+            ancestor_size = AncSize,
+            ancestor_fee = AncFee
+        },
+
+        %% Insert into tables
+        insert_entry(Entry2),
+
+        %% Update ancestors
+        update_ancestors_for_new_tx(Tx, VSize, Fee),
+
+        %% Reprocess orphans
+        reprocess_orphans(Txid),
+
+        St#state{
+            total_bytes = St#state.total_bytes + VSize,
+            total_count = St#state.total_count + 1
+        }
+    end, State, lists:reverse(TxEntries)).
 
 %%% ===================================================================
 %%% Internal: input lookup
