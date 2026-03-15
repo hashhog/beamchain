@@ -18,6 +18,22 @@
 
 %% Block index
 -export([store_block_index/5, get_block_index/1, get_block_index_by_hash/1]).
+-export([update_block_status/2, get_all_block_indexes/0]).
+
+%% Block status constants (Bitcoin Core compatible)
+%% These correspond to bits in the nStatus field of CBlockIndex.
+-define(BLOCK_VALID_HEADER, 1).         %% Parsed, version ok, hash satisfies claimed PoW
+-define(BLOCK_VALID_TREE, 2).           %% Valid header, parent is known
+-define(BLOCK_VALID_TRANSACTIONS, 3).   %% All txs loaded and parseable
+-define(BLOCK_VALID_CHAIN, 4).          %% All txs valid for this block and all parents
+-define(BLOCK_VALID_SCRIPTS, 5).        %% All script/signature verification passed
+-define(BLOCK_HAVE_DATA, 8).            %% Block data stored in blk*.dat
+-define(BLOCK_HAVE_UNDO, 16).           %% Block undo data available
+-define(BLOCK_FAILED_VALID, 32).        %% Block or ancestor failed validation
+-define(BLOCK_FAILED_CHILD, 64).        %% Descends from a failed block (unused in Core)
+
+-export_type([block_status/0]).
+-type block_status() :: non_neg_integer().
 
 %% Chain tip (fully validated blocks)
 -export([get_chain_tip/0, set_chain_tip/2]).
@@ -167,6 +183,16 @@ get_block_index(Height) ->
            chainwork => binary(), status => integer()}} | not_found.
 get_block_index_by_hash(Hash) when byte_size(Hash) =:= 32 ->
     gen_server:call(?SERVER, {get_block_index_by_hash, Hash}, 30000).
+
+%% @doc Update block index status (for invalidateblock/reconsiderblock)
+-spec update_block_status(binary(), non_neg_integer()) -> ok | {error, term()}.
+update_block_status(Hash, NewStatus) when byte_size(Hash) =:= 32 ->
+    gen_server:call(?SERVER, {update_block_status, Hash, NewStatus}, 30000).
+
+%% @doc Get all block index entries (for finding descendants)
+-spec get_all_block_indexes() -> {ok, [map()]} | {error, term()}.
+get_all_block_indexes() ->
+    gen_server:call(?SERVER, get_all_block_indexes, 60000).
 
 %% @doc Get the current chain tip
 -spec get_chain_tip() -> {ok, #{hash => binary(), height => integer()}} | not_found.
@@ -681,6 +707,46 @@ handle_call({is_block_pruned, Hash}, _From, State) ->
     Result = check_block_pruned(Hash, State),
     {reply, Result, State};
 
+%% Update block index status (for invalidateblock/reconsiderblock)
+handle_call({update_block_status, Hash, NewStatus}, _From,
+            #state{db_handle = Db, cf_block_idx = CF, cf_meta = MetaCF} = State) ->
+    %% First look up the height from the reverse index
+    HashKey = <<"blkidx:", Hash/binary>>,
+    Result = case rocksdb:get(Db, MetaCF, HashKey, []) of
+        {ok, HeightKey} ->
+            %% Get the current entry
+            case rocksdb:get(Db, CF, HeightKey, []) of
+                {ok, Bin} ->
+                    Entry = decode_block_index_entry(Bin),
+                    %% Re-encode with new status
+                    #{hash := H, header := Header, chainwork := Chainwork} = Entry,
+                    NewValue = encode_block_index_entry(H, Header, Chainwork, NewStatus),
+                    case rocksdb:put(Db, CF, HeightKey, NewValue, []) of
+                        ok -> ok;
+                        Error -> Error
+                    end;
+                not_found ->
+                    {error, block_index_not_found}
+            end;
+        not_found ->
+            {error, block_not_found}
+    end,
+    {reply, Result, State};
+
+%% Get all block indexes (for finding descendants during invalidation)
+handle_call(get_all_block_indexes, _From,
+            #state{db_handle = Db, cf_block_idx = CF} = State) ->
+    %% Iterate over all block index entries
+    Result = case rocksdb:iterator(Db, CF, []) of
+        {ok, Iter} ->
+            Entries = collect_block_indexes(rocksdb:iterator_move(Iter, first), Iter, []),
+            rocksdb:iterator_close(Iter),
+            {ok, Entries};
+        Error ->
+            Error
+    end,
+    {reply, Result, State};
+
 handle_call(_Request, _From, State) ->
     {reply, {error, not_implemented}, State}.
 
@@ -782,6 +848,15 @@ decode_block_index_entry(<<Hash:32/binary, HeaderBin:80/binary,
     {Header, <<>>} = beamchain_serialize:decode_block_header(HeaderBin),
     #{hash => Hash, header => Header,
       chainwork => Chainwork, status => Status}.
+
+%% @doc Collect all block index entries from iterator
+collect_block_indexes({error, _}, _Iter, Acc) ->
+    lists:reverse(Acc);
+collect_block_indexes({ok, Key, Value}, Iter, Acc) ->
+    <<Height:64/big>> = Key,
+    Entry = decode_block_index_entry(Value),
+    collect_block_indexes(rocksdb:iterator_move(Iter, next), Iter,
+                          [Entry#{height => Height} | Acc]).
 
 %% @doc Resolve a batch operation's CF name to a CF handle
 resolve_batch_op({put, CF, Key, Value}, State) ->
