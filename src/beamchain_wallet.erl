@@ -5,7 +5,7 @@
 -include("beamchain_protocol.hrl").
 
 %% gen_server API
--export([start_link/0,
+-export([start_link/0, start_link/1,
          create/0, create/1, create/2,
          load/1, load/2,
          get_new_address/0, get_new_address/1,
@@ -14,6 +14,15 @@
          get_balance/0,
          get_private_key/1,
          get_wallet_info/0]).
+
+%% Multi-wallet API (wallet name as first parameter)
+-export([get_new_address/2,
+         get_change_address/2,
+         list_addresses/1,
+         get_balance/1,
+         get_private_key/2,
+         get_wallet_info/1,
+         is_locked/1]).
 
 %% Wallet encryption API
 -export([encryptwallet/1,
@@ -101,6 +110,7 @@
 %%% -------------------------------------------------------------------
 
 -record(wallet_state, {
+    wallet_name    :: binary(),             %% wallet name (<<>> for default)
     master_key     :: #hd_key{} | undefined,
     seed           :: binary() | undefined,
     network        :: atom(),
@@ -130,7 +140,14 @@
 %%% ===================================================================
 
 start_link() ->
-    gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
+    gen_server:start_link({local, ?SERVER}, ?MODULE, [<<>>], []).
+
+%% @doc Start a wallet with a specific name.
+%% Used by beamchain_wallet_sup for multi-wallet support.
+-spec start_link(binary()) -> {ok, pid()} | {error, term()}.
+start_link(WalletName) when is_binary(WalletName) ->
+    %% Don't register with a name - managed by wallet_sup registry
+    gen_server:start_link(?MODULE, [WalletName], []).
 
 %% @doc Create a new wallet with a random 32-byte seed.
 -spec create() -> {ok, Seed :: binary()} | {error, term()}.
@@ -232,10 +249,51 @@ is_locked() ->
     gen_server:call(?SERVER, is_locked).
 
 %%% ===================================================================
+%%% Multi-wallet API (wallet specified by pid)
+%%% ===================================================================
+
+%% @doc Get a new address from a specific wallet.
+-spec get_new_address(pid(), p2wpkh | p2tr | p2pkh) -> {ok, string()} | {error, term()}.
+get_new_address(Pid, Type) when is_pid(Pid) ->
+    gen_server:call(Pid, {get_new_address, Type}).
+
+%% @doc Get a change address from a specific wallet.
+-spec get_change_address(pid(), p2wpkh | p2tr | p2pkh) -> {ok, string()} | {error, term()}.
+get_change_address(Pid, Type) when is_pid(Pid) ->
+    gen_server:call(Pid, {get_change_address, Type}).
+
+%% @doc List all addresses from a specific wallet.
+-spec list_addresses(pid()) -> {ok, [map()]} | {error, term()}.
+list_addresses(Pid) when is_pid(Pid) ->
+    gen_server:call(Pid, list_addresses).
+
+%% @doc Get balance from a specific wallet.
+-spec get_balance(pid()) -> {ok, non_neg_integer()} | {error, term()}.
+get_balance(Pid) when is_pid(Pid) ->
+    gen_server:call(Pid, get_balance).
+
+%% @doc Get private key from a specific wallet.
+-spec get_private_key(pid(), string()) -> {ok, binary()} | {error, term()}.
+get_private_key(Pid, Address) when is_pid(Pid) ->
+    gen_server:call(Pid, {get_private_key, Address}).
+
+%% @doc Get wallet info from a specific wallet.
+-spec get_wallet_info(pid()) -> {ok, map()} | {error, term()}.
+get_wallet_info(Pid) when is_pid(Pid) ->
+    gen_server:call(Pid, get_wallet_info).
+
+%% @doc Check if a specific wallet is locked.
+-spec is_locked(pid()) -> boolean().
+is_locked(Pid) when is_pid(Pid) ->
+    gen_server:call(Pid, is_locked).
+
+%%% ===================================================================
 %%% gen_server callbacks
 %%% ===================================================================
 
 init([]) ->
+    init([<<>>]);
+init([WalletName]) when is_binary(WalletName) ->
     Network = try beamchain_config:network()
               catch _:_ -> mainnet
               end,
@@ -246,6 +304,7 @@ init([]) ->
     %% Create ETS tables for wallet UTXOs and script lookup
     init_ets_tables(),
     {ok, #wallet_state{
+        wallet_name  = WalletName,
         network      = Network,
         coin_type    = CoinType,
         next_receive = #{p2wpkh => 0, p2tr => 0, p2pkh => 0},
@@ -401,6 +460,7 @@ handle_call({get_private_key, Address}, _From, State) ->
 
 handle_call(get_wallet_info, _From, State) ->
     Info = #{
+        wallet_name => State#wallet_state.wallet_name,
         network    => State#wallet_state.network,
         addresses  => length(State#wallet_state.addresses),
         has_seed   => State#wallet_state.seed =/= undefined,
