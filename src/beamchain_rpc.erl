@@ -130,6 +130,22 @@ terminate(_Reason, _State) ->
     ok.
 
 %%% ===================================================================
+%%% Parallel map for batch processing
+%%% ===================================================================
+
+%% Parallel map using spawn_link and message passing.
+%% Executes Fun on each element of List concurrently and returns results
+%% in the same order as the input list.
+pmap(Fun, List) ->
+    Parent = self(),
+    Refs = [begin
+        Ref = make_ref(),
+        spawn_link(fun() -> Parent ! {Ref, Fun(E)} end),
+        Ref
+    end || E <- List],
+    [receive {Ref, R} -> R end || Ref <- Refs].
+
+%%% ===================================================================
 %%% Cowboy handler
 %%% ===================================================================
 
@@ -170,10 +186,16 @@ process_body(Req0, CowboyState) ->
     {ok, Body, Req1} = cowboy_req:read_body(Req0),
     try jsx:decode(Body, [return_maps]) of
         Request when is_map(Request) ->
+            %% Single request
             Response = dispatch(Request),
             reply_json(Response, Req1, CowboyState);
+        [] ->
+            %% Empty batch is an invalid request per JSON-RPC 2.0 spec
+            reply_json(error_obj(null, ?RPC_INVALID_REQUEST,
+                <<"Invalid Request: empty batch">>), Req1, CowboyState);
         Batch when is_list(Batch) ->
-            Responses = [dispatch(R) || R <- Batch, is_map(R)],
+            %% Batch request: process each independently with parallel execution
+            Responses = handle_batch(Batch),
             reply_json(Responses, Req1, CowboyState);
         _ ->
             reply_json(error_obj(null, ?RPC_PARSE_ERROR,
@@ -183,6 +205,21 @@ process_body(Req0, CowboyState) ->
             reply_json(error_obj(null, ?RPC_PARSE_ERROR,
                 <<"Parse error">>), Req1, CowboyState)
     end.
+
+%% Handle a batch of JSON-RPC requests.
+%% Each request is processed independently; individual failures don't
+%% affect other requests. Non-object elements return invalid request errors.
+%% Uses parallel execution for better throughput.
+handle_batch(Batch) ->
+    pmap(fun handle_batch_element/1, Batch).
+
+%% Handle a single element in a batch request.
+%% Returns a proper error for non-object elements.
+handle_batch_element(Request) when is_map(Request) ->
+    dispatch(Request);
+handle_batch_element(_NonObject) ->
+    %% Non-object array elements are invalid requests
+    error_obj(null, ?RPC_INVALID_REQUEST, <<"Invalid Request">>).
 
 reply_json(Body, Req0, CowboyState) ->
     Req = cowboy_req:reply(200, #{
