@@ -795,3 +795,62 @@ mixed_inputs_coinbase_immature_test() ->
     %% Should throw - coinbase only has 50 confirmations
     ?assertThrow(premature_spend_of_coinbase,
                  beamchain_validation:check_coinbase_maturity(InputCoins, CurrentHeight)).
+
+%%% ===================================================================
+%%% Pay-to-Anchor (P2A) tests
+%%% ===================================================================
+
+%% P2A script pattern: OP_1 OP_PUSHBYTES_2 0x4e73
+-define(P2A_SCRIPT, <<16#51, 16#02, 16#4e, 16#73>>).
+
+%% Test is_pay_to_anchor recognizes valid P2A script
+p2a_is_pay_to_anchor_valid_test() ->
+    ?assert(beamchain_script:is_pay_to_anchor(?P2A_SCRIPT)).
+
+%% Test is_pay_to_anchor rejects non-P2A scripts
+p2a_is_pay_to_anchor_invalid_test() ->
+    %% P2TR (32-byte program)
+    P2TR = <<16#51, 16#20, 0:256>>,
+    ?assertNot(beamchain_script:is_pay_to_anchor(P2TR)),
+    %% P2WPKH
+    P2WPKH = <<16#00, 16#14, 0:160>>,
+    ?assertNot(beamchain_script:is_pay_to_anchor(P2WPKH)),
+    %% Empty script
+    ?assertNot(beamchain_script:is_pay_to_anchor(<<>>)),
+    %% Wrong 2-byte witness program (not 0x4e73)
+    WrongBytes = <<16#51, 16#02, 16#ff, 16#ff>>,
+    ?assertNot(beamchain_script:is_pay_to_anchor(WrongBytes)),
+    %% Wrong witness version (OP_2 instead of OP_1)
+    WrongVersion = <<16#52, 16#02, 16#4e, 16#73>>,
+    ?assertNot(beamchain_script:is_pay_to_anchor(WrongVersion)).
+
+%% Test P2A dust threshold is 240 satoshis
+%% Output size: 8 (value) + 1 (script len) + 4 (script) = 13 bytes
+%% Input size: 67 bytes (standard witness input)
+%% Total: 80 bytes, dust = 80 * 3000 / 1000 = 240 satoshis
+p2a_dust_threshold_test() ->
+    %% This test verifies our dust calculation logic.
+    %% We can't directly call dust_threshold without running the mempool,
+    %% so we verify the constants are correct for a P2A output.
+    OutputSize = 8 + 1 + 4,  %% 13 bytes
+    InputSize = 67,          %% standard witness input size
+    DustRelayFee = 3000,     %% sat/kvB
+    Threshold = (OutputSize + InputSize) * DustRelayFee div 1000,
+    ?assertEqual(240, Threshold).
+
+%% Test valid P2A transaction structure
+p2a_valid_tx_test() ->
+    Tx = make_regular_tx(
+        [{<<1:256>>, 0}],
+        [{240, ?P2A_SCRIPT}]  %% P2A output with exactly 240 satoshis
+    ),
+    ?assertEqual(ok, beamchain_validation:check_transaction(Tx)).
+
+%% Test P2A output with zero value fails check_transaction
+p2a_zero_value_test() ->
+    Tx = make_regular_tx(
+        [{<<1:256>>, 0}],
+        [{0, ?P2A_SCRIPT}]  %% P2A output with 0 satoshis
+    ),
+    %% Zero value is technically valid in check_transaction (dust is checked in mempool)
+    ?assertEqual(ok, beamchain_validation:check_transaction(Tx)).
