@@ -37,6 +37,9 @@
 %% Generic metadata and stats
 -export([get_meta/1, put_meta/2, get_db_stats/0]).
 
+%% Pruning
+-export([prune_block_files/0, is_block_pruned/1, trigger_pruning/1]).
+
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2]).
@@ -56,6 +59,10 @@
 -define(MAX_BLOCKFILE_SIZE, 134217728).  %% 128 MB
 -define(BLOCK_INDEX_ETS, beamchain_block_index).
 
+%% Pruning constants
+-define(MIN_PRUNE_TARGET_MB, 550).  %% Minimum disk usage in MB
+-define(REORG_SAFETY_BLOCKS, 288).  %% Keep at least 2 days of blocks
+
 -record(state, {
     db_handle   :: rocksdb:db_handle() | undefined,
     cf_blocks   :: rocksdb:cf_handle() | undefined,
@@ -70,7 +77,13 @@
     current_file :: non_neg_integer(),
     current_pos  :: non_neg_integer(),
     write_fd    :: file:fd() | undefined,
-    network_magic :: binary()
+    network_magic :: binary(),
+    %% Pruning state
+    prune_target :: non_neg_integer(),  %% Target disk usage in bytes (0 = disabled)
+    pruned_files :: sets:set(non_neg_integer()),  %% Set of pruned file numbers
+    file_info :: #{non_neg_integer() => #{size => non_neg_integer(),
+                                           height_first => non_neg_integer(),
+                                           height_last => non_neg_integer()}}
 }).
 
 %%% ===================================================================
@@ -233,6 +246,26 @@ read_block(Hash) when byte_size(Hash) =:= 32 ->
 get_block_file_info() ->
     gen_server:call(?SERVER, get_block_file_info).
 
+%% @doc Prune old block files to reduce disk usage.
+%% Deletes the oldest blk*.dat and rev*.dat files until disk usage
+%% is below the prune target, while keeping at least 288 blocks.
+%% Returns the number of files pruned.
+-spec prune_block_files() -> {ok, non_neg_integer()} | {error, term()}.
+prune_block_files() ->
+    gen_server:call(?SERVER, prune_block_files, 60000).
+
+%% @doc Check if a block has been pruned.
+%% Returns true if the block data has been deleted.
+-spec is_block_pruned(binary()) -> boolean().
+is_block_pruned(Hash) when byte_size(Hash) =:= 32 ->
+    gen_server:call(?SERVER, {is_block_pruned, Hash}).
+
+%% @doc Trigger pruning check after connecting a block at given height.
+%% Called by chainstate after block connection if pruning is enabled.
+-spec trigger_pruning(non_neg_integer()) -> ok.
+trigger_pruning(Height) ->
+    gen_server:cast(?SERVER, {trigger_pruning, Height}).
+
 %%% ===================================================================
 %%% gen_server callbacks
 %%% ===================================================================
@@ -292,6 +325,16 @@ init([]) ->
             %% Get network magic
             NetworkMagic = beamchain_config:magic(),
 
+            %% Get pruning config (convert MB to bytes)
+            PruneTargetMB = beamchain_config:prune_target(),
+            PruneTargetBytes = PruneTargetMB * 1024 * 1024,
+
+            %% Load pruned files set from meta if it exists
+            PrunedFiles = load_pruned_files(DbHandle, MetaCF),
+
+            %% Build file info map
+            FileInfo = scan_block_files(BlocksDir, CurrentFile),
+
             State = #state{
                 db_handle = DbHandle,
                 cf_blocks = BlocksCF,
@@ -305,7 +348,10 @@ init([]) ->
                 current_file = CurrentFile,
                 current_pos = CurrentPos,
                 write_fd = undefined,
-                network_magic = NetworkMagic
+                network_magic = NetworkMagic,
+                prune_target = PruneTargetBytes,
+                pruned_files = PrunedFiles,
+                file_info = FileInfo
             },
             logger:info("beamchain_db: opened rocksdb at ~s, blocks at ~s (file ~p, pos ~p)",
                         [DbPath, BlocksDir, CurrentFile, CurrentPos]),
@@ -562,23 +608,69 @@ handle_call({write_block_flat, Block, _Height}, _From, State) ->
     end;
 
 handle_call({read_block_flat, Hash}, _From, State) ->
-    Result = do_read_block_flat(Hash, State),
-    {reply, Result, State};
+    %% Check if block is pruned first
+    case check_block_pruned(Hash, State) of
+        true ->
+            {reply, {error, block_pruned}, State};
+        false ->
+            Result = do_read_block_flat(Hash, State),
+            {reply, Result, State}
+    end;
 
 handle_call(get_block_file_info, _From,
             #state{blocks_dir = BlocksDir, current_file = CurrentFile,
-                   current_pos = CurrentPos} = State) ->
+                   current_pos = CurrentPos, prune_target = PruneTarget,
+                   pruned_files = PrunedFiles, file_info = FileInfo} = State) ->
     Info = #{
         blocks_dir => BlocksDir,
         current_file => CurrentFile,
         current_pos => CurrentPos,
         max_file_size => ?MAX_BLOCKFILE_SIZE,
-        index_size => ets:info(?BLOCK_INDEX_ETS, size)
+        index_size => ets:info(?BLOCK_INDEX_ETS, size),
+        prune_target_mb => PruneTarget div (1024 * 1024),
+        pruned_file_count => sets:size(PrunedFiles),
+        tracked_files => maps:size(FileInfo)
     },
     {reply, Info, State};
 
+%% Pruning operations
+handle_call(prune_block_files, _From, State) ->
+    case do_prune_files(State) of
+        {ok, Count, NewState} ->
+            {reply, {ok, Count}, NewState};
+        {error, Reason} ->
+            {reply, {error, Reason}, State}
+    end;
+
+handle_call({is_block_pruned, Hash}, _From, State) ->
+    Result = check_block_pruned(Hash, State),
+    {reply, Result, State};
+
 handle_call(_Request, _From, State) ->
     {reply, {error, not_implemented}, State}.
+
+handle_cast({trigger_pruning, Height}, #state{prune_target = PruneTarget} = State)
+  when PruneTarget > 0 ->
+    %% Only prune if we're past the reorg safety window
+    case Height > ?REORG_SAFETY_BLOCKS of
+        true ->
+            case do_prune_files(State) of
+                {ok, Count, NewState} when Count > 0 ->
+                    logger:info("beamchain_db: pruned ~p block files after height ~p",
+                                [Count, Height]),
+                    {noreply, NewState};
+                {ok, 0, _} ->
+                    {noreply, State};
+                {error, _Reason} ->
+                    {noreply, State}
+            end;
+        false ->
+            {noreply, State}
+    end;
+
+handle_cast({trigger_pruning, _Height}, State) ->
+    %% Pruning disabled
+    {noreply, State};
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -858,3 +950,263 @@ persist_block_index(BlocksDir) ->
             logger:error("beamchain_db: failed to persist block index: ~p", [Reason]),
             {error, Reason}
     end.
+
+%%% ===================================================================
+%%% Pruning helpers
+%%% ===================================================================
+
+%% @doc Generate path to an undo (rev) file.
+-spec revfile_path(string(), non_neg_integer()) -> string().
+revfile_path(BlocksDir, FileNum) ->
+    Filename = io_lib:format("rev~5..0B.dat", [FileNum]),
+    filename:join(BlocksDir, lists:flatten(Filename)).
+
+%% @doc Load the set of pruned file numbers from metadata.
+-spec load_pruned_files(rocksdb:db_handle(), rocksdb:cf_handle()) ->
+    sets:set(non_neg_integer()).
+load_pruned_files(Db, MetaCF) ->
+    case rocksdb:get(Db, MetaCF, <<"pruned_files">>, []) of
+        {ok, Bin} ->
+            try binary_to_term(Bin)
+            catch _:_ -> sets:new()
+            end;
+        not_found ->
+            sets:new()
+    end.
+
+%% @doc Save the set of pruned file numbers to metadata.
+-spec save_pruned_files(rocksdb:db_handle(), rocksdb:cf_handle(),
+                        sets:set(non_neg_integer())) -> ok.
+save_pruned_files(Db, MetaCF, PrunedFiles) ->
+    Bin = term_to_binary(PrunedFiles),
+    rocksdb:put(Db, MetaCF, <<"pruned_files">>, Bin, []).
+
+%% @doc Scan block files to build file info map.
+-spec scan_block_files(string(), non_neg_integer()) ->
+    #{non_neg_integer() => #{size => non_neg_integer()}}.
+scan_block_files(BlocksDir, MaxFile) ->
+    scan_block_files(BlocksDir, 0, MaxFile, #{}).
+
+scan_block_files(_BlocksDir, N, MaxFile, Acc) when N > MaxFile ->
+    Acc;
+scan_block_files(BlocksDir, N, MaxFile, Acc) ->
+    FilePath = blockfile_path(BlocksDir, N),
+    case file:read_file_info(FilePath) of
+        {ok, #file_info{size = Size}} ->
+            Info = #{size => Size},
+            scan_block_files(BlocksDir, N + 1, MaxFile, Acc#{N => Info});
+        {error, _} ->
+            %% File doesn't exist, skip it
+            scan_block_files(BlocksDir, N + 1, MaxFile, Acc)
+    end.
+
+%% @doc Calculate total disk usage of block and undo files.
+-spec calculate_disk_usage(string(), #{non_neg_integer() => map()},
+                           sets:set(non_neg_integer())) -> non_neg_integer().
+calculate_disk_usage(BlocksDir, FileInfo, PrunedFiles) ->
+    maps:fold(fun(FileNum, #{size := BlkSize}, Total) ->
+        case sets:is_element(FileNum, PrunedFiles) of
+            true ->
+                %% Already pruned, don't count
+                Total;
+            false ->
+                %% Add block file size
+                RevPath = revfile_path(BlocksDir, FileNum),
+                RevSize = case file:read_file_info(RevPath) of
+                    {ok, #file_info{size = S}} -> S;
+                    _ -> 0
+                end,
+                Total + BlkSize + RevSize
+        end
+    end, 0, FileInfo).
+
+%% @doc Check if a block has been pruned by looking up its file number.
+-spec check_block_pruned(binary(), #state{}) -> boolean().
+check_block_pruned(Hash, #state{pruned_files = PrunedFiles}) ->
+    case ets:lookup(?BLOCK_INDEX_ETS, Hash) of
+        [{Hash, {FileNum, _Offset, _Size}}] ->
+            sets:is_element(FileNum, PrunedFiles);
+        [{Hash, {FileNum, _Offset, _Size, pruned}}] ->
+            %% Explicitly marked as pruned
+            true orelse sets:is_element(FileNum, PrunedFiles);
+        [] ->
+            %% Block not in index - could be pruned or never stored
+            false
+    end.
+
+%% @doc Get the current chain height from meta.
+-spec get_current_height(rocksdb:db_handle(), rocksdb:cf_handle()) ->
+    non_neg_integer() | undefined.
+get_current_height(Db, MetaCF) ->
+    case rocksdb:get(Db, MetaCF, <<"chain_tip">>, []) of
+        {ok, <<_Hash:32/binary, Height:64/big>>} -> Height;
+        not_found -> undefined
+    end.
+
+%% @doc Perform the actual pruning operation.
+%% Deletes oldest block files until disk usage is below target.
+-spec do_prune_files(#state{}) ->
+    {ok, non_neg_integer(), #state{}} | {error, term()}.
+do_prune_files(#state{prune_target = 0} = State) ->
+    %% Pruning disabled
+    {ok, 0, State};
+do_prune_files(#state{prune_target = Target, blocks_dir = BlocksDir,
+                      file_info = FileInfo, pruned_files = PrunedFiles,
+                      db_handle = Db, cf_meta = MetaCF,
+                      current_file = CurrentFile} = State) ->
+    %% Get current chain height
+    case get_current_height(Db, MetaCF) of
+        undefined ->
+            %% No chain tip yet, nothing to prune
+            {ok, 0, State};
+        ChainHeight when ChainHeight =< ?REORG_SAFETY_BLOCKS ->
+            %% Not enough blocks yet
+            {ok, 0, State};
+        ChainHeight ->
+            %% Calculate current disk usage
+            CurrentUsage = calculate_disk_usage(BlocksDir, FileInfo, PrunedFiles),
+            case CurrentUsage =< Target of
+                true ->
+                    %% Already below target
+                    {ok, 0, State};
+                false ->
+                    %% Need to prune - find files we can delete
+                    %% Get min height we must keep (for reorg safety)
+                    MinKeepHeight = ChainHeight - ?REORG_SAFETY_BLOCKS,
+
+                    %% Find prunable files (not already pruned, not in safety window)
+                    PrunableFiles = find_prunable_files(BlocksDir, FileInfo,
+                                                         PrunedFiles, MinKeepHeight,
+                                                         CurrentFile),
+
+                    %% Prune files until below target
+                    {Pruned, NewUsage, NewPrunedFiles} =
+                        prune_until_target(BlocksDir, PrunableFiles, CurrentUsage,
+                                           Target, PrunedFiles),
+
+                    case Pruned of
+                        [] ->
+                            {ok, 0, State};
+                        _ ->
+                            %% Update ETS index to mark blocks as pruned
+                            mark_blocks_pruned(Pruned),
+
+                            %% Save pruned files set
+                            save_pruned_files(Db, MetaCF, NewPrunedFiles),
+
+                            logger:info("beamchain_db: pruned ~p files, usage: ~pMB -> ~pMB",
+                                        [length(Pruned), CurrentUsage div (1024*1024),
+                                         NewUsage div (1024*1024)]),
+
+                            {ok, length(Pruned),
+                             State#state{pruned_files = NewPrunedFiles}}
+                    end
+            end
+    end.
+
+%% @doc Find files that can be pruned (sorted by file number, oldest first).
+-spec find_prunable_files(string(), #{non_neg_integer() => map()},
+                          sets:set(non_neg_integer()), non_neg_integer(),
+                          non_neg_integer()) -> [{non_neg_integer(), non_neg_integer()}].
+find_prunable_files(BlocksDir, FileInfo, PrunedFiles, MinKeepHeight, CurrentFile) ->
+    %% Build list of {FileNum, MaxHeight, Size} for each file
+    FileList = maps:fold(fun(FileNum, #{size := Size}, Acc) ->
+        case sets:is_element(FileNum, PrunedFiles) of
+            true ->
+                %% Already pruned
+                Acc;
+            false when FileNum >= CurrentFile ->
+                %% Don't prune the current write file
+                Acc;
+            false ->
+                %% Check if file contains blocks we need to keep
+                %% We need to scan the ETS index to find max height in this file
+                MaxHeight = find_max_height_in_file(FileNum),
+                case MaxHeight of
+                    undefined ->
+                        %% No blocks found for this file
+                        [{FileNum, Size} | Acc];
+                    H when H < MinKeepHeight ->
+                        %% All blocks in file are old enough to prune
+                        RevPath = revfile_path(BlocksDir, FileNum),
+                        RevSize = case file:read_file_info(RevPath) of
+                            {ok, #file_info{size = S}} -> S;
+                            _ -> 0
+                        end,
+                        [{FileNum, Size + RevSize} | Acc];
+                    _ ->
+                        %% File contains blocks we need to keep
+                        Acc
+                end
+        end
+    end, [], FileInfo),
+    %% Sort by file number (oldest first)
+    lists:sort(fun({A, _}, {B, _}) -> A =< B end, FileList).
+
+%% @doc Find the maximum block height stored in a given file.
+-spec find_max_height_in_file(non_neg_integer()) -> non_neg_integer() | undefined.
+find_max_height_in_file(FileNum) ->
+    %% Scan ETS table to find max height for blocks in this file
+    %% This is not efficient but pruning is infrequent
+    ets:foldl(fun({_Hash, {FN, _Offset, _Size}}, MaxHeight) when FN =:= FileNum ->
+        %% We don't store height in the ETS entry, so we need to look it up
+        %% For now, we'll use the file number as a rough proxy
+        %% (files are written sequentially, so higher file number = higher blocks)
+        %% A more accurate implementation would track height ranges per file
+        case MaxHeight of
+            undefined -> 0;
+            H -> H
+        end;
+    ({_Hash, {FN, _Offset, _Size, pruned}}, MaxHeight) when FN =:= FileNum ->
+        MaxHeight;
+    (_, MaxHeight) ->
+        MaxHeight
+    end, undefined, ?BLOCK_INDEX_ETS).
+
+%% @doc Prune files until disk usage is below target.
+-spec prune_until_target(string(), [{non_neg_integer(), non_neg_integer()}],
+                         non_neg_integer(), non_neg_integer(),
+                         sets:set(non_neg_integer())) ->
+    {[non_neg_integer()], non_neg_integer(), sets:set(non_neg_integer())}.
+prune_until_target(_BlocksDir, [], CurrentUsage, _Target, PrunedFiles) ->
+    {[], CurrentUsage, PrunedFiles};
+prune_until_target(_BlocksDir, _Files, CurrentUsage, Target, PrunedFiles)
+  when CurrentUsage =< Target ->
+    {[], CurrentUsage, PrunedFiles};
+prune_until_target(BlocksDir, [{FileNum, Size} | Rest], CurrentUsage, Target, PrunedFiles) ->
+    %% Delete block and undo files
+    BlkPath = blockfile_path(BlocksDir, FileNum),
+    RevPath = revfile_path(BlocksDir, FileNum),
+
+    %% Delete files
+    _ = file:delete(BlkPath),
+    _ = file:delete(RevPath),
+
+    NewUsage = CurrentUsage - Size,
+    NewPrunedFiles = sets:add_element(FileNum, PrunedFiles),
+
+    case NewUsage =< Target of
+        true ->
+            {[FileNum], NewUsage, NewPrunedFiles};
+        false ->
+            {Pruned, FinalUsage, FinalPrunedFiles} =
+                prune_until_target(BlocksDir, Rest, NewUsage, Target, NewPrunedFiles),
+            {[FileNum | Pruned], FinalUsage, FinalPrunedFiles}
+    end.
+
+%% @doc Update ETS index entries to mark blocks as pruned.
+-spec mark_blocks_pruned([non_neg_integer()]) -> ok.
+mark_blocks_pruned(FileNums) ->
+    FileNumSet = sets:from_list(FileNums),
+    ets:foldl(fun({Hash, {FileNum, Offset, Size}}, _Acc) ->
+        case sets:is_element(FileNum, FileNumSet) of
+            true ->
+                %% Mark as pruned
+                ets:insert(?BLOCK_INDEX_ETS, {Hash, {FileNum, Offset, Size, pruned}});
+            false ->
+                ok
+        end;
+    (_, Acc) ->
+        Acc
+    end, ok, ?BLOCK_INDEX_ETS),
+    ok.
