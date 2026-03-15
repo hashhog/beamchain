@@ -88,6 +88,10 @@
     wants_addrv2 = false    :: boolean(),
     wtxidrelay = false      :: boolean(),
     fee_filter = 0          :: non_neg_integer(),
+    %% BIP330 Erlay
+    erlay_enabled = false   :: boolean(),          %% peer supports erlay
+    erlay_local_salt        :: non_neg_integer() | undefined,  %% our salt for sendtxrcncl
+    erlay_version = 0       :: non_neg_integer(),  %% negotiated erlay version
     %% Our state
     our_nonce               :: non_neg_integer(),
     magic                   :: binary(),
@@ -462,6 +466,9 @@ dispatch_message(wtxidrelay, _Payload, Data) ->
         false -> {ok, Data#peer_data{wtxidrelay = true}};
         true  -> {ok, Data}
     end;
+dispatch_message(sendtxrcncl, Payload, Data) ->
+    %% BIP 330: Erlay reconciliation handshake
+    handle_sendtxrcncl_msg(Payload, Data);
 dispatch_message(feefilter, Payload, Data) ->
     handle_feefilter_msg(Payload, Data);
 dispatch_message(Command, Payload, Data) ->
@@ -520,9 +527,11 @@ handle_version_msg(Payload, Data) ->
                     %% Send wtxidrelay and sendaddrv2 before verack (BIP 339/155)
                     Data4 = do_send_raw(wtxidrelay, <<>>, Data3),
                     Data5 = do_send_raw(sendaddrv2, <<>>, Data4),
+                    %% BIP330: Send sendtxrcncl before verack (if peer supports wtxidrelay and tx relay)
+                    Data6 = maybe_send_sendtxrcncl(Data5),
                     %% Send verack
-                    Data6 = do_send_raw(verack, <<>>, Data5),
-                    {ok, Data6#peer_data{verack_sent = true}}
+                    Data7 = do_send_raw(verack, <<>>, Data6),
+                    {ok, Data7#peer_data{verack_sent = true}}
             end;
         {error, _} ->
             logger:warning("peer ~p bad version", [Data#peer_data.address]),
@@ -542,6 +551,73 @@ handshake_complete(#peer_data{version_sent = true, version_recv = true,
     true;
 handshake_complete(_) ->
     false.
+
+%%% ===================================================================
+%%% Internal: BIP330 Erlay
+%%% ===================================================================
+
+%% Send sendtxrcncl if conditions are met:
+%% - Peer supports wtxidrelay (required for Erlay)
+%% - Peer allows tx relay (not block-only)
+%% - We're in protocol version >= 70016 (WTXID relay version)
+maybe_send_sendtxrcncl(#peer_data{peer_relay = true, wtxidrelay = true,
+                                   peer_version = V} = Data) when V >= 70016 ->
+    %% Pre-register with Erlay module to get our local salt
+    LocalSalt = beamchain_erlay:pre_register_peer(self()),
+    ErlayVersion = beamchain_erlay:version(),
+    Payload = beamchain_p2p_msg:encode_payload(sendtxrcncl, #{
+        version => ErlayVersion,
+        salt => LocalSalt
+    }),
+    Data2 = do_send_raw(sendtxrcncl, Payload, Data),
+    Data2#peer_data{erlay_local_salt = LocalSalt};
+maybe_send_sendtxrcncl(Data) ->
+    %% Conditions not met for Erlay
+    Data.
+
+%% Handle received sendtxrcncl message
+handle_sendtxrcncl_msg(Payload, Data) ->
+    case handshake_complete(Data) of
+        true ->
+            %% Protocol violation: sendtxrcncl after verack
+            logger:warning("peer ~p sent sendtxrcncl after verack",
+                           [Data#peer_data.address]),
+            {stop, protocol_violation};
+        false ->
+            case beamchain_p2p_msg:decode_payload(sendtxrcncl, Payload) of
+                {ok, #{version := PeerVersion, salt := PeerSalt}} when PeerVersion >= 1 ->
+                    %% Check if we can support Erlay with this peer
+                    case Data#peer_data.peer_relay andalso Data#peer_data.erlay_local_salt =/= undefined of
+                        true ->
+                            %% Register with Erlay module
+                            IsPeerInbound = (Data#peer_data.direction =:= inbound),
+                            case beamchain_erlay:register_peer(self(), IsPeerInbound,
+                                                                PeerVersion, PeerSalt) of
+                                ok ->
+                                    ErlayVersion = min(PeerVersion, beamchain_erlay:version()),
+                                    logger:debug("peer ~p erlay enabled (version ~p)",
+                                                 [Data#peer_data.address, ErlayVersion]),
+                                    {ok, Data#peer_data{erlay_enabled = true,
+                                                        erlay_version = ErlayVersion}};
+                                {error, Reason} ->
+                                    logger:warning("peer ~p erlay registration failed: ~p",
+                                                   [Data#peer_data.address, Reason]),
+                                    {ok, Data}
+                            end;
+                        false ->
+                            %% We didn't send sendtxrcncl or peer doesn't relay txs
+                            {ok, Data}
+                    end;
+                {ok, #{version := V}} when V < 1 ->
+                    %% Protocol violation: version below 1
+                    logger:warning("peer ~p sent sendtxrcncl with invalid version ~p",
+                                   [Data#peer_data.address, V]),
+                    {stop, protocol_violation};
+                {error, _} ->
+                    logger:warning("peer ~p bad sendtxrcncl", [Data#peer_data.address]),
+                    {ok, Data}
+            end
+    end.
 
 %%% ===================================================================
 %%% Internal: Ping / Pong
