@@ -41,7 +41,13 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] Eclipse attack protections (bucket-based addrman, netgroup limits, anchor connections)
 - [x] Stale peer eviction (tip timeout, headers timeout, ping timeout, network protection)
 - [x] Block pruning (delete old blk/rev files, keep 288 blocks for reorg safety)
-- [ ] Wallet (HD keys, signing)
+- [x] HD wallet (BIP32/44/84 key derivation)
+- [x] Wallet UTXO tracking and balance
+- [x] Coin selection (Branch-and-Bound, knapsack)
+- [x] Transaction signing (P2PKH, P2WPKH, P2TR)
+- [x] PSBT support (BIP 174/370)
+- [x] Wallet RPC methods (getnewaddress, getbalance, sendtoaddress)
+- [x] Keypool with 1000-address lookahead
 - [ ] Compact block relay (BIP152)
 
 ## Quick start
@@ -79,7 +85,8 @@ src/
 ├── beamchain_versionbits.erl  BIP9 deployment tracking
 ├── beamchain_chain_params.erl Network parameters and checkpoints
 ├── beamchain_db.erl           RocksDB wrapper, flat file storage, pruning
-└── beamchain_rpc.erl          JSON-RPC server
+├── beamchain_rpc.erl          JSON-RPC server
+└── beamchain_wallet.erl       HD wallet, PSBT, coin selection
 
 c_src/
 └── beamchain_crypto_nif.c     libsecp256k1 bindings
@@ -95,7 +102,8 @@ test/
 ├── beamchain_pow_tests.erl            PoW and difficulty adjustment tests
 ├── beamchain_versionbits_tests.erl    BIP9 state machine tests
 ├── beamchain_validation_tests.erl     Consensus rule tests
-└── beamchain_rpc_tests.erl            RPC tests (core blockchain and transaction RPCs)
+├── beamchain_rpc_tests.erl            RPC tests (core blockchain and transaction RPCs)
+└── beamchain_wallet_tests.erl         HD wallet and coin selection tests
 ```
 
 ## Running tests
