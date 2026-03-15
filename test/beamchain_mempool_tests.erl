@@ -22,7 +22,7 @@
 %%% ===================================================================
 
 setup() ->
-    Tables = [mempool_txs, mempool_by_fee, mempool_outpoints, mempool_orphans, mempool_clusters],
+    Tables = [mempool_txs, mempool_by_fee, mempool_outpoints, mempool_orphans, mempool_clusters, mempool_ephemeral],
     lists:foreach(fun(T) ->
         case ets:info(T) of
             undefined -> ok;
@@ -34,6 +34,7 @@ setup() ->
     ets:new(mempool_outpoints, [set, public, named_table]),
     ets:new(mempool_orphans, [set, public, named_table]),
     ets:new(mempool_clusters, [set, public, named_table, {read_concurrency, true}]),
+    ets:new(mempool_ephemeral, [set, public, named_table]),
     ok.
 
 cleanup(_) ->
@@ -42,7 +43,7 @@ cleanup(_) ->
             undefined -> ok;
             _ -> ets:delete(T)
         end
-    end, [mempool_txs, mempool_by_fee, mempool_outpoints, mempool_orphans, mempool_clusters]).
+    end, [mempool_txs, mempool_by_fee, mempool_outpoints, mempool_orphans, mempool_clusters, mempool_ephemeral]).
 
 %%% ===================================================================
 %%% has_tx / get_tx / get_all_txids tests
@@ -1357,3 +1358,144 @@ find_index(Elem, List) ->
 find_index(_, [], _) -> -1;
 find_index(Elem, [Elem | _], Idx) -> Idx;
 find_index(Elem, [_ | Rest], Idx) -> find_index(Elem, Rest, Idx + 1).
+
+%%% ===================================================================
+%%% Ephemeral Anchor Dust Policy tests
+%%% ===================================================================
+
+%% P2A (Pay-to-Anchor) script: OP_1 OP_PUSHBYTES_2 0x4e73
+p2a_script() ->
+    <<16#51, 16#02, 16#4e, 16#73>>.
+
+%% Helper to create a tx with specific outputs
+make_tx_with_outputs(Inputs, Outputs) ->
+    TxIns = [#tx_in{
+        prev_out = #outpoint{hash = H, index = I},
+        script_sig = <<>>,
+        sequence = 16#fffffffe,
+        witness = []
+    } || {H, I} <- Inputs],
+    TxOuts = [#tx_out{value = V, script_pubkey = SPK} || {V, SPK} <- Outputs],
+    #transaction{
+        version = 2,
+        inputs = TxIns,
+        outputs = TxOuts,
+        locktime = 0
+    }.
+
+%% Test that P2A script is correctly identified
+p2a_script_detection_test() ->
+    ?assert(beamchain_script:is_pay_to_anchor(p2a_script())),
+    ?assertNot(beamchain_script:is_pay_to_anchor(p2pkh_script())),
+    ?assertNot(beamchain_script:is_pay_to_anchor(p2wpkh_script())).
+
+%% Test that zero-value P2A output with non-zero fee is rejected (dust)
+ephemeral_dust_nonzero_fee_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             %% Create tx with zero-value P2A output
+             Tx = make_tx_with_outputs(
+                 [{<<100:256>>, 0}],
+                 [{0, p2a_script()}, {5000, p2pkh_script()}]
+             ),
+             %% Fee is non-zero (we have 5000 output from 5100 input = 100 fee)
+             %% This should be rejected because ephemeral anchors need 0 fee
+             %% We call the internal check_dust function
+             %% Fee > 0 means zero-value P2A is dust
+             Fee = 100,
+             try
+                 %% This should throw ephemeral_dust_requires_zero_fee
+                 beamchain_mempool:check_dust(Tx, Fee),
+                 ?assert(false)  %% Should not reach here
+             catch
+                 throw:ephemeral_dust_requires_zero_fee ->
+                     ok  %% Expected
+             end
+         end]
+     end}.
+
+%% Test that zero-value P2A with zero fee is allowed (ephemeral anchor)
+ephemeral_anchor_allowed_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             %% Create tx with zero-value P2A output and no other outputs (0 fee)
+             Tx = make_tx_with_outputs(
+                 [{<<100:256>>, 0}],
+                 [{0, p2a_script()}]
+             ),
+             Fee = 0,
+             Result = beamchain_mempool:check_dust(Tx, Fee),
+             ?assertMatch({has_ephemeral, 0}, Result)
+         end]
+     end}.
+
+%% Test that multiple zero-value P2A outputs are rejected
+multiple_ephemeral_anchors_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             %% Create tx with TWO zero-value P2A outputs
+             Tx = make_tx_with_outputs(
+                 [{<<100:256>>, 0}],
+                 [{0, p2a_script()}, {0, p2a_script()}]
+             ),
+             Fee = 0,
+             try
+                 beamchain_mempool:check_dust(Tx, Fee),
+                 ?assert(false)  %% Should not reach here
+             catch
+                 throw:multiple_p2a_outputs ->
+                     ok  %% Expected - max 1 P2A per tx
+             end
+         end]
+     end}.
+
+%% Test that regular dust (non-P2A) is still rejected with zero fee
+regular_dust_still_rejected_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             %% Create tx with a very small value non-P2A output (dust)
+             Tx = make_tx_with_outputs(
+                 [{<<100:256>>, 0}],
+                 [{10, p2pkh_script()}]  %% 10 sats is below dust threshold
+             ),
+             Fee = 0,
+             try
+                 beamchain_mempool:check_dust(Tx, Fee),
+                 ?assert(false)
+             catch
+                 throw:dust ->
+                     ok  %% Expected - non-P2A dust is rejected
+             end
+         end]
+     end}.
+
+%% Test that P2A outputs with non-zero value work normally
+p2a_nonzero_value_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             %% P2A dust threshold is 240 sats
+             Tx = make_tx_with_outputs(
+                 [{<<100:256>>, 0}],
+                 [{240, p2a_script()}]  %% At threshold
+             ),
+             Fee = 1000,
+             Result = beamchain_mempool:check_dust(Tx, Fee),
+             ?assertEqual(none, Result)  %% No ephemeral anchor, just normal P2A
+         end]
+     end}.
+
+%% Test ephemeral ETS table creation
+ephemeral_ets_exists_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             %% Verify the ephemeral table exists after setup
+             %% Table should exist (created by setup/0)
+             ?assertNotEqual(undefined, ets:info(mempool_ephemeral))
+         end]
+     end}.
