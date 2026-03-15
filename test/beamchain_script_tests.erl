@@ -423,6 +423,89 @@ p2sh_detection_test() ->
         beamchain_script:verify_script(ScriptSig, P2SHScript, [], Flags, #{})).
 
 %%% -------------------------------------------------------------------
+%%% P2SH push-only enforcement (BIP 16 - unconditional)
+%%% -------------------------------------------------------------------
+
+%% P2SH scriptSig containing OP_DUP (0x76) must fail — this is NOT push-only
+p2sh_pushonly_op_dup_test() ->
+    %% Redeem script: OP_1 (always succeeds)
+    RedeemScript = <<16#51>>,
+    ScriptHash = beamchain_crypto:hash160(RedeemScript),
+    P2SHScript = <<16#a9, 16#14, ScriptHash/binary, 16#87>>,
+    %% scriptSig with OP_DUP (non-push opcode) followed by push of redeem script
+    %% OP_DUP = 0x76
+    BadScriptSig = <<16#76, 1, 16#51>>,
+    Flags = ?SCRIPT_VERIFY_P2SH,
+    %% Must fail because scriptSig is not push-only
+    ?assertEqual(false,
+        beamchain_script:verify_script(BadScriptSig, P2SHScript, [], Flags, #{})).
+
+%% P2SH scriptSig containing OP_NOP (0x61) must fail
+p2sh_pushonly_op_nop_test() ->
+    RedeemScript = <<16#51>>,
+    ScriptHash = beamchain_crypto:hash160(RedeemScript),
+    P2SHScript = <<16#a9, 16#14, ScriptHash/binary, 16#87>>,
+    %% scriptSig with OP_NOP (0x61) then push redeem script
+    BadScriptSig = <<16#61, 1, 16#51>>,
+    Flags = ?SCRIPT_VERIFY_P2SH,
+    ?assertEqual(false,
+        beamchain_script:verify_script(BadScriptSig, P2SHScript, [], Flags, #{})).
+
+%% P2SH scriptSig containing OP_IF (0x63) must fail
+p2sh_pushonly_op_if_test() ->
+    RedeemScript = <<16#51>>,
+    ScriptHash = beamchain_crypto:hash160(RedeemScript),
+    P2SHScript = <<16#a9, 16#14, ScriptHash/binary, 16#87>>,
+    %% scriptSig with OP_IF
+    BadScriptSig = <<16#63, 1, 16#51>>,
+    Flags = ?SCRIPT_VERIFY_P2SH,
+    ?assertEqual(false,
+        beamchain_script:verify_script(BadScriptSig, P2SHScript, [], Flags, #{})).
+
+%% Valid P2SH with only push ops should succeed
+p2sh_pushonly_valid_test() ->
+    RedeemScript = <<16#51>>,  %% OP_1
+    ScriptHash = beamchain_crypto:hash160(RedeemScript),
+    P2SHScript = <<16#a9, 16#14, ScriptHash/binary, 16#87>>,
+    %% scriptSig: OP_1 (push 1) then push redeem script
+    %% This pushes <<1>> (script number 1) then <<0x51>> (the redeem script)
+    GoodScriptSig = <<16#51, 1, 16#51>>,
+    Flags = ?SCRIPT_VERIFY_P2SH,
+    ?assertEqual(true,
+        beamchain_script:verify_script(GoodScriptSig, P2SHScript, [], Flags, #{})).
+
+%% P2SH push-only check uses all push variants (PUSHDATA1, OP_0, OP_1-16, etc)
+p2sh_pushonly_pushdata1_test() ->
+    RedeemScript = <<16#51>>,  %% OP_1
+    ScriptHash = beamchain_crypto:hash160(RedeemScript),
+    P2SHScript = <<16#a9, 16#14, ScriptHash/binary, 16#87>>,
+    %% scriptSig using PUSHDATA1 to push redeem script
+    GoodScriptSig = <<16#4c, 1, 16#51>>,  %% OP_PUSHDATA1 <1> <0x51>
+    Flags = ?SCRIPT_VERIFY_P2SH,
+    ?assertEqual(true,
+        beamchain_script:verify_script(GoodScriptSig, P2SHScript, [], Flags, #{})).
+
+%% Non-P2SH scripts with computational ops should still work
+non_p2sh_with_op_dup_test() ->
+    %% P2PKH-like pattern: OP_DUP OP_HASH160 <hash> OP_EQUALVERIFY OP_CHECKSIG
+    %% Using a mock checker
+    PubKey = <<16#02, 1:256>>,  %% compressed pubkey
+    PubKeyHash = beamchain_crypto:hash160(PubKey),
+    ScriptPubKey = <<16#76, 16#a9, 20, PubKeyHash/binary, 16#88, 16#ac>>,
+    FakeSig = <<16#30, 16#06, 16#02, 16#01, 16#01, 16#02, 16#01, 16#01, 16#01>>,
+    ScriptSig = <<(byte_size(FakeSig)), FakeSig/binary,
+                  (byte_size(PubKey)), PubKey/binary>>,
+    SigChecker = #{
+        check_ecdsa_sig => fun(_, _, _) -> true end,
+        compute_sighash => fun(_, _) -> <<0:256>> end
+    },
+    Flags = ?SCRIPT_VERIFY_P2SH,
+    %% This is NOT P2SH (scriptPubKey doesn't match P2SH pattern), so
+    %% the scriptSig does NOT need to be push-only
+    ?assertEqual(true,
+        beamchain_script:verify_script(ScriptSig, ScriptPubKey, [], Flags, SigChecker)).
+
+%%% -------------------------------------------------------------------
 %%% Witness program extraction test
 %%% -------------------------------------------------------------------
 
