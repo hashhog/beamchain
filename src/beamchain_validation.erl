@@ -33,6 +33,9 @@
 %% Undo data serialization (exported for testing)
 -export([encode_undo_data/1, decode_undo_data/1]).
 
+%% Checkpoint enforcement
+-export([check_against_checkpoint/3]).
+
 %%% -------------------------------------------------------------------
 %%% Context-free block header validation
 %%% -------------------------------------------------------------------
@@ -344,6 +347,30 @@ has_witness(#transaction{inputs = Inputs}) ->
     lists:any(fun(#tx_in{witness = W}) ->
         W =/= [] andalso W =/= undefined
     end, Inputs).
+
+%%% -------------------------------------------------------------------
+%%% Checkpoint enforcement
+%%% -------------------------------------------------------------------
+
+%% @doc Check if a block at the given height matches the checkpoint.
+%% When connecting a block at a checkpoint height, the block hash must match.
+%% Returns ok if the block passes or if there's no checkpoint at that height.
+%% Returns {error, checkpoint_mismatch} if the hash doesn't match.
+%% BlockHash is in internal byte order.
+-spec check_against_checkpoint(non_neg_integer(), binary(), atom()) ->
+    ok | {error, checkpoint_mismatch}.
+check_against_checkpoint(Height, BlockHash, Network) ->
+    case beamchain_chain_params:get_checkpoint(Height, Network) of
+        none ->
+            ok;
+        ExpectedHashDisplay ->
+            %% Checkpoint hashes are in display byte order; convert to internal
+            ExpectedHash = beamchain_serialize:reverse_bytes(ExpectedHashDisplay),
+            case BlockHash =:= ExpectedHash of
+                true -> ok;
+                false -> {error, checkpoint_mismatch}
+            end
+    end.
 
 %%% -------------------------------------------------------------------
 %%% Context-free transaction validation
@@ -779,30 +806,58 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
         Network = maps:get(network, Params, mainnet),
         Flags = beamchain_script:flags_for_height(Height, Network),
 
-        %% get assume_valid hash (convert from display to internal byte order)
+        BlockHash = beamchain_serialize:block_hash(Header),
+
+        %% 3b. Checkpoint enforcement: verify block hash matches checkpoint
+        case check_against_checkpoint(Height, BlockHash, Network) of
+            ok -> ok;
+            {error, checkpoint_mismatch} -> throw(checkpoint_mismatch)
+        end,
+
+        %% Determine whether to skip script verification.
+        %% Skip scripts if:
+        %% 1. Block is at or below the assume_valid hash, OR
+        %% 2. Block is at or below the last checkpoint height (IBD optimization)
+        %%
+        %% For checkpoint-based skipping, we still verify PoW and merkle root
+        %% (which are checked in check_block_header and check_block above).
         AssumeValidDisplay = maps:get(assume_valid, Params, <<0:256>>),
         AssumeValid = case AssumeValidDisplay of
             <<0:256>> -> <<0:256>>;
             _ -> beamchain_serialize:reverse_bytes(AssumeValidDisplay)
         end,
-        BlockHash = beamchain_serialize:block_hash(Header),
-        %% Skip script verification for all blocks up to the assume_valid block.
+        %% Cache the last checkpoint height in process dictionary
+        LastCheckpointHeight = case get(last_checkpoint_height) of
+            undefined ->
+                LCH = case beamchain_chain_params:get_last_checkpoint(Height, Network) of
+                    none -> -1;
+                    {H, _Hash} -> H
+                end,
+                put(last_checkpoint_height, LCH),
+                LCH;
+            Cached1 -> Cached1
+        end,
+        %% Skip script verification for all blocks up to the assume_valid block
+        %% or up to the last checkpoint (whichever is higher).
         %% Cache the assume_valid height in process dictionary to avoid
         %% repeated DB lookups.
         SkipScripts = case AssumeValid of
-            <<0:256>> -> false;
+            <<0:256>> ->
+                %% No assume_valid configured; use checkpoint-based skipping
+                Height =< LastCheckpointHeight;
             _ ->
                 AVHeight = case get(assume_valid_height) of
                     undefined ->
-                        H = case beamchain_db:get_block_index_by_hash(AssumeValid) of
+                        AH = case beamchain_db:get_block_index_by_hash(AssumeValid) of
                             {ok, #{height := HH}} -> HH;
                             not_found -> -1
                         end,
-                        put(assume_valid_height, H),
-                        H;
-                    Cached -> Cached
+                        put(assume_valid_height, AH),
+                        AH;
+                    Cached2 -> Cached2
                 end,
-                Height =< AVHeight
+                %% Skip if below assume_valid OR below last checkpoint
+                Height =< AVHeight orelse Height =< LastCheckpointHeight
         end,
 
         %% 4. validate each transaction (sequential: UTXO checks)
