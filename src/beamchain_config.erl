@@ -14,7 +14,9 @@
          network_params/0,
          datadir/0,
          magic/0,
-         txindex_enabled/0]).
+         txindex_enabled/0,
+         prune_enabled/0,
+         prune_target/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -85,6 +87,43 @@ txindex_enabled() ->
                 false -> false;
                 _ -> true  %% Default to enabled
             end
+    end.
+
+%% @doc Check if pruning is enabled.
+%% Reads from config file (prune=<mb>) or env var (BEAMCHAIN_PRUNE=<mb>).
+%% Set to a positive MB value to enable, 0 to disable.
+%% Defaults to disabled (0).
+-spec prune_enabled() -> boolean().
+prune_enabled() ->
+    prune_target() > 0.
+
+%% @doc Get prune target in MB.
+%% Minimum is 550 MB if enabled (enough for UTXO set + recent blocks).
+%% Returns 0 if pruning is disabled.
+-spec prune_target() -> non_neg_integer().
+prune_target() ->
+    Target = case os:getenv("BEAMCHAIN_PRUNE") of
+        false ->
+            case get(prune, "0") of
+                S when is_list(S) ->
+                    case catch list_to_integer(S) of
+                        N when is_integer(N) -> N;
+                        _ -> 0
+                    end;
+                N when is_integer(N) -> N;
+                _ -> 0
+            end;
+        S ->
+            case catch list_to_integer(S) of
+                N when is_integer(N) -> N;
+                _ -> 0
+            end
+    end,
+    %% Enforce minimum of 550 MB if pruning is enabled
+    case Target of
+        0 -> 0;
+        _ when Target < 550 -> 550;
+        _ -> Target
     end.
 
 %%% ===================================================================
