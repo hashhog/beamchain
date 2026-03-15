@@ -25,7 +25,7 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] Undo data for block disconnection (reorg support)
 - [x] Mempool with fee-based ordering and ancestor/descendant limits
 - [x] BIP68 relative lock-time (sequence locks)
-- [x] JSON-RPC interface (sendrawtransaction with max_fee_rate, broadcast)
+- [x] JSON-RPC interface (sendrawtransaction, getrawtransaction with txindex)
 - [x] Block template construction (getblocktemplate)
 - [x] Witness commitment (BIP141)
 - [x] CPFP-aware tx selection (ancestor fee rate)
@@ -91,7 +91,7 @@ test/
 ├── beamchain_pow_tests.erl            PoW and difficulty adjustment tests
 ├── beamchain_versionbits_tests.erl    BIP9 state machine tests
 ├── beamchain_validation_tests.erl     Consensus rule tests
-└── beamchain_rpc_tests.erl            RPC sendrawtransaction tests
+└── beamchain_rpc_tests.erl            RPC tests (sendrawtransaction, getrawtransaction)
 ```
 
 ## Running tests
