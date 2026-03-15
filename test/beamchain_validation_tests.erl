@@ -617,3 +617,85 @@ make_regular_tx(Inputs, Outputs) ->
         outputs = TxOuts,
         locktime = 0
     }.
+
+%%% ===================================================================
+%%% Checkpoint tests
+%%% ===================================================================
+
+%% Test that get_checkpoint returns hash at exact checkpoint height
+get_checkpoint_exact_height_test() ->
+    %% Genesis block is a checkpoint on mainnet
+    Hash = beamchain_chain_params:get_checkpoint(0, mainnet),
+    ?assertNotEqual(none, Hash),
+    %% Should be the genesis hash
+    ExpectedHash = beamchain_serialize:hex_decode(
+        <<"000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f">>),
+    ?assertEqual(ExpectedHash, Hash).
+
+%% Test that get_checkpoint returns none for non-checkpoint heights
+get_checkpoint_non_checkpoint_test() ->
+    %% Height 100 is not a checkpoint
+    ?assertEqual(none, beamchain_chain_params:get_checkpoint(100, mainnet)),
+    %% Height 11110 (just before 11111) is not a checkpoint
+    ?assertEqual(none, beamchain_chain_params:get_checkpoint(11110, mainnet)).
+
+%% Test that get_last_checkpoint returns correct checkpoint
+get_last_checkpoint_exact_test() ->
+    %% At height 11111, last checkpoint is 11111 itself
+    {Height, _Hash} = beamchain_chain_params:get_last_checkpoint(11111, mainnet),
+    ?assertEqual(11111, Height).
+
+%% Test that get_last_checkpoint returns previous checkpoint
+get_last_checkpoint_between_test() ->
+    %% At height 20000 (between 11111 and 33333), last checkpoint is 11111
+    {Height, _Hash} = beamchain_chain_params:get_last_checkpoint(20000, mainnet),
+    ?assertEqual(11111, Height).
+
+%% Test that get_last_checkpoint returns none below first checkpoint
+get_last_checkpoint_at_genesis_test() ->
+    %% At height 0, last checkpoint is genesis (0)
+    {Height, _Hash} = beamchain_chain_params:get_last_checkpoint(0, mainnet),
+    ?assertEqual(0, Height).
+
+%% Test that networks without checkpoints return none
+get_last_checkpoint_no_checkpoints_test() ->
+    %% regtest has no checkpoints
+    ?assertEqual(none, beamchain_chain_params:get_last_checkpoint(100, regtest)).
+
+%% Test check_against_checkpoint passes for matching hash
+check_against_checkpoint_match_test() ->
+    %% Genesis block hash should match checkpoint
+    GenesisHashDisplay = beamchain_serialize:hex_decode(
+        <<"000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f">>),
+    GenesisHashInternal = beamchain_serialize:reverse_bytes(GenesisHashDisplay),
+    ?assertEqual(ok, beamchain_validation:check_against_checkpoint(
+        0, GenesisHashInternal, mainnet)).
+
+%% Test check_against_checkpoint fails for wrong hash
+check_against_checkpoint_mismatch_test() ->
+    %% Wrong hash at genesis should fail
+    WrongHash = <<1:256>>,
+    ?assertEqual({error, checkpoint_mismatch},
+                 beamchain_validation:check_against_checkpoint(0, WrongHash, mainnet)).
+
+%% Test check_against_checkpoint passes for non-checkpoint heights
+check_against_checkpoint_non_checkpoint_test() ->
+    %% Any hash is fine at a non-checkpoint height
+    AnyHash = <<123:256>>,
+    ?assertEqual(ok, beamchain_validation:check_against_checkpoint(
+        100, AnyHash, mainnet)).
+
+%% Test mainnet has genesis checkpoint
+mainnet_has_genesis_checkpoint_test() ->
+    Params = beamchain_chain_params:params(mainnet),
+    Checkpoints = maps:get(checkpoints, Params),
+    ?assert(maps:is_key(0, Checkpoints)),
+    %% Should have 11111 checkpoint too
+    ?assert(maps:is_key(11111, Checkpoints)).
+
+%% Test mainnet checkpoint count
+mainnet_checkpoint_count_test() ->
+    Params = beamchain_chain_params:params(mainnet),
+    Checkpoints = maps:get(checkpoints, Params),
+    %% Should have at least 14 checkpoints (0, 11111, 33333, ..., 295000)
+    ?assert(maps:size(Checkpoints) >= 14).
