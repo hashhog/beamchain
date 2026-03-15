@@ -26,7 +26,12 @@ db_test_() ->
           {"block index lookup by hash", fun block_index_by_hash/0},
           {"tx index store/get", fun tx_index_roundtrip/0},
           {"undo data store/get", fun undo_data_roundtrip/0},
-          {"batch write atomicity", fun batch_write/0}
+          {"batch write atomicity", fun batch_write/0},
+          %% Flat file storage tests
+          {"flat file write/read roundtrip", fun flat_file_roundtrip/0},
+          {"flat file multiple blocks", fun flat_file_multiple_blocks/0},
+          {"flat file read not found", fun flat_file_not_found/0},
+          {"flat file info", fun flat_file_info/0}
          ]
      end}.
 
@@ -123,6 +128,11 @@ block_by_height() ->
     Block1 = make_test_block(Block0#block.hash, 101),
     ok = beamchain_db:store_block(Block0, 0),
     ok = beamchain_db:store_block(Block1, 1),
+    %% store_block only stores by hash; we need store_block_index for height lookup
+    ok = beamchain_db:store_block_index(0, Block0#block.hash, Block0#block.header,
+                                         <<0:64>>, 1),
+    ok = beamchain_db:store_block_index(1, Block1#block.hash, Block1#block.header,
+                                         <<0:64>>, 1),
     {ok, Retrieved} = beamchain_db:get_block_by_height(1),
     ?assertEqual(Block1#block.header, Retrieved#block.header),
     ?assertEqual(not_found, beamchain_db:get_block_by_height(999)).
@@ -292,3 +302,63 @@ batch_write() ->
     {ok, Tip} = beamchain_db:get_chain_tip(),
     ?assertEqual(TipHash, maps:get(hash, Tip)),
     ?assertEqual(50, maps:get(height, Tip)).
+
+%%% ===================================================================
+%%% Flat file storage tests
+%%% ===================================================================
+
+flat_file_roundtrip() ->
+    Block = make_test_block(<<0:256>>, 1000),
+    Hash = Block#block.hash,
+    %% Write block to flat file
+    {ok, {FileNum, Offset, Size}} = beamchain_db:write_block(Block, 0),
+    ?assert(is_integer(FileNum)),
+    ?assert(is_integer(Offset)),
+    ?assert(is_integer(Size)),
+    ?assert(Size > 0),
+    %% Read block back from flat file
+    {ok, Retrieved} = beamchain_db:read_block(Hash),
+    %% Verify header matches
+    ?assertEqual(Block#block.header, Retrieved#block.header),
+    %% Verify tx count matches
+    ?assertEqual(length(Block#block.transactions),
+                 length(Retrieved#block.transactions)).
+
+flat_file_multiple_blocks() ->
+    %% Write multiple blocks
+    Block0 = make_test_block(<<0:256>>, 2000),
+    Block1 = make_test_block(Block0#block.hash, 2001),
+    Block2 = make_test_block(Block1#block.hash, 2002),
+
+    {ok, Loc0} = beamchain_db:write_block(Block0, 0),
+    {ok, Loc1} = beamchain_db:write_block(Block1, 1),
+    {ok, Loc2} = beamchain_db:write_block(Block2, 2),
+
+    %% Verify locations are different
+    ?assertNotEqual(Loc0, Loc1),
+    ?assertNotEqual(Loc1, Loc2),
+
+    %% Read all blocks back in different order
+    {ok, R2} = beamchain_db:read_block(Block2#block.hash),
+    {ok, R0} = beamchain_db:read_block(Block0#block.hash),
+    {ok, R1} = beamchain_db:read_block(Block1#block.hash),
+
+    ?assertEqual(Block2#block.header, R2#block.header),
+    ?assertEqual(Block0#block.header, R0#block.header),
+    ?assertEqual(Block1#block.header, R1#block.header).
+
+flat_file_not_found() ->
+    %% Try to read a block that doesn't exist
+    FakeHash = crypto:strong_rand_bytes(32),
+    ?assertEqual(not_found, beamchain_db:read_block(FakeHash)).
+
+flat_file_info() ->
+    %% Get block file info
+    Info = beamchain_db:get_block_file_info(),
+    ?assert(is_map(Info)),
+    ?assert(maps:is_key(blocks_dir, Info)),
+    ?assert(maps:is_key(current_file, Info)),
+    ?assert(maps:is_key(current_pos, Info)),
+    ?assert(maps:is_key(max_file_size, Info)),
+    ?assert(maps:is_key(index_size, Info)),
+    ?assertEqual(134217728, maps:get(max_file_size, Info)).
