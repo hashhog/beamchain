@@ -20,6 +20,7 @@ init([]) ->
         child_spec(beamchain_sig_cache, worker),
         child_spec(beamchain_chainstate, worker),
         child_spec(beamchain_mempool, worker),
+        child_spec(beamchain_erlay, worker),
         child_spec(beamchain_fee_estimator, worker),
         child_spec(beamchain_addrman, worker),
         child_spec(beamchain_peer_manager, worker),
