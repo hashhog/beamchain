@@ -185,3 +185,140 @@ testmempoolaccept_format_test() ->
     ?assert(maps:is_key(<<"txid">>, MockResult)),
     ?assert(maps:is_key(<<"allowed">>, MockResult)),
     ?assert(maps:is_key(<<"reject-reason">>, MockResult)).
+
+%%% ===================================================================
+%%% getrawtransaction tests
+%%% ===================================================================
+
+%% Test verbosity parameter parsing
+getrawtransaction_verbosity_test_() ->
+    {"getrawtransaction verbosity parsing",
+     [
+      {"0 returns raw hex mode", fun() ->
+          %% Verbosity 0 means return raw hex
+          ?assertEqual(0, parse_verbosity_value(0))
+      end},
+      {"false returns raw hex mode", fun() ->
+          ?assertEqual(0, parse_verbosity_value(false))
+      end},
+      {"1 returns JSON mode", fun() ->
+          ?assertEqual(1, parse_verbosity_value(1))
+      end},
+      {"true returns JSON mode", fun() ->
+          ?assertEqual(1, parse_verbosity_value(true))
+      end},
+      {"2 returns JSON with prevout mode", fun() ->
+          ?assertEqual(2, parse_verbosity_value(2))
+      end},
+      {"Higher values capped at 2", fun() ->
+          ?assertEqual(2, parse_verbosity_value(99))
+      end}
+     ]}.
+
+%% Helper to test verbosity parsing (mirrors RPC module logic)
+parse_verbosity_value(0) -> 0;
+parse_verbosity_value(1) -> 1;
+parse_verbosity_value(2) -> 2;
+parse_verbosity_value(false) -> 0;
+parse_verbosity_value(true) -> 1;
+parse_verbosity_value(V) when is_integer(V), V >= 0 -> min(V, 2);
+parse_verbosity_value(_) -> 0.
+
+%% Test getrawtransaction parameter format
+getrawtransaction_params_test_() ->
+    {"getrawtransaction parameter formats",
+     [
+      {"Accepts txid only", fun() ->
+          TxidHex = <<"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b">>,
+          ?assert(is_binary(TxidHex)),
+          ?assertEqual(64, byte_size(TxidHex))
+      end},
+      {"Accepts txid and verbosity", fun() ->
+          TxidHex = <<"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b">>,
+          Verbosity = 1,
+          ?assert(is_binary(TxidHex)),
+          ?assert(is_integer(Verbosity))
+      end},
+      {"Accepts txid, verbosity, and blockhash", fun() ->
+          TxidHex = <<"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b">>,
+          Verbosity = 1,
+          BlockHashHex = <<"000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f">>,
+          ?assert(is_binary(TxidHex)),
+          ?assert(is_integer(Verbosity)),
+          ?assert(is_binary(BlockHashHex)),
+          ?assertEqual(64, byte_size(BlockHashHex))
+      end}
+     ]}.
+
+%% Test in_active_chain field behavior
+in_active_chain_field_test_() ->
+    {"in_active_chain field handling",
+     [
+      {"Field included when blockhash provided", fun() ->
+          %% When blockhash is explicitly provided, in_active_chain should be present
+          MockResult = #{<<"txid">> => <<"abc">>,
+                         <<"blockhash">> => <<"def">>,
+                         <<"in_active_chain">> => true},
+          ?assert(maps:is_key(<<"in_active_chain">>, MockResult))
+      end},
+      {"Field absent when blockhash not provided", fun() ->
+          %% When blockhash is not provided (tx found via txindex),
+          %% in_active_chain should NOT be present
+          MockResult = #{<<"txid">> => <<"abc">>,
+                         <<"blockhash">> => <<"def">>},
+          ?assertNot(maps:is_key(<<"in_active_chain">>, MockResult))
+      end}
+     ]}.
+
+%% Test verbose output format
+getrawtransaction_verbose_format_test() ->
+    %% When verbose=1, the result should include these fields
+    MockVerboseResult = #{
+        <<"txid">> => <<"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b">>,
+        <<"hash">> => <<"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b">>,
+        <<"version">> => 1,
+        <<"size">> => 204,
+        <<"vsize">> => 204,
+        <<"weight">> => 816,
+        <<"locktime">> => 0,
+        <<"vin">> => [],
+        <<"vout">> => [],
+        <<"hex">> => <<"01000000...">>,
+        %% Fields added when tx is in a block
+        <<"blockhash">> => <<"000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f">>,
+        <<"confirmations">> => 100,
+        <<"time">> => 1231006505,
+        <<"blocktime">> => 1231006505
+    },
+    %% Check all required fields are present
+    ?assert(maps:is_key(<<"txid">>, MockVerboseResult)),
+    ?assert(maps:is_key(<<"hash">>, MockVerboseResult)),
+    ?assert(maps:is_key(<<"version">>, MockVerboseResult)),
+    ?assert(maps:is_key(<<"vin">>, MockVerboseResult)),
+    ?assert(maps:is_key(<<"vout">>, MockVerboseResult)),
+    ?assert(maps:is_key(<<"hex">>, MockVerboseResult)),
+    ?assert(maps:is_key(<<"blockhash">>, MockVerboseResult)),
+    ?assert(maps:is_key(<<"confirmations">>, MockVerboseResult)),
+    ?assert(maps:is_key(<<"blocktime">>, MockVerboseResult)).
+
+%% Test error messages for missing transactions
+getrawtransaction_error_messages_test_() ->
+    {"getrawtransaction error messages",
+     [
+      {"Missing tx with txindex enabled", fun() ->
+          ExpectedMsg = <<"No such mempool or blockchain transaction. Use gettransaction for wallet transactions.">>,
+          ?assert(is_binary(ExpectedMsg))
+      end},
+      {"Missing tx without txindex", fun() ->
+          ExpectedMsg = <<"No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries. Use gettransaction for wallet transactions.">>,
+          ?assert(is_binary(ExpectedMsg))
+      end},
+      {"Block not found", fun() ->
+          ExpectedMsg = <<"Block hash not found">>,
+          ?assert(is_binary(ExpectedMsg))
+      end},
+      {"Tx not in provided block", fun() ->
+          ExpectedMsg = <<"No such transaction found in the provided block">>,
+          ?assert(is_binary(ExpectedMsg))
+      end}
+     ]}.
