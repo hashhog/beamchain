@@ -23,7 +23,12 @@
          is_banned/1,
          broadcast/2,
          broadcast/3,
-         request_addresses/1]).
+         request_addresses/1,
+         %% Misbehavior and banning
+         misbehaving/3,
+         get_ban_list/0,
+         set_ban/3,
+         clear_ban/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -31,6 +36,18 @@
 
 -define(SERVER, ?MODULE).
 -define(PEER_TABLE, beamchain_peers).
+-define(BANNED_PEERS_TABLE, banned_peers).
+-define(MISBEHAVIOR_TABLE, peer_misbehavior).
+
+%% Misbehavior scoring thresholds
+-define(BAN_THRESHOLD, 100).
+-define(DEFAULT_BAN_DURATION, 86400).  %% 24 hours in seconds
+
+%% Misbehavior score values (Bitcoin Core compatible)
+-define(MISBEHAVIOR_INVALID_BLOCK, 100).       %% instant ban
+-define(MISBEHAVIOR_INVALID_TX, 10).
+-define(MISBEHAVIOR_UNCONNECTING_HEADERS, 20).
+-define(MISBEHAVIOR_INVALID_COMPACT_BLOCK, 100).
 
 %% Connection loop intervals
 -define(CONNECT_INTERVAL, 500).        %% 500ms between connection attempts
@@ -43,7 +60,8 @@
     direction   :: inbound | outbound,
     mon_ref     :: reference(),
     connected   :: boolean(),    %% true after handshake complete
-    info = #{}  :: map()         %% version, services, user_agent, etc
+    info = #{}  :: map(),        %% version, services, user_agent, etc
+    misbehavior_score = 0 :: non_neg_integer()  %% accumulated misbehavior score
 }).
 
 -record(state, {
@@ -146,6 +164,34 @@ broadcast(Command, Payload, FilterFun) ->
 request_addresses(Pid) ->
     beamchain_peer:send_message(Pid, {getaddr, #{}}).
 
+%% @doc Report misbehavior by a peer. Increments the peer's score by the
+%% given amount and logs the reason. When the score reaches 100, the peer
+%% is banned (disconnected and IP added to ban list for 24 hours).
+%%
+%% Score values follow Bitcoin Core conventions:
+%% - invalid_block: 100 (instant ban)
+%% - invalid_tx: 10
+%% - unconnecting_headers: 20
+%% - invalid_compact_block: 100 (instant ban)
+-spec misbehaving(pid(), non_neg_integer(), binary() | string()) -> ok.
+misbehaving(Pid, Score, Reason) ->
+    gen_server:cast(?SERVER, {misbehaving, Pid, Score, Reason}).
+
+%% @doc Get list of all banned IPs with their expiry times.
+-spec get_ban_list() -> [{inet:ip_address(), non_neg_integer()}].
+get_ban_list() ->
+    gen_server:call(?SERVER, get_ban_list).
+
+%% @doc Manually ban an IP address for the specified duration (seconds).
+-spec set_ban(inet:ip_address(), non_neg_integer(), binary() | string()) -> ok.
+set_ban(IP, Duration, Reason) ->
+    gen_server:call(?SERVER, {set_ban, IP, Duration, Reason}).
+
+%% @doc Remove an IP address from the ban list.
+-spec clear_ban(inet:ip_address()) -> ok | {error, not_found}.
+clear_ban(IP) ->
+    gen_server:call(?SERVER, {clear_ban, IP}).
+
 %%% ===================================================================
 %%% gen_server callbacks
 %%% ===================================================================
@@ -156,6 +202,15 @@ init([]) ->
     ets:new(?PEER_TABLE, [named_table, set, public,
                           {keypos, #peer_entry.pid},
                           {read_concurrency, true}]),
+    %% Create ETS table for banned peers: {IP, BanExpiry}
+    %% Using IP only (not port) for banning as that matches Bitcoin Core
+    case ets:info(?BANNED_PEERS_TABLE) of
+        undefined ->
+            ets:new(?BANNED_PEERS_TABLE, [named_table, set, public,
+                                           {read_concurrency, true}]);
+        _ ->
+            ok  %% table already exists (e.g., from tests)
+    end,
     Nonce = generate_nonce(),
     %% Start listening for inbound connections
     {ListenSock, Acceptor} = start_listener(),
@@ -163,6 +218,8 @@ init([]) ->
     self() ! bootstrap,
     %% Start connection maintenance loop
     Timer = erlang:send_after(?CONNECT_INTERVAL, self(), connect_tick),
+    %% Schedule periodic cleanup of expired bans
+    erlang:send_after(60000, self(), cleanup_expired_bans),
     {ok, #state{our_nonce = Nonce, connect_timer = Timer,
                 listen_socket = ListenSock, acceptor = Acceptor}}.
 
@@ -197,6 +254,29 @@ handle_call({connect_to, IP, Port}, _From, State) ->
 handle_call({is_banned, Address}, _From, State) ->
     {reply, is_banned_internal(Address, State), State};
 
+handle_call(get_ban_list, _From, State) ->
+    BanList = get_ban_list_internal(),
+    {reply, BanList, State};
+
+handle_call({set_ban, IP, Duration, Reason}, _From, State) ->
+    BanExpiry = erlang:system_time(second) + Duration,
+    ets:insert(?BANNED_PEERS_TABLE, {IP, BanExpiry}),
+    logger:info("peer manager: manually banned ~p for ~B seconds: ~s",
+                [IP, Duration, Reason]),
+    %% Disconnect any connected peers from this IP
+    disconnect_peers_by_ip(IP),
+    {reply, ok, State};
+
+handle_call({clear_ban, IP}, _From, State) ->
+    case ets:lookup(?BANNED_PEERS_TABLE, IP) of
+        [{IP, _}] ->
+            ets:delete(?BANNED_PEERS_TABLE, IP),
+            logger:info("peer manager: unbanned ~p", [IP]),
+            {reply, ok, State};
+        [] ->
+            {reply, {error, not_found}, State}
+    end;
+
 handle_call(get_state, _From, State) ->
     {reply, State, State};
 
@@ -224,6 +304,9 @@ handle_cast(resolve_dns_seeds, State) ->
         Self ! {dns_seeds_resolved, Addrs}
     end),
     {noreply, State#state{dns_pending = true}};
+
+handle_cast({misbehaving, Pid, Score, Reason}, State) ->
+    handle_misbehaving(Pid, Score, Reason, State);
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -347,6 +430,12 @@ handle_info({'DOWN', _MonRef, process, Pid, Reason}, State) ->
         [] ->
             {noreply, State}
     end;
+
+%% Periodic cleanup of expired bans
+handle_info(cleanup_expired_bans, State) ->
+    cleanup_expired_bans(),
+    erlang:send_after(60000, self(), cleanup_expired_bans),
+    {noreply, State};
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -558,12 +647,92 @@ handle_getaddr_msg(Pid, State) ->
 %%% Internal: ban management
 %%% ===================================================================
 
-is_banned_internal(Address, #state{banned = Banned}) ->
-    case maps:find(Address, Banned) of
-        {ok, BanUntil} ->
-            erlang:system_time(second) < BanUntil;
-        error ->
+is_banned_internal({IP, _Port}, _State) ->
+    %% Check the ETS ban table by IP (ignoring port, like Bitcoin Core)
+    is_ip_banned(IP);
+is_banned_internal(IP, _State) when is_tuple(IP) ->
+    is_ip_banned(IP).
+
+%% Check if an IP is banned in the ETS table
+is_ip_banned(IP) ->
+    case ets:lookup(?BANNED_PEERS_TABLE, IP) of
+        [{IP, BanExpiry}] ->
+            Now = erlang:system_time(second),
+            case Now < BanExpiry of
+                true -> true;
+                false ->
+                    %% Ban has expired, remove it
+                    ets:delete(?BANNED_PEERS_TABLE, IP),
+                    false
+            end;
+        [] ->
             false
+    end.
+
+%% Get all currently banned IPs
+get_ban_list_internal() ->
+    Now = erlang:system_time(second),
+    ets:foldl(fun({IP, BanExpiry}, Acc) ->
+        case BanExpiry > Now of
+            true -> [{IP, BanExpiry} | Acc];
+            false -> Acc
+        end
+    end, [], ?BANNED_PEERS_TABLE).
+
+%% Cleanup expired bans from the ETS table
+cleanup_expired_bans() ->
+    Now = erlang:system_time(second),
+    ets:foldl(fun({IP, BanExpiry}, _) ->
+        case BanExpiry =< Now of
+            true ->
+                ets:delete(?BANNED_PEERS_TABLE, IP),
+                logger:debug("peer manager: ban expired for ~p", [IP]);
+            false ->
+                ok
+        end
+    end, ok, ?BANNED_PEERS_TABLE).
+
+%% Disconnect all peers from a given IP
+disconnect_peers_by_ip(IP) ->
+    ets:foldl(fun(#peer_entry{pid = Pid, address = {PeerIP, _}}, _) ->
+        case PeerIP =:= IP of
+            true -> beamchain_peer:disconnect(Pid);
+            false -> ok
+        end
+    end, ok, ?PEER_TABLE).
+
+%% Handle misbehavior report
+handle_misbehaving(Pid, Score, Reason, State) ->
+    case ets:lookup(?PEER_TABLE, Pid) of
+        [#peer_entry{address = {IP, Port}, misbehavior_score = OldScore} = Entry] ->
+            NewScore = OldScore + Score,
+            ReasonStr = if
+                is_binary(Reason) -> Reason;
+                is_list(Reason) -> list_to_binary(Reason);
+                true -> <<"unknown">>
+            end,
+            logger:warning("peer manager: misbehaving peer ~p:~B (+~B -> ~B): ~s",
+                           [IP, Port, Score, NewScore, ReasonStr]),
+            case NewScore >= ?BAN_THRESHOLD of
+                true ->
+                    %% Ban the peer
+                    BanExpiry = erlang:system_time(second) + ?DEFAULT_BAN_DURATION,
+                    ets:insert(?BANNED_PEERS_TABLE, {IP, BanExpiry}),
+                    logger:info("peer manager: banning ~p:~B for ~B seconds (score ~B)",
+                                [IP, Port, ?DEFAULT_BAN_DURATION, NewScore]),
+                    %% Disconnect the peer
+                    beamchain_peer:disconnect(Pid),
+                    {noreply, State};
+                false ->
+                    %% Update the score
+                    Entry2 = Entry#peer_entry{misbehavior_score = NewScore},
+                    ets:insert(?PEER_TABLE, Entry2),
+                    {noreply, State}
+            end;
+        [] ->
+            %% Unknown peer, ignore
+            logger:debug("peer manager: misbehaving report for unknown pid ~p", [Pid]),
+            {noreply, State}
     end.
 
 %%% ===================================================================
