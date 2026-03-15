@@ -653,29 +653,145 @@ rpc_decoderawtransaction(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"Usage: decoderawtransaction \"hexstring\"">>}.
 
+%% Default max fee rate: 0.10 BTC/kvB = 10,000,000 sat/kvB
+-define(DEFAULT_MAX_RAW_TX_FEE_RATE, 10000000).
+
 rpc_sendrawtransaction([HexStr]) when is_binary(HexStr) ->
+    rpc_sendrawtransaction([HexStr, ?DEFAULT_MAX_RAW_TX_FEE_RATE / 100000000.0]);
+rpc_sendrawtransaction([HexStr, MaxFeeRateBtcKvB]) when is_binary(HexStr) ->
+    %% MaxFeeRateBtcKvB is in BTC/kvB; convert to sat/vB for comparison
+    MaxFeeRateSatVB = case MaxFeeRateBtcKvB of
+        N when is_number(N) -> N * 100000000.0 / 1000.0;  %% BTC/kvB to sat/vB
+        _ -> ?DEFAULT_MAX_RAW_TX_FEE_RATE / 1000.0
+    end,
     try
         Bin = beamchain_serialize:hex_decode(HexStr),
         {Tx, _} = beamchain_serialize:decode_transaction(Bin),
+        Txid = beamchain_serialize:tx_hash(Tx),
+
+        %% Check if already in mempool
+        case beamchain_mempool:has_tx(Txid) of
+            true ->
+                throw({already_in_mempool, Txid});
+            false ->
+                ok
+        end,
+
+        %% Check if already in blockchain
+        case beamchain_db:get_tx_location(Txid) of
+            {ok, _} ->
+                throw({already_in_chain, Txid});
+            not_found ->
+                ok
+        end,
+
+        %% Check max fee rate if non-zero (anti-fat-finger protection)
+        case MaxFeeRateSatVB > 0 of
+            true ->
+                check_max_fee_rate(Tx, MaxFeeRateSatVB);
+            false ->
+                ok
+        end,
+
         case beamchain_mempool:add_transaction(Tx) of
-            {ok, Txid} ->
-                %% Broadcast to peers
-                try beamchain_peer_manager:broadcast(inv, #{
-                    items => [#{type => ?MSG_TX, hash => Txid}]
-                }) catch _:_ -> ok end,
-                {ok, hash_to_hex(Txid)};
+            {ok, AcceptedTxid} ->
+                %% Broadcast to all connected peers via inv message
+                relay_transaction(AcceptedTxid),
+                {ok, hash_to_hex(AcceptedTxid)};
             {error, Reason} ->
-                {error, ?RPC_VERIFY_REJECTED,
-                 iolist_to_binary(io_lib:format("~p", [Reason]))}
+                format_mempool_error(Reason, Txid)
         end
     catch
+        throw:{already_in_mempool, _} ->
+            {error, ?RPC_VERIFY_ALREADY_IN_CHAIN,
+             <<"Transaction already in mempool">>};
+        throw:{already_in_chain, _} ->
+            {error, ?RPC_VERIFY_ALREADY_IN_CHAIN,
+             <<"Transaction already in block chain">>};
+        throw:{max_fee_exceeded, FeeRate} ->
+            {error, ?RPC_VERIFY_REJECTED,
+             iolist_to_binary(io_lib:format(
+                 "Fee rate (~.2f sat/vB) exceeds maximum (~.2f sat/vB)",
+                 [FeeRate, MaxFeeRateSatVB]))};
+        throw:{missing_inputs, _} ->
+            {error, ?RPC_VERIFY_ERROR,
+             <<"Missing inputs">>};
         _:_ ->
             {error, ?RPC_DESERIALIZATION_ERROR,
-             <<"TX decode failed">>}
+             <<"TX decode failed. Make sure the tx has at least one input.">>}
     end;
 rpc_sendrawtransaction(_) ->
     {error, ?RPC_INVALID_PARAMS,
-     <<"Usage: sendrawtransaction \"hexstring\"">>}.
+     <<"Usage: sendrawtransaction \"hexstring\" ( maxfeerate )">>}.
+
+%% Check if transaction fee rate exceeds the maximum allowed.
+%% Throws {max_fee_exceeded, ActualFeeRate} if exceeded.
+check_max_fee_rate(Tx, MaxFeeRateSatVB) ->
+    %% Look up inputs to calculate fee
+    TotalIn = compute_tx_input_value(Tx),
+    TotalOut = lists:foldl(fun(#tx_out{value = V}, Acc) -> Acc + V end,
+                           0, Tx#transaction.outputs),
+    case TotalIn of
+        0 ->
+            %% Can't determine fee without inputs
+            ok;
+        _ ->
+            Fee = TotalIn - TotalOut,
+            VSize = beamchain_serialize:tx_vsize(Tx),
+            FeeRate = Fee / max(1, VSize),
+            case FeeRate > MaxFeeRateSatVB of
+                true -> throw({max_fee_exceeded, FeeRate});
+                false -> ok
+            end
+    end.
+
+%% Compute total input value for a transaction.
+compute_tx_input_value(#transaction{inputs = Inputs}) ->
+    lists:foldl(fun(#tx_in{prev_out = #outpoint{hash = H, index = I}}, Acc) ->
+        case beamchain_chainstate:get_utxo(H, I) of
+            {ok, #utxo{value = V}} -> Acc + V;
+            not_found ->
+                case beamchain_mempool:get_mempool_utxo(H, I) of
+                    {ok, #utxo{value = V}} -> Acc + V;
+                    not_found -> Acc
+                end
+        end
+    end, 0, Inputs).
+
+%% Relay a transaction to all connected peers.
+relay_transaction(Txid) ->
+    try
+        beamchain_peer_manager:broadcast(inv, #{
+            items => [#{type => ?MSG_TX, hash => Txid}]
+        })
+    catch
+        _:_ -> ok
+    end.
+
+%% Format mempool rejection errors with appropriate RPC error codes.
+format_mempool_error(orphan, _Txid) ->
+    {error, ?RPC_VERIFY_ERROR, <<"Missing inputs">>};
+format_mempool_error(already_in_mempool, _Txid) ->
+    {error, ?RPC_VERIFY_ALREADY_IN_CHAIN, <<"Transaction already in mempool">>};
+format_mempool_error(insufficient_fee, _Txid) ->
+    {error, ?RPC_VERIFY_REJECTED, <<"Insufficient fee">>};
+format_mempool_error(mempool_min_fee_not_met, _Txid) ->
+    {error, ?RPC_VERIFY_REJECTED, <<"mempool min fee not met">>};
+format_mempool_error(dust, _Txid) ->
+    {error, ?RPC_VERIFY_REJECTED, <<"dust">>};
+format_mempool_error(too_long_mempool_chain, _Txid) ->
+    {error, ?RPC_VERIFY_REJECTED, <<"too-long-mempool-chain">>};
+format_mempool_error(rbf_not_signaled, _Txid) ->
+    {error, ?RPC_VERIFY_REJECTED, <<"txn-mempool-conflict">>};
+format_mempool_error({script_verify_failed, Idx}, _Txid) ->
+    {error, ?RPC_VERIFY_ERROR,
+     iolist_to_binary(io_lib:format("mandatory-script-verify-flag-failed (input ~B)", [Idx]))};
+format_mempool_error({validation, Reason}, _Txid) ->
+    {error, ?RPC_VERIFY_ERROR,
+     iolist_to_binary(io_lib:format("~p", [Reason]))};
+format_mempool_error(Reason, _Txid) ->
+    {error, ?RPC_VERIFY_REJECTED,
+     iolist_to_binary(io_lib:format("~p", [Reason]))}.
 
 rpc_testmempoolaccept([RawTxs]) when is_list(RawTxs) ->
     Results = lists:map(fun(HexStr) ->
