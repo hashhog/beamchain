@@ -17,9 +17,12 @@
 %% ElligatorSwift operations (BIP324 v2 transport)
 -export([ellswift_create/2, ellswift_xdh/4]).
 
-%% Hashing
+%% Hashing (NIF-accelerated with pure Erlang fallback)
 -export([sha256/1, hash256/1, hash160/1,
          tagged_hash/2, hmac_sha512/2]).
+
+%% Batch verification (reduces NIF call overhead)
+-export([batch_ecdsa_verify/1, batch_schnorr_verify/1]).
 
 %% SipHash-2-4 (for BIP152 compact blocks)
 -export([siphash/3, siphash_uint256/3]).
@@ -39,6 +42,9 @@
 -define(SECP256K1_N_HALF,
     16#7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0).
 
+%% Track whether NIF loaded successfully for fallback logic
+-define(NIF_LOADED, beamchain_crypto_nif_loaded).
+
 %%% -------------------------------------------------------------------
 %%% NIF loading
 %%% -------------------------------------------------------------------
@@ -46,6 +52,14 @@
 init() ->
     SoName = filename:join(priv_dir(), "beamchain_crypto_nif"),
     Ret = erlang:load_nif(SoName, 0),
+    %% Track NIF load status for fallback logic
+    case Ret of
+        ok ->
+            persistent_term:put(?NIF_LOADED, true);
+        _ ->
+            persistent_term:put(?NIF_LOADED, false),
+            logger:warning("beamchain_crypto: NIF not loaded, using pure Erlang fallback")
+    end,
     init_tag_hashes(),
     Ret.
 
@@ -105,6 +119,20 @@ ellswift_create_nif(_SecKey, _AuxRand) ->
     erlang:nif_error(nif_not_loaded).
 
 ellswift_xdh_nif(_EllA, _EllB, _SecKey, _Party) ->
+    erlang:nif_error(nif_not_loaded).
+
+%% SHA-256 NIFs (with hardware acceleration when available)
+sha256_nif(_Data) ->
+    erlang:nif_error(nif_not_loaded).
+
+double_sha256_nif(_Data) ->
+    erlang:nif_error(nif_not_loaded).
+
+%% Batch verification NIFs
+batch_ecdsa_verify_nif(_Items) ->
+    erlang:nif_error(nif_not_loaded).
+
+batch_schnorr_verify_nif(_Items) ->
     erlang:nif_error(nif_not_loaded).
 
 %%% -------------------------------------------------------------------
@@ -264,29 +292,79 @@ ellswift_xdh(EllA, EllB, SecKey, Party) when byte_size(EllA) =:= 64,
     ellswift_xdh_nif(EllA, EllB, SecKey, Party).
 
 %%% -------------------------------------------------------------------
-%%% Hashing
+%%% Hashing (NIF-accelerated with hardware intrinsics when available)
 %%% -------------------------------------------------------------------
 
 -spec sha256(binary()) -> binary().
 sha256(Data) ->
-    crypto:hash(sha256, Data).
+    try
+        sha256_nif(Data)
+    catch
+        error:nif_not_loaded ->
+            %% Fallback to pure Erlang
+            crypto:hash(sha256, Data)
+    end.
 
 -spec hash256(binary()) -> binary().
 hash256(Data) ->
-    crypto:hash(sha256, crypto:hash(sha256, Data)).
+    try
+        double_sha256_nif(Data)
+    catch
+        error:nif_not_loaded ->
+            %% Fallback to pure Erlang
+            crypto:hash(sha256, crypto:hash(sha256, Data))
+    end.
 
 -spec hash160(binary()) -> binary().
 hash160(Data) ->
-    crypto:hash(ripemd160, crypto:hash(sha256, Data)).
+    crypto:hash(ripemd160, sha256(Data)).
 
 -spec tagged_hash(Tag :: binary(), Data :: binary()) -> binary().
 tagged_hash(Tag, Data) ->
     TagHash = get_tag_hash(Tag),
-    crypto:hash(sha256, <<TagHash/binary, TagHash/binary, Data/binary>>).
+    sha256(<<TagHash/binary, TagHash/binary, Data/binary>>).
 
 -spec hmac_sha512(Key :: binary(), Data :: binary()) -> binary().
 hmac_sha512(Key, Data) ->
     crypto:mac(hmac, sha512, Key, Data).
+
+%%% -------------------------------------------------------------------
+%%% Batch verification (reduces NIF call overhead)
+%%%
+%%% When verifying multiple signatures (e.g., all inputs in a block),
+%%% batch verification amortizes the NIF call overhead by processing
+%%% multiple signatures in a single call to C.
+%%% -------------------------------------------------------------------
+
+%% @doc Verify multiple ECDSA signatures in a single NIF call.
+%% Input: list of {MsgHash32, DerSig, PubKey} tuples.
+%% Output: list of booleans in the same order.
+-spec batch_ecdsa_verify([{binary(), binary(), binary()}]) -> [boolean()].
+batch_ecdsa_verify([]) ->
+    [];
+batch_ecdsa_verify(Items) when is_list(Items) ->
+    try
+        batch_ecdsa_verify_nif(Items)
+    catch
+        error:nif_not_loaded ->
+            %% Fallback to individual verification
+            [ecdsa_verify(Msg, Sig, PubKey) || {Msg, Sig, PubKey} <- Items]
+    end.
+
+%% @doc Verify multiple Schnorr signatures in a single NIF call.
+%% Input: list of {MsgHash32, Sig64, XOnlyPubKey32} tuples.
+%% Output: list of booleans in the same order.
+-spec batch_schnorr_verify([{binary(), binary(), binary()}]) -> [boolean()].
+batch_schnorr_verify([]) ->
+    [];
+batch_schnorr_verify(Items) when is_list(Items) ->
+    try
+        batch_schnorr_verify_nif(Items)
+    catch
+        error:nif_not_loaded ->
+            %% Fallback to individual verification
+            [schnorr_verify(Msg, Sig, PubKey) || {Msg, Sig, PubKey} <- Items]
+    end.
 
 %%% -------------------------------------------------------------------
 %%% Tag hash cache (persistent_term for fast lookups)
@@ -302,7 +380,7 @@ init_tag_hashes() ->
 get_tag_hash(Tag) ->
     case persistent_term:get({beamchain_tag_hash, Tag}, undefined) of
         undefined ->
-            Hash = crypto:hash(sha256, Tag),
+            Hash = sha256(Tag),
             persistent_term:put({beamchain_tag_hash, Tag}, Hash),
             Hash;
         Hash ->
