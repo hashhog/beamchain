@@ -48,6 +48,8 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] PSBT support (BIP 174/370)
 - [x] Wallet RPC methods (getnewaddress, getbalance, sendtoaddress)
 - [x] Keypool with 1000-address lookahead
+- [x] Coinbase maturity enforcement (100-block rule)
+- [x] Wallet encryption (AES-256-CBC with PBKDF2 key derivation)
 - [ ] Compact block relay (BIP152)
 
 ## Quick start
