@@ -63,6 +63,7 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] Miniscript policy compiler (type checking, script compilation, satisfaction)
 - [x] BIP330 Erlay transaction reconciliation (sendtxrcncl handshake, set reconciliation)
 - [x] assumeUTXO snapshot-based sync (loadtxoutset RPC, background validation)
+- [x] Pay-to-Anchor (P2A) outputs (witness v1 anyone-can-spend for Lightning anchors)
 
 ## Quick start
 
