@@ -57,6 +57,7 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] Keypool with 1000-address lookahead
 - [x] Coinbase maturity enforcement (100-block rule)
 - [x] Wallet encryption (AES-256-CBC with PBKDF2 key derivation)
+- [x] Multi-wallet support (createwallet, loadwallet, unloadwallet, listwallets)
 - [x] Compact block relay (BIP152 with SipHash-2-4)
 - [x] BIP324 v2 encrypted transport (ElligatorSwift, ChaCha20-Poly1305)
 - [x] BIP155 ADDRv2 messages (TorV3, I2P, CJDNS address support)
@@ -112,6 +113,7 @@ src/
 ├── beamchain_rpc.erl          JSON-RPC server
 ├── beamchain_rest.erl         REST API server
 ├── beamchain_wallet.erl       HD wallet, coin selection
+├── beamchain_wallet_sup.erl   Multi-wallet supervisor
 ├── beamchain_psbt.erl         BIP 174 PSBT serialization and signing
 ├── beamchain_descriptor.erl   Output descriptors (BIP380-386)
 ├── beamchain_miniscript.erl   Miniscript policy compiler
