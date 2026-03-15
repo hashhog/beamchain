@@ -52,6 +52,7 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] Coinbase maturity enforcement (100-block rule)
 - [x] Wallet encryption (AES-256-CBC with PBKDF2 key derivation)
 - [x] Compact block relay (BIP152 with SipHash-2-4)
+- [x] BIP324 v2 encrypted transport (ElligatorSwift, ChaCha20-Poly1305)
 
 ## Quick start
 
@@ -90,7 +91,8 @@ src/
 ├── beamchain_chain_params.erl Network parameters and checkpoints
 ├── beamchain_db.erl           RocksDB wrapper, flat file storage, block indexes
 ├── beamchain_rpc.erl          JSON-RPC server
-└── beamchain_wallet.erl       HD wallet, PSBT, coin selection
+├── beamchain_wallet.erl       HD wallet, PSBT, coin selection
+└── beamchain_transport_v2.erl BIP324 v2 encrypted transport
 
 c_src/
 └── beamchain_crypto_nif.c     libsecp256k1 bindings
@@ -108,7 +110,8 @@ test/
 ├── beamchain_validation_tests.erl     Consensus rule tests
 ├── beamchain_rpc_tests.erl            RPC tests (core blockchain and transaction RPCs)
 ├── beamchain_wallet_tests.erl         HD wallet and coin selection tests
-└── beamchain_block_sync_tests.erl     Block sync and compact block tests
+├── beamchain_block_sync_tests.erl     Block sync and compact block tests
+└── beamchain_transport_v2_tests.erl   BIP324 v2 transport tests
 ```
 
 ## Running tests
