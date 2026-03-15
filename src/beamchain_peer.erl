@@ -15,7 +15,8 @@
 %% API
 -export([connect/3, accept/3,
          send_message/2, add_misbehavior/2,
-         disconnect/1, info/1]).
+         disconnect/1, info/1,
+         queue_tx_inv/2]).
 
 %% gen_statem callbacks
 -export([callback_mode/0, init/1, terminate/3]).
@@ -32,6 +33,19 @@
 -define(INACTIVITY_TIMEOUT, 1800000).  %% 30 minutes
 
 -define(BAN_SCORE, 100).
+
+%%% -------------------------------------------------------------------
+%%% Inv trickling constants (per Bitcoin Core net_processing.cpp)
+%%% -------------------------------------------------------------------
+
+%% Average delay between trickled inventory transmissions for inbound peers
+-define(INBOUND_INV_INTERVAL_MS, 5000).   %% 5 seconds
+%% Average delay for outbound peers (less privacy concern)
+-define(OUTBOUND_INV_INTERVAL_MS, 2000).  %% 2 seconds
+%% Target number of tx inv items per tick (14/sec * 5s = 70)
+-define(INV_BROADCAST_TARGET, 70).
+%% Maximum number of tx inv items per tick
+-define(INV_BROADCAST_MAX, 1000).
 
 %%% -------------------------------------------------------------------
 %%% State data
@@ -74,7 +88,10 @@
     latency_ms              :: non_neg_integer() | undefined,
     bytes_sent = 0          :: non_neg_integer(),
     bytes_recv = 0          :: non_neg_integer(),
-    misbehavior = 0         :: non_neg_integer()
+    misbehavior = 0         :: non_neg_integer(),
+    %% Inv trickling (privacy: randomized tx relay)
+    pending_tx_inv = []     :: [binary()],  %% txids waiting to be sent
+    trickle_timer_ref       :: reference() | undefined
 }).
 
 %%% ===================================================================
@@ -113,6 +130,13 @@ disconnect(Pid) ->
 -spec info(pid()) -> {ok, map()} | {error, term()}.
 info(Pid) ->
     gen_statem:call(Pid, info).
+
+%% @doc Queue a transaction for trickling via inv. Instead of immediate
+%% broadcast, txids are batched and sent with randomized Poisson delays
+%% to prevent timing-based deanonymization.
+-spec queue_tx_inv(pid(), binary()) -> ok.
+queue_tx_inv(Pid, Txid) when is_binary(Txid), byte_size(Txid) =:= 32 ->
+    gen_statem:cast(Pid, {queue_tx_inv, Txid}).
 
 %%% ===================================================================
 %%% gen_statem callbacks
@@ -256,8 +280,10 @@ ready(enter, handshaking, Data) ->
     Data2 = send_feature_msgs(Data),
     %% Notify handler
     Data2#peer_data.handler ! {peer_connected, self(), build_info(Data2)},
+    %% Schedule first inv trickle with Poisson delay
+    Data3 = schedule_trickle_timer(Data2),
     %% Start ping timer and inactivity timeout
-    {keep_state, Data2,
+    {keep_state, Data3,
      [{{timeout, ping}, ?PING_INTERVAL, send_ping},
       {{timeout, inactivity}, ?INACTIVITY_TIMEOUT, inactive}]};
 
@@ -313,6 +339,20 @@ ready(cast, disconnect, Data) ->
 ready(cast, {misbehavior, Score}, Data) ->
     check_ban(Data#peer_data{
         misbehavior = Data#peer_data.misbehavior + Score});
+
+ready(cast, {queue_tx_inv, Txid}, Data) ->
+    %% Add txid to pending queue if not already there
+    Pending = Data#peer_data.pending_tx_inv,
+    case lists:member(Txid, Pending) of
+        true  -> {keep_state, Data};
+        false -> {keep_state, Data#peer_data{pending_tx_inv = [Txid | Pending]}}
+    end;
+
+ready(info, trickle_inv, Data) ->
+    %% Flush queued inv items with randomized ordering
+    Data2 = do_trickle_inv(Data),
+    Data3 = schedule_trickle_timer(Data2),
+    {keep_state, Data3};
 
 ready({call, From}, info, Data) ->
     {keep_state_and_data, [{reply, From, {ok, build_info(Data)}}]};
@@ -589,3 +629,70 @@ build_info(#peer_data{} = D) ->
       bytes_sent    => D#peer_data.bytes_sent,
       bytes_recv    => D#peer_data.bytes_recv,
       connected_at  => D#peer_data.connected_at}.
+
+%%% ===================================================================
+%%% Internal: Inv trickling (privacy-preserving tx relay)
+%%% ===================================================================
+
+%% Schedule the next trickle timer using Poisson distribution.
+%% For exponentially distributed intervals: -ln(U) * mean
+%% where U is uniform random in (0,1].
+schedule_trickle_timer(#peer_data{direction = Dir} = Data) ->
+    %% Cancel any existing timer
+    case Data#peer_data.trickle_timer_ref of
+        undefined -> ok;
+        OldRef -> erlang:cancel_timer(OldRef)
+    end,
+    %% Calculate Poisson-distributed interval
+    BaseInterval = case Dir of
+        inbound  -> ?INBOUND_INV_INTERVAL_MS;
+        outbound -> ?OUTBOUND_INV_INTERVAL_MS
+    end,
+    Interval = poisson_interval(BaseInterval),
+    Ref = erlang:send_after(Interval, self(), trickle_inv),
+    Data#peer_data{trickle_timer_ref = Ref}.
+
+%% Generate Poisson-distributed interval: -ln(U) * mean
+%% where U is uniform random in (0,1]. We use rand:uniform() which
+%% returns (0.0, 1.0] and apply the transformation.
+poisson_interval(MeanMs) ->
+    U = rand:uniform(),  %% (0.0, 1.0]
+    Interval = round(-math:log(U) * MeanMs),
+    %% Clamp to reasonable bounds (1ms to 60s)
+    max(1, min(Interval, 60000)).
+
+%% Flush pending tx inv items to the peer.
+%% Randomize order to prevent timing analysis, limit per tick.
+do_trickle_inv(#peer_data{pending_tx_inv = []} = Data) ->
+    Data;
+do_trickle_inv(#peer_data{pending_tx_inv = Pending, peer_relay = Relay} = Data) ->
+    case Relay of
+        false ->
+            %% Peer requested no tx relay, clear queue
+            Data#peer_data{pending_tx_inv = []};
+        true ->
+            %% Calculate broadcast max: target + 5 per 1000 pending
+            BroadcastMax = min(?INV_BROADCAST_MAX,
+                               ?INV_BROADCAST_TARGET + (length(Pending) div 1000) * 5),
+            %% Shuffle and take up to max
+            Shuffled = shuffle_list(Pending),
+            {ToSend, Remaining} = lists:split(min(BroadcastMax, length(Shuffled)), Shuffled),
+            %% Send inv message if we have items
+            Data2 = case ToSend of
+                [] -> Data;
+                _  -> send_tx_inv(ToSend, Data)
+            end,
+            Data2#peer_data{pending_tx_inv = Remaining}
+    end.
+
+%% Send inv message for a list of txids
+send_tx_inv(Txids, Data) ->
+    Items = [#{type => 1, hash => Txid} || Txid <- Txids],  %% 1 = MSG_TX
+    do_send_msg(inv, #{items => Items}, Data).
+
+%% Fisher-Yates shuffle for randomizing inv order
+shuffle_list([]) -> [];
+shuffle_list([X]) -> [X];
+shuffle_list(List) ->
+    %% Use a simple random sort for small lists
+    lists:sort(fun(_, _) -> rand:uniform() > 0.5 end, List).
