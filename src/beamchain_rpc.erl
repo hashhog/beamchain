@@ -407,6 +407,10 @@ handle_method(<<"decodepsbt">>, P) -> rpc_decodepsbt(P);
 handle_method(<<"combinepsbt">>, P) -> rpc_combinepsbt(P);
 handle_method(<<"finalizepsbt">>, P) -> rpc_finalizepsbt(P);
 
+%% -- Descriptors --
+handle_method(<<"deriveaddresses">>, P) -> rpc_deriveaddresses(P);
+handle_method(<<"getdescriptorinfo">>, P) -> rpc_getdescriptorinfo(P);
+
 handle_method(Method, _) ->
     {error, ?RPC_METHOD_NOT_FOUND,
      <<"Method not found: ", Method/binary>>}.
@@ -472,7 +476,9 @@ rpc_help_list() ->
         <<"testmempoolaccept [\"rawtx\"]">>,
         <<"">>,
         <<"== Util ==">>,
+        <<"deriveaddresses \"descriptor\" ( range )">>,
         <<"estimatesmartfee conf_target ( \"estimate_mode\" )">>,
+        <<"getdescriptorinfo \"descriptor\"">>,
         <<"validateaddress \"address\"">>,
         <<"">>,
         <<"== Wallet ==">>,
@@ -2991,3 +2997,112 @@ sighash_name(N) when N band ?SIGHASH_ANYONECANPAY =/= 0 ->
     <<Base/binary, "|ANYONECANPAY">>;
 sighash_name(N) ->
     iolist_to_binary(io_lib:format("UNKNOWN(~B)", [N])).
+
+%%% ===================================================================
+%%% Descriptor methods
+%%% ===================================================================
+
+%% deriveaddresses "descriptor" ( range )
+%% Derives one or more addresses from an output descriptor.
+rpc_deriveaddresses([DescStr]) ->
+    %% Non-ranged descriptor: derive single address
+    rpc_deriveaddresses([DescStr, 0]);
+rpc_deriveaddresses([DescStr, Range]) when is_binary(DescStr) ->
+    Network = beamchain_config:network(),
+    try
+        case beamchain_descriptor:parse(binary_to_list(DescStr)) of
+            {ok, Desc} ->
+                case beamchain_descriptor:is_solvable(Desc) of
+                    false ->
+                        {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+                         <<"Descriptor is not solvable">>};
+                    true ->
+                        derive_addresses_range(Desc, Range, Network)
+                end;
+            {error, Reason} ->
+                {error, ?RPC_INVALID_PARAMETER,
+                 iolist_to_binary(io_lib:format("Invalid descriptor: ~p", [Reason]))}
+        end
+    catch
+        _:Err ->
+            {error, ?RPC_MISC_ERROR,
+             iolist_to_binary(io_lib:format("Error: ~p", [Err]))}
+    end;
+rpc_deriveaddresses(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"deriveaddresses \"descriptor\" ( range )">>}.
+
+derive_addresses_range(Desc, Range, Network) ->
+    IsRange = beamchain_descriptor:is_range(Desc),
+    {Start, End} = parse_range(Range, IsRange),
+    case Start > End of
+        true ->
+            {error, ?RPC_INVALID_PARAMETER, <<"Invalid range">>};
+        false ->
+            case beamchain_descriptor:expand(Desc, {Start, End}, Network) of
+                {ok, Results} ->
+                    Addresses = lists:map(fun({_Idx, Script}) ->
+                        script_to_address_bin(Script, Network)
+                    end, Results),
+                    {ok, Addresses};
+                {error, Reason} ->
+                    {error, ?RPC_MISC_ERROR,
+                     iolist_to_binary(io_lib:format("Derivation failed: ~p", [Reason]))}
+            end
+    end.
+
+parse_range(N, _IsRange) when is_integer(N), N >= 0 ->
+    %% Single index
+    {N, N};
+parse_range([Start, End], true) when is_integer(Start), is_integer(End) ->
+    %% [start, end] range
+    {Start, End};
+parse_range([Start], true) when is_integer(Start) ->
+    %% [start] means [0, start]
+    {0, Start};
+parse_range(_, false) ->
+    %% Non-ranged descriptor, just use index 0
+    {0, 0};
+parse_range(_, _) ->
+    {0, 0}.
+
+script_to_address_bin(Script, Network) ->
+    case beamchain_address:script_to_address(Script, Network) of
+        unknown -> <<"unknown">>;
+        "OP_RETURN" -> <<"OP_RETURN">>;
+        Addr -> list_to_binary(Addr)
+    end.
+
+%% getdescriptorinfo "descriptor"
+%% Analyses a descriptor string and returns information about it.
+rpc_getdescriptorinfo([DescStr]) when is_binary(DescStr) ->
+    try
+        DescStrList = binary_to_list(DescStr),
+        %% Strip checksum if present for computing the canonical descriptor
+        Stripped = case string:rchr(DescStrList, $#) of
+            0 -> DescStrList;
+            Pos -> string:substr(DescStrList, 1, Pos - 1)
+        end,
+        case beamchain_descriptor:parse(Stripped) of
+            {ok, Desc} ->
+                Checksum = beamchain_descriptor:checksum(Stripped),
+                WithChecksum = Stripped ++ "#" ++ Checksum,
+                Result = #{
+                    <<"descriptor">> => list_to_binary(WithChecksum),
+                    <<"checksum">> => list_to_binary(Checksum),
+                    <<"isrange">> => beamchain_descriptor:is_range(Desc),
+                    <<"issolvable">> => beamchain_descriptor:is_solvable(Desc),
+                    <<"hasprivatekeys">> => beamchain_descriptor:has_private_keys(Desc)
+                },
+                {ok, Result};
+            {error, Reason} ->
+                {error, ?RPC_INVALID_PARAMETER,
+                 iolist_to_binary(io_lib:format("Invalid descriptor: ~p", [Reason]))}
+        end
+    catch
+        _:Err ->
+            {error, ?RPC_MISC_ERROR,
+             iolist_to_binary(io_lib:format("Error: ~p", [Err]))}
+    end;
+rpc_getdescriptorinfo(_) ->
+    {error, ?RPC_INVALID_PARAMS, <<"getdescriptorinfo \"descriptor\"">>}.
