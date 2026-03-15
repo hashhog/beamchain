@@ -153,4 +153,15 @@
 -define(MAX_PACKAGE_COUNT, 25).               %% Max transactions in a package
 -define(MAX_PACKAGE_WEIGHT, 404000).          %% Max weight (allows 101 kvB vsize)
 
+%%% -------------------------------------------------------------------
+%%% v3/TRUC (Topologically Restricted Until Confirmation) policy
+%%% BIP 431 - transactions with nVersion=3 have restricted topology
+%%% -------------------------------------------------------------------
+
+-define(TRUC_VERSION, 3).                     %% v3 transactions are TRUC
+-define(TRUC_ANCESTOR_LIMIT, 2).              %% Max 1 unconfirmed parent + self
+-define(TRUC_DESCENDANT_LIMIT, 2).            %% Max 1 unconfirmed child + self
+-define(TRUC_MAX_VSIZE, 10000).               %% Max vsize for any v3 tx
+-define(TRUC_CHILD_MAX_VSIZE, 1000).          %% Max vsize for v3 child (has unconf parent)
+
 -endif.

@@ -27,6 +27,9 @@
 %% UTXO lookups (called externally from validation)
 -export([get_mempool_utxo/2]).
 
+%% TRUC (v3 transaction) policy checks - exported for testing
+-export([check_truc_rules/3]).
+
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2]).
@@ -321,6 +324,21 @@ do_add_transaction(Tx, State) ->
 
         %% 10. verify scripts
         verify_scripts(Tx, InputCoins),
+
+        %% 10b. TRUC (v3 transaction) policy checks
+        MempoolParentTxids = get_parent_txids(Tx),
+        case check_truc_rules(Tx, VSize, MempoolParentTxids) of
+            ok ->
+                ok;
+            {sibling_eviction, SiblingTxid} ->
+                %% v3 sibling eviction - new child replaces existing child
+                case do_truc_sibling_eviction(SiblingTxid, Tx, Fee) of
+                    ok -> ok;
+                    {error, TrucErr} -> throw(TrucErr)
+                end;
+            {error, TrucErr} ->
+                throw(TrucErr)
+        end,
 
         %% 11. ancestor/descendant limits
         {AncCount, AncSize, AncFee} = compute_ancestors(Tx, Fee, VSize),
@@ -748,6 +766,9 @@ do_package_rbf(_TxPairs, TotalFee, TotalVSize, ConflictTxids) ->
 
 %% Accept all package transactions (after CPFP validation passed).
 accept_package_txs(TxEntries, State) ->
+    %% Build package map for TRUC checks
+    PackageTxMap = [{Txid, Tx} || {Txid, Tx, _Entry, _Coins} <- TxEntries],
+
     lists:foldl(fun({Txid, Tx, Entry, InputCoins}, St) ->
         %% Verify scripts
         verify_scripts(Tx, InputCoins),
@@ -759,6 +780,13 @@ accept_package_txs(TxEntries, State) ->
         AncCount =< ?MAX_ANCESTOR_COUNT orelse throw(too_long_mempool_chain),
         AncSize =< ?MAX_ANCESTOR_SIZE orelse throw(too_long_mempool_chain),
         check_descendant_limits(Tx, VSize),
+
+        %% TRUC checks for package transactions
+        MempoolParentTxids = get_parent_txids(Tx),
+        case check_truc_package_rules(Tx, VSize, PackageTxMap, MempoolParentTxids) of
+            ok -> ok;
+            {error, TrucErr} -> throw(TrucErr)
+        end,
 
         %% Update entry with computed ancestors
         Entry2 = Entry#mempool_entry{
@@ -818,8 +846,8 @@ lookup_inputs(#transaction{inputs = Inputs}) ->
 %%% ===================================================================
 
 check_standard(#transaction{version = V} = Tx) ->
-    %% version must be 1 or 2
-    (V =:= 1 orelse V =:= 2) orelse throw(version),
+    %% version must be 1, 2, or 3 (v3 = TRUC)
+    (V =:= 1 orelse V =:= 2 orelse V =:= 3) orelse throw(version),
     %% weight limit
     Weight = beamchain_serialize:tx_weight(Tx),
     Weight =< ?MAX_STANDARD_TX_WEIGHT orelse throw(tx_size),
@@ -1449,6 +1477,318 @@ do_expire_orphans() ->
         true ->
             logger:debug("mempool: expired ~B orphans", [Expired]);
         false -> ok
+    end.
+
+%%% ===================================================================
+%%% Internal: TRUC (v3 transaction) policy checks
+%%% BIP 431 - Topologically Restricted Until Confirmation
+%%% ===================================================================
+
+%% @doc Check TRUC rules for a single transaction.
+%% Returns ok or {error, {truc_violation, Reason}} or {sibling_eviction, SiblingTxid}.
+-spec check_truc_rules(#transaction{}, non_neg_integer(), [binary()]) ->
+    ok | {error, {truc_violation, term()}} | {sibling_eviction, binary()}.
+check_truc_rules(Tx, VSize, MempoolParentTxids) ->
+    TxVersion = Tx#transaction.version,
+    case TxVersion of
+        ?TRUC_VERSION ->
+            check_truc_v3_rules(Tx, VSize, MempoolParentTxids);
+        _ ->
+            %% Non-v3 tx cannot spend unconfirmed v3 outputs
+            check_non_truc_parents(MempoolParentTxids)
+    end.
+
+%% Check that a non-v3 tx doesn't have any v3 parents in mempool.
+check_non_truc_parents([]) ->
+    ok;
+check_non_truc_parents([ParentTxid | Rest]) ->
+    case ets:lookup(?MEMPOOL_TXS, ParentTxid) of
+        [{_, Entry}] ->
+            ParentTx = Entry#mempool_entry.tx,
+            case ParentTx#transaction.version of
+                ?TRUC_VERSION ->
+                    {error, {truc_violation, non_truc_spends_truc}};
+                _ ->
+                    check_non_truc_parents(Rest)
+            end;
+        [] ->
+            check_non_truc_parents(Rest)
+    end.
+
+%% Check TRUC rules for a v3 transaction.
+check_truc_v3_rules(Tx, VSize, MempoolParentTxids) ->
+    %% Rule 1: v3 tx must be <= TRUC_MAX_VSIZE
+    case VSize > ?TRUC_MAX_VSIZE of
+        true ->
+            {error, {truc_violation, {tx_too_large, VSize, ?TRUC_MAX_VSIZE}}};
+        false ->
+            check_truc_v3_ancestry(Tx, VSize, MempoolParentTxids)
+    end.
+
+check_truc_v3_ancestry(_Tx, _VSize, []) ->
+    %% No mempool parents - this is a v3 parent (no unconfirmed ancestors)
+    ok;
+check_truc_v3_ancestry(Tx, VSize, MempoolParentTxids) ->
+    %% Has mempool parents - this is a v3 child
+
+    %% Rule 2: v3 child can have at most 1 unconfirmed parent
+    case length(MempoolParentTxids) > 1 of
+        true ->
+            {error, {truc_violation, too_many_ancestors}};
+        false ->
+            [ParentTxid] = MempoolParentTxids,
+            check_truc_v3_child_rules(Tx, VSize, ParentTxid)
+    end.
+
+check_truc_v3_child_rules(_Tx, VSize, ParentTxid) ->
+    %% Rule 3: v3 child must be <= TRUC_CHILD_MAX_VSIZE
+    case VSize > ?TRUC_CHILD_MAX_VSIZE of
+        true ->
+            {error, {truc_violation, {child_too_large, VSize, ?TRUC_CHILD_MAX_VSIZE}}};
+        false ->
+            check_truc_parent_version(ParentTxid, VSize)
+    end.
+
+check_truc_parent_version(ParentTxid, VSize) ->
+    %% Rule 4: v3 child can only spend from v3 parent
+    case ets:lookup(?MEMPOOL_TXS, ParentTxid) of
+        [{_, Entry}] ->
+            ParentTx = Entry#mempool_entry.tx,
+            case ParentTx#transaction.version of
+                ?TRUC_VERSION ->
+                    check_truc_parent_descendant_limit(Entry, VSize);
+                _ ->
+                    {error, {truc_violation, truc_spends_non_truc}}
+            end;
+        [] ->
+            %% Parent not in mempool (should not happen if called correctly)
+            ok
+    end.
+
+check_truc_parent_descendant_limit(ParentEntry, _VSize) ->
+    %% Rule 5: v3 parent can have at most 1 unconfirmed child
+    %% descendant_count includes the parent itself, so limit is 2
+    case ParentEntry#mempool_entry.descendant_count >= ?TRUC_DESCENDANT_LIMIT of
+        true ->
+            %% Parent already has a child - check for sibling eviction
+            ParentTxid = ParentEntry#mempool_entry.txid,
+            case find_truc_sibling(ParentTxid) of
+                {ok, SiblingTxid} ->
+                    %% Sibling eviction is possible
+                    {sibling_eviction, SiblingTxid};
+                not_found ->
+                    %% No sibling found (inconsistent state) or multiple children
+                    {error, {truc_violation, too_many_descendants}}
+            end;
+        false ->
+            ok
+    end.
+
+%% Find the existing child of a v3 parent for sibling eviction.
+find_truc_sibling(ParentTxid) ->
+    case ets:lookup(?MEMPOOL_TXS, ParentTxid) of
+        [{_, Entry}] ->
+            ParentTx = Entry#mempool_entry.tx,
+            NumOutputs = length(ParentTx#transaction.outputs),
+            find_truc_sibling_in_outputs(ParentTxid, 0, NumOutputs);
+        [] ->
+            not_found
+    end.
+
+find_truc_sibling_in_outputs(_ParentTxid, Idx, NumOutputs) when Idx >= NumOutputs ->
+    not_found;
+find_truc_sibling_in_outputs(ParentTxid, Idx, NumOutputs) ->
+    case ets:lookup(?MEMPOOL_OUTPOINTS, {ParentTxid, Idx}) of
+        [{{ParentTxid, Idx}, ChildTxid}] ->
+            %% Found a child spending this output
+            {ok, ChildTxid};
+        [] ->
+            find_truc_sibling_in_outputs(ParentTxid, Idx + 1, NumOutputs)
+    end.
+
+%% @doc Perform sibling eviction for v3 transactions.
+%% Evicts the existing sibling and returns ok if successful.
+-spec do_truc_sibling_eviction(binary(), #transaction{}, non_neg_integer()) ->
+    ok | {error, term()}.
+do_truc_sibling_eviction(SiblingTxid, NewTx, NewFee) ->
+    case ets:lookup(?MEMPOOL_TXS, SiblingTxid) of
+        [{_, SiblingEntry}] ->
+            %% For sibling eviction, the new child must pay enough to cover
+            %% the sibling's fee plus incremental relay fee
+            SiblingFee = SiblingEntry#mempool_entry.fee,
+            NewVSize = beamchain_serialize:tx_vsize(NewTx),
+            MinFee = SiblingFee + NewVSize,  %% sibling fee + 1 sat/vB * new_vsize
+            case NewFee >= MinFee of
+                true ->
+                    %% Evict sibling and its descendants
+                    Descendants = get_all_descendants(SiblingTxid),
+                    AllEvict = [SiblingTxid | Descendants],
+                    lists:foreach(fun(Txid) -> remove_entry(Txid) end, AllEvict),
+                    logger:debug("mempool: truc sibling eviction ~s + ~B descendants",
+                                 [short_hex(SiblingTxid), length(Descendants)]),
+                    ok;
+                false ->
+                    {error, {truc_violation, sibling_eviction_insufficient_fee}}
+            end;
+        [] ->
+            %% Sibling already removed
+            ok
+    end.
+
+%% @doc Check TRUC rules for package transactions.
+%% Must check that v3 topology is maintained within the package.
+-spec check_truc_package_rules(#transaction{}, non_neg_integer(),
+                                [{binary(), #transaction{}}], [binary()]) ->
+    ok | {error, {truc_violation, term()}}.
+check_truc_package_rules(Tx, VSize, PackageTxMap, MempoolParentTxids) ->
+    TxVersion = Tx#transaction.version,
+    Txid = beamchain_serialize:tx_hash(Tx),
+
+    %% Find in-package parents
+    InPackageParents = find_in_package_parents(Tx, PackageTxMap, Txid),
+
+    case TxVersion of
+        ?TRUC_VERSION ->
+            check_truc_v3_package_rules(VSize, PackageTxMap, Txid,
+                                        MempoolParentTxids, InPackageParents);
+        _ ->
+            %% Non-v3: check for v3 parents in mempool or package
+            check_non_truc_package_parents(MempoolParentTxids, InPackageParents, PackageTxMap)
+    end.
+
+find_in_package_parents(Tx, PackageTxMap, OwnTxid) ->
+    lists:filtermap(fun(#tx_in{prev_out = #outpoint{hash = H}}) ->
+        case H =:= OwnTxid of
+            true -> false;  %% Skip self-reference
+            false ->
+                case lists:keyfind(H, 1, PackageTxMap) of
+                    {H, _ParentTx} -> {true, H};
+                    false -> false
+                end
+        end
+    end, Tx#transaction.inputs).
+
+check_non_truc_package_parents(MempoolParentTxids, InPackageParents, PackageTxMap) ->
+    %% Check mempool parents
+    case check_non_truc_parents(MempoolParentTxids) of
+        ok ->
+            %% Check in-package parents
+            check_non_truc_in_package_parents(InPackageParents, PackageTxMap);
+        Error ->
+            Error
+    end.
+
+check_non_truc_in_package_parents([], _PackageTxMap) ->
+    ok;
+check_non_truc_in_package_parents([ParentTxid | Rest], PackageTxMap) ->
+    case lists:keyfind(ParentTxid, 1, PackageTxMap) of
+        {ParentTxid, ParentTx} ->
+            case ParentTx#transaction.version of
+                ?TRUC_VERSION ->
+                    {error, {truc_violation, non_truc_spends_truc}};
+                _ ->
+                    check_non_truc_in_package_parents(Rest, PackageTxMap)
+            end;
+        false ->
+            check_non_truc_in_package_parents(Rest, PackageTxMap)
+    end.
+
+check_truc_v3_package_rules(VSize, PackageTxMap, Txid, MempoolParentTxids, InPackageParents) ->
+    %% Rule 1: v3 tx size limit
+    case VSize > ?TRUC_MAX_VSIZE of
+        true ->
+            {error, {truc_violation, {tx_too_large, VSize, ?TRUC_MAX_VSIZE}}};
+        false ->
+            AllParents = MempoolParentTxids ++ InPackageParents,
+            check_truc_v3_package_ancestry(VSize, PackageTxMap, Txid,
+                                           MempoolParentTxids, AllParents)
+    end.
+
+check_truc_v3_package_ancestry(_VSize, _PackageTxMap, _Txid,
+                               _MempoolParentTxids, []) ->
+    %% No parents - this is a v3 parent
+    ok;
+check_truc_v3_package_ancestry(VSize, PackageTxMap, Txid,
+                               MempoolParentTxids, AllParents) ->
+    %% Rule 2: max 1 unconfirmed parent total (mempool + package)
+    case length(AllParents) > 1 of
+        true ->
+            {error, {truc_violation, too_many_ancestors}};
+        false ->
+            %% Rule 3: v3 child size limit
+            case VSize > ?TRUC_CHILD_MAX_VSIZE of
+                true ->
+                    {error, {truc_violation, {child_too_large, VSize, ?TRUC_CHILD_MAX_VSIZE}}};
+                false ->
+                    [ParentTxid] = AllParents,
+                    check_truc_v3_package_parent(ParentTxid, Txid, PackageTxMap,
+                                                 MempoolParentTxids)
+            end
+    end.
+
+check_truc_v3_package_parent(ParentTxid, ChildTxid, PackageTxMap, MempoolParentTxids) ->
+    %% Get parent version
+    ParentVersion = case lists:keyfind(ParentTxid, 1, PackageTxMap) of
+        {ParentTxid, ParentTx} ->
+            ParentTx#transaction.version;
+        false ->
+            case ets:lookup(?MEMPOOL_TXS, ParentTxid) of
+                [{_, Entry}] -> (Entry#mempool_entry.tx)#transaction.version;
+                [] -> undefined
+            end
+    end,
+
+    %% Rule 4: v3 child must have v3 parent
+    case ParentVersion of
+        ?TRUC_VERSION ->
+            %% Check for siblings in package or mempool
+            check_truc_v3_package_siblings(ParentTxid, ChildTxid, PackageTxMap,
+                                           MempoolParentTxids);
+        undefined ->
+            %% Parent not found - let other validation catch this
+            ok;
+        _ ->
+            {error, {truc_violation, truc_spends_non_truc}}
+    end.
+
+check_truc_v3_package_siblings(ParentTxid, ChildTxid, PackageTxMap, MempoolParentTxids) ->
+    %% Check if any other tx in the package spends from the same parent
+    OtherPackageChildren = lists:filtermap(fun({OtherTxid, OtherTx}) ->
+        case OtherTxid =:= ChildTxid of
+            true -> false;
+            false ->
+                SpendsParent = lists:any(fun(#tx_in{prev_out = #outpoint{hash = H}}) ->
+                    H =:= ParentTxid
+                end, OtherTx#transaction.inputs),
+                case SpendsParent of
+                    true -> {true, OtherTxid};
+                    false -> false
+                end
+        end
+    end, PackageTxMap),
+
+    case OtherPackageChildren of
+        [_|_] ->
+            {error, {truc_violation, too_many_descendants}};
+        [] ->
+            %% Check mempool for existing children
+            case lists:member(ParentTxid, MempoolParentTxids) of
+                true ->
+                    %% Parent is in mempool - check its descendant count
+                    case ets:lookup(?MEMPOOL_TXS, ParentTxid) of
+                        [{_, Entry}] ->
+                            case Entry#mempool_entry.descendant_count >= ?TRUC_DESCENDANT_LIMIT of
+                                true ->
+                                    {error, {truc_violation, too_many_descendants}};
+                                false ->
+                                    ok
+                            end;
+                        [] ->
+                            ok
+                    end;
+                false ->
+                    ok
+            end
     end.
 
 %%% ===================================================================
