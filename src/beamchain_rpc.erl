@@ -329,6 +329,9 @@ handle_method(<<"getpeerinfo">>, _) -> rpc_getpeerinfo();
 handle_method(<<"getconnectioncount">>, _) -> rpc_getconnectioncount();
 handle_method(<<"addnode">>, P) -> rpc_addnode(P);
 handle_method(<<"disconnectnode">>, P) -> rpc_disconnectnode(P);
+handle_method(<<"listbanned">>, _) -> rpc_listbanned();
+handle_method(<<"setban">>, P) -> rpc_setban(P);
+handle_method(<<"clearbanned">>, _) -> rpc_clearbanned();
 
 %% -- Mining --
 handle_method(<<"getmininginfo">>, _) -> rpc_getmininginfo();
@@ -384,10 +387,13 @@ rpc_help_list() ->
         <<"">>,
         <<"== Network ==">>,
         <<"addnode \"node\" \"command\"">>,
+        <<"clearbanned">>,
         <<"disconnectnode ( \"address\" nodeid )">>,
         <<"getconnectioncount">>,
         <<"getnetworkinfo">>,
         <<"getpeerinfo">>,
+        <<"listbanned">>,
+        <<"setban \"subnet\" \"command\" ( bantime )">>,
         <<"">>,
         <<"== Rawtransactions ==">>,
         <<"decoderawtransaction \"hexstring\"">>,
@@ -927,6 +933,86 @@ rpc_disconnectnode([Address]) when is_binary(Address) ->
 rpc_disconnectnode(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"Usage: disconnectnode \"address\"">>}.
+
+rpc_listbanned() ->
+    BanList = beamchain_peer_manager:get_ban_list(),
+    Now = erlang:system_time(second),
+    Entries = lists:map(fun({IP, BanExpiry}) ->
+        #{
+            <<"address">> => format_ip(IP),
+            <<"ban_created">> => BanExpiry - 86400,  %% approximate
+            <<"banned_until">> => BanExpiry,
+            <<"ban_duration">> => BanExpiry - Now,
+            <<"ban_reason">> => <<"node misbehaving">>
+        }
+    end, BanList),
+    {ok, Entries}.
+
+rpc_setban([Subnet, Command]) ->
+    rpc_setban([Subnet, Command, 86400]);  %% default 24 hours
+rpc_setban([Subnet, Command, BanTime]) when is_binary(Subnet),
+                                             is_binary(Command) ->
+    case Command of
+        <<"add">> ->
+            case parse_subnet(Subnet) of
+                {ok, IP} ->
+                    Duration = if
+                        is_integer(BanTime) -> BanTime;
+                        is_binary(BanTime) ->
+                            binary_to_integer(BanTime);
+                        true -> 86400
+                    end,
+                    beamchain_peer_manager:set_ban(IP, Duration, <<"manual">>),
+                    {ok, null};
+                {error, Msg} ->
+                    {error, ?RPC_INVALID_PARAMETER, Msg}
+            end;
+        <<"remove">> ->
+            case parse_subnet(Subnet) of
+                {ok, IP} ->
+                    case beamchain_peer_manager:clear_ban(IP) of
+                        ok -> {ok, null};
+                        {error, not_found} ->
+                            {error, ?RPC_MISC_ERROR, <<"Error: Unban failed">>}
+                    end;
+                {error, Msg} ->
+                    {error, ?RPC_INVALID_PARAMETER, Msg}
+            end;
+        _ ->
+            {error, ?RPC_INVALID_PARAMETER,
+             <<"Command must be add or remove">>}
+    end;
+rpc_setban(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: setban \"subnet\" \"command\" ( bantime )">>}.
+
+rpc_clearbanned() ->
+    BanList = beamchain_peer_manager:get_ban_list(),
+    lists:foreach(fun({IP, _}) ->
+        beamchain_peer_manager:clear_ban(IP)
+    end, BanList),
+    {ok, null}.
+
+%% Parse a subnet or IP address string (e.g., "192.168.1.1" or "192.168.1.0/24")
+%% For now, we only support single IPs (no CIDR notation)
+parse_subnet(Subnet) when is_binary(Subnet) ->
+    parse_subnet(binary_to_list(Subnet));
+parse_subnet(Subnet) when is_list(Subnet) ->
+    %% Strip any /32 or CIDR suffix for now (we only support single IPs)
+    IPStr = case string:split(Subnet, "/") of
+        [IP, _Mask] -> IP;
+        [IP] -> IP
+    end,
+    case inet:parse_address(IPStr) of
+        {ok, IP} -> {ok, IP};
+        {error, _} -> {error, <<"Invalid IP address">>}
+    end.
+
+%% Format IP address for display
+format_ip({A, B, C, D}) ->
+    iolist_to_binary(io_lib:format("~B.~B.~B.~B", [A, B, C, D]));
+format_ip(IP) ->
+    iolist_to_binary(io_lib:format("~p", [IP])).
 
 %%% ===================================================================
 %%% Mining methods
