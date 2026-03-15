@@ -35,6 +35,19 @@
 -define(BAN_SCORE, 100).
 
 %%% -------------------------------------------------------------------
+%%% BIP 133 feefilter constants
+%%% -------------------------------------------------------------------
+
+%% Average delay between feefilter broadcasts (10 minutes)
+-define(FEEFILTER_BROADCAST_INTERVAL_MS, 600000).
+%% Maximum delay after significant fee change (5 minutes)
+-define(FEEFILTER_MAX_CHANGE_DELAY_MS, 300000).
+%% Minimum protocol version for feefilter (BIP 133)
+-define(FEEFILTER_VERSION, 70013).
+%% Default minimum relay fee (1000 sat/kvB = 1 sat/vB)
+-define(DEFAULT_MIN_RELAY_FEE, 1000).
+
+%%% -------------------------------------------------------------------
 %%% Inv trickling constants (per Bitcoin Core net_processing.cpp)
 %%% -------------------------------------------------------------------
 
@@ -91,7 +104,11 @@
     misbehavior = 0         :: non_neg_integer(),
     %% Inv trickling (privacy: randomized tx relay)
     pending_tx_inv = []     :: [binary()],  %% txids waiting to be sent
-    trickle_timer_ref       :: reference() | undefined
+    trickle_timer_ref       :: reference() | undefined,
+    %% BIP 133 feefilter
+    our_fee_filter = ?DEFAULT_MIN_RELAY_FEE :: non_neg_integer(),  %% our feefilter sent to peer
+    feefilter_sent_at       :: non_neg_integer() | undefined,      %% when we last sent feefilter
+    feefilter_timer_ref     :: reference() | undefined             %% timer for periodic updates
 }).
 
 %%% ===================================================================
@@ -354,6 +371,18 @@ ready(info, trickle_inv, Data) ->
     Data3 = schedule_trickle_timer(Data2),
     {keep_state, Data3};
 
+ready(info, check_feefilter, Data) ->
+    %% Periodic feefilter check - update if fee changed
+    Data2 = maybe_update_feefilter(Data),
+    Data3 = schedule_feefilter_timer(Data2),
+    {keep_state, Data3};
+
+ready(info, send_feefilter_now, Data) ->
+    %% Accelerated feefilter update due to significant fee change
+    CurrentFee = get_mempool_min_fee(),
+    Data2 = do_send_feefilter(CurrentFee, Data),
+    {keep_state, Data2};
+
 ready({call, From}, info, Data) ->
     {keep_state_and_data, [{reply, From, {ok, build_info(Data)}}]};
 
@@ -576,13 +605,115 @@ handle_feefilter_msg(Payload, Data) ->
             {ok, Data}
     end.
 
+%%% ===================================================================
+%%% Internal: BIP 133 feefilter
+%%% ===================================================================
+
+%% @doc Send initial feefilter after handshake if peer supports it.
+%% Only sent to peers with protocol version >= 70013 that accept tx relay.
+maybe_send_initial_feefilter(#peer_data{peer_version = V, peer_relay = Relay} = Data)
+        when V >= ?FEEFILTER_VERSION, Relay =:= true ->
+    %% Get current mempool minimum fee
+    FeeRate = get_mempool_min_fee(),
+    Data2 = do_send_feefilter(FeeRate, Data),
+    %% Schedule periodic feefilter updates with exponential distribution
+    schedule_feefilter_timer(Data2);
+maybe_send_initial_feefilter(Data) ->
+    %% Peer doesn't support feefilter or doesn't want tx relay
+    Data.
+
+%% @doc Send a feefilter message to the peer.
+do_send_feefilter(FeeRate, Data) ->
+    %% Ensure minimum relay fee floor
+    FilterToSend = max(FeeRate, ?DEFAULT_MIN_RELAY_FEE),
+    Payload = beamchain_p2p_msg:encode_payload(feefilter, #{feerate => FilterToSend}),
+    Data2 = do_send_raw(feefilter, Payload, Data),
+    Now = erlang:system_time(millisecond),
+    Data2#peer_data{
+        our_fee_filter = FilterToSend,
+        feefilter_sent_at = Now
+    }.
+
+%% @doc Schedule next feefilter update using exponential distribution.
+%% Average interval is 10 minutes for privacy.
+schedule_feefilter_timer(Data) ->
+    %% Cancel any existing timer
+    case Data#peer_data.feefilter_timer_ref of
+        undefined -> ok;
+        OldRef -> erlang:cancel_timer(OldRef)
+    end,
+    %% Exponential distribution: -ln(U) * mean
+    Interval = feefilter_poisson_interval(?FEEFILTER_BROADCAST_INTERVAL_MS),
+    Ref = erlang:send_after(Interval, self(), check_feefilter),
+    Data#peer_data{feefilter_timer_ref = Ref}.
+
+%% @doc Generate Poisson-distributed interval.
+feefilter_poisson_interval(MeanMs) ->
+    U = rand:uniform(),
+    Interval = round(-math:log(U) * MeanMs),
+    %% Clamp to reasonable bounds (1 second to 30 minutes)
+    max(1000, min(Interval, 1800000)).
+
+%% @doc Check if feefilter should be updated and send if necessary.
+maybe_update_feefilter(Data) ->
+    CurrentFee = get_mempool_min_fee(),
+    SentFee = Data#peer_data.our_fee_filter,
+    Now = erlang:system_time(millisecond),
+    SentAt = Data#peer_data.feefilter_sent_at,
+
+    %% Check if fee changed significantly (>25% drop or >33% increase)
+    %% Bitcoin Core uses: currentFilter < 3 * sent / 4 || currentFilter > 4 * sent / 3
+    SignificantChange = (CurrentFee * 4 < SentFee * 3) orelse
+                        (CurrentFee * 3 > SentFee * 4),
+
+    case SignificantChange of
+        true when SentAt =/= undefined ->
+            %% Significant change - schedule accelerated update with random delay
+            %% up to MAX_FEEFILTER_CHANGE_DELAY_MS for privacy
+            Delay = rand:uniform(?FEEFILTER_MAX_CHANGE_DELAY_MS),
+            NextSendAt = SentAt + ?FEEFILTER_BROADCAST_INTERVAL_MS,
+            %% Only accelerate if we weren't going to send soon anyway
+            case Now + Delay < NextSendAt of
+                true ->
+                    %% Update now with small random delay
+                    erlang:send_after(Delay, self(), send_feefilter_now),
+                    Data;
+                false ->
+                    Data
+            end;
+        _ ->
+            %% No significant change or first update - send if filter value changed
+            case CurrentFee =/= SentFee of
+                true ->
+                    do_send_feefilter(CurrentFee, Data);
+                false ->
+                    Data
+            end
+    end.
+
+%% @doc Get current mempool minimum fee rate in sat/kvB.
+get_mempool_min_fee() ->
+    try
+        case beamchain_mempool:get_info() of
+            #{min_fee := MinFee} when is_number(MinFee) ->
+                %% Convert sat/vB to sat/kvB (multiply by 1000)
+                round(MinFee * 1000);
+            _ ->
+                ?DEFAULT_MIN_RELAY_FEE
+        end
+    catch
+        _:_ -> ?DEFAULT_MIN_RELAY_FEE
+    end.
+
 send_feature_msgs(Data) ->
     %% sendheaders and sendcmpct are sent after handshake complete.
     %% wtxidrelay and sendaddrv2 are sent before verack (see handle_version_msg).
     D1 = do_send_raw(sendheaders, <<>>, Data),
     CmpctPayload = beamchain_p2p_msg:encode_payload(sendcmpct,
                        #{announce => false, version => 2}),
-    do_send_raw(sendcmpct, CmpctPayload, D1).
+    D2 = do_send_raw(sendcmpct, CmpctPayload, D1),
+    %% BIP 133: Send feefilter if peer supports it
+    maybe_send_initial_feefilter(D2).
 
 %%% ===================================================================
 %%% Internal: Misbehavior
@@ -663,26 +794,55 @@ poisson_interval(MeanMs) ->
 
 %% Flush pending tx inv items to the peer.
 %% Randomize order to prevent timing analysis, limit per tick.
+%% Filter by peer's feefilter (BIP 133) before sending.
 do_trickle_inv(#peer_data{pending_tx_inv = []} = Data) ->
     Data;
-do_trickle_inv(#peer_data{pending_tx_inv = Pending, peer_relay = Relay} = Data) ->
+do_trickle_inv(#peer_data{pending_tx_inv = Pending, peer_relay = Relay,
+                          fee_filter = PeerFeeFilter} = Data) ->
     case Relay of
         false ->
             %% Peer requested no tx relay, clear queue
             Data#peer_data{pending_tx_inv = []};
         true ->
+            %% Filter by peer's feefilter (BIP 133)
+            %% Skip txs with fee rate below peer's minimum
+            Filtered = filter_by_feefilter(Pending, PeerFeeFilter),
             %% Calculate broadcast max: target + 5 per 1000 pending
             BroadcastMax = min(?INV_BROADCAST_MAX,
-                               ?INV_BROADCAST_TARGET + (length(Pending) div 1000) * 5),
+                               ?INV_BROADCAST_TARGET + (length(Filtered) div 1000) * 5),
             %% Shuffle and take up to max
-            Shuffled = shuffle_list(Pending),
+            Shuffled = shuffle_list(Filtered),
             {ToSend, Remaining} = lists:split(min(BroadcastMax, length(Shuffled)), Shuffled),
             %% Send inv message if we have items
             Data2 = case ToSend of
                 [] -> Data;
                 _  -> send_tx_inv(ToSend, Data)
             end,
-            Data2#peer_data{pending_tx_inv = Remaining}
+            %% Remove filtered txs from queue (they'll never pass the filter)
+            FilteredOut = Pending -- Filtered,
+            Data2#peer_data{pending_tx_inv = Remaining -- FilteredOut}
+    end.
+
+%% @doc Filter txids by peer's feefilter value.
+%% Returns only txids whose fee rate >= peer's feefilter.
+filter_by_feefilter(Txids, PeerFeeFilter) when PeerFeeFilter =< 0 ->
+    %% No feefilter or peer accepts all fees
+    Txids;
+filter_by_feefilter(Txids, PeerFeeFilter) ->
+    lists:filter(fun(Txid) ->
+        tx_passes_feefilter(Txid, PeerFeeFilter)
+    end, Txids).
+
+%% @doc Check if a transaction's fee rate passes the peer's feefilter.
+%% feefilter is in sat/kvB, we need to compare with tx fee rate.
+tx_passes_feefilter(Txid, PeerFeeFilter) ->
+    case beamchain_mempool:get_tx_fee_rate(Txid) of
+        {ok, FeeRateKvB} ->
+            %% FeeRateKvB is already in sat/kvB
+            FeeRateKvB >= PeerFeeFilter;
+        not_found ->
+            %% Tx no longer in mempool, filter it out
+            false
     end.
 
 %% Send inv message for a list of txids
