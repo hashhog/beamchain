@@ -37,6 +37,7 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] Block template construction (getblocktemplate)
 - [x] Witness commitment (BIP141)
 - [x] CPFP-aware tx selection (ancestor fee rate)
+- [x] Regtest block generation (generate, generatetoaddress, generateblock)
 - [x] Difficulty adjustment algorithm (retarget every 2016 blocks)
 - [x] BIP9 versionbits soft fork deployment tracking
 - [x] Checkpoint enforcement (reject forks below checkpoints, skip scripts during IBD)
