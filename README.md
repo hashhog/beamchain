@@ -26,6 +26,7 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] UTXO cache FRESH flag optimization (like Bitcoin Core's CCoinsViewCache)
 - [x] Undo data for block disconnection (reorg support)
 - [x] Mempool with fee-based ordering and ancestor/descendant limits
+- [x] Cluster mempool (union-find clustering, linearization, fee-rate diagram RBF)
 - [x] Full RBF (Replace-by-Fee) transaction replacement
 - [x] Package acceptance (CPFP within packages, package RBF)
 - [x] v3/TRUC policy (BIP431 topologically restricted transactions)
@@ -92,7 +93,7 @@ src/
 ├── beamchain_block_sync.erl   Block download and compact block relay
 ├── beamchain_compact_block.erl BIP152 compact block reconstruction
 ├── beamchain_chainstate.erl   UTXO management
-├── beamchain_mempool.erl      Transaction pool
+├── beamchain_mempool.erl      Transaction pool with cluster linearization
 ├── beamchain_miner.erl        Block template construction
 ├── beamchain_pow.erl          Proof of work and difficulty
 ├── beamchain_versionbits.erl  BIP9 deployment tracking
@@ -114,7 +115,7 @@ test/
 ├── beamchain_script_tests.erl         Script and sighash tests
 ├── beamchain_chainstate_tests.erl     Undo data and disconnect tests
 ├── beamchain_miner_tests.erl          Block template and witness tests
-├── beamchain_mempool_tests.erl        Mempool and limit tests
+├── beamchain_mempool_tests.erl        Mempool, cluster, and limit tests
 ├── beamchain_peer_tests.erl           Inv trickling and relay tests
 ├── beamchain_peer_manager_tests.erl   Misbehavior, banning, and stale eviction tests
 ├── beamchain_addrman_tests.erl        Bucket assignment and netgroup tests
