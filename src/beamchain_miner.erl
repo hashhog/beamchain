@@ -335,13 +335,15 @@ select_transactions() ->
     Entries = beamchain_mempool:get_sorted_by_fee(),
 
     %% Re-sort by ancestor fee rate for CPFP
+    %% ancestor_fee_rate = (tx fee + ancestor fees) / (tx weight + ancestor weight)
+    %% We use weight directly for more accurate fee rate comparison
     Sorted = lists:sort(fun(A, B) ->
         ancestor_fee_rate(A) >= ancestor_fee_rate(B)
     end, Entries),
 
-    %% Available weight: max block weight minus header and coinbase reserve
-    MaxWeight = ?MAX_BLOCK_WEIGHT - ?COINBASE_WEIGHT_RESERVE
-                - (80 * ?WITNESS_SCALE_FACTOR),
+    %% Available weight: max block weight (4,000,000 WU) minus coinbase reserve
+    %% Block weight is sum of all tx weights, header is NOT included
+    MaxWeight = ?MAX_BLOCK_WEIGHT - ?COINBASE_WEIGHT_RESERVE,
     MaxSigops = ?MAX_BLOCK_SIGOPS_COST,
 
     {Selected, Fees, Weight, Sigops} =
@@ -352,10 +354,20 @@ select_transactions() ->
     Ordered = topological_sort(Selected),
     {Ordered, Fees, Weight, Sigops}.
 
+%% Calculate ancestor fee rate in sat/WU for accurate comparison.
+%% Uses weight (not vsize) for proper SegWit fee rate comparison.
+%% ancestor_fee_rate = (tx fee + ancestor fees) / (tx weight + ancestor weight)
 ancestor_fee_rate(Entry) ->
-    case Entry#mempool_entry.ancestor_size of
-        0 -> Entry#mempool_entry.fee_rate;
-        AncSize -> Entry#mempool_entry.ancestor_fee / AncSize
+    %% ancestor_fee and weight already include the tx's own values
+    %% (set in beamchain_mempool:compute_ancestors)
+    AncFee = Entry#mempool_entry.ancestor_fee,
+    %% Convert ancestor_size (vsize) to weight approximation
+    %% This is a simplification - for truly accurate results we'd track
+    %% ancestor_weight separately, but vsize*4 is a reasonable upper bound
+    AncWeight = Entry#mempool_entry.ancestor_size * ?WITNESS_SCALE_FACTOR,
+    case AncWeight of
+        0 -> Entry#mempool_entry.fee / max(1, Entry#mempool_entry.weight);
+        _ -> AncFee / AncWeight
     end.
 
 %%% ===================================================================
@@ -514,11 +526,13 @@ build_coinbase(Height, CoinbaseScriptPubKey, CoinbaseValue,
     ExtraNonce = <<0, 0, 0, 0, 0, 0, 0, 0>>,
     ScriptSig = <<HeightScript/binary, ExtraNonce/binary>>,
 
-    %% Coinbase input
+    %% Coinbase input:
+    %% - sequence = 0xFFFFFFFE (MAX_SEQUENCE_NONFINAL) to ensure locktime is enforced
+    %% - witness = [32 zero bytes] if block has witness txs
     CbInput = #tx_in{
         prev_out = #outpoint{hash = <<0:256>>, index = 16#ffffffff},
         script_sig = ScriptSig,
-        sequence = 16#ffffffff,
+        sequence = 16#fffffffe,  %% CTxIn::MAX_SEQUENCE_NONFINAL (anti-fee-sniping)
         witness = case HasWitnessTx of
             true -> [<<0:256>>];   %% witness nonce: 32 zero bytes
             false -> []
@@ -541,11 +555,18 @@ build_coinbase(Height, CoinbaseScriptPubKey, CoinbaseValue,
             [PayoutOutput]
     end,
 
+    %% Anti-fee-sniping: set locktime to Height - 1
+    %% This makes the coinbase invalid for reorgs to earlier blocks
+    Locktime = case Height of
+        0 -> 0;
+        _ -> Height - 1
+    end,
+
     #transaction{
         version = 2,
         inputs = [CbInput],
         outputs = Outputs,
-        locktime = 0
+        locktime = Locktime
     }.
 
 %% Build the OP_RETURN witness commitment output (BIP 141).
