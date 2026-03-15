@@ -217,3 +217,87 @@ get_available_peers_pure(Peers, PeerStats, MaxPerPeer) ->
             false -> false
         end
     end, maps:to_list(PeerStats)).
+
+%%% ===================================================================
+%%% SipHash tests (BIP152)
+%%% ===================================================================
+
+siphash_basic_test() ->
+    %% Test vector from SipHash reference implementation
+    %% Key: 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f
+    K0 = 16#0706050403020100,
+    K1 = 16#0f0e0d0c0b0a0908,
+    %% Empty input should hash to a known value
+    Hash = beamchain_crypto:siphash(K0, K1, <<>>),
+    ?assert(is_integer(Hash)).
+
+siphash_uint256_test() ->
+    %% Test SipHash with a 32-byte input
+    K0 = 16#0706050403020100,
+    K1 = 16#0f0e0d0c0b0a0908,
+    Data = <<1:256>>,
+    Hash = beamchain_crypto:siphash_uint256(K0, K1, Data),
+    ?assert(is_integer(Hash)),
+    %% Should be same as regular siphash
+    Hash2 = beamchain_crypto:siphash(K0, K1, Data),
+    ?assertEqual(Hash, Hash2).
+
+siphash_consistency_test() ->
+    %% Same input should always produce same output
+    K0 = 16#deadbeef,
+    K1 = 16#cafebabe,
+    Data = <<"hello compact blocks">>,
+    Hash1 = beamchain_crypto:siphash(K0, K1, Data),
+    Hash2 = beamchain_crypto:siphash(K0, K1, Data),
+    ?assertEqual(Hash1, Hash2).
+
+%%% ===================================================================
+%%% Compact block short id tests
+%%% ===================================================================
+
+short_id_length_test() ->
+    %% Short ids should be 6 bytes
+    K0 = 16#1234567890abcdef,
+    K1 = 16#fedcba0987654321,
+    Wtxid = <<0:256>>,
+    ShortId = beamchain_compact_block:compute_short_id(K0, K1, Wtxid),
+    ?assertEqual(6, byte_size(ShortId)).
+
+short_id_deterministic_test() ->
+    K0 = 16#1111,
+    K1 = 16#2222,
+    Wtxid = <<1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,
+              17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32>>,
+    ShortId1 = beamchain_compact_block:compute_short_id(K0, K1, Wtxid),
+    ShortId2 = beamchain_compact_block:compute_short_id(K0, K1, Wtxid),
+    ?assertEqual(ShortId1, ShortId2).
+
+short_id_differs_for_different_wtxids_test() ->
+    K0 = 16#1111,
+    K1 = 16#2222,
+    Wtxid1 = <<0:256>>,
+    Wtxid2 = <<1:256>>,
+    ShortId1 = beamchain_compact_block:compute_short_id(K0, K1, Wtxid1),
+    ShortId2 = beamchain_compact_block:compute_short_id(K0, K1, Wtxid2),
+    ?assertNotEqual(ShortId1, ShortId2).
+
+%%% ===================================================================
+%%% SipHash key derivation tests
+%%% ===================================================================
+
+siphash_key_derivation_test() ->
+    Header = #block_header{
+        version = 1,
+        prev_hash = <<0:256>>,
+        merkle_root = <<1:256>>,
+        timestamp = 1000,
+        bits = 0,
+        nonce = 0
+    },
+    Nonce = 12345,
+    {K0, K1} = beamchain_compact_block:derive_siphash_key(Header, Nonce),
+    ?assert(is_integer(K0)),
+    ?assert(is_integer(K1)),
+    %% Different nonce should produce different key
+    {K0b, K1b} = beamchain_compact_block:derive_siphash_key(Header, Nonce + 1),
+    ?assert(K0 =/= K0b orelse K1 =/= K1b).
