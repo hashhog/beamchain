@@ -65,6 +65,7 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] assumeUTXO snapshot-based sync (loadtxoutset RPC, background validation)
 - [x] Pay-to-Anchor (P2A) outputs (witness v1 anyone-can-spend for Lightning anchors)
 - [x] Ephemeral anchor dust policy (zero-value P2A in zero-fee packages)
+- [x] REST API (block, tx, headers, chaininfo, mempool, UTXO endpoints in JSON/binary/hex)
 
 ## Quick start
 
@@ -105,6 +106,7 @@ src/
 ├── beamchain_chain_params.erl Network parameters and checkpoints
 ├── beamchain_db.erl           RocksDB wrapper, flat file storage, block indexes
 ├── beamchain_rpc.erl          JSON-RPC server
+├── beamchain_rest.erl         REST API server
 ├── beamchain_wallet.erl       HD wallet, coin selection
 ├── beamchain_psbt.erl         BIP 174 PSBT serialization and signing
 ├── beamchain_descriptor.erl   Output descriptors (BIP380-386)
@@ -135,7 +137,8 @@ test/
 ├── beamchain_miniscript_tests.erl     Miniscript parsing, compilation, satisfaction
 ├── beamchain_transport_v2_tests.erl   BIP324 v2 transport tests
 ├── beamchain_erlay_tests.erl          BIP330 Erlay reconciliation tests
-└── beamchain_snapshot_tests.erl       assumeUTXO snapshot tests
+├── beamchain_snapshot_tests.erl       assumeUTXO snapshot tests
+└── beamchain_rest_tests.erl           REST API endpoint tests
 ```
 
 ## Running tests
