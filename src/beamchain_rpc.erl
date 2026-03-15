@@ -378,6 +378,11 @@ handle_method(<<"getmininginfo">>, _) -> rpc_getmininginfo();
 handle_method(<<"getblocktemplate">>, P) -> rpc_getblocktemplate(P);
 handle_method(<<"submitblock">>, P) -> rpc_submitblock(P);
 
+%% -- Generating (regtest only) --
+handle_method(<<"generatetoaddress">>, P) -> rpc_generatetoaddress(P);
+handle_method(<<"generateblock">>, P) -> rpc_generateblock(P);
+handle_method(<<"generate">>, P) -> rpc_generate(P);
+
 %% -- Fee estimation --
 handle_method(<<"estimatesmartfee">>, P) -> rpc_estimatesmartfee(P);
 
@@ -449,6 +454,9 @@ rpc_help_list() ->
         <<"uptime">>,
         <<"">>,
         <<"== Generating ==">>,
+        <<"generate nblocks ( maxtries ) [regtest only]">>,
+        <<"generateblock \"output\" [\"rawtx/txid\",...] ( submit ) [regtest only]">>,
+        <<"generatetoaddress nblocks \"address\" ( maxtries ) [regtest only]">>,
         <<"getblocktemplate ( \"template_request\" )">>,
         <<"getmininginfo">>,
         <<"submitblock \"hexdata\"">>,
@@ -1868,6 +1876,158 @@ rpc_submitblock([HexData]) when is_binary(HexData) ->
 rpc_submitblock(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"Usage: submitblock \"hexdata\"">>}.
+
+%%% ===================================================================
+%%% Generating methods (regtest only)
+%%% ===================================================================
+
+%% generatetoaddress nblocks address [maxtries]
+%% Mine nblocks blocks with coinbase paying to address.
+%% Only works on regtest.
+rpc_generatetoaddress([NBlocks, Address]) ->
+    rpc_generatetoaddress([NBlocks, Address, 1000000]);
+rpc_generatetoaddress([NBlocks, Address, MaxTries])
+  when is_integer(NBlocks), is_binary(Address), is_integer(MaxTries) ->
+    %% Check if regtest
+    case beamchain_config:network() of
+        regtest ->
+            %% Convert address to scriptPubKey
+            Network = beamchain_config:network(),
+            NetType = case Network of mainnet -> mainnet; _ -> testnet end,
+            AddrStr = binary_to_list(Address),
+            case beamchain_address:address_to_script(AddrStr, NetType) of
+                {ok, Script} ->
+                    case beamchain_miner:generate_blocks(Script, NBlocks, MaxTries) of
+                        {ok, BlockHashes} ->
+                            {ok, BlockHashes};
+                        {error, Reason} ->
+                            {error, ?RPC_MISC_ERROR,
+                             iolist_to_binary(io_lib:format("~p", [Reason]))}
+                    end;
+                {error, _} ->
+                    {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+                     <<"Error: Invalid address">>}
+            end;
+        _ ->
+            {error, ?RPC_METHOD_NOT_FOUND,
+             <<"Method not found (regtest only)">>}
+    end;
+rpc_generatetoaddress(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: generatetoaddress nblocks \"address\" ( maxtries )">>}.
+
+%% generateblock output transactions [submit]
+%% Mine a block with specific transactions.
+%% output: address or descriptor to pay coinbase to
+%% transactions: array of txids (from mempool) or raw tx hex
+%% submit: whether to submit the block (default true)
+rpc_generateblock([Output, Transactions]) ->
+    rpc_generateblock([Output, Transactions, true]);
+rpc_generateblock([Output, Transactions, Submit])
+  when is_binary(Output), is_list(Transactions), is_boolean(Submit) ->
+    %% Check if regtest
+    case beamchain_config:network() of
+        regtest ->
+            %% Convert output address to scriptPubKey
+            Network = beamchain_config:network(),
+            NetType = case Network of mainnet -> mainnet; _ -> testnet end,
+            OutputStr = binary_to_list(Output),
+            case beamchain_address:address_to_script(OutputStr, NetType) of
+                {ok, Script} ->
+                    %% Parse transactions (txids from mempool or raw tx hex)
+                    case parse_generate_transactions(Transactions) of
+                        {ok, Txs} ->
+                            case beamchain_miner:generate_block_with_txs(Script, Txs, Submit) of
+                                {ok, Result} ->
+                                    {ok, Result};
+                                {error, Reason} ->
+                                    {error, ?RPC_MISC_ERROR,
+                                     iolist_to_binary(io_lib:format("~p", [Reason]))}
+                            end;
+                        {error, Reason} ->
+                            {error, ?RPC_INVALID_PARAMETER, Reason}
+                    end;
+                {error, _} ->
+                    {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+                     <<"Error: Invalid address or descriptor">>}
+            end;
+        _ ->
+            {error, ?RPC_METHOD_NOT_FOUND,
+             <<"Method not found (regtest only)">>}
+    end;
+rpc_generateblock(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: generateblock \"output\" [\"rawtx/txid\",...] ( submit )">>}.
+
+%% generate nblocks
+%% Deprecated in Bitcoin Core. We implement a simple version that uses OP_TRUE.
+rpc_generate([NBlocks]) when is_integer(NBlocks) ->
+    rpc_generate([NBlocks, 1000000]);
+rpc_generate([NBlocks, MaxTries]) when is_integer(NBlocks), is_integer(MaxTries) ->
+    %% Check if regtest
+    case beamchain_config:network() of
+        regtest ->
+            %% Use OP_TRUE (0x51) as the coinbase script
+            Script = <<16#51>>,
+            case beamchain_miner:generate_blocks(Script, NBlocks, MaxTries) of
+                {ok, BlockHashes} ->
+                    {ok, BlockHashes};
+                {error, Reason} ->
+                    {error, ?RPC_MISC_ERROR,
+                     iolist_to_binary(io_lib:format("~p", [Reason]))}
+            end;
+        _ ->
+            {error, ?RPC_METHOD_NOT_FOUND,
+             <<"Method not found (regtest only)">>}
+    end;
+rpc_generate(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: generate nblocks ( maxtries )">>}.
+
+%% Parse transaction list for generateblock.
+%% Each element is either a txid (look up in mempool) or raw tx hex.
+parse_generate_transactions(TxList) ->
+    parse_generate_transactions(TxList, []).
+
+parse_generate_transactions([], Acc) ->
+    {ok, lists:reverse(Acc)};
+parse_generate_transactions([TxIdOrHex | Rest], Acc) when is_binary(TxIdOrHex) ->
+    case byte_size(TxIdOrHex) of
+        64 ->
+            %% Looks like a txid (64 hex chars = 32 bytes)
+            try
+                TxidBin = beamchain_serialize:hex_decode(TxIdOrHex),
+                %% Txids in RPC are display order (reversed)
+                TxidInternal = beamchain_serialize:reverse_bytes(TxidBin),
+                case beamchain_mempool:get_tx(TxidInternal) of
+                    {ok, Tx} ->
+                        parse_generate_transactions(Rest, [Tx | Acc]);
+                    not_found ->
+                        {error, iolist_to_binary(
+                            io_lib:format("Transaction ~s not in mempool", [TxIdOrHex]))}
+                end
+            catch
+                _:_ ->
+                    %% Not valid hex, try as raw tx
+                    try_parse_raw_tx(TxIdOrHex, Rest, Acc)
+            end;
+        _ ->
+            %% Try to decode as raw transaction hex
+            try_parse_raw_tx(TxIdOrHex, Rest, Acc)
+    end;
+parse_generate_transactions([_ | _], _Acc) ->
+    {error, <<"Invalid transaction format">>}.
+
+try_parse_raw_tx(TxHex, Rest, Acc) ->
+    try
+        TxBin = beamchain_serialize:hex_decode(TxHex),
+        {Tx, _} = beamchain_serialize:decode_transaction(TxBin),
+        parse_generate_transactions(Rest, [Tx | Acc])
+    catch
+        _:_ ->
+            {error, iolist_to_binary(
+                io_lib:format("Transaction decode failed for ~s", [TxHex]))}
+    end.
 
 %%% ===================================================================
 %%% Fee estimation
