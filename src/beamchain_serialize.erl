@@ -34,8 +34,8 @@
 %% Merkle
 -export([compute_merkle_root/1, compute_witness_commitment/2]).
 
-%% Weight/vsize
--export([tx_weight/1, tx_vsize/1]).
+%% Weight/vsize/size
+-export([tx_weight/1, tx_vsize/1, tx_size/1]).
 
 %% Utility
 -export([reverse_bytes/1, hex_encode/1, hex_decode/1]).
@@ -334,6 +334,11 @@ tx_weight(Tx) ->
 tx_vsize(Tx) ->
     Weight = tx_weight(Tx),
     (Weight + ?WITNESS_SCALE_FACTOR - 1) div ?WITNESS_SCALE_FACTOR.
+
+%% @doc Get the serialized size of a transaction in bytes
+-spec tx_size(#transaction{}) -> non_neg_integer().
+tx_size(Tx) ->
+    byte_size(encode_transaction(Tx)).
 
 %%% -------------------------------------------------------------------
 %%% Utility functions
