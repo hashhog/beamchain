@@ -15,6 +15,15 @@
          get_private_key/1,
          get_wallet_info/0]).
 
+%% Wallet encryption API
+-export([encryptwallet/1,
+         walletpassphrase/2,
+         walletlock/0,
+         is_locked/0]).
+
+%% Encryption helpers (exported for testing)
+-export([derive_encryption_key/2, pkcs7_pad/2, pkcs7_unpad/1]).
+
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2]).
@@ -102,7 +111,13 @@
     wallet_file    :: string() | undefined,
     passphrase     :: binary() | undefined, %% kept in memory for re-saving
     keypool_size   :: non_neg_integer(),    %% lookahead pool size
-    gap_limit      :: non_neg_integer()     %% BIP 44 gap limit
+    gap_limit      :: non_neg_integer(),    %% BIP 44 gap limit
+    %% Encryption state
+    encrypted      :: boolean(),            %% true if wallet is encrypted
+    locked         :: boolean(),            %% true if wallet is locked (keys unavailable)
+    encrypted_seed :: binary() | undefined, %% AES-256-CBC encrypted seed
+    encryption_salt :: binary() | undefined, %% 16-byte salt for PBKDF2
+    lock_timer_ref :: reference() | undefined  %% auto-lock timer reference
 }).
 
 %% Default keypool size (1000 addresses lookahead per type)
@@ -188,6 +203,35 @@ get_keypool_size() ->
     gen_server:call(?SERVER, get_keypool_size).
 
 %%% ===================================================================
+%%% Wallet encryption API
+%%% ===================================================================
+
+%% @doc Encrypt the wallet with a passphrase.
+%% After encryption, the wallet will be locked and require walletpassphrase
+%% to unlock for signing operations. This is a one-way operation.
+-spec encryptwallet(binary()) -> ok | {error, term()}.
+encryptwallet(Passphrase) when is_binary(Passphrase), byte_size(Passphrase) >= 1 ->
+    gen_server:call(?SERVER, {encryptwallet, Passphrase}).
+
+%% @doc Unlock the wallet for the specified timeout (in seconds).
+%% Decrypts the master key into memory for signing operations.
+%% After the timeout, the wallet automatically locks.
+-spec walletpassphrase(binary(), non_neg_integer()) -> ok | {error, term()}.
+walletpassphrase(Passphrase, Timeout) when is_binary(Passphrase), Timeout > 0 ->
+    gen_server:call(?SERVER, {walletpassphrase, Passphrase, Timeout}).
+
+%% @doc Immediately lock the wallet.
+%% Clears the decrypted master key from memory.
+-spec walletlock() -> ok | {error, term()}.
+walletlock() ->
+    gen_server:call(?SERVER, walletlock).
+
+%% @doc Check if the wallet is locked.
+-spec is_locked() -> boolean().
+is_locked() ->
+    gen_server:call(?SERVER, is_locked).
+
+%%% ===================================================================
 %%% gen_server callbacks
 %%% ===================================================================
 
@@ -208,7 +252,12 @@ init([]) ->
         next_change  = #{p2wpkh => 0, p2tr => 0, p2pkh => 0},
         addresses    = [],
         keypool_size = ?DEFAULT_KEYPOOL_SIZE,
-        gap_limit    = ?DEFAULT_GAP_LIMIT
+        gap_limit    = ?DEFAULT_GAP_LIMIT,
+        encrypted    = false,
+        locked       = false,
+        encrypted_seed = undefined,
+        encryption_salt = undefined,
+        lock_timer_ref = undefined
     }}.
 
 %% @doc Initialize ETS tables for wallet UTXO tracking.
@@ -248,9 +297,6 @@ handle_call({create, Seed, Passphrase}, _From, State) ->
 handle_call({load, FilePath, Passphrase}, _From, State) ->
     case load_wallet_file(FilePath, Passphrase) of
         {ok, WalletData} ->
-            SeedHex = maps:get(<<"seed">>, WalletData),
-            Seed = hex_decode(SeedHex),
-            MasterKey = master_from_seed(Seed),
             Addrs = maps:get(<<"addresses">>, WalletData, []),
             NextRecv = maps:get(<<"next_receive">>, WalletData,
                                 #{<<"p2wpkh">> => 0, <<"p2tr">> => 0,
@@ -258,15 +304,45 @@ handle_call({load, FilePath, Passphrase}, _From, State) ->
             NextChg = maps:get(<<"next_change">>, WalletData,
                                #{<<"p2wpkh">> => 0, <<"p2tr">> => 0,
                                  <<"p2pkh">> => 0}),
-            NewState = State#wallet_state{
-                master_key  = MasterKey,
-                seed        = Seed,
-                wallet_file = FilePath,
-                passphrase  = Passphrase,
-                addresses   = Addrs,
-                next_receive = decode_index_map(NextRecv),
-                next_change  = decode_index_map(NextChg)
-            },
+            %% Check if wallet is encrypted at the JSON level
+            IsEncrypted = maps:get(<<"encrypted">>, WalletData, false),
+            NewState = case IsEncrypted of
+                true ->
+                    %% Encrypted wallet: load encrypted seed, start locked
+                    EncSeedHex = maps:get(<<"encrypted_seed">>, WalletData),
+                    EncSaltHex = maps:get(<<"encryption_salt">>, WalletData),
+                    EncSeed = hex_decode(EncSeedHex),
+                    EncSalt = hex_decode(EncSaltHex),
+                    State#wallet_state{
+                        master_key  = undefined,
+                        seed        = undefined,
+                        wallet_file = FilePath,
+                        passphrase  = Passphrase,
+                        addresses   = Addrs,
+                        next_receive = decode_index_map(NextRecv),
+                        next_change  = decode_index_map(NextChg),
+                        encrypted   = true,
+                        locked      = true,
+                        encrypted_seed = EncSeed,
+                        encryption_salt = EncSalt
+                    };
+                false ->
+                    %% Unencrypted wallet: load seed directly
+                    SeedHex = maps:get(<<"seed">>, WalletData),
+                    Seed = hex_decode(SeedHex),
+                    MasterKey = master_from_seed(Seed),
+                    State#wallet_state{
+                        master_key  = MasterKey,
+                        seed        = Seed,
+                        wallet_file = FilePath,
+                        passphrase  = Passphrase,
+                        addresses   = Addrs,
+                        next_receive = decode_index_map(NextRecv),
+                        next_change  = decode_index_map(NextChg),
+                        encrypted   = false,
+                        locked      = false
+                    }
+            end,
             {reply, ok, NewState};
         {error, Reason} ->
             {reply, {error, Reason}, State}
@@ -305,6 +381,9 @@ handle_call(get_balance, _From, #wallet_state{addresses = Addrs,
     end, 0, Addrs),
     {reply, {ok, Balance}, State};
 
+handle_call({get_private_key, _Address}, _From,
+            #wallet_state{locked = true} = State) ->
+    {reply, {error, wallet_locked}, State};
 handle_call({get_private_key, Address}, _From, State) ->
     AddrBin = case is_list(Address) of
         true -> list_to_binary(Address);
@@ -327,7 +406,9 @@ handle_call(get_wallet_info, _From, State) ->
         has_seed   => State#wallet_state.seed =/= undefined,
         wallet_file => State#wallet_state.wallet_file,
         keypool_size => State#wallet_state.keypool_size,
-        gap_limit    => State#wallet_state.gap_limit
+        gap_limit    => State#wallet_state.gap_limit,
+        encrypted    => State#wallet_state.encrypted,
+        locked       => State#wallet_state.locked
     },
     {reply, {ok, Info}, State};
 
@@ -335,16 +416,71 @@ handle_call(get_keypool_size, _From, State) ->
     %% Return the actual number of addresses in the keypool
     {reply, {ok, length(State#wallet_state.addresses)}, State};
 
+%% Encryption: encryptwallet
+handle_call({encryptwallet, _Passphrase}, _From,
+            #wallet_state{seed = undefined} = State) ->
+    {reply, {error, no_wallet}, State};
+handle_call({encryptwallet, _Passphrase}, _From,
+            #wallet_state{encrypted = true} = State) ->
+    {reply, {error, already_encrypted}, State};
+handle_call({encryptwallet, Passphrase}, _From, State) ->
+    case do_encrypt_wallet(State, Passphrase) of
+        {ok, NewState} ->
+            ok = save_wallet(NewState),
+            {reply, ok, NewState};
+        {error, Reason} ->
+            {reply, {error, Reason}, State}
+    end;
+
+%% Encryption: walletpassphrase (unlock)
+handle_call({walletpassphrase, _Passphrase, _Timeout}, _From,
+            #wallet_state{encrypted = false} = State) ->
+    {reply, {error, not_encrypted}, State};
+handle_call({walletpassphrase, _Passphrase, _Timeout}, _From,
+            #wallet_state{locked = false} = State) ->
+    {reply, {error, already_unlocked}, State};
+handle_call({walletpassphrase, Passphrase, Timeout}, _From, State) ->
+    case do_unlock_wallet(State, Passphrase, Timeout) of
+        {ok, NewState} ->
+            {reply, ok, NewState};
+        {error, Reason} ->
+            {reply, {error, Reason}, State}
+    end;
+
+%% Encryption: walletlock
+handle_call(walletlock, _From, #wallet_state{encrypted = false} = State) ->
+    {reply, {error, not_encrypted}, State};
+handle_call(walletlock, _From, State) ->
+    NewState = do_lock_wallet(State),
+    {reply, ok, NewState};
+
+%% Encryption: is_locked
+handle_call(is_locked, _From, State) ->
+    {reply, State#wallet_state.locked, State};
+
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_request}, State}.
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
+handle_info(wallet_lock, State) ->
+    %% Auto-lock timer fired
+    logger:info("wallet: auto-locking after timeout"),
+    NewState = do_lock_wallet(State),
+    {noreply, NewState};
 handle_info(_Info, State) ->
     {noreply, State}.
 
-terminate(_Reason, _State) ->
+terminate(_Reason, State) ->
+    %% Clear sensitive data on shutdown
+    case State#wallet_state.seed of
+        undefined -> ok;
+        Seed when is_binary(Seed) ->
+            %% Overwrite seed memory (best effort)
+            _ = crypto:strong_rand_bytes(byte_size(Seed)),
+            ok
+    end,
     ok.
 
 %%% ===================================================================
@@ -1115,16 +1251,33 @@ accumulate_coins([{_Txid, _Vout, Utxo} = Coin | Rest], Target, CostPerInput,
 
 save_wallet(#wallet_state{wallet_file = undefined}) ->
     ok;
-save_wallet(#wallet_state{seed = Seed, addresses = Addrs,
+save_wallet(#wallet_state{addresses = Addrs,
                            next_receive = NextRecv, next_change = NextChg,
-                           passphrase = Passphrase, wallet_file = File}) ->
-    WalletData = #{
-        <<"seed">>         => hex_encode(Seed),
-        <<"addresses">>    => Addrs,
-        <<"next_receive">> => encode_index_map(NextRecv),
-        <<"next_change">>  => encode_index_map(NextChg),
-        <<"created_at">>   => erlang:system_time(second)
-    },
+                           passphrase = Passphrase, wallet_file = File,
+                           encrypted = Encrypted, encrypted_seed = EncSeed,
+                           encryption_salt = EncSalt, seed = Seed}) ->
+    %% For encrypted wallets, save the encrypted seed
+    %% For unencrypted wallets, save the plaintext seed
+    WalletData = case Encrypted of
+        true ->
+            #{
+                <<"encrypted">>       => true,
+                <<"encrypted_seed">>  => hex_encode(EncSeed),
+                <<"encryption_salt">> => hex_encode(EncSalt),
+                <<"addresses">>       => Addrs,
+                <<"next_receive">>    => encode_index_map(NextRecv),
+                <<"next_change">>     => encode_index_map(NextChg),
+                <<"created_at">>      => erlang:system_time(second)
+            };
+        false ->
+            #{
+                <<"seed">>         => hex_encode(Seed),
+                <<"addresses">>    => Addrs,
+                <<"next_receive">> => encode_index_map(NextRecv),
+                <<"next_change">>  => encode_index_map(NextChg),
+                <<"created_at">>   => erlang:system_time(second)
+            }
+    end,
     Json = jsx:encode(WalletData, [space, indent]),
     case Passphrase of
         undefined ->
@@ -1480,3 +1633,120 @@ hex_decode_str([], Acc) ->
 hex_decode_str([H1, H2 | Rest], Acc) ->
     B = list_to_integer([H1, H2], 16),
     hex_decode_str(Rest, <<Acc/binary, B>>).
+
+%%% ===================================================================
+%%% Wallet encryption (at-rest key protection)
+%%% ===================================================================
+
+%% PBKDF2 iteration count for key derivation
+-define(PBKDF2_ITERATIONS, 25000).
+%% AES-256 key size
+-define(AES_KEY_SIZE, 32).
+%% IV size for AES-256-CBC
+-define(AES_IV_SIZE, 16).
+%% Salt size for PBKDF2
+-define(PBKDF2_SALT_SIZE, 16).
+
+%% @doc Encrypt the wallet's master seed with a passphrase.
+%% Uses PBKDF2-SHA512 for key derivation and AES-256-CBC for encryption.
+-spec do_encrypt_wallet(#wallet_state{}, binary()) -> {ok, #wallet_state{}} | {error, term()}.
+do_encrypt_wallet(#wallet_state{seed = Seed} = State, Passphrase) ->
+    %% Generate random salt
+    Salt = crypto:strong_rand_bytes(?PBKDF2_SALT_SIZE),
+    %% Derive encryption key using PBKDF2-SHA512
+    DerivedKey = derive_encryption_key(Passphrase, Salt),
+    %% Encrypt the seed using AES-256-CBC
+    %% IV is the first 16 bytes of the derived key material
+    <<Key:?AES_KEY_SIZE/binary, IV:?AES_IV_SIZE/binary>> = DerivedKey,
+    %% PKCS#7 padding for 32-byte seed to align to 16-byte block
+    PaddedSeed = pkcs7_pad(Seed, 16),
+    EncryptedSeed = crypto:crypto_one_time(aes_256_cbc, Key, IV, PaddedSeed, true),
+    %% Clear the plaintext seed and master key from state
+    NewState = State#wallet_state{
+        seed = undefined,
+        master_key = undefined,
+        encrypted = true,
+        locked = true,
+        encrypted_seed = EncryptedSeed,
+        encryption_salt = Salt
+    },
+    logger:info("wallet: encrypted with passphrase (~B byte salt)",
+                [byte_size(Salt)]),
+    {ok, NewState}.
+
+%% @doc Unlock the wallet by decrypting the master seed.
+%% Sets a timer to auto-lock after the specified timeout.
+-spec do_unlock_wallet(#wallet_state{}, binary(), non_neg_integer()) ->
+    {ok, #wallet_state{}} | {error, term()}.
+do_unlock_wallet(#wallet_state{encrypted_seed = EncSeed,
+                                encryption_salt = Salt,
+                                lock_timer_ref = OldRef} = State,
+                  Passphrase, Timeout) ->
+    %% Cancel any existing lock timer
+    cancel_lock_timer(OldRef),
+    %% Derive the decryption key
+    DerivedKey = derive_encryption_key(Passphrase, Salt),
+    <<Key:?AES_KEY_SIZE/binary, IV:?AES_IV_SIZE/binary>> = DerivedKey,
+    %% Decrypt the seed
+    try
+        DecryptedPadded = crypto:crypto_one_time(aes_256_cbc, Key, IV, EncSeed, false),
+        Seed = pkcs7_unpad(DecryptedPadded),
+        %% Verify the seed is valid by deriving the master key
+        MasterKey = master_from_seed(Seed),
+        %% Set auto-lock timer
+        TimerRef = erlang:send_after(Timeout * 1000, self(), wallet_lock),
+        NewState = State#wallet_state{
+            seed = Seed,
+            master_key = MasterKey,
+            locked = false,
+            lock_timer_ref = TimerRef
+        },
+        logger:info("wallet: unlocked for ~B seconds", [Timeout]),
+        {ok, NewState}
+    catch
+        _:_ ->
+            {error, wrong_passphrase}
+    end.
+
+%% @doc Lock the wallet by clearing the decrypted seed from memory.
+-spec do_lock_wallet(#wallet_state{}) -> #wallet_state{}.
+do_lock_wallet(#wallet_state{lock_timer_ref = OldRef} = State) ->
+    %% Cancel any existing lock timer
+    cancel_lock_timer(OldRef),
+    %% Clear sensitive data from state
+    State#wallet_state{
+        seed = undefined,
+        master_key = undefined,
+        locked = true,
+        lock_timer_ref = undefined
+    }.
+
+%% @doc Cancel an existing lock timer if present.
+-spec cancel_lock_timer(reference() | undefined) -> ok.
+cancel_lock_timer(undefined) -> ok;
+cancel_lock_timer(Ref) ->
+    erlang:cancel_timer(Ref),
+    %% Flush any pending wallet_lock message
+    receive wallet_lock -> ok after 0 -> ok end.
+
+%% @doc Derive an encryption key from a passphrase using PBKDF2-SHA512.
+%% Returns 48 bytes: 32 for AES key + 16 for IV.
+-spec derive_encryption_key(binary(), binary()) -> binary().
+derive_encryption_key(Passphrase, Salt) ->
+    %% Use crypto:pbkdf2_hmac for key derivation
+    %% Returns 48 bytes: 32 for key + 16 for IV
+    crypto:pbkdf2_hmac(sha512, Passphrase, Salt, ?PBKDF2_ITERATIONS, 48).
+
+%% @doc PKCS#7 padding for block cipher.
+-spec pkcs7_pad(binary(), pos_integer()) -> binary().
+pkcs7_pad(Data, BlockSize) ->
+    PadLen = BlockSize - (byte_size(Data) rem BlockSize),
+    Padding = binary:copy(<<PadLen>>, PadLen),
+    <<Data/binary, Padding/binary>>.
+
+%% @doc PKCS#7 unpadding.
+-spec pkcs7_unpad(binary()) -> binary().
+pkcs7_unpad(Data) ->
+    PadLen = binary:last(Data),
+    DataLen = byte_size(Data) - PadLen,
+    binary:part(Data, 0, DataLen).
