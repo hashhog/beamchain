@@ -71,6 +71,7 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] ZMQ pub/sub notifications (hashblock, hashtx, rawblock, rawtx, sequence topics)
 - [x] Tor SOCKS5 proxy (connect to .onion peers, stream isolation, v3 address generation)
 - [x] I2P SAM 3.1 support (connect to .b32.i2p peers, session management)
+- [x] invalidateblock/reconsiderblock RPCs (manual chain management)
 
 ## Quick start
 
@@ -128,7 +129,7 @@ c_src/
 
 test/
 ├── beamchain_script_tests.erl         Script and sighash tests
-├── beamchain_chainstate_tests.erl     Undo data and disconnect tests
+├── beamchain_chainstate_tests.erl     Undo data, disconnect, and invalidation tests
 ├── beamchain_miner_tests.erl          Block template and witness tests
 ├── beamchain_mempool_tests.erl        Mempool, cluster, and limit tests
 ├── beamchain_peer_tests.erl           Inv trickling and relay tests
