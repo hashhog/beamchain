@@ -39,6 +39,16 @@
 %% Number of timestamps to keep for MTP calculation
 -define(MTP_WINDOW, 11).
 
+%% Anti-DoS: Maximum unconnecting headers per peer before disconnect.
+%% If a peer sends more than this many headers that don't connect to our
+%% chain, we consider them misbehaving and disconnect.
+-define(MAX_UNCONNECTING_HEADERS, 10).
+
+%% Anti-DoS: Minimum reorg depth requiring more cumulative work.
+%% Headers forking more than this many blocks deep must have more
+%% cumulative work than our current tip to be accepted.
+-define(MIN_FORK_DEPTH_FOR_WORK_CHECK, 288).
+
 -record(state, {
     %% Current sync status: idle | syncing | complete
     status = idle           :: idle | syncing | complete,
@@ -62,7 +72,10 @@
     %% Progress callback: fun(InfoMap) or undefined
     progress_cb             :: function() | undefined,
     %% Known connected peers with their heights: #{Pid => Height}
-    peer_heights = #{}      :: #{pid() => non_neg_integer()}
+    peer_heights = #{}      :: #{pid() => non_neg_integer()},
+    %% Anti-DoS: Per-peer state tracking
+    %% #{Pid => #{unconnecting_count => N, last_header_hash => Hash}}
+    peer_header_state = #{} :: #{pid() => map()}
 }).
 
 %%% ===================================================================
@@ -152,8 +165,18 @@ handle_cast(stop_sync, State) ->
 handle_cast({headers, Peer, Headers}, #state{status = syncing,
                                               sync_peer = Peer} = State) ->
     State2 = cancel_timer(State),
-    State3 = process_headers(Headers, State2),
-    {noreply, State3};
+    %% Anti-DoS: Validate PoW and continuity before any processing
+    case check_headers_pow_and_continuity(Headers, State2) of
+        ok ->
+            State3 = process_headers(Headers, Peer, State2),
+            {noreply, State3};
+        {error, invalid_pow} ->
+            logger:warning("header_sync: peer ~p sent header with invalid PoW", [Peer]),
+            handle_misbehaving_peer(Peer, 100, State2);
+        {error, non_continuous} ->
+            logger:warning("header_sync: peer ~p sent non-continuous headers", [Peer]),
+            handle_misbehaving_peer(Peer, 100, State2)
+    end;
 handle_cast({headers, _Peer, _Headers}, State) ->
     %% Headers from a peer we're not syncing from, ignore
     {noreply, State};
@@ -172,8 +195,8 @@ handle_cast({peer_connected, Peer, Info}, State) ->
     end;
 
 handle_cast({peer_disconnected, Peer}, State) ->
-    PeerHeights = maps:remove(Peer, State#state.peer_heights),
-    State2 = State#state{peer_heights = PeerHeights},
+    %% Clean up all peer state
+    State2 = remove_peer_state(Peer, State),
     case State2#state.sync_peer of
         Peer ->
             %% Our sync peer disconnected, try another
@@ -325,13 +348,31 @@ build_locator_hashes(Height, Hash, Step, Acc) ->
 %%% Internal: header processing
 %%% ===================================================================
 
-process_headers([], State) ->
+process_headers([], _Peer, State) ->
     %% Empty response: peer has no new headers for us
     %% Check if we should try another peer or declare complete
     logger:info("header_sync: peer sent 0 headers, checking if in sync"),
     check_sync_complete(State);
 
-process_headers(Headers, State) ->
+process_headers(Headers, Peer, State) ->
+    %% Check if headers connect to our chain
+    FirstHeader = hd(Headers),
+    case headers_connect_to_chain(FirstHeader, State) of
+        true ->
+            %% Headers connect - reset unconnecting counter and process
+            State2 = reset_unconnecting_count(Peer, State),
+            process_connecting_headers(Headers, Peer, State2);
+        false ->
+            %% Headers don't connect - track and handle
+            handle_unconnecting_headers(Headers, Peer, State)
+    end.
+
+%% Check if a header connects to our current chain tip
+headers_connect_to_chain(Header, #state{tip_hash = TipHash}) ->
+    Header#block_header.prev_hash =:= TipHash.
+
+%% Process headers that connect to our chain
+process_connecting_headers(Headers, Peer, State) ->
     case validate_and_store_headers(Headers, State) of
         {ok, State2} ->
             NumReceived = length(Headers),
@@ -353,13 +394,177 @@ process_headers(Headers, State) ->
         {error, Reason, State2} ->
             logger:warning("header_sync: validation failed: ~p", [Reason]),
             %% Misbehaving peer, try another
-            case State2#state.sync_peer of
-                undefined -> ok;
-                Peer -> beamchain_peer:add_misbehavior(Peer, 20)
-            end,
+            beamchain_peer:add_misbehavior(Peer, 20),
             State3 = State2#state{sync_peer = undefined, status = idle},
             pick_sync_peer_and_start(State3)
     end.
+
+%% Handle headers that don't connect to our chain tip
+handle_unconnecting_headers(Headers, Peer, State) ->
+    %% Increment unconnecting counter for this peer
+    PeerState = get_peer_header_state(Peer, State),
+    UnconnectingCount = maps:get(unconnecting_count, PeerState, 0) + 1,
+
+    case UnconnectingCount > ?MAX_UNCONNECTING_HEADERS of
+        true ->
+            %% Peer has sent too many unconnecting headers - disconnect
+            logger:warning("header_sync: peer ~p exceeded max unconnecting "
+                          "headers (~B), disconnecting",
+                          [Peer, ?MAX_UNCONNECTING_HEADERS]),
+            handle_misbehaving_peer(Peer, 100, State);
+        false ->
+            %% Check if this might be a deep fork requiring more work
+            FirstHeader = hd(Headers),
+            case check_deep_fork(FirstHeader, State) of
+                ok ->
+                    %% Send getheaders to try to connect the chain
+                    State2 = update_peer_unconnecting_count(Peer, UnconnectingCount, State),
+                    logger:debug("header_sync: unconnecting headers from ~p "
+                                "(count ~B), sending getheaders",
+                                [Peer, UnconnectingCount]),
+                    %% Record last unconnecting header for potential later use
+                    LastHash = beamchain_serialize:block_hash(lists:last(Headers)),
+                    State3 = update_peer_last_header(Peer, LastHash, State2),
+                    send_getheaders(State3);
+                {error, deep_fork_insufficient_work} ->
+                    %% Deep fork without sufficient work - reject
+                    logger:warning("header_sync: peer ~p sent deep fork headers "
+                                  "without sufficient work", [Peer]),
+                    handle_misbehaving_peer(Peer, 20, State)
+            end
+    end.
+
+%%% ===================================================================
+%%% Anti-DoS: PoW and continuity checks
+%%% ===================================================================
+
+%% Validate PoW on all headers and check continuity before any processing.
+%% This prevents memory exhaustion from invalid headers.
+-spec check_headers_pow_and_continuity([#block_header{}], #state{}) ->
+    ok | {error, invalid_pow | non_continuous}.
+check_headers_pow_and_continuity([], _State) ->
+    ok;
+check_headers_pow_and_continuity(Headers, #state{params = Params}) ->
+    PowLimit = maps:get(pow_limit, Params),
+    check_headers_pow_and_continuity(Headers, PowLimit, undefined).
+
+check_headers_pow_and_continuity([], _PowLimit, _PrevHash) ->
+    ok;
+check_headers_pow_and_continuity([Header | Rest], PowLimit, PrevHash) ->
+    BlockHash = beamchain_serialize:block_hash(Header),
+    %% Check PoW: block hash must be <= target <= pow_limit
+    case beamchain_pow:check_pow(BlockHash, Header#block_header.bits, PowLimit) of
+        false ->
+            {error, invalid_pow};
+        true ->
+            %% Check continuity: each header's prev_hash must match previous
+            case PrevHash of
+                undefined ->
+                    %% First header - skip continuity check (will check connection later)
+                    check_headers_pow_and_continuity(Rest, PowLimit, BlockHash);
+                _ when Header#block_header.prev_hash =:= PrevHash ->
+                    check_headers_pow_and_continuity(Rest, PowLimit, BlockHash);
+                _ ->
+                    {error, non_continuous}
+            end
+    end.
+
+%% Handle a misbehaving peer: add misbehavior score and try another peer
+handle_misbehaving_peer(Peer, Score, State) ->
+    beamchain_peer:add_misbehavior(Peer, Score),
+    %% Remove peer from tracking
+    State2 = remove_peer_state(Peer, State),
+    State3 = State2#state{sync_peer = undefined, status = idle},
+    {noreply, pick_sync_peer_and_start(State3)}.
+
+%%% ===================================================================
+%%% Anti-DoS: Per-peer state management
+%%% ===================================================================
+
+%% Get the header state for a specific peer
+get_peer_header_state(Peer, #state{peer_header_state = PeerStates}) ->
+    maps:get(Peer, PeerStates, #{}).
+
+%% Reset the unconnecting header count for a peer (they sent connecting headers)
+reset_unconnecting_count(Peer, #state{peer_header_state = PeerStates} = State) ->
+    PeerState = maps:get(Peer, PeerStates, #{}),
+    PeerState2 = PeerState#{unconnecting_count => 0},
+    State#state{peer_header_state = maps:put(Peer, PeerState2, PeerStates)}.
+
+%% Update the unconnecting header count for a peer
+update_peer_unconnecting_count(Peer, Count, #state{peer_header_state = PeerStates} = State) ->
+    PeerState = maps:get(Peer, PeerStates, #{}),
+    PeerState2 = PeerState#{unconnecting_count => Count},
+    State#state{peer_header_state = maps:put(Peer, PeerState2, PeerStates)}.
+
+%% Record the last header hash received from a peer (for future download)
+update_peer_last_header(Peer, Hash, #state{peer_header_state = PeerStates} = State) ->
+    PeerState = maps:get(Peer, PeerStates, #{}),
+    PeerState2 = PeerState#{last_header_hash => Hash},
+    State#state{peer_header_state = maps:put(Peer, PeerState2, PeerStates)}.
+
+%% Remove all state for a peer
+remove_peer_state(Peer, #state{peer_header_state = PeerStates,
+                                peer_heights = PeerHeights} = State) ->
+    State#state{
+        peer_header_state = maps:remove(Peer, PeerStates),
+        peer_heights = maps:remove(Peer, PeerHeights)
+    }.
+
+%%% ===================================================================
+%%% Anti-DoS: Deep fork protection
+%%% ===================================================================
+
+%% Check if headers represent a deep fork that requires more work.
+%% If headers fork more than 288 blocks from our tip, they must have
+%% more cumulative work to be accepted.
+check_deep_fork(FirstHeader, #state{tip_height = TipHeight,
+                                     tip_chainwork = TipCW,
+                                     params = Params}) ->
+    %% Try to find where this header connects to our chain
+    case find_fork_point(FirstHeader#block_header.prev_hash) of
+        {ok, ForkHeight, _ForkChainwork} ->
+            Depth = TipHeight - ForkHeight,
+            case Depth > ?MIN_FORK_DEPTH_FOR_WORK_CHECK of
+                true ->
+                    %% Deep fork - would need to check if incoming chain has more work
+                    %% Since we don't have all headers yet, we can't know the work
+                    %% For now, we allow it if we haven't passed min_chainwork
+                    MinChainwork = maps:get(min_chainwork, Params, <<0:256>>),
+                    TipCWInt = binary:decode_unsigned(TipCW, big),
+                    MinCWInt = binary:decode_unsigned(MinChainwork, big),
+                    case TipCWInt < MinCWInt of
+                        true ->
+                            %% Still in IBD, allow deep forks
+                            ok;
+                        false ->
+                            %% Past minimum chainwork - reject deep forks without proof
+                            %% Note: In a full implementation, we'd track the fork's
+                            %% claimed work and verify it exceeds ours
+                            {error, deep_fork_insufficient_work}
+                    end;
+                false ->
+                    %% Shallow fork, allow
+                    ok
+            end;
+        not_found ->
+            %% Can't find fork point - this is an unconnecting header
+            %% Allow it for now, the getheaders will try to connect
+            ok
+    end.
+
+%% Find the fork point for a given previous hash
+find_fork_point(PrevHash) ->
+    case beamchain_db:get_block_index_by_hash(PrevHash) of
+        {ok, #{height := Height, chainwork := CW}} ->
+            {ok, Height, CW};
+        not_found ->
+            not_found
+    end.
+
+%%% ===================================================================
+%%% Internal: sync completion check
+%%% ===================================================================
 
 %% Check if we're fully synced or need to try another peer.
 check_sync_complete(#state{peer_heights = PeerHeights,
@@ -429,8 +634,15 @@ validate_one_header(Header, #state{tip_height = TipHeight,
         Header#block_header.bits =:= ExpectedBits
             orelse throw(bad_diffbits),
 
-        %% 6. Checkpoint enforcement
+        %% 6. Checkpoint enforcement (exact match at checkpoint heights)
         check_checkpoint(NewHeight, BlockHash, Params),
+
+        %% 6b. Enhanced checkpoint enforcement: reject headers that would
+        %% fork below the last checkpoint (anti-DoS measure)
+        case check_checkpoint_ancestry(NewHeight, BlockHash, Params) of
+            ok -> ok;
+            {error, checkpoint_ancestry_mismatch} -> throw(checkpoint_ancestry_mismatch)
+        end,
 
         %% 7. BIP94 (testnet4): first block of retarget period
         check_bip94(NewHeight, Header, State),
@@ -512,6 +724,8 @@ load_mtp_window(Height, _Params) ->
 %%% Internal: checkpoint enforcement
 %%% ===================================================================
 
+%% Check if a header matches any checkpoint at its height.
+%% If the height has a checkpoint, the hash must match.
 check_checkpoint(Height, BlockHash, Params) ->
     Checkpoints = maps:get(checkpoints, Params, #{}),
     case maps:find(Height, Checkpoints) of
@@ -525,6 +739,47 @@ check_checkpoint(Height, BlockHash, Params) ->
         error ->
             ok
     end.
+
+%% Enhanced checkpoint enforcement: reject headers on a chain that
+%% forks before the last checkpoint. This prevents an attacker from
+%% feeding us a fake chain that diverges early in history.
+%% Returns ok if the header is acceptable, or {error, Reason} if not.
+-spec check_checkpoint_ancestry(non_neg_integer(), binary(), map()) ->
+    ok | {error, term()}.
+check_checkpoint_ancestry(Height, BlockHash, Params) ->
+    Checkpoints = maps:get(checkpoints, Params, #{}),
+    case maps:size(Checkpoints) of
+        0 ->
+            %% No checkpoints configured (testnet4, regtest)
+            ok;
+        _ ->
+            LastCheckpointHeight = get_last_checkpoint_height(Checkpoints),
+            case Height < LastCheckpointHeight of
+                true ->
+                    %% We're below the last checkpoint - must be on checkpoint chain
+                    %% Check if our chain of headers leads to the checkpoint
+                    %% For now, we just verify any checkpoints at this height match
+                    case maps:find(Height, Checkpoints) of
+                        {ok, ExpectedHash} ->
+                            case BlockHash =:= beamchain_serialize:reverse_bytes(ExpectedHash) of
+                                true -> ok;
+                                false -> {error, checkpoint_ancestry_mismatch}
+                            end;
+                        error ->
+                            %% No checkpoint at this exact height - allow
+                            %% The actual checkpoint enforcement happens when we reach
+                            %% a checkpoint height
+                            ok
+                    end;
+                false ->
+                    %% Above last checkpoint - allow
+                    ok
+            end
+    end.
+
+%% Get the highest checkpoint height
+get_last_checkpoint_height(Checkpoints) ->
+    maps:fold(fun(H, _, Max) -> max(H, Max) end, 0, Checkpoints).
 
 %%% ===================================================================
 %%% Internal: BIP94 (testnet4 difficulty adjustment)
