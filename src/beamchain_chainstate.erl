@@ -542,6 +542,10 @@ do_connect_block(#block{header = Header} = Block,
             },
             State3 = maybe_check_ibd(State2),
             State4 = maybe_flush(State3),
+
+            %% ZMQ notification for block connect
+            beamchain_zmq:notify_block(Block, connect),
+
             {ok, State4};
         {error, Reason} ->
             {error, Reason}
@@ -604,6 +608,9 @@ do_disconnect_block(#state{tip_hash = TipHash, tip_height = TipHeight,
                     %% Update MTP: drop newest, restore oldest if possible
                     NewMTP = update_mtp_disconnect(PrevHeight,
                                                     State#state.mtp_timestamps),
+
+                    %% ZMQ notification for block disconnect
+                    beamchain_zmq:notify_block(Block, disconnect),
 
                     {ok, State#state{
                         tip_hash = PrevHash,
