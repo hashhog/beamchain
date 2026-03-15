@@ -32,6 +32,7 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] Difficulty adjustment algorithm (retarget every 2016 blocks)
 - [x] BIP9 versionbits soft fork deployment tracking
 - [x] Checkpoint enforcement (mainnet checkpoints)
+- [x] Peer misbehavior scoring and banning
 - [ ] Wallet (HD keys, signing)
 - [ ] Compact block relay (BIP152)
 
@@ -59,6 +60,7 @@ src/
 ├── beamchain_crypto.erl       secp256k1 NIF bindings
 ├── beamchain_p2p_msg.erl      P2P message encoding
 ├── beamchain_peer.erl         Connection handling
+├── beamchain_peer_manager.erl Peer lifecycle and banning
 ├── beamchain_header_sync.erl  Header-first sync with anti-DoS
 ├── beamchain_block_sync.erl   Block download
 ├── beamchain_chainstate.erl   UTXO management
@@ -74,12 +76,13 @@ c_src/
 └── beamchain_crypto_nif.c     libsecp256k1 bindings
 
 test/
-├── beamchain_script_tests.erl       Script and sighash tests
-├── beamchain_chainstate_tests.erl   Undo data and disconnect tests
-├── beamchain_miner_tests.erl        Block template and witness tests
-├── beamchain_pow_tests.erl          PoW and difficulty adjustment tests
-├── beamchain_versionbits_tests.erl  BIP9 state machine tests
-└── beamchain_validation_tests.erl   Consensus rule tests
+├── beamchain_script_tests.erl         Script and sighash tests
+├── beamchain_chainstate_tests.erl     Undo data and disconnect tests
+├── beamchain_miner_tests.erl          Block template and witness tests
+├── beamchain_peer_manager_tests.erl   Misbehavior and banning tests
+├── beamchain_pow_tests.erl            PoW and difficulty adjustment tests
+├── beamchain_versionbits_tests.erl    BIP9 state machine tests
+└── beamchain_validation_tests.erl     Consensus rule tests
 ```
 
 ## Running tests
