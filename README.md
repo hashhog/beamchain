@@ -19,6 +19,7 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] SegWit v0 (P2WPKH, P2WSH) with BIP143 sighash
 - [x] Taproot (key path and script path) with BIP341 sighash
 - [x] MINIMALIF enforcement for witness scripts
+- [x] Accurate sigop counting (legacy, P2SH, witness)
 - [x] UTXO set management and chainstate
 - [x] Undo data for block disconnection (reorg support)
 - [x] Mempool with fee-based ordering
