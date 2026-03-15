@@ -608,36 +608,135 @@ rpc_verifychain() ->
 %%% ===================================================================
 
 rpc_getrawtransaction([TxidHex]) ->
-    rpc_getrawtransaction([TxidHex, false]);
-rpc_getrawtransaction([TxidHex, Verbose | _]) when is_binary(TxidHex) ->
+    rpc_getrawtransaction([TxidHex, 0, null]);
+rpc_getrawtransaction([TxidHex, Verbose]) ->
+    rpc_getrawtransaction([TxidHex, Verbose, null]);
+rpc_getrawtransaction([TxidHex, Verbose, BlockHashParam]) when is_binary(TxidHex) ->
     Txid = hex_to_internal_hash(TxidHex),
-    case find_transaction(Txid) of
-        {ok, Tx, BlockHash, Height, _Pos} ->
-            case Verbose of
-                true ->
-                    TxJson = format_tx_json(Tx),
-                    TxJson2 = case BlockHash of
-                        undefined -> TxJson;
-                        _ ->
-                            TxJson#{
-                                <<"blockhash">> => hash_to_hex(BlockHash),
-                                <<"confirmations">> => confirmations(Height),
-                                <<"blocktime">> => block_time(Height)
-                            }
-                    end,
-                    {ok, TxJson2};
-                _ ->
-                    Hex = beamchain_serialize:hex_encode(
-                        beamchain_serialize:encode_transaction(Tx)),
-                    {ok, Hex}
+    %% Parse verbosity: 0/false = hex, 1/true = JSON, 2 = JSON with prevout (not yet supported)
+    Verbosity = parse_verbosity(Verbose),
+
+    %% Handle optional blockhash parameter
+    case BlockHashParam of
+        null ->
+            %% No blockhash provided - search mempool then txindex
+            find_and_format_tx(Txid, Verbosity, undefined);
+        BlockHashHex when is_binary(BlockHashHex) ->
+            %% Blockhash provided - only search that specific block
+            BlockHash = hex_to_internal_hash(BlockHashHex),
+            case beamchain_db:get_block(BlockHash) of
+                {ok, Block} ->
+                    find_tx_in_block_and_format(Txid, Block, BlockHash, Verbosity);
+                not_found ->
+                    {error, ?RPC_INVALID_ADDRESS_OR_KEY, <<"Block hash not found">>}
             end;
-        not_found ->
-            {error, ?RPC_INVALID_ADDRESS_OR_KEY,
-             <<"No such mempool or blockchain transaction">>}
+        _ ->
+            {error, ?RPC_INVALID_PARAMS, <<"Invalid blockhash parameter">>}
     end;
 rpc_getrawtransaction(_) ->
     {error, ?RPC_INVALID_PARAMS,
-     <<"Usage: getrawtransaction \"txid\" ( verbose )">>}.
+     <<"Usage: getrawtransaction \"txid\" ( verbose \"blockhash\" )">>}.
+
+%% Parse verbosity parameter (0/false = hex, 1/true = JSON, 2 = JSON with prevout)
+parse_verbosity(0) -> 0;
+parse_verbosity(1) -> 1;
+parse_verbosity(2) -> 2;
+parse_verbosity(false) -> 0;
+parse_verbosity(true) -> 1;
+parse_verbosity(V) when is_integer(V), V >= 0 -> min(V, 2);
+parse_verbosity(_) -> 0.
+
+%% Find transaction and format according to verbosity
+find_and_format_tx(Txid, Verbosity, ProvidedBlockHash) ->
+    case find_transaction(Txid) of
+        {ok, Tx, BlockHash, Height, _Pos} ->
+            format_getrawtransaction_result(Tx, BlockHash, Height, Verbosity,
+                                             ProvidedBlockHash =/= undefined);
+        not_found ->
+            %% Generate appropriate error message based on txindex status
+            TxIndexEnabled = beamchain_config:txindex_enabled(),
+            ErrMsg = case TxIndexEnabled of
+                true ->
+                    <<"No such mempool or blockchain transaction. Use gettransaction for wallet transactions.">>;
+                false ->
+                    <<"No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries. Use gettransaction for wallet transactions.">>
+            end,
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY, ErrMsg}
+    end.
+
+%% Find a transaction in a specific block and format result
+find_tx_in_block_and_format(Txid, #block{transactions = Txs},
+                             BlockHash, Verbosity) ->
+    Height = case beamchain_db:get_block_index_by_hash(BlockHash) of
+        {ok, #{height := H}} -> H;
+        _ -> -1
+    end,
+    case find_tx_in_list(Txid, Txs, 0) of
+        {ok, Tx, _Pos} ->
+            %% Check if block is in active chain
+            InActiveChain = is_block_in_active_chain(BlockHash),
+            format_getrawtransaction_result(Tx, BlockHash, Height, Verbosity,
+                                             true, InActiveChain);
+        not_found ->
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+             <<"No such transaction found in the provided block">>}
+    end.
+
+%% Find transaction in a list by txid
+find_tx_in_list(_Txid, [], _Pos) -> not_found;
+find_tx_in_list(Txid, [Tx | Rest], Pos) ->
+    case beamchain_serialize:tx_hash(Tx) of
+        Txid -> {ok, Tx, Pos};
+        _ -> find_tx_in_list(Txid, Rest, Pos + 1)
+    end.
+
+%% Check if a block hash is in the active chain
+is_block_in_active_chain(BlockHash) ->
+    case beamchain_db:get_block_index_by_hash(BlockHash) of
+        {ok, #{height := Height}} ->
+            %% Verify the block at this height has the same hash
+            case beamchain_db:get_block_index(Height) of
+                {ok, #{hash := Hash}} -> Hash =:= BlockHash;
+                _ -> false
+            end;
+        _ -> false
+    end.
+
+%% Format getrawtransaction result based on verbosity
+format_getrawtransaction_result(Tx, BlockHash, Height, Verbosity, BlockHashProvided) ->
+    format_getrawtransaction_result(Tx, BlockHash, Height, Verbosity,
+                                     BlockHashProvided, true).
+
+format_getrawtransaction_result(Tx, _BlockHash, _Height, 0, _BlockHashProvided,
+                                 _InActiveChain) ->
+    %% Verbosity 0: return raw hex
+    Hex = beamchain_serialize:hex_encode(
+        beamchain_serialize:encode_transaction(Tx)),
+    {ok, Hex};
+format_getrawtransaction_result(Tx, BlockHash, Height, Verbosity, BlockHashProvided,
+                                 InActiveChain) when Verbosity >= 1 ->
+    %% Verbosity 1+: return JSON object
+    TxJson = format_tx_json(Tx),
+    TxJson2 = case BlockHash of
+        undefined ->
+            TxJson;
+        _ ->
+            BlockTime = block_time(Height),
+            TxJson#{
+                <<"blockhash">> => hash_to_hex(BlockHash),
+                <<"confirmations">> => confirmations(Height),
+                <<"time">> => BlockTime,
+                <<"blocktime">> => BlockTime
+            }
+    end,
+    %% Add in_active_chain only when blockhash was explicitly provided
+    TxJson3 = case BlockHashProvided of
+        true when BlockHash =/= undefined ->
+            TxJson2#{<<"in_active_chain">> => InActiveChain};
+        _ ->
+            TxJson2
+    end,
+    {ok, TxJson3}.
 
 rpc_decoderawtransaction([HexStr]) when is_binary(HexStr) ->
     try
@@ -1116,11 +1215,11 @@ parse_subnet(Subnet) when is_binary(Subnet) ->
 parse_subnet(Subnet) when is_list(Subnet) ->
     %% Strip any /32 or CIDR suffix for now (we only support single IPs)
     IPStr = case string:split(Subnet, "/") of
-        [IP, _Mask] -> IP;
-        [IP] -> IP
+        [IpPart, _Mask] -> IpPart;
+        [IpPart] -> IpPart
     end,
     case inet:parse_address(IPStr) of
-        {ok, IP} -> {ok, IP};
+        {ok, ParsedIP} -> {ok, ParsedIP};
         {error, _} -> {error, <<"Invalid IP address">>}
     end.
 
