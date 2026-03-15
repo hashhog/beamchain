@@ -6,6 +6,7 @@
 -include("beamchain_protocol.hrl").
 
 -export([params/1, genesis_block/1, block_subsidy/2]).
+-export([get_last_checkpoint/2, get_checkpoint/2]).
 
 %% @doc Returns comprehensive chain parameters for the given network.
 -spec params(mainnet | testnet | testnet4 | regtest | signet) -> map().
@@ -247,6 +248,7 @@ params(signet) ->
 
 mainnet_checkpoints() ->
     #{
+        0      => hex_to_bin("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"),
         11111  => hex_to_bin("0000000069e244f73d78e8fd29ba2fd2ed618bd6fa2ee92559f542fdb26e7c1d"),
         33333  => hex_to_bin("000000002dd5588a74784eaa7ab0507a18ad16a236e7b1ce69f00d7ddfb5d0a6"),
         74000  => hex_to_bin("0000000000573993a3c9e41ce34471c079dcf5f52a0e824a81e7f953b8661a20"),
@@ -355,6 +357,40 @@ block_subsidy(Height, Network) ->
     case Halvings >= 64 of
         true -> 0;
         false -> ?INITIAL_SUBSIDY bsr Halvings
+    end.
+
+%%% -------------------------------------------------------------------
+%%% Checkpoint helpers
+%%% -------------------------------------------------------------------
+
+%% @doc Get the highest checkpoint at or below the given height.
+%% Returns {Height, Hash} or 'none' if no checkpoint exists at or below Height.
+%% Hash is in display byte order.
+-spec get_last_checkpoint(non_neg_integer(), atom()) ->
+    {non_neg_integer(), binary()} | none.
+get_last_checkpoint(Height, Network) ->
+    #{checkpoints := Checkpoints} = params(Network),
+    case maps:size(Checkpoints) of
+        0 -> none;
+        _ ->
+            %% Find the highest checkpoint height <= Height
+            ValidHeights = [H || H <- maps:keys(Checkpoints), H =< Height],
+            case ValidHeights of
+                [] -> none;
+                _ ->
+                    MaxH = lists:max(ValidHeights),
+                    {MaxH, maps:get(MaxH, Checkpoints)}
+            end
+    end.
+
+%% @doc Get the checkpoint hash at exact height, or none if no checkpoint.
+%% Hash is in display byte order.
+-spec get_checkpoint(non_neg_integer(), atom()) -> binary() | none.
+get_checkpoint(Height, Network) ->
+    #{checkpoints := Checkpoints} = params(Network),
+    case maps:find(Height, Checkpoints) of
+        {ok, Hash} -> Hash;
+        error -> none
     end.
 
 %%% -------------------------------------------------------------------
