@@ -22,6 +22,9 @@
 %% Flush
 -export([flush/0]).
 
+%% Cache statistics
+-export([cache_stats/0, cache_memory_usage/0]).
+
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2]).
@@ -31,13 +34,18 @@
 %% ETS table names
 -define(UTXO_CACHE, beamchain_utxo_cache).
 -define(UTXO_DIRTY, beamchain_utxo_dirty).
+-define(UTXO_FRESH, beamchain_utxo_fresh).  %% Entries that don't exist in RocksDB
 -define(UTXO_SPENT, beamchain_utxo_spent).
 -define(CHAIN_META, beamchain_chain_meta).
 
 %% Flush tuning
--define(DEFAULT_MAX_CACHE_MB, 200).
+-define(DEFAULT_MAX_CACHE_MB, 450).
 -define(IBD_MAX_CACHE_MB, 1024).
 -define(IBD_FLUSH_INTERVAL, 2000).
+
+%% Estimated cache entry count threshold (3 million entries ~ 450MB)
+%% Each UTXO entry is roughly 150 bytes on average (key + value + ETS overhead)
+-define(DEFAULT_MAX_CACHE_ENTRIES, 3000000).
 
 -record(state, {
     %% Current chain tip
@@ -55,6 +63,12 @@
 
     %% Max UTXO cache size before forcing a flush (bytes)
     max_cache_bytes   :: non_neg_integer(),
+
+    %% Max UTXO cache entries before forcing a flush
+    max_cache_entries :: non_neg_integer(),
+
+    %% Running estimate of dynamic memory usage (bytes)
+    cache_usage_bytes :: non_neg_integer(),
 
     %% Whether we're in initial block download
     ibd               :: boolean()
@@ -121,6 +135,7 @@ flush() ->
 %%% ===================================================================
 
 %% @doc Look up a UTXO. Checks ETS cache first, falls through to RocksDB.
+%% Cache misses from RocksDB are added to cache (not dirty, not fresh).
 -spec get_utxo(binary(), non_neg_integer()) -> {ok, #utxo{}} | not_found.
 get_utxo(Txid, Vout) ->
     Key = {Txid, Vout},
@@ -133,11 +148,12 @@ get_utxo(Txid, Vout) ->
                 true ->
                     not_found;
                 false ->
-                    %% Fall through to RocksDB
+                    %% Fall through to RocksDB (cache miss)
                     case beamchain_db:get_utxo(Txid, Vout) of
                         {ok, Utxo} ->
-                            %% Cache for future lookups
-                            ets:insert(?UTXO_CACHE, {Key, Utxo}),
+                            %% Cache for future lookups. NOT dirty, NOT fresh
+                            %% since it already exists in RocksDB.
+                            add_utxo_from_disk(Txid, Vout, Utxo),
                             {ok, Utxo};
                         not_found ->
                             not_found
@@ -159,29 +175,53 @@ has_utxo(Txid, Vout) ->
     end.
 
 %% @doc Add a UTXO to the cache (write-behind, not persisted until flush).
+%% New UTXOs created in this session are marked FRESH (don't exist in RocksDB).
+%% If marked FRESH and spent before flush, we can skip both the DB write and delete.
 -spec add_utxo(binary(), non_neg_integer(), #utxo{}) -> ok.
 add_utxo(Txid, Vout, Utxo) ->
     Key = {Txid, Vout},
     ets:insert(?UTXO_CACHE, {Key, Utxo}),
     ets:insert(?UTXO_DIRTY, {Key}),
-    %% If it was pending a DB delete, cancel that
+    %% Mark as FRESH (doesn't exist in RocksDB yet)
+    %% This enables the optimization where spending a FRESH UTXO skips DB ops
+    ets:insert(?UTXO_FRESH, {Key}),
+    %% If it was pending a DB delete, cancel that (reorg case)
     ets:delete(?UTXO_SPENT, Key),
+    ok.
+
+%% @doc Add a UTXO from disk (for cache miss fills). Not marked FRESH or DIRTY.
+-spec add_utxo_from_disk(binary(), non_neg_integer(), #utxo{}) -> ok.
+add_utxo_from_disk(Txid, Vout, Utxo) ->
+    Key = {Txid, Vout},
+    ets:insert(?UTXO_CACHE, {Key, Utxo}),
+    %% Not dirty (matches what's in RocksDB), not fresh (exists in RocksDB)
     ok.
 
 %% @doc Spend (remove) a UTXO from the cache.
 %% Returns the spent UTXO for undo data.
+%%
+%% FRESH flag optimization (like Bitcoin Core's CCoinsViewCache):
+%% - If the UTXO is FRESH (created in cache, not yet in RocksDB), spending it
+%%   means we just delete it from cache — no DB operations needed at all.
+%% - If the UTXO is not FRESH (loaded from RocksDB), we schedule a DB delete.
 -spec spend_utxo(binary(), non_neg_integer()) -> {ok, #utxo{}} | not_found.
 spend_utxo(Txid, Vout) ->
     Key = {Txid, Vout},
     case ets:lookup(?UTXO_CACHE, Key) of
         [{Key, Utxo}] ->
             ets:delete(?UTXO_CACHE, Key),
-            case ets:member(?UTXO_DIRTY, Key) of
+            IsFresh = ets:member(?UTXO_FRESH, Key),
+            case IsFresh of
                 true ->
-                    %% Was freshly created, never persisted — just forget it
-                    ets:delete(?UTXO_DIRTY, Key);
+                    %% FRESH optimization: UTXO was created in cache and never
+                    %% persisted to RocksDB. We can just forget it entirely —
+                    %% no need to write it or schedule a delete.
+                    ets:delete(?UTXO_DIRTY, Key),
+                    ets:delete(?UTXO_FRESH, Key);
                 false ->
-                    %% Was loaded from RocksDB — schedule a DB delete on flush
+                    %% Not fresh: either loaded from RocksDB or modified.
+                    %% Schedule a DB delete on flush.
+                    ets:delete(?UTXO_DIRTY, Key),
                     ets:insert(?UTXO_SPENT, {Key})
             end,
             {ok, Utxo};
@@ -207,8 +247,10 @@ init([]) ->
     ets:new(?UTXO_CACHE, [set, public, named_table,
                            {read_concurrency, true},
                            {write_concurrency, true}]),
-    %% Dirty/spent: write_concurrency since many processes update these
+    %% Dirty/fresh/spent: write_concurrency since many processes update these
     ets:new(?UTXO_DIRTY, [set, public, named_table,
+                           {write_concurrency, true}]),
+    ets:new(?UTXO_FRESH, [set, public, named_table,
                            {write_concurrency, true}]),
     ets:new(?UTXO_SPENT, [set, public, named_table,
                            {write_concurrency, true}]),
@@ -241,6 +283,8 @@ init([]) ->
         params = Params,
         blocks_since_flush = 0,
         max_cache_bytes = MaxCacheMB * 1024 * 1024,
+        max_cache_entries = ?DEFAULT_MAX_CACHE_ENTRIES,
+        cache_usage_bytes = 0,
         ibd = true
     }}.
 
@@ -392,13 +436,15 @@ maybe_check_ibd(#state{ibd = true, mtp_timestamps = Ts} = State) ->
     case (Now - Latest) < 3600 of
         true ->
             logger:info("chainstate: leaving IBD at height ~B, "
-                        "shrinking cache to ~BMB",
-                        [State#state.tip_height, ?DEFAULT_MAX_CACHE_MB]),
+                        "shrinking cache to ~BMB (~B max entries)",
+                        [State#state.tip_height, ?DEFAULT_MAX_CACHE_MB,
+                         ?DEFAULT_MAX_CACHE_ENTRIES]),
             %% Flush and shrink cache for normal operation
             State2 = do_flush(State),
             State2#state{
                 ibd = false,
-                max_cache_bytes = ?DEFAULT_MAX_CACHE_MB * 1024 * 1024
+                max_cache_bytes = ?DEFAULT_MAX_CACHE_MB * 1024 * 1024,
+                max_cache_entries = ?DEFAULT_MAX_CACHE_ENTRIES
             };
         false ->
             State
@@ -545,26 +591,34 @@ hash_hex(_) -> "???".
 %%% Internal: UTXO cache flush
 %%% ===================================================================
 
-%% Decide whether to flush based on IBD interval or cache size.
+%% Decide whether to flush based on IBD interval, entry count, or memory size.
 maybe_flush(#state{ibd = true, blocks_since_flush = N} = State)
   when N >= ?IBD_FLUSH_INTERVAL ->
     do_flush(State);
-maybe_flush(#state{ibd = false} = State) ->
-    %% In normal operation, flush if cache exceeds max size
-    CacheBytes = ets:info(?UTXO_CACHE, memory) * erlang:system_info(wordsize),
-    case CacheBytes > State#state.max_cache_bytes of
-        true -> do_flush(State);
-        false -> State
+maybe_flush(#state{ibd = false, max_cache_bytes = MaxBytes,
+                    max_cache_entries = MaxEntries} = State) ->
+    %% In normal operation, flush if cache exceeds limits
+    CacheEntries = ets:info(?UTXO_CACHE, size),
+    CacheBytes = cache_memory_usage(),
+    case CacheEntries > MaxEntries orelse CacheBytes > MaxBytes of
+        true ->
+            logger:info("chainstate: flushing cache (~B entries, ~.1fMB)",
+                        [CacheEntries, CacheBytes / 1024 / 1024]),
+            do_flush(State);
+        false ->
+            State
     end;
 maybe_flush(State) ->
     State.
 
 %% Flush dirty entries to RocksDB in a single write batch.
+%% After flush, all entries become "clean" (match what's in RocksDB).
 do_flush(#state{tip_hash = undefined} = State) ->
     State;
 do_flush(#state{tip_hash = TipHash, tip_height = TipHeight} = State) ->
     DirtyCount = ets:info(?UTXO_DIRTY, size),
     SpentCount = ets:info(?UTXO_SPENT, size),
+    FreshCount = ets:info(?UTXO_FRESH, size),
     case DirtyCount =:= 0 andalso SpentCount =:= 0 of
         true ->
             %% Nothing to flush
@@ -587,16 +641,19 @@ do_flush(#state{tip_hash = TipHash, tip_height = TipHeight} = State) ->
 
             case beamchain_db:write_batch(AllOps) of
                 ok ->
-                    %% Clear dirty/spent tracking
+                    %% Clear dirty/fresh/spent tracking tables.
+                    %% After flush, all cached entries match RocksDB (clean).
+                    %% FRESH entries are no longer fresh (they're now in RocksDB).
                     ets:delete_all_objects(?UTXO_DIRTY),
+                    ets:delete_all_objects(?UTXO_FRESH),
                     ets:delete_all_objects(?UTXO_SPENT),
 
                     %% Remove crash recovery marker
                     beamchain_db:put_meta(<<"HEAD_BLOCKS">>, <<>>),
 
-                    logger:debug("chainstate: flushed ~B dirty, ~B spent "
+                    logger:debug("chainstate: flushed ~B dirty (~B fresh), ~B spent "
                                  "at height ~B",
-                                 [DirtyCount, SpentCount, TipHeight]),
+                                 [DirtyCount, FreshCount, SpentCount, TipHeight]),
                     State#state{blocks_since_flush = 0};
                 {error, Reason} ->
                     logger:error("chainstate: flush failed: ~p", [Reason]),
@@ -634,6 +691,38 @@ encode_utxo(#utxo{value = Value, script_pubkey = Script,
                    is_coinbase = IsCoinbase, height = Height}) ->
     CoinbaseFlag = case IsCoinbase of true -> 1; false -> 0 end,
     <<Value:64/little, Height:32/little, CoinbaseFlag:8, Script/binary>>.
+
+%%% ===================================================================
+%%% UTXO cache statistics
+%%% ===================================================================
+
+%% @doc Get cache statistics.
+-spec cache_stats() -> map().
+cache_stats() ->
+    CacheSize = ets:info(?UTXO_CACHE, size),
+    DirtyCount = ets:info(?UTXO_DIRTY, size),
+    FreshCount = ets:info(?UTXO_FRESH, size),
+    SpentCount = ets:info(?UTXO_SPENT, size),
+    MemoryBytes = cache_memory_usage(),
+    #{
+        cache_entries => CacheSize,
+        dirty_entries => DirtyCount,
+        fresh_entries => FreshCount,
+        pending_deletes => SpentCount,
+        memory_bytes => MemoryBytes,
+        memory_mb => MemoryBytes / 1024 / 1024
+    }.
+
+%% @doc Get approximate cache memory usage in bytes.
+%% Uses ETS memory info * word size for accurate estimate.
+-spec cache_memory_usage() -> non_neg_integer().
+cache_memory_usage() ->
+    WordSize = erlang:system_info(wordsize),
+    CacheMem = ets:info(?UTXO_CACHE, memory) * WordSize,
+    DirtyMem = ets:info(?UTXO_DIRTY, memory) * WordSize,
+    FreshMem = ets:info(?UTXO_FRESH, memory) * WordSize,
+    SpentMem = ets:info(?UTXO_SPENT, memory) * WordSize,
+    CacheMem + DirtyMem + FreshMem + SpentMem.
 
 %%% ===================================================================
 %%% Internal: MTP computation
