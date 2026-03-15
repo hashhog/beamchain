@@ -25,7 +25,7 @@
 -export([store_tx_index/4, get_tx_location/1]).
 
 %% Undo data
--export([store_undo/2, get_undo/1]).
+-export([store_undo/2, get_undo/1, delete_undo/1]).
 
 %% Batch writes
 -export([write_batch/1]).
@@ -172,6 +172,11 @@ store_undo(BlockHash, UndoData) when byte_size(BlockHash) =:= 32 ->
 -spec get_undo(binary()) -> {ok, binary()} | not_found.
 get_undo(BlockHash) when byte_size(BlockHash) =:= 32 ->
     gen_server:call(?SERVER, {get_undo, BlockHash}).
+
+%% @doc Delete undo data for a block (after successful reorg)
+-spec delete_undo(binary()) -> ok.
+delete_undo(BlockHash) when byte_size(BlockHash) =:= 32 ->
+    gen_server:call(?SERVER, {delete_undo, BlockHash}).
 
 %% @doc Atomic batch write across column families
 %% Ops = [{put, CF, Key, Value} | {delete, CF, Key}]
@@ -441,6 +446,11 @@ handle_call({get_undo, BlockHash}, _From,
         {ok, UndoData} -> {ok, UndoData};
         not_found -> not_found
     end,
+    {reply, Result, State};
+
+handle_call({delete_undo, BlockHash}, _From,
+            #state{db_handle = Db, cf_undo = CF} = State) ->
+    Result = rocksdb:delete(Db, CF, BlockHash, []),
     {reply, Result, State};
 
 %% Batch writes
