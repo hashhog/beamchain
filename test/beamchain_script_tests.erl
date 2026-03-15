@@ -770,3 +770,152 @@ op_codeseparator_test() ->
     %% OP_1 OP_CODESEPARATOR OP_1 -> [1, 1]
     %% OP_CODESEPARATOR just updates the code separator position
     {ok, [<<1>>, <<1>>]} = eval(<<16#51, 16#ab, 16#51>>).
+
+%%% -------------------------------------------------------------------
+%%% NULLFAIL enforcement tests (BIP 146)
+%%% -------------------------------------------------------------------
+
+%% Test that NULLFAIL flag is set at segwit activation height for mainnet
+nullfail_flag_mainnet_test() ->
+    %% Pre-segwit: NULLFAIL should NOT be set
+    FlagsPreSegwit = beamchain_script:flags_for_height(481823, mainnet),
+    ?assertEqual(0, FlagsPreSegwit band ?SCRIPT_VERIFY_NULLFAIL),
+    %% At segwit activation: NULLFAIL should be set
+    FlagsAtSegwit = beamchain_script:flags_for_height(481824, mainnet),
+    ?assertNotEqual(0, FlagsAtSegwit band ?SCRIPT_VERIFY_NULLFAIL),
+    %% Post-segwit: NULLFAIL should still be set
+    FlagsPostSegwit = beamchain_script:flags_for_height(500000, mainnet),
+    ?assertNotEqual(0, FlagsPostSegwit band ?SCRIPT_VERIFY_NULLFAIL).
+
+%% Test that NULLFAIL is set for testnet/regtest (all flags active from genesis)
+nullfail_flag_testnet_test() ->
+    Flags = beamchain_script:flags_for_height(0, testnet),
+    ?assertNotEqual(0, Flags band ?SCRIPT_VERIFY_NULLFAIL).
+
+nullfail_flag_regtest_test() ->
+    Flags = beamchain_script:flags_for_height(0, regtest),
+    ?assertNotEqual(0, Flags band ?SCRIPT_VERIFY_NULLFAIL).
+
+%% Test NULLFAIL enforcement in OP_CHECKSIG: failing sig with non-empty sig
+%% must return error when NULLFAIL flag is set
+nullfail_checksig_nonempty_sig_test() ->
+    %% Create a script that does OP_CHECKSIG with a non-empty signature
+    %% that will fail verification (because our mock returns false)
+    NonEmptySig = <<16#30, 16#06, 16#02, 16#01, 16#01, 16#02, 16#01, 16#01, 16#01>>,
+    FakePK = <<16#02, 0:256>>,
+    %% Mock sig checker that always fails
+    SigChecker = #{
+        check_ecdsa_sig => fun(_, _, _) -> false end,
+        compute_sighash => fun(_, _) -> <<0:256>> end
+    },
+    Script = <<
+        (byte_size(NonEmptySig)), NonEmptySig/binary,
+        (byte_size(FakePK)), FakePK/binary,
+        16#ac  %% OP_CHECKSIG
+    >>,
+    %% Without NULLFAIL flag, should push false (but succeed)
+    {ok, [<<>>]} = beamchain_script:eval_script(Script, [], 0, SigChecker, base),
+    %% With NULLFAIL flag, should fail with nullfail error
+    {error, nullfail} = beamchain_script:eval_script(
+        Script, [], ?SCRIPT_VERIFY_NULLFAIL, SigChecker, base).
+
+%% Test NULLFAIL with empty signature: should succeed even with NULLFAIL flag
+nullfail_checksig_empty_sig_test() ->
+    FakePK = <<16#02, 0:256>>,
+    SigChecker = #{
+        check_ecdsa_sig => fun(_, _, _) -> false end,
+        compute_sighash => fun(_, _) -> <<0:256>> end
+    },
+    Script = <<
+        16#00,  %% OP_0 (empty sig)
+        (byte_size(FakePK)), FakePK/binary,
+        16#ac  %% OP_CHECKSIG
+    >>,
+    %% Empty sig with NULLFAIL should push false (not error)
+    {ok, [<<>>]} = beamchain_script:eval_script(
+        Script, [], ?SCRIPT_VERIFY_NULLFAIL, SigChecker, base).
+
+%% Test NULLFAIL enforcement in OP_CHECKMULTISIG
+nullfail_checkmultisig_nonempty_sig_test() ->
+    %% 1-of-1 multisig with failing non-empty sig
+    NonEmptySig = <<16#30, 16#06, 16#02, 16#01, 16#01, 16#02, 16#01, 16#01, 16#01>>,
+    FakePK = <<16#02, 0:256>>,
+    SigChecker = #{
+        check_ecdsa_sig => fun(_, _, _) -> false end,
+        compute_sighash => fun(_, _) -> <<0:256>> end
+    },
+    Script = <<
+        16#00,                                   %% OP_0 (dummy)
+        (byte_size(NonEmptySig)), NonEmptySig/binary,
+        16#51,                                   %% OP_1 (m = 1)
+        (byte_size(FakePK)), FakePK/binary,
+        16#51,                                   %% OP_1 (n = 1)
+        16#ae                                    %% OP_CHECKMULTISIG
+    >>,
+    %% Without NULLFAIL flag, should push false
+    {ok, [<<>>]} = beamchain_script:eval_script(Script, [], 0, SigChecker, base),
+    %% With NULLFAIL flag, should fail with nullfail error
+    {error, nullfail} = beamchain_script:eval_script(
+        Script, [], ?SCRIPT_VERIFY_NULLFAIL, SigChecker, base).
+
+%% Test NULLFAIL with all empty sigs in checkmultisig: should succeed
+nullfail_checkmultisig_empty_sigs_test() ->
+    FakePK = <<16#02, 0:256>>,
+    SigChecker = #{
+        check_ecdsa_sig => fun(_, _, _) -> false end,
+        compute_sighash => fun(_, _) -> <<0:256>> end
+    },
+    Script = <<
+        16#00,  %% OP_0 (dummy)
+        16#00,  %% OP_0 (empty sig)
+        16#51,  %% OP_1 (m = 1)
+        (byte_size(FakePK)), FakePK/binary,
+        16#51,  %% OP_1 (n = 1)
+        16#ae   %% OP_CHECKMULTISIG
+    >>,
+    %% Empty sig with NULLFAIL should push false (not error)
+    {ok, [<<>>]} = beamchain_script:eval_script(
+        Script, [], ?SCRIPT_VERIFY_NULLFAIL, SigChecker, base).
+
+%% Test NULLFAIL enforcement in OP_CHECKSIGVERIFY
+nullfail_checksigverify_nonempty_sig_test() ->
+    NonEmptySig = <<16#30, 16#06, 16#02, 16#01, 16#01, 16#02, 16#01, 16#01, 16#01>>,
+    FakePK = <<16#02, 0:256>>,
+    SigChecker = #{
+        check_ecdsa_sig => fun(_, _, _) -> false end,
+        compute_sighash => fun(_, _) -> <<0:256>> end
+    },
+    Script = <<
+        (byte_size(NonEmptySig)), NonEmptySig/binary,
+        (byte_size(FakePK)), FakePK/binary,
+        16#ad  %% OP_CHECKSIGVERIFY
+    >>,
+    %% Without NULLFAIL flag, CHECKSIGVERIFY fails with verify error
+    {error, checksigverify_failed} = beamchain_script:eval_script(
+        Script, [], 0, SigChecker, base),
+    %% With NULLFAIL flag, should fail with nullfail error (checked before verify)
+    {error, nullfail} = beamchain_script:eval_script(
+        Script, [], ?SCRIPT_VERIFY_NULLFAIL, SigChecker, base).
+
+%% Test NULLFAIL enforcement in OP_CHECKMULTISIGVERIFY
+nullfail_checkmultisigverify_nonempty_sig_test() ->
+    NonEmptySig = <<16#30, 16#06, 16#02, 16#01, 16#01, 16#02, 16#01, 16#01, 16#01>>,
+    FakePK = <<16#02, 0:256>>,
+    SigChecker = #{
+        check_ecdsa_sig => fun(_, _, _) -> false end,
+        compute_sighash => fun(_, _) -> <<0:256>> end
+    },
+    Script = <<
+        16#00,                                   %% OP_0 (dummy)
+        (byte_size(NonEmptySig)), NonEmptySig/binary,
+        16#51,                                   %% OP_1 (m = 1)
+        (byte_size(FakePK)), FakePK/binary,
+        16#51,                                   %% OP_1 (n = 1)
+        16#af                                    %% OP_CHECKMULTISIGVERIFY
+    >>,
+    %% Without NULLFAIL flag, fails with checkmultisigverify_failed
+    {error, checkmultisigverify_failed} = beamchain_script:eval_script(
+        Script, [], 0, SigChecker, base),
+    %% With NULLFAIL flag, should fail with nullfail error
+    {error, nullfail} = beamchain_script:eval_script(
+        Script, [], ?SCRIPT_VERIFY_NULLFAIL, SigChecker, base).
