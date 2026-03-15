@@ -988,6 +988,71 @@ minimalif_enforcement_test() ->
     {error, _} = beamchain_script:eval_script(
         Script, [], ?SCRIPT_VERIFY_MINIMALIF, #{}, base).
 
+%% MINIMALIF in witness scripts: <<2>> as OP_IF argument must fail
+minimalif_witness_fail_test() ->
+    %% Script: push <<2>> then OP_IF OP_1 OP_ENDIF
+    %% <<2>> is truthy but not minimal (not <<>> or <<1>>)
+    Script = <<1, 2, 16#63, 16#51, 16#68>>,  %% <02> OP_IF OP_1 OP_ENDIF
+    %% In witness_v0, MINIMALIF is enforced (flag added automatically)
+    %% Should fail because <<2>> is not minimal
+    {error, minimalif_failed} = beamchain_script:eval_script(
+        Script, [], ?SCRIPT_VERIFY_MINIMALIF, #{}, witness_v0).
+
+%% MINIMALIF in witness scripts: <<1>> must pass
+minimalif_witness_pass_true_test() ->
+    %% Script: push <<1>> then OP_IF OP_1 OP_ENDIF
+    Script = <<1, 1, 16#63, 16#51, 16#68>>,  %% <01> OP_IF OP_1 OP_ENDIF
+    %% <<1>> is valid minimal true
+    {ok, [<<1>>]} = beamchain_script:eval_script(
+        Script, [], ?SCRIPT_VERIFY_MINIMALIF, #{}, witness_v0).
+
+%% MINIMALIF in witness scripts: <<>> must pass
+minimalif_witness_pass_false_test() ->
+    %% Script: OP_0 OP_IF OP_2 OP_ELSE OP_1 OP_ENDIF
+    Script = <<16#00, 16#63, 16#52, 16#67, 16#51, 16#68>>,  %% OP_0 OP_IF OP_2 OP_ELSE OP_1 OP_ENDIF
+    %% <<>> is valid minimal false, takes else branch
+    {ok, [<<1>>]} = beamchain_script:eval_script(
+        Script, [], ?SCRIPT_VERIFY_MINIMALIF, #{}, witness_v0).
+
+%% MINIMALIF: <<0, 0>> must fail (not minimal false)
+minimalif_witness_fail_nonminimal_false_test() ->
+    %% Script: push <<0, 0>> then OP_IF OP_1 OP_ELSE OP_2 OP_ENDIF
+    Script = <<2, 0, 0, 16#63, 16#51, 16#67, 16#52, 16#68>>,
+    %% <<0, 0>> is falsey but not minimal (should be <<>>)
+    {error, minimalif_failed} = beamchain_script:eval_script(
+        Script, [], ?SCRIPT_VERIFY_MINIMALIF, #{}, witness_v0).
+
+%% MINIMALIF: <<1, 0>> must fail (not minimal true)
+minimalif_witness_fail_nonminimal_true_test() ->
+    %% Script: push <<1, 0>> then OP_IF OP_1 OP_ENDIF
+    Script = <<2, 1, 0, 16#63, 16#51, 16#68>>,
+    %% <<1, 0>> is truthy but not minimal (should be <<1>>)
+    {error, minimalif_failed} = beamchain_script:eval_script(
+        Script, [], ?SCRIPT_VERIFY_MINIMALIF, #{}, witness_v0).
+
+%% MINIMALIF in legacy scripts without flag: <<2>> must pass
+minimalif_legacy_no_flag_test() ->
+    %% Script: push <<2>> then OP_IF OP_1 OP_ENDIF
+    Script = <<1, 2, 16#63, 16#51, 16#68>>,
+    %% Without MINIMALIF flag, <<2>> is accepted as truthy
+    {ok, [<<1>>]} = beamchain_script:eval_script(Script, [], 0, #{}, base).
+
+%% MINIMALIF in tapscript: always enforced regardless of flag
+minimalif_tapscript_always_enforced_test() ->
+    %% Script: push <<2>> then OP_IF OP_1 OP_ENDIF
+    Script = <<1, 2, 16#63, 16#51, 16#68>>,
+    %% In tapscript, MINIMALIF is consensus (always enforced)
+    %% Even with Flags=0, should fail
+    {error, minimalif_failed} = beamchain_script:eval_script(Script, [], 0, #{}, tapscript).
+
+%% MINIMALIF with OP_NOTIF in witness
+minimalif_notif_witness_test() ->
+    %% Script: push <<2>> then OP_NOTIF OP_1 OP_ENDIF
+    Script = <<1, 2, 16#64, 16#51, 16#68>>,  %% <02> OP_NOTIF OP_1 OP_ENDIF
+    %% Should fail because <<2>> is not minimal
+    {error, minimalif_failed} = beamchain_script:eval_script(
+        Script, [], ?SCRIPT_VERIFY_MINIMALIF, #{}, witness_v0).
+
 %%% -------------------------------------------------------------------
 %%% Multiple OP_SUCCESS codes in tapscript
 %%% -------------------------------------------------------------------
