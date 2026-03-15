@@ -2801,9 +2801,9 @@ flags_for_height(Height, mainnet) ->
         true -> F5 bor ?SCRIPT_VERIFY_TAPROOT;
         false -> F5
     end,
-    %% NULLDUMMY is consensus since segwit activation
+    %% NULLDUMMY and NULLFAIL are consensus since segwit activation (BIP 141/146)
     case Height >= 481824 of
-        true -> F6 bor ?SCRIPT_VERIFY_NULLDUMMY;
+        true -> F6 bor ?SCRIPT_VERIFY_NULLDUMMY bor ?SCRIPT_VERIFY_NULLFAIL;
         false -> F6
     end;
 
@@ -2817,4 +2817,5 @@ flags_for_height(_Height, _Network) ->
     bor ?SCRIPT_VERIFY_CHECKSEQUENCEVERIFY
     bor ?SCRIPT_VERIFY_WITNESS
     bor ?SCRIPT_VERIFY_NULLDUMMY
+    bor ?SCRIPT_VERIFY_NULLFAIL
     bor ?SCRIPT_VERIFY_TAPROOT.
