@@ -118,7 +118,8 @@
     total_count    :: non_neg_integer(),   %% number of transactions
     %% Union-find: txid -> cluster_id (root txid of cluster)
     union_find     :: map(),               %% txid -> parent_txid (for find)
-    cluster_count  :: non_neg_integer()    %% number of clusters
+    cluster_count  :: non_neg_integer(),   %% number of clusters
+    zmq_seq        :: non_neg_integer()    %% ZMQ sequence number for mempool events
 }).
 
 %%% ===================================================================
@@ -263,7 +264,8 @@ init([]) ->
         total_bytes = 0,
         total_count = 0,
         union_find = #{},
-        cluster_count = 0
+        cluster_count = 0,
+        zmq_seq = 0
     }}.
 
 handle_call({add_tx, Tx}, _From, State) ->
@@ -471,9 +473,14 @@ do_add_transaction(Tx, State) ->
         %% 19. check if any orphans now have parents
         reprocess_orphans(Txid),
 
+        %% 20. ZMQ notification for mempool acceptance
+        ZmqSeq = State4#state.zmq_seq,
+        beamchain_zmq:notify_transaction(Tx, mempool_add, ZmqSeq),
+        State5 = State4#state{zmq_seq = ZmqSeq + 1},
+
         logger:debug("mempool: accepted ~s (fee_rate=~.1f sat/vB, ~B vB)",
                      [short_hex(Txid), FeeRate, VSize]),
-        {ok, Txid, State4}
+        {ok, Txid, State5}
     catch
         throw:{validation, Reason} ->
             {error, Reason};
@@ -1617,6 +1624,18 @@ remove_entry(Txid) ->
             not_found
     end.
 
+%% @doc Remove an entry and send ZMQ notification.
+%% Returns {Entry, NewState} on success or {not_found, State} if not in mempool.
+remove_entry_with_zmq(Txid, Reason, #state{zmq_seq = ZmqSeq} = State) ->
+    case remove_entry(Txid) of
+        #mempool_entry{tx = Tx} = Entry ->
+            %% Send ZMQ notification for mempool removal
+            beamchain_zmq:notify_transaction(Tx, Reason, ZmqSeq),
+            {Entry, State#state{zmq_seq = ZmqSeq + 1}};
+        not_found ->
+            {not_found, State}
+    end.
+
 %% @doc Find parents that have ephemeral anchors no longer spent by this child.
 %% Returns list of parent txids that should be removed because their dust is unspent.
 find_orphaned_ephemeral_parents(Txid) ->
@@ -1700,11 +1719,11 @@ remove_block_conflicts(ConfirmedTxids, State) ->
                         Desc = get_all_descendants(Txid),
                         AllRemove = [Txid | Desc],
                         lists:foldl(fun(RTxid, {B, C, St2}) ->
-                            case remove_entry(RTxid) of
-                                #mempool_entry{vsize = VS} ->
-                                    St3 = cluster_remove_tx(RTxid, St2),
-                                    {B + VS, C + 1, St3};
-                                not_found -> {B, C, St2}
+                            case remove_entry_with_zmq(RTxid, mempool_remove, St2) of
+                                {#mempool_entry{vsize = VS}, St3} ->
+                                    St4 = cluster_remove_tx(RTxid, St3),
+                                    {B + VS, C + 1, St4};
+                                {not_found, St3} -> {B, C, St3}
                             end
                         end, {Bytes, Count, St}, AllRemove);
                     false ->
