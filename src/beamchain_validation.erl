@@ -27,6 +27,9 @@
 %% Utility
 -export([is_coinbase_tx/1]).
 
+%% BIP 68 sequence locks
+-export([calculate_sequence_lock_pair/3]).
+
 %% Undo data serialization (exported for testing)
 -export([encode_undo_data/1, decode_undo_data/1]).
 
@@ -766,12 +769,7 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
                         check_coinbase_maturity(InputCoins, Height),
 
                         %% e. BIP 68 relative locktime
-                        case Tx#transaction.version >= 2 of
-                            true ->
-                                check_sequence_locks(Tx, InputCoins,
-                                                     Height, PrevIndex);
-                            false -> ok
-                        end,
+                        check_sequence_locks(Tx, InputCoins, Height, PrevIndex),
 
                         %% f. count sigops
                         TxSigopCost = get_tx_sigop_cost(Tx, InputCoins, Flags),
@@ -941,39 +939,73 @@ check_coinbase_maturity(InputCoins, Height) ->
         end
     end, InputCoins).
 
-%% @doc Check BIP 68 sequence locks.
-%% For tx version >= 2, verify relative timelocks are satisfied.
-check_sequence_locks(#transaction{inputs = Inputs}, InputCoins,
-                     Height, PrevIndex) ->
-    MTP = median_time_past(PrevIndex),
-    lists:foreach(fun({Input, Coin}) ->
+%% @doc Calculate the minimum block height and time at which a transaction
+%% can be included, based on BIP 68 relative lock-time constraints.
+%% Returns {MinHeight, MinTime} where:
+%%   - MinHeight is the minimum block height (or -1 if no height constraint)
+%%   - MinTime is the minimum MTP of the previous block (or -1 if no time constraint)
+%% Following Bitcoin Core semantics: these are "last invalid" values.
+-spec calculate_sequence_lock_pair(#transaction{}, [#utxo{}], map()) ->
+    {integer(), integer()}.
+calculate_sequence_lock_pair(#transaction{version = Version},
+                             _InputCoins, _PrevIndex) when Version < 2 ->
+    %% BIP 68 only applies to tx version >= 2
+    {-1, -1};
+calculate_sequence_lock_pair(#transaction{inputs = Inputs}, InputCoins, _PrevIndex) ->
+    lists:foldl(fun({Input, Coin}, {MinH, MinT}) ->
         Seq = Input#tx_in.sequence,
-        %% if disable flag is set, skip
+        %% if disable flag is set, skip this input
         case (Seq band ?SEQUENCE_LOCKTIME_DISABLE_FLAG) =/= 0 of
-            true -> ok;
+            true ->
+                {MinH, MinT};
             false ->
                 Masked = Seq band ?SEQUENCE_LOCKTIME_MASK,
                 case (Seq band ?SEQUENCE_LOCKTIME_TYPE_FLAG) =/= 0 of
                     false ->
-                        %% height-based: input must have Masked confirmations
-                        MinHeight = Coin#utxo.height + Masked,
-                        Height >= MinHeight
-                            orelse throw(sequence_lock_not_met);
+                        %% height-based lock
+                        %% Bitcoin Core: nMinHeight = max(nMinHeight, coinHeight + value - 1)
+                        CoinHeight = Coin#utxo.height,
+                        NewMinH = CoinHeight + Masked - 1,
+                        {max(MinH, NewMinH), MinT};
                     true ->
-                        %% time-based: check against MTP
-                        %% BIP 68: MTP(spending block - 1) - MTP(coin block - 1) >= masked * 512
-                        CoinMTPIndex = case beamchain_db:get_block_index(
-                                Coin#utxo.height - 1) of
-                            {ok, CI} -> CI;
-                            not_found -> throw(missing_block_index)
+                        %% time-based lock
+                        %% Bitcoin Core: get MTP of block prior to coin's block
+                        CoinMTP = case Coin#utxo.height of
+                            0 -> 0;
+                            H ->
+                                CoinMTPIndex = case beamchain_db:get_block_index(H - 1) of
+                                    {ok, CI} -> CI;
+                                    not_found -> error({missing_block_index, H - 1})
+                                end,
+                                median_time_past(CoinMTPIndex)
                         end,
-                        CoinMTP = median_time_past(CoinMTPIndex),
-                        MinTime = CoinMTP + (Masked bsl ?SEQUENCE_LOCKTIME_GRANULARITY),
-                        MTP >= MinTime
-                            orelse throw(sequence_lock_not_met)
+                        %% Bitcoin Core: nMinTime = max(nMinTime, coinMTP + (value << 9) - 1)
+                        LockSeconds = Masked bsl ?SEQUENCE_LOCKTIME_GRANULARITY,
+                        NewMinT = CoinMTP + LockSeconds - 1,
+                        {MinH, max(MinT, NewMinT)}
                 end
         end
-    end, lists:zip(Inputs, InputCoins)).
+    end, {-1, -1}, lists:zip(Inputs, InputCoins)).
+
+%% @doc Check BIP 68 sequence locks.
+%% For tx version >= 2, verify relative timelocks are satisfied.
+check_sequence_locks(#transaction{version = Version}, _InputCoins,
+                     _Height, _PrevIndex) when Version < 2 ->
+    %% BIP 68 only applies to tx version >= 2
+    ok;
+check_sequence_locks(Tx, InputCoins, Height, PrevIndex) ->
+    {MinHeight, MinTime} = calculate_sequence_lock_pair(Tx, InputCoins, PrevIndex),
+    MTP = median_time_past(PrevIndex),
+    %% Bitcoin Core EvaluateSequenceLocks:
+    %% Lock is satisfied when MinHeight < Height AND MinTime < MTP
+    case MinHeight >= Height of
+        true -> throw(sequence_lock_not_met);
+        false -> ok
+    end,
+    case MinTime >= MTP of
+        true -> throw(sequence_lock_not_met);
+        false -> ok
+    end.
 
 %% @doc Verify scripts for all inputs of a transaction.
 verify_tx_scripts(Tx, InputCoins, _Height, Flags) ->
