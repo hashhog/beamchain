@@ -40,6 +40,7 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] Inv trickling (privacy-preserving tx relay with Poisson delays)
 - [x] Eclipse attack protections (bucket-based addrman, netgroup limits, anchor connections)
 - [x] Stale peer eviction (tip timeout, headers timeout, ping timeout, network protection)
+- [x] Block pruning (delete old blk/rev files, keep 288 blocks for reorg safety)
 - [ ] Wallet (HD keys, signing)
 - [ ] Compact block relay (BIP152)
 
@@ -77,7 +78,7 @@ src/
 ├── beamchain_pow.erl          Proof of work and difficulty
 ├── beamchain_versionbits.erl  BIP9 deployment tracking
 ├── beamchain_chain_params.erl Network parameters and checkpoints
-├── beamchain_db.erl           RocksDB wrapper
+├── beamchain_db.erl           RocksDB wrapper, flat file storage, pruning
 └── beamchain_rpc.erl          JSON-RPC server
 
 c_src/
