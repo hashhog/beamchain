@@ -42,6 +42,7 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] Peer misbehavior scoring and banning
 - [x] Pre-handshake connection rejection (ban/limit checks before handshake)
 - [x] Inv trickling (privacy-preserving tx relay with Poisson delays)
+- [x] BIP133 feefilter (filter tx relay by peer's minimum fee rate)
 - [x] Eclipse attack protections (bucket-based addrman, netgroup limits, anchor connections)
 - [x] Stale peer eviction (tip timeout, headers timeout, ping timeout, network protection)
 - [x] Block pruning (delete old blk/rev files, keep 288 blocks for reorg safety)
