@@ -317,6 +317,7 @@ handle_method(<<"decoderawtransaction">>, P) -> rpc_decoderawtransaction(P);
 handle_method(<<"sendrawtransaction">>, P) -> rpc_sendrawtransaction(P);
 handle_method(<<"testmempoolaccept">>, P) -> rpc_testmempoolaccept(P);
 handle_method(<<"gettxout">>, P) -> rpc_gettxout(P);
+handle_method(<<"gettxoutsetinfo">>, P) -> rpc_gettxoutsetinfo(P);
 
 %% -- Mempool --
 handle_method(<<"getmempoolinfo">>, _) -> rpc_getmempoolinfo();
@@ -368,6 +369,7 @@ rpc_help_list() ->
         <<"getblockheader \"blockhash\" ( verbose )">>,
         <<"getchaintips">>,
         <<"getdifficulty">>,
+        <<"gettxoutsetinfo ( \"hash_type\" )">>,
         <<"verifychain ( checklevel nblocks )">>,
         <<"">>,
         <<"== Control ==">>,
@@ -458,6 +460,7 @@ rpc_getblockchaininfo() ->
                     {<<0:256>>, 0}
             end,
             Difficulty = tip_difficulty(),
+            Softforks = get_softfork_status(Network, TipHeight),
             {ok, #{
                 <<"chain">> => network_name(Network),
                 <<"blocks">> => TipHeight,
@@ -473,6 +476,7 @@ rpc_getblockchaininfo() ->
                 <<"initialblockdownload">> => not Synced,
                 <<"chainwork">> => beamchain_serialize:hex_encode(Chainwork),
                 <<"pruned">> => false,
+                <<"softforks">> => Softforks,
                 <<"warnings">> => <<>>
             }};
         not_found ->
@@ -488,6 +492,7 @@ rpc_getblockchaininfo() ->
                 <<"initialblockdownload">> => true,
                 <<"chainwork">> => <<"0000000000000000000000000000000000000000000000000000000000000000">>,
                 <<"pruned">> => false,
+                <<"softforks">> => #{},
                 <<"warnings">> => <<>>
             }}
     end.
@@ -951,6 +956,39 @@ rpc_gettxout(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"Usage: gettxout \"txid\" n ( include_mempool )">>}.
 
+rpc_gettxoutsetinfo([]) ->
+    rpc_gettxoutsetinfo([<<"none">>]);
+rpc_gettxoutsetinfo([_HashType | _]) ->
+    %% Get UTXO set statistics
+    case beamchain_chainstate:get_tip() of
+        {ok, {TipHash, TipHeight}} ->
+            %% Get cache statistics from chainstate
+            CacheStats = beamchain_chainstate:cache_stats(),
+            CacheEntries = maps:get(cache_entries, CacheStats, 0),
+            %% Estimate total UTXOs (cache + flushed to disk)
+            %% This is approximate since we don't iterate the full DB
+            TxOuts = CacheEntries,
+            %% Approximate bogosize (150 bytes per UTXO on average)
+            Bogosize = TxOuts * 150,
+            {ok, #{
+                <<"height">> => TipHeight,
+                <<"bestblock">> => hash_to_hex(TipHash),
+                <<"txouts">> => TxOuts,
+                <<"bogosize">> => Bogosize,
+                <<"total_amount">> => 0.0,  %% Would require iterating all UTXOs
+                <<"disk_size">> => 0  %% Would require DB stats
+            }};
+        not_found ->
+            {ok, #{
+                <<"height">> => 0,
+                <<"bestblock">> => <<"0000000000000000000000000000000000000000000000000000000000000000">>,
+                <<"txouts">> => 0,
+                <<"bogosize">> => 0,
+                <<"total_amount">> => 0.0,
+                <<"disk_size">> => 0
+            }}
+    end.
+
 %%% ===================================================================
 %%% Mempool methods
 %%% ===================================================================
@@ -1396,6 +1434,28 @@ rpc_decodescript(_) ->
 %%% ===================================================================
 %%% Internal helpers
 %%% ===================================================================
+
+%% Get soft fork deployment status for getblockchaininfo.
+%% Returns a map of softfork name => status info.
+get_softfork_status(Network, TipHeight) ->
+    Params = beamchain_chain_params:params(Network),
+    %% Buried deployments (height-based activation)
+    Buried = [
+        {<<"bip34">>, maps:get(bip34_height, Params, 0)},
+        {<<"bip66">>, maps:get(bip66_height, Params, 0)},
+        {<<"bip65">>, maps:get(bip65_height, Params, 0)},
+        {<<"csv">>, maps:get(csv_height, Params, 0)},
+        {<<"segwit">>, maps:get(segwit_height, Params, 0)},
+        {<<"taproot">>, maps:get(taproot_height, Params, 0)}
+    ],
+    lists:foldl(fun({Name, ActivationHeight}, Acc) ->
+        IsActive = TipHeight >= ActivationHeight,
+        maps:put(Name, #{
+            <<"type">> => <<"buried">>,
+            <<"active">> => IsActive,
+            <<"height">> => ActivationHeight
+        }, Acc)
+    end, #{}, Buried).
 
 rpc_port(Params) ->
     case beamchain_config:get(rpcport) of
