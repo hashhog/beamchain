@@ -49,7 +49,7 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] Wallet UTXO tracking and balance
 - [x] Coin selection (Branch-and-Bound, knapsack)
 - [x] Transaction signing (P2PKH, P2WPKH, P2TR)
-- [x] PSBT support (BIP 174/370)
+- [x] PSBT support (BIP 174 with createpsbt, decodepsbt, combinepsbt, finalizepsbt RPCs)
 - [x] Wallet RPC methods (getnewaddress, getbalance, sendtoaddress)
 - [x] Keypool with 1000-address lookahead
 - [x] Coinbase maturity enforcement (100-block rule)
@@ -95,7 +95,8 @@ src/
 ├── beamchain_chain_params.erl Network parameters and checkpoints
 ├── beamchain_db.erl           RocksDB wrapper, flat file storage, block indexes
 ├── beamchain_rpc.erl          JSON-RPC server
-├── beamchain_wallet.erl       HD wallet, PSBT, coin selection
+├── beamchain_wallet.erl       HD wallet, coin selection
+├── beamchain_psbt.erl         BIP 174 PSBT serialization and signing
 └── beamchain_transport_v2.erl BIP324 v2 encrypted transport
 
 c_src/
@@ -114,6 +115,7 @@ test/
 ├── beamchain_validation_tests.erl     Consensus rule tests
 ├── beamchain_rpc_tests.erl            RPC tests (core blockchain and transaction RPCs)
 ├── beamchain_wallet_tests.erl         HD wallet and coin selection tests
+├── beamchain_psbt_tests.erl           BIP 174 PSBT tests
 ├── beamchain_block_sync_tests.erl     Block sync and compact block tests
 └── beamchain_transport_v2_tests.erl   BIP324 v2 transport tests
 ```
