@@ -411,6 +411,10 @@ handle_method(<<"finalizepsbt">>, P) -> rpc_finalizepsbt(P);
 handle_method(<<"deriveaddresses">>, P) -> rpc_deriveaddresses(P);
 handle_method(<<"getdescriptorinfo">>, P) -> rpc_getdescriptorinfo(P);
 
+%% -- assumeUTXO --
+handle_method(<<"loadtxoutset">>, P) -> rpc_loadtxoutset(P);
+handle_method(<<"dumptxoutset">>, P) -> rpc_dumptxoutset(P);
+
 handle_method(Method, _) ->
     {error, ?RPC_METHOD_NOT_FOUND,
      <<"Method not found: ", Method/binary>>}.
@@ -496,7 +500,11 @@ rpc_help_list() ->
         <<"loadwallet \"filename\"">>,
         <<"sendtoaddress \"address\" amount ( \"comment\" )">>,
         <<"walletlock">>,
-        <<"walletpassphrase \"passphrase\" timeout">>
+        <<"walletpassphrase \"passphrase\" timeout">>,
+        <<"">>,
+        <<"== assumeUTXO ==">>,
+        <<"loadtxoutset \"path\"">>,
+        <<"dumptxoutset \"path\"">>
     ],
     {ok, iolist_to_binary(lists:join(<<"\n">>, Lines))}.
 
@@ -3106,3 +3114,84 @@ rpc_getdescriptorinfo([DescStr]) when is_binary(DescStr) ->
     end;
 rpc_getdescriptorinfo(_) ->
     {error, ?RPC_INVALID_PARAMS, <<"getdescriptorinfo \"descriptor\"">>}.
+
+%%% ===================================================================
+%%% assumeUTXO methods
+%%% ===================================================================
+
+%% @doc Load a UTXO set snapshot from file.
+%% Implements Bitcoin Core's loadtxoutset RPC.
+%% The snapshot allows the node to start validating new blocks immediately
+%% while validating the historical chain in the background.
+rpc_loadtxoutset([Path]) when is_binary(Path) ->
+    PathStr = binary_to_list(Path),
+
+    %% First, read the snapshot metadata
+    case beamchain_snapshot:read_metadata(PathStr) of
+        {ok, #{base_hash := BaseHash, num_coins := NumCoins}} ->
+            Network = beamchain_config:network(),
+
+            %% Check if we have parameters for this snapshot
+            case beamchain_chain_params:get_assumeutxo_by_hash(BaseHash, Network) of
+                {ok, _Height, _} ->
+                    %% Load the snapshot into chainstate
+                    case beamchain_chainstate:load_snapshot(PathStr) of
+                        {ok, LoadedHeight} ->
+                            {ok, #{
+                                <<"base_blockhash">> => beamchain_serialize:hex_encode(BaseHash),
+                                <<"coins_loaded">> => NumCoins,
+                                <<"base_height">> => LoadedHeight,
+                                <<"message">> => <<"Snapshot loaded successfully. Background validation started.">>
+                            }};
+                        {error, Reason} ->
+                            {error, ?RPC_MISC_ERROR,
+                             iolist_to_binary(io_lib:format("Failed to load snapshot: ~p", [Reason]))}
+                    end;
+                not_found ->
+                    HashHex = beamchain_serialize:hex_encode(BaseHash),
+                    {error, ?RPC_MISC_ERROR,
+                     iolist_to_binary([<<"Unknown snapshot base block hash: ">>, HashHex,
+                                       <<". Snapshot not recognized for this network.">>])}
+            end;
+        {error, Reason} ->
+            {error, ?RPC_MISC_ERROR,
+             iolist_to_binary(io_lib:format("Failed to read snapshot: ~p", [Reason]))}
+    end;
+rpc_loadtxoutset(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: loadtxoutset \"path/to/snapshot.dat\"">>}.
+
+%% @doc Dump the current UTXO set to a file.
+%% Creates a snapshot that can be loaded with loadtxoutset.
+rpc_dumptxoutset([Path]) when is_binary(Path) ->
+    PathStr = binary_to_list(Path),
+
+    %% Get current chain tip
+    case beamchain_chainstate:get_tip() of
+        {ok, {TipHash, TipHeight}} ->
+            %% Flush cache to ensure all UTXOs are in RocksDB
+            ok = beamchain_chainstate:flush(),
+
+            %% Serialize the snapshot
+            Network = beamchain_config:network(),
+            SnapshotBin = beamchain_snapshot:serialize_snapshot(TipHash, Network),
+
+            %% Write to file
+            case file:write_file(PathStr, SnapshotBin) of
+                ok ->
+                    {ok, #{
+                        <<"path">> => Path,
+                        <<"base_blockhash">> => beamchain_serialize:hex_encode(TipHash),
+                        <<"base_height">> => TipHeight,
+                        <<"message">> => <<"UTXO set snapshot written successfully.">>
+                    }};
+                {error, Reason} ->
+                    {error, ?RPC_MISC_ERROR,
+                     iolist_to_binary(io_lib:format("Failed to write snapshot: ~p", [Reason]))}
+            end;
+        not_found ->
+            {error, ?RPC_MISC_ERROR, <<"No chain tip available">>}
+    end;
+rpc_dumptxoutset(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: dumptxoutset \"path/to/snapshot.dat\"">>}.
