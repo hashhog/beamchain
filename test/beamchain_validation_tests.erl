@@ -699,3 +699,99 @@ mainnet_checkpoint_count_test() ->
     Checkpoints = maps:get(checkpoints, Params),
     %% Should have at least 14 checkpoints (0, 11111, 33333, ..., 295000)
     ?assert(maps:size(Checkpoints) >= 14).
+
+%%% ===================================================================
+%%% Coinbase maturity tests
+%%% ===================================================================
+
+%% Test that COINBASE_MATURITY constant is 100
+coinbase_maturity_constant_test() ->
+    ?assertEqual(100, ?COINBASE_MATURITY).
+
+%% Test that spending a mature coinbase output passes
+coinbase_mature_spend_test() ->
+    %% Coinbase at height 100, current height 200 (100 confirmations)
+    InputCoins = [#utxo{
+        value = 5000000000,
+        script_pubkey = <<>>,
+        is_coinbase = true,
+        height = 100
+    }],
+    CurrentHeight = 200,
+    %% Should pass - 100 confirmations (200 - 100 = 100)
+    ?assertEqual(ok, beamchain_validation:check_coinbase_maturity(InputCoins, CurrentHeight)).
+
+%% Test that spending an immature coinbase output fails
+coinbase_immature_spend_test() ->
+    %% Coinbase at height 100, current height 150 (only 50 confirmations)
+    InputCoins = [#utxo{
+        value = 5000000000,
+        script_pubkey = <<>>,
+        is_coinbase = true,
+        height = 100
+    }],
+    CurrentHeight = 150,
+    %% Should throw premature_spend_of_coinbase
+    ?assertThrow(premature_spend_of_coinbase,
+                 beamchain_validation:check_coinbase_maturity(InputCoins, CurrentHeight)).
+
+%% Test that coinbase at height 1, current height 100 is immature
+coinbase_at_boundary_immature_test() ->
+    %% Coinbase at height 1, current height 100 (99 confirmations)
+    InputCoins = [#utxo{
+        value = 5000000000,
+        script_pubkey = <<>>,
+        is_coinbase = true,
+        height = 1
+    }],
+    CurrentHeight = 100,
+    %% Should throw - 99 confirmations (100 - 1 = 99)
+    ?assertThrow(premature_spend_of_coinbase,
+                 beamchain_validation:check_coinbase_maturity(InputCoins, CurrentHeight)).
+
+%% Test that coinbase at height 1, current height 101 is mature
+coinbase_at_boundary_mature_test() ->
+    %% Coinbase at height 1, current height 101 (100 confirmations)
+    InputCoins = [#utxo{
+        value = 5000000000,
+        script_pubkey = <<>>,
+        is_coinbase = true,
+        height = 1
+    }],
+    CurrentHeight = 101,
+    %% Should pass - 100 confirmations (101 - 1 = 100)
+    ?assertEqual(ok, beamchain_validation:check_coinbase_maturity(InputCoins, CurrentHeight)).
+
+%% Test that non-coinbase outputs have no maturity requirement
+non_coinbase_no_maturity_test() ->
+    %% Non-coinbase output at height 100, current height 105 (only 5 confirmations)
+    InputCoins = [#utxo{
+        value = 5000000000,
+        script_pubkey = <<>>,
+        is_coinbase = false,
+        height = 100
+    }],
+    CurrentHeight = 105,
+    %% Should pass - non-coinbase has no maturity requirement
+    ?assertEqual(ok, beamchain_validation:check_coinbase_maturity(InputCoins, CurrentHeight)).
+
+%% Test mixed inputs - one coinbase (mature), one regular
+mixed_inputs_coinbase_mature_test() ->
+    InputCoins = [
+        #utxo{value = 5000000000, script_pubkey = <<>>, is_coinbase = true, height = 100},
+        #utxo{value = 1000000, script_pubkey = <<>>, is_coinbase = false, height = 195}
+    ],
+    CurrentHeight = 200,
+    %% Should pass - coinbase has 100 confirmations, regular has 5
+    ?assertEqual(ok, beamchain_validation:check_coinbase_maturity(InputCoins, CurrentHeight)).
+
+%% Test mixed inputs - one coinbase (immature), one regular
+mixed_inputs_coinbase_immature_test() ->
+    InputCoins = [
+        #utxo{value = 5000000000, script_pubkey = <<>>, is_coinbase = true, height = 150},
+        #utxo{value = 1000000, script_pubkey = <<>>, is_coinbase = false, height = 100}
+    ],
+    CurrentHeight = 200,
+    %% Should throw - coinbase only has 50 confirmations
+    ?assertThrow(premature_spend_of_coinbase,
+                 beamchain_validation:check_coinbase_maturity(InputCoins, CurrentHeight)).

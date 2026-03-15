@@ -289,6 +289,61 @@ build_transaction_test() ->
     ?assertEqual(16#fffffffd, Input#tx_in.sequence).
 
 %%% -------------------------------------------------------------------
+%%% Wallet encryption tests
+%%% -------------------------------------------------------------------
+
+%% Test PKCS#7 padding roundtrip
+pkcs7_padding_test() ->
+    %% 32-byte data padded to 48 bytes (next multiple of 16)
+    Data32 = binary:copy(<<1>>, 32),
+    Padded = beamchain_wallet:pkcs7_pad(Data32, 16),
+    ?assertEqual(48, byte_size(Padded)),
+    Unpadded = beamchain_wallet:pkcs7_unpad(Padded),
+    ?assertEqual(Data32, Unpadded).
+
+%% Test PKCS#7 padding edge case: already aligned
+pkcs7_padding_aligned_test() ->
+    %% 16-byte data should pad to 32 bytes (adds full block of padding)
+    Data16 = binary:copy(<<2>>, 16),
+    Padded = beamchain_wallet:pkcs7_pad(Data16, 16),
+    ?assertEqual(32, byte_size(Padded)),
+    Unpadded = beamchain_wallet:pkcs7_unpad(Padded),
+    ?assertEqual(Data16, Unpadded).
+
+%% Test derive_encryption_key produces 48 bytes
+derive_encryption_key_length_test() ->
+    Passphrase = <<"test_passphrase">>,
+    Salt = crypto:strong_rand_bytes(16),
+    Key = beamchain_wallet:derive_encryption_key(Passphrase, Salt),
+    ?assertEqual(48, byte_size(Key)).
+
+%% Test derive_encryption_key is deterministic
+derive_encryption_key_deterministic_test() ->
+    Passphrase = <<"deterministic_test">>,
+    Salt = <<1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16>>,
+    Key1 = beamchain_wallet:derive_encryption_key(Passphrase, Salt),
+    Key2 = beamchain_wallet:derive_encryption_key(Passphrase, Salt),
+    ?assertEqual(Key1, Key2).
+
+%% Test derive_encryption_key produces different keys with different salts
+derive_encryption_key_salt_matters_test() ->
+    Passphrase = <<"same_passphrase">>,
+    Salt1 = <<1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16>>,
+    Salt2 = <<16,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1>>,
+    Key1 = beamchain_wallet:derive_encryption_key(Passphrase, Salt1),
+    Key2 = beamchain_wallet:derive_encryption_key(Passphrase, Salt2),
+    ?assertNotEqual(Key1, Key2).
+
+%% Test derive_encryption_key produces different keys with different passphrases
+derive_encryption_key_passphrase_matters_test() ->
+    Passphrase1 = <<"passphrase_one">>,
+    Passphrase2 = <<"passphrase_two">>,
+    Salt = <<1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16>>,
+    Key1 = beamchain_wallet:derive_encryption_key(Passphrase1, Salt),
+    Key2 = beamchain_wallet:derive_encryption_key(Passphrase2, Salt),
+    ?assertNotEqual(Key1, Key2).
+
+%%% -------------------------------------------------------------------
 %%% Helper functions
 %%% -------------------------------------------------------------------
 
