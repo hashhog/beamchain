@@ -20,6 +20,7 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] Taproot (key path and script path) with BIP341 sighash
 - [x] MINIMALIF enforcement for witness scripts
 - [x] UTXO set management and chainstate
+- [x] Undo data for block disconnection (reorg support)
 - [x] Mempool with fee-based ordering
 - [x] JSON-RPC interface
 - [ ] Wallet (HD keys, signing)
@@ -59,7 +60,9 @@ c_src/
 └── beamchain_crypto_nif.c     libsecp256k1 bindings
 
 test/
-└── beamchain_script_tests.erl Script and sighash tests
+├── beamchain_script_tests.erl     Script and sighash tests
+├── beamchain_chainstate_tests.erl Undo data and disconnect tests
+└── beamchain_validation_tests.erl Consensus rule tests
 ```
 
 ## Running tests
