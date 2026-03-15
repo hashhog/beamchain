@@ -482,3 +482,133 @@ batch_jsonrpc_format_test_() ->
           ?assert(maps:is_key(<<"id">>, Response))
       end}
      ]}.
+
+%%% ===================================================================
+%%% Block stats helper function tests
+%%% ===================================================================
+
+%% Test truncated median calculation
+truncated_median_test_() ->
+    {"Truncated median calculation",
+     [
+      {"empty list returns 0", fun() ->
+          ?assertEqual(0, truncated_median([]))
+      end},
+      {"single element returns that element", fun() ->
+          ?assertEqual(42, truncated_median([42]))
+      end},
+      {"odd count returns middle element", fun() ->
+          ?assertEqual(3, truncated_median([1, 2, 3, 4, 5]))
+      end},
+      {"even count returns truncated average", fun() ->
+          %% [1, 2, 3, 4] -> (2 + 3) / 2 = 2 (truncated)
+          ?assertEqual(2, truncated_median([1, 2, 3, 4]))
+      end},
+      {"unsorted input still works", fun() ->
+          ?assertEqual(3, truncated_median([5, 1, 3, 2, 4]))
+      end}
+     ]}.
+
+%% Local implementation of truncated_median for testing
+truncated_median([]) -> 0;
+truncated_median(Values) ->
+    Sorted = lists:sort(Values),
+    Size = length(Sorted),
+    case Size rem 2 of
+        0 ->
+            Mid = Size div 2,
+            (lists:nth(Mid, Sorted) + lists:nth(Mid + 1, Sorted)) div 2;
+        1 ->
+            lists:nth((Size div 2) + 1, Sorted)
+    end.
+
+%% Test fee rate percentile calculation
+feerate_percentiles_test_() ->
+    {"Fee rate percentile calculation",
+     [
+      {"empty list returns zeros", fun() ->
+          Result = calculate_feerate_percentiles([], 0),
+          ?assertEqual([0, 0, 0, 0, 0], Result)
+      end},
+      {"single element fills all percentiles", fun() ->
+          %% Single tx with fee rate 100 and weight 1000
+          Result = calculate_feerate_percentiles([{100, 1000}], 1000),
+          ?assertEqual([100, 100, 100, 100, 100], Result)
+      end},
+      {"two elements with equal weight", fun() ->
+          %% Two tx, fee rates 10 and 20, each weight 500
+          Result = calculate_feerate_percentiles([{10, 500}, {20, 500}], 1000),
+          %% 10th at 100 = first element (10)
+          %% 25th at 250 = first element (10)
+          %% 50th at 500 = first element (10)
+          %% 75th at 750 = second element (20)
+          %% 90th at 900 = second element (20)
+          ?assertEqual([10, 10, 10, 20, 20], Result)
+      end}
+     ]}.
+
+%% Local implementation of percentile calculation for testing
+calculate_feerate_percentiles([], _TotalWeight) ->
+    [0, 0, 0, 0, 0];
+calculate_feerate_percentiles(_FeeRates, TotalWeight) when TotalWeight =< 0 ->
+    [0, 0, 0, 0, 0];
+calculate_feerate_percentiles(FeeRates, TotalWeight) ->
+    Sorted = lists:sort(fun({A, _}, {B, _}) -> A =< B end, FeeRates),
+    Targets = [
+        TotalWeight / 10,
+        TotalWeight / 4,
+        TotalWeight / 2,
+        TotalWeight * 3 / 4,
+        TotalWeight * 9 / 10
+    ],
+    calculate_percentiles_helper(Sorted, Targets, 0, []).
+
+calculate_percentiles_helper(_Sorted, [], _CumWeight, Acc) ->
+    lists:reverse(Acc);
+calculate_percentiles_helper([], [_|RestTargets], _CumWeight, Acc) ->
+    LastVal = case Acc of [] -> 0; [V|_] -> V end,
+    calculate_percentiles_helper([], RestTargets, 0, [LastVal | Acc]);
+calculate_percentiles_helper([{FeeRate, Weight} | RestRates], [Target | RestTargets] = Targets,
+                             CumWeight, Acc) ->
+    NewCumWeight = CumWeight + Weight,
+    case NewCumWeight >= Target of
+        true ->
+            calculate_percentiles_helper([{FeeRate, Weight} | RestRates], RestTargets,
+                                          CumWeight, [FeeRate | Acc]);
+        false ->
+            calculate_percentiles_helper(RestRates, Targets, NewCumWeight, Acc)
+    end.
+
+%% Test block subsidy calculation
+block_subsidy_test_() ->
+    {"Block subsidy calculation",
+     [
+      {"height 0 returns 50 BTC", fun() ->
+          ?assertEqual(5000000000, block_subsidy(0))
+      end},
+      {"height 209999 still returns 50 BTC", fun() ->
+          ?assertEqual(5000000000, block_subsidy(209999))
+      end},
+      {"height 210000 returns 25 BTC", fun() ->
+          ?assertEqual(2500000000, block_subsidy(210000))
+      end},
+      {"height 420000 returns 12.5 BTC", fun() ->
+          ?assertEqual(1250000000, block_subsidy(420000))
+      end},
+      {"height 630000 returns 6.25 BTC", fun() ->
+          ?assertEqual(625000000, block_subsidy(630000))
+      end},
+      {"height 64*210000 returns 0", fun() ->
+          %% After 64 halvings, subsidy is 0
+          ?assertEqual(0, block_subsidy(64 * 210000))
+      end}
+     ]}.
+
+%% Local implementation for testing
+block_subsidy(Height) ->
+    HalvingInterval = 210000,
+    Halvings = Height div HalvingInterval,
+    case Halvings >= 64 of
+        true -> 0;
+        false -> (50 * 100000000) bsr Halvings
+    end.
