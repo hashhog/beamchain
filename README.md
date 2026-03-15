@@ -22,6 +22,7 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] UTXO set management and chainstate
 - [x] Undo data for block disconnection (reorg support)
 - [x] Mempool with fee-based ordering
+- [x] BIP68 relative lock-time (sequence locks)
 - [x] JSON-RPC interface
 - [ ] Wallet (HD keys, signing)
 - [ ] Compact block relay (BIP152)
