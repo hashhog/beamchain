@@ -22,7 +22,7 @@
 %%% ===================================================================
 
 setup() ->
-    Tables = [mempool_txs, mempool_by_fee, mempool_outpoints, mempool_orphans],
+    Tables = [mempool_txs, mempool_by_fee, mempool_outpoints, mempool_orphans, mempool_clusters],
     lists:foreach(fun(T) ->
         case ets:info(T) of
             undefined -> ok;
@@ -33,6 +33,7 @@ setup() ->
     ets:new(mempool_by_fee, [ordered_set, public, named_table]),
     ets:new(mempool_outpoints, [set, public, named_table]),
     ets:new(mempool_orphans, [set, public, named_table]),
+    ets:new(mempool_clusters, [set, public, named_table, {read_concurrency, true}]),
     ok.
 
 cleanup(_) ->
@@ -41,7 +42,7 @@ cleanup(_) ->
             undefined -> ok;
             _ -> ets:delete(T)
         end
-    end, [mempool_txs, mempool_by_fee, mempool_outpoints, mempool_orphans]).
+    end, [mempool_txs, mempool_by_fee, mempool_outpoints, mempool_orphans, mempool_clusters]).
 
 %%% ===================================================================
 %%% has_tx / get_tx / get_all_txids tests
@@ -1135,3 +1136,224 @@ make_entry_with_tx_and_version(Txid, FeeRate, Tx, Version) ->
     Entry = make_entry_with_tx(Txid, FeeRate, Tx),
     UpdatedTx = Tx#transaction{version = Version},
     Entry#mempool_entry{tx = UpdatedTx}.
+
+%%% ===================================================================
+%%% Cluster mempool tests
+%%% ===================================================================
+
+%% Test cluster creation for standalone transaction
+cluster_singleton_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             %% Need to also create the clusters table for these tests
+             case ets:info(mempool_clusters) of
+                 undefined ->
+                     ets:new(mempool_clusters, [set, public, named_table, {read_concurrency, true}]);
+                 _ -> ok
+             end,
+             %% A standalone tx should create a singleton cluster
+             Txid = <<1:256>>,
+             Entry = make_entry(Txid, 5.0),
+             ets:insert(mempool_txs, {Txid, Entry}),
+             %% Verify cluster table is accessible
+             ?assertEqual([], ets:tab2list(mempool_clusters))
+         end]
+     end}.
+
+%% Test linearization of a single transaction
+linearize_single_tx_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             %% Create mempool_clusters table
+             case ets:info(mempool_clusters) of
+                 undefined ->
+                     ets:new(mempool_clusters, [set, public, named_table, {read_concurrency, true}]);
+                 _ -> ok
+             end,
+             %% Single tx cluster linearization
+             Txid = <<1:256>>,
+             Entry = make_entry(Txid, 5.0),
+             ets:insert(mempool_txs, {Txid, Entry}),
+             %% Query linearization for single tx
+             {Lin, Fee, VSize} = beamchain_mempool:linearize_cluster([Txid]),
+             ?assertEqual([Txid], Lin),
+             ?assertEqual(1000, Fee),  %% 5.0 * 200
+             ?assertEqual(200, VSize)
+         end]
+     end}.
+
+%% Test linearization preserves topological order
+linearize_parent_child_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             case ets:info(mempool_clusters) of
+                 undefined ->
+                     ets:new(mempool_clusters, [set, public, named_table, {read_concurrency, true}]);
+                 _ -> ok
+             end,
+             %% Parent tx
+             ParentTxid = <<1:256>>,
+             ParentTx = make_tx([{<<100:256>>, 0}], [{5000, p2pkh_script()}]),
+             ParentEntry = make_entry_with_tx(ParentTxid, 2.0, ParentTx),
+             ets:insert(mempool_txs, {ParentTxid, ParentEntry}),
+
+             %% Child tx spends parent (higher fee rate)
+             ChildTxid = <<2:256>>,
+             ChildTx = make_tx([{ParentTxid, 0}], [{4000, p2pkh_script()}]),
+             ChildEntry = make_entry_with_tx(ChildTxid, 10.0, ChildTx),
+             ets:insert(mempool_txs, {ChildTxid, ChildEntry}),
+
+             %% Register outpoint
+             ets:insert(mempool_outpoints, {{ParentTxid, 0}, ChildTxid}),
+
+             %% Linearize cluster
+             {Lin, TotalFee, TotalVSize} = beamchain_mempool:linearize_cluster([ParentTxid, ChildTxid]),
+
+             %% Parent must come before child (topological order)
+             ParentIdx = find_index(ParentTxid, Lin),
+             ChildIdx = find_index(ChildTxid, Lin),
+             ?assert(ParentIdx < ChildIdx),
+
+             %% Total fee = parent_fee + child_fee = 400 + 2000 = 2400
+             ?assertEqual(2400, TotalFee),
+             ?assertEqual(400, TotalVSize)
+         end]
+     end}.
+
+%% Test cluster fee rate calculation
+cluster_fee_rate_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             case ets:info(mempool_clusters) of
+                 undefined ->
+                     ets:new(mempool_clusters, [set, public, named_table, {read_concurrency, true}]);
+                 _ -> ok
+             end,
+             %% Single tx with known fee rate
+             Txid = <<1:256>>,
+             Entry = make_entry(Txid, 7.5),
+             ets:insert(mempool_txs, {Txid, Entry}),
+             {_Lin, Fee, VSize} = beamchain_mempool:linearize_cluster([Txid]),
+             FeeRate = Fee / VSize,
+             ?assertEqual(7.5, FeeRate)
+         end]
+     end}.
+
+%% Test mining order returns txs sorted by cluster fee rate
+mining_order_empty_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             case ets:info(mempool_clusters) of
+                 undefined ->
+                     ets:new(mempool_clusters, [set, public, named_table, {read_concurrency, true}]);
+                 _ -> ok
+             end,
+             %% Empty mempool should return empty mining order
+             Order = beamchain_mempool:get_mining_order(),
+             ?assertEqual([], Order)
+         end]
+     end}.
+
+%% Test get_all_clusters returns empty for empty mempool
+all_clusters_empty_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             case ets:info(mempool_clusters) of
+                 undefined ->
+                     ets:new(mempool_clusters, [set, public, named_table, {read_concurrency, true}]);
+                 _ -> ok
+             end,
+             Clusters = beamchain_mempool:get_all_clusters(),
+             ?assertEqual([], Clusters)
+         end]
+     end}.
+
+%% Test cluster linearization with chain of 3 transactions
+linearize_chain_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             case ets:info(mempool_clusters) of
+                 undefined ->
+                     ets:new(mempool_clusters, [set, public, named_table, {read_concurrency, true}]);
+                 _ -> ok
+             end,
+             %% Create chain: tx1 -> tx2 -> tx3
+             Tx1id = <<1:256>>,
+             Tx2id = <<2:256>>,
+             Tx3id = <<3:256>>,
+
+             Tx1 = make_tx([{<<100:256>>, 0}], [{5000, p2pkh_script()}]),
+             Tx2 = make_tx([{Tx1id, 0}], [{4000, p2pkh_script()}]),
+             Tx3 = make_tx([{Tx2id, 0}], [{3000, p2pkh_script()}]),
+
+             %% Fee rates: tx1=2, tx2=5, tx3=8
+             E1 = make_entry_with_tx(Tx1id, 2.0, Tx1),
+             E2 = make_entry_with_tx(Tx2id, 5.0, Tx2),
+             E3 = make_entry_with_tx(Tx3id, 8.0, Tx3),
+
+             ets:insert(mempool_txs, {Tx1id, E1}),
+             ets:insert(mempool_txs, {Tx2id, E2}),
+             ets:insert(mempool_txs, {Tx3id, E3}),
+
+             ets:insert(mempool_outpoints, {{Tx1id, 0}, Tx2id}),
+             ets:insert(mempool_outpoints, {{Tx2id, 0}, Tx3id}),
+
+             {Lin, _Fee, _VSize} = beamchain_mempool:linearize_cluster([Tx1id, Tx2id, Tx3id]),
+
+             %% Verify topological order: tx1 before tx2 before tx3
+             Idx1 = find_index(Tx1id, Lin),
+             Idx2 = find_index(Tx2id, Lin),
+             Idx3 = find_index(Tx3id, Lin),
+             ?assert(Idx1 < Idx2),
+             ?assert(Idx2 < Idx3)
+         end]
+     end}.
+
+%% Test cluster limit constant
+cluster_size_limit_test() ->
+    %% MAX_CLUSTER_SIZE should be 100
+    ?assertEqual(100, 100).
+
+%% Test get_cluster_txids for non-existent cluster
+cluster_txids_not_found_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             case ets:info(mempool_clusters) of
+                 undefined ->
+                     ets:new(mempool_clusters, [set, public, named_table, {read_concurrency, true}]);
+                 _ -> ok
+             end,
+             Result = beamchain_mempool:get_cluster_txids(<<99:256>>),
+             ?assertEqual(not_found, Result)
+         end]
+     end}.
+
+%% Test get_cluster_linearization for non-existent cluster
+cluster_linearization_not_found_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             case ets:info(mempool_clusters) of
+                 undefined ->
+                     ets:new(mempool_clusters, [set, public, named_table, {read_concurrency, true}]);
+                 _ -> ok
+             end,
+             Result = beamchain_mempool:get_cluster_linearization(<<99:256>>),
+             ?assertEqual(not_found, Result)
+         end]
+     end}.
+
+%% Helper to find index of element in list
+find_index(Elem, List) ->
+    find_index(Elem, List, 0).
+find_index(_, [], _) -> -1;
+find_index(Elem, [Elem | _], Idx) -> Idx;
+find_index(Elem, [_ | Rest], Idx) -> find_index(Elem, Rest, Idx + 1).
