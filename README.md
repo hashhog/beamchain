@@ -53,6 +53,7 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] Wallet encryption (AES-256-CBC with PBKDF2 key derivation)
 - [x] Compact block relay (BIP152 with SipHash-2-4)
 - [x] BIP324 v2 encrypted transport (ElligatorSwift, ChaCha20-Poly1305)
+- [x] BIP155 ADDRv2 messages (TorV3, I2P, CJDNS address support)
 
 ## Quick start
 
