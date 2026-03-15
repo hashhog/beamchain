@@ -28,6 +28,7 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] Mempool with fee-based ordering and ancestor/descendant limits
 - [x] BIP68 relative lock-time (sequence locks)
 - [x] JSON-RPC interface (complete core RPCs including getblockchaininfo, getblock, gettxoutsetinfo)
+- [x] Batch JSON-RPC support (parallel request processing)
 - [x] Block template construction (getblocktemplate)
 - [x] Witness commitment (BIP141)
 - [x] CPFP-aware tx selection (ancestor fee rate)
