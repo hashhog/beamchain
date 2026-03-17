@@ -670,7 +670,7 @@ i2p_dest_to_b32(DestBase64) when is_binary(DestBase64) ->
     StdBase64 = i2p_to_std_base64(DestBase64),
     DestBin = base64:decode(StdBase64),
     %% SHA256 hash of destination
-    Hash = crypto:hash(sha256, DestBin),
+    Hash = beamchain_crypto:sha256(DestBin),
     %% Base32 encode (lowercase, no padding)
     Base32 = base32_encode_lower(Hash),
     Base32 ++ ".b32.i2p".

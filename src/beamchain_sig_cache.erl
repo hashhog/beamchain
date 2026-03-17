@@ -89,7 +89,7 @@ terminate(_Reason, _State) ->
 
 make_key(SigHash, PubKey, Sig) ->
     %% Use a hash of the concatenation for a compact fixed-size key
-    crypto:hash(sha256, <<SigHash/binary, PubKey/binary, Sig/binary>>).
+    beamchain_crypto:sha256(<<SigHash/binary, PubKey/binary, Sig/binary>>).
 
 maybe_evict(#state{count = Count} = State) when Count =< ?MAX_ENTRIES ->
     State;

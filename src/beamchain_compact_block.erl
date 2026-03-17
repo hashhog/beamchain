@@ -203,7 +203,7 @@ compute_short_id(K0, K1, Wtxid) when byte_size(Wtxid) =:= 32 ->
     {non_neg_integer(), non_neg_integer()}.
 derive_siphash_key(Header, Nonce) ->
     HeaderBin = beamchain_serialize:encode_block_header(Header),
-    KeyData = crypto:hash(sha256, <<HeaderBin/binary, Nonce:64/little>>),
+    KeyData = beamchain_crypto:sha256(<<HeaderBin/binary, Nonce:64/little>>),
     <<K0:64/little, K1:64/little, _/binary>> = KeyData,
     {K0, K1}.
 
