@@ -1278,7 +1278,7 @@ execute_hash(HashType, Rest, Pos, State) ->
 
 do_hash(ripemd160, Data) -> crypto:hash(ripemd160, Data);
 do_hash(sha1, Data) -> crypto:hash(sha, Data);
-do_hash(sha256, Data) -> crypto:hash(sha256, Data);
+do_hash(sha256, Data) -> beamchain_crypto:sha256(Data);
 do_hash(hash160, Data) -> beamchain_crypto:hash160(Data);
 do_hash(hash256, Data) -> beamchain_crypto:hash256(Data).
 
@@ -2216,7 +2216,7 @@ verify_witness_program(0, Program, Witness, Flags, SigChecker)
             WitnessScript = lists:last(Witness),
             StackItems = lists:droplast(Witness),
             %% SHA256(witness_script) must equal program
-            case crypto:hash(sha256, WitnessScript) =:= Program of
+            case beamchain_crypto:sha256(WitnessScript) =:= Program of
                 true ->
                     case byte_size(WitnessScript) > ?MAX_SCRIPT_SIZE of
                         true -> {error, witness_script_too_large};

@@ -136,11 +136,11 @@ decode_block_header(<<Version:32/little,
 
 -spec hash256(binary()) -> binary().
 hash256(Data) ->
-    crypto:hash(sha256, crypto:hash(sha256, Data)).
+    beamchain_crypto:hash256(Data).
 
 -spec hash160(binary()) -> binary().
 hash160(Data) ->
-    crypto:hash(ripemd160, crypto:hash(sha256, Data)).
+    beamchain_crypto:hash160(Data).
 
 -spec block_hash(#block_header{} | #block{}) -> binary().
 block_hash(#block{header = Header}) ->
