@@ -72,7 +72,7 @@ and Taproot), and maintains a UTXO set backed by RocksDB.
 - [x] Tor SOCKS5 proxy (connect to .onion peers, stream isolation, v3 address generation)
 - [x] I2P SAM 3.1 support (connect to .b32.i2p peers, session management)
 - [x] invalidateblock/reconsiderblock RPCs (manual chain management)
-- [x] NIF-accelerated SHA256/double-SHA256 (with pure Erlang fallback)
+- [x] NIF-accelerated SHA256/double-SHA256 in all hot paths (SHA-NI, ARM crypto)
 - [x] Batch signature verification (amortize NIF call overhead)
 
 ## Quick start
