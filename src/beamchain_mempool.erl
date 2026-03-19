@@ -18,6 +18,7 @@
 -export([get_all_txids/0, get_info/0]).
 -export([get_sorted_by_fee/0]).
 -export([get_tx_fee_rate/1]).
+-export([get_ancestors/1]).
 
 %% Block interaction
 -export([remove_for_block/1]).
@@ -1544,6 +1545,31 @@ get_parent_txids_from_inputs(Inputs) ->
 
 get_parent_txids(#transaction{inputs = Inputs}) ->
     get_parent_txids_from_inputs(Inputs).
+
+%% @doc Get all in-mempool ancestors of a transaction (recursive).
+%% Returns a list of ancestor txids (not including the queried tx itself).
+get_ancestors(Txid) ->
+    case get_tx(Txid) of
+        {ok, Tx} ->
+            Parents = get_parent_txids(Tx),
+            get_ancestors_loop(Parents, sets:from_list(Parents), []);
+        not_found ->
+            []
+    end.
+
+get_ancestors_loop([], _Visited, Acc) ->
+    lists:usort(Acc);
+get_ancestors_loop([Txid | Rest], Visited, Acc) ->
+    case get_tx(Txid) of
+        {ok, Tx} ->
+            Parents = get_parent_txids(Tx),
+            NewParents = [P || P <- Parents, not sets:is_element(P, Visited)],
+            NewVisited = lists:foldl(fun(P, S) -> sets:add_element(P, S) end,
+                                      Visited, NewParents),
+            get_ancestors_loop(Rest ++ NewParents, NewVisited, [Txid | Acc]);
+        not_found ->
+            get_ancestors_loop(Rest, Visited, Acc)
+    end.
 
 %%% ===================================================================
 %%% Internal: orphan pool

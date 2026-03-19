@@ -21,6 +21,9 @@
 -export([sha256/1, hash256/1, hash160/1,
          tagged_hash/2, hmac_sha512/2]).
 
+%% Hardware introspection
+-export([sha256_hardware_info/0]).
+
 %% Batch verification (reduces NIF call overhead)
 -export([batch_ecdsa_verify/1, batch_schnorr_verify/1]).
 
@@ -126,6 +129,9 @@ sha256_nif(_Data) ->
     erlang:nif_error(nif_not_loaded).
 
 double_sha256_nif(_Data) ->
+    erlang:nif_error(nif_not_loaded).
+
+sha256_hardware_info_nif() ->
     erlang:nif_error(nif_not_loaded).
 
 %% Batch verification NIFs
@@ -327,6 +333,25 @@ tagged_hash(Tag, Data) ->
 -spec hmac_sha512(Key :: binary(), Data :: binary()) -> binary().
 hmac_sha512(Key, Data) ->
     crypto:mac(hmac, sha512, Key, Data).
+
+%%% -------------------------------------------------------------------
+%%% Hardware introspection
+%%% -------------------------------------------------------------------
+
+%% @doc Returns which SHA-256 implementation is active.
+%% Returns {ok, Algorithm} where Algorithm is:
+%%   sha_ni   - Intel SHA-NI hardware extensions
+%%   arm_sha  - ARM SHA hardware extensions (Apple Silicon, etc.)
+%%   generic  - Portable C implementation (or pure Erlang fallback)
+-spec sha256_hardware_info() -> {ok, sha_ni | arm_sha | generic}.
+sha256_hardware_info() ->
+    try
+        sha256_hardware_info_nif()
+    catch
+        error:nif_not_loaded ->
+            %% NIF not loaded, using pure Erlang fallback
+            {ok, generic}
+    end.
 
 %%% -------------------------------------------------------------------
 %%% Batch verification (reduces NIF call overhead)

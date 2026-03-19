@@ -552,6 +552,32 @@ double_sha256_nif_empty_test() ->
     ?assertEqual(Expected, beamchain_crypto:hash256(<<>>)).
 
 %%% ===================================================================
+%%% SHA-256 hardware info tests
+%%% ===================================================================
+
+sha256_hardware_info_returns_valid_atom_test() ->
+    %% Must return {ok, Algo} where Algo is a known implementation
+    {ok, Algo} = beamchain_crypto:sha256_hardware_info(),
+    ?assert(lists:member(Algo, [sha_ni, arm_sha, generic])).
+
+sha256_hardware_info_consistent_test() ->
+    %% Calling multiple times should return the same result
+    {ok, Algo1} = beamchain_crypto:sha256_hardware_info(),
+    {ok, Algo2} = beamchain_crypto:sha256_hardware_info(),
+    ?assertEqual(Algo1, Algo2).
+
+sha256_hardware_info_matches_sha256_correctness_test() ->
+    %% Regardless of which implementation, sha256 must be correct
+    {ok, _Algo} = beamchain_crypto:sha256_hardware_info(),
+    %% Test a few known vectors to ensure the implementation is correct
+    ?assertEqual(hex("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+                 beamchain_crypto:sha256(<<>>)),
+    ?assertEqual(hex("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"),
+                 beamchain_crypto:sha256(<<"hello">>)),
+    ?assertEqual(hex("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+                 beamchain_crypto:sha256(<<"abc">>)).
+
+%%% ===================================================================
 %%% Batch verification tests
 %%% ===================================================================
 
