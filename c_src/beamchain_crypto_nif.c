@@ -21,20 +21,42 @@
 /* SHA-256 implementation with hardware acceleration                    */
 /* ------------------------------------------------------------------ */
 
-/* Detect CPU features at compile time */
+/* Detect CPU architecture at compile time */
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
     #define BEAMCHAIN_X86 1
+    /* Always include immintrin.h if SHA intrinsics available at compile time */
     #if defined(__SHA__)
-        #define BEAMCHAIN_SHA_NI 1
+        #define BEAMCHAIN_SHA_NI_COMPILED 1
         #include <immintrin.h>
+    #endif
+    /* For CPUID detection */
+    #if defined(__GNUC__) || defined(__clang__)
+        #include <cpuid.h>
+        #define BEAMCHAIN_HAS_CPUID 1
     #endif
 #elif defined(__aarch64__) || defined(_M_ARM64)
     #define BEAMCHAIN_ARM64 1
     #if defined(__ARM_FEATURE_CRYPTO)
-        #define BEAMCHAIN_ARM_SHA 1
+        #define BEAMCHAIN_ARM_SHA_COMPILED 1
         #include <arm_neon.h>
     #endif
+    /* For runtime feature detection on Linux */
+    #if defined(__linux__)
+        #include <sys/auxv.h>
+        #include <asm/hwcap.h>
+        #define BEAMCHAIN_ARM_HWCAP 1
+    #endif
 #endif
+
+/* SHA-256 implementation type - determined at runtime */
+typedef enum {
+    SHA256_IMPL_PORTABLE = 0,
+    SHA256_IMPL_SHA_NI,
+    SHA256_IMPL_ARM_SHA
+} sha256_impl_t;
+
+/* Global variable set at NIF load time */
+static sha256_impl_t sha256_implementation = SHA256_IMPL_PORTABLE;
 
 /* SHA-256 constants */
 static const uint32_t K256[64] = {
@@ -118,7 +140,7 @@ static void sha256_transform_portable(uint32_t state[8],
     state[4] += e; state[5] += f; state[6] += g; state[7] += h;
 }
 
-#ifdef BEAMCHAIN_SHA_NI
+#ifdef BEAMCHAIN_SHA_NI_COMPILED
 /* SHA-NI accelerated transform for x86 with SHA extensions */
 static void sha256_transform_shani(uint32_t state[8],
                                     const unsigned char block[64])
@@ -306,7 +328,7 @@ static void sha256_transform_shani(uint32_t state[8],
 
     /* Rounds 60-63 */
     MSG = _mm_add_epi32(MSG3, _mm_set_epi64x(0xC67178F2BEF9A3F7ULL,
-                                              0xA4506CEBF90BEFFAULL));
+                                              0xA4506CEB90BEFFFAULL));
     STATE1 = _mm_sha256rnds2_epu32(STATE1, STATE0, MSG);
     MSG = _mm_shuffle_epi32(MSG, 0x0E);
     STATE0 = _mm_sha256rnds2_epu32(STATE0, STATE1, MSG);
@@ -324,9 +346,9 @@ static void sha256_transform_shani(uint32_t state[8],
     _mm_storeu_si128((__m128i *)&state[0], STATE0);
     _mm_storeu_si128((__m128i *)&state[4], STATE1);
 }
-#endif /* BEAMCHAIN_SHA_NI */
+#endif /* BEAMCHAIN_SHA_NI_COMPILED */
 
-#ifdef BEAMCHAIN_ARM_SHA
+#ifdef BEAMCHAIN_ARM_SHA_COMPILED
 /* ARM SHA extensions accelerated transform */
 static void sha256_transform_arm(uint32_t state[8],
                                   const unsigned char block[64])
@@ -475,19 +497,82 @@ static void sha256_transform_arm(uint32_t state[8],
     vst1q_u32(&state[0], STATE0);
     vst1q_u32(&state[4], STATE1);
 }
-#endif /* BEAMCHAIN_ARM_SHA */
+#endif /* BEAMCHAIN_ARM_SHA_COMPILED */
 
-/* Select best available transform function */
+/* ------------------------------------------------------------------ */
+/* Runtime CPU feature detection                                        */
+/* ------------------------------------------------------------------ */
+
+#ifdef BEAMCHAIN_HAS_CPUID
+/* Detect SHA-NI support via CPUID on x86/x86_64 */
+static int detect_sha_ni(void)
+{
+    unsigned int eax, ebx, ecx, edx;
+
+    /* Check if CPUID supports leaf 7 (extended features) */
+    if (!__get_cpuid(0, &eax, &ebx, &ecx, &edx) || eax < 7) {
+        return 0;
+    }
+
+    /* Check CPUID leaf 7, subleaf 0:
+     * EBX bit 29 = SHA extensions */
+    if (!__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
+        return 0;
+    }
+
+    return (ebx >> 29) & 1;
+}
+#endif
+
+/* Detect CPU features and select best SHA-256 implementation */
+static void detect_sha256_implementation(void)
+{
+    sha256_implementation = SHA256_IMPL_PORTABLE;
+
+#if defined(BEAMCHAIN_X86) && defined(BEAMCHAIN_HAS_CPUID)
+    #ifdef BEAMCHAIN_SHA_NI_COMPILED
+    /* If compiled with SHA-NI support, check runtime availability */
+    if (detect_sha_ni()) {
+        sha256_implementation = SHA256_IMPL_SHA_NI;
+        return;
+    }
+    #endif
+#endif
+
+#if defined(BEAMCHAIN_ARM64)
+    #if defined(BEAMCHAIN_ARM_HWCAP) && defined(BEAMCHAIN_ARM_SHA_COMPILED)
+    /* On Linux ARM64, check for SHA2 support via hwcap */
+    unsigned long hwcap = getauxval(AT_HWCAP);
+    if (hwcap & HWCAP_SHA2) {
+        sha256_implementation = SHA256_IMPL_ARM_SHA;
+        return;
+    }
+    #elif defined(__APPLE__) && defined(BEAMCHAIN_ARM_SHA_COMPILED)
+    /* On Apple Silicon, crypto extensions are always available */
+    sha256_implementation = SHA256_IMPL_ARM_SHA;
+    #endif
+#endif
+}
+
+/* Select transform function based on detected implementation */
 static void sha256_transform(uint32_t state[8],
                               const unsigned char block[64])
 {
-    /*
-     * TODO: Enable hardware acceleration after thorough testing.
-     * For now, use portable implementation to ensure correctness.
-     * The SHA-NI and ARM implementations need further validation
-     * against test vectors before enabling.
-     */
-    sha256_transform_portable(state, block);
+    switch (sha256_implementation) {
+#ifdef BEAMCHAIN_SHA_NI_COMPILED
+        case SHA256_IMPL_SHA_NI:
+            sha256_transform_shani(state, block);
+            return;
+#endif
+#ifdef BEAMCHAIN_ARM_SHA_COMPILED
+        case SHA256_IMPL_ARM_SHA:
+            sha256_transform_arm(state, block);
+            return;
+#endif
+        default:
+            sha256_transform_portable(state, block);
+            return;
+    }
 }
 
 /* Full SHA-256 hash with proper padding */
@@ -553,6 +638,10 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info)
     ctx = secp256k1_context_create(
         SECP256K1_CONTEXT_VERIFY | SECP256K1_CONTEXT_SIGN);
     if (!ctx) return -1;
+
+    /* Detect best SHA-256 implementation at load time */
+    detect_sha256_implementation();
+
     return 0;
 }
 
@@ -582,6 +671,33 @@ static ERL_NIF_TERM make_ok_binary(ErlNifEnv *env,
     unsigned char *buf = enif_make_new_binary(env, len, &bin);
     memcpy(buf, data, len);
     return enif_make_tuple2(env, enif_make_atom(env, "ok"), bin);
+}
+
+/* ------------------------------------------------------------------ */
+/* sha256_hardware_info_nif() -> {ok, sha_ni | arm_sha | generic}      */
+/* Reports which SHA-256 implementation is in use.                      */
+/* ------------------------------------------------------------------ */
+
+static ERL_NIF_TERM sha256_hardware_info_nif(ErlNifEnv *env, int argc,
+                                              const ERL_NIF_TERM argv[])
+{
+    const char *impl_name;
+
+    switch (sha256_implementation) {
+        case SHA256_IMPL_SHA_NI:
+            impl_name = "sha_ni";
+            break;
+        case SHA256_IMPL_ARM_SHA:
+            impl_name = "arm_sha";
+            break;
+        default:
+            impl_name = "generic";
+            break;
+    }
+
+    return enif_make_tuple2(env,
+        enif_make_atom(env, "ok"),
+        enif_make_atom(env, impl_name));
 }
 
 /* ------------------------------------------------------------------ */
@@ -1130,6 +1246,8 @@ static ErlNifFunc nif_funcs[] = {
         0},  /* Fast enough for normal scheduler */
     {"double_sha256_nif",          1, double_sha256_nif,
         0},  /* Fast enough for normal scheduler */
+    {"sha256_hardware_info_nif",   0, sha256_hardware_info_nif,
+        0},  /* Query only, very fast */
     {"batch_ecdsa_verify_nif",     1, batch_ecdsa_verify_nif,
         ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"batch_schnorr_verify_nif",   1, batch_schnorr_verify_nif,

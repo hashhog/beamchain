@@ -400,7 +400,7 @@ init_chainstate(Role, SnapshotData) ->
     logger:info("chainstate (~p): initialized at height ~B (cache ~BMB)",
                 [Role, TipHeight, MaxCacheMB]),
 
-    {ok, #state{
+    State0 = #state{
         tip_hash = TipHash,
         tip_height = TipHeight,
         mtp_timestamps = MTPTimestamps,
@@ -413,7 +413,26 @@ init_chainstate(Role, SnapshotData) ->
         chainstate_role = Role,
         snapshot_base_height = SnapshotBaseHeight,
         snapshot_base_hash = SnapshotBaseHash
-    }}.
+    },
+
+    %% On a fresh database (no chain tip), connect the genesis block
+    %% so that regtest mining and other operations have a valid tip.
+    State1 = case {Role, TipHash} of
+        {main, undefined} ->
+            Genesis = maps:get(genesis_block, Params),
+            case do_connect_block(Genesis, State0) of
+                {ok, StateG} ->
+                    logger:info("chainstate: connected genesis block"),
+                    StateG;
+                {error, Reason} ->
+                    logger:warning("chainstate: failed to connect genesis: ~p",
+                                   [Reason]),
+                    State0
+            end;
+        _ ->
+            State0
+    end,
+    {ok, State1}.
 
 handle_call(get_mtp, _From, #state{mtp_timestamps = Ts} = State) ->
     {reply, compute_mtp(Ts), State};
@@ -569,6 +588,23 @@ do_connect_block(#block{header = Header} = Block,
     case beamchain_validation:connect_block(Block, Height, PrevIndex, Params) of
         ok ->
             BlockHash = beamchain_serialize:block_hash(Header),
+
+            %% Store block data and block index entry
+            beamchain_db:store_block(Block, Height),
+            PrevCW = maps:get(chainwork, PrevIndex, <<0:256>>),
+            PrevCWInt = binary:decode_unsigned(PrevCW, big),
+            BlockWork = beamchain_pow:compute_work(Header#block_header.bits),
+            NewCWInt = PrevCWInt + BlockWork,
+            NewCW = case NewCWInt of
+                0 -> <<0:256>>;
+                _ ->
+                    Bin = binary:encode_unsigned(NewCWInt, big),
+                    case byte_size(Bin) < 32 of
+                        true -> <<0:((32 - byte_size(Bin)) * 8), Bin/binary>>;
+                        false -> Bin
+                    end
+            end,
+            beamchain_db:store_block_index(Height, BlockHash, Header, NewCW, 2),
 
             %% Update chain tip in ETS for fast reads
             ets:insert(?CHAIN_META, {tip, BlockHash, Height}),
@@ -995,14 +1031,14 @@ do_compute_utxo_hash() ->
         Key1 =< Key2
     end, AllEntries),
 
-    %% Hash all entries
-    HashCtx = crypto:hash_init(sha256),
-    FinalCtx = lists:foldl(fun({{Txid, Vout}, Utxo}, Ctx) ->
-        CoinBin = serialize_coin_for_hash(Txid, Vout, Utxo),
-        crypto:hash_update(Ctx, CoinBin)
-    end, HashCtx, Sorted),
-
-    crypto:hash_final(FinalCtx).
+    %% Hash all entries — accumulate serialized coins and hash in one shot
+    %% via the NIF-backed beamchain_crypto:sha256/1 instead of streaming
+    %% crypto:hash_init/update/final (UTXO set fits in memory since it's
+    %% already materialized in the ETS table above).
+    AllBins = lists:map(fun({{Txid, Vout}, Utxo}) ->
+        serialize_coin_for_hash(Txid, Vout, Utxo)
+    end, Sorted),
+    beamchain_crypto:sha256(iolist_to_binary(AllBins)).
 
 %% Serialize a coin for hashing (deterministic format)
 serialize_coin_for_hash(Txid, Vout, #utxo{value = Value, script_pubkey = Script,

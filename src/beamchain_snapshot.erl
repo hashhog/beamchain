@@ -295,14 +295,14 @@ compute_utxo_hash_from_list(Coins) ->
         {Txid1, Vout1} =< {Txid2, Vout2}
     end, Coins),
 
-    %% Serialize each coin and hash incrementally
-    HashCtx = crypto:hash_init(sha256),
-    FinalCtx = lists:foldl(fun({Txid, Vout, Utxo}, Ctx) ->
-        CoinBin = serialize_coin_for_hash(Txid, Vout, Utxo),
-        crypto:hash_update(Ctx, CoinBin)
-    end, HashCtx, Sorted),
-
-    crypto:hash_final(FinalCtx).
+    %% Serialize each coin and hash in one shot via the NIF-backed
+    %% beamchain_crypto:sha256/1 instead of streaming crypto:hash_init/update/final.
+    %% The coin list is already fully materialized in memory, so accumulating
+    %% the binaries does not increase peak memory usage.
+    AllBins = lists:map(fun({Txid, Vout, Utxo}) ->
+        serialize_coin_for_hash(Txid, Vout, Utxo)
+    end, Sorted),
+    beamchain_crypto:sha256(iolist_to_binary(AllBins)).
 
 serialize_coin_for_hash(Txid, Vout, #utxo{value = Value, script_pubkey = Script,
                                           is_coinbase = IsCoinbase, height = Height}) ->
