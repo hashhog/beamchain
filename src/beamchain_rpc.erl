@@ -364,6 +364,7 @@ handle_method(<<"reconsiderblock">>, P, _W) -> rpc_reconsiderblock(P);
 handle_method(<<"getrawtransaction">>, P, _W) -> rpc_getrawtransaction(P);
 handle_method(<<"decoderawtransaction">>, P, _W) -> rpc_decoderawtransaction(P);
 handle_method(<<"sendrawtransaction">>, P, _W) -> rpc_sendrawtransaction(P);
+handle_method(<<"createrawtransaction">>, P, _W) -> rpc_createrawtransaction(P);
 handle_method(<<"testmempoolaccept">>, P, _W) -> rpc_testmempoolaccept(P);
 handle_method(<<"gettxout">>, P, _W) -> rpc_gettxout(P);
 handle_method(<<"gettxoutsetinfo">>, P, _W) -> rpc_gettxoutsetinfo(P);
@@ -372,6 +373,7 @@ handle_method(<<"gettxoutsetinfo">>, P, _W) -> rpc_gettxoutsetinfo(P);
 handle_method(<<"getmempoolinfo">>, _, _W) -> rpc_getmempoolinfo();
 handle_method(<<"getrawmempool">>, P, _W) -> rpc_getrawmempool(P);
 handle_method(<<"getmempoolentry">>, P, _W) -> rpc_getmempoolentry(P);
+handle_method(<<"getmempoolancestors">>, P, _W) -> rpc_getmempoolancestors(P);
 
 %% -- Network --
 handle_method(<<"getnetworkinfo">>, _, _W) -> rpc_getnetworkinfo();
@@ -417,6 +419,8 @@ handle_method(<<"listtransactions">>, P, W) -> rpc_listtransactions(P, W);
 handle_method(<<"encryptwallet">>, P, W) -> rpc_encryptwallet(P, W);
 handle_method(<<"walletpassphrase">>, P, W) -> rpc_walletpassphrase(P, W);
 handle_method(<<"walletlock">>, _, W) -> rpc_walletlock(W);
+handle_method(<<"signrawtransactionwithwallet">>, P, W) -> rpc_signrawtransactionwithwallet(P, W);
+handle_method(<<"importdescriptors">>, P, W) -> rpc_importdescriptors(P, W);
 
 %% -- PSBT --
 handle_method(<<"createpsbt">>, P, _W) -> rpc_createpsbt(P);
@@ -476,6 +480,7 @@ rpc_help_list() ->
         <<"submitblock \"hexdata\"">>,
         <<"">>,
         <<"== Mempool ==">>,
+        <<"getmempoolancestors \"txid\" ( verbose )">>,
         <<"getmempoolentry \"txid\"">>,
         <<"getmempoolinfo">>,
         <<"getrawmempool ( verbose )">>,
@@ -493,6 +498,7 @@ rpc_help_list() ->
         <<"== Rawtransactions ==">>,
         <<"combinepsbt [\"psbt\",...]">>,
         <<"createpsbt [{\"txid\":\"hex\",\"vout\":n},...] [{\"address\":amount},...] ( locktime )">>,
+        <<"createrawtransaction [{\"txid\":\"hex\",\"vout\":n},...] [{\"address\":amount},...] ( locktime replaceable )">>,
         <<"decoderawtransaction \"hexstring\"">>,
         <<"decodepsbt \"psbt\"">>,
         <<"decodescript \"hexstring\"">>,
@@ -521,7 +527,9 @@ rpc_help_list() ->
         <<"listunspent ( minconf maxconf )">>,
         <<"listwallets">>,
         <<"loadwallet \"name\"">>,
+        <<"importdescriptors \"requests\"">>,
         <<"sendtoaddress \"address\" amount ( \"comment\" )">>,
+        <<"signrawtransactionwithwallet \"hexstring\" ( [{\"txid\":\"hex\",\"vout\":n,\"scriptPubKey\":\"hex\"},...] )">>,
         <<"unloadwallet ( \"name\" )">>,
         <<"walletlock">>,
         <<"walletpassphrase \"passphrase\" timeout">>,
@@ -1441,6 +1449,59 @@ rpc_sendrawtransaction(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"Usage: sendrawtransaction \"hexstring\" ( maxfeerate )">>}.
 
+%% @doc createrawtransaction: Create a raw transaction from inputs and outputs.
+%% Returns hex-encoded unsigned transaction.
+rpc_createrawtransaction([Inputs, Outputs]) when is_list(Inputs), is_list(Outputs) ->
+    rpc_createrawtransaction([Inputs, Outputs, 0, false]);
+rpc_createrawtransaction([Inputs, Outputs, Locktime]) when is_list(Inputs), is_list(Outputs) ->
+    rpc_createrawtransaction([Inputs, Outputs, Locktime, false]);
+rpc_createrawtransaction([Inputs, Outputs, Locktime, Replaceable])
+  when is_list(Inputs), is_list(Outputs) ->
+    try
+        %% Parse inputs
+        TxInputs = lists:map(fun(#{<<"txid">> := TxidHex, <<"vout">> := Vout} = InMap) ->
+            Txid = hex_to_internal_hash(TxidHex),
+            Sequence = case maps:get(<<"sequence">>, InMap, undefined) of
+                undefined ->
+                    case Replaceable of
+                        true -> 16#FFFFFFFD;  %% BIP125 replaceable
+                        _ -> 16#FFFFFFFF
+                    end;
+                Seq -> Seq
+            end,
+            #tx_in{prev_out = #outpoint{hash = Txid, index = Vout},
+                   script_sig = <<>>,
+                   sequence = Sequence}
+        end, Inputs),
+        %% Parse outputs (list of maps, each with address:amount or data:hex)
+        TxOutputs = lists:flatmap(fun(OutMap) ->
+            maps:fold(fun
+                (<<"data">>, HexData, Acc) ->
+                    Script = <<16#6a, (beamchain_serialize:hex_decode(HexData))/binary>>,
+                    [#tx_out{value = 0, script_pubkey = Script} | Acc];
+                (Address, Amount, Acc) ->
+                    Satoshis = btc_to_satoshi(Amount),
+                    Script = beamchain_script:address_to_script_pubkey(binary_to_list(Address)),
+                    [#tx_out{value = Satoshis, script_pubkey = Script} | Acc]
+            end, [], OutMap)
+        end, Outputs),
+        Tx = #transaction{
+            version = 2,
+            inputs = TxInputs,
+            outputs = TxOutputs,
+            locktime = Locktime
+        },
+        HexTx = beamchain_serialize:hex_encode(beamchain_serialize:serialize_tx(Tx)),
+        {ok, HexTx}
+    catch
+        _:Err ->
+            {error, ?RPC_MISC_ERROR,
+             iolist_to_binary(io_lib:format("Error: ~p", [Err]))}
+    end;
+rpc_createrawtransaction(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: createrawtransaction [{\"txid\":\"hex\",\"vout\":n},...] [{\"address\":amount},...] ( locktime replaceable )">>}.
+
 %% Check if transaction fee rate exceeds the maximum allowed.
 %% Throws {max_fee_exceeded, ActualFeeRate} if exceeded.
 check_max_fee_rate(Tx, MaxFeeRateSatVB) ->
@@ -1667,6 +1728,35 @@ rpc_getmempoolentry([TxidHex]) when is_binary(TxidHex) ->
 rpc_getmempoolentry(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"Usage: getmempoolentry \"txid\"">>}.
+
+rpc_getmempoolancestors([TxidHex]) when is_binary(TxidHex) ->
+    rpc_getmempoolancestors([TxidHex, false]);
+rpc_getmempoolancestors([TxidHex, Verbose]) when is_binary(TxidHex) ->
+    Txid = hex_to_internal_hash(TxidHex),
+    case beamchain_mempool:get_entry(Txid) of
+        {ok, _Entry} ->
+            AncestorTxids = beamchain_mempool:get_ancestors(Txid),
+            case Verbose of
+                true ->
+                    Entries = lists:map(fun(AncTxid) ->
+                        case beamchain_mempool:get_entry(AncTxid) of
+                            {ok, AncEntry} ->
+                                {hash_to_hex(AncTxid), format_mempool_entry(AncEntry)};
+                            not_found ->
+                                {hash_to_hex(AncTxid), #{}}
+                        end
+                    end, AncestorTxids),
+                    {ok, maps:from_list(Entries)};
+                _ ->
+                    {ok, [hash_to_hex(T) || T <- AncestorTxids]}
+            end;
+        not_found ->
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+             <<"Transaction not in mempool">>}
+    end;
+rpc_getmempoolancestors(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: getmempoolancestors \"txid\" ( verbose )">>}.
 
 %%% ===================================================================
 %%% Network methods
@@ -3083,6 +3173,148 @@ btc_to_satoshi(Btc) when is_float(Btc) ->
     round(Btc * 100000000);
 btc_to_satoshi(Btc) when is_integer(Btc) ->
     Btc * 100000000.
+
+%%% ===================================================================
+%%% Wallet signing and descriptor import
+%%% ===================================================================
+
+%% @doc signrawtransactionwithwallet: Sign inputs of a raw transaction using wallet keys.
+%% Returns the signed hex and whether it is complete.
+rpc_signrawtransactionwithwallet([HexStr], WalletName) when is_binary(HexStr) ->
+    rpc_signrawtransactionwithwallet([HexStr, []], WalletName);
+rpc_signrawtransactionwithwallet([HexStr, PrevTxs], WalletName) when is_binary(HexStr) ->
+    case resolve_wallet(WalletName) of
+        {ok, Pid} ->
+            try
+                TxBin = beamchain_serialize:hex_decode(HexStr),
+                Tx = beamchain_serialize:deserialize_tx(TxBin),
+                %% Gather UTXO data for signing (from prevtxs param or UTXO set)
+                InputUtxos = lists:map(fun(#tx_in{prev_out = #outpoint{hash = H, index = I}}) ->
+                    case find_prevtx(PrevTxs, H, I) of
+                        {ok, Utxo} -> Utxo;
+                        not_found ->
+                            case beamchain_chainstate:get_utxo(H, I) of
+                                {ok, Utxo} -> Utxo;
+                                not_found -> throw({missing_input, H, I})
+                            end
+                    end
+                end, Tx#transaction.inputs),
+                %% Get private keys from wallet for each input
+                PrivKeys = lists:map(fun(Utxo) ->
+                    Address = beamchain_script:script_pubkey_to_address(
+                        Utxo#utxo.script_pubkey, beamchain_config:network()),
+                    case beamchain_wallet:get_private_key(Pid, Address) of
+                        {ok, Key} -> Key;
+                        _ -> <<0:256>>  %% Placeholder for keys not in this wallet
+                    end
+                end, InputUtxos),
+                case beamchain_wallet:sign_transaction(Tx, InputUtxos, PrivKeys) of
+                    {ok, SignedTx} ->
+                        SignedHex = beamchain_serialize:hex_encode(
+                            beamchain_serialize:serialize_tx(SignedTx)),
+                        Complete = lists:all(fun(K) -> K =/= <<0:256>> end, PrivKeys),
+                        {ok, #{
+                            <<"hex">> => SignedHex,
+                            <<"complete">> => Complete
+                        }};
+                    {error, Reason} ->
+                        {error, ?RPC_MISC_ERROR, iolist_to_binary(
+                            io_lib:format("Signing error: ~p", [Reason]))}
+                end
+            catch
+                _:Err ->
+                    {error, ?RPC_MISC_ERROR,
+                     iolist_to_binary(io_lib:format("Error: ~p", [Err]))}
+            end;
+        {error, _} ->
+            wallet_not_found_error(WalletName)
+    end;
+rpc_signrawtransactionwithwallet(_, _) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: signrawtransactionwithwallet \"hexstring\" ( prevtxs )">>}.
+
+%% Helper: find a previous tx output from the prevtxs parameter.
+find_prevtx([], _Hash, _Index) -> not_found;
+find_prevtx([#{<<"txid">> := TxidHex, <<"vout">> := Vout,
+               <<"scriptPubKey">> := ScriptHex} = Map | Rest], Hash, Index) ->
+    case {hex_to_internal_hash(TxidHex), Vout} of
+        {Hash, Index} ->
+            Amount = maps:get(<<"amount">>, Map, 0),
+            {ok, #utxo{
+                value = btc_to_satoshi(Amount),
+                script_pubkey = beamchain_serialize:hex_decode(ScriptHex),
+                height = 0,
+                is_coinbase = false
+            }};
+        _ ->
+            find_prevtx(Rest, Hash, Index)
+    end;
+find_prevtx([_ | Rest], Hash, Index) ->
+    find_prevtx(Rest, Hash, Index).
+
+%% @doc importdescriptors: Import descriptors into the wallet.
+%% Takes an array of descriptor request objects.
+rpc_importdescriptors([Requests], WalletName) when is_list(Requests) ->
+    case resolve_wallet(WalletName) of
+        {ok, Pid} ->
+            Results = lists:map(fun(#{<<"desc">> := DescStr} = Req) ->
+                Timestamp = maps:get(<<"timestamp">>, Req, <<"now">>),
+                Internal = maps:get(<<"internal">>, Req, false),
+                Range = maps:get(<<"range">>, Req, null),
+                Label = maps:get(<<"label">>, Req, <<>>),
+                try
+                    case beamchain_descriptor:parse(DescStr) of
+                        {ok, Desc} ->
+                            %% Derive addresses for the descriptor range
+                            Addresses = case Range of
+                                [Start, End] when is_integer(Start), is_integer(End) ->
+                                    case beamchain_descriptor:expand(Desc, {Start, End}) of
+                                        {ok, Addrs} -> Addrs;
+                                        {error, _} -> []
+                                    end;
+                                _ ->
+                                    case beamchain_descriptor:derive(Desc, 0) of
+                                        {ok, Addr} -> [Addr];
+                                        {error, _} -> []
+                                    end
+                            end,
+                            %% Import each derived address into the wallet
+                            lists:foreach(fun(Addr) ->
+                                beamchain_wallet:import_address(Pid, Addr, Label,
+                                    Internal, Timestamp)
+                            end, Addresses),
+                            #{<<"success">> => true};
+                        {error, ParseErr} ->
+                            #{<<"success">> => false,
+                              <<"error">> => #{
+                                  <<"code">> => ?RPC_INVALID_PARAMETER,
+                                  <<"message">> => iolist_to_binary(
+                                      io_lib:format("Invalid descriptor: ~p", [ParseErr]))
+                              }}
+                    end
+                catch
+                    _:Err ->
+                        #{<<"success">> => false,
+                          <<"error">> => #{
+                              <<"code">> => ?RPC_MISC_ERROR,
+                              <<"message">> => iolist_to_binary(
+                                  io_lib:format("Error: ~p", [Err]))
+                          }}
+                end;
+            (_InvalidReq) ->
+                #{<<"success">> => false,
+                  <<"error">> => #{
+                      <<"code">> => ?RPC_INVALID_PARAMS,
+                      <<"message">> => <<"Missing required field 'desc'">>
+                  }}
+            end, Requests),
+            {ok, Results};
+        {error, _} ->
+            wallet_not_found_error(WalletName)
+    end;
+rpc_importdescriptors(_, _) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: importdescriptors \"requests\"">>}.
 
 %%% ===================================================================
 %%% PSBT methods (BIP 174)

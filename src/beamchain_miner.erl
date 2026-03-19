@@ -666,9 +666,9 @@ do_generate_blocks_loop(CoinbaseScript, N, MaxTries, State, Acc) ->
     end.
 
 %% Generate a single block using the current chain state.
-do_generate_one_block(CoinbaseScript, MaxTries, #state{params = Params}) ->
-    case create_block_template(CoinbaseScript) of
-        {ok, Template} ->
+do_generate_one_block(CoinbaseScript, MaxTries, #state{params = Params} = State) ->
+    case do_create_template(CoinbaseScript, #{}, State) of
+        {ok, Template, _State2} ->
             Header = maps:get(<<"_header">>, Template),
             AllTxs = maps:get(<<"_all_txs">>, Template),
             PowLimit = maps:get(pow_limit, Params),
