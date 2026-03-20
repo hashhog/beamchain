@@ -5,7 +5,7 @@
 
 %% Public API
 -export([verify_script/5, eval_script/5]).
--export([decode_script_num/2, encode_script_num/1, script_bool/1]).
+-export([decode_script_num/2, decode_script_num/3, encode_script_num/1, script_bool/1]).
 -export([check_minimal_encoding/1]).
 -export([flags_for_height/2]).
 
@@ -170,15 +170,19 @@ is_pay_to_anchor(_) -> false.
 %%% -------------------------------------------------------------------
 
 -spec decode_script_num(binary(), integer()) -> {ok, integer()} | {error, atom()}.
-decode_script_num(<<>>, _MaxLen) ->
+decode_script_num(Bin, MaxLen) ->
+    decode_script_num(Bin, MaxLen, false).
+
+-spec decode_script_num(binary(), integer(), boolean()) -> {ok, integer()} | {error, atom()}.
+decode_script_num(<<>>, _MaxLen, _RequireMinimal) ->
     {ok, 0};
-decode_script_num(Bin, MaxLen) when byte_size(Bin) > MaxLen ->
+decode_script_num(Bin, MaxLen, _RequireMinimal) when byte_size(Bin) > MaxLen ->
     {error, script_num_overflow};
-decode_script_num(Bin, _MaxLen) ->
+decode_script_num(Bin, _MaxLen, RequireMinimal) ->
     Bytes = binary_to_list(Bin),
-    case check_minimal_num(Bytes) of
-        false -> {ok, decode_num_bytes(Bytes)};
-        true -> {ok, decode_num_bytes(Bytes)}
+    case RequireMinimal andalso check_minimal_num(Bytes) of
+        true -> {error, non_minimal_encoding};
+        _ -> {ok, decode_num_bytes(Bytes)}
     end.
 
 decode_num_bytes([]) ->
@@ -363,7 +367,8 @@ pop_num(State) ->
 pop_num(State, MaxLen) ->
     case pop(State) of
         {ok, Bin, State1} ->
-            case decode_script_num(Bin, MaxLen) of
+            RequireMinimal = (State1#script_state.flags band ?SCRIPT_VERIFY_MINIMALDATA) =/= 0,
+            case decode_script_num(Bin, MaxLen, RequireMinimal) of
                 {ok, N} -> {ok, N, State1};
                 {error, _} = E -> E
             end;
@@ -1234,11 +1239,12 @@ do_arith(?OP_MAX, Rest, Pos, State) ->
 do_arith(?OP_WITHIN, Rest, Pos, State) ->
     case pop3(State) of
         {ok, X, Min, Max, State1} ->
-            case decode_script_num(X, 4) of
+            ReqMin = (State1#script_state.flags band ?SCRIPT_VERIFY_MINIMALDATA) =/= 0,
+            case decode_script_num(X, 4, ReqMin) of
                 {ok, XN} ->
-                    case decode_script_num(Min, 4) of
+                    case decode_script_num(Min, 4, ReqMin) of
                         {ok, MinN} ->
-                            case decode_script_num(Max, 4) of
+                            case decode_script_num(Max, 4, ReqMin) of
                                 {ok, MaxN} ->
                                     R = case MinN =< XN andalso XN < MaxN of
                                         true -> 1; false -> 0
