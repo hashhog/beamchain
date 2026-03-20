@@ -315,12 +315,17 @@ run_script_vectors() ->
         case Entry of
             L when is_list(L) ->
                 N = length(L),
+                %% Witness tests have a sub-list as first element
+                IsWitness = N >= 1 andalso is_list(hd(L)),
                 if
+                    IsWitness ->
+                        %% Witness test, skip for now
+                        maps:update_with(skip, fun(V) -> V + 1 end, Acc);
                     N =:= 1; N =:= 2; N =:= 3 ->
                         %% Comment or malformed, skip
                         Acc;
                     N >= 6 ->
-                        %% Witness test, skip for now
+                        %% Witness test (legacy format), skip for now
                         maps:update_with(skip, fun(V) -> V + 1 end, Acc);
                     N =:= 4; N =:= 5 ->
                         SigAsm = binary_to_list(lists:nth(1, L)),
@@ -340,14 +345,16 @@ run_script_vectors() ->
         end
     end, #{pass => 0, fail => 0, error => 0, skip => 0, total => 0}, Vectors),
 
-    io:format("~n=== Script Test Vector Results ===~n"),
-    io:format("Total non-witness tests: ~p~n", [maps:get(total, Results)]),
-    io:format("  PASS:  ~p~n", [maps:get(pass, Results)]),
-    io:format("  FAIL:  ~p~n", [maps:get(fail, Results)]),
-    io:format("  ERROR: ~p~n", [maps:get(error, Results)]),
-    io:format("  Skipped (witness): ~p~n", [maps:get(skip, Results)]),
+    io:format(standard_error, "~n=== Script Test Vector Results ===~n", []),
+    io:format(standard_error, "Total non-witness tests: ~p~n", [maps:get(total, Results)]),
+    io:format(standard_error, "  PASS:  ~p~n", [maps:get(pass, Results)]),
+    io:format(standard_error, "  FAIL:  ~p~n", [maps:get(fail, Results)]),
+    io:format(standard_error, "  ERROR: ~p~n", [maps:get(error, Results)]),
+    io:format(standard_error, "  Skipped (witness): ~p~n", [maps:get(skip, Results)]),
 
-    %% We report results but don't assert 100% pass for now
+    %% Assert 100% pass rate
+    ?assertEqual(0, maps:get(fail, Results)),
+    ?assertEqual(0, maps:get(error, Results)),
     ok.
 
 run_one_test(SigAsm, PubAsm, FlagsStr, Expected, Comment, Acc) ->

@@ -1,7 +1,7 @@
 -module(beamchain_crypto).
 
 %% Signature verification (NIF-backed)
--export([ecdsa_verify/3, schnorr_verify/3]).
+-export([ecdsa_verify/3, ecdsa_verify_lax/3, schnorr_verify/3]).
 
 %% Cached verification (checks sig cache before calling NIF)
 -export([ecdsa_verify_cached/3, schnorr_verify_cached/3]).
@@ -31,7 +31,7 @@
 -export([siphash/3, siphash_uint256/3]).
 
 %% DER signature handling
--export([decode_der_signature/1, encode_der_signature/2,
+-export([decode_der_signature/1, decode_der_lax/1, encode_der_signature/2,
          check_strict_der/1, is_low_s/1, normalize_s/1]).
 
 %% Public key validation
@@ -152,6 +152,24 @@ ecdsa_verify(Msg, Sig, PubKey) when byte_size(Msg) =:= 32 ->
         true  -> true;
         false -> false;
         {error, _} -> false
+    end.
+
+%% @doc ECDSA verify with lax DER parsing.
+%% Extracts R/S from non-strict DER, normalizes S (low-S), re-encodes
+%% as canonical DER, then passes to the strict NIF for verification.
+%% This matches Bitcoin Core's pre-BIP66 behavior.
+-spec ecdsa_verify_lax(Msg :: binary(), Sig :: binary(),
+                       PubKey :: binary()) -> boolean().
+ecdsa_verify_lax(Msg, Sig, PubKey) when byte_size(Msg) =:= 32 ->
+    case decode_der_lax(Sig) of
+        {ok, {R, S}} ->
+            %% Normalize S to low-S form
+            S2 = normalize_s(S),
+            %% Re-encode as canonical DER
+            CanonicalSig = encode_der_signature(R, S2),
+            ecdsa_verify(Msg, CanonicalSig, PubKey);
+        {error, _} ->
+            false
     end.
 
 -spec schnorr_verify(Msg :: binary(), Sig :: binary(),
@@ -493,6 +511,94 @@ validate_pubkey(_) -> false.
 is_compressed_pubkey(<<16#02, _:32/binary>>) -> true;
 is_compressed_pubkey(<<16#03, _:32/binary>>) -> true;
 is_compressed_pubkey(_) -> false.
+
+%%% -------------------------------------------------------------------
+%%% Lax DER signature decoding
+%%%
+%%% Matches Bitcoin Core's ecdsa_signature_parse_der_lax from pubkey.cpp.
+%%% Tolerates non-canonical DER: excess padding, negative integers,
+%%% incorrect compound length, etc. Returns the raw unsigned R/S values.
+%%% -------------------------------------------------------------------
+
+-spec decode_der_lax(binary()) ->
+    {ok, {R :: binary(), S :: binary()}} | {error, term()}.
+decode_der_lax(Sig) ->
+    try decode_der_lax_impl(Sig)
+    catch _:_ -> {error, invalid_lax_der}
+    end.
+
+decode_der_lax_impl(Sig) when byte_size(Sig) < 1 ->
+    {error, too_short};
+decode_der_lax_impl(<<16#30, Rest/binary>>) ->
+    %% Read compound length (skip it, don't validate)
+    {_CompoundLen, Rest2} = read_der_length(Rest),
+    %% Read R integer
+    case Rest2 of
+        <<16#02, Rest3/binary>> ->
+            {RLen, Rest4} = read_der_length(Rest3),
+            case Rest4 of
+                <<RBytes:RLen/binary, Rest5/binary>> ->
+                    %% Read S integer
+                    case Rest5 of
+                        <<16#02, Rest6/binary>> ->
+                            {SLen, Rest7} = read_der_length(Rest6),
+                            case Rest7 of
+                                <<SBytes:SLen/binary, _/binary>> ->
+                                    R = lax_int_to_unsigned(RBytes),
+                                    S = lax_int_to_unsigned(SBytes),
+                                    case R =:= <<>> orelse S =:= <<>> of
+                                        true -> {error, zero_rs};
+                                        false -> {ok, {R, S}}
+                                    end;
+                                _ ->
+                                    {error, s_truncated}
+                            end;
+                        _ ->
+                            {error, missing_s_tag}
+                    end;
+                _ ->
+                    {error, r_truncated}
+            end;
+        _ ->
+            {error, missing_r_tag}
+    end;
+decode_der_lax_impl(_) ->
+    {error, missing_sequence_tag}.
+
+%% Read a DER length field (handles 1-byte and multi-byte forms)
+read_der_length(<<>>) -> {0, <<>>};
+read_der_length(<<Len, Rest/binary>>) when Len < 16#80 ->
+    {Len, Rest};
+read_der_length(<<16#81, Len, Rest/binary>>) ->
+    {Len, Rest};
+read_der_length(<<16#82, Len:16/big, Rest/binary>>) ->
+    {Len, Rest};
+read_der_length(<<_, Rest/binary>>) ->
+    %% Fallback: treat as zero length
+    {0, Rest}.
+
+%% Convert a lax DER integer (possibly with padding/negative) to unsigned binary.
+%% Strips leading zero bytes but preserves at least 1 byte if non-zero.
+lax_int_to_unsigned(<<>>) -> <<>>;
+lax_int_to_unsigned(Bytes) ->
+    %% Strip all leading zero bytes
+    Stripped = strip_leading_zeros(Bytes),
+    case Stripped of
+        <<>> ->
+            %% All zeros
+            <<>>;
+        <<B, _/binary>> when B >= 16#80 ->
+            %% If the value bytes had high bit set, the leading zero was the sign byte.
+            %% For secp256k1 R/S, we just want the magnitude (unsigned).
+            Stripped;
+        _ ->
+            Stripped
+    end.
+
+strip_leading_zeros(<<0, Rest/binary>>) when byte_size(Rest) > 0 ->
+    strip_leading_zeros(Rest);
+strip_leading_zeros(Bin) ->
+    Bin.
 
 %%% -------------------------------------------------------------------
 %%% Internal helpers
