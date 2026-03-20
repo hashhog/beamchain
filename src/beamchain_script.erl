@@ -513,10 +513,14 @@ execute(<<PushLen, Rest/binary>>, Pos, State)
                 true ->
                     case check_push_size(Data, State) of
                         ok ->
-                            State1 = push(Data, State),
-                            case check_stack_size(State1) of
-                                true -> execute(Rest2, Pos + 1 + PushLen, State1);
-                                false -> {error, stack_overflow}
+                            case check_minimal_push(direct_push, Data, State) of
+                                ok ->
+                                    State1 = push(Data, State),
+                                    case check_stack_size(State1) of
+                                        true -> execute(Rest2, Pos + 1 + PushLen, State1);
+                                        false -> {error, stack_overflow}
+                                    end;
+                                Error -> Error
                             end;
                         Error -> Error
                     end;
@@ -539,15 +543,15 @@ execute(<<?OP_0, Rest/binary>>, Pos, State) ->
 
 %% --- OP_PUSHDATA1 ---
 execute(<<?OP_PUSHDATA1, Len:8, Rest/binary>>, Pos, State) ->
-    execute_pushdata(Len, Rest, Pos + 2, State);
+    execute_pushdata(Len, Rest, Pos + 2, State, pushdata1);
 
 %% --- OP_PUSHDATA2 ---
 execute(<<?OP_PUSHDATA2, Len:16/little, Rest/binary>>, Pos, State) ->
-    execute_pushdata(Len, Rest, Pos + 3, State);
+    execute_pushdata(Len, Rest, Pos + 3, State, pushdata2);
 
 %% --- OP_PUSHDATA4 ---
 execute(<<?OP_PUSHDATA4, Len:32/little, Rest/binary>>, Pos, State) ->
-    execute_pushdata(Len, Rest, Pos + 5, State);
+    execute_pushdata(Len, Rest, Pos + 5, State, pushdata4);
 
 %% --- OP_1NEGATE ---
 execute(<<?OP_1NEGATE, Rest/binary>>, Pos, State) ->
@@ -587,9 +591,13 @@ execute(<<?OP_NOP, Rest/binary>>, Pos, State) ->
 
 %% --- OP_VER (causes failure if executed) ---
 execute(<<?OP_VER, Rest/binary>>, Pos, State) ->
-    case executing(State) of
-        true -> {error, op_ver};
-        false -> execute(Rest, Pos + 1, State)
+    case count_op(State) of
+        {ok, State1} ->
+            case executing(State1) of
+                true -> {error, op_ver};
+                false -> execute(Rest, Pos + 1, State1)
+            end;
+        Error -> Error
     end;
 
 %% --- OP_VERIF / OP_VERNOTIF (always fail) ---
@@ -662,9 +670,13 @@ execute(<<?OP_VERIFY, Rest/binary>>, Pos, State) ->
 
 %% --- OP_RETURN ---
 execute(<<?OP_RETURN, Rest/binary>>, Pos, State) ->
-    case executing(State) of
-        true -> {error, op_return};
-        false -> execute(Rest, Pos + 1, State)
+    case count_op(State) of
+        {ok, State1} ->
+            case executing(State1) of
+                true -> {error, op_return};
+                false -> execute(Rest, Pos + 1, State1)
+            end;
+        Error -> Error
     end;
 
 %% --- Stack operations ---
@@ -769,14 +781,27 @@ execute(<<?OP_SIZE, Rest/binary>>, Pos, State) ->
         Error -> Error
     end;
 
-%% --- Disabled opcodes ---
+%% --- Disabled opcodes and remaining opcodes ---
 execute(<<Op, _Rest/binary>>, _Pos, #script_state{sig_version = SigVer} = _State)
   when is_integer(Op) ->
     case is_disabled_opcode(Op) of
         true when SigVer =/= tapscript ->
+            %% Disabled opcodes ALWAYS fail, even in non-executing branches
             {error, disabled_opcode};
         _ ->
-            execute_remaining(Op, _Rest, _Pos, _State)
+            case executing(_State) of
+                false ->
+                    %% In non-executing branches, skip all opcodes
+                    %% (except IF/NOTIF/ELSE/ENDIF which are handled above,
+                    %% and disabled opcodes which always fail).
+                    %% Still need to count the op.
+                    case count_op(_State) of
+                        {ok, State1} -> execute(_Rest, _Pos + 1, State1);
+                        Error -> Error
+                    end;
+                true ->
+                    execute_remaining(Op, _Rest, _Pos, _State)
+            end
     end;
 
 execute(_, _Pos, _State) ->
@@ -816,17 +841,21 @@ execute_remaining(Op, Rest, Pos, State) ->
 %%% Pushdata helper
 %%% -------------------------------------------------------------------
 
-execute_pushdata(Len, Bin, Pos, State) ->
+execute_pushdata(Len, Bin, Pos, State, PushType) ->
     case Bin of
         <<Data:Len/binary, Rest/binary>> ->
             case executing(State) of
                 true ->
                     case check_push_size(Data, State) of
                         ok ->
-                            State1 = push(Data, State),
-                            case check_stack_size(State1) of
-                                true -> execute(Rest, Pos + Len, State1);
-                                false -> {error, stack_overflow}
+                            case check_minimal_push(PushType, Data, State) of
+                                ok ->
+                                    State1 = push(Data, State),
+                                    case check_stack_size(State1) of
+                                        true -> execute(Rest, Pos + Len, State1);
+                                        false -> {error, stack_overflow}
+                                    end;
+                                Error -> Error
                             end;
                         Error -> Error
                     end;
@@ -848,6 +877,63 @@ check_push_size(Data, _State) ->
         true -> {error, push_size_exceeded};
         false -> ok
     end.
+
+%%% -------------------------------------------------------------------
+%%% CheckMinimalPush - MINIMALDATA enforcement for push opcodes
+%%% -------------------------------------------------------------------
+%%
+%% PushType indicates which opcode was used:
+%%   direct_push - OP_PUSHBYTES_N (1-75)
+%%   pushdata1   - OP_PUSHDATA1
+%%   pushdata2   - OP_PUSHDATA2
+%%   pushdata4   - OP_PUSHDATA4
+%%   pushdata    - generic (from execute_pushdata with old API)
+
+check_minimal_push(_PushType, _Data, #script_state{flags = Flags})
+  when (Flags band ?SCRIPT_VERIFY_MINIMALDATA) =:= 0 ->
+    ok;
+check_minimal_push(direct_push, Data, _State) ->
+    %% Direct push (1-75 bytes). Check if data could use a smaller opcode.
+    case Data of
+        <<N>> when N >= 1, N =< 16 ->
+            %% Should use OP_1 through OP_16
+            {error, minimaldata};
+        <<16#81>> ->
+            %% Should use OP_1NEGATE
+            {error, minimaldata};
+        _ ->
+            ok
+    end;
+check_minimal_push(pushdata1, Data, _State) ->
+    Len = byte_size(Data),
+    if
+        Len < 16#4c ->
+            %% Could use direct push
+            {error, minimaldata};
+        true ->
+            ok
+    end;
+check_minimal_push(pushdata2, Data, _State) ->
+    Len = byte_size(Data),
+    if
+        Len =< 16#ff ->
+            %% Could use PUSHDATA1
+            {error, minimaldata};
+        true ->
+            ok
+    end;
+check_minimal_push(pushdata4, Data, _State) ->
+    Len = byte_size(Data),
+    if
+        Len =< 16#ffff ->
+            %% Could use PUSHDATA2
+            {error, minimaldata};
+        true ->
+            ok
+    end;
+check_minimal_push(pushdata, _Data, _State) ->
+    %% Legacy path, no check
+    ok.
 
 %%% -------------------------------------------------------------------
 %%% IF/NOTIF execution
@@ -1360,24 +1446,6 @@ do_checksig_ecdsa(Rest, Pos, State) ->
                     HashTypeByte = binary:at(Sig, SigLen - 1),
                     SigBody = binary:part(Sig, 0, SigLen - 1),
                     Flags = State1#script_state.flags,
-                    %% check DER encoding
-                    DerOk = case Flags band ?SCRIPT_VERIFY_DERSIG of
-                        0 -> true;
-                        _ -> beamchain_crypto:check_strict_der(SigBody)
-                    end,
-                    LowSOk = case Flags band ?SCRIPT_VERIFY_LOW_S of
-                        0 -> true;
-                        _ ->
-                            case beamchain_crypto:decode_der_signature(SigBody) of
-                                {ok, {_R, S}} -> beamchain_crypto:is_low_s(S);
-                                _ -> false
-                            end
-                    end,
-                    StrictEncOk = case Flags band ?SCRIPT_VERIFY_STRICTENC of
-                        0 -> true;
-                        _ -> check_hash_type(HashTypeByte) andalso
-                             beamchain_crypto:validate_pubkey(PubKey)
-                    end,
                     %% BIP 141: WITNESS_PUBKEYTYPE requires compressed pubkeys in witness v0
                     WitnessPubKeyTypeOk = case State1#script_state.sig_version of
                         witness_v0 ->
@@ -1385,38 +1453,36 @@ do_checksig_ecdsa(Rest, Pos, State) ->
                             is_compressed_pubkey(PubKey);
                         _ -> true
                     end,
-                    case DerOk andalso LowSOk andalso StrictEncOk andalso WitnessPubKeyTypeOk of
-                        false when not WitnessPubKeyTypeOk ->
-                            %% WITNESS_PUBKEYTYPE failure is always an error
-                            {error, witness_pubkeytype};
+                    case WitnessPubKeyTypeOk of
                         false ->
-                            case Flags band ?SCRIPT_VERIFY_NULLFAIL of
-                                0 -> execute(Rest, Pos, push(script_false(), State1));
-                                _ -> {error, sig_encoding}
-                            end;
+                            {error, witness_pubkeytype};
                         true ->
-                            %% FindAndDelete: for legacy scripts, remove the
-                            %% signature from the scriptCode before computing sighash
-                            State2 = case State1#script_state.sig_version of
-                                base ->
-                                    S2 = find_and_delete(State1#script_state.script, Sig),
-                                    State1#script_state{script = S2};
-                                _ ->
-                                    State1
-                            end,
-                            SigChecker = State2#script_state.sig_checker,
-                            SigHash = compute_sig_hash(State2, HashTypeByte, Pos),
-                            Valid = check_ecdsa_sig(SigChecker, SigBody, PubKey, SigHash),
-                            case Valid of
-                                true ->
-                                    execute(Rest, Pos, push(script_true(), State1));
-                                false ->
-                                    case Flags band ?SCRIPT_VERIFY_NULLFAIL of
-                                        0 ->
-                                            execute(Rest, Pos,
-                                                    push(script_false(), State1));
+                            case check_sig_encoding(SigBody, HashTypeByte, PubKey, Flags) of
+                                {error, _} = E -> E;
+                                ok ->
+                                    %% FindAndDelete: for legacy scripts, remove the
+                                    %% signature from the scriptCode before computing sighash
+                                    State2 = case State1#script_state.sig_version of
+                                        base ->
+                                            S2 = find_and_delete(State1#script_state.script, Sig),
+                                            State1#script_state{script = S2};
                                         _ ->
-                                            {error, nullfail}
+                                            State1
+                                    end,
+                                    SigChecker = State2#script_state.sig_checker,
+                                    SigHash = compute_sig_hash(State2, HashTypeByte, Pos),
+                                    Valid = check_ecdsa_sig(SigChecker, SigBody, PubKey, SigHash),
+                                    case Valid of
+                                        true ->
+                                            execute(Rest, Pos, push(script_true(), State1));
+                                        false ->
+                                            case Flags band ?SCRIPT_VERIFY_NULLFAIL of
+                                                0 ->
+                                                    execute(Rest, Pos,
+                                                            push(script_false(), State1));
+                                                _ ->
+                                                    {error, nullfail}
+                                            end
                                     end
                             end
                     end
@@ -1562,22 +1628,27 @@ do_checksig_result(State, Pos) ->
                             SigLen = byte_size(Sig),
                             HashTypeByte = binary:at(Sig, SigLen - 1),
                             SigBody = binary:part(Sig, 0, SigLen - 1),
-                            %% FindAndDelete for legacy scripts
-                            State2 = case State1#script_state.sig_version of
-                                base ->
-                                    S2 = find_and_delete(State1#script_state.script, Sig),
-                                    State1#script_state{script = S2};
-                                _ ->
-                                    State1
-                            end,
-                            SigHash = compute_sig_hash(State2, HashTypeByte, Pos),
-                            Valid = check_ecdsa_sig(
-                                State2#script_state.sig_checker, SigBody, PubKey, SigHash),
-                            case Valid of
-                                false when (Flags band ?SCRIPT_VERIFY_NULLFAIL) =/= 0 ->
-                                    {error, nullfail};
-                                _ ->
-                                    {ok, Valid, State1}
+                            %% Check signature encoding
+                            case check_sig_encoding(SigBody, HashTypeByte, PubKey, Flags) of
+                                {error, _} = E -> E;
+                                ok ->
+                                    %% FindAndDelete for legacy scripts
+                                    State2 = case State1#script_state.sig_version of
+                                        base ->
+                                            S2 = find_and_delete(State1#script_state.script, Sig),
+                                            State1#script_state{script = S2};
+                                        _ ->
+                                            State1
+                                    end,
+                                    SigHash = compute_sig_hash(State2, HashTypeByte, Pos),
+                                    Valid = check_ecdsa_sig(
+                                        State2#script_state.sig_checker, SigBody, PubKey, SigHash),
+                                    case Valid of
+                                        false when (Flags band ?SCRIPT_VERIFY_NULLFAIL) =/= 0 ->
+                                            {error, nullfail};
+                                        _ ->
+                                            {ok, Valid, State1}
+                                    end
                             end
                     end
             end;
@@ -1629,16 +1700,22 @@ verify_multisig_sigs([PK | PKRest], [Sig | SigRest] = Sigs, State, Pos) ->
             SigLen = byte_size(Sig),
             HashTypeByte = binary:at(Sig, SigLen - 1),
             SigBody = binary:part(Sig, 0, SigLen - 1),
-            SigHash = compute_sig_hash(State, HashTypeByte, Pos),
-            case check_ecdsa_sig(State#script_state.sig_checker, SigBody, PK, SigHash) of
-                true ->
-                    verify_multisig_sigs(PKRest, SigRest, State, Pos);
-                false ->
-                    case length(PKRest) >= length(Sigs) of
+            Flags = State#script_state.flags,
+            %% Check signature encoding (DER, LOW_S, STRICTENC)
+            case check_sig_encoding(SigBody, HashTypeByte, PK, Flags) of
+                {error, _} = E -> E;
+                ok ->
+                    SigHash = compute_sig_hash(State, HashTypeByte, Pos),
+                    case check_ecdsa_sig(State#script_state.sig_checker, SigBody, PK, SigHash) of
                         true ->
-                            verify_multisig_sigs(PKRest, Sigs, State, Pos);
+                            verify_multisig_sigs(PKRest, SigRest, State, Pos);
                         false ->
-                            false
+                            case length(PKRest) >= length(Sigs) of
+                                true ->
+                                    verify_multisig_sigs(PKRest, Sigs, State, Pos);
+                                false ->
+                                    false
+                            end
                     end
             end
     end.
@@ -1716,6 +1793,8 @@ do_checkmultisig_eval(State, Pos) ->
                                                             case Result of
                                                                 true ->
                                                                     {ok, true, State6};
+                                                                {error, _} = E ->
+                                                                    E;
                                                                 false ->
                                                                     case (Flags band ?SCRIPT_VERIFY_NULLFAIL) =/= 0 andalso
                                                                          lists:any(fun(S) -> S =/= <<>> end, Sigs) of
@@ -1901,10 +1980,15 @@ execute_csv(Rest, Pos, State) ->
 execute_nop(Rest, Pos, State) ->
     case count_op(State) of
         {ok, State1} ->
-            Flags = State1#script_state.flags,
-            case Flags band ?SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS of
-                0 -> execute(Rest, Pos, State1);
-                _ -> {error, discourage_upgradable_nops}
+            case executing(State1) of
+                false ->
+                    execute(Rest, Pos, State1);
+                true ->
+                    Flags = State1#script_state.flags,
+                    case Flags band ?SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS of
+                        0 -> execute(Rest, Pos, State1);
+                        _ -> {error, discourage_upgradable_nops}
+                    end
             end;
         Error -> Error
     end.
@@ -2067,6 +2151,39 @@ compute_taproot_sig_hash(_, _, _) ->
 check_hash_type(HT) ->
     Base = HT band (bnot ?SIGHASH_ANYONECANPAY),
     Base >= ?SIGHASH_ALL andalso Base =< ?SIGHASH_SINGLE.
+
+%% @doc Check signature encoding (DER, LOW_S, STRICTENC) - returns ok or {error, Reason}.
+%% This consolidates all encoding checks done before signature verification.
+check_sig_encoding(SigBody, HashTypeByte, PubKey, Flags) ->
+    DerOk = case Flags band ?SCRIPT_VERIFY_DERSIG of
+        0 -> true;
+        _ -> beamchain_crypto:check_strict_der(SigBody)
+    end,
+    case DerOk of
+        false -> {error, sig_der};
+        true ->
+            LowSOk = case Flags band ?SCRIPT_VERIFY_LOW_S of
+                0 -> true;
+                _ ->
+                    case beamchain_crypto:decode_der_signature(SigBody) of
+                        {ok, {_R, S}} -> beamchain_crypto:is_low_s(S);
+                        _ -> false
+                    end
+            end,
+            case LowSOk of
+                false -> {error, sig_high_s};
+                true ->
+                    StrictEncOk = case Flags band ?SCRIPT_VERIFY_STRICTENC of
+                        0 -> true;
+                        _ -> check_hash_type(HashTypeByte) andalso
+                             beamchain_crypto:validate_pubkey(PubKey)
+                    end,
+                    case StrictEncOk of
+                        false -> {error, sig_encoding};
+                        true -> ok
+                    end
+            end
+    end.
 
 %%% -------------------------------------------------------------------
 %%% Top-level script verification
