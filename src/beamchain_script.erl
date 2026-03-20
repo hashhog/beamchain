@@ -250,8 +250,20 @@ check_minimal_encoding(Bin) ->
             true
     end.
 
-check_minimal_num(_Bytes) ->
-    true.
+check_minimal_num([]) ->
+    false;
+check_minimal_num(Bytes) ->
+    Len = length(Bytes),
+    Last = lists:last(Bytes),
+    case Last band 16#7f of
+        0 when Len =:= 1 ->
+            true;
+        0 when Len > 1 ->
+            PrevByte = lists:nth(Len - 1, Bytes),
+            (PrevByte band 16#80) =:= 0;
+        _ ->
+            false
+    end.
 
 %%% -------------------------------------------------------------------
 %%% Script boolean
