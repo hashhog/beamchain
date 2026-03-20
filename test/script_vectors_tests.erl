@@ -231,14 +231,39 @@ flag_value(Unknown) ->
     0.
 
 %%% -------------------------------------------------------------------
-%%% Dummy transaction for script verification
+%%% Bitcoin Core crediting/spending transaction construction
+%%%
+%%% Matches CTransaction BuildCreditingTransaction / BuildSpendingTransaction
+%%% from Bitcoin Core's src/test/script_tests.cpp:
+%%%   - Crediting tx: version=1, locktime=0, one input (null prevout
+%%%     hash=0, index=0xFFFFFFFF, scriptSig=OP_0 OP_0, seq=0xFFFFFFFF),
+%%%     one output (value=0, scriptPubKey=test's scriptPubKey).
+%%%   - Spending tx: version=1, locktime=0, one input (prevout=txid of
+%%%     crediting tx : 0, scriptSig=test's scriptSig, seq=0xFFFFFFFF),
+%%%     one output (value=0, scriptPubKey=empty).
 %%% -------------------------------------------------------------------
 
-make_dummy_tx(ScriptSig) ->
+make_crediting_tx(ScriptPubKey) ->
     #transaction{
         version = 1,
         inputs = [#tx_in{
             prev_out = #outpoint{hash = <<0:256>>, index = 16#ffffffff},
+            script_sig = <<16#00, 16#00>>,  %% OP_0 OP_0
+            sequence = 16#ffffffff,
+            witness = []
+        }],
+        outputs = [#tx_out{value = 0, script_pubkey = ScriptPubKey}],
+        locktime = 0,
+        txid = undefined,
+        wtxid = undefined
+    }.
+
+make_spending_tx(CreditingTx, ScriptSig) ->
+    CreditTxId = beamchain_serialize:tx_hash(CreditingTx),
+    #transaction{
+        version = 1,
+        inputs = [#tx_in{
+            prev_out = #outpoint{hash = CreditTxId, index = 0},
             script_sig = ScriptSig,
             sequence = 16#ffffffff,
             witness = []
@@ -249,14 +274,29 @@ make_dummy_tx(ScriptSig) ->
         wtxid = undefined
     }.
 
-%% Dummy signature checker that always fails sig checks
-make_dummy_checker(_Tx) ->
-    #{check_ecdsa_sig => fun(_Sig, _PubKey, _SigHash) -> false end,
-      check_schnorr_sig => fun(_Sig, _PubKey, _SigHash) -> false end,
-      check_locktime => fun(_LockTime) -> false end,
-      check_sequence => fun(_Sequence) -> false end,
-      compute_sighash => fun(_HashType, _SigVersion, _CodeSepPos) -> <<0:256>> end,
-      compute_taproot_sighash => fun(_HashType, _CodeSepPos) -> <<0:256>> end}.
+%% Build a real sig checker using the tuple form {Tx, InputIndex, Amount}.
+%% The script interpreter extracts the scriptCode from its internal state
+%% and computes real sighashes via beamchain_script:sighash_legacy/4.
+%% It then calls beamchain_crypto:ecdsa_verify_cached/3 for ECDSA verification.
+make_sig_checker(SpendingTx) ->
+    {SpendingTx, 0, 0}.
+
+%% Ensure the sig_cache ETS tables exist so ecdsa_verify_cached doesn't crash.
+%% In production these are created by the beamchain_sig_cache gen_server.
+ensure_sig_cache() ->
+    try ets:info(beamchain_sig_cache_tab, size) of
+        undefined ->
+            ets:new(beamchain_sig_cache_tab, [set, public, named_table,
+                                               {read_concurrency, true}]),
+            ets:new(beamchain_sig_cache_order, [ordered_set, public, named_table]);
+        _ ->
+            ok
+    catch
+        _:_ ->
+            ets:new(beamchain_sig_cache_tab, [set, public, named_table,
+                                               {read_concurrency, true}]),
+            ets:new(beamchain_sig_cache_order, [ordered_set, public, named_table])
+    end.
 
 %%% -------------------------------------------------------------------
 %%% Main test
@@ -266,6 +306,8 @@ script_vectors_test_() ->
     {timeout, 300, fun run_script_vectors/0}.
 
 run_script_vectors() ->
+    %% Ensure sig_cache ETS tables exist for ecdsa_verify_cached
+    ensure_sig_cache(),
     {ok, JsonBin} = file:read_file(?SCRIPT_TESTS_PATH),
     Vectors = jsx:decode(JsonBin, [return_maps]),
 
@@ -314,8 +356,12 @@ run_one_test(SigAsm, PubAsm, FlagsStr, Expected, Comment, Acc) ->
         ScriptSig = assemble_script(SigAsm),
         ScriptPubKey = assemble_script(PubAsm),
         Flags = parse_flags(FlagsStr),
-        Tx = make_dummy_tx(ScriptSig),
-        Checker = make_dummy_checker(Tx),
+
+        %% Build proper crediting and spending transactions
+        %% matching Bitcoin Core's BuildCreditingTransaction/BuildSpendingTransaction
+        CreditingTx = make_crediting_tx(ScriptPubKey),
+        SpendingTx = make_spending_tx(CreditingTx, ScriptSig),
+        Checker = make_sig_checker(SpendingTx),
 
         Result = beamchain_script:verify_script(ScriptSig, ScriptPubKey, [], Flags, Checker),
         GotOk = (Result =:= true),
