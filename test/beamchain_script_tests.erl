@@ -984,9 +984,13 @@ minimalif_enforcement_test() ->
     Script = <<2, 1, 0, 16#63, 16#51, 16#68>>,  %% <01 00> OP_IF OP_1 OP_ENDIF
     %% Without MINIMALIF, should succeed (<<1, 0>> is truthy)
     {ok, [<<1>>]} = beamchain_script:eval_script(Script, [], 0, #{}, base),
-    %% With MINIMALIF, should fail
+    %% MINIMALIF flag in base mode is ignored (per Bitcoin Core behavior:
+    %% MINIMALIF only applies in witness_v0 and tapscript execution contexts)
+    {ok, [<<1>>]} = beamchain_script:eval_script(
+        Script, [], ?SCRIPT_VERIFY_MINIMALIF, #{}, base),
+    %% In witness_v0 mode, MINIMALIF is enforced
     {error, _} = beamchain_script:eval_script(
-        Script, [], ?SCRIPT_VERIFY_MINIMALIF, #{}, base).
+        Script, [], ?SCRIPT_VERIFY_MINIMALIF, #{}, witness_v0).
 
 %% MINIMALIF in witness scripts: <<2>> as OP_IF argument must fail
 minimalif_witness_fail_test() ->

@@ -509,10 +509,10 @@ execute(<<PushLen, Rest/binary>>, Pos, State)
   when PushLen >= 1, PushLen =< 16#4b ->
     case Rest of
         <<Data:PushLen/binary, Rest2/binary>> ->
-            case executing(State) of
-                true ->
-                    case check_push_size(Data, State) of
-                        ok ->
+            case check_push_size(Data, State) of
+                ok ->
+                    case executing(State) of
+                        true ->
                             case check_minimal_push(direct_push, Data, State) of
                                 ok ->
                                     State1 = push(Data, State),
@@ -522,10 +522,10 @@ execute(<<PushLen, Rest/binary>>, Pos, State)
                                     end;
                                 Error -> Error
                             end;
-                        Error -> Error
+                        false ->
+                            execute(Rest2, Pos + 1 + PushLen, State)
                     end;
-                false ->
-                    execute(Rest2, Pos + 1 + PushLen, State)
+                Error -> Error
             end;
         _ ->
             {error, script_truncated}
@@ -844,10 +844,10 @@ execute_remaining(Op, Rest, Pos, State) ->
 execute_pushdata(Len, Bin, Pos, State, PushType) ->
     case Bin of
         <<Data:Len/binary, Rest/binary>> ->
-            case executing(State) of
-                true ->
-                    case check_push_size(Data, State) of
-                        ok ->
+            case check_push_size(Data, State) of
+                ok ->
+                    case executing(State) of
+                        true ->
                             case check_minimal_push(PushType, Data, State) of
                                 ok ->
                                     State1 = push(Data, State),
@@ -857,10 +857,10 @@ execute_pushdata(Len, Bin, Pos, State, PushType) ->
                                     end;
                                 Error -> Error
                             end;
-                        Error -> Error
+                        false ->
+                            execute(Rest, Pos + Len, State)
                     end;
-                false ->
-                    execute(Rest, Pos + Len, State)
+                Error -> Error
             end;
         _ ->
             {error, script_truncated}
@@ -952,7 +952,7 @@ execute_if(ExpectTrue, Rest, Pos, State) ->
                                 <<1>> -> true;
                                 _ -> error
                             end;
-                        _ ->
+                        witness_v0 ->
                             case (State1#script_state.flags band
                                   ?SCRIPT_VERIFY_MINIMALIF) =/= 0 of
                                 true ->
@@ -963,7 +963,9 @@ execute_if(ExpectTrue, Rest, Pos, State) ->
                                     end;
                                 false ->
                                     script_bool(Cond)
-                            end
+                            end;
+                        base ->
+                            script_bool(Cond)
                     end,
                     case Bool of
                         error ->
@@ -2028,9 +2030,11 @@ pop_n(N, State) when N > 0 ->
 check_ecdsa_sig(#{check_ecdsa_sig := Fun}, Sig, PubKey, SigHash) ->
     Fun(Sig, PubKey, SigHash);
 check_ecdsa_sig({_Tx, _Idx, _Amt, _PrevOuts}, Sig, PubKey, SigHash) ->
-    beamchain_crypto:ecdsa_verify_cached(SigHash, Sig, PubKey);
+    %% Use lax DER parsing: strict checks already done by check_sig_encoding.
+    %% Lax parsing handles pre-BIP66 non-canonical DER signatures.
+    beamchain_crypto:ecdsa_verify_lax(SigHash, Sig, PubKey);
 check_ecdsa_sig({_Tx, _Idx, _Amt}, Sig, PubKey, SigHash) ->
-    beamchain_crypto:ecdsa_verify_cached(SigHash, Sig, PubKey);
+    beamchain_crypto:ecdsa_verify_lax(SigHash, Sig, PubKey);
 check_ecdsa_sig(_, _Sig, _PubKey, _SigHash) ->
     false.
 
@@ -2155,7 +2159,7 @@ check_hash_type(HT) ->
 %% @doc Check signature encoding (DER, LOW_S, STRICTENC) - returns ok or {error, Reason}.
 %% This consolidates all encoding checks done before signature verification.
 check_sig_encoding(SigBody, HashTypeByte, PubKey, Flags) ->
-    DerOk = case Flags band ?SCRIPT_VERIFY_DERSIG of
+    DerOk = case Flags band (?SCRIPT_VERIFY_DERSIG bor ?SCRIPT_VERIFY_LOW_S bor ?SCRIPT_VERIFY_STRICTENC) of
         0 -> true;
         _ -> beamchain_crypto:check_strict_der(SigBody)
     end,
