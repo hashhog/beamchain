@@ -437,22 +437,24 @@ get_balance(Opts) ->
 %%% ===================================================================
 
 apply_opts(Opts) ->
-    %% Set network in application env before starting
+    %% Set network in application env before starting.
+    %% Use [{persistent, true}] so that application:load/1 does not
+    %% overwrite these values with the defaults from beamchain.app.
     case maps:get(network, Opts, undefined) of
         undefined -> ok;
-        Net -> application:set_env(beamchain, network, Net)
+        Net -> application:set_env(beamchain, network, Net, [{persistent, true}])
     end,
     case maps:get(datadir, Opts, undefined) of
         undefined -> ok;
-        Dir -> application:set_env(beamchain, datadir, Dir)
+        Dir -> application:set_env(beamchain, datadir, Dir, [{persistent, true}])
     end,
     case maps:get(rpc_port, Opts, undefined) of
         undefined -> ok;
-        RpcPort -> application:set_env(beamchain, rpcport, RpcPort)
+        RpcPort -> application:set_env(beamchain, rpcport, RpcPort, [{persistent, true}])
     end,
     case maps:get(p2p_port, Opts, undefined) of
         undefined -> ok;
-        P2pPort -> application:set_env(beamchain, p2pport, P2pPort)
+        P2pPort -> application:set_env(beamchain, p2pport, P2pPort, [{persistent, true}])
     end,
     case maps:get(debug, Opts, false) of
         true ->
