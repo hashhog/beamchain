@@ -311,6 +311,86 @@ ensure_sig_cache() ->
     end.
 
 %%% -------------------------------------------------------------------
+%%% Taproot placeholder resolution
+%%% -------------------------------------------------------------------
+
+%% The secp256k1 generator point x-coordinate (used as internal key)
+-define(TAPROOT_INTERNAL_KEY,
+    <<16#79, 16#BE, 16#66, 16#7E, 16#F9, 16#DC, 16#BB, 16#AC,
+      16#55, 16#A0, 16#62, 16#95, 16#CE, 16#87, 16#0B, 16#07,
+      16#02, 16#9B, 16#FC, 16#DB, 16#2D, 16#CE, 16#28, 16#D9,
+      16#59, 16#F2, 16#81, 16#5B, 16#16, 16#F8, 16#17, 16#98>>).
+
+%% Check if a witness array contains taproot placeholders
+has_taproot_placeholders(WitArray, PubStr) ->
+    HasWitPlaceholder = lists:any(fun(Item) ->
+        is_binary(Item) andalso
+        binary:match(Item, <<"#">>) =/= nomatch
+    end, WitArray),
+    HasPubPlaceholder = string:find(PubStr, "#") =/= nomatch,
+    HasWitPlaceholder orelse HasPubPlaceholder.
+
+%% Resolve taproot placeholders in a witness test vector.
+%% Returns {ResolvedWitBins, ResolvedPubAsm}.
+resolve_taproot_placeholders(WitHexItems, PubAsm) ->
+    %% Find the #SCRIPT# item and extract its ASM
+    {ScriptBin, ResolvedWitItems} = resolve_witness_items(WitHexItems),
+    %% Compute tapleaf hash: tagged_hash("TapLeaf", 0xc0 || compact_size(len) || script)
+    ScriptLen = byte_size(ScriptBin),
+    CompactLen = beamchain_serialize:encode_varint(ScriptLen),
+    LeafData = <<16#c0, CompactLen/binary, ScriptBin/binary>>,
+    LeafHash = beamchain_crypto:tagged_hash(<<"TapLeaf">>, LeafData),
+    %% Single leaf: merkle root = leaf hash
+    MerkleRoot = LeafHash,
+    %% Compute tweak: tagged_hash("TapTweak", internal_key || merkle_root)
+    TweakHash = beamchain_crypto:tagged_hash(
+        <<"TapTweak">>,
+        <<?TAPROOT_INTERNAL_KEY/binary, MerkleRoot/binary>>),
+    %% Compute tweaked output key via secp256k1 NIF
+    {ok, OutputKey, Parity} = beamchain_crypto:xonly_pubkey_tweak_add(
+        ?TAPROOT_INTERNAL_KEY, TweakHash),
+    %% Build control block: (0xc0 | parity) || internal_key (33 bytes)
+    LeafVersionByte = 16#c0 bor (Parity band 1),
+    ControlBlock = <<LeafVersionByte, ?TAPROOT_INTERNAL_KEY/binary>>,
+    %% Replace #CONTROLBLOCK# in witness items
+    FinalWitItems = lists:map(fun(Item) ->
+        case Item of
+            controlblock_placeholder -> ControlBlock;
+            _ -> Item
+        end
+    end, ResolvedWitItems),
+    %% Replace #TAPROOTOUTPUT# in scriptPubKey ASM
+    %% Prefix with 0x so the ASM assembler recognizes it as hex data
+    OutputKeyHex = "0x" ++ binary_to_list(beamchain_serialize:hex_encode(OutputKey)),
+    ResolvedPubAsm = re:replace(PubAsm, "#TAPROOTOUTPUT#", OutputKeyHex,
+                                [{return, list}, global]),
+    {FinalWitItems, ResolvedPubAsm}.
+
+%% Process witness hex items, resolving #SCRIPT# and marking #CONTROLBLOCK#.
+%% Returns {ScriptBin, ResolvedItems} where ScriptBin is the assembled script
+%% and ResolvedItems has binaries for normal items, the script binary for
+%% #SCRIPT# items, and the atom controlblock_placeholder for #CONTROLBLOCK#.
+resolve_witness_items(WitHexItems) ->
+    resolve_witness_items(WitHexItems, undefined, []).
+
+resolve_witness_items([], ScriptBin, Acc) ->
+    {ScriptBin, lists:reverse(Acc)};
+resolve_witness_items([Item | Rest], ScriptBin, Acc) ->
+    ItemStr = binary_to_list(Item),
+    case ItemStr of
+        "#SCRIPT# " ++ AsmStr ->
+            %% Assemble the ASM into script bytes
+            Script = assemble_script(AsmStr),
+            resolve_witness_items(Rest, Script, [Script | Acc]);
+        "#CONTROLBLOCK#" ->
+            resolve_witness_items(Rest, ScriptBin, [controlblock_placeholder | Acc]);
+        _ ->
+            %% Normal hex witness item
+            Bin = hex_to_bin(ItemStr),
+            resolve_witness_items(Rest, ScriptBin, [Bin | Acc])
+    end.
+
+%%% -------------------------------------------------------------------
 %%% Main test
 %%% -------------------------------------------------------------------
 
@@ -336,29 +416,28 @@ run_script_vectors() ->
                         %% or with comment at position 6.
                         %% Amount is LAST element of the sub-array.
                         WitArray = hd(L),
-                        %% Skip taproot vectors with #SCRIPT#/#CONTROLBLOCK# placeholders
-                        HasPlaceholder = lists:any(fun(Item) ->
-                            is_binary(Item) andalso
-                            binary:match(Item, <<"#">>) =/= nomatch
-                        end, WitArray),
-                        %% Also check scriptPubKey for placeholders
                         PubStr = binary_to_list(lists:nth(3, L)),
-                        HasPubPlaceholder = string:find(PubStr, "#") =/= nomatch,
-                        case HasPlaceholder orelse HasPubPlaceholder of
+                        HasPlaceholders = has_taproot_placeholders(WitArray, PubStr),
+                        AmountRaw = lists:last(WitArray),
+                        WitHexItems = lists:droplast(WitArray),
+                        SigAsm = binary_to_list(lists:nth(2, L)),
+                        FlagsStr = binary_to_list(lists:nth(4, L)),
+                        Expected = binary_to_list(lists:nth(5, L)),
+                        Comment = case N of
+                            6 -> binary_to_list(lists:nth(6, L));
+                            _ -> ""
+                        end,
+                        AmountSat = parse_amount(AmountRaw),
+                        case HasPlaceholders of
                             true ->
-                                maps:update_with(skip, fun(V) -> V + 1 end, Acc);
+                                %% Resolve taproot placeholders
+                                {WitnessBins, ResolvedPubAsm} =
+                                    resolve_taproot_placeholders(WitHexItems, PubStr),
+                                run_one_witness_test(SigAsm, ResolvedPubAsm, FlagsStr,
+                                                     Expected, Comment, WitnessBins,
+                                                     AmountSat, Acc);
                             false ->
-                                AmountRaw = lists:last(WitArray),
-                                WitHexItems = lists:droplast(WitArray),
-                                SigAsm = binary_to_list(lists:nth(2, L)),
                                 PubAsm = PubStr,
-                                FlagsStr = binary_to_list(lists:nth(4, L)),
-                                Expected = binary_to_list(lists:nth(5, L)),
-                                Comment = case N of
-                                    6 -> binary_to_list(lists:nth(6, L));
-                                    _ -> ""
-                                end,
-                                AmountSat = parse_amount(AmountRaw),
                                 WitnessBins = [hex_to_bin(binary_to_list(W)) || W <- WitHexItems],
                                 run_one_witness_test(SigAsm, PubAsm, FlagsStr, Expected,
                                                      Comment, WitnessBins, AmountSat, Acc)

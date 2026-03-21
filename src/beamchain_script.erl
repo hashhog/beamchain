@@ -325,7 +325,7 @@ is_op_success(16#89) -> true;
 is_op_success(16#8a) -> true;
 is_op_success(16#8d) -> true;
 is_op_success(16#8e) -> true;
-is_op_success(Op) when Op >= 16#95, Op =< 16#b9 -> true;
+is_op_success(Op) when Op >= 16#95, Op =< 16#99 -> true;
 is_op_success(Op) when Op >= 16#bb, Op =< 16#fe -> true;
 is_op_success(_) -> false.
 
