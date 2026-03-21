@@ -1707,16 +1707,27 @@ verify_multisig_sigs([PK | PKRest], [Sig | SigRest] = Sigs, State, Pos) ->
             case check_sig_encoding(SigBody, HashTypeByte, PK, Flags) of
                 {error, _} = E -> E;
                 ok ->
-                    SigHash = compute_sig_hash(State, HashTypeByte, Pos),
-                    case check_ecdsa_sig(State#script_state.sig_checker, SigBody, PK, SigHash) of
+                    %% BIP 141: WITNESS_PUBKEYTYPE requires compressed pubkeys in witness v0
+                    %% This check is per-key, matching Bitcoin Core's behavior
+                    WPKTOk = case State#script_state.sig_version of
+                        witness_v0 when (Flags band ?SCRIPT_VERIFY_WITNESS_PUBKEYTYPE) =/= 0 ->
+                            is_compressed_pubkey(PK);
+                        _ -> true
+                    end,
+                    case WPKTOk of
+                        false -> {error, witness_pubkeytype};
                         true ->
-                            verify_multisig_sigs(PKRest, SigRest, State, Pos);
-                        false ->
-                            case length(PKRest) >= length(Sigs) of
+                            SigHash = compute_sig_hash(State, HashTypeByte, Pos),
+                            case check_ecdsa_sig(State#script_state.sig_checker, SigBody, PK, SigHash) of
                                 true ->
-                                    verify_multisig_sigs(PKRest, Sigs, State, Pos);
+                                    verify_multisig_sigs(PKRest, SigRest, State, Pos);
                                 false ->
-                                    false
+                                    case length(PKRest) >= length(Sigs) of
+                                        true ->
+                                            verify_multisig_sigs(PKRest, Sigs, State, Pos);
+                                        false ->
+                                            false
+                                    end
                             end
                     end
             end
@@ -1758,16 +1769,6 @@ do_checkmultisig_eval(State, Pos) ->
                     case pop_n(NKeys, State2) of
                         {ok, PubKeys, State3} ->
                             Flags = State3#script_state.flags,
-                            %% BIP 141: WITNESS_PUBKEYTYPE requires compressed pubkeys in witness v0
-                            WitnessPubKeyTypeOk = case State3#script_state.sig_version of
-                                witness_v0 when (Flags band ?SCRIPT_VERIFY_WITNESS_PUBKEYTYPE) =/= 0 ->
-                                    lists:all(fun is_compressed_pubkey/1, PubKeys);
-                                _ -> true
-                            end,
-                            case WitnessPubKeyTypeOk of
-                                false ->
-                                    {error, witness_pubkeytype};
-                                true ->
                             case pop_num(State3) of
                                 {ok, NSigs, State4} when NSigs >= 0, NSigs =< NKeys ->
                                     case pop_n(NSigs, State4) of
@@ -1811,7 +1812,6 @@ do_checkmultisig_eval(State, Pos) ->
                                     end;
                                 {ok, _, _} -> {error, invalid_multisig};
                                 Error -> Error
-                            end
                             end;
                         Error -> Error
                     end
@@ -2197,20 +2197,9 @@ check_sig_encoding(SigBody, HashTypeByte, PubKey, Flags) ->
                     non_neg_integer(), term()) -> boolean().
 verify_script(ScriptSig, ScriptPubKey, Witness, Flags, SigChecker) ->
     try
-        Result = do_verify_script(ScriptSig, ScriptPubKey, Witness, Flags, SigChecker),
-        case Result of
-            false ->
-                logger:error("verify_script returned false for ~s",
-                             [binary:encode_hex(ScriptPubKey)]);
-            _ -> ok
-        end,
-        Result
+        do_verify_script(ScriptSig, ScriptPubKey, Witness, Flags, SigChecker)
     catch
-        Class:Reason:Stack ->
-            logger:error("verify_script exception: ~p:~p stack=~p "
-                         "scriptPubKey=~s",
-                         [Class, Reason, lists:sublist(Stack, 3),
-                          binary:encode_hex(ScriptPubKey)]),
+        _Class:_Reason:_Stack ->
             false
     end.
 
@@ -2268,16 +2257,42 @@ do_verify_script(ScriptSig, ScriptPubKey, Witness, Flags, SigChecker) ->
                             end,
                             %% Step 4: Witness program check
                             WitnessProg = extract_witness_program(ScriptPubKey),
+                            HadWitness = (Flags band ?SCRIPT_VERIFY_WITNESS) =/= 0,
                             WitnessResult = case WitnessProg of
-                                {ok, WitVer, WitProg} when
-                                    (Flags band ?SCRIPT_VERIFY_WITNESS) =/= 0 ->
-                                    verify_witness_program(
-                                        WitVer, WitProg, Witness,
-                                        Flags, SigChecker);
+                                {ok, WitVer, WitProg} when HadWitness ->
+                                    %% BIP 141: Native witness program -
+                                    %% scriptSig must be empty (WITNESS_MALLEATED)
+                                    case ScriptSig of
+                                        <<>> ->
+                                            verify_witness_program(
+                                                WitVer, WitProg, Witness,
+                                                Flags, SigChecker);
+                                        _ ->
+                                            {error, witness_malleated}
+                                    end;
                                 _ ->
                                     %% Check if P2SH redeem script is witness program
-                                    check_p2sh_witness(IsP2SH, StackCopy,
-                                        Witness, Flags, SigChecker, Stack3)
+                                    P2SHWitResult = check_p2sh_witness(
+                                        IsP2SH, StackCopy,
+                                        Witness, Flags, SigChecker, Stack3),
+                                    case P2SHWitResult of
+                                        {ok, FS} ->
+                                            %% BIP 141: If WITNESS flag is set and
+                                            %% no witness program was found (neither
+                                            %% native nor P2SH-wrapped), the witness
+                                            %% must be empty (WITNESS_UNEXPECTED)
+                                            IsP2SHWitness = is_p2sh_witness(
+                                                IsP2SH, StackCopy, Flags),
+                                            case HadWitness andalso
+                                                 not IsP2SHWitness andalso
+                                                 Witness =/= [] of
+                                                true ->
+                                                    {error, witness_unexpected};
+                                                false ->
+                                                    {ok, FS}
+                                            end;
+                                        Other -> Other
+                                    end
                             end,
                             case WitnessResult of
                                 {ok, FinalStack} ->
@@ -2288,10 +2303,7 @@ do_verify_script(ScriptSig, ScriptPubKey, Witness, Flags, SigChecker) ->
                                         false ->
                                             true
                                     end;
-                                {error, WE} ->
-                                    logger:error("verify: witness error=~p "
-                                                 "scriptPubKey=~s",
-                                                 [WE, binary:encode_hex(ScriptPubKey)]),
+                                {error, _WE} ->
                                     false
                             end
                     end;
@@ -2323,10 +2335,8 @@ verify_witness_program(0, Program, Witness, Flags, SigChecker)
                     Script = <<?OP_DUP, ?OP_HASH160,
                                20, Program/binary,
                                ?OP_EQUALVERIFY, ?OP_CHECKSIG>>,
-                    %% Add MINIMALIF for witness execution (prevents third-party malleability)
-                    WitnessFlags = Flags bor ?SCRIPT_VERIFY_MINIMALIF,
                     %% Stack: PubKey on top (HEAD), Sig below — matches P2PKH expectations
-                    P2WPKHResult = eval_script(Script, [PubKey, Sig], WitnessFlags, SigChecker, witness_v0),
+                    P2WPKHResult = eval_script(Script, [PubKey, Sig], Flags, SigChecker, witness_v0),
                     case P2WPKHResult of
                         {ok, [Top]} ->
                             case script_bool(Top) of
@@ -2360,12 +2370,10 @@ verify_witness_program(0, Program, Witness, Flags, SigChecker)
                     case byte_size(WitnessScript) > ?MAX_SCRIPT_SIZE of
                         true -> {error, witness_script_too_large};
                         false ->
-                            %% Add MINIMALIF for witness execution (prevents third-party malleability)
-                            WitnessFlags = Flags bor ?SCRIPT_VERIFY_MINIMALIF,
                             %% Reverse stack items: wire order is bottom-to-top,
                             %% but our list HEAD = top of stack
                             case eval_script(WitnessScript, lists:reverse(StackItems),
-                                           WitnessFlags, SigChecker, witness_v0) of
+                                           Flags, SigChecker, witness_v0) of
                                 {ok, [Top]} ->
                                     case script_bool(Top) of
                                         true -> {ok, [Top]};
@@ -2614,8 +2622,18 @@ check_p2sh_witness(true, [RS | _], Witness, Flags, SigChecker, _Stack3) ->
         _ ->
             {ok, _Stack3}
     end;
+check_p2sh_witness(true, [], _Witness, _Flags, _SigChecker, Stack3) ->
+    {ok, Stack3};
 check_p2sh_witness(_, _, _, _, _, Stack3) ->
     {ok, Stack3}.
+
+%% Check if the P2SH redeem script is a witness program (without executing it).
+%% Used to determine if we should enforce WITNESS_UNEXPECTED.
+is_p2sh_witness(true, [RS | _], Flags) ->
+    (Flags band ?SCRIPT_VERIFY_WITNESS) =/= 0 andalso
+    extract_witness_program(RS) =/= none;
+is_p2sh_witness(_, _, _) ->
+    false.
 
 %%% -------------------------------------------------------------------
 %%% Push-only check (for scriptSig with SIGPUSHONLY flag)
