@@ -244,6 +244,9 @@ flag_value(Unknown) ->
 %%% -------------------------------------------------------------------
 
 make_crediting_tx(ScriptPubKey) ->
+    make_crediting_tx(ScriptPubKey, 0).
+
+make_crediting_tx(ScriptPubKey, Amount) ->
     #transaction{
         version = 1,
         inputs = [#tx_in{
@@ -252,23 +255,29 @@ make_crediting_tx(ScriptPubKey) ->
             sequence = 16#ffffffff,
             witness = []
         }],
-        outputs = [#tx_out{value = 0, script_pubkey = ScriptPubKey}],
+        outputs = [#tx_out{value = Amount, script_pubkey = ScriptPubKey}],
         locktime = 0,
         txid = undefined,
         wtxid = undefined
     }.
 
 make_spending_tx(CreditingTx, ScriptSig) ->
+    make_spending_tx(CreditingTx, ScriptSig, []).
+
+make_spending_tx(CreditingTx, ScriptSig, Witness) ->
     CreditTxId = beamchain_serialize:tx_hash(CreditingTx),
+    %% Bitcoin Core: spending tx output value = crediting tx output value
+    [CreditOutput] = CreditingTx#transaction.outputs,
+    OutputValue = CreditOutput#tx_out.value,
     #transaction{
         version = 1,
         inputs = [#tx_in{
             prev_out = #outpoint{hash = CreditTxId, index = 0},
             script_sig = ScriptSig,
             sequence = 16#ffffffff,
-            witness = []
+            witness = Witness
         }],
-        outputs = [#tx_out{value = 0, script_pubkey = <<>>}],
+        outputs = [#tx_out{value = OutputValue, script_pubkey = <<>>}],
         locktime = 0,
         txid = undefined,
         wtxid = undefined
@@ -280,6 +289,9 @@ make_spending_tx(CreditingTx, ScriptSig) ->
 %% It then calls beamchain_crypto:ecdsa_verify_cached/3 for ECDSA verification.
 make_sig_checker(SpendingTx) ->
     {SpendingTx, 0, 0}.
+
+make_sig_checker(SpendingTx, Amount) ->
+    {SpendingTx, 0, Amount}.
 
 %% Ensure the sig_cache ETS tables exist so ecdsa_verify_cached doesn't crash.
 %% In production these are created by the beamchain_sig_cache gen_server.
@@ -318,14 +330,47 @@ run_script_vectors() ->
                 %% Witness tests have a sub-list as first element
                 IsWitness = N >= 1 andalso is_list(hd(L)),
                 if
+                    IsWitness andalso (N =:= 5 orelse N =:= 6) ->
+                        %% Witness format: [[wit_hex1, wit_hex2, ..., amount],
+                        %%                  scriptSig, scriptPubKey, flags, expected]
+                        %% or with comment at position 6.
+                        %% Amount is LAST element of the sub-array.
+                        WitArray = hd(L),
+                        %% Skip taproot vectors with #SCRIPT#/#CONTROLBLOCK# placeholders
+                        HasPlaceholder = lists:any(fun(Item) ->
+                            is_binary(Item) andalso
+                            binary:match(Item, <<"#">>) =/= nomatch
+                        end, WitArray),
+                        %% Also check scriptPubKey for placeholders
+                        PubStr = binary_to_list(lists:nth(3, L)),
+                        HasPubPlaceholder = string:find(PubStr, "#") =/= nomatch,
+                        case HasPlaceholder orelse HasPubPlaceholder of
+                            true ->
+                                maps:update_with(skip, fun(V) -> V + 1 end, Acc);
+                            false ->
+                                AmountRaw = lists:last(WitArray),
+                                WitHexItems = lists:droplast(WitArray),
+                                SigAsm = binary_to_list(lists:nth(2, L)),
+                                PubAsm = PubStr,
+                                FlagsStr = binary_to_list(lists:nth(4, L)),
+                                Expected = binary_to_list(lists:nth(5, L)),
+                                Comment = case N of
+                                    6 -> binary_to_list(lists:nth(6, L));
+                                    _ -> ""
+                                end,
+                                AmountSat = parse_amount(AmountRaw),
+                                WitnessBins = [hex_to_bin(binary_to_list(W)) || W <- WitHexItems],
+                                run_one_witness_test(SigAsm, PubAsm, FlagsStr, Expected,
+                                                     Comment, WitnessBins, AmountSat, Acc)
+                        end;
                     IsWitness ->
-                        %% Witness test, skip for now
+                        %% Unknown witness format, skip
                         maps:update_with(skip, fun(V) -> V + 1 end, Acc);
                     N =:= 1; N =:= 2; N =:= 3 ->
                         %% Comment or malformed, skip
                         Acc;
                     N >= 6 ->
-                        %% Witness test (legacy format), skip for now
+                        %% Unknown format, skip
                         maps:update_with(skip, fun(V) -> V + 1 end, Acc);
                     N =:= 4; N =:= 5 ->
                         SigAsm = binary_to_list(lists:nth(1, L)),
@@ -343,19 +388,30 @@ run_script_vectors() ->
             _ ->
                 Acc
         end
-    end, #{pass => 0, fail => 0, error => 0, skip => 0, total => 0}, Vectors),
+    end, #{pass => 0, fail => 0, error => 0, skip => 0, total => 0,
+           witness_pass => 0, witness_fail => 0, witness_error => 0,
+           witness_total => 0}, Vectors),
 
     io:format(standard_error, "~n=== Script Test Vector Results ===~n", []),
-    io:format(standard_error, "Total non-witness tests: ~p~n", [maps:get(total, Results)]),
+    io:format(standard_error, "Non-witness tests: ~p~n", [maps:get(total, Results)]),
     io:format(standard_error, "  PASS:  ~p~n", [maps:get(pass, Results)]),
     io:format(standard_error, "  FAIL:  ~p~n", [maps:get(fail, Results)]),
     io:format(standard_error, "  ERROR: ~p~n", [maps:get(error, Results)]),
-    io:format(standard_error, "  Skipped (witness): ~p~n", [maps:get(skip, Results)]),
+    io:format(standard_error, "Witness tests: ~p~n", [maps:get(witness_total, Results)]),
+    io:format(standard_error, "  PASS:  ~p~n", [maps:get(witness_pass, Results)]),
+    io:format(standard_error, "  FAIL:  ~p~n", [maps:get(witness_fail, Results)]),
+    io:format(standard_error, "  ERROR: ~p~n", [maps:get(witness_error, Results)]),
+    io:format(standard_error, "  Skipped: ~p~n", [maps:get(skip, Results)]),
 
-    %% Assert 100% pass rate
-    ?assertEqual(0, maps:get(fail, Results)),
-    ?assertEqual(0, maps:get(error, Results)),
+    TotalFail = maps:get(fail, Results) + maps:get(witness_fail, Results),
+    TotalError = maps:get(error, Results) + maps:get(witness_error, Results),
+    ?assertEqual(0, TotalFail),
+    ?assertEqual(0, TotalError),
     ok.
+
+%% Parse amount from JSON: can be integer or float (BTC, multiply by 1e8)
+parse_amount(V) when is_integer(V) -> V;
+parse_amount(V) when is_float(V) -> round(V * 100000000).
 
 run_one_test(SigAsm, PubAsm, FlagsStr, Expected, Comment, Acc) ->
     Acc1 = maps:update_with(total, fun(V) -> V + 1 end, Acc),
@@ -393,5 +449,47 @@ run_one_test(SigAsm, PubAsm, FlagsStr, Expected, Comment, Acc) ->
                     io:format("ERROR: ~p:~p sig=[~s] pub=[~s] flags=~s ~s~n",
                               [Class, Reason, SigAsm, PubAsm, FlagsStr, Comment]),
                     maps:update_with(error, fun(V) -> V + 1 end, Acc1)
+            end
+    end.
+
+run_one_witness_test(SigAsm, PubAsm, FlagsStr, Expected, Comment,
+                     WitnessBins, AmountSat, Acc) ->
+    Acc1 = maps:update_with(witness_total, fun(V) -> V + 1 end, Acc),
+    try
+        ScriptSig = assemble_script(SigAsm),
+        ScriptPubKey = assemble_script(PubAsm),
+        Flags = parse_flags(FlagsStr),
+
+        %% Build crediting tx with the correct amount
+        CreditingTx = make_crediting_tx(ScriptPubKey, AmountSat),
+        %% Build spending tx with witness data on the input
+        SpendingTx = make_spending_tx(CreditingTx, ScriptSig, WitnessBins),
+        %% Sig checker needs the amount for BIP143 sighash
+        Checker = make_sig_checker(SpendingTx, AmountSat),
+
+        Result = beamchain_script:verify_script(
+            ScriptSig, ScriptPubKey, WitnessBins, Flags, Checker),
+        GotOk = (Result =:= true),
+        ExpectedOk = (Expected =:= "OK"),
+
+        case GotOk =:= ExpectedOk of
+            true ->
+                maps:update_with(witness_pass, fun(V) -> V + 1 end, Acc1);
+            false ->
+                io:format("WITNESS FAIL: expected=~s got=~p sig=[~s] pub=[~s] flags=~s ~s~n",
+                          [Expected, Result, SigAsm, PubAsm, FlagsStr, Comment]),
+                maps:update_with(witness_fail, fun(V) -> V + 1 end, Acc1)
+        end
+    catch
+        Class:Reason ->
+            ExpectedOk2 = (Expected =:= "OK"),
+            case ExpectedOk2 of
+                false ->
+                    %% Expected failure and got exception, count as pass
+                    maps:update_with(witness_pass, fun(V) -> V + 1 end, Acc1);
+                true ->
+                    io:format("WITNESS ERROR: ~p:~p sig=[~s] pub=[~s] flags=~s ~s~n",
+                              [Class, Reason, SigAsm, PubAsm, FlagsStr, Comment]),
+                    maps:update_with(witness_error, fun(V) -> V + 1 end, Acc1)
             end
     end.
