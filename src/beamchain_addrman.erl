@@ -658,29 +658,67 @@ persist_to_dets(#state{dets_table = DetsTab, addr_table = AddrTab}) ->
 load_from_dets(DetsTab, #state{addr_table = AddrTab, new_buckets = NewBuckets,
                                 tried_buckets = TriedBuckets, secret = Secret} = State) ->
     {NewCount, TriedCount} = dets:foldl(
-        fun(#addr_info{address = Address, in_tried = InTried,
-                       source_netgroup = SourceNG} = Entry, {NC, TC}) ->
-            ets:insert(AddrTab, Entry),
-            case InTried of
-                true ->
-                    Bucket = get_tried_bucket(Address, Secret),
-                    Slot = get_bucket_position(Address, false, Bucket, Secret),
-                    ets:insert(TriedBuckets, {{Bucket, Slot}, Address}),
-                    {NC, TC + 1};
-                false ->
-                    SNG = case SourceNG of
-                        undefined -> other;
-                        _ -> SourceNG
-                    end,
-                    Bucket = get_new_bucket(Address, SNG, Secret),
-                    Slot = get_bucket_position(Address, true, Bucket, Secret),
-                    ets:insert(NewBuckets, {{Bucket, Slot}, Address}),
-                    {NC + 1, TC}
+        fun(RawEntry, {NC, TC}) ->
+            case upgrade_addr_info(RawEntry) of
+                skip ->
+                    {NC, TC};
+                #addr_info{address = Address, in_tried = InTried,
+                           source_netgroup = SourceNG} = Entry ->
+                    ets:insert(AddrTab, Entry),
+                    case InTried of
+                        true ->
+                            Bucket = get_tried_bucket(Address, Secret),
+                            Slot = get_bucket_position(Address, false, Bucket, Secret),
+                            ets:insert(TriedBuckets, {{Bucket, Slot}, Address}),
+                            {NC, TC + 1};
+                        false ->
+                            SNG = case SourceNG of
+                                undefined -> other;
+                                _ -> SourceNG
+                            end,
+                            Bucket = get_new_bucket(Address, SNG, Secret),
+                            Slot = get_bucket_position(Address, true, Bucket, Secret),
+                            ets:insert(NewBuckets, {{Bucket, Slot}, Address}),
+                            {NC + 1, TC}
+                    end
             end
         end, {0, 0}, DetsTab),
     logger:info("addrman: loaded ~B new, ~B tried addresses from disk",
                 [NewCount, TriedCount]),
     State#state{new_count = NewCount, tried_count = TriedCount}.
+
+%% @doc Upgrade old addr_info records to the current format.
+%% Old 8-element tuple (7 fields): {addr_info, Address, Services, Timestamp, Source, Attempts, LastTry, LastSuccess}
+%% Current 12-element tuple (11 fields): adds source_netgroup, in_tried, ref_count, network_id
+upgrade_addr_info(#addr_info{} = Entry) ->
+    %% Already current format
+    Entry;
+upgrade_addr_info(Tuple) when is_tuple(Tuple), element(1, Tuple) =:= addr_info,
+                               tuple_size(Tuple) =:= 8 ->
+    %% Old format: {addr_info, Address, Services, Timestamp, Source, Attempts, LastTry, LastSuccess}
+    Address = element(2, Tuple),
+    Services = element(3, Tuple),
+    Timestamp = element(4, Tuple),
+    Source = element(5, Tuple),
+    Attempts = element(6, Tuple),
+    LastTry = element(7, Tuple),
+    LastSuccess = element(8, Tuple),
+    #addr_info{
+        address = Address,
+        services = Services,
+        timestamp = Timestamp,
+        source = Source,
+        source_netgroup = undefined,
+        attempts = Attempts,
+        last_try = LastTry,
+        last_success = LastSuccess,
+        in_tried = false,
+        ref_count = 0,
+        network_id = 1
+    };
+upgrade_addr_info(Other) ->
+    logger:warning("addrman: skipping unrecognized DETS entry: ~p", [Other]),
+    skip.
 
 %%% ===================================================================
 %%% Internal: secret key management
