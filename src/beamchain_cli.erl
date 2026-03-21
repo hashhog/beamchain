@@ -190,6 +190,7 @@ start_node(Opts) ->
     apply_opts(Opts),
     case start_app() of
         ok ->
+            setup_file_logger(),
             print_banner(),
             io:format("~s~n", [green("node started, press Ctrl-C to stop")]),
             %% Block forever -the OTP app runs in the background
@@ -491,8 +492,16 @@ print_banner() ->
     Network = beamchain_config:network(),
     DataDir = beamchain_config:datadir(),
     Params = beamchain_config:network_params(),
-    P2PPort = Params#network_params.default_port,
-    RPCPort = Params#network_params.rpc_port,
+    P2PPort = case beamchain_config:get(p2pport) of
+        undefined -> Params#network_params.default_port;
+        PP when is_integer(PP) -> PP;
+        PP when is_list(PP) -> list_to_integer(PP)
+    end,
+    RPCPort = case beamchain_config:get(rpcport) of
+        undefined -> Params#network_params.rpc_port;
+        RP when is_integer(RP) -> RP;
+        RP when is_list(RP) -> list_to_integer(RP)
+    end,
     io:format("~n"),
     io:format("  ~s~n", [bold("beamchain " ++ ?VERSION)]),
     io:format("  ~s~n", [dim("bitcoin full node in erlang/otp")]),
@@ -513,6 +522,26 @@ block_forever() ->
         _ ->
             block_forever()
     end.
+
+%% @doc Set up a file logger so sync progress is visible in the log file.
+%% Writes to <datadir>/beamchain.log with info level.
+setup_file_logger() ->
+    DataDir = beamchain_config:datadir(),
+    LogFile = filename:join(DataDir, "beamchain.log"),
+    ok = filelib:ensure_dir(LogFile),
+    logger:add_handler(beamchain_file_logger, logger_std_h, #{
+        level => info,
+        config => #{
+            file => LogFile,
+            max_no_bytes => 10485760,   %% 10 MB
+            max_no_files => 3
+        },
+        formatter => {logger_formatter, #{
+            template => [time, " [", level, "] ", msg, "\n"],
+            single_line => true
+        }}
+    }),
+    ok.
 
 %% @doc Graceful shutdown -flush state and stop cleanly.
 graceful_shutdown() ->

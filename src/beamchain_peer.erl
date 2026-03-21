@@ -302,7 +302,7 @@ handshaking(info, {tcp_error, _, Reason}, Data) ->
     {stop, {tcp_error, Reason}};
 
 handshaking(info, {'DOWN', Ref, process, _, _}, #peer_data{handler_mon = Ref}) ->
-    {stop, handler_down};
+    {stop, {shutdown, handler_down}};
 
 handshaking(cast, disconnect, _Data) ->
     {stop, normal};
@@ -376,7 +376,7 @@ ready(info, {tcp_error, _, Reason}, Data) ->
     {stop, {tcp_error, Reason}};
 
 ready(info, {'DOWN', Ref, process, _, _}, #peer_data{handler_mon = Ref}) ->
-    {stop, handler_down};
+    {stop, {shutdown, handler_down}};
 
 ready(cast, {send, Command, PayloadData}, Data) ->
     Data2 = do_send_msg(Command, PayloadData, Data),
