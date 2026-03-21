@@ -300,6 +300,18 @@ init([]) ->
         ets:insert(?CONFIG_TABLE, {K, V})
     end, ConfigMap),
 
+    %% Store CLI port overrides from application env (set by apply_opts)
+    case application:get_env(beamchain, p2pport) of
+        {ok, P2PPort} when is_integer(P2PPort) ->
+            ets:insert(?CONFIG_TABLE, {p2pport, P2PPort});
+        _ -> ok
+    end,
+    case application:get_env(beamchain, rpcport) of
+        {ok, RPCPort} when is_integer(RPCPort) ->
+            ets:insert(?CONFIG_TABLE, {rpcport, RPCPort});
+        _ -> ok
+    end,
+
     State = #state{
         network = Network,
         datadir = DataDir,

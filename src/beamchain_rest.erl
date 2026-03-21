@@ -1066,11 +1066,17 @@ script_type(_) ->
 %%% ===================================================================
 
 rest_port(Params) ->
-    %% Use RPC port + 1 for REST by default, or read from config
+    %% Use RPC port + 10 for REST by default, or read from config.
+    %% Using +10 instead of +1 to avoid collision with P2P port
+    %% (e.g., testnet4: rpc=48332, p2p=48333, rest=48342).
     case os:getenv("BEAMCHAIN_REST_PORT") of
         false ->
-            RpcPort = Params#network_params.rpc_port,
-            RpcPort + 1;
+            RpcPort = case beamchain_config:get(rpcport) of
+                undefined -> Params#network_params.rpc_port;
+                P when is_integer(P) -> P;
+                P when is_list(P) -> list_to_integer(P)
+            end,
+            RpcPort + 10;
         PortStr ->
             list_to_integer(PortStr)
     end.

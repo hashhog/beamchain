@@ -1248,7 +1248,11 @@ ip_in_cidr(_, _, _) ->
 
 start_listener() ->
     Params = beamchain_config:network_params(),
-    Port = Params#network_params.default_port,
+    Port = case beamchain_config:get(p2pport) of
+        undefined -> Params#network_params.default_port;
+        P when is_integer(P) -> P;
+        P when is_list(P) -> list_to_integer(P)
+    end,
     case gen_tcp:listen(Port, [binary, {active, false}, {packet, raw},
                                 {reuseaddr, true}, {nodelay, true},
                                 {backlog, 128}]) of
@@ -1513,7 +1517,12 @@ is_network_protected(NetType, ProtectedNetworks) ->
 %% @doc Get our current chain tip height.
 get_our_tip_height() ->
     try
-        beamchain_chainstate:get_tip_height()
+        case beamchain_chainstate:get_tip_height() of
+            {ok, H} when is_integer(H) -> H;
+            not_found -> 0;
+            H when is_integer(H) -> H;
+            _ -> 0
+        end
     catch
         _:_ -> 0
     end.

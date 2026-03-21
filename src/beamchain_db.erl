@@ -146,22 +146,22 @@ has_block(Hash) when byte_size(Hash) =:= 32 ->
 %% @doc Get a UTXO by outpoint
 -spec get_utxo(binary(), non_neg_integer()) -> {ok, #utxo{}} | not_found.
 get_utxo(Txid, Vout) when byte_size(Txid) =:= 32 ->
-    gen_server:call(?SERVER, {get_utxo, Txid, Vout}).
+    gen_server:call(?SERVER, {get_utxo, Txid, Vout}, infinity).
 
 %% @doc Store a UTXO
 -spec store_utxo(binary(), non_neg_integer(), #utxo{}) -> ok.
 store_utxo(Txid, Vout, Utxo) when byte_size(Txid) =:= 32 ->
-    gen_server:call(?SERVER, {store_utxo, Txid, Vout, Utxo}).
+    gen_server:call(?SERVER, {store_utxo, Txid, Vout, Utxo}, infinity).
 
 %% @doc Spend (remove) a UTXO, returns the spent UTXO for undo data
 -spec spend_utxo(binary(), non_neg_integer()) -> {ok, #utxo{}} | not_found.
 spend_utxo(Txid, Vout) when byte_size(Txid) =:= 32 ->
-    gen_server:call(?SERVER, {spend_utxo, Txid, Vout}).
+    gen_server:call(?SERVER, {spend_utxo, Txid, Vout}, infinity).
 
 %% @doc Check if a UTXO exists
 -spec has_utxo(binary(), non_neg_integer()) -> boolean().
 has_utxo(Txid, Vout) when byte_size(Txid) =:= 32 ->
-    gen_server:call(?SERVER, {has_utxo, Txid, Vout}).
+    gen_server:call(?SERVER, {has_utxo, Txid, Vout}, infinity).
 
 %% @doc Store block index entry (header metadata for a given height)
 -spec store_block_index(non_neg_integer(), binary(), #block_header{},
