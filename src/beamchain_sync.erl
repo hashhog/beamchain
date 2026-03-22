@@ -98,7 +98,7 @@ handle_call(_Request, _From, State) ->
 handle_cast({peer_connected, Peer, Info}, State) ->
     beamchain_header_sync:handle_peer_connected(Peer, Info),
     beamchain_block_sync:handle_peer_connected(Peer, Info),
-    %% If we're idle, kick off header sync
+    %% If we're idle or complete, kick off header sync
     State2 = maybe_start_header_sync(State),
     {noreply, State2};
 
@@ -115,6 +115,12 @@ handle_cast({headers_complete, TipHeight}, #state{phase = headers} = State) ->
     State2 = cancel_header_check_timer(State),
     State3 = start_block_sync(TipHeight, State2),
     {noreply, State3};
+handle_cast({headers_complete, TipHeight}, #state{phase = complete} = State) ->
+    %% Re-entered header sync after being complete; download new blocks
+    logger:info("sync: new headers found at ~B, starting block download",
+                [TipHeight]),
+    State2 = start_block_sync(TipHeight, State),
+    {noreply, State2};
 handle_cast({headers_complete, _TipHeight}, State) ->
     {noreply, State};
 
@@ -185,9 +191,30 @@ route_message(Peer, notfound, Payload, State) ->
     end,
     State;
 
-route_message(_Peer, inv, _Payload, State) ->
-    %% TODO: handle block announcements via inv
-    State;
+route_message(Peer, inv, Payload, State) ->
+    case beamchain_p2p_msg:decode_payload(inv, Payload) of
+        {ok, #{items := Items}} ->
+            %% Check if any items are block announcements
+            HasBlock = lists:any(fun(#{type := Type}) ->
+                Type =:= ?MSG_BLOCK orelse Type =:= ?MSG_WITNESS_BLOCK;
+                (_) -> false
+            end, Items),
+            case HasBlock andalso State#state.phase =:= complete of
+                true ->
+                    %% Peer announced a new block and we think we're
+                    %% synced — kick off a header sync cycle to catch up
+                    logger:info("sync: received block inv from ~p, "
+                                "restarting header sync", [Peer]),
+                    beamchain_header_sync:start_sync(#{}),
+                    Timer = erlang:send_after(?HEADER_CHECK_INTERVAL,
+                                              self(), check_header_sync),
+                    State#state{phase = headers, header_check_timer = Timer};
+                _ ->
+                    State
+            end;
+        _Error ->
+            State
+    end;
 
 %% BIP152 compact block messages
 route_message(Peer, cmpctblock, Payload, State) ->
@@ -218,6 +245,13 @@ route_message(_Peer, _Command, _Payload, State) ->
 maybe_start_header_sync(#state{phase = idle} = State) ->
     beamchain_header_sync:start_sync(#{}),
     %% Start polling for header sync completion
+    Timer = erlang:send_after(?HEADER_CHECK_INTERVAL, self(),
+                               check_header_sync),
+    State#state{phase = headers, header_check_timer = Timer};
+maybe_start_header_sync(#state{phase = complete} = State) ->
+    %% After completing sync, allow re-entering header sync when new
+    %% peers connect that may have newer blocks.
+    beamchain_header_sync:start_sync(#{}),
     Timer = erlang:send_after(?HEADER_CHECK_INTERVAL, self(),
                                check_header_sync),
     State#state{phase = headers, header_check_timer = Timer};
