@@ -149,13 +149,14 @@ handle_call(get_status, _From, State) ->
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_request}, State}.
 
-handle_cast({start_sync, Opts}, #state{status = idle} = State) ->
+handle_cast({start_sync, Opts}, #state{status = Status} = State)
+  when Status =:= idle; Status =:= complete ->
     ProgressCb = maps:get(progress_cb, Opts, undefined),
-    State2 = State#state{progress_cb = ProgressCb},
+    State2 = State#state{progress_cb = ProgressCb, status = idle},
     State3 = pick_sync_peer_and_start(State2),
     {noreply, State3};
 handle_cast({start_sync, _Opts}, State) ->
-    %% Already syncing or complete
+    %% Already syncing
     {noreply, State};
 
 handle_cast(stop_sync, State) ->
@@ -185,11 +186,13 @@ handle_cast({peer_connected, Peer, Info}, State) ->
     PeerHeight = maps:get(start_height, Info, 0),
     PeerHeights = maps:put(Peer, PeerHeight, State#state.peer_heights),
     State2 = State#state{peer_heights = PeerHeights},
-    %% If we're idle and this peer is ahead of us, start syncing
+    %% If we're idle or complete and this peer is ahead, start syncing
     case State2#state.status of
-        idle when PeerHeight > State2#state.tip_height ->
-            State3 = pick_sync_peer_and_start(State2),
-            {noreply, State3};
+        Status when (Status =:= idle orelse Status =:= complete),
+                    PeerHeight > State2#state.tip_height ->
+            State3 = State2#state{status = idle},
+            State4 = pick_sync_peer_and_start(State3),
+            {noreply, State4};
         _ ->
             {noreply, State2}
     end;
