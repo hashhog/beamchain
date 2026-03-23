@@ -155,8 +155,9 @@ params(testnet4) ->
         taproot_height => 1,
 
         min_chainwork => <<0:256>>,
-        %% Disabled — verify all scripts during sync
-        assume_valid => <<0:256>>,
+        %% Skip script verification below height 123613
+        assume_valid => hex_to_bin(
+            "0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a"),
         checkpoints => #{},
 
         %% assumeutxo snapshots
