@@ -110,30 +110,30 @@ get_next_work_required(PrevIndex, Header, Params) ->
             %% regtest: never adjust difficulty
             PrevBits;
         false ->
-            %% BIP-94: check min-difficulty BEFORE retarget boundary.
-            %% If block timestamp > prev + spacing*2, allow powLimit even
-            %% at retarget boundaries (matches Bitcoin Core ordering).
-            Spacing = maps:get(pow_target_spacing, Params, ?POW_TARGET_SPACING),
-            MinDiffTriggered = AllowMinDiff andalso
-                (Header#block_header.timestamp >
-                 PrevHeader#block_header.timestamp + Spacing * 2),
-            case MinDiffTriggered of
-                true ->
-                    PowLimitBits;
-                false ->
-                    case Height rem ?DIFFICULTY_ADJUSTMENT_INTERVAL of
-                        0 ->
-                            %% retarget boundary
-                            calculate_retarget(PrevIndex, Params);
-                        _ ->
-                            %% not at a retarget boundary
-                            case AllowMinDiff of
+            case Height rem ?DIFFICULTY_ADJUSTMENT_INTERVAL of
+                0 ->
+                    %% Retarget boundary — always recalculate difficulty.
+                    %% Min-difficulty 20-minute rule does NOT apply here
+                    %% (matches Bitcoin Core ordering).
+                    calculate_retarget(PrevIndex, Params);
+                _ ->
+                    %% Not at a retarget boundary
+                    case AllowMinDiff of
+                        true ->
+                            %% Testnet min-difficulty rule: if timestamp
+                            %% > prev + spacing*2, allow powLimit
+                            Spacing = maps:get(pow_target_spacing, Params,
+                                               ?POW_TARGET_SPACING),
+                            case Header#block_header.timestamp >
+                                 PrevHeader#block_header.timestamp + Spacing * 2 of
                                 true ->
-                                    %% walk back to find the last non-min-difficulty block
-                                    find_last_non_special_block(PrevIndex, Params);
+                                    PowLimitBits;
                                 false ->
-                                    PrevBits
-                            end
+                                    %% Walk back to last non-min-difficulty block
+                                    find_last_non_special_block(PrevIndex, Params)
+                            end;
+                        false ->
+                            PrevBits
                     end
             end
     end.
