@@ -173,10 +173,10 @@ handle_cast({headers, Peer, Headers}, #state{status = syncing,
             {noreply, State3};
         {error, invalid_pow} ->
             logger:warning("header_sync: peer ~p sent header with invalid PoW", [Peer]),
-            handle_misbehaving_peer(Peer, 100, State2);
+            {noreply, handle_misbehaving_peer(Peer, 100, State2)};
         {error, non_continuous} ->
             logger:warning("header_sync: peer ~p sent non-continuous headers", [Peer]),
-            handle_misbehaving_peer(Peer, 100, State2)
+            {noreply, handle_misbehaving_peer(Peer, 100, State2)}
     end;
 handle_cast({headers, _Peer, _Headers}, State) ->
     %% Headers from a peer we're not syncing from, ignore
@@ -478,7 +478,7 @@ handle_misbehaving_peer(Peer, Score, State) ->
     %% Remove peer from tracking
     State2 = remove_peer_state(Peer, State),
     State3 = State2#state{sync_peer = undefined, status = idle},
-    {noreply, pick_sync_peer_and_start(State3)}.
+    pick_sync_peer_and_start(State3).
 
 %%% ===================================================================
 %%% Anti-DoS: Per-peer state management
