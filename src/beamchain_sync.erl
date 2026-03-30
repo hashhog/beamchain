@@ -194,23 +194,38 @@ route_message(Peer, notfound, Payload, State) ->
 route_message(Peer, inv, Payload, State) ->
     case beamchain_p2p_msg:decode_payload(inv, Payload) of
         {ok, #{items := Items}} ->
-            %% Check if any items are block announcements
-            HasBlock = lists:any(fun(#{type := Type}) ->
-                Type =:= ?MSG_BLOCK orelse Type =:= ?MSG_WITNESS_BLOCK;
+            %% Collect block inv items we don't already have
+            BlockItems = lists:filter(fun(#{type := Type, hash := Hash}) ->
+                (Type =:= ?MSG_BLOCK orelse Type =:= ?MSG_WITNESS_BLOCK)
+                    andalso not beamchain_db:has_block(Hash);
                 (_) -> false
             end, Items),
-            case HasBlock andalso State#state.phase =:= complete of
-                true ->
-                    %% Peer announced a new block and we think we're
-                    %% synced — kick off a header sync cycle to catch up
-                    logger:info("sync: received block inv from ~p, "
-                                "restarting header sync", [Peer]),
-                    beamchain_header_sync:start_sync(#{}),
-                    Timer = erlang:send_after(?HEADER_CHECK_INTERVAL,
-                                              self(), check_header_sync),
-                    State#state{phase = headers, header_check_timer = Timer};
+            case BlockItems of
+                [] ->
+                    State;
                 _ ->
-                    State
+                    %% Directly request the announced blocks via getdata
+                    %% so we don't depend on a getheaders round-trip
+                    GetDataItems = [#{type => ?MSG_WITNESS_BLOCK,
+                                      hash => Hash}
+                                    || #{hash := Hash} <- BlockItems],
+                    beamchain_peer:send_message(Peer,
+                        {getdata, #{items => GetDataItems}}),
+                    logger:info("sync: received block inv from ~p, "
+                                "requesting ~B blocks via getdata",
+                                [Peer, length(GetDataItems)]),
+                    %% Also kick off header sync if we think we're done,
+                    %% so the header chain catches up too
+                    case State#state.phase =:= complete of
+                        true ->
+                            beamchain_header_sync:start_sync(#{}),
+                            Timer = erlang:send_after(?HEADER_CHECK_INTERVAL,
+                                                      self(), check_header_sync),
+                            State#state{phase = headers,
+                                        header_check_timer = Timer};
+                        false ->
+                            State
+                    end
             end;
         _Error ->
             State
