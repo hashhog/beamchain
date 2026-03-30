@@ -366,13 +366,133 @@ process_headers(Headers, Peer, State) ->
             State2 = reset_unconnecting_count(Peer, State),
             process_connecting_headers(Headers, Peer, State2);
         false ->
-            %% Headers don't connect - track and handle
-            handle_unconnecting_headers(Headers, Peer, State)
+            %% Headers don't connect to our tip. Check if this is a
+            %% reorg: the headers may connect to an earlier known block
+            %% in our chain (or a known fork block).
+            case check_reorg(FirstHeader, Headers, State) of
+                {reorg, ForkHeight, _ForkHash, _ForkCW, State2} ->
+                    %% Reorg detected: headers connect to a known block
+                    %% that is an ancestor of our tip. Roll back and
+                    %% process the new (more-work) chain.
+                    logger:info("header_sync: reorg detected at height ~B, "
+                                "rolling back from ~B",
+                                [ForkHeight, State#state.tip_height]),
+                    State3 = reset_unconnecting_count(Peer, State2),
+                    process_connecting_headers(Headers, Peer, State3);
+                no_reorg ->
+                    %% Not a recognized reorg - handle as unconnecting
+                    handle_unconnecting_headers(Headers, Peer, State)
+            end
     end.
 
 %% Check if a header connects to our current chain tip
 headers_connect_to_chain(Header, #state{tip_hash = TipHash}) ->
     Header#block_header.prev_hash =:= TipHash.
+
+%% Check if unconnecting headers represent a reorg (fork with more work).
+%% If the first header's prev_hash points to a known block in our index,
+%% the peer is offering an alternative chain from that fork point.
+check_reorg(FirstHeader, Headers, #state{tip_height = TipHeight,
+                                          tip_chainwork = TipCW,
+                                          params = Params} = State) ->
+    PrevHash = FirstHeader#block_header.prev_hash,
+    case beamchain_db:get_block_index_by_hash(PrevHash) of
+        {ok, #{height := ForkHeight, chainwork := ForkCW}} ->
+            %% The headers connect to a known block at ForkHeight.
+            %% Estimate the incoming chain's work: fork chainwork +
+            %% work from the new headers.
+            NewWork = lists:foldl(fun(H, Acc) ->
+                Acc + beamchain_pow:compute_work(H#block_header.bits)
+            end, 0, Headers),
+            ForkCWInt = binary:decode_unsigned(ForkCW, big),
+            IncomingCWInt = ForkCWInt + NewWork,
+            TipCWInt = binary:decode_unsigned(TipCW, big),
+            case IncomingCWInt > TipCWInt orelse
+                 (length(Headers) + ForkHeight > TipHeight andalso
+                  ForkHeight >= TipHeight - 10) of
+                true ->
+                    %% More work (or a shallow fork where the peer
+                    %% likely has more headers to send). Accept reorg.
+                    logger:info("header_sync: fork at height ~B "
+                                "(depth ~B), incoming work ~B vs tip ~B",
+                                [ForkHeight,
+                                 TipHeight - ForkHeight,
+                                 IncomingCWInt, TipCWInt]),
+                    %% Mark orphaned blocks as invalid in the index
+                    mark_orphaned_blocks(ForkHeight + 1, TipHeight),
+                    %% Roll back state to the fork point
+                    State2 = rollback_to(ForkHeight, PrevHash, ForkCW,
+                                          Params, State),
+                    {reorg, ForkHeight, PrevHash, ForkCW, State2};
+                false ->
+                    %% Less work - don't reorg
+                    logger:debug("header_sync: ignoring fork at ~B "
+                                 "(less work)", [ForkHeight]),
+                    no_reorg
+            end;
+        not_found ->
+            %% prev_hash not in our index at all
+            no_reorg
+    end.
+
+%% Mark blocks from StartHeight to EndHeight as orphaned (failed valid).
+mark_orphaned_blocks(StartHeight, EndHeight) when StartHeight > EndHeight ->
+    ok;
+mark_orphaned_blocks(Height, EndHeight) ->
+    case beamchain_db:get_block_index(Height) of
+        {ok, #{hash := Hash}} ->
+            %% Mark as failed validation (orphaned)
+            beamchain_db:update_block_status(Hash, 32),
+            mark_orphaned_blocks(Height + 1, EndHeight);
+        not_found ->
+            ok
+    end.
+
+%% Roll back the header sync state to a given fork point.
+rollback_to(ForkHeight, ForkHash, ForkCW, Params, State) ->
+    %% Update header tip in DB
+    ok = beamchain_db:set_header_tip(ForkHash, ForkHeight),
+    %% Also disconnect blocks from the chainstate (UTXO set) back to
+    %% the fork point. Without this, the UTXO set still contains
+    %% outputs from the orphaned blocks, causing BIP30 failures.
+    disconnect_chainstate_to(ForkHeight),
+    %% Rebuild MTP window from the fork point
+    MTPWindow = load_mtp_window(ForkHeight, Params),
+    State#state{
+        tip_height = ForkHeight,
+        tip_hash = ForkHash,
+        tip_chainwork = ForkCW,
+        mtp_window = MTPWindow
+    }.
+
+%% Disconnect blocks from the chainstate until the chainstate tip is
+%% at or below TargetHeight. Uses undo data to reverse UTXO changes.
+disconnect_chainstate_to(TargetHeight) ->
+    case beamchain_chainstate:get_tip() of
+        {ok, {_Hash, TipHeight}} when TipHeight > TargetHeight ->
+            logger:info("header_sync: disconnecting chainstate from ~B to ~B",
+                        [TipHeight, TargetHeight]),
+            disconnect_chainstate_loop(TargetHeight);
+        _ ->
+            %% Chainstate is already at or below fork point
+            ok
+    end.
+
+disconnect_chainstate_loop(TargetHeight) ->
+    case beamchain_chainstate:get_tip() of
+        {ok, {_Hash, TipHeight}} when TipHeight > TargetHeight ->
+            case beamchain_chainstate:disconnect_block() of
+                ok ->
+                    disconnect_chainstate_loop(TargetHeight);
+                {error, Reason} ->
+                    logger:error("header_sync: chainstate disconnect failed: ~p",
+                                 [Reason]),
+                    %% Continue anyway — block sync will handle the mismatch
+                    ok
+            end;
+        _ ->
+            ok
+    end.
 
 %% Process headers that connect to our chain
 process_connecting_headers(Headers, Peer, State) ->
