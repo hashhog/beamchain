@@ -226,8 +226,11 @@ init({inbound, Socket, Addr, Handler}) ->
     Nonce = generate_nonce(),
     Magic = beamchain_config:magic(),
     MonRef = erlang:monitor(process, Handler),
-    inet:setopts(Socket, [{active, once},
-                           {recbuf, 262144}, {sndbuf, 262144}]),
+    %% Only set buffer sizes here.  Do NOT enable {active, once} yet —
+    %% the socket's controlling process is still the peer manager at this
+    %% point.  We wait for a socket_owner_transferred message (sent by
+    %% the manager after gen_tcp:controlling_process/2) before activating.
+    inet:setopts(Socket, [{recbuf, 262144}, {sndbuf, 262144}]),
     Data = #peer_data{
         socket = Socket,
         address = Addr,
@@ -281,6 +284,12 @@ handshaking(enter, _OldState, _Data) ->
 handshaking(state_timeout, handshake_timeout, Data) ->
     logger:info("peer ~p handshake timeout", [Data#peer_data.address]),
     {stop, handshake_timeout};
+
+handshaking(info, socket_owner_transferred, #peer_data{socket = Socket} = Data) ->
+    %% The peer manager has transferred socket ownership to us.
+    %% Now it is safe to enable active-once delivery.
+    inet:setopts(Socket, [{active, once}]),
+    {keep_state, Data};
 
 handshaking(info, {tcp, Socket, Bin}, #peer_data{socket = Socket} = Data) ->
     case handle_tcp_data(Bin, Data) of
