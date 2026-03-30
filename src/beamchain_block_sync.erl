@@ -284,8 +284,12 @@ handle_cast(stop_sync, State) ->
 handle_cast({block, Peer, Block}, #state{status = syncing} = State) ->
     State2 = handle_block_received(Peer, Block, State),
     {noreply, State2};
-handle_cast({block, _Peer, _Block}, State) ->
-    {noreply, State};
+handle_cast({block, Peer, Block}, State) ->
+    %% Unsolicited block (not in syncing state) — validate and connect
+    %% directly. This handles blocks fetched via getdata from inv
+    %% announcements when we're idle or complete.
+    State2 = handle_unsolicited_block(Peer, Block, State),
+    {noreply, State2};
 
 handle_cast({notfound, Peer, Items}, #state{status = syncing} = State) ->
     State2 = handle_notfound_items(Peer, Items, State),
@@ -590,6 +594,47 @@ handle_block_received(Peer, Block, State) ->
             logger:debug("block_sync: unsolicited block ~s from ~p",
                          [hash_hex(BlockHash), Peer]),
             State
+    end.
+
+%% Handle an unsolicited block (received outside of IBD syncing state).
+%% Validates and connects the block directly to the chain tip.
+%% chainstate:connect_block/1 handles full validation, storage, and tip update.
+handle_unsolicited_block(Peer, Block, State) ->
+    BlockHash = beamchain_serialize:block_hash(Block#block.header),
+    case beamchain_db:has_block(BlockHash) of
+        true ->
+            %% Already have this block, ignore
+            State;
+        false ->
+            Params = State#state.params,
+            %% 1. Context-free validation
+            case beamchain_validation:check_block(Block, Params) of
+                ok ->
+                    %% 2. Connect via chainstate — this does contextual
+                    %%    validation, UTXO updates, block storage, block
+                    %%    index, and tip update all in one call.
+                    case beamchain_chainstate:connect_block(Block) of
+                        ok ->
+                            {ok, {_, Height}} = beamchain_chainstate:get_tip(),
+                            %% 3. Store tx index entries (not done by chainstate)
+                            store_tx_index(Block, Height),
+                            logger:info("block_sync: connected unsolicited "
+                                        "block ~s at height ~B from ~p",
+                                        [hash_hex(BlockHash), Height, Peer]),
+                            State;
+                        {error, Reason} ->
+                            logger:debug("block_sync: unsolicited block ~s "
+                                         "failed connect: ~p",
+                                         [hash_hex(BlockHash), Reason]),
+                            State
+                    end;
+                {error, Reason} ->
+                    logger:warning("block_sync: unsolicited block ~s "
+                                   "failed validation: ~p",
+                                   [hash_hex(BlockHash), Reason]),
+                    beamchain_peer:add_misbehavior(Peer, 20),
+                    State
+            end
     end.
 
 %% Update peer stats after receiving a block.
