@@ -1038,6 +1038,9 @@ handle_peer_message(Pid, tx, Payload, State) ->
 handle_peer_message(Pid, notfound, Payload, State) ->
     beamchain_sync:handle_peer_message(Pid, notfound, Payload),
     {noreply, State};
+handle_peer_message(Pid, getdata, Payload, State) ->
+    handle_getdata_msg(Pid, Payload),
+    {noreply, State};
 handle_peer_message(_Pid, _Command, _Payload, State) ->
     {noreply, State}.
 
@@ -1071,6 +1074,40 @@ handle_getaddr_msg(Pid, State) ->
         _  -> beamchain_peer:send_message(Pid, {addr, #{addrs => Entries}})
     end,
     {noreply, State}.
+
+handle_getdata_msg(Pid, Payload) ->
+    case beamchain_p2p_msg:decode_payload(getdata, Payload) of
+        {ok, #{items := Items}} ->
+            NotFound = lists:filtermap(fun(#{type := Type, hash := Hash}) ->
+                case Type of
+                    T when T =:= ?MSG_BLOCK; T =:= ?MSG_WITNESS_BLOCK ->
+                        case beamchain_db:get_block(Hash) of
+                            {ok, Block} ->
+                                beamchain_peer:send_message(Pid, {block, Block}),
+                                false;
+                            not_found ->
+                                {true, #{type => Type, hash => Hash}}
+                        end;
+                    T when T =:= ?MSG_TX; T =:= ?MSG_WITNESS_TX ->
+                        case beamchain_mempool:get_tx(Hash) of
+                            {ok, Tx} ->
+                                beamchain_peer:send_message(Pid, {tx, Tx}),
+                                false;
+                            not_found ->
+                                {true, #{type => Type, hash => Hash}}
+                        end;
+                    _ ->
+                        {true, #{type => Type, hash => Hash}}
+                end
+            end, Items),
+            case NotFound of
+                [] -> ok;
+                _  -> beamchain_peer:send_message(Pid,
+                        {notfound, #{items => NotFound}})
+            end;
+        _ ->
+            ok
+    end.
 
 %%% ===================================================================
 %%% Internal: ban management
