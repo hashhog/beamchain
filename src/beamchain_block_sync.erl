@@ -700,6 +700,17 @@ validate_and_connect(Height, Block,
                             assume_valid = AssumeValid,
                             assume_valid_height = AVHeight} = State) ->
     try
+        %% 0. Guard against replaying a block that was already connected
+        %%    (e.g. after a gen_server call timeout where the chainstate
+        %%    processed the block but the caller didn't see the reply).
+        case beamchain_chainstate:get_tip() of
+            {ok, {_, TipH}} when TipH >= Height ->
+                logger:info("block_sync: height ~B already connected "
+                            "(tip=~B), skipping", [Height, TipH]),
+                throw(already_connected);
+            _ -> ok
+        end,
+
         %% 1. Context-free block check
         case beamchain_validation:check_block(Block, Params) of
             ok -> ok;
@@ -744,6 +755,7 @@ validate_and_connect(Height, Block,
 
         {ok, State}
     catch
+        throw:already_connected -> {ok, State};
         throw:Reason -> {error, Reason};
         exit:Reason ->
             logger:error("block_sync: exit at height ~B: ~p",
