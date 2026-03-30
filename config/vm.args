@@ -1,0 +1,17 @@
+-name beamchain@127.0.0.1
+-setcookie beamchain
+
+## Process limit — 1M processes for concurrent peer/block handling
++P 1048576
+
+## Enable kernel polling for better I/O scalability
++K true
+
+## Async thread pool for NIF/driver I/O (RocksDB, secp256k1)
++A 64
+
+## Reduce fullsweep GC frequency for long-lived processes
+-env ERL_FULLSWEEP_AFTER 10
+
+## Increase atom table for dynamic peer/config atoms
++t 1048576
