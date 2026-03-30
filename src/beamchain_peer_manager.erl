@@ -1041,6 +1041,9 @@ handle_peer_message(Pid, notfound, Payload, State) ->
 handle_peer_message(Pid, getdata, Payload, State) ->
     handle_getdata_msg(Pid, Payload),
     {noreply, State};
+handle_peer_message(Pid, getheaders, Payload, State) ->
+    handle_getheaders_msg(Pid, Payload),
+    {noreply, State};
 handle_peer_message(_Pid, _Command, _Payload, State) ->
     {noreply, State}.
 
@@ -1107,6 +1110,50 @@ handle_getdata_msg(Pid, Payload) ->
             end;
         _ ->
             ok
+    end.
+
+%% Respond to a getheaders request from a peer.
+%% Walk our chain from the best matching locator hash and send up to
+%% 2000 headers (the Bitcoin protocol limit).
+handle_getheaders_msg(Pid, Payload) ->
+    case beamchain_p2p_msg:decode_payload(getheaders, Payload) of
+        {ok, #{locators := Locators, stop_hash := StopHash}} ->
+            %% Find the best locator hash we have
+            StartHeight = find_locator_intersection(Locators),
+            %% Collect up to 2000 headers starting after the intersection
+            Headers = collect_headers(StartHeight + 1, StopHash, 2000, []),
+            case Headers of
+                [] -> ok;
+                _  -> beamchain_peer:send_message(Pid,
+                        {headers, #{headers => Headers}})
+            end;
+        _ ->
+            ok
+    end.
+
+%% Find the height of the best (first matching) locator hash.
+%% Returns -1 if none match (will start from genesis).
+find_locator_intersection([]) -> -1;
+find_locator_intersection([Hash | Rest]) ->
+    case beamchain_db:get_block_index_by_hash(Hash) of
+        {ok, #{height := Height}} -> Height;
+        not_found -> find_locator_intersection(Rest)
+    end.
+
+%% Collect headers from StartHeight up to 2000 or until StopHash is reached.
+collect_headers(_Height, _StopHash, 0, Acc) ->
+    lists:reverse(Acc);
+collect_headers(Height, StopHash, Remaining, Acc) ->
+    case beamchain_db:get_block_index(Height) of
+        {ok, #{header := Header, hash := Hash}} ->
+            NewAcc = [Header | Acc],
+            case Hash =:= StopHash of
+                true  -> lists:reverse(NewAcc);
+                false -> collect_headers(Height + 1, StopHash,
+                                         Remaining - 1, NewAcc)
+            end;
+        not_found ->
+            lists:reverse(Acc)
     end.
 
 %%% ===================================================================
