@@ -1369,7 +1369,9 @@ accept_loop(LSock, Manager) ->
                     %% AcceptConnection behavior.
                     case beamchain_peer_manager:check_inbound(Address) of
                         {ok, accept} ->
-                            %% Transfer socket to manager for peer creation
+                            %% Transfer socket ownership to manager so it can
+                            %% later hand it off to the peer process.
+                            gen_tcp:controlling_process(Socket, Manager),
                             Manager ! {accepted, Socket, Address};
                         {reject, Reason} ->
                             %% Reject immediately without protocol messages.
@@ -1395,8 +1397,12 @@ handle_inbound(Socket, {IP, _Port} = Address, State) ->
     %% At this point we just spawn the peer process.
     case beamchain_peer:accept(Socket, Address, self()) of
         {ok, Pid} ->
-            %% Transfer socket ownership to peer process
+            %% Transfer socket ownership to peer process.  The accept_loop
+            %% already transferred ownership to us (the manager), so this
+            %% call will succeed.  After the transfer the peer can safely
+            %% enable {active, once} on the socket.
             gen_tcp:controlling_process(Socket, Pid),
+            Pid ! socket_owner_transferred,
             Now = erlang:system_time(second),
             MonRef = erlang:monitor(process, Pid),
             Entry = #peer_entry{
