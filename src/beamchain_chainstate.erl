@@ -61,6 +61,11 @@
 %% Each UTXO entry is roughly 150 bytes on average (key + value + ETS overhead)
 -define(DEFAULT_MAX_CACHE_ENTRIES, 3000000).
 
+%% Post-flush eviction thresholds: evict clean entries when cache exceeds
+%% this many entries, trimming down to the low-water mark.
+-define(EVICT_HIGH_WATER, 500000).
+-define(EVICT_LOW_WATER, 250000).
+
 -record(state, {
     %% Current chain tip
     tip_hash          :: binary() | undefined,
@@ -869,6 +874,9 @@ do_flush(#state{tip_hash = TipHash, tip_height = TipHeight} = State) ->
                     logger:debug("chainstate: flushed ~B dirty (~B fresh), ~B spent "
                                  "at height ~B",
                                  [DirtyCount, FreshCount, SpentCount, TipHeight]),
+                    %% Evict clean entries if the cache is too large.
+                    %% After flush, all remaining entries are clean (on disk).
+                    maybe_evict_cache(),
                     State#state{blocks_since_flush = 0};
                 {error, Reason} ->
                     logger:error("chainstate: flush failed: ~p", [Reason]),
@@ -900,6 +908,37 @@ build_flush_ops() ->
     end, [], ?UTXO_SPENT),
 
     DirtyOps ++ SpentOps.
+
+%% @doc Evict clean UTXO cache entries after flush to bound memory.
+%% After a flush, dirty/fresh/spent tables are empty so every entry in
+%% UTXO_CACHE is clean (safely on disk in RocksDB). If the cache has
+%% more than EVICT_HIGH_WATER entries, delete entries until we reach
+%% EVICT_LOW_WATER. We walk the ETS table with first/next which gives
+%% effectively random (hash) order -- good enough since there is no
+%% LRU tracking.
+maybe_evict_cache() ->
+    Size = ets:info(?UTXO_CACHE, size),
+    case Size > ?EVICT_HIGH_WATER of
+        true ->
+            ToEvict = Size - ?EVICT_LOW_WATER,
+            Evicted = evict_entries(ets:first(?UTXO_CACHE), ToEvict, 0),
+            logger:info("chainstate: evicted ~B clean UTXO cache entries "
+                        "(~B -> ~B)",
+                        [Evicted, Size, ets:info(?UTXO_CACHE, size)]);
+        false ->
+            ok
+    end.
+
+evict_entries('$end_of_table', _Remaining, Count) ->
+    Count;
+evict_entries(_Key, Remaining, Count) when Remaining =< 0 ->
+    Count;
+evict_entries(Key, Remaining, Count) ->
+    %% Grab the next key BEFORE deleting, since delete invalidates
+    %% the iterator position for the current key.
+    Next = ets:next(?UTXO_CACHE, Key),
+    ets:delete(?UTXO_CACHE, Key),
+    evict_entries(Next, Remaining - 1, Count + 1).
 
 %% Encode UTXO to binary (same format as beamchain_db).
 encode_utxo(#utxo{value = Value, script_pubkey = Script,
