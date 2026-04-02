@@ -406,33 +406,38 @@ fill_pipeline(#state{status = syncing, download_queue = []} = State) ->
 fill_pipeline(#state{status = syncing,
                      next_to_validate = NextH,
                      downloaded = Downloaded} = State) ->
+    %% If the next-to-validate block is missing and we have too many
+    %% blocks buffered ahead, we're deadlocked. Clear the excess buffer
+    %% to make room for new downloads starting from next_to_validate.
+    NeedNext = not maps:is_key(NextH, Downloaded)
+               andalso not maps:is_key(NextH, State#state.in_flight),
+    State1 = case NeedNext andalso maps:size(Downloaded) >= ?MAX_DOWNLOADED_AHEAD of
+        true ->
+            logger:info("block_sync: clearing ~B buffered blocks ahead of ~B to break deadlock",
+                        [maps:size(Downloaded), NextH]),
+            %% Re-queue all buffered block heights
+            ReQueue = maps:keys(Downloaded) ++ State#state.download_queue,
+            State#state{downloaded = #{}, download_queue = ReQueue};
+        false ->
+            State
+    end,
     %% Get available peers with capacity
-    AvailablePeers = get_available_peers(State),
+    AvailablePeers = get_available_peers(State1),
     case AvailablePeers of
         [] ->
-            %% No peers with capacity right now
-            State;
+            State1;
         _ ->
-            %% Check global in-flight limit
-            TotalInFlight = maps:size(State#state.in_flight),
+            TotalInFlight = maps:size(State1#state.in_flight),
             case TotalInFlight >= ?MAX_IN_FLIGHT of
                 true ->
-                    State;
+                    State1;
                 false ->
-                    %% Also cap by downloaded-ahead to limit memory.
-                    %% BUT: always allow downloading the next-to-validate
-                    %% block even when over the cap, to prevent deadlock
-                    %% when a block fails validation and is re-queued while
-                    %% many later blocks are already downloaded.
-                    DownloadedAhead = maps:size(Downloaded),
-                    NeedNext = not maps:is_key(NextH, Downloaded)
-                               andalso not maps:is_key(NextH, State#state.in_flight),
-                    case DownloadedAhead >= ?MAX_DOWNLOADED_AHEAD
-                         andalso not NeedNext of
+                    DownloadedAhead = maps:size(State1#state.downloaded),
+                    case DownloadedAhead >= ?MAX_DOWNLOADED_AHEAD of
                         true ->
-                            State;
+                            State1;
                         false ->
-                            assign_blocks_to_peers(AvailablePeers, State)
+                            assign_blocks_to_peers(AvailablePeers, State1)
                     end
             end
     end;
@@ -689,12 +694,18 @@ validate_sequential(#state{next_to_validate = NextH,
                 {error, Reason} ->
                     logger:error("block_sync: validation failed at height ~B: ~p",
                                  [NextH, Reason]),
-                    %% Drop this block, it will need to be re-fetched
-                    Downloaded2 = maps:remove(NextH, State#state.downloaded),
-                    %% Re-queue this height
-                    Queue = [NextH | State#state.download_queue],
-                    State#state{downloaded = Downloaded2,
-                                download_queue = Queue}
+                    %% Drop this block AND all buffered downloaded blocks.
+                    %% They can't be validated until this height succeeds,
+                    %% and keeping them blocks the download pipeline
+                    %% (MAX_DOWNLOADED_AHEAD cap prevents new requests).
+                    DroppedHeights = maps:keys(State#state.downloaded),
+                    ReQueue = [NextH | DroppedHeights] ++
+                              State#state.download_queue,
+                    logger:info("block_sync: dropped ~B buffered blocks, "
+                                "re-queuing from height ~B",
+                                [length(DroppedHeights), NextH]),
+                    State#state{downloaded = #{},
+                                download_queue = ReQueue}
             end;
         error ->
             %% Not yet downloaded, nothing to do
