@@ -855,7 +855,14 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
                             {ok, #{height := HH}} -> HH;
                             not_found -> -1
                         end,
-                        put(assume_valid_height, AH),
+                        %% Only cache positive values — the assume_valid block
+                        %% may not be in the index yet during early IBD when
+                        %% headers haven't been fully synced. Re-check each
+                        %% time until we get a positive result.
+                        case AH > 0 of
+                            true -> put(assume_valid_height, AH);
+                            false -> ok
+                        end,
                         AH;
                     Cached2 -> Cached2
                 end,
