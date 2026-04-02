@@ -793,8 +793,15 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
         end,
 
         %% 3. BIP 30: no duplicate txids in UTXO set
+        %% Skip for known exception blocks (91842, 91880).
+        %% Also skip after BIP34 activation — unique coinbase heights make
+        %% duplicate txids impossible after height 227931. Bitcoin Core skips
+        %% the check between BIP34 activation and height 1,983,702.
         Bip30Exceptions = maps:get(bip30_exceptions, Params, []),
-        case lists:member(Height, Bip30Exceptions) of
+        Bip34Height = maps:get(bip34_height, Params, 0),
+        SkipBip30 = lists:member(Height, Bip30Exceptions)
+                    orelse (Height > Bip34Height andalso Height < 1983702),
+        case SkipBip30 of
             false ->
                 lists:foreach(fun(Tx) ->
                     Txid = beamchain_serialize:tx_hash(Tx),
@@ -802,7 +809,7 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
                     check_no_existing_outputs(Txid, NumOutputs)
                 end, Txs);
             true ->
-                ok  %% skip BIP 30 for exception heights
+                ok
         end,
 
         %% get script flags for this height
