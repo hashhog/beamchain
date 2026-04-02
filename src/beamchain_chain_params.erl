@@ -70,8 +70,10 @@ params(mainnet) ->
             "seed.bitcoin.wiz.biz"
         ],
 
-        %% bip30 exception heights (duplicate txids allowed)
-        bip30_exceptions => [91722, 91812],
+        %% BIP30 exception heights: blocks that overwrite earlier coinbase txids.
+        %% Bitcoin Core's IsBIP30Repeat: 91842 and 91880 (NOT 91722/91812
+        %% which are the original blocks whose coinbases were overwritten).
+        bip30_exceptions => [91842, 91880],
 
         %% address encoding
         pubkey_prefix => 0,
