@@ -403,7 +403,9 @@ fill_pipeline(#state{status = syncing, download_queue = []} = State) ->
     %% Queue is empty. Check if we're done.
     maybe_complete(State);
 
-fill_pipeline(#state{status = syncing} = State) ->
+fill_pipeline(#state{status = syncing,
+                     next_to_validate = NextH,
+                     downloaded = Downloaded} = State) ->
     %% Get available peers with capacity
     AvailablePeers = get_available_peers(State),
     case AvailablePeers of
@@ -417,9 +419,16 @@ fill_pipeline(#state{status = syncing} = State) ->
                 true ->
                     State;
                 false ->
-                    %% Also cap by downloaded-ahead to limit memory
-                    DownloadedAhead = maps:size(State#state.downloaded),
-                    case DownloadedAhead >= ?MAX_DOWNLOADED_AHEAD of
+                    %% Also cap by downloaded-ahead to limit memory.
+                    %% BUT: always allow downloading the next-to-validate
+                    %% block even when over the cap, to prevent deadlock
+                    %% when a block fails validation and is re-queued while
+                    %% many later blocks are already downloaded.
+                    DownloadedAhead = maps:size(Downloaded),
+                    NeedNext = not maps:is_key(NextH, Downloaded)
+                               andalso not maps:is_key(NextH, State#state.in_flight),
+                    case DownloadedAhead >= ?MAX_DOWNLOADED_AHEAD
+                         andalso not NeedNext of
                         true ->
                             State;
                         false ->
