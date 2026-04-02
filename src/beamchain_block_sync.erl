@@ -45,8 +45,9 @@
 %% UTXO batch flush every N blocks during IBD
 -define(UTXO_FLUSH_INTERVAL, 1000).
 
-%% Memory cap: max blocks downloaded ahead of validation
--define(MAX_DOWNLOADED_AHEAD, 1000).
+%% Memory cap: max blocks downloaded ahead of validation.
+%% Set high enough to absorb jitter from out-of-order delivery.
+-define(MAX_DOWNLOADED_AHEAD, 5000).
 
 %% Max blocks to validate per gen_server iteration (yield to process messages)
 -define(MAX_VALIDATE_BATCH, 50).
@@ -333,12 +334,28 @@ handle_cast({blocktxn, _Peer, _BlockTxn}, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info(stall_check, #state{status = syncing} = State) ->
+handle_info(stall_check, #state{status = syncing,
+                                next_to_validate = NextH,
+                                downloaded = Downloaded} = State) ->
     State2 = check_stalls(State),
+    %% Also try to validate — the next block may have arrived since
+    %% the last validate_sequential call but no event triggered it.
+    State3 = validate_sequential(State2),
     %% Reschedule
     Timer = erlang:send_after(?STALL_CHECK_INTERVAL, self(), stall_check),
-    State3 = fill_pipeline(State2#state{stall_timer = Timer}),
-    {noreply, State3};
+    State4 = fill_pipeline(State3#state{stall_timer = Timer}),
+    %% Log stall detection
+    case State4#state.next_to_validate =:= NextH
+         andalso maps:size(State4#state.downloaded) > 0 of
+        true ->
+            logger:info("block_sync: watchdog — stuck at ~B, "
+                        "downloaded=~B in_flight=~B",
+                        [NextH, maps:size(State4#state.downloaded),
+                         maps:size(State4#state.in_flight)]);
+        false ->
+            ok
+    end,
+    {noreply, State4};
 handle_info(stall_check, State) ->
     {noreply, State#state{stall_timer = undefined}};
 
@@ -406,16 +423,20 @@ fill_pipeline(#state{status = syncing, download_queue = []} = State) ->
 fill_pipeline(#state{status = syncing,
                      next_to_validate = NextH,
                      downloaded = Downloaded} = State) ->
-    %% If the next-to-validate block is missing and we have too many
-    %% blocks buffered ahead, we're deadlocked. Clear the excess buffer
-    %% to make room for new downloads starting from next_to_validate.
-    NeedNext = not maps:is_key(NextH, Downloaded)
-               andalso not maps:is_key(NextH, State#state.in_flight),
-    State1 = case NeedNext andalso maps:size(Downloaded) >= ?MAX_DOWNLOADED_AHEAD of
+    %% Deadlock detection: next_to_validate is missing, nothing in flight,
+    %% and downloaded buffer is full. This means no new blocks can be
+    %% requested. Clear the buffer to break the deadlock.
+    TotalInFlight = maps:size(State#state.in_flight),
+    DownloadedAhead = maps:size(Downloaded),
+    NeedNext = not maps:is_key(NextH, Downloaded),
+    IsDeadlocked = NeedNext
+                   andalso TotalInFlight =:= 0
+                   andalso DownloadedAhead >= ?MAX_DOWNLOADED_AHEAD,
+    State1 = case IsDeadlocked of
         true ->
-            logger:info("block_sync: clearing ~B buffered blocks ahead of ~B to break deadlock",
-                        [maps:size(Downloaded), NextH]),
-            %% Re-queue all buffered block heights
+            logger:info("block_sync: deadlock detected — clearing ~B buffered "
+                        "blocks ahead of ~B (in_flight=0)",
+                        [DownloadedAhead, NextH]),
             ReQueue = maps:keys(Downloaded) ++ State#state.download_queue,
             State#state{downloaded = #{}, download_queue = ReQueue};
         false ->
@@ -427,13 +448,13 @@ fill_pipeline(#state{status = syncing,
         [] ->
             State1;
         _ ->
-            TotalInFlight = maps:size(State1#state.in_flight),
-            case TotalInFlight >= ?MAX_IN_FLIGHT of
+            TotalInFlight2 = maps:size(State1#state.in_flight),
+            case TotalInFlight2 >= ?MAX_IN_FLIGHT of
                 true ->
                     State1;
                 false ->
-                    DownloadedAhead = maps:size(State1#state.downloaded),
-                    case DownloadedAhead >= ?MAX_DOWNLOADED_AHEAD of
+                    DownloadedAhead2 = maps:size(State1#state.downloaded),
+                    case DownloadedAhead2 >= ?MAX_DOWNLOADED_AHEAD of
                         true ->
                             State1;
                         false ->
@@ -694,18 +715,12 @@ validate_sequential(#state{next_to_validate = NextH,
                 {error, Reason} ->
                     logger:error("block_sync: validation failed at height ~B: ~p",
                                  [NextH, Reason]),
-                    %% Drop this block AND all buffered downloaded blocks.
-                    %% They can't be validated until this height succeeds,
-                    %% and keeping them blocks the download pipeline
-                    %% (MAX_DOWNLOADED_AHEAD cap prevents new requests).
-                    DroppedHeights = maps:keys(State#state.downloaded),
-                    ReQueue = [NextH | DroppedHeights] ++
-                              State#state.download_queue,
-                    logger:info("block_sync: dropped ~B buffered blocks, "
-                                "re-queuing from height ~B",
-                                [length(DroppedHeights), NextH]),
-                    State#state{downloaded = #{},
-                                download_queue = ReQueue}
+                    %% Re-queue only the failed block. Keep buffered blocks —
+                    %% they'll be validated once this height succeeds.
+                    Downloaded2 = maps:remove(NextH, State#state.downloaded),
+                    Queue = [NextH | State#state.download_queue],
+                    State#state{downloaded = Downloaded2,
+                                download_queue = Queue}
             end;
         error ->
             %% Not yet downloaded, nothing to do
