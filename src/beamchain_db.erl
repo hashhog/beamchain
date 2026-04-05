@@ -143,10 +143,17 @@ get_block_by_height(Height) ->
 has_block(Hash) when byte_size(Hash) =:= 32 ->
     gen_server:call(?SERVER, {has_block, Hash}).
 
-%% @doc Get a UTXO by outpoint
+%% @doc Get a UTXO by outpoint.
+%% Uses direct RocksDB read (bypasses gen_server for lower latency).
 -spec get_utxo(binary(), non_neg_integer()) -> {ok, #utxo{}} | not_found.
 get_utxo(Txid, Vout) when byte_size(Txid) =:= 32 ->
-    gen_server:call(?SERVER, {get_utxo, Txid, Vout}, infinity).
+    Db = persistent_term:get(beamchain_db_handle),
+    CF = persistent_term:get(beamchain_cf_chainstate),
+    Key = encode_outpoint(Txid, Vout),
+    case rocksdb:get(Db, CF, Key, []) of
+        {ok, Bin} -> {ok, decode_utxo(Bin)};
+        not_found -> not_found
+    end.
 
 %% @doc Store a UTXO
 -spec store_utxo(binary(), non_neg_integer(), #utxo{}) -> ok.
@@ -158,10 +165,17 @@ store_utxo(Txid, Vout, Utxo) when byte_size(Txid) =:= 32 ->
 spend_utxo(Txid, Vout) when byte_size(Txid) =:= 32 ->
     gen_server:call(?SERVER, {spend_utxo, Txid, Vout}, infinity).
 
-%% @doc Check if a UTXO exists
+%% @doc Check if a UTXO exists.
+%% Uses direct RocksDB read (bypasses gen_server for lower latency).
 -spec has_utxo(binary(), non_neg_integer()) -> boolean().
 has_utxo(Txid, Vout) when byte_size(Txid) =:= 32 ->
-    gen_server:call(?SERVER, {has_utxo, Txid, Vout}, infinity).
+    Db = persistent_term:get(beamchain_db_handle),
+    CF = persistent_term:get(beamchain_cf_chainstate),
+    Key = encode_outpoint(Txid, Vout),
+    case rocksdb:get(Db, CF, Key, []) of
+        {ok, _} -> true;
+        not_found -> false
+    end.
 
 %% @doc Store block index entry (header metadata for a given height)
 -spec store_block_index(non_neg_integer(), binary(), #block_header{},
@@ -324,11 +338,17 @@ init([]) ->
         {max_bytes_for_level_base, 256 * 1024 * 1024}
     ],
     CFOpts = [],
+    %% Chainstate CF gets bloom filter + optimized for point lookups
+    %% to reduce read amplification during UTXO lookups.
+    ChainstateCFOpts = [
+        {bloom_filter_policy, 10},
+        {optimize_filters_for_hits, true}
+    ],
     CFDescriptors = [
         {?CF_DEFAULT, CFOpts},
         {?CF_BLOCKS, CFOpts},
         {?CF_BLOCK_INDEX, CFOpts},
-        {?CF_CHAINSTATE, CFOpts},
+        {?CF_CHAINSTATE, ChainstateCFOpts},
         {?CF_TX_INDEX, CFOpts},
         {?CF_META, CFOpts},
         {?CF_UNDO, CFOpts}
@@ -414,6 +434,10 @@ init([]) ->
                 pruned_files = PrunedFiles,
                 file_info = FileInfo
             },
+            %% Store handles in persistent_term for direct read access
+            %% (bypasses gen_server for read-only UTXO lookups)
+            persistent_term:put(beamchain_db_handle, DbHandle),
+            persistent_term:put(beamchain_cf_chainstate, ChainstateCF),
             logger:info("beamchain_db: opened rocksdb at ~s, blocks at ~s (file ~p, pos ~p)",
                         [DbPath, BlocksDir, CurrentFile, CurrentPos]),
             {ok, State};

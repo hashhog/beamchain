@@ -63,8 +63,8 @@
 
 %% Post-flush eviction thresholds: evict clean entries when cache exceeds
 %% this many entries, trimming down to the low-water mark.
--define(EVICT_HIGH_WATER, 500000).
--define(EVICT_LOW_WATER, 250000).
+-define(EVICT_HIGH_WATER, 2000000).
+-define(EVICT_LOW_WATER, 1500000).
 
 -record(state, {
     %% Current chain tip
@@ -265,11 +265,34 @@ has_utxo(Txid, Vout) ->
 -spec add_utxo(binary(), non_neg_integer(), #utxo{}) -> ok.
 add_utxo(Txid, Vout, Utxo) ->
     Key = {Txid, Vout},
+    %% Check if the entry already exists in DB (BIP30 duplicate case).
+    %% If it exists in RocksDB, we must NOT mark as FRESH — the DB entry needs
+    %% to be updated/deleted on flush, not skipped via the FRESH optimization.
+    %%
+    %% Cache-first approach to avoid RocksDB read amplification:
+    %% 1. If in UTXO_CACHE and NOT fresh -> it came from DB (exists in DB)
+    %% 2. If in UTXO_SPENT -> it was in DB, now pending delete (exists in DB)
+    %% 3. Only fall through to RocksDB on full cache miss
+    AlreadyInDb = case ets:member(?UTXO_CACHE, Key) of
+        true ->
+            not ets:member(?UTXO_FRESH, Key);
+        false ->
+            case ets:member(?UTXO_SPENT, Key) of
+                true -> true;
+                false -> beamchain_db:has_utxo(Txid, Vout)
+            end
+    end,
     ets:insert(?UTXO_CACHE, {Key, Utxo}),
     ets:insert(?UTXO_DIRTY, {Key}),
-    %% Mark as FRESH (doesn't exist in RocksDB yet)
-    %% This enables the optimization where spending a FRESH UTXO skips DB ops
-    ets:insert(?UTXO_FRESH, {Key}),
+    case AlreadyInDb of
+        true ->
+            %% Overwriting an existing DB entry (BIP30 duplicate coinbase).
+            %% NOT fresh — the DB has an old value that needs updating.
+            ets:delete(?UTXO_FRESH, Key);
+        false ->
+            %% Truly new UTXO — mark as FRESH for the skip optimization.
+            ets:insert(?UTXO_FRESH, {Key})
+    end,
     %% If it was pending a DB delete, cancel that (reorg case)
     ets:delete(?UTXO_SPENT, Key),
     ok.
@@ -573,7 +596,23 @@ collect_timestamps(Height, N, Acc) ->
 %%% ===================================================================
 
 do_connect_block(#block{header = Header} = Block,
-                 #state{tip_height = TipHeight, params = Params} = State) ->
+                 #state{tip_height = TipHeight, tip_hash = TipHash} = State) ->
+    %% Verify the block's prev_hash matches the current tip.
+    %% Without this check, blocks submitted out of order via submitblock
+    %% could be connected at the wrong height, corrupting the chain.
+    PrevHashOk = case TipHeight >= 0 of
+        true -> Header#block_header.prev_hash =:= TipHash;
+        false -> true  %% Genesis block
+    end,
+    case PrevHashOk of
+        false ->
+            {error, bad_prevblk};
+        true ->
+            do_connect_block_inner(Block, State)
+    end.
+
+do_connect_block_inner(#block{header = Header} = Block,
+                       #state{tip_height = TipHeight, params = Params} = State) ->
     Height = TipHeight + 1,
 
     %% Build PrevIndex for validation
@@ -611,6 +650,9 @@ do_connect_block(#block{header = Header} = Block,
             end,
             beamchain_db:store_block_index(Height, BlockHash, Header, NewCW, 2),
 
+            %% Store tx index entries
+            store_tx_index(Block, BlockHash, Height),
+
             %% Update chain tip in ETS for fast reads
             ets:insert(?CHAIN_META, {tip, BlockHash, Height}),
 
@@ -637,6 +679,15 @@ do_connect_block(#block{header = Header} = Block,
     end.
 
 %% Append a new timestamp to the MTP window, keeping at most 11.
+%% Store tx index entries for all transactions in a block.
+store_tx_index(#block{transactions = Txs}, BlockHash, Height) ->
+    lists:foldl(fun(Tx, Pos) ->
+        Txid = beamchain_serialize:tx_hash(Tx),
+        beamchain_db:store_tx_index(Txid, BlockHash, Height, Pos),
+        Pos + 1
+    end, 0, Txs),
+    ok.
+
 update_mtp_connect(Timestamp, Timestamps) ->
     Updated = Timestamps ++ [Timestamp],
     case length(Updated) > 11 of
@@ -874,6 +925,10 @@ do_flush(#state{tip_hash = TipHash, tip_height = TipHeight} = State) ->
                     logger:debug("chainstate: flushed ~B dirty (~B fresh), ~B spent "
                                  "at height ~B",
                                  [DirtyCount, FreshCount, SpentCount, TipHeight]),
+                    %% Verify a sample of cached entries are in RocksDB.
+                    %% This catches flush bugs where writes silently fail.
+                    verify_flush_sample(),
+
                     %% Evict clean entries if the cache is too large.
                     %% After flush, all remaining entries are clean (on disk).
                     maybe_evict_cache(),
@@ -914,6 +969,57 @@ build_flush_ops() ->
 %% UTXO_CACHE is clean (safely on disk in RocksDB). If the cache has
 %% more than EVICT_HIGH_WATER entries, delete entries until we reach
 %% EVICT_LOW_WATER. We walk the ETS table with first/next which gives
+%% Verify that a random sample of ETS cache entries exist in RocksDB.
+%% Called after flush to detect silent write failures.
+verify_flush_sample() ->
+    CacheSize = ets:info(?UTXO_CACHE, size),
+    case CacheSize > 0 of
+        false -> ok;
+        true ->
+            %% Check up to 10 random entries
+            SampleSize = min(10, CacheSize),
+            verify_flush_entries(ets:first(?UTXO_CACHE), SampleSize, 0, 0,
+                                CacheSize)
+    end.
+
+verify_flush_entries('$end_of_table', _Remaining, Checked, Failures, _Total) ->
+    case Failures > 0 of
+        true ->
+            logger:error("chainstate: FLUSH VERIFICATION FAILED: "
+                         "~B/~B entries NOT in RocksDB after flush!",
+                         [Failures, Checked]);
+        false -> ok
+    end;
+verify_flush_entries(_Key, 0, Checked, Failures, _Total) ->
+    case Failures > 0 of
+        true ->
+            logger:error("chainstate: FLUSH VERIFICATION FAILED: "
+                         "~B/~B entries NOT in RocksDB after flush!",
+                         [Failures, Checked]);
+        false -> ok
+    end;
+verify_flush_entries(Key, Remaining, Checked, Failures, Total) ->
+    %% Skip some entries to spread the sample across the table
+    Skip = max(1, Total div 10),
+    Next = skip_entries(Key, Skip),
+    {Txid, Vout} = Key,
+    InDb = beamchain_db:has_utxo(Txid, Vout),
+    NewFailures = case InDb of
+        true -> Failures;
+        false ->
+            logger:error("chainstate: MISSING from RocksDB after flush: "
+                         "~s:~B",
+                         [binary:encode_hex(
+                             beamchain_serialize:reverse_bytes(Txid)), Vout]),
+            Failures + 1
+    end,
+    verify_flush_entries(Next, Remaining - 1, Checked + 1, NewFailures, Total).
+
+skip_entries('$end_of_table', _N) -> '$end_of_table';
+skip_entries(Key, 0) -> Key;
+skip_entries(Key, N) ->
+    skip_entries(ets:next(?UTXO_CACHE, Key), N - 1).
+
 %% effectively random (hash) order -- good enough since there is no
 %% LRU tracking.
 maybe_evict_cache() ->

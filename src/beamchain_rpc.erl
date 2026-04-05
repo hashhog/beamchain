@@ -43,7 +43,7 @@
 
 -define(RPC_AUTH_TABLE, rpc_auth).
 -define(RATE_LIMIT_TABLE, rpc_rate_limit).
--define(MAX_REQUESTS_PER_MINUTE, 100).
+-define(MAX_REQUESTS_PER_MINUTE, 100000).
 
 -record(state, {
     start_time :: non_neg_integer()
