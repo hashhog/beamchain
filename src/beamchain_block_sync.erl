@@ -46,8 +46,9 @@
 -define(UTXO_FLUSH_INTERVAL, 1000).
 
 %% Memory cap: max blocks downloaded ahead of validation.
-%% Set high enough to absorb jitter from out-of-order delivery.
--define(MAX_DOWNLOADED_AHEAD, 5000).
+%% Mainnet blocks average ~1.5 MB; 256 blocks ≈ 384 MB.
+%% Previous value of 5000 caused 5+ GB RSS on mainnet.
+-define(MAX_DOWNLOADED_AHEAD, 256).
 
 %% Max blocks to validate per gen_server iteration (yield to process messages)
 -define(MAX_VALIDATE_BATCH, 50).
@@ -335,8 +336,7 @@ handle_cast(_Msg, State) ->
     {noreply, State}.
 
 handle_info(stall_check, #state{status = syncing,
-                                next_to_validate = NextH,
-                                downloaded = Downloaded} = State) ->
+                                next_to_validate = NextH} = State) ->
     State2 = check_stalls(State),
     %% Also try to validate — the next block may have arrived since
     %% the last validate_sequential call but no event triggered it.
@@ -423,22 +423,48 @@ fill_pipeline(#state{status = syncing, download_queue = []} = State) ->
 fill_pipeline(#state{status = syncing,
                      next_to_validate = NextH,
                      downloaded = Downloaded} = State) ->
-    %% Deadlock detection: next_to_validate is missing, nothing in flight,
-    %% and downloaded buffer is full. This means no new blocks can be
-    %% requested. Clear the buffer to break the deadlock.
     TotalInFlight = maps:size(State#state.in_flight),
     DownloadedAhead = maps:size(Downloaded),
     NeedNext = not maps:is_key(NextH, Downloaded),
-    IsDeadlocked = NeedNext
-                   andalso TotalInFlight =:= 0
-                   andalso DownloadedAhead >= ?MAX_DOWNLOADED_AHEAD,
-    State1 = case IsDeadlocked of
+    NextInFlight = maps:is_key(NextH, State#state.in_flight),
+
+    %% Deadlock detection — two cases:
+    %% 1) Hard deadlock: in_flight=0, buffer full, needed block missing
+    %% 2) Soft deadlock: needed block not in buffer AND not in flight,
+    %%    but buffer is full so no new requests can be made
+    IsHardDeadlock = NeedNext
+                     andalso TotalInFlight =:= 0
+                     andalso DownloadedAhead >= (?MAX_DOWNLOADED_AHEAD - 32),
+    IsSoftDeadlock = NeedNext
+                     andalso (not NextInFlight)
+                     andalso DownloadedAhead >= ?MAX_DOWNLOADED_AHEAD,
+
+    State1 = case IsHardDeadlock orelse IsSoftDeadlock of
         true ->
-            logger:info("block_sync: deadlock detected — clearing ~B buffered "
-                        "blocks ahead of ~B (in_flight=0)",
-                        [DownloadedAhead, NextH]),
-            ReQueue = maps:keys(Downloaded) ++ State#state.download_queue,
-            State#state{downloaded = #{}, download_queue = ReQueue};
+            %% Evict enough of the highest buffered blocks to get below
+            %% MAX_DOWNLOADED_AHEAD so the normal pipeline can resume.
+            %% Previous approach of evicting only 1 caused an infinite
+            %% evict-request-stall loop; evicting 32 was still not enough
+            %% when the buffer exceeded 256+32 due to arrival races.
+            EvictTarget = max(0, DownloadedAhead - (?MAX_DOWNLOADED_AHEAD - 64)),
+            EvictCount = max(EvictTarget, 32),
+            AllHeights = lists:sort(fun(A, B) -> A >= B end,
+                                    maps:keys(Downloaded)),
+            {ToEvict, _Keep} = take_from_queue(EvictCount, AllHeights),
+            Downloaded2 = lists:foldl(fun maps:remove/2, Downloaded, ToEvict),
+            OldQueue = State#state.download_queue,
+            %% Remove NextH from queue if already there (avoid duplicates)
+            CleanQueue = lists:delete(NextH, OldQueue),
+            %% Put NextH at front, then re-queue evicted heights
+            NewQueue = [NextH | ToEvict ++ CleanQueue],
+            logger:info("block_sync: deadlock — need height ~B, "
+                        "evicted ~B blocks (in_flight=~B), "
+                        "blast-requesting gap from all peers",
+                        [NextH, length(ToEvict), TotalInFlight]),
+            %% Blast-request NextH from ALL connected peers for redundancy
+            State_tmp = State#state{downloaded = Downloaded2,
+                                     download_queue = NewQueue},
+            blast_request_height(NextH, State_tmp);
         false ->
             State
     end,
@@ -456,7 +482,20 @@ fill_pipeline(#state{status = syncing,
                     DownloadedAhead2 = maps:size(State1#state.downloaded),
                     case DownloadedAhead2 >= ?MAX_DOWNLOADED_AHEAD of
                         true ->
-                            State1;
+                            %% Buffer full — but if next_to_validate is
+                            %% missing and not in flight, force-request it
+                            %% to prevent starvation.
+                            NextH1 = State1#state.next_to_validate,
+                            NextMissing = not maps:is_key(NextH1,
+                                            State1#state.downloaded),
+                            NextNotInFlight = not maps:is_key(NextH1,
+                                                State1#state.in_flight),
+                            case NextMissing andalso NextNotInFlight of
+                                true ->
+                                    blast_request_height(NextH1, State1);
+                                false ->
+                                    State1
+                            end;
                         false ->
                             assign_blocks_to_peers(AvailablePeers, State1)
                     end
@@ -474,6 +513,50 @@ get_available_peers(#state{peer_stats = PeerStats, peers = Peers}) ->
             false -> false
         end
     end, maps:to_list(PeerStats)).
+
+%% Blast-request a specific height from ALL connected peers simultaneously.
+%% Used during deadlock recovery to maximise the chance of getting the
+%% needed block quickly.  Only the first arrival is kept (duplicates are
+%% ignored in handle_block_received via hash_to_height lookup).
+blast_request_height(Height, #state{peers = Peers,
+                                     in_flight = InFlight,
+                                     hash_to_height = H2H,
+                                     peer_stats = AllStats} = State) ->
+    case beamchain_db:get_block_index(Height) of
+        {ok, #{hash := Hash}} ->
+            Item = #{type => ?MSG_WITNESS_BLOCK, hash => Hash},
+            Now = erlang:monotonic_time(millisecond),
+            PeerList = maps:keys(Peers),
+            %% Pick the first peer as the "official" in_flight owner
+            case PeerList of
+                [] ->
+                    State;
+                [Primary | _Others] ->
+                    InFlight2 = maps:put(Height, {Primary, Now, Hash}, InFlight),
+                    H2H2 = maps:put(Hash, Height, H2H),
+                    %% Send getdata to ALL peers
+                    lists:foreach(fun(P) ->
+                        beamchain_peer:send_message(P,
+                            {getdata, #{items => [Item]}})
+                    end, PeerList),
+                    %% Only count the primary peer's in_flight
+                    PStats = maps:get(Primary, AllStats, #peer_stats{}),
+                    PStats2 = PStats#peer_stats{
+                        in_flight_count = PStats#peer_stats.in_flight_count + 1
+                    },
+                    AllStats2 = maps:put(Primary, PStats2, AllStats),
+                    %% Remove Height from download_queue since it's now in_flight
+                    Queue2 = lists:delete(Height, State#state.download_queue),
+                    State#state{in_flight = InFlight2,
+                                hash_to_height = H2H2,
+                                peer_stats = AllStats2,
+                                download_queue = Queue2}
+            end;
+        not_found ->
+            logger:warning("block_sync: blast_request — no block index "
+                           "for height ~B", [Height]),
+            State
+    end.
 
 %% Assign blocks from the queue to available peers.
 %% Batches multiple block requests per peer in a single getdata message
@@ -699,6 +782,28 @@ validate_sequential(State, 0) ->
     refresh_in_flight_timestamps(State);
 validate_sequential(#state{next_to_validate = NextH,
                             downloaded = Downloaded} = State, Remaining) ->
+    %% Fast-forward: if next_to_validate is behind the chainstate tip,
+    %% skip directly to tip+1 (avoids re-downloading already-connected blocks)
+    case beamchain_chainstate:get_tip() of
+        {ok, {_, TipH}} when TipH >= NextH ->
+            logger:info("block_sync: fast-forward next_to_validate "
+                        "from ~B to ~B (chainstate tip ahead)",
+                        [NextH, TipH + 1]),
+            StaleKeys = [K || K <- maps:keys(Downloaded), K =< TipH],
+            Downloaded2 = lists:foldl(fun maps:remove/2, Downloaded, StaleKeys),
+            Queue2 = [H || H <- State#state.download_queue, H > TipH],
+            State2 = State#state{
+                next_to_validate = TipH + 1,
+                downloaded = Downloaded2,
+                download_queue = Queue2
+            },
+            validate_sequential_inner(State2, Remaining);
+        _ ->
+            validate_sequential_inner(State, Remaining)
+    end.
+
+validate_sequential_inner(#state{next_to_validate = NextH,
+                            downloaded = Downloaded} = State, Remaining) ->
     case maps:find(NextH, Downloaded) of
         {ok, Block} ->
             case validate_and_connect(NextH, Block, State) of
@@ -711,7 +816,27 @@ validate_sequential(#state{next_to_validate = NextH,
                         blocks_validated = State2#state.blocks_validated + 1
                     },
                     %% Continue validating the next one
-                    validate_sequential(State3, Remaining - 1);
+                    validate_sequential_inner(State3, Remaining - 1);
+                {skip_to, SkipH, State2} ->
+                    %% Block was already connected — jump next_to_validate
+                    %% to TipH+1 and discard any stale buffered blocks below
+                    %% that height to avoid re-downloading them.
+                    logger:info("block_sync: skipping next_to_validate "
+                                "from ~B to ~B (tip already ahead)",
+                                [NextH, SkipH]),
+                    StaleKeys = [K || K <- maps:keys(Downloaded)
+                                    , K < SkipH],
+                    Downloaded2 = lists:foldl(fun maps:remove/2,
+                                              Downloaded, StaleKeys),
+                    %% Also clear any stale entries from download_queue
+                    Queue2 = [H || H <- State2#state.download_queue,
+                                   H >= SkipH],
+                    State3 = State2#state{
+                        next_to_validate = SkipH,
+                        downloaded = Downloaded2,
+                        download_queue = Queue2
+                    },
+                    validate_sequential_inner(State3, Remaining - 1);
                 {error, Reason} ->
                     logger:error("block_sync: validation failed at height ~B: ~p",
                                  [NextH, Reason]),
@@ -741,7 +866,7 @@ validate_and_connect(Height, Block,
         case beamchain_chainstate:get_tip() of
             {ok, {_, TipH}} when TipH >= Height ->
                 logger:info("block_sync: height ~B already connected "
-                            "(tip=~B), skipping", [Height, TipH]),
+                            "(tip=~B), skipping ahead", [Height, TipH]),
                 throw(already_connected);
             _ -> ok
         end,
@@ -790,7 +915,13 @@ validate_and_connect(Height, Block,
 
         {ok, State}
     catch
-        throw:already_connected -> {ok, State};
+        throw:already_connected ->
+            %% Re-query tip to find skip target (catch vars are unsafe)
+            SkipTarget = case beamchain_chainstate:get_tip() of
+                {ok, {_, CurTip}} -> CurTip + 1;
+                _ -> Height + 1
+            end,
+            {skip_to, SkipTarget, State};
         throw:Reason -> {error, Reason};
         exit:Reason ->
             logger:error("block_sync: exit at height ~B: ~p",
