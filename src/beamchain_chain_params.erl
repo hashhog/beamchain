@@ -46,9 +46,9 @@ params(mainnet) ->
         min_chainwork => hex_to_bin(
             "000000000000000000000000000000000000000072a4fe66c1e2e826e5e1e9d0"),
 
-        %% skip script verification before this block
+        %% skip script verification before this block (height 938343)
         assume_valid => hex_to_bin(
-            "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5"),
+            "00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac"),
 
         %% checkpoints (height => hash in display byte order)
         checkpoints => mainnet_checkpoints(),
@@ -70,9 +70,11 @@ params(mainnet) ->
             "seed.bitcoin.wiz.biz"
         ],
 
-        %% BIP30 exception heights: blocks that overwrite earlier coinbase txids.
-        %% Bitcoin Core's IsBIP30Repeat: 91842 and 91880 (NOT 91722/91812
-        %% which are the original blocks whose coinbases were overwritten).
+        %% BIP30 exception heights: blocks that contain duplicate coinbase txids
+        %% which overwrite earlier coinbases. Bitcoin Core's IsBIP30Repeat()
+        %% in validation.cpp exempts these two heights from the BIP30 check.
+        %% NOTE: 91722/91812 are the ORIGINAL blocks whose coinbases were
+        %% overwritten; 91842/91880 are the REPEAT blocks that must be exempted.
         bip30_exceptions => [91842, 91880],
 
         %% address encoding

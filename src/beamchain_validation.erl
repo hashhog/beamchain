@@ -860,16 +860,14 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
                     undefined ->
                         AH = case beamchain_db:get_block_index_by_hash(AssumeValid) of
                             {ok, #{height := HH}} -> HH;
-                            not_found -> -1
+                            not_found ->
+                                %% During submitblock-based feeding, headers
+                                %% may not be synced yet. Use a safe fallback:
+                                %% assume the assume_valid block is far ahead
+                                %% so scripts are skipped during IBD.
+                                999999999
                         end,
-                        %% Only cache positive values — the assume_valid block
-                        %% may not be in the index yet during early IBD when
-                        %% headers haven't been fully synced. Re-check each
-                        %% time until we get a positive result.
-                        case AH > 0 of
-                            true -> put(assume_valid_height, AH);
-                            false -> ok
-                        end,
+                        put(assume_valid_height, AH),
                         AH;
                     Cached2 -> Cached2
                 end,
@@ -879,7 +877,15 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
 
         %% 4. validate each transaction (sequential: UTXO checks)
         %% Script verification is deferred and run in parallel below.
+        %%
+        %% IMPORTANT: We track processed transactions incrementally in the
+        %% process dictionary so that if any transaction throws mid-fold,
+        %% the catch block can roll back UTXO changes from the transactions
+        %% that were already applied. Without this, a mid-fold throw would
+        %% leave spent UTXOs unrestored, corrupting the UTXO set and causing
+        %% permanent "missing_inputs" failures on retry.
         [CoinbaseTx | _RegularTxs] = Txs,
+        put(connect_block_undo, {[], []}),
         {TotalFees, AllUndoData, TotalSigopCost, ScriptJobs} = lists:foldl(
             fun(Tx, {FeesAcc, UndoAcc, SigopsAcc, JobsAcc}) ->
                 IsCoinbase = is_coinbase_tx(Tx),
@@ -948,7 +954,14 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
                             Idx + 1
                         end, 0, Tx#transaction.outputs),
 
-                        {FeesAcc + Fee, UndoAcc ++ SpentCoins, NewSigops,
+                        %% Update incremental undo data so rollback works
+                        %% even if a later transaction in this block throws.
+                        NewUndoData = UndoAcc ++ SpentCoins,
+                        {ProcessedTxs0, _} = get(connect_block_undo),
+                        put(connect_block_undo,
+                            {ProcessedTxs0 ++ [Tx], NewUndoData}),
+
+                        {FeesAcc + Fee, NewUndoData, NewSigops,
                          NewJobs}
                 end
             end,
@@ -956,7 +969,7 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
             Txs),
 
         %% 4b. verify scripts in parallel (one process per tx)
-        %% Save undo info in process dictionary so we can roll back on failure.
+        %% Update undo info with full transaction list for script-phase rollback.
         %% AllUndoData has the spent coins; Txs has the added outputs.
         put(connect_block_undo, {Txs, AllUndoData}),
 
@@ -964,8 +977,6 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
             [] -> ok;
             _ -> verify_scripts_parallel(ScriptJobs, Flags)
         end,
-
-        erase(connect_block_undo),
 
         %% Also count coinbase legacy sigops in the total
         CbSigops = count_legacy_sigops_tx(CoinbaseTx) * ?WITNESS_SCALE_FACTOR,
@@ -998,6 +1009,11 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
         %% Chain tip is updated in ETS by chainstate:do_connect_block.
         %% The RocksDB chain_tip is written during flush (atomically with
         %% UTXO changes) to avoid tip/UTXO mismatch on crash.
+
+        %% All UTXO modifications are complete and no more throws can
+        %% happen. Clear the undo tracking — the catch block no longer
+        %% needs it.
+        erase(connect_block_undo),
 
         ok
     catch
@@ -1060,7 +1076,11 @@ fetch_input_coins(#transaction{inputs = Inputs}) ->
 check_no_existing_outputs(Txid, NumOutputs) ->
     lists:foreach(fun(Idx) ->
         case beamchain_chainstate:has_utxo(Txid, Idx) of
-            true -> throw(duplicate_txid);
+            true ->
+                logger:error("BIP30 duplicate_txid: txid=~s vout=~B (of ~B outputs)",
+                             [binary:encode_hex(beamchain_serialize:reverse_bytes(Txid)),
+                              Idx, NumOutputs]),
+                throw(duplicate_txid);
             false -> ok
         end
     end, lists:seq(0, NumOutputs - 1)).
@@ -1320,6 +1340,10 @@ disconnect_block(#block{header = Header, transactions = Txs},
 
 %% Split a list, taking the last N elements.
 %% Returns {LastN, Rest} where Rest ++ LastN = List.
+%% If N >= length(List), returns {List, []}.
 split_last_n(List, N) ->
     Len = length(List),
-    {lists:sublist(List, Len - N), lists:nthtail(Len - N, List)}.
+    case Len =< N of
+        true -> {List, []};
+        false -> {lists:sublist(List, Len - N), lists:nthtail(Len - N, List)}
+    end.

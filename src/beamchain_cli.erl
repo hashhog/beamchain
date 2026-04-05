@@ -49,6 +49,8 @@ run_command(start, Opts) ->
     start_node(Opts);
 run_command(sync, Opts) ->
     sync_blockchain(Opts);
+run_command(import, Opts) ->
+    import_blocks(Opts);
 run_command(status, Opts) ->
     ensure_httpc(),
     show_status(Opts);
@@ -120,6 +122,11 @@ parse_args(["--p2p-port=" ++ Value | Rest], Cmd, Opts) ->
 parse_args(["--reset" | Rest], Cmd, Opts) ->
     parse_args(Rest, Cmd, Opts#{reset => true});
 
+parse_args(["--import-file", Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{import_file => Value});
+parse_args(["--import-file=" ++ Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{import_file => Value});
+
 parse_args(["--limit", Value | Rest], Cmd, Opts) ->
     parse_args(Rest, Cmd, Opts#{limit => list_to_integer(Value)});
 parse_args(["--limit=" ++ Value | Rest], Cmd, Opts) ->
@@ -128,6 +135,8 @@ parse_args(["--limit=" ++ Value | Rest], Cmd, Opts) ->
 %% Commands
 parse_args(["start" | Rest], undefined, Opts) ->
     parse_args(Rest, start, Opts);
+parse_args(["import" | Rest], undefined, Opts) ->
+    parse_args(Rest, import, Opts);
 parse_args(["sync" | Rest], undefined, Opts) ->
     parse_args(Rest, sync, Opts);
 parse_args(["status" | Rest], undefined, Opts) ->
@@ -163,6 +172,7 @@ print_usage() ->
         "~s~n"
         "  start        start the beamchain node~n"
         "  sync         sync the blockchain with progress display~n"
+        "  import       import blocks from stdin or file (bypasses P2P)~n"
         "  status       show node status~n"
         "  stop         stop a running node~n"
         "  getbalance   get balance for an address~n"
@@ -175,6 +185,7 @@ print_usage() ->
         "  --debug           enable debug logging~n"
         "  --reset           reset chain data before sync~n"
         "  --limit=<n>       limit sync to n blocks~n"
+        "  --import-file=<f> file to import blocks from (default: stdin)~n"
         "  -h, --help        show this help~n"
         "  -v, --version     show version~n",
         [header("beamchain " ++ ?VERSION ++ " - bitcoin full node in erlang/otp"),
@@ -266,6 +277,24 @@ sync_loop(Frame, StartTime) ->
             %% Move cursor up 2 lines for redraw
             io:format("\e[2A"),
             sync_loop(NextFrame, StartTime)
+    end.
+
+%%% ===================================================================
+%%% import command -- import blocks from stdin/file
+%%% ===================================================================
+
+import_blocks(Opts) ->
+    apply_opts(Opts),
+    case start_app() of
+        ok ->
+            setup_file_logger(),
+            Network = beamchain_config:network(),
+            io:format("beamchain import - ~s~n", [atom_to_list(Network)]),
+            beamchain_import:run(Opts);
+        {error, Reason} ->
+            io:format(standard_error, "~s failed to start: ~p~n",
+                      [red("error:"), Reason]),
+            halt(1)
     end.
 
 draw_header_progress(Spinner, Info) ->
