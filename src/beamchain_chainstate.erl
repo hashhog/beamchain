@@ -739,7 +739,10 @@ do_disconnect_block(#state{tip_hash = TipHash, tip_height = TipHeight,
                     PrevHeight = TipHeight - 1,
 
                     ets:insert(?CHAIN_META, {tip, PrevHash, PrevHeight}),
-                    beamchain_db:set_chain_tip(PrevHash, PrevHeight),
+                    %% Do NOT call set_chain_tip here — that's a standalone
+                    %% rocksdb:put which is NOT atomic with UTXO changes.
+                    %% Instead, force a flush so the rolled-back UTXO state
+                    %% and the new tip are written in the same WriteBatch.
 
                     %% Update MTP: drop newest, restore oldest if possible
                     NewMTP = update_mtp_disconnect(PrevHeight,
@@ -748,11 +751,14 @@ do_disconnect_block(#state{tip_hash = TipHash, tip_height = TipHeight,
                     %% ZMQ notification for block disconnect
                     beamchain_zmq:notify_block(Block, disconnect),
 
-                    {ok, State#state{
+                    State2 = State#state{
                         tip_hash = PrevHash,
                         tip_height = PrevHeight,
                         mtp_timestamps = NewMTP
-                    }};
+                    },
+                    %% Force flush: UTXO rollback + tip update in one batch
+                    State3 = do_flush(State2),
+                    {ok, State3};
                 {error, Reason} ->
                     {error, Reason}
             end;
@@ -892,22 +898,29 @@ do_flush(#state{tip_hash = TipHash, tip_height = TipHeight} = State) ->
     FreshCount = ets:info(?UTXO_FRESH, size),
     case DirtyCount =:= 0 andalso SpentCount =:= 0 of
         true ->
-            %% Nothing to flush
+            %% No UTXO changes to flush, but still write the tip
+            %% so the on-disk tip stays consistent with state.
+            TipValue = <<TipHash:32/binary, TipHeight:64/big>>,
+            TipOps = [
+                {put, meta, <<"chain_tip">>, TipValue},
+                {put, meta, <<"utxo_flush_height">>,
+                 <<TipHeight:64/big>>}
+            ],
+            beamchain_db:write_batch(TipOps),
             State#state{blocks_since_flush = 0};
         false ->
-            %% Write HEAD_BLOCKS marker (crash recovery sentinel)
-            Marker = <<TipHash/binary, TipHeight:64/big>>,
-            beamchain_db:put_meta(<<"HEAD_BLOCKS">>, Marker),
-
             %% Build write batch
             Ops = build_flush_ops(),
 
-            %% Add chain tip and flush height to the batch
+            %% Add chain tip, flush height, and HEAD_BLOCKS marker
+            %% ALL in the same atomic WriteBatch — no separate puts.
+            Marker = <<TipHash/binary, TipHeight:64/big>>,
             TipValue = <<TipHash:32/binary, TipHeight:64/big>>,
             AllOps = Ops ++ [
                 {put, meta, <<"chain_tip">>, TipValue},
                 {put, meta, <<"utxo_flush_height">>,
-                 <<TipHeight:64/big>>}
+                 <<TipHeight:64/big>>},
+                {put, meta, <<"HEAD_BLOCKS">>, Marker}
             ],
 
             case beamchain_db:write_batch(AllOps) of
@@ -919,7 +932,7 @@ do_flush(#state{tip_hash = TipHash, tip_height = TipHeight} = State) ->
                     ets:delete_all_objects(?UTXO_FRESH),
                     ets:delete_all_objects(?UTXO_SPENT),
 
-                    %% Remove crash recovery marker
+                    %% Clear crash recovery marker (best-effort, not critical)
                     beamchain_db:put_meta(<<"HEAD_BLOCKS">>, <<>>),
 
                     logger:debug("chainstate: flushed ~B dirty (~B fresh), ~B spent "
