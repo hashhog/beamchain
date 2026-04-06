@@ -50,6 +50,9 @@
 %% Batch writes
 -export([write_batch/1]).
 
+%% Atomic block connect (block + index + tx_index in single WriteBatch)
+-export([atomic_connect_writes/5]).
+
 %% Generic metadata and stats
 -export([get_meta/1, put_meta/2, get_db_stats/0]).
 
@@ -262,6 +265,16 @@ delete_undo(BlockHash) when byte_size(BlockHash) =:= 32 ->
 -spec write_batch([tuple()]) -> ok | {error, term()}.
 write_batch(Ops) ->
     gen_server:call(?SERVER, {write_batch, Ops}, infinity).
+
+%% @doc Atomically write block data, block index, and tx index in a single
+%% RocksDB WriteBatch.  This prevents partial writes that can corrupt the
+%% chain state when submitblock or the feeder is interrupted mid-flight.
+-spec atomic_connect_writes(#block{}, non_neg_integer(), binary(),
+                            binary(), integer()) -> ok | {error, term()}.
+atomic_connect_writes(Block, Height, Chainwork, BlockHash, Status) ->
+    gen_server:call(?SERVER,
+                    {atomic_connect_writes, Block, Height, Chainwork,
+                     BlockHash, Status}, 60000).
 
 %% @doc Get a value from the meta column family
 -spec get_meta(binary()) -> {ok, binary()} | not_found.
@@ -660,6 +673,34 @@ handle_call({write_batch, Ops}, _From, State) ->
     Result = rocksdb:write(State#state.db_handle, WriteActions, []),
     {reply, Result, State};
 
+%% Atomic block connect: block data + block index + tx index in one WriteBatch
+handle_call({atomic_connect_writes, Block, Height, Chainwork, BlockHash, Status},
+            _From, #state{db_handle = Db, cf_blocks = BlocksCF,
+                          cf_block_idx = IdxCF, cf_meta = MetaCF,
+                          cf_tx_index = TxCF} = State) ->
+    %% 1. Block data (keyed by hash)
+    Hash = block_hash(Block),
+    BlockBin = beamchain_serialize:encode_block(Block),
+    BlockOp = {put, BlocksCF, Hash, BlockBin},
+
+    %% 2. Block index (height -> entry)
+    HeightKey = encode_height(Height),
+    IdxValue = encode_block_index_entry(BlockHash, Block#block.header,
+                                        Chainwork, Status),
+    IdxOp = {put, IdxCF, HeightKey, IdxValue},
+
+    %% 3. Reverse index (hash -> height)
+    RevKey = <<"blkidx:", BlockHash/binary>>,
+    RevOp = {put, MetaCF, RevKey, HeightKey},
+
+    %% 4. Tx index entries
+    TxOps = build_tx_index_ops(Block#block.transactions, BlockHash,
+                                Height, 0, TxCF, []),
+
+    AllOps = [BlockOp, IdxOp, RevOp | TxOps],
+    Result = rocksdb:write(Db, AllOps, []),
+    {reply, Result, State};
+
 %% Generic metadata
 handle_call({get_meta, Key}, _From,
             #state{db_handle = Db, cf_meta = CF} = State) ->
@@ -867,6 +908,16 @@ encode_block_index_entry(Hash, Header, Chainwork, Status) ->
     <<Hash:32/binary, HeaderBin:80/binary,
       CWLen:16/big, Chainwork:CWLen/binary,
       Status:32/little>>.
+
+%% @doc Build tx_index write ops for atomic batch.
+%% Returns [{put, TxCF, Txid, Value}] for each transaction.
+build_tx_index_ops([], _BlockHash, _Height, _Pos, _CF, Acc) ->
+    lists:reverse(Acc);
+build_tx_index_ops([Tx | Rest], BlockHash, Height, Pos, CF, Acc) ->
+    Txid = beamchain_serialize:tx_hash(Tx),
+    Value = <<BlockHash:32/binary, Height:64/big, Pos:32/big>>,
+    build_tx_index_ops(Rest, BlockHash, Height, Pos + 1, CF,
+                       [{put, CF, Txid, Value} | Acc]).
 
 %% @doc Decode a block index entry
 decode_block_index_entry(<<Hash:32/binary, HeaderBin:80/binary,
