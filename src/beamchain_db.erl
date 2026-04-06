@@ -335,7 +335,10 @@ init([]) ->
         {write_buffer_size, 64 * 1024 * 1024},
         {max_write_buffer_number, 3},
         {target_file_size_base, 64 * 1024 * 1024},
-        {max_bytes_for_level_base, 256 * 1024 * 1024}
+        {max_bytes_for_level_base, 256 * 1024 * 1024},
+        {block_based_table_options, [
+            {block_cache_size, 256 * 1024 * 1024}  %% 256MB RocksDB block cache
+        ]}
     ],
     CFOpts = [],
     %% Chainstate CF gets bloom filter + optimized for point lookups
