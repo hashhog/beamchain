@@ -633,8 +633,7 @@ do_connect_block_inner(#block{header = Header} = Block,
         ok ->
             BlockHash = beamchain_serialize:block_hash(Header),
 
-            %% Store block data and block index entry
-            beamchain_db:store_block(Block, Height),
+            %% Compute chainwork
             PrevCW = maps:get(chainwork, PrevIndex, <<0:256>>),
             PrevCWInt = binary:decode_unsigned(PrevCW, big),
             BlockWork = beamchain_pow:compute_work(Header#block_header.bits),
@@ -648,10 +647,12 @@ do_connect_block_inner(#block{header = Header} = Block,
                         false -> Bin
                     end
             end,
-            beamchain_db:store_block_index(Height, BlockHash, Header, NewCW, 2),
 
-            %% Store tx index entries
-            store_tx_index(Block, BlockHash, Height),
+            %% Atomic WriteBatch: block data + block index + tx index
+            %% in a single RocksDB write.  Prevents partial writes that
+            %% caused corruption at height 351,267 via submitblock feeder.
+            ok = beamchain_db:atomic_connect_writes(
+                     Block, Height, NewCW, BlockHash, 2),
 
             %% Update chain tip in ETS for fast reads
             ets:insert(?CHAIN_META, {tip, BlockHash, Height}),
@@ -679,15 +680,6 @@ do_connect_block_inner(#block{header = Header} = Block,
     end.
 
 %% Append a new timestamp to the MTP window, keeping at most 11.
-%% Store tx index entries for all transactions in a block.
-store_tx_index(#block{transactions = Txs}, BlockHash, Height) ->
-    lists:foldl(fun(Tx, Pos) ->
-        Txid = beamchain_serialize:tx_hash(Tx),
-        beamchain_db:store_tx_index(Txid, BlockHash, Height, Pos),
-        Pos + 1
-    end, 0, Txs),
-    ok.
-
 update_mtp_connect(Timestamp, Timestamps) ->
     Updated = Timestamps ++ [Timestamp],
     case length(Updated) > 11 of
