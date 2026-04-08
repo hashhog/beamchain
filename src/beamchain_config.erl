@@ -300,16 +300,34 @@ init([]) ->
         ets:insert(?CONFIG_TABLE, {K, V})
     end, ConfigMap),
 
-    %% Store CLI port overrides from application env (set by apply_opts)
-    case application:get_env(beamchain, p2pport) of
-        {ok, P2PPort} when is_integer(P2PPort) ->
-            ets:insert(?CONFIG_TABLE, {p2pport, P2PPort});
-        _ -> ok
+    %% Store port overrides.  Priority: env var > application env > config file.
+    case os:getenv("BEAMCHAIN_P2P_PORT") of
+        false ->
+            case application:get_env(beamchain, p2pport) of
+                {ok, P2PPort} when is_integer(P2PPort) ->
+                    ets:insert(?CONFIG_TABLE, {p2pport, P2PPort});
+                _ -> ok
+            end;
+        P2PStr ->
+            case catch list_to_integer(P2PStr) of
+                P2PPort when is_integer(P2PPort) ->
+                    ets:insert(?CONFIG_TABLE, {p2pport, P2PPort});
+                _ -> ok
+            end
     end,
-    case application:get_env(beamchain, rpcport) of
-        {ok, RPCPort} when is_integer(RPCPort) ->
-            ets:insert(?CONFIG_TABLE, {rpcport, RPCPort});
-        _ -> ok
+    case os:getenv("BEAMCHAIN_RPC_PORT") of
+        false ->
+            case application:get_env(beamchain, rpcport) of
+                {ok, RPCPort} when is_integer(RPCPort) ->
+                    ets:insert(?CONFIG_TABLE, {rpcport, RPCPort});
+                _ -> ok
+            end;
+        RPCStr ->
+            case catch list_to_integer(RPCStr) of
+                RPCPort when is_integer(RPCPort) ->
+                    ets:insert(?CONFIG_TABLE, {rpcport, RPCPort});
+                _ -> ok
+            end
     end,
 
     State = #state{
