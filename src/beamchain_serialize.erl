@@ -346,24 +346,20 @@ tx_size(Tx) ->
 
 -spec reverse_bytes(binary()) -> binary().
 reverse_bytes(Bin) ->
-    list_to_binary(lists:reverse(binary_to_list(Bin))).
+    S = byte_size(Bin) * 8,
+    <<V:S/integer-little>> = Bin,
+    <<V:S/integer-big>>.
 
 
 -spec hex_encode(binary()) -> binary().
 hex_encode(Bin) ->
-    list_to_binary(lists:flatten(
-        [io_lib:format("~2.16.0b", [B]) || <<B:8>> <= Bin]
-    )).
+    binary:encode_hex(Bin, lowercase).
 
 -spec hex_decode(binary() | string()) -> binary().
 hex_decode(Hex) when is_binary(Hex) ->
-    hex_decode(binary_to_list(Hex));
+    binary:decode_hex(Hex);
 hex_decode(Hex) when is_list(Hex) ->
-    list_to_binary(hex_decode_pairs(Hex)).
-
-hex_decode_pairs([]) -> [];
-hex_decode_pairs([H1, H2 | Rest]) ->
-    [list_to_integer([H1, H2], 16) | hex_decode_pairs(Rest)].
+    binary:decode_hex(list_to_binary(Hex)).
 
 %%% -------------------------------------------------------------------
 %%% Internal helpers

@@ -895,13 +895,16 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
         %% permanent "missing_inputs" failures on retry.
         [CoinbaseTx | _RegularTxs] = Txs,
         put(connect_block_undo, {[], []}),
-        {TotalFees, AllUndoData, TotalSigopCost, ScriptJobs} = lists:foldl(
-            fun(Tx, {FeesAcc, UndoAcc, SigopsAcc, JobsAcc}) ->
+        %% UndoAcc is a reversed list of SpentCoins chunks (list of lists).
+        %% ProcessedTxsAcc is a reversed list of processed txs.
+        %% We flatten/reverse at the end to avoid O(n^2) ++ accumulation.
+        {TotalFees, UndoChunksRev, TotalSigopCost, ScriptJobs, _ProcessedTxsRev} = lists:foldl(
+            fun(Tx, {FeesAcc, UndoAcc, SigopsAcc, JobsAcc, TxsAcc}) ->
                 IsCoinbase = is_coinbase_tx(Tx),
                 case IsCoinbase of
                     true ->
                         %% coinbase: no inputs to validate
-                        {FeesAcc, UndoAcc, SigopsAcc, JobsAcc};
+                        {FeesAcc, UndoAcc, SigopsAcc, JobsAcc, TxsAcc};
                     false ->
                         %% a. verify all inputs exist in UTXO set
                         InputCoins = fetch_input_coins(Tx),
@@ -950,7 +953,9 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
                         lists:foreach(fun(#tx_in{prev_out = #outpoint{hash = HH, index = II}}) ->
                             beamchain_chainstate:spend_utxo(HH, II)
                         end, Tx#transaction.inputs),
-                        %% Create outputs
+                        %% Create outputs (use add_utxo_fresh since BIP30
+                        %% uniqueness was already checked above — no need
+                        %% for the expensive RocksDB existence check)
                         Txid2 = beamchain_serialize:tx_hash(Tx),
                         lists:foldl(fun(#tx_out{value = V2, script_pubkey = SPK2}, Idx) ->
                             Utxo = #utxo{
@@ -959,23 +964,29 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
                                 is_coinbase = false,
                                 height = Height
                             },
-                            beamchain_chainstate:add_utxo(Txid2, Idx, Utxo),
+                            beamchain_chainstate:add_utxo_fresh(Txid2, Idx, Utxo),
                             Idx + 1
                         end, 0, Tx#transaction.outputs),
 
                         %% Update incremental undo data so rollback works
                         %% even if a later transaction in this block throws.
-                        NewUndoData = UndoAcc ++ SpentCoins,
-                        {ProcessedTxs0, _} = get(connect_block_undo),
+                        %% Accumulate in reverse order (O(1) prepend) and
+                        %% flatten at the end to avoid O(n^2) list append.
+                        NewUndoAcc = [SpentCoins | UndoAcc],
+                        NewTxsAcc = [Tx | TxsAcc],
+                        %% Flatten for process dict (needed for mid-fold rollback)
                         put(connect_block_undo,
-                            {ProcessedTxs0 ++ [Tx], NewUndoData}),
+                            {lists:reverse(NewTxsAcc),
+                             lists:append(lists:reverse(NewUndoAcc))}),
 
-                        {FeesAcc + Fee, NewUndoData, NewSigops,
-                         NewJobs}
+                        {FeesAcc + Fee, NewUndoAcc, NewSigops,
+                         NewJobs, NewTxsAcc}
                 end
             end,
-            {0, [], 0, []},
+            {0, [], 0, [], []},
             Txs),
+        %% Flatten the reversed undo chunks into a single list
+        AllUndoData = lists:append(lists:reverse(UndoChunksRev)),
 
         %% 4b. verify scripts in parallel (one process per tx)
         %% Update undo info with full transaction list for script-phase rollback.
@@ -998,7 +1009,8 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
                               0, CoinbaseTx#transaction.outputs),
         CbValue =< Subsidy + TotalFees orelse throw(bad_cb_amount),
 
-        %% 6. add coinbase outputs to UTXO set
+        %% 6. add coinbase outputs to UTXO set (use add_utxo_fresh —
+        %%    BIP30 uniqueness was already checked in step 3 above)
         CbTxid = beamchain_serialize:tx_hash(CoinbaseTx),
         lists:foldl(fun(#tx_out{value = V, script_pubkey = SPK}, Idx) ->
             Utxo = #utxo{
@@ -1007,13 +1019,13 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
                 is_coinbase = true,
                 height = Height
             },
-            beamchain_chainstate:add_utxo(CbTxid, Idx, Utxo),
+            beamchain_chainstate:add_utxo_fresh(CbTxid, Idx, Utxo),
             Idx + 1
         end, 0, CoinbaseTx#transaction.outputs),
 
-        %% 7. store undo data
+        %% 7. store undo data (direct write bypasses gen_server)
         UndoBin = encode_undo_data(AllUndoData),
-        beamchain_db:store_undo(BlockHash, UndoBin),
+        beamchain_db:direct_store_undo(BlockHash, UndoBin),
 
         %% Chain tip is updated in ETS by chainstate:do_connect_block.
         %% The RocksDB chain_tip is written during flush (atomically with

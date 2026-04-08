@@ -15,7 +15,7 @@
 -export([get_tip_height/0]).
 
 %% UTXO cache — module functions (direct ETS access, no gen_server call)
--export([get_utxo/2, has_utxo/2, add_utxo/3, spend_utxo/2]).
+-export([get_utxo/2, has_utxo/2, add_utxo/3, add_utxo_fresh/3, spend_utxo/2]).
 
 %% Block connection / disconnection
 -export([connect_block/1, disconnect_block/0, reorganize/1]).
@@ -296,6 +296,19 @@ add_utxo(Txid, Vout, Utxo) ->
             ets:insert(?UTXO_FRESH, {Key})
     end,
     %% If it was pending a DB delete, cancel that (reorg case)
+    ets:delete(?UTXO_SPENT, Key),
+    ok.
+
+%% @doc Add a UTXO that is known to be new (not in RocksDB).
+%% Fast path: skips BIP30 duplicate check and DB existence check.
+%% Use when the caller has already verified uniqueness (e.g., BIP30 check
+%% was already done in validation, or BIP34 guarantees no duplicates).
+-spec add_utxo_fresh(binary(), non_neg_integer(), #utxo{}) -> ok.
+add_utxo_fresh(Txid, Vout, Utxo) ->
+    Key = {Txid, Vout},
+    ets:insert(?UTXO_CACHE, {Key, Utxo}),
+    ets:insert(?UTXO_DIRTY, {Key}),
+    ets:insert(?UTXO_FRESH, {Key}),
     ets:delete(?UTXO_SPENT, Key),
     ok.
 
@@ -673,7 +686,8 @@ do_connect_block_inner(#block{header = Header} = Block,
                 %% Atomic WriteBatch: block data + block index + tx index
                 %% in a single RocksDB write.  Prevents partial writes that
                 %% caused corruption at height 351,267 via submitblock feeder.
-                ok = beamchain_db:atomic_connect_writes(
+                %% Uses direct write (bypasses gen_server) for IBD performance.
+                ok = beamchain_db:direct_atomic_connect_writes(
                          Block, Height, NewCW, BlockHash, 2),
 
                 %% Update chain tip in ETS for fast reads
@@ -940,7 +954,7 @@ do_flush(#state{tip_hash = TipHash, tip_height = TipHeight} = State) ->
                 {put, meta, <<"utxo_flush_height">>,
                  <<TipHeight:64/big>>}
             ],
-            beamchain_db:write_batch(TipOps),
+            beamchain_db:direct_write_batch(TipOps),
             State#state{blocks_since_flush = 0};
         false ->
             %% Build write batch
@@ -957,7 +971,7 @@ do_flush(#state{tip_hash = TipHash, tip_height = TipHeight} = State) ->
                 {put, meta, <<"HEAD_BLOCKS">>, Marker}
             ],
 
-            case beamchain_db:write_batch(AllOps) of
+            case beamchain_db:direct_write_batch(AllOps) of
                 ok ->
                     %% Clear dirty/fresh/spent tracking tables.
                     %% After flush, all cached entries match RocksDB (clean).
