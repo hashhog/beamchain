@@ -531,6 +531,11 @@ apply_opts(Opts) ->
     ok.
 
 start_app() ->
+    %% When running as escript, NIF-based dependencies (rocksdb) cannot
+    %% find their .so libraries because code:priv_dir/1 doesn't resolve
+    %% inside an escript archive.  Fix: add each dep's ebin/ from the
+    %% _build tree to the code path so that code:priv_dir/1 works.
+    ensure_nif_deps_on_path(),
     %% Ensure all dependency applications are started
     ensure_started(crypto),
     ensure_started(asn1),
@@ -551,6 +556,54 @@ ensure_started(App) ->
         {ok, _} -> ok;
         {error, {already_started, _}} -> ok;
         {error, _Reason} -> ok  %% best effort
+    end.
+
+%% @doc Ensure NIF-based deps (rocksdb) are loadable when running as escript.
+%% Escript bundles .beam files inside a zip archive, but NIF .so files
+%% live on the real filesystem.  The rocksdb NIF loader checks
+%% code:priv_dir(rocksdb) which fails in escript mode because the app
+%% is loaded from an archive.  Fix: register the rocksdb application's
+%% priv dir in the code server by loading the .app from the filesystem
+%% before ensure_all_started triggers the archive copy.
+ensure_nif_deps_on_path() ->
+    NifOk = case code:priv_dir(rocksdb) of
+        {error, bad_name} -> false;
+        Dir -> filelib:is_regular(filename:join(Dir, "liberocksdb.so"))
+    end,
+    case NifOk of
+        true ->
+            ok;  %% priv_dir resolves to a real directory with the NIF
+        false ->
+            %% Running as escript — priv_dir points inside the archive
+            %% which doesn't contain .so files.  Re-point to filesystem.
+            ScriptDir = escript_dir(),
+            LibDir = filename:join(filename:dirname(ScriptDir), "lib"),
+            case filelib:is_dir(filename:join([LibDir, "rocksdb", "ebin"])) of
+                true ->
+                    Ebins = filelib:wildcard(filename:join(LibDir, "*/ebin")),
+                    lists:foreach(fun(Ebin) -> code:add_patha(Ebin) end, Ebins),
+                    %% Unload the escript-archive version of rocksdb
+                    %% so it reloads from the filesystem code path
+                    %% where priv_dir/1 resolves correctly.
+                    application:unload(rocksdb),
+                    code:purge(rocksdb),
+                    code:delete(rocksdb),
+                    code:purge(rocksdb),
+                    ok;
+                false ->
+                    ok
+            end
+    end.
+
+%% @doc Return the directory containing the running escript.
+escript_dir() ->
+    case escript:script_name() of
+        [] ->
+            %% Fallback: cwd
+            {ok, Cwd} = file:get_cwd(),
+            Cwd;
+        Name ->
+            filename:dirname(filename:absname(Name))
     end.
 
 print_banner() ->
