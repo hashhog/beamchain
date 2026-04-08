@@ -247,7 +247,7 @@ get_tx_location(Txid) when byte_size(Txid) =:= 32 ->
 %% @doc Store undo data for a block (spent UTXOs, for reorgs)
 -spec store_undo(binary(), binary()) -> ok.
 store_undo(BlockHash, UndoData) when byte_size(BlockHash) =:= 32 ->
-    gen_server:call(?SERVER, {store_undo, BlockHash, UndoData}).
+    gen_server:call(?SERVER, {store_undo, BlockHash, UndoData}, infinity).
 
 %% @doc Get undo data for a block
 -spec get_undo(binary()) -> {ok, binary()} | not_found.
