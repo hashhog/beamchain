@@ -51,6 +51,8 @@ run_command(sync, Opts) ->
     sync_blockchain(Opts);
 run_command(import, Opts) ->
     import_blocks(Opts);
+run_command('import-utxo', Opts) ->
+    import_utxo(Opts);
 run_command(status, Opts) ->
     ensure_httpc(),
     show_status(Opts);
@@ -127,6 +129,11 @@ parse_args(["--import-file", Value | Rest], Cmd, Opts) ->
 parse_args(["--import-file=" ++ Value | Rest], Cmd, Opts) ->
     parse_args(Rest, Cmd, Opts#{import_file => Value});
 
+parse_args(["--import-utxo", Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{import_utxo => Value});
+parse_args(["--import-utxo=" ++ Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{import_utxo => Value});
+
 parse_args(["--limit", Value | Rest], Cmd, Opts) ->
     parse_args(Rest, Cmd, Opts#{limit => list_to_integer(Value)});
 parse_args(["--limit=" ++ Value | Rest], Cmd, Opts) ->
@@ -137,6 +144,8 @@ parse_args(["start" | Rest], undefined, Opts) ->
     parse_args(Rest, start, Opts);
 parse_args(["import" | Rest], undefined, Opts) ->
     parse_args(Rest, import, Opts);
+parse_args(["import-utxo" | Rest], undefined, Opts) ->
+    parse_args(Rest, 'import-utxo', Opts);
 parse_args(["sync" | Rest], undefined, Opts) ->
     parse_args(Rest, sync, Opts);
 parse_args(["status" | Rest], undefined, Opts) ->
@@ -173,6 +182,7 @@ print_usage() ->
         "  start        start the beamchain node~n"
         "  sync         sync the blockchain with progress display~n"
         "  import       import blocks from stdin or file (bypasses P2P)~n"
+        "  import-utxo  import UTXO snapshot from HDOG file~n"
         "  status       show node status~n"
         "  stop         stop a running node~n"
         "  getbalance   get balance for an address~n"
@@ -186,6 +196,7 @@ print_usage() ->
         "  --reset           reset chain data before sync~n"
         "  --limit=<n>       limit sync to n blocks~n"
         "  --import-file=<f> file to import blocks from (default: stdin)~n"
+        "  --import-utxo=<f> HDOG snapshot file for UTXO import~n"
         "  -h, --help        show this help~n"
         "  -v, --version     show version~n",
         [header("beamchain " ++ ?VERSION ++ " - bitcoin full node in erlang/otp"),
@@ -295,6 +306,31 @@ import_blocks(Opts) ->
             io:format(standard_error, "~s failed to start: ~p~n",
                       [red("error:"), Reason]),
             halt(1)
+    end.
+
+%%% ===================================================================
+%%% import-utxo command -- import UTXO snapshot from HDOG file
+%%% ===================================================================
+
+import_utxo(Opts) ->
+    case maps:get(import_utxo, Opts, undefined) of
+        undefined ->
+            io:format(standard_error,
+                      "~s --import-utxo=<path> is required~n"
+                      "  usage: beamchain import-utxo --import-utxo=/path/to/snapshot.hdog~n",
+                      [red("error:")]),
+            halt(1);
+        _Path ->
+            apply_opts(Opts),
+            case start_app() of
+                ok ->
+                    setup_file_logger(),
+                    beamchain_hdog_import:run(Opts);
+                {error, Reason} ->
+                    io:format(standard_error, "~s failed to start: ~p~n",
+                              [red("error:"), Reason]),
+                    halt(1)
+            end
     end.
 
 draw_header_progress(Spinner, Info) ->
