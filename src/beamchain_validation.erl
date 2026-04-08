@@ -39,6 +39,9 @@
 %% Checkpoint enforcement
 -export([check_against_checkpoint/3]).
 
+%% UTXO rollback (used by chainstate terminate for crash recovery)
+-export([rollback_block_utxos/2]).
+
 %%% -------------------------------------------------------------------
 %%% Context-free block header validation
 %%% -------------------------------------------------------------------
@@ -195,7 +198,13 @@ contextual_check_block_header(Header, PrevIndex, Params) ->
 
 %% @doc Compute median time past from the previous block index.
 %% Returns the median timestamp of the last 11 blocks.
+%% When PrevIndex contains a cached mtp_timestamps list (injected by
+%% chainstate during connect_block), we use it directly instead of
+%% walking the DB for 11 block index lookups per block.
 -spec median_time_past(map()) -> non_neg_integer().
+median_time_past(#{mtp_timestamps := Ts}) when is_list(Ts), Ts =/= [] ->
+    Sorted = lists:sort(Ts),
+    lists:nth((length(Sorted) div 2) + 1, Sorted);
 median_time_past(PrevIndex) ->
     Timestamps = collect_timestamps(PrevIndex, 11, []),
     Sorted = lists:sort(Timestamps),
@@ -1010,10 +1019,12 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
         %% The RocksDB chain_tip is written during flush (atomically with
         %% UTXO changes) to avoid tip/UTXO mismatch on crash.
 
-        %% All UTXO modifications are complete and no more throws can
-        %% happen. Clear the undo tracking — the catch block no longer
-        %% needs it.
-        erase(connect_block_undo),
+        %% NOTE: We intentionally do NOT erase connect_block_undo here.
+        %% The caller (do_connect_block_inner) still has post-validation
+        %% work to do (atomic_connect_writes, state update).  If any of
+        %% those steps fail with an exit/crash, the terminate/2 handler
+        %% needs the undo data to roll back the UTXO changes before
+        %% flushing.  The caller erases it after all work is done.
 
         ok
     catch
@@ -1031,7 +1042,20 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
                     rollback_block_utxos(UndoTxs2, UndoCoins2);
                 _ -> ok
             end,
-            {error, {internal_error, Reason2}}
+            {error, {internal_error, Reason2}};
+        exit:Reason3 ->
+            %% Catch exit signals (e.g. gen_server:call timeout to
+            %% beamchain_db during store_undo). Without this clause,
+            %% the exit propagates up and crashes the chainstate
+            %% gen_server, whose terminate/2 flushes the partially-
+            %% modified UTXO cache to RocksDB — corrupting the UTXO
+            %% set (inputs spent but chain_tip not advanced).
+            case erase(connect_block_undo) of
+                {UndoTxs3, UndoCoins3} ->
+                    rollback_block_utxos(UndoTxs3, UndoCoins3);
+                _ -> ok
+            end,
+            {error, {exit_during_connect, Reason3}}
     end.
 
 %% Roll back UTXO changes from a failed block validation.
