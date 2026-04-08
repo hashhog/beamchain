@@ -50,6 +50,11 @@
 %% Batch writes
 -export([write_batch/1]).
 
+%% Direct write (bypasses gen_server for performance-critical paths)
+-export([direct_write_batch/1]).
+-export([direct_store_undo/2]).
+-export([direct_atomic_connect_writes/5]).
+
 %% Atomic block connect (block + index + tx_index in single WriteBatch)
 -export([atomic_connect_writes/5]).
 
@@ -331,6 +336,81 @@ trigger_pruning(Height) ->
     gen_server:cast(?SERVER, {trigger_pruning, Height}).
 
 %%% ===================================================================
+%%% Direct-write API (bypasses gen_server for hot paths)
+%%%
+%%% These functions use persistent_term to access RocksDB handles
+%%% directly from the calling process. This avoids gen_server message
+%%% passing overhead during block connection, which is critical during
+%%% IBD where we connect hundreds of blocks per second.
+%%%
+%%% SAFETY: RocksDB write operations are thread-safe. The gen_server
+%%% is only needed for operations that modify Erlang state (flat file
+%%% position, pruning sets, etc.).
+%%% ===================================================================
+
+%% @doc Direct write batch — bypasses gen_server.
+%% Ops = [{put, CF, Key, Value} | {delete, CF, Key}]
+%% CF is one of: blocks, block_index, chainstate, tx_index, meta, undo
+-spec direct_write_batch([tuple()]) -> ok | {error, term()}.
+direct_write_batch(Ops) ->
+    Db = persistent_term:get(beamchain_db_handle),
+    WriteActions = lists:map(fun(Op) -> resolve_direct_batch_op(Op) end, Ops),
+    rocksdb:write(Db, WriteActions, []).
+
+%% @doc Direct store undo data — bypasses gen_server.
+-spec direct_store_undo(binary(), binary()) -> ok | {error, term()}.
+direct_store_undo(BlockHash, UndoData) ->
+    Db = persistent_term:get(beamchain_db_handle),
+    CF = persistent_term:get(beamchain_cf_undo),
+    rocksdb:put(Db, CF, BlockHash, UndoData, []).
+
+%% @doc Direct atomic connect writes — bypasses gen_server.
+%% Writes block data + block index + tx index in a single WriteBatch.
+-spec direct_atomic_connect_writes(#block{}, non_neg_integer(), binary(),
+                                   binary(), integer()) -> ok | {error, term()}.
+direct_atomic_connect_writes(Block, Height, Chainwork, BlockHash, Status) ->
+    Db = persistent_term:get(beamchain_db_handle),
+    BlocksCF = persistent_term:get(beamchain_cf_blocks),
+    IdxCF = persistent_term:get(beamchain_cf_block_idx),
+    MetaCF = persistent_term:get(beamchain_cf_meta),
+    TxCF = persistent_term:get(beamchain_cf_tx_index),
+
+    %% 1. Block data (keyed by hash)
+    Hash = block_hash(Block),
+    BlockBin = beamchain_serialize:encode_block(Block),
+    BlockOp = {put, BlocksCF, Hash, BlockBin},
+
+    %% 2. Block index (height -> entry)
+    HeightKey = encode_height(Height),
+    IdxValue = encode_block_index_entry(BlockHash, Block#block.header,
+                                        Chainwork, Status),
+    IdxOp = {put, IdxCF, HeightKey, IdxValue},
+
+    %% 3. Reverse index (hash -> height)
+    RevKey = <<"blkidx:", BlockHash/binary>>,
+    RevOp = {put, MetaCF, RevKey, HeightKey},
+
+    %% 4. Tx index entries
+    TxOps = build_tx_index_ops(Block#block.transactions, BlockHash,
+                                Height, 0, TxCF, []),
+
+    AllOps = [BlockOp, IdxOp, RevOp | TxOps],
+    rocksdb:write(Db, AllOps, []).
+
+%% @doc Resolve batch op CF name to persistent_term handle (direct path).
+resolve_direct_batch_op({put, CF, Key, Value}) ->
+    {put, direct_cf_handle(CF), Key, Value};
+resolve_direct_batch_op({delete, CF, Key}) ->
+    {delete, direct_cf_handle(CF), Key}.
+
+direct_cf_handle(blocks) -> persistent_term:get(beamchain_cf_blocks);
+direct_cf_handle(block_index) -> persistent_term:get(beamchain_cf_block_idx);
+direct_cf_handle(chainstate) -> persistent_term:get(beamchain_cf_chainstate);
+direct_cf_handle(tx_index) -> persistent_term:get(beamchain_cf_tx_index);
+direct_cf_handle(meta) -> persistent_term:get(beamchain_cf_meta);
+direct_cf_handle(undo) -> persistent_term:get(beamchain_cf_undo).
+
+%%% ===================================================================
 %%% gen_server callbacks
 %%% ===================================================================
 
@@ -450,10 +530,16 @@ init([]) ->
                 pruned_files = PrunedFiles,
                 file_info = FileInfo
             },
-            %% Store handles in persistent_term for direct read access
-            %% (bypasses gen_server for read-only UTXO lookups)
+            %% Store handles in persistent_term for direct access
+            %% (bypasses gen_server for read-only UTXO lookups and
+            %%  direct writes from chainstate/validation processes)
             persistent_term:put(beamchain_db_handle, DbHandle),
             persistent_term:put(beamchain_cf_chainstate, ChainstateCF),
+            persistent_term:put(beamchain_cf_blocks, BlocksCF),
+            persistent_term:put(beamchain_cf_block_idx, BlockIdxCF),
+            persistent_term:put(beamchain_cf_tx_index, TxIndexCF),
+            persistent_term:put(beamchain_cf_meta, MetaCF),
+            persistent_term:put(beamchain_cf_undo, UndoCF),
             logger:info("beamchain_db: opened rocksdb at ~s, blocks at ~s (file ~p, pos ~p)",
                         [DbPath, BlocksDir, CurrentFile, CurrentPos]),
             {ok, State};
