@@ -54,17 +54,19 @@
 
 %% Flush tuning
 -define(DEFAULT_MAX_CACHE_MB, 450).
--define(IBD_MAX_CACHE_MB, 1024).
--define(IBD_FLUSH_INTERVAL, 2000).
+-define(IBD_MAX_CACHE_MB, 4096).
+-define(IBD_FLUSH_INTERVAL, 5000).
 
 %% Estimated cache entry count threshold (3 million entries ~ 450MB)
 %% Each UTXO entry is roughly 150 bytes on average (key + value + ETS overhead)
--define(DEFAULT_MAX_CACHE_ENTRIES, 3000000).
+-define(DEFAULT_MAX_CACHE_ENTRIES, 10000000).
 
 %% Post-flush eviction thresholds: evict clean entries when cache exceeds
 %% this many entries, trimming down to the low-water mark.
--define(EVICT_HIGH_WATER, 2000000).
--define(EVICT_LOW_WATER, 1500000).
+%% With 128GB RAM, we can afford a large cache during IBD to minimize
+%% RocksDB lookups on UTXO cache misses.
+-define(EVICT_HIGH_WATER, 8000000).
+-define(EVICT_LOW_WATER, 6000000).
 
 -record(state, {
     %% Current chain tip
@@ -555,6 +557,17 @@ handle_info(_Info, State) ->
     {noreply, State}.
 
 terminate(_Reason, State) ->
+    %% If a connect_block was in progress when we crashed (e.g. due to
+    %% a gen_server:call timeout in store_undo), the UTXO cache may
+    %% contain partial changes from that block. Roll them back before
+    %% flushing to avoid persisting a corrupted UTXO set.
+    case erase(connect_block_undo) of
+        {UndoTxs, UndoCoins} ->
+            logger:warning("chainstate: rolling back in-progress block "
+                           "changes before flush"),
+            beamchain_validation:rollback_block_utxos(UndoTxs, UndoCoins);
+        _ -> ok
+    end,
     logger:info("chainstate: flushing UTXO cache on shutdown"),
     do_flush(State),
     ok.
@@ -612,7 +625,8 @@ do_connect_block(#block{header = Header} = Block,
     end.
 
 do_connect_block_inner(#block{header = Header} = Block,
-                       #state{tip_height = TipHeight, params = Params} = State) ->
+                       #state{tip_height = TipHeight, params = Params,
+                              mtp_timestamps = MTPTimestamps} = State) ->
     Height = TipHeight + 1,
 
     %% Build PrevIndex for validation
@@ -623,7 +637,10 @@ do_connect_block_inner(#block{header = Header} = Block,
               chainwork => <<0:256>>, status => 2};
         false ->
             case beamchain_db:get_block_index(TipHeight) of
-                {ok, PI} -> PI;
+                {ok, PI} ->
+                    %% Inject cached MTP timestamps so validation can compute
+                    %% median_time_past without walking the DB (11 lookups/block).
+                    PI#{mtp_timestamps => MTPTimestamps};
                 not_found -> error({missing_prev_index, TipHeight})
             end
     end,
@@ -631,50 +648,75 @@ do_connect_block_inner(#block{header = Header} = Block,
     %% Full consensus validation + UTXO update
     case beamchain_validation:connect_block(Block, Height, PrevIndex, Params) of
         ok ->
-            BlockHash = beamchain_serialize:block_hash(Header),
+            %% Validation succeeded — UTXO changes are applied in ETS.
+            %% connect_block_undo is still set in the process dictionary
+            %% so that if ANY subsequent step fails, terminate/2 can
+            %% roll back the UTXO changes before flushing to RocksDB.
+            try
+                BlockHash = beamchain_serialize:block_hash(Header),
 
-            %% Compute chainwork
-            PrevCW = maps:get(chainwork, PrevIndex, <<0:256>>),
-            PrevCWInt = binary:decode_unsigned(PrevCW, big),
-            BlockWork = beamchain_pow:compute_work(Header#block_header.bits),
-            NewCWInt = PrevCWInt + BlockWork,
-            NewCW = case NewCWInt of
-                0 -> <<0:256>>;
-                _ ->
-                    Bin = binary:encode_unsigned(NewCWInt, big),
-                    case byte_size(Bin) < 32 of
-                        true -> <<0:((32 - byte_size(Bin)) * 8), Bin/binary>>;
-                        false -> Bin
-                    end
-            end,
+                %% Compute chainwork
+                PrevCW = maps:get(chainwork, PrevIndex, <<0:256>>),
+                PrevCWInt = binary:decode_unsigned(PrevCW, big),
+                BlockWork = beamchain_pow:compute_work(Header#block_header.bits),
+                NewCWInt = PrevCWInt + BlockWork,
+                NewCW = case NewCWInt of
+                    0 -> <<0:256>>;
+                    _ ->
+                        Bin = binary:encode_unsigned(NewCWInt, big),
+                        case byte_size(Bin) < 32 of
+                            true -> <<0:((32 - byte_size(Bin)) * 8), Bin/binary>>;
+                            false -> Bin
+                        end
+                end,
 
-            %% Atomic WriteBatch: block data + block index + tx index
-            %% in a single RocksDB write.  Prevents partial writes that
-            %% caused corruption at height 351,267 via submitblock feeder.
-            ok = beamchain_db:atomic_connect_writes(
-                     Block, Height, NewCW, BlockHash, 2),
+                %% Atomic WriteBatch: block data + block index + tx index
+                %% in a single RocksDB write.  Prevents partial writes that
+                %% caused corruption at height 351,267 via submitblock feeder.
+                ok = beamchain_db:atomic_connect_writes(
+                         Block, Height, NewCW, BlockHash, 2),
 
-            %% Update chain tip in ETS for fast reads
-            ets:insert(?CHAIN_META, {tip, BlockHash, Height}),
+                %% Update chain tip in ETS for fast reads
+                ets:insert(?CHAIN_META, {tip, BlockHash, Height}),
 
-            %% Update MTP sliding window
-            NewMTP = update_mtp_connect(Header#block_header.timestamp,
-                                         State#state.mtp_timestamps),
+                %% Update MTP sliding window
+                NewMTP = update_mtp_connect(Header#block_header.timestamp,
+                                             State#state.mtp_timestamps),
 
-            BlocksSinceFlush = State#state.blocks_since_flush + 1,
-            State2 = State#state{
-                tip_hash = BlockHash,
-                tip_height = Height,
-                mtp_timestamps = NewMTP,
-                blocks_since_flush = BlocksSinceFlush
-            },
-            State3 = maybe_check_ibd(State2),
-            State4 = maybe_flush(State3),
+                BlocksSinceFlush = State#state.blocks_since_flush + 1,
+                State2 = State#state{
+                    tip_hash = BlockHash,
+                    tip_height = Height,
+                    mtp_timestamps = NewMTP,
+                    blocks_since_flush = BlocksSinceFlush
+                },
+                State3 = maybe_check_ibd(State2),
+                State4 = maybe_flush(State3),
 
-            %% ZMQ notification for block connect
-            beamchain_zmq:notify_block(Block, connect),
+                %% All post-validation work complete.  Now safe to clear
+                %% the undo tracking — terminate/2 no longer needs it.
+                erase(connect_block_undo),
 
-            {ok, State4};
+                %% ZMQ notification for block connect
+                beamchain_zmq:notify_block(Block, connect),
+
+                {ok, State4}
+            catch
+                Class:Reason2:Stack ->
+                    %% A post-validation step failed (e.g. atomic_connect_writes
+                    %% timeout, RocksDB error).  Roll back UTXO changes to
+                    %% prevent persisting a corrupted UTXO set.
+                    logger:error("chainstate: post-validation failure at "
+                                 "height ~B: ~p:~p~n~p",
+                                 [Height, Class, Reason2, Stack]),
+                    case erase(connect_block_undo) of
+                        {UndoTxs, UndoCoins} ->
+                            beamchain_validation:rollback_block_utxos(
+                                UndoTxs, UndoCoins);
+                        _ -> ok
+                    end,
+                    {error, {post_validation_failure, Reason2}}
+            end;
         {error, Reason} ->
             {error, Reason}
     end.
