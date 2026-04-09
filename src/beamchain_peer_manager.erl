@@ -40,7 +40,8 @@
          update_peer_height/2,
          mark_getheaders_sent/1,
          mark_headers_received/1,
-         update_ping_latency/2]).
+         update_ping_latency/2,
+         notify_tip_updated/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -64,6 +65,8 @@
 -define(MISBEHAVIOR_INVALID_TX, 10).
 -define(MISBEHAVIOR_UNCONNECTING_HEADERS, 20).
 -define(MISBEHAVIOR_INVALID_COMPACT_BLOCK, 100).
+-define(MISBEHAVIOR_BLOCK_DOWNLOAD_STALL, 50).
+-define(MISBEHAVIOR_UNREQUESTED_DATA, 5).
 
 %% Connection loop intervals
 -define(CONNECT_INTERVAL, 500).        %% 500ms between connection attempts
@@ -82,6 +85,11 @@
 -define(HEADERS_RESPONSE_TIMEOUT, 120000).   %% 2 minutes in milliseconds
 -define(PING_TIMEOUT, 1200000).              %% 20 minutes in milliseconds
 -define(MIN_CONNECT_TIME_FOR_EVICTION, 30).  %% 30 seconds
+
+%% Stale tip detection (Bitcoin Core: TipMayBeStale / CheckForStaleTipAndEvictPeers)
+-define(STALE_TIP_CHECK_INTERVAL, 600000).   %% 10 minutes in milliseconds
+-define(STALE_TIP_AGE_THRESHOLD, 1800).      %% 30 minutes: 3 * nPowTargetSpacing
+-define(PERIODIC_HEADER_INTERVAL, 300000).   %% 5 minutes: periodic getheaders
 
 -record(peer_entry, {
     pid         :: pid(),
@@ -134,7 +142,13 @@
     %% Data directory for anchor file
     datadir :: string(),
     %% Stale peer check timer
-    stale_check_timer :: reference() | undefined
+    stale_check_timer :: reference() | undefined,
+    %% Stale tip detection: when our chain tip last advanced (erlang:system_time(second))
+    last_tip_update :: non_neg_integer(),
+    %% Timer for periodic stale tip check
+    stale_tip_timer :: reference() | undefined,
+    %% Timer for periodic getheaders to random peer
+    periodic_header_timer :: reference() | undefined
 }).
 
 %%% ===================================================================
@@ -318,6 +332,12 @@ update_ping_latency(Pid, LatencyMs) ->
             ok
     end.
 
+%% @doc Notify that our chain tip has been updated (new block connected).
+%% Resets the stale tip timer so we don't falsely detect stale tip.
+-spec notify_tip_updated() -> ok.
+notify_tip_updated() ->
+    gen_server:cast(?SERVER, tip_updated).
+
 %%% ===================================================================
 %%% gen_server callbacks
 %%% ===================================================================
@@ -353,12 +373,20 @@ init([]) ->
     erlang:send_after(60000, self(), cleanup_expired_bans),
     %% Schedule stale peer check
     StaleTimer = erlang:send_after(?STALE_CHECK_INTERVAL, self(), check_stale_peers),
+    %% Schedule stale tip detection (Bitcoin Core: CheckForStaleTipAndEvictPeers)
+    StaleTipTimer = erlang:send_after(?STALE_TIP_CHECK_INTERVAL, self(), check_stale_tip),
+    %% Schedule periodic getheaders to random peer
+    PeriodicHdrTimer = erlang:send_after(?PERIODIC_HEADER_INTERVAL, self(), periodic_getheaders),
+    Now = erlang:system_time(second),
     MaxInbound = beamchain_config:get(max_inbound, ?MAX_INBOUND_DEFAULT),
     {ok, #state{our_nonce = Nonce, connect_timer = Timer,
                 listen_socket = ListenSock, acceptor = Acceptor,
                 max_inbound = MaxInbound, anchors = Anchors,
                 netgroup_secret = NetgroupSecret, datadir = DataDir,
-                stale_check_timer = StaleTimer}}.
+                stale_check_timer = StaleTimer,
+                last_tip_update = Now,
+                stale_tip_timer = StaleTipTimer,
+                periodic_header_timer = PeriodicHdrTimer}}.
 
 handle_call({connect_to, IP, Port}, _From, State) ->
     Address = {IP, Port},
@@ -455,6 +483,11 @@ handle_cast(resolve_dns_seeds, State) ->
 
 handle_cast({misbehaving, Pid, Score, Reason}, State) ->
     handle_misbehaving(Pid, Score, Reason, State);
+
+%% Chain tip updated — reset stale tip timer
+handle_cast(tip_updated, State) ->
+    Now = erlang:system_time(second),
+    {noreply, State#state{last_tip_update = Now}};
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -644,6 +677,30 @@ handle_info({evict_peer, Pid, Reason}, State) ->
             ok
     end,
     {noreply, State};
+
+%% Stale tip detection: check if our chain tip hasn't advanced
+%% Reference: Bitcoin Core TipMayBeStale() + CheckForStaleTipAndEvictPeers()
+handle_info(check_stale_tip, #state{last_tip_update = LastUpdate} = State) ->
+    Now = erlang:system_time(second),
+    StaleDuration = Now - LastUpdate,
+    State2 = case StaleDuration > ?STALE_TIP_AGE_THRESHOLD of
+        true ->
+            %% Our tip is stale — send getheaders to best peer, disconnect worst
+            logger:warning("peer_manager: potential stale tip detected "
+                           "(last tip update: ~B seconds ago)", [StaleDuration]),
+            handle_stale_tip_detected(State);
+        false ->
+            State
+    end,
+    Timer = erlang:send_after(?STALE_TIP_CHECK_INTERVAL, self(), check_stale_tip),
+    {noreply, State2#state{stale_tip_timer = Timer}};
+
+%% Periodic getheaders to random peer to discover new blocks
+%% Reference: Bitcoin Core SendMessages() periodic header fetch
+handle_info(periodic_getheaders, State) ->
+    send_periodic_getheaders(),
+    Timer = erlang:send_after(?PERIODIC_HEADER_INTERVAL, self(), periodic_getheaders),
+    {noreply, State#state{periodic_header_timer = Timer}};
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -1205,6 +1262,49 @@ cleanup_expired_bans() ->
         end
     end, ok, ?BANNED_PEERS_TABLE).
 
+%% Persist ban list to banned.json in the data directory.
+save_bans(DataDir) ->
+    BanList = get_ban_list_internal(),
+    Entries = lists:map(fun({IP, BanExpiry}) ->
+        IPStr = inet:ntoa(IP),
+        #{<<"ip">> => list_to_binary(IPStr),
+          <<"until_timestamp">> => BanExpiry}
+    end, BanList),
+    Json = jsx:encode(Entries),
+    Path = filename:join(DataDir, "banned.json"),
+    ok = file:write_file(Path, Json),
+    ok.
+
+%% Load ban list from banned.json on startup.
+load_bans(DataDir) ->
+    Path = filename:join(DataDir, "banned.json"),
+    case file:read_file(Path) of
+        {ok, Bin} ->
+            try
+                Entries = jsx:decode(Bin, [return_maps]),
+                Now = erlang:system_time(second),
+                lists:foreach(fun(Entry) ->
+                    IPStr = binary_to_list(maps:get(<<"ip">>, Entry)),
+                    BanExpiry = maps:get(<<"until_timestamp">>, Entry),
+                    case inet:parse_address(IPStr) of
+                        {ok, IP} when BanExpiry > Now ->
+                            ets:insert(?BANNED_PEERS_TABLE, {IP, BanExpiry});
+                        _ ->
+                            ok
+                    end
+                end, Entries),
+                logger:info("peer manager: loaded ~B bans from ~s",
+                            [length(Entries), Path])
+            catch
+                _:_ ->
+                    logger:warning("peer manager: failed to parse ~s", [Path])
+            end;
+        {error, enoent} ->
+            ok;
+        {error, Reason} ->
+            logger:warning("peer manager: failed to read ~s: ~p", [Path, Reason])
+    end.
+
 %% Disconnect all peers from a given IP
 disconnect_peers_by_ip(IP) ->
     ets:foldl(fun(#peer_entry{pid = Pid, address = {PeerIP, _}}, _) ->
@@ -1476,6 +1576,100 @@ generate_nonce() ->
 shuffle(List) ->
     Tagged = [{rand:uniform(), X} || X <- List],
     [X || {_, X} <- lists:sort(Tagged)].
+
+%%% ===================================================================
+%%% Internal: stale tip detection (Bitcoin Core TipMayBeStale)
+%%% ===================================================================
+
+%% @doc Handle stale tip: disconnect worst peer, request headers from best.
+%% When our chain tip hasn't advanced in > 30 minutes and peers report
+%% higher tips, we disconnect the lowest-height peer and request headers
+%% from the highest-height peer.
+handle_stale_tip_detected(State) ->
+    OurTipHeight = get_our_tip_height(),
+    %% Collect outbound peers with their heights
+    OutboundPeers = ets:foldl(fun
+        (#peer_entry{connected = true, direction = outbound} = E, Acc) ->
+            [E | Acc];
+        (_, Acc) ->
+            Acc
+    end, [], ?PEER_TABLE),
+    case OutboundPeers of
+        [] ->
+            logger:warning("peer_manager: stale tip but no outbound peers connected"),
+            State;
+        Peers ->
+            %% Find best and worst peers
+            {BestPeer, WorstPeer} = find_best_worst_peers(Peers),
+            %% Disconnect worst peer if behind us (make room for better peer)
+            case WorstPeer of
+                {WorstPid, WorstAddr, WorstH} when WorstH < OurTipHeight ->
+                    case BestPeer of
+                        {BestPid, _, _} when WorstPid =/= BestPid ->
+                            logger:warning("peer_manager: disconnecting stale peer ~p "
+                                           "(height ~B, ours ~B) due to stale tip",
+                                           [WorstAddr, WorstH, OurTipHeight]),
+                            beamchain_peer:disconnect(WorstPid);
+                        _ ->
+                            ok
+                    end;
+                _ ->
+                    ok
+            end,
+            %% Request headers from best peer
+            case BestPeer of
+                {BestPid2, BestAddr2, BestH2} when BestH2 > OurTipHeight ->
+                    logger:info("peer_manager: requesting headers from best peer ~p "
+                                "(height ~B, ours ~B) due to stale tip",
+                                [BestAddr2, BestH2, OurTipHeight]),
+                    beamchain_header_sync:handle_peer_connected(BestPid2,
+                        #{start_height => BestH2});
+                _ ->
+                    %% No peer ahead — send getheaders to all to discover new blocks
+                    send_periodic_getheaders()
+            end,
+            State
+    end.
+
+%% Find the peer with highest and lowest best_height.
+find_best_worst_peers(Peers) ->
+    lists:foldl(fun(#peer_entry{pid = Pid, address = Addr, best_height = H},
+                    {Best, Worst}) ->
+        NewBest = case Best of
+            none -> {Pid, Addr, H};
+            {_, _, BH} when H > BH -> {Pid, Addr, H};
+            _ -> Best
+        end,
+        NewWorst = case Worst of
+            none -> {Pid, Addr, H};
+            {_, _, WH} when H < WH -> {Pid, Addr, H};
+            _ -> Worst
+        end,
+        {NewBest, NewWorst}
+    end, {none, none}, Peers).
+
+%% @doc Send getheaders to a random connected peer to discover new blocks.
+%% Reference: Bitcoin Core SendMessages() periodic header fetch.
+send_periodic_getheaders() ->
+    AllPeers = ets:foldl(fun
+        (#peer_entry{connected = true, pid = Pid}, Acc) -> [Pid | Acc];
+        (_, Acc) -> Acc
+    end, [], ?PEER_TABLE),
+    case AllPeers of
+        [] ->
+            ok;
+        Peers ->
+            %% Pick a random peer
+            Idx = rand:uniform(length(Peers)),
+            Peer = lists:nth(Idx, Peers),
+            %% Trigger header sync check with this peer
+            PeerHeight = case ets:lookup(?PEER_TABLE, Peer) of
+                [#peer_entry{best_height = H}] -> H;
+                _ -> 0
+            end,
+            beamchain_header_sync:handle_peer_connected(Peer,
+                #{start_height => PeerHeight})
+    end.
 
 %%% ===================================================================
 %%% Internal: stale peer eviction (Bitcoin Core parity)
