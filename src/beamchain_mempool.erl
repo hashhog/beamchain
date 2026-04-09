@@ -11,7 +11,7 @@
 -export([start_link/0]).
 
 %% Transaction submission
--export([add_transaction/1, accept_package/1]).
+-export([accept_to_memory_pool/1, add_transaction/1, accept_package/1]).
 
 %% Queries
 -export([has_tx/1, get_tx/1, get_entry/1]).
@@ -129,6 +129,14 @@
 
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
+
+%% @doc AcceptToMemoryPool — canonical entry point matching Bitcoin Core naming.
+%% Validates and adds a transaction to the mempool with all policy checks
+%% including BIP125 RBF, fee-rate validation, script verification, and
+%% cluster mempool limits.
+-spec accept_to_memory_pool(#transaction{}) -> {ok, binary()} | {error, term()}.
+accept_to_memory_pool(Tx) ->
+    add_transaction(Tx).
 
 %% @doc Submit a transaction to the mempool.
 -spec add_transaction(#transaction{}) -> {ok, binary()} | {error, term()}.

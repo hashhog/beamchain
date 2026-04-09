@@ -284,6 +284,26 @@ route_message(Peer, getblocktxn, Payload, State) ->
     end,
     State;
 
+%% Handle incoming tx message: validate via AcceptToMemoryPool and relay
+route_message(Peer, tx, Payload, State) ->
+    case beamchain_p2p_msg:decode_payload(tx, Payload) of
+        {ok, Tx} ->
+            case beamchain_mempool:accept_to_memory_pool(Tx) of
+                {ok, Txid} ->
+                    logger:info("sync: accepted tx ~s from ~p",
+                                [beamchain_serialize:encode_hex(Txid), Peer]),
+                    %% Relay to all peers via inv
+                    beamchain_peer_manager:broadcast(inv, #{
+                        items => [#{type => ?MSG_TX, hash => Txid}]
+                    });
+                {error, Reason} ->
+                    logger:debug("sync: rejected tx from ~p: ~p", [Peer, Reason])
+            end;
+        _Error ->
+            beamchain_peer:add_misbehavior(Peer, 20)
+    end,
+    State;
+
 route_message(_Peer, _Command, _Payload, State) ->
     State.
 
