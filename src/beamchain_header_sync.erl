@@ -467,12 +467,23 @@ rollback_to(ForkHeight, ForkHash, ForkCW, Params, State) ->
 
 %% Disconnect blocks from the chainstate until the chainstate tip is
 %% at or below TargetHeight. Uses undo data to reverse UTXO changes.
+%% If rolling back to genesis (TargetHeight =< 0) and block-by-block
+%% disconnect fails (e.g. missing undo data), wipe the entire chainstate
+%% to avoid leaving stale UTXOs that cause BIP30 false positives.
 disconnect_chainstate_to(TargetHeight) ->
     case beamchain_chainstate:get_tip() of
         {ok, {_Hash, TipHeight}} when TipHeight > TargetHeight ->
             logger:info("header_sync: disconnecting chainstate from ~B to ~B",
                         [TipHeight, TargetHeight]),
             disconnect_chainstate_loop(TargetHeight);
+        _ when TargetHeight =< 0 ->
+            %% Chainstate tip is already at or below genesis, but if we're
+            %% rolling back to genesis we must still wipe to clear any stale
+            %% UTXOs in RocksDB that survived a previous incomplete wipe
+            %% (e.g. tip metadata was reset but UTXO entries remained).
+            logger:info("header_sync: chainstate tip already at genesis, "
+                        "wiping to clear any stale RocksDB UTXOs"),
+            beamchain_chainstate:wipe_chainstate();
         _ ->
             %% Chainstate is already at or below fork point
             ok
@@ -485,10 +496,20 @@ disconnect_chainstate_loop(TargetHeight) ->
                 ok ->
                     disconnect_chainstate_loop(TargetHeight);
                 {error, Reason} ->
-                    logger:error("header_sync: chainstate disconnect failed: ~p",
-                                 [Reason]),
-                    %% Continue anyway — block sync will handle the mismatch
-                    ok
+                    logger:error("header_sync: chainstate disconnect failed at ~B: ~p",
+                                 [TipHeight, Reason]),
+                    %% If we're rolling back to genesis and disconnect fails,
+                    %% wipe the entire chainstate to prevent stale UTXOs.
+                    case TargetHeight =< 0 of
+                        true ->
+                            logger:warning("header_sync: wiping chainstate for "
+                                           "full resync (disconnect to genesis failed)"),
+                            beamchain_chainstate:wipe_chainstate();
+                        false ->
+                            %% Partial rollback failure — log and continue.
+                            %% Block sync will encounter mismatches but may recover.
+                            ok
+                    end
             end;
         _ ->
             ok

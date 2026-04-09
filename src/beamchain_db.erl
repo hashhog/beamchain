@@ -15,6 +15,7 @@
 
 %% UTXO set
 -export([get_utxo/2, store_utxo/3, spend_utxo/2, has_utxo/2]).
+-export([clear_chainstate_cf/0]).
 
 %% Block index
 -export([store_block_index/5, get_block_index/1, get_block_index_by_hash/1]).
@@ -183,6 +184,29 @@ has_utxo(Txid, Vout) when byte_size(Txid) =:= 32 ->
     case rocksdb:get(Db, CF, Key, []) of
         {ok, _} -> true;
         not_found -> false
+    end.
+
+%% @doc Clear all entries in the chainstate column family (RocksDB).
+%% Used during full chainstate wipe to remove stale UTXOs that persist
+%% on disk even after ETS caches are cleared. Uses delete_range over the
+%% entire key space.
+-spec clear_chainstate_cf() -> ok | {error, term()}.
+clear_chainstate_cf() ->
+    Db = persistent_term:get(beamchain_db_handle),
+    CF = persistent_term:get(beamchain_cf_chainstate),
+    %% delete_range is [BeginKey, EndKey) — use empty binary as start
+    %% and a key of all 0xFF bytes as end to cover the entire key space.
+    %% Outpoint keys are 36 bytes (32-byte txid + 4-byte vout), so a
+    %% 36-byte 0xFF key is sufficient.
+    BeginKey = <<>>,
+    EndKey = binary:copy(<<16#FF>>, 36),
+    case rocksdb:delete_range(Db, CF, BeginKey, EndKey, [{sync, true}]) of
+        ok ->
+            logger:info("beamchain_db: cleared chainstate column family"),
+            ok;
+        {error, Reason} = Err ->
+            logger:error("beamchain_db: failed to clear chainstate CF: ~p", [Reason]),
+            Err
     end.
 
 %% @doc Store block index entry (header metadata for a given height)
