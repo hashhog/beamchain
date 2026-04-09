@@ -32,6 +32,9 @@
 %% Flush
 -export([flush/0]).
 
+%% Wipe chainstate (ETS caches + RocksDB tip) for full resync
+-export([wipe_chainstate/0]).
+
 %% Cache statistics
 -export([cache_stats/0, cache_memory_usage/0]).
 
@@ -168,6 +171,14 @@ reorganize(NewBlocks) ->
 -spec flush() -> ok.
 flush() ->
     gen_server:call(?SERVER, flush, 60000).
+
+%% @doc Wipe the entire chainstate: clear all UTXO ETS caches and reset
+%% the chain tip to genesis (height -1). Used when disconnect_block fails
+%% during a full rollback (e.g. missing undo data) so the node can resync
+%% from scratch without stale UTXOs causing BIP30 false positives.
+-spec wipe_chainstate() -> ok.
+wipe_chainstate() ->
+    gen_server:call(?SERVER, wipe_chainstate, 60000).
 
 %%% ===================================================================
 %%% Block invalidation / reconsideration API
@@ -513,6 +524,35 @@ handle_call({reorganize, NewBlocks}, _From, State) ->
 
 handle_call(flush, _From, State) ->
     State2 = do_flush(State),
+    {reply, ok, State2};
+
+handle_call(wipe_chainstate, _From, State) ->
+    logger:warning("chainstate: wiping entire UTXO set and resetting tip to genesis"),
+    %% Clear all ETS caches
+    ets:delete_all_objects(?UTXO_CACHE),
+    ets:delete_all_objects(?UTXO_DIRTY),
+    ets:delete_all_objects(?UTXO_FRESH),
+    ets:delete_all_objects(?UTXO_SPENT),
+    ets:delete_all_objects(?CHAIN_META),
+    %% Clear all UTXO entries from RocksDB to prevent stale UTXOs
+    %% from causing BIP30 false positives on resync. Previously only
+    %% ETS caches were cleared, but has_utxo/get_utxo fall through
+    %% to RocksDB on cache miss, so stale entries persisted on disk.
+    case beamchain_db:clear_chainstate_cf() of
+        ok -> ok;
+        {error, Reason} ->
+            logger:error("chainstate: failed to clear RocksDB chainstate CF: ~p "
+                         "(stale UTXOs may remain)", [Reason])
+    end,
+    %% Reset tip in RocksDB so restart also sees genesis
+    beamchain_db:put_meta(<<"chain_tip">>, <<>>),
+    beamchain_db:put_meta(<<"utxo_flush_height">>, <<>>),
+    State2 = State#state{
+        tip_hash = undefined,
+        tip_height = -1,
+        blocks_since_flush = 0,
+        mtp_timestamps = []
+    },
     {reply, ok, State2};
 
 %% assumeUTXO support
