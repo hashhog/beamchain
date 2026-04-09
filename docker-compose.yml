@@ -1,0 +1,16 @@
+services:
+  beamchain:
+    build: .
+    container_name: beamchain
+    restart: unless-stopped
+    ports:
+      - "48348:48348"
+      - "48338:48338"
+    volumes:
+      - beamchain-data:/data
+    environment:
+      - BEAMCHAIN_DATADIR=/data
+      - BEAMCHAIN_NETWORK=testnet4
+
+volumes:
+  beamchain-data:
