@@ -10,6 +10,7 @@
 -export([start_link/0]).
 -export([track_tx/3, process_block/2]).
 -export([estimate_fee/1, get_fee_histogram/0]).
+-export([save_state/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -28,6 +29,8 @@
 -define(SUCCESS_THRESHOLD, 0.85). %% 85% confirmation success rate
 -define(MIN_TRACKED_TXS, 100).    %% minimum data before using buckets
 -define(MAX_CONF_TARGET, 1008).   %% max target (~1 week of blocks)
+-define(PERSIST_INTERVAL, 300_000). %% persist every 5 minutes
+-define(FEE_EST_FILE, "fee_estimates.dat").
 
 %% ETS table: txid -> {bucket_index, entry_height}
 -define(FEE_EST_TRACKED, fee_est_tracked).
@@ -85,6 +88,11 @@ estimate_fee(_) ->
 get_fee_histogram() ->
     gen_server:call(?SERVER, get_fee_histogram).
 
+%% @doc Persist the current estimator state to disk.
+-spec save_state() -> ok | {error, term()}.
+save_state() ->
+    gen_server:call(?SERVER, save_state).
+
 %%% ===================================================================
 %%% gen_server callbacks
 %%% ===================================================================
@@ -94,7 +102,7 @@ init([]) ->
 
     Buckets = generate_buckets(),
     NumBuckets = length(Buckets),
-    Data = maps:from_list([{I, #bucket_data{}} ||
+    EmptyData = maps:from_list([{I, #bucket_data{}} ||
                            I <- lists:seq(0, NumBuckets - 1)]),
 
     Height = case beamchain_chainstate:get_tip() of
@@ -102,12 +110,25 @@ init([]) ->
         _ -> 0
     end,
 
+    %% Try to load persisted state
+    {Data, TotalTracked} = case load_persisted_state(NumBuckets) of
+        {ok, PData, PTotal} ->
+            logger:info("fee_estimator: loaded persisted state (~B tracked txs)",
+                        [PTotal]),
+            {PData, PTotal};
+        {error, _} ->
+            {EmptyData, 0}
+    end,
+
+    %% Schedule periodic persistence
+    erlang:send_after(?PERSIST_INTERVAL, self(), persist),
+
     logger:info("fee_estimator: initialized with ~B buckets", [NumBuckets]),
     {ok, #state{
         buckets = Buckets,
         num_buckets = NumBuckets,
         data = Data,
-        total_tracked = 0,
+        total_tracked = TotalTracked,
         block_height = Height
     }}.
 
@@ -117,6 +138,9 @@ handle_call({estimate_fee, ConfTarget}, _From, State) ->
 handle_call(get_fee_histogram, _From, State) ->
     Histogram = do_get_fee_histogram(State),
     {reply, Histogram, State};
+handle_call(save_state, _From, State) ->
+    Result = do_save_state(State),
+    {reply, Result, State};
 handle_call(_Request, _From, State) ->
     {reply, {error, not_implemented}, State}.
 
@@ -129,11 +153,16 @@ handle_cast({process_block, Height, Txids}, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
+handle_info(persist, State) ->
+    do_save_state(State),
+    erlang:send_after(?PERSIST_INTERVAL, self(), persist),
+    {noreply, State};
 handle_info(_Info, State) ->
     {noreply, State}.
 
-terminate(_Reason, _State) ->
-    logger:info("fee_estimator: shutting down"),
+terminate(_Reason, State) ->
+    do_save_state(State),
+    logger:info("fee_estimator: shutting down (state persisted)"),
     ok.
 
 %%% ===================================================================
@@ -331,6 +360,86 @@ collect_rates_asc('$end_of_table', Acc) ->
     lists:reverse(Acc);
 collect_rates_asc({FeeRate, _Txid} = Key, Acc) ->
     collect_rates_asc(ets:next(mempool_by_fee, Key), [FeeRate | Acc]).
+
+%%% ===================================================================
+%%% Internal: persistence
+%%% ===================================================================
+
+%% Return the path to the fee estimation data file.
+persist_path() ->
+    DataDir = try beamchain_config:datadir()
+              catch _:_ -> "/tmp"
+              end,
+    filename:join(DataDir, ?FEE_EST_FILE).
+
+%% Save the current estimator state to disk as an Erlang term file.
+do_save_state(#state{data = Data, total_tracked = Total,
+                     block_height = Height}) ->
+    Path = persist_path(),
+    %% Convert bucket data to a serializable form (maps with atoms stripped)
+    SerData = maps:map(fun(_Idx, #bucket_data{total = T, in_mempool = M,
+                                               confirmed = C}) ->
+        #{total => T, in_mempool => M, confirmed => C}
+    end, Data),
+    Term = #{version => 1,
+             data => SerData,
+             total_tracked => Total,
+             block_height => Height},
+    TmpPath = Path ++ ".tmp",
+    case file:write_file(TmpPath, term_to_binary(Term)) of
+        ok ->
+            case file:rename(TmpPath, Path) of
+                ok ->
+                    logger:debug("fee_estimator: persisted state (~B tracked)",
+                                 [Total]),
+                    ok;
+                {error, Reason} ->
+                    logger:warning("fee_estimator: rename failed: ~p", [Reason]),
+                    file:delete(TmpPath),
+                    {error, Reason}
+            end;
+        {error, Reason} ->
+            logger:warning("fee_estimator: write failed: ~p", [Reason]),
+            {error, Reason}
+    end.
+
+%% Load persisted state from disk.
+load_persisted_state(NumBuckets) ->
+    Path = persist_path(),
+    case file:read_file(Path) of
+        {ok, Bin} ->
+            try
+                #{version := 1,
+                  data := SerData,
+                  total_tracked := Total,
+                  block_height := _Height} = binary_to_term(Bin),
+                %% Reconstruct bucket_data records
+                Data = maps:map(fun(_Idx, #{total := T, in_mempool := M,
+                                            confirmed := C}) ->
+                    #bucket_data{total = T, in_mempool = M, confirmed = C}
+                end, SerData),
+                %% Validate bucket count matches
+                case maps:size(Data) of
+                    NumBuckets -> {ok, Data, Total};
+                    Other ->
+                        logger:warning("fee_estimator: bucket count mismatch "
+                                       "(file=~B, expected=~B), starting fresh",
+                                       [Other, NumBuckets]),
+                        {error, bucket_mismatch}
+                end
+            catch
+                _:Reason ->
+                    logger:warning("fee_estimator: corrupt state file: ~p",
+                                   [Reason]),
+                    {error, corrupt}
+            end;
+        {error, enoent} ->
+            {error, no_file};
+        {error, Reason} ->
+            logger:warning("fee_estimator: could not read ~s: ~p",
+                           [Path, Reason]),
+            {error, Reason}
+    end.
 
 %%% ===================================================================
 %%% Internal: fee histogram
