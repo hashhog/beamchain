@@ -1079,6 +1079,8 @@ entry_to_map(#peer_entry{pid = Pid, address = Addr, direction = Dir,
 
 handle_peer_message(Pid, addr, Payload, State) ->
     handle_addr_msg(Pid, Payload, State);
+handle_peer_message(Pid, addrv2, Payload, State) ->
+    handle_addrv2_msg(Pid, Payload, State);
 handle_peer_message(Pid, getaddr, _Payload, State) ->
     handle_getaddr_msg(Pid, State);
 %% Sync-related messages: forward to sync coordinator
@@ -1116,10 +1118,35 @@ handle_addr_msg(Pid, Payload, State) ->
             end, Addrs),
             logger:debug("received ~B addresses from ~p",
                          [length(Addrs), Pid]),
+            %% Relay to 2 random peers (BIP155)
+            relay_addr_to_random_peers(Pid, {addr, #{addrs => Addrs}}, State),
             {noreply, State};
         {ok, #{addrs := Addrs}} when length(Addrs) > 1000 ->
             %% Too many addresses, misbehaving
             beamchain_peer:add_misbehavior(Pid, 20),
+            {noreply, State};
+        _ ->
+            {noreply, State}
+    end.
+
+%% @doc Handle addrv2 messages (BIP155).
+handle_addrv2_msg(Pid, Payload, State) ->
+    case beamchain_p2p_msg:decode_payload(addrv2, Payload) of
+        {ok, #{addrs := Addrs}} when length(Addrs) =< 1000 ->
+            %% Extract IPv4 addresses and add to addrman
+            lists:foreach(fun(Entry) ->
+                case Entry of
+                    #{ip := IP, port := Port} ->
+                        Svc = maps:get(services, Entry, 0),
+                        beamchain_addrman:add_address({IP, Port}, Svc, Pid);
+                    _ ->
+                        ok  %% Skip non-IPv4 for now
+                end
+            end, Addrs),
+            logger:debug("received ~B addrv2 entries from ~p",
+                         [length(Addrs), Pid]),
+            %% Relay to 2 random peers
+            relay_addr_to_random_peers(Pid, {addr, #{addrs => Addrs}}, State),
             {noreply, State};
         _ ->
             {noreply, State}
@@ -1136,6 +1163,24 @@ handle_getaddr_msg(Pid, State) ->
         _  -> beamchain_peer:send_message(Pid, {addr, #{addrs => Entries}})
     end,
     {noreply, State}.
+
+%% @doc Relay an addr message to up to 2 random connected peers (not the source).
+relay_addr_to_random_peers(SourcePid, Msg, _State) ->
+    AllPeers = ets:foldl(fun(#peer_entry{} = E, Acc) -> [E | Acc] end,
+                         [], ?PEER_TABLE),
+    Candidates = [P || P <- AllPeers,
+                       P#peer_entry.pid =/= SourcePid,
+                       P#peer_entry.connected =:= true],
+    case Candidates of
+        [] -> ok;
+        _ ->
+            Shuffled = [X || {_, X} <- lists:sort(
+                [{rand:uniform(), C} || C <- Candidates])],
+            Targets = lists:sublist(Shuffled, 2),
+            lists:foreach(fun(#peer_entry{pid = TargetPid}) ->
+                beamchain_peer:send_message(TargetPid, Msg)
+            end, Targets)
+    end.
 
 handle_getdata_msg(Pid, Payload) ->
     case beamchain_p2p_msg:decode_payload(getdata, Payload) of
