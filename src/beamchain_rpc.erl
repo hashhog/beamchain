@@ -1418,7 +1418,7 @@ rpc_sendrawtransaction([HexStr, MaxFeeRateBtcKvB]) when is_binary(HexStr) ->
                 ok
         end,
 
-        case beamchain_mempool:add_transaction(Tx) of
+        case beamchain_mempool:accept_to_memory_pool(Tx) of
             {ok, AcceptedTxid} ->
                 %% Broadcast to all connected peers via inv message
                 relay_transaction(AcceptedTxid),
@@ -1587,7 +1587,7 @@ rpc_testmempoolaccept([RawTxs]) when is_list(RawTxs) ->
             Bin = beamchain_serialize:hex_decode(HexStr),
             {Tx, _} = beamchain_serialize:decode_transaction(Bin),
             Txid = beamchain_serialize:tx_hash(Tx),
-            case beamchain_mempool:add_transaction(Tx) of
+            case beamchain_mempool:accept_to_memory_pool(Tx) of
                 {ok, _} ->
                     %% Remove it right away (this was just a test)
                     beamchain_mempool:remove_for_block([Txid]),
