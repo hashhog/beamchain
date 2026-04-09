@@ -250,6 +250,40 @@ route_message(Peer, blocktxn, Payload, State) ->
     end,
     State;
 
+%% BIP152: Handle getblocktxn - peer requests missing transactions for a compact block
+route_message(Peer, getblocktxn, Payload, State) ->
+    case beamchain_p2p_msg:decode_payload(getblocktxn, Payload) of
+        {ok, #{block_hash := BlockHash, indexes := Indexes}} ->
+            logger:debug("sync: getblocktxn from ~p for ~s (~B indexes)",
+                         [Peer, beamchain_serialize:encode_hex(BlockHash),
+                          length(Indexes)]),
+            %% Look up the full block and respond with requested transactions
+            case beamchain_db:get_block(BlockHash) of
+                {ok, Block} ->
+                    Txs = Block#block.transactions,
+                    TxArray = list_to_tuple(Txs),
+                    RequestedTxs = lists:filtermap(
+                        fun(Idx) ->
+                            %% Indexes are 0-based
+                            ArrIdx = Idx + 1,
+                            if ArrIdx >= 1, ArrIdx =< tuple_size(TxArray) ->
+                                {true, element(ArrIdx, TxArray)};
+                               true ->
+                                false
+                            end
+                        end, Indexes),
+                    beamchain_peer:send_message(Peer,
+                        {blocktxn, #{block_hash => BlockHash,
+                                     transactions => RequestedTxs}});
+                not_found ->
+                    logger:debug("sync: getblocktxn block not found: ~s",
+                                 [beamchain_serialize:encode_hex(BlockHash)])
+            end;
+        _Error ->
+            beamchain_peer:add_misbehavior(Peer, 20)
+    end,
+    State;
+
 route_message(_Peer, _Command, _Payload, State) ->
     State.
 
