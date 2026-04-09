@@ -1,163 +1,134 @@
 # beamchain
 
-A Bitcoin full node in Erlang/OTP.
+A Bitcoin full node implementation in Erlang/OTP.
 
-## What is it?
+## Quick Start
 
-Maybe you've wondered what it takes to validate a Bitcoin transaction from scratch.
-beamchain is a from-scratch Bitcoin full node written in Erlang that does exactly that.
-It syncs the blockchain, validates blocks with full consensus rules (including SegWit
-and Taproot), and maintains a UTXO set backed by RocksDB.
-
-## Current status
-
-- [x] P2P networking and peer management
-- [x] Header-first sync with full validation
-- [x] Header sync anti-DoS (PoW validation, unconnecting limits, deep fork protection)
-- [x] Block download and storage (RocksDB)
-- [x] Flat file block storage (blk*.dat files, Bitcoin Core compatible format)
-- [x] Script interpreter (all opcodes)
-- [x] Legacy sighash (FindAndDelete, OP_CODESEPARATOR)
-- [x] SegWit v0 (P2WPKH, P2WSH) with BIP143 sighash
-- [x] Taproot (key path and script path) with BIP341 sighash
-- [x] MINIMALIF enforcement for witness scripts
-- [x] Accurate sigop counting (legacy, P2SH, witness)
-- [x] UTXO set management and chainstate with write-back cache
-- [x] UTXO cache FRESH flag optimization (like Bitcoin Core's CCoinsViewCache)
-- [x] Undo data for block disconnection (reorg support)
-- [x] Mempool with fee-based ordering and ancestor/descendant limits
-- [x] Cluster mempool (union-find clustering, linearization, fee-rate diagram RBF)
-- [x] Full RBF (Replace-by-Fee) transaction replacement
-- [x] Package acceptance (CPFP within packages, package RBF)
-- [x] v3/TRUC policy (BIP431 topologically restricted transactions)
-- [x] BIP68 relative lock-time (sequence locks)
-- [x] JSON-RPC interface (core RPCs including getblock, gettxoutsetinfo, getblockstats)
-- [x] Block statistics RPCs (getblockstats, getchaintxstats)
-- [x] Batch JSON-RPC support (parallel request processing)
-- [x] Block template construction (getblocktemplate)
-- [x] Witness commitment (BIP141)
-- [x] CPFP-aware tx selection (ancestor fee rate)
-- [x] Regtest block generation (generate, generatetoaddress, generateblock)
-- [x] Difficulty adjustment algorithm (retarget every 2016 blocks)
-- [x] BIP9 versionbits soft fork deployment tracking
-- [x] Checkpoint enforcement (reject forks below checkpoints, skip scripts during IBD)
-- [x] Peer misbehavior scoring and banning
-- [x] Pre-handshake connection rejection (ban/limit checks before handshake)
-- [x] Inv trickling (privacy-preserving tx relay with Poisson delays)
-- [x] BIP133 feefilter (filter tx relay by peer's minimum fee rate)
-- [x] Eclipse attack protections (bucket-based addrman, netgroup limits, anchor connections)
-- [x] Stale peer eviction (tip timeout, headers timeout, ping timeout, network protection)
-- [x] Block pruning (delete old blk/rev files, keep 288 blocks for reorg safety)
-- [x] HD wallet (BIP32/44/84 key derivation)
-- [x] Wallet UTXO tracking and balance
-- [x] Coin selection (Branch-and-Bound, knapsack)
-- [x] Transaction signing (P2PKH, P2WPKH, P2TR)
-- [x] PSBT support (BIP 174 with createpsbt, decodepsbt, combinepsbt, finalizepsbt RPCs)
-- [x] Wallet RPC methods (getnewaddress, getbalance, sendtoaddress)
-- [x] Keypool with 1000-address lookahead
-- [x] Coinbase maturity enforcement (100-block rule)
-- [x] Wallet encryption (AES-256-CBC with PBKDF2 key derivation)
-- [x] Multi-wallet support (createwallet, loadwallet, unloadwallet, listwallets)
-- [x] Compact block relay (BIP152 with SipHash-2-4)
-- [x] BIP324 v2 encrypted transport (ElligatorSwift, ChaCha20-Poly1305)
-- [x] BIP155 ADDRv2 messages (TorV3, I2P, CJDNS address support)
-- [x] Output descriptors (BIP380-386: pkh, wpkh, sh, wsh, multi, tr, addr, raw)
-- [x] Miniscript policy compiler (type checking, script compilation, satisfaction)
-- [x] BIP330 Erlay transaction reconciliation (sendtxrcncl handshake, set reconciliation)
-- [x] assumeUTXO snapshot-based sync (loadtxoutset RPC, background validation)
-- [x] Pay-to-Anchor (P2A) outputs (witness v1 anyone-can-spend for Lightning anchors)
-- [x] Ephemeral anchor dust policy (zero-value P2A in zero-fee packages)
-- [x] REST API (block, tx, headers, chaininfo, mempool, UTXO endpoints in JSON/binary/hex)
-- [x] ZMQ pub/sub notifications (hashblock, hashtx, rawblock, rawtx, sequence topics)
-- [x] Tor SOCKS5 proxy (connect to .onion peers, stream isolation, v3 address generation)
-- [x] I2P SAM 3.1 support (connect to .b32.i2p peers, session management)
-- [x] invalidateblock/reconsiderblock RPCs (manual chain management)
-- [x] NIF-accelerated SHA256/double-SHA256 in all hot paths (SHA-NI, ARM crypto)
-- [x] Batch signature verification (amortize NIF call overhead)
-
-## Quick start
+### Docker
 
 ```bash
-# Build
+docker build -t beamchain .
+docker run -v beamchain-data:/data -p 48348:48348 -p 48338:48338 beamchain
+```
+
+### From Source
+
+```bash
 rebar3 compile
-
-# Sync testnet4
-BEAMCHAIN_NETWORK=testnet4 ./beamchain sync
-
-# Or run directly with erl
-BEAMCHAIN_NETWORK=testnet4 erl -pa _build/default/lib/*/ebin \
-  -eval "application:ensure_all_started(beamchain)."
+rebar3 escriptize
+./beamchain start --network=testnet4
+./beamchain --help
 ```
 
-## Project structure
+## Features
 
-```
-src/
-├── beamchain_script.erl       Script interpreter (~2800 lines)
-├── beamchain_validation.erl   Block/tx consensus rules
-├── beamchain_serialize.erl    Tx encoding (legacy + segwit)
-├── beamchain_crypto.erl       secp256k1 and SHA256 NIF bindings
-├── beamchain_sig_cache.erl    Signature verification cache (ETS)
-├── beamchain_p2p_msg.erl      P2P message encoding
-├── beamchain_peer.erl         Connection handling
-├── beamchain_peer_manager.erl Peer lifecycle, banning, eclipse protections
-├── beamchain_addrman.erl      Address manager with bucket-based storage
-├── beamchain_header_sync.erl  Header-first sync with anti-DoS
-├── beamchain_block_sync.erl   Block download and compact block relay
-├── beamchain_compact_block.erl BIP152 compact block reconstruction
-├── beamchain_chainstate.erl   UTXO management with assumeUTXO
-├── beamchain_chainstate_sup.erl Chainstate supervisor (snapshot/background)
-├── beamchain_snapshot.erl     UTXO snapshot loading and verification
-├── beamchain_mempool.erl      Transaction pool with cluster linearization
-├── beamchain_miner.erl        Block template construction
-├── beamchain_pow.erl          Proof of work and difficulty
-├── beamchain_versionbits.erl  BIP9 deployment tracking
-├── beamchain_chain_params.erl Network parameters and checkpoints
-├── beamchain_db.erl           RocksDB wrapper, flat file storage, block indexes
-├── beamchain_rpc.erl          JSON-RPC server
-├── beamchain_rest.erl         REST API server
-├── beamchain_wallet.erl       HD wallet, coin selection
-├── beamchain_wallet_sup.erl   Multi-wallet supervisor
-├── beamchain_psbt.erl         BIP 174 PSBT serialization and signing
-├── beamchain_descriptor.erl   Output descriptors (BIP380-386)
-├── beamchain_miniscript.erl   Miniscript policy compiler
-├── beamchain_transport_v2.erl BIP324 v2 encrypted transport
-├── beamchain_erlay.erl        BIP330 Erlay set reconciliation
-├── beamchain_minisketch.erl   Minisketch library bindings
-├── beamchain_zmq.erl          ZMQ notification publisher
-└── beamchain_proxy.erl        Tor SOCKS5 and I2P SAM proxy support
+- Full block and transaction validation (SegWit v0, Taproot key/script path, BIP68 sequence locks, accurate sigop counting)
+- Script interpreter (all opcodes, legacy sighash with FindAndDelete/OP_CODESEPARATOR, BIP143, BIP341, MINIMALIF, NULLFAIL)
+- Header-first sync with anti-DoS (PoW validation, unconnecting limits, deep fork protection)
+- Block download with compact block relay (BIP-152, SipHash-2-4)
+- UTXO set with write-back cache (FRESH flag optimization, undo data for reorgs)
+- Cluster mempool (union-find clustering, linearization, fee-rate diagram RBF, full RBF)
+- Package acceptance (CPFP within packages, package RBF, v3/TRUC policy, ephemeral anchors)
+- BIP-324 v2 encrypted transport (ElligatorSwift, ChaCha20-Poly1305)
+- BIP-330 Erlay transaction reconciliation (sendtxrcncl handshake, set reconciliation)
+- BIP-133 feefilter (filter tx relay by peer minimum fee rate)
+- BIP-155 ADDRv2 (TorV3, I2P, CJDNS address support)
+- BIP-9 versionbits soft fork deployment tracking
+- Eclipse attack protections (bucket-based addrman, netgroup limits, anchor connections)
+- Stale peer eviction (tip timeout, headers timeout, ping timeout, network protection)
+- Inventory trickling (Poisson-timed tx relay for privacy)
+- Peer misbehavior scoring and banning with pre-handshake rejection
+- HD wallet (BIP-32/44/84, BnB+Knapsack coin selection, encrypted storage)
+- Multi-wallet support (createwallet, loadwallet, unloadwallet)
+- PSBT (BIP-174 with createpsbt, decodepsbt, combinepsbt, finalizepsbt RPCs)
+- Output descriptors (BIP380-386: pkh, wpkh, sh, wsh, multi, tr, addr, raw)
+- Miniscript policy compiler (type checking, script compilation, satisfaction)
+- assumeUTXO snapshot-based sync (loadtxoutset RPC, background validation)
+- Block pruning (delete old blk/rev files, keep 288 blocks for reorg safety)
+- Flat file block storage (blk*.dat files, Bitcoin Core compatible format)
+- Fee estimation (bucketed tracking, confirmation time analysis)
+- Block template construction (CPFP-aware tx selection, witness commitment)
+- REST API (block, tx, headers, chaininfo, mempool, UTXO endpoints; JSON/binary/hex)
+- ZMQ pub/sub notifications (hashblock, hashtx, rawblock, rawtx, sequence topics)
+- Tor SOCKS5 proxy and I2P SAM 3.1 support
+- NIF-accelerated SHA256/double-SHA256 (SHA-NI, ARM crypto extensions)
+- Batch signature verification (amortized NIF call overhead)
+- Regtest block generation (generate, generatetoaddress, generateblock RPCs)
+- Chain management (invalidateblock, reconsiderblock RPCs)
 
-c_src/
-├── beamchain_crypto_nif.c     libsecp256k1 + SHA256 NIF bindings
-└── Makefile                   NIF build with SHA-NI/ARM crypto flags
+## Configuration
 
-test/
-├── beamchain_script_tests.erl         Script and sighash tests
-├── beamchain_chainstate_tests.erl     Undo data, disconnect, and invalidation tests
-├── beamchain_miner_tests.erl          Block template and witness tests
-├── beamchain_mempool_tests.erl        Mempool, cluster, and limit tests
-├── beamchain_peer_tests.erl           Inv trickling and relay tests
-├── beamchain_peer_manager_tests.erl   Misbehavior, banning, and stale eviction tests
-├── beamchain_addrman_tests.erl        Bucket assignment and netgroup tests
-├── beamchain_pow_tests.erl            PoW and difficulty adjustment tests
-├── beamchain_versionbits_tests.erl    BIP9 state machine tests
-├── beamchain_validation_tests.erl     Consensus rule tests
-├── beamchain_rpc_tests.erl            RPC tests (core blockchain and transaction RPCs)
-├── beamchain_wallet_tests.erl         HD wallet and coin selection tests
-├── beamchain_psbt_tests.erl           BIP 174 PSBT tests
-├── beamchain_block_sync_tests.erl     Block sync and compact block tests
-├── beamchain_descriptor_tests.erl     Output descriptor tests
-├── beamchain_miniscript_tests.erl     Miniscript parsing, compilation, satisfaction
-├── beamchain_transport_v2_tests.erl   BIP324 v2 transport tests
-├── beamchain_erlay_tests.erl          BIP330 Erlay reconciliation tests
-├── beamchain_snapshot_tests.erl       assumeUTXO snapshot tests
-├── beamchain_rest_tests.erl           REST API endpoint tests
-├── beamchain_zmq_tests.erl            ZMQ notification tests
-└── beamchain_proxy_tests.erl          Tor/I2P proxy tests
-```
+### CLI Flags
 
-## Running tests
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--network=NET` | `mainnet` | Network: mainnet, testnet, testnet4, regtest, signet |
+| `--datadir=DIR` | `~/.beamchain` | Data directory |
+| `--rpc-port=PORT` | per-network | RPC server port |
+| `--p2p-port=PORT` | per-network | P2P listen port |
+| `--debug` | off | Enable debug logging |
+| `--reset` | off | Reset chain data before sync |
+| `--limit=N` | none | Limit sync to N blocks |
+| `--import-file=PATH` | stdin | File to import blocks from |
+| `--import-utxo=PATH` | none | HDOG snapshot file for UTXO import |
 
-```bash
-rebar3 eunit
-```
+### Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `BEAMCHAIN_NETWORK` | Override network selection |
+| `BEAMCHAIN_DATADIR` | Override data directory |
+| `BEAMCHAIN_TXINDEX` | Enable/disable transaction index (`1`/`0`) |
+| `BEAMCHAIN_PRUNE` | Prune target in MB (0=disabled, min 550) |
+
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `start` | Start the node and block until Ctrl-C |
+| `sync` | Start node and show sync progress display |
+| `import` | Import blocks from stdin or file (bypasses P2P) |
+| `import-utxo` | Import UTXO snapshot from HDOG file |
+| `status` | Show node status via RPC |
+| `stop` | Stop a running node via RPC |
+| `getbalance` | Get balance for an address |
+
+## RPC API
+
+Bitcoin Core-compatible JSON-RPC with batch request support.
+
+| Category | Methods |
+|----------|---------|
+| Blockchain | `getblockchaininfo`, `getblock`, `getblockhash`, `getblockheader`, `getblockcount`, `getbestblockhash`, `getchaintips`, `getdifficulty`, `getblockstats`, `getchaintxstats`, `gettxout`, `gettxoutsetinfo` |
+| Transactions | `getrawtransaction`, `sendrawtransaction`, `decoderawtransaction`, `createrawtransaction`, `decodescript` |
+| Mempool | `getmempoolinfo`, `getrawmempool`, `getmempoolentry`, `getmempoolancestors` |
+| Mining | `getblocktemplate`, `submitblock`, `getmininginfo`, `generate`, `generatetoaddress`, `generateblock` |
+| Network | `getpeerinfo`, `getnetworkinfo`, `getconnectioncount`, `listbanned` |
+| Wallet | `createwallet`, `loadwallet`, `unloadwallet`, `listwallets`, `getnewaddress`, `getrawchangeaddress`, `getbalance`, `sendtoaddress`, `listunspent`, `listtransactions`, `listaddresses`, `getwalletinfo`, `dumpprivkey` |
+| Wallet Security | `encryptwallet`, `walletpassphrase`, `walletlock` |
+| Descriptors | `getdescriptorinfo`, `deriveaddresses` |
+| PSBT | `createpsbt`, `decodepsbt`, `combinepsbt`, `finalizepsbt` |
+| Util | `validateaddress`, `estimatesmartfee` |
+| Chain Mgmt | `invalidateblock`, `reconsiderblock` |
+| assumeUTXO | `loadtxoutset`, `dumptxoutset` |
+| Control | `stop`, `help` |
+
+REST API available with endpoints for blocks, transactions, headers, chain info, mempool, and UTXOs.
+
+## Monitoring
+
+No dedicated Prometheus exporter. Monitor via RPC calls to `getblockchaininfo`, `getpeerinfo`, `getmempoolinfo`, and `getnetworkinfo`.
+
+## Architecture
+
+beamchain uses OTP supervision trees to structure the node as a collection of supervised processes. The top-level application supervisor manages child supervisors for the chainstate, wallet subsystem, and peer connections. Each peer runs as an independent `gen_statem` process, allowing the node to handle connection failures in isolation without affecting overall operation. The peer manager coordinates connection pooling, DNS discovery, and eclipse attack mitigations through bucketed address management.
+
+Performance-critical cryptographic operations are implemented as NIFs (Native Implemented Functions) in C, binding to libsecp256k1 for ECDSA/Schnorr verification and providing hardware-accelerated SHA256 via SHA-NI or ARM crypto extensions. Batch signature verification amortizes NIF call overhead across multiple transactions within a block. The signature cache uses ETS (Erlang Term Storage) tables for lock-free concurrent reads during parallel validation.
+
+The storage layer uses RocksDB via Erlang NIF bindings for the block index, UTXO set, and chain state, with column families separating different data types. Flat file block storage follows Bitcoin Core's blk*.dat format for compatibility. The UTXO cache implements the same FRESH flag optimization as Bitcoin Core's CCoinsViewCache, minimizing unnecessary writes during batch flush operations.
+
+The mempool uses cluster-based linearization for optimal fee-rate ordering, with union-find data structures for efficient cluster management. Package acceptance supports CPFP fee-bumping within child-with-parents topologies, and v3/TRUC policy enforcement restricts transaction topology for Lightning anchor outputs. The Erlang process model naturally maps to the event-driven nature of mempool updates, with each transaction acceptance running as an isolated operation.
+
+## License
+
+MIT
