@@ -714,6 +714,9 @@ do_connect_block_inner(#block{header = Header} = Block,
                 %% ZMQ notification for block connect
                 beamchain_zmq:notify_block(Block, connect),
 
+                %% Notify peer manager that our tip advanced (stale tip detection)
+                beamchain_peer_manager:notify_tip_updated(),
+
                 {ok, State4}
             catch
                 Class:Reason2:Stack ->
