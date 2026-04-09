@@ -32,7 +32,8 @@ init([]) ->
         child_spec(beamchain_wallet_sup, supervisor),
         child_spec(beamchain_wallet, worker),
         child_spec(beamchain_rpc, worker),
-        child_spec(beamchain_rest, worker)
+        child_spec(beamchain_rest, worker),
+        child_spec(beamchain_metrics, worker)
     ],
     %% Optional ZMQ notifications (only if configured)
     ZmqChildren = case beamchain_config:zmq_enabled() of
