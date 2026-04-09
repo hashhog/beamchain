@@ -369,6 +369,8 @@ init([]) ->
     self() ! bootstrap,
     %% Start connection maintenance loop
     Timer = erlang:send_after(?CONNECT_INTERVAL, self(), connect_tick),
+    %% Load persisted bans from disk
+    load_bans(DataDir),
     %% Schedule periodic cleanup of expired bans
     erlang:send_after(60000, self(), cleanup_expired_bans),
     %% Schedule stale peer check
@@ -1333,6 +1335,8 @@ handle_misbehaving(Pid, Score, Reason, State) ->
                     ets:insert(?BANNED_PEERS_TABLE, {IP, BanExpiry}),
                     logger:info("peer manager: banning ~p:~B for ~B seconds (score ~B)",
                                 [IP, Port, ?DEFAULT_BAN_DURATION, NewScore]),
+                    %% Persist bans to disk
+                    save_bans(State#state.datadir),
                     %% Disconnect the peer
                     beamchain_peer:disconnect(Pid),
                     {noreply, State};

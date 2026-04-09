@@ -1015,6 +1015,9 @@ handle_stall(Height, Peer, #state{in_flight = InFlight,
     },
     AllStats2 = maps:put(Peer, Stats2, AllStats),
 
+    %% Score misbehavior for stalling block downloads (+50 per stall)
+    beamchain_peer:add_misbehavior(Peer, 50),
+
     %% If peer has stalled too many times, disconnect
     case Stats2#peer_stats.stall_count >= 3 of
         true ->

@@ -176,7 +176,7 @@ handle_cast({headers, Peer, Headers}, #state{status = syncing,
             {noreply, handle_misbehaving_peer(Peer, 100, State2)};
         {error, non_continuous} ->
             logger:warning("header_sync: peer ~p sent non-continuous headers", [Peer]),
-            {noreply, handle_misbehaving_peer(Peer, 100, State2)}
+            {noreply, handle_misbehaving_peer(Peer, 20, State2)}
     end;
 handle_cast({headers, _Peer, _Headers}, State) ->
     %% Headers from a peer we're not syncing from, ignore
