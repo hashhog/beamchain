@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Git pre-push hook for beamchain.
+#
+# Install once per clone:
+#   git config --local core.hooksPath scripts/hooks
+#
+# Runs the fast static + smoke checks that would have caught the
+# ets:fun2ms regression (commit 45dc51f4). If either fails, the push
+# is aborted and a NEW commit must be made to address the issue
+# before pushing again.
+#
+# Skip temporarily (emergencies only):
+#   git push --no-verify
+#
+# Expected runtime: ~45-90s on a warm build tree.
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+echo "[pre-push] 1/2 rebar3 xref"
+if ! rebar3 xref; then
+    cat >&2 <<'MSG'
+
+[pre-push] xref reported undefined function calls. Push aborted.
+
+Common causes:
+  - New call to a parse-transform function (e.g. ets:fun2ms) without the
+    required -include_lib("stdlib/include/ms_transform.hrl").
+  - Typo in a module or function name.
+  - Calling a deps function that isn't in .app.src 'applications'.
+
+Fix the issue, make a NEW commit (do not amend if you've already built
+against the bad commit), and push again. If you must bypass in an
+emergency: git push --no-verify.
+MSG
+    exit 1
+fi
+
+echo "[pre-push] 2/2 smoke test"
+if ! ./scripts/smoke-beamchain.sh; then
+    cat >&2 <<'MSG'
+
+[pre-push] smoke test failed — the release builds but cannot cold-boot.
+
+Inspect the erlang log dumped above for the first ERROR REPORT (not the
+last — supervision thrash hides the root cause at the top of the log).
+
+Fix the issue, make a NEW commit, and push again. If you must bypass in
+an emergency: git push --no-verify.
+MSG
+    exit 1
+fi
+
+echo "[pre-push] all checks passed"
