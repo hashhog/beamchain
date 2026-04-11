@@ -5,6 +5,15 @@
 
 -include("beamchain.hrl").
 
+%% Dialyzer suppressions for false positives:
+%% derive/3, derive_key/2, derive_keys/3, derive_tree/3, maybe_add_origin/2:
+%%   defensive {error,_} handlers that dialyzer thinks are unreachable because
+%%   it infers the callee always returns {ok,_}; kept for robustness.
+%%   maybe_add_origin/2: bip32_key clause is valid but dialyzer sees only
+%%   const_key from call sites.
+-dialyzer({nowarn_function, [derive/3, derive_key/2, derive_keys/3,
+                              derive_tree/3, maybe_add_origin/2]}).
+
 %% Public API
 -export([parse/1, parse/2,
          derive/2, derive/3,

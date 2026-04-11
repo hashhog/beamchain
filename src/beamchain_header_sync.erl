@@ -15,6 +15,11 @@
 -include("beamchain.hrl").
 -include("beamchain_protocol.hrl").
 
+%% Dialyzer suppressions for false positives:
+%% load_mtp_window/2: the Height < 0 guard is a safety net even though
+%% dialyzer infers Height :: non_neg_integer() from all call sites.
+-dialyzer({nowarn_function, load_mtp_window/2}).
+
 %% API
 -export([start_link/0,
          start_sync/1,

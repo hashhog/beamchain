@@ -6,6 +6,13 @@
 
 -export([main/1]).
 
+%% Dialyzer suppressions for false positives:
+%% import_utxo/1 calls halt/1 (diverges) on one path; dialyzer treats it as
+%%   no local return because start_app() is inferred to always return ok.
+%% flatten/1: the catch-all clause is legitimate defensive code for iolist/other
+%%   types even though dialyzer only sees list/binary from current call sites.
+-dialyzer({nowarn_function, [import_utxo/1, flatten/1]}).
+
 -define(VERSION, "0.1.0").
 
 %% Spinner frames (braille pattern dots)
