@@ -26,7 +26,7 @@
 -export([clear_chainstate_cf/0]).
 
 %% Block index
--export([store_block_index/5, get_block_index/1, get_block_index_by_hash/1]).
+-export([store_block_index/5, store_block_index/6, get_block_index/1, get_block_index_by_hash/1]).
 -export([update_block_status/2, get_all_block_indexes/0]).
 
 %% Block status constants (Bitcoin Core compatible)
@@ -222,7 +222,14 @@ clear_chainstate_cf() ->
                         binary(), integer()) -> ok.
 store_block_index(Height, Hash, Header, Chainwork, Status) ->
     gen_server:call(?SERVER, {store_block_index, Height, Hash, Header,
-                              Chainwork, Status}, 30000).
+                              Chainwork, Status, 0}, 30000).
+
+%% @doc Store a block index entry with an explicit transaction count.
+-spec store_block_index(non_neg_integer(), binary(), #block_header{},
+                        binary(), integer(), non_neg_integer()) -> ok.
+store_block_index(Height, Hash, Header, Chainwork, Status, NTx) ->
+    gen_server:call(?SERVER, {store_block_index, Height, Hash, Header,
+                              Chainwork, Status, NTx}, 30000).
 
 %% @doc Get block index by height
 -spec get_block_index(non_neg_integer()) ->
@@ -673,11 +680,11 @@ handle_call({has_utxo, Txid, Vout}, _From,
     {reply, Result, State};
 
 %% Block index operations
-handle_call({store_block_index, Height, Hash, Header, Chainwork, Status},
+handle_call({store_block_index, Height, Hash, Header, Chainwork, Status, NTx},
             _From, #state{db_handle = Db, cf_block_idx = CF,
                           cf_meta = MetaCF} = State) ->
     HeightKey = encode_height(Height),
-    Value = encode_block_index_entry(Hash, Header, Chainwork, Status),
+    Value = encode_block_index_entry(Hash, Header, Chainwork, Status, NTx),
     rocksdb:put(Db, CF, HeightKey, Value, []),
     %% Reverse index: hash -> height for lookup by hash
     HashKey = <<"blkidx:", Hash/binary>>,
