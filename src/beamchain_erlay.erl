@@ -22,6 +22,12 @@
 
 -include("beamchain.hrl").
 
+%% Dialyzer suppressions for false positives:
+%% build_sketch/1 and merge_sketches/2: minisketch NIF fallback returns a
+%% {minisketch_fallback,[]} tuple; the {error,_} branches are defensive code
+%% for the case where minisketch_nif returns an error in the future.
+-dialyzer({nowarn_function, [build_sketch/1, merge_sketches/2]}).
+
 %% API
 -export([start_link/0]).
 

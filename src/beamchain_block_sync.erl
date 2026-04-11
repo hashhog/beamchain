@@ -15,6 +15,16 @@
 -include("beamchain.hrl").
 -include("beamchain_protocol.hrl").
 
+%% Dialyzer suppressions for false positives:
+%% validate_sequential/2: recursive decrement from 50 reaches 0 but dialyzer
+%%   infers the type from the entry point call-site (literal 50) and flags the
+%%   base-case clause matching 0.  refresh_in_flight_timestamps/1 is only
+%%   reachable from that base case.  maybe_complete/1 catch-all clause is
+%%   valid defensive code; dialyzer infers the exhaustive type from one path.
+-dialyzer({nowarn_function, [validate_sequential/2,
+                              refresh_in_flight_timestamps/1,
+                              maybe_complete/1]}).
+
 %% API
 -export([start_link/0,
          start_sync/1,
@@ -52,6 +62,10 @@
 
 %% Max blocks to validate per gen_server iteration (yield to process messages)
 -define(MAX_VALIDATE_BATCH, 50).
+
+%% Max times to retry validation for the same block height before giving up.
+%% Prevents infinite retry loops (e.g. BIP30 false positive from stale UTXOs).
+-define(MAX_VALIDATION_RETRIES, 3).
 
 %% Progress reporting interval
 -define(PROGRESS_INTERVAL, 1000).
@@ -122,7 +136,12 @@
     %% Recently seen transactions for compact block reconstruction
     recent_txns = []         :: [#transaction{}],
     %% Max recent txns to keep
-    max_recent_txns = 100    :: non_neg_integer()
+    max_recent_txns = 100    :: non_neg_integer(),
+
+    %% Height -> retry count — tracks how many times validation failed
+    %% for a given height. After MAX_VALIDATION_RETRIES, skip the block
+    %% and halt sync to avoid infinite retry loops.
+    validation_failures = #{} :: #{non_neg_integer() => non_neg_integer()}
 }).
 
 %%% ===================================================================
@@ -838,14 +857,33 @@ validate_sequential_inner(#state{next_to_validate = NextH,
                     },
                     validate_sequential_inner(State3, Remaining - 1);
                 {error, Reason} ->
-                    logger:error("block_sync: validation failed at height ~B: ~p",
-                                 [NextH, Reason]),
-                    %% Re-queue only the failed block. Keep buffered blocks —
-                    %% they'll be validated once this height succeeds.
-                    Downloaded2 = maps:remove(NextH, State#state.downloaded),
-                    Queue = [NextH | State#state.download_queue],
-                    State#state{downloaded = Downloaded2,
-                                download_queue = Queue}
+                    Failures = State#state.validation_failures,
+                    RetryCount = maps:get(NextH, Failures, 0) + 1,
+                    Failures2 = maps:put(NextH, RetryCount, Failures),
+                    case RetryCount >= ?MAX_VALIDATION_RETRIES of
+                        true ->
+                            logger:error("block_sync: validation failed at height ~B "
+                                         "after ~B retries (~p), halting sync",
+                                         [NextH, RetryCount, Reason]),
+                            %% Stop sync entirely — operator must investigate.
+                            %% Clear downloaded buffer for this height.
+                            Downloaded2 = maps:remove(NextH, State#state.downloaded),
+                            State#state{status = idle,
+                                        downloaded = Downloaded2,
+                                        download_queue = [],
+                                        validation_failures = Failures2};
+                        false ->
+                            logger:error("block_sync: validation failed at height ~B: ~p "
+                                         "(retry ~B/~B)",
+                                         [NextH, Reason, RetryCount,
+                                          ?MAX_VALIDATION_RETRIES]),
+                            %% Re-queue the failed block for retry.
+                            Downloaded2 = maps:remove(NextH, State#state.downloaded),
+                            Queue = [NextH | State#state.download_queue],
+                            State#state{downloaded = Downloaded2,
+                                        download_queue = Queue,
+                                        validation_failures = Failures2}
+                    end
             end;
         error ->
             %% Not yet downloaded, nothing to do

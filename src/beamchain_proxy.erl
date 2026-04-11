@@ -8,6 +8,11 @@
 %% - v3 onion address generation from ed25519 keys
 %% - Network type detection and routing
 
+%% Dialyzer suppressions for false positives:
+%% i2p_to_std_base64/1: the list/string clause is defensive; dialyzer infers
+%% only binary() from call sites.
+-dialyzer({nowarn_function, i2p_to_std_base64/1}).
+
 -export([
     %% Connection routing
     connect/3,

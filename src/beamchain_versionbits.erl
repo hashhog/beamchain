@@ -10,6 +10,12 @@
 -include("beamchain.hrl").
 -include("beamchain_protocol.hrl").
 
+%% Dialyzer suppressions for false positives:
+%% get_state_for/4: the NEVER_ACTIVE (-2) clause is a valid BIP9 sentinel
+%% for future soft-fork proposals; dialyzer infers start_time from the
+%% specific timestamp values in existing deployment records only.
+-dialyzer({nowarn_function, get_state_for/4}).
+
 -export([
     get_deployment_state/3,
     get_deployment_state_at_height/4,
