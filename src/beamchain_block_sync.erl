@@ -927,8 +927,13 @@ validate_and_connect(Height, Block,
         %% 4. Store tx index entries
         store_tx_index(Block, Height),
 
-        %% 5. Update block_index status to fully validated (status=2)
+        %% 5. Update block_index status to fully validated (status=2).
+        %% direct_atomic_connect_writes already stored the entry with the
+        %% correct NTx count; re-read and preserve it so we don't clobber
+        %% it with the default-zero written by store_block_index/5.
         case beamchain_db:get_block_index(Height) of
+            {ok, #{hash := BH, header := Hdr, chainwork := CW, n_tx := NTx}} ->
+                beamchain_db:store_block_index(Height, BH, Hdr, CW, 2, NTx);
             {ok, #{hash := BH, header := Hdr, chainwork := CW}} ->
                 beamchain_db:store_block_index(Height, BH, Hdr, CW, 2);
             not_found ->
