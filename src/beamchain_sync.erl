@@ -8,6 +8,11 @@
 -include("beamchain.hrl").
 -include("beamchain_protocol.hrl").
 
+%% Dialyzer suppressions for false positives:
+%% route_message/4: _Error catch-all clauses are defensive; dialyzer infers
+%% decode_payload always returns {ok,_} from the specific call sites here.
+-dialyzer({nowarn_function, route_message/4}).
+
 %% API
 -export([start_link/0]).
 -export([handle_peer_message/3]).
@@ -179,7 +184,7 @@ route_message(Peer, notfound, Payload, State) ->
     case beamchain_p2p_msg:decode_payload(notfound, Payload) of
         {ok, #{items := Items}} ->
             %% Filter to block items and forward to block_sync
-            BlockItems = [{Type, Hash} || {Type, Hash} <- Items,
+            BlockItems = [{Type, Hash} || #{type := Type, hash := Hash} <- Items,
                           Type =:= ?MSG_BLOCK orelse
                           Type =:= ?MSG_WITNESS_BLOCK],
             case BlockItems of
@@ -255,7 +260,7 @@ route_message(Peer, getblocktxn, Payload, State) ->
     case beamchain_p2p_msg:decode_payload(getblocktxn, Payload) of
         {ok, #{block_hash := BlockHash, indexes := Indexes}} ->
             logger:debug("sync: getblocktxn from ~p for ~s (~B indexes)",
-                         [Peer, beamchain_serialize:encode_hex(BlockHash),
+                         [Peer, beamchain_serialize:hex_encode(BlockHash),
                           length(Indexes)]),
             %% Look up the full block and respond with requested transactions
             case beamchain_db:get_block(BlockHash) of
@@ -277,7 +282,7 @@ route_message(Peer, getblocktxn, Payload, State) ->
                                      transactions => RequestedTxs}});
                 not_found ->
                     logger:debug("sync: getblocktxn block not found: ~s",
-                                 [beamchain_serialize:encode_hex(BlockHash)])
+                                 [beamchain_serialize:hex_encode(BlockHash)])
             end;
         _Error ->
             beamchain_peer:add_misbehavior(Peer, 20)
@@ -291,7 +296,7 @@ route_message(Peer, tx, Payload, State) ->
             case beamchain_mempool:accept_to_memory_pool(Tx) of
                 {ok, Txid} ->
                     logger:info("sync: accepted tx ~s from ~p",
-                                [beamchain_serialize:encode_hex(Txid), Peer]),
+                                [beamchain_serialize:hex_encode(Txid), Peer]),
                     %% Relay to all peers via inv
                     beamchain_peer_manager:broadcast(inv, #{
                         items => [#{type => ?MSG_TX, hash => Txid}]

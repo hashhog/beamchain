@@ -204,9 +204,14 @@ get_addresses_test_() ->
         fun(_Setup) ->
             [
                 fun() ->
-                    %% Add 10 addresses
+                    %% Add 10 addresses from 10 distinct /16 netgroups so
+                    %% each lands in a different new-table bucket regardless
+                    %% of the random secret.  Using addresses all in the same
+                    %% /16 (e.g. 10.0.0.x) can cause two to hash to the same
+                    %% slot and one is silently dropped, making the count
+                    %% non-deterministic.
                     lists:foreach(fun(I) ->
-                        Addr = {{10, 0, 0, I}, 8333},
+                        Addr = {{I, I, 0, 1}, 8333},
                         beamchain_addrman:add_address(Addr, 0, dns)
                     end, lists:seq(1, 10)),
                     timer:sleep(100),

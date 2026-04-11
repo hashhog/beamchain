@@ -66,7 +66,9 @@ priv_dir() ->
 %% @doc Create a new sketch with given bits and capacity.
 %% bits = element size in bits (typically 32 for Erlay)
 %% capacity = maximum number of elements that can be decoded
--spec create(non_neg_integer(), non_neg_integer()) -> {ok, reference()} | {error, term()}.
+%% The spec includes {ok, term()} to accommodate the fallback representation
+%% used when the NIF is not loaded (which dialyzer cannot see beyond).
+-spec create(non_neg_integer(), non_neg_integer()) -> {ok, term()} | {error, term()}.
 create(Bits, Capacity) ->
     create_nif(Bits, Capacity).
 
@@ -75,19 +77,20 @@ create_nif(_Bits, _Capacity) ->
     {ok, {minisketch_fallback, []}}.
 
 %% @doc Create a sketch sized for max_elements with false positive rate 2^-fpbits.
+%% See create/2 for why the spec uses {ok, term()} rather than {ok, reference()}.
 -spec create_fp(non_neg_integer(), non_neg_integer(), non_neg_integer()) ->
-    {ok, reference()} | {error, term()}.
+    {ok, term()} | {error, term()}.
 create_fp(Bits, MaxElements, FPBits) ->
     Capacity = compute_capacity(Bits, MaxElements, FPBits),
     create(Bits, Capacity).
 
 %% @doc Destroy a sketch and free resources.
--spec destroy(reference()) -> ok.
+-spec destroy(term()) -> ok.
 destroy(_Sketch) ->
     ok.
 
 %% @doc Clone a sketch.
--spec clone(reference()) -> {ok, reference()} | {error, term()}.
+-spec clone(term()) -> {ok, term()} | {error, term()}.
 clone({minisketch_fallback, Elements}) ->
     {ok, {minisketch_fallback, Elements}};
 clone(Sketch) ->
@@ -97,7 +100,7 @@ clone_nif(_Sketch) ->
     {error, nif_not_loaded}.
 
 %% @doc Add an element to the sketch. Adding the same element twice removes it.
--spec add(reference(), non_neg_integer()) -> ok.
+-spec add(term(), non_neg_integer()) -> ok.
 add({minisketch_fallback, Elements}, Element) ->
     %% XOR-based toggle
     case lists:member(Element, Elements) of
@@ -117,7 +120,7 @@ add_nif(_Sketch, _Element) ->
 
 %% @doc Merge another sketch into this one (XOR operation).
 %% After merging, sketch contains the symmetric difference of both sets.
--spec merge(reference(), reference()) -> ok | {error, term()}.
+-spec merge(term(), term()) -> ok | {error, term()}.
 merge({minisketch_fallback, Elements1}, {minisketch_fallback, Elements2}) ->
     %% Symmetric difference: (A - B) union (B - A)
     Set1 = sets:from_list(Elements1),
@@ -134,7 +137,7 @@ merge_nif(_Sketch, _OtherSketch) ->
     {error, nif_not_loaded}.
 
 %% @doc Get serialized size of sketch in bytes.
--spec serialized_size(reference()) -> non_neg_integer().
+-spec serialized_size(term()) -> non_neg_integer().
 serialized_size({minisketch_fallback, Elements}) ->
     length(Elements) * 4;  %% 32-bit elements
 serialized_size(Sketch) ->
@@ -144,7 +147,7 @@ serialized_size_nif(_Sketch) ->
     0.
 
 %% @doc Serialize sketch to binary.
--spec serialize(reference()) -> {ok, binary()} | {error, term()}.
+-spec serialize(term()) -> {ok, binary()} | {error, term()}.
 serialize({minisketch_fallback, Elements}) ->
     %% Simple serialization: concatenate 32-bit elements
     Bin = << <<E:32/little>> || E <- Elements >>,
@@ -156,7 +159,7 @@ serialize_nif(_Sketch) ->
     {error, nif_not_loaded}.
 
 %% @doc Deserialize binary into sketch.
--spec deserialize(reference(), binary()) -> ok | {error, term()}.
+-spec deserialize(term(), binary()) -> ok | {error, term()}.
 deserialize({minisketch_fallback, _}, Bin) ->
     %% Parse 32-bit elements
     Elements = parse_elements(Bin, []),
@@ -174,7 +177,7 @@ parse_elements(<<E:32/little, Rest/binary>>, Acc) ->
 
 %% @doc Decode the sketch to recover elements.
 %% Returns {ok, [Element]} or {error, decode_failed}.
--spec decode(reference(), non_neg_integer()) -> {ok, [non_neg_integer()]} | {error, term()}.
+-spec decode(term(), non_neg_integer()) -> {ok, [non_neg_integer()]} | {error, term()}.
 decode({minisketch_fallback, Elements}, _MaxElements) ->
     {ok, Elements};
 decode(Sketch, MaxElements) ->
@@ -184,14 +187,14 @@ decode_nif(_Sketch, _MaxElements) ->
     {error, nif_not_loaded}.
 
 %% @doc Get element size in bits.
--spec bits(reference()) -> non_neg_integer().
+-spec bits(term()) -> non_neg_integer().
 bits({minisketch_fallback, _}) -> 32;
 bits(Sketch) -> bits_nif(Sketch).
 
 bits_nif(_Sketch) -> 32.
 
 %% @doc Get capacity.
--spec capacity(reference()) -> non_neg_integer().
+-spec capacity(term()) -> non_neg_integer().
 capacity({minisketch_fallback, Elements}) -> length(Elements);
 capacity(Sketch) -> capacity_nif(Sketch).
 
