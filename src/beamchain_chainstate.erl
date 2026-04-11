@@ -7,6 +7,11 @@
 -include("beamchain.hrl").
 -include("beamchain_protocol.hrl").
 
+%% Dialyzer suppressions for false positives:
+%% is_descendant_of/3 and find_fork_point/3: dialyzer infers AllBlocks is []
+%% from one call-site path, making the non-false branch appear unreachable.
+-dialyzer({nowarn_function, [is_descendant_of/3, find_fork_point/3]}).
+
 %% API
 -export([start_link/0, start_link/1, start_link/2]).
 

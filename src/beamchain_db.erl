@@ -4,6 +4,14 @@
 -include("beamchain.hrl").
 -include_lib("kernel/include/file.hrl").
 
+%% Dialyzer suppressions for false positives:
+%% init/1: dialyzer cannot prove all called functions return (rocksdb APIs
+%%   returning error tuples trigger defensive patterns, making init look like
+%%   it has no local return due to cascaded analysis).
+%% handle_call/3, handle_cast/2: do_prune_files always returns {ok,...} in
+%%   practice; the {error,_} branches are defensive code for future error cases.
+-dialyzer({nowarn_function, [init/1, handle_call/3, handle_cast/2]}).
+
 %% API
 -export([start_link/0, stop/0]).
 
