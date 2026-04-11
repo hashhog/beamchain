@@ -23,7 +23,7 @@
     prev_out   :: #outpoint{},
     script_sig :: binary(),
     sequence   :: non_neg_integer(),
-    witness    :: [binary()]    %% list of witness stack items
+    witness    :: [binary()] | undefined    %% list of witness stack items; undefined = no witness
 }).
 
 -record(tx_out, {
