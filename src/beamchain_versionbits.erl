@@ -22,6 +22,7 @@
     get_state_statistics/4,
     deployment_params/2,
     deployments/1,
+    deployment_maps/1,
     signal_bit/3,
     init_cache/0
 ]).
@@ -280,6 +281,20 @@ deployments(signet) ->
             min_activation_height = 0
         }
     ].
+
+%% @doc Return a list of maps describing all deployments for a network.
+%% Each map contains: name (binary), bit, start_time, timeout,
+%% min_activation_height.  This avoids exposing the #deployment record
+%% to callers that do not include the versionbits header.
+-spec deployment_maps(atom()) -> [map()].
+deployment_maps(Network) ->
+    [#{ name                  => atom_to_binary(D#deployment.name, utf8),
+        name_atom             => D#deployment.name,
+        bit                   => D#deployment.bit,
+        start_time            => D#deployment.start_time,
+        timeout               => D#deployment.timeout,
+        min_activation_height => D#deployment.min_activation_height }
+     || D <- deployments(Network)].
 
 %% @doc Check if a block should signal for a deployment.
 %% Returns true if deployment is in STARTED or LOCKED_IN state.

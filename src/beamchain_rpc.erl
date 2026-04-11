@@ -359,6 +359,7 @@ handle_method(<<"uptime">>, _, _W) -> rpc_uptime();
 handle_method(<<"getblockcount">>, _, _W) -> rpc_getblockcount();
 handle_method(<<"getbestblockhash">>, _, _W) -> rpc_getbestblockhash();
 handle_method(<<"getblockchaininfo">>, _, _W) -> rpc_getblockchaininfo();
+handle_method(<<"getdeploymentinfo">>, P, _W) -> rpc_getdeploymentinfo(P);
 handle_method(<<"getblockhash">>, P, _W) -> rpc_getblockhash(P);
 handle_method(<<"getblock">>, P, _W) -> rpc_getblock(P);
 handle_method(<<"getblockheader">>, P, _W) -> rpc_getblockheader(P);
@@ -465,6 +466,7 @@ rpc_help_list() ->
         <<"getblock \"blockhash\" ( verbosity )">>,
         <<"getblockchaininfo">>,
         <<"getblockcount">>,
+        <<"getdeploymentinfo ( \"blockhash\" )">>,
         <<"getblockhash height">>,
         <<"getblockheader \"blockhash\" ( verbose )">>,
         <<"getblockstats \"hash_or_height\" ( stats )">>,
@@ -633,6 +635,125 @@ rpc_getblockchaininfo() ->
                 <<"warnings">> => <<>>
             }}
     end.
+
+%% getdeploymentinfo ( "blockhash" )
+%%
+%% Returns deployment state for all known soft forks at a given block.
+%% If no blockhash is given, uses the current chain tip.
+%%
+%% Returns:
+%%   hash         - the block hash queried
+%%   height       - the block height queried
+%%   deployments  - map of deployment name => deployment info
+%%
+%% Each deployment entry contains:
+%%   type                  - "buried" | "bip9"
+%%   active                - whether the deployment is active at this block
+%%   height                - activation height (buried) or since (bip9)
+%%   min_activation_height - minimum height for activation (bip9)
+%%   For bip9 deployments, also: bit, start_time, timeout, status,
+%%     count, elapsed, possible (signaling stats for current period)
+%%
+rpc_getdeploymentinfo([]) ->
+    rpc_getdeploymentinfo_at_tip();
+rpc_getdeploymentinfo([null]) ->
+    rpc_getdeploymentinfo_at_tip();
+rpc_getdeploymentinfo([HashHex]) when is_binary(HashHex) ->
+    Hash = hex_to_internal_hash(HashHex),
+    case beamchain_db:get_block_index_by_hash(Hash) of
+        {ok, #{height := Height}} ->
+            rpc_getdeploymentinfo_at(Hash, Height);
+        not_found ->
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY, <<"Block not found">>}
+    end;
+rpc_getdeploymentinfo(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: getdeploymentinfo ( \"blockhash\" )">>}.
+
+rpc_getdeploymentinfo_at_tip() ->
+    case beamchain_chainstate:get_tip() of
+        {ok, {TipHash, TipHeight}} ->
+            rpc_getdeploymentinfo_at(TipHash, TipHeight);
+        not_found ->
+            %% No blocks yet — return empty deployments
+            {ok, #{
+                <<"hash">>        => <<"0000000000000000000000000000000000000000000000000000000000000000">>,
+                <<"height">>      => 0,
+                <<"deployments">> => #{}
+            }}
+    end.
+
+rpc_getdeploymentinfo_at(BlockHash, Height) ->
+    Network = beamchain_config:network(),
+    Params = beamchain_chain_params:params(Network),
+
+    %% HeightGetter used by the versionbits state machine
+    HeightGetter = fun(H) -> beamchain_db:get_block_index(H) end,
+
+    %% ---- Buried deployments ----
+    BuriedDefs = [
+        {<<"bip34">>, bip34_height},
+        {<<"bip65">>, bip65_height},
+        {<<"bip66">>, bip66_height},
+        {<<"csv">>,   csv_height},
+        {<<"segwit">>, segwit_height},
+        {<<"taproot">>, taproot_height}
+    ],
+    BuriedMap = lists:foldl(fun({Name, Key}, Acc) ->
+        ActivationHeight = maps:get(Key, Params, 0),
+        IsActive = Height >= ActivationHeight,
+        maps:put(Name, #{
+            <<"type">>   => <<"buried">>,
+            <<"active">> => IsActive,
+            <<"height">> => ActivationHeight
+        }, Acc)
+    end, #{}, BuriedDefs),
+
+    %% ---- BIP9 deployments (versionbits) ----
+    %% These share names with some buried deployments on mainnet (csv/segwit/taproot
+    %% are buried there) but are valid BIP9 entries on testnet/signet.
+    %% We merge them under the same key so caller always sees type=bip9 when the
+    %% deployment comes from the versionbits state machine.
+    Bip9Deployments = beamchain_versionbits:deployment_maps(Network),
+    Bip9Map = lists:foldl(fun(Dep, Acc) ->
+        NameAtom = maps:get(name_atom, Dep),
+        Name     = maps:get(name, Dep),
+        State    = beamchain_versionbits:get_deployment_state_at_height(
+                       Network, NameAtom, Height, HeightGetter),
+        IsActive = State =:= active,
+
+        %% Signaling stats for the current period
+        {Count, Elapsed, Possible} =
+            beamchain_versionbits:get_state_statistics(
+                Network, NameAtom, Height, HeightGetter),
+
+        Entry = #{
+            <<"type">>                  => <<"bip9">>,
+            <<"active">>                => IsActive,
+            <<"height">>                => Height,
+            <<"min_activation_height">> => maps:get(min_activation_height, Dep),
+            <<"bit">>                   => maps:get(bit, Dep),
+            <<"start_time">>            => maps:get(start_time, Dep),
+            <<"timeout">>               => maps:get(timeout, Dep),
+            <<"status">>                => atom_to_binary(State, utf8),
+            <<"count">>                 => Count,
+            <<"elapsed">>               => Elapsed,
+            <<"possible">>              => Possible
+        },
+        maps:put(Name, Entry, Acc)
+    end, #{}, Bip9Deployments),
+
+    %% Merge: buried entries take precedence for named deployments that are
+    %% buried on this network (they are always-active and the buried record is
+    %% the authoritative activation height).  BIP9 entries not also buried are
+    %% kept as-is.
+    Deployments = maps:merge(Bip9Map, BuriedMap),
+
+    {ok, #{
+        <<"hash">>        => hash_to_hex(BlockHash),
+        <<"height">>      => Height,
+        <<"deployments">> => Deployments
+    }}.
 
 rpc_getblockhash([Height]) when is_integer(Height), Height >= 0 ->
     case beamchain_db:get_block_index(Height) of

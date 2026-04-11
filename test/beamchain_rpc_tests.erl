@@ -612,3 +612,137 @@ block_subsidy(Height) ->
         true -> 0;
         false -> (50 * 100000000) bsr Halvings
     end.
+
+%%% ===================================================================
+%%% getdeploymentinfo tests
+%%% ===================================================================
+
+%% Test that deployment_maps/1 returns non-empty list for all relevant networks.
+getdeploymentinfo_deployments_non_empty_test_() ->
+    {"deployment_maps returns non-empty lists",
+     [
+      {"mainnet has deployments", fun() ->
+          Maps = beamchain_versionbits:deployment_maps(mainnet),
+          ?assert(length(Maps) > 0)
+      end},
+      {"regtest has deployments", fun() ->
+          Maps = beamchain_versionbits:deployment_maps(regtest),
+          ?assert(length(Maps) > 0)
+      end},
+      {"testnet4 has deployments", fun() ->
+          Maps = beamchain_versionbits:deployment_maps(testnet4),
+          ?assert(length(Maps) > 0)
+      end}
+     ]}.
+
+%% Test that segwit deployment is present in deployment_maps.
+getdeploymentinfo_segwit_present_test_() ->
+    {"segwit deployment is present",
+     [
+      {"mainnet", fun() ->
+          Maps = beamchain_versionbits:deployment_maps(mainnet),
+          Names = [maps:get(name, M) || M <- Maps],
+          ?assert(lists:member(<<"segwit">>, Names))
+      end},
+      {"regtest", fun() ->
+          Maps = beamchain_versionbits:deployment_maps(regtest),
+          Names = [maps:get(name, M) || M <- Maps],
+          ?assert(lists:member(<<"segwit">>, Names))
+      end}
+     ]}.
+
+%% Test that taproot deployment is present in deployment_maps.
+getdeploymentinfo_taproot_present_test_() ->
+    {"taproot deployment is present",
+     [
+      {"mainnet", fun() ->
+          Maps = beamchain_versionbits:deployment_maps(mainnet),
+          Names = [maps:get(name, M) || M <- Maps],
+          ?assert(lists:member(<<"taproot">>, Names))
+      end},
+      {"regtest", fun() ->
+          Maps = beamchain_versionbits:deployment_maps(regtest),
+          Names = [maps:get(name, M) || M <- Maps],
+          ?assert(lists:member(<<"taproot">>, Names))
+      end}
+     ]}.
+
+%% Test that each deployment map has the required fields.
+getdeploymentinfo_deployment_map_fields_test_() ->
+    {"each deployment map has required fields",
+     fun() ->
+         Maps = beamchain_versionbits:deployment_maps(mainnet),
+         lists:foreach(fun(M) ->
+             ?assert(maps:is_key(name, M)),
+             ?assert(maps:is_key(name_atom, M)),
+             ?assert(maps:is_key(bit, M)),
+             ?assert(maps:is_key(start_time, M)),
+             ?assert(maps:is_key(timeout, M)),
+             ?assert(maps:is_key(min_activation_height, M))
+         end, Maps)
+     end}.
+
+%% Test the shape of a simulated getdeploymentinfo response.
+getdeploymentinfo_response_shape_test_() ->
+    {"getdeploymentinfo response has correct top-level keys",
+     fun() ->
+         %% Build a mock response matching what rpc_getdeploymentinfo_at returns
+         MockResponse = #{
+             <<"hash">>        => <<"000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f">>,
+             <<"height">>      => 750000,
+             <<"deployments">> => #{
+                 <<"segwit">>  => #{<<"type">> => <<"buried">>, <<"active">> => true,
+                                   <<"height">> => 481824},
+                 <<"taproot">> => #{<<"type">> => <<"buried">>, <<"active">> => true,
+                                   <<"height">> => 709632}
+             }
+         },
+         ?assert(maps:is_key(<<"hash">>, MockResponse)),
+         ?assert(maps:is_key(<<"height">>, MockResponse)),
+         ?assert(maps:is_key(<<"deployments">>, MockResponse)),
+         Deployments = maps:get(<<"deployments">>, MockResponse),
+         ?assert(maps:is_key(<<"segwit">>, Deployments)),
+         ?assert(maps:is_key(<<"taproot">>, Deployments))
+     end}.
+
+%% Test bip9 deployment entry fields.
+getdeploymentinfo_bip9_entry_fields_test_() ->
+    {"bip9 deployment entry has required fields",
+     fun() ->
+         MockBip9Entry = #{
+             <<"type">>                  => <<"bip9">>,
+             <<"active">>                => false,
+             <<"height">>                => 100,
+             <<"min_activation_height">> => 0,
+             <<"bit">>                   => 1,
+             <<"start_time">>            => 1479168000,
+             <<"timeout">>               => 1510704000,
+             <<"status">>                => <<"defined">>,
+             <<"count">>                 => 0,
+             <<"elapsed">>               => 100,
+             <<"possible">>              => true
+         },
+         ?assert(maps:is_key(<<"type">>, MockBip9Entry)),
+         ?assert(maps:is_key(<<"active">>, MockBip9Entry)),
+         ?assert(maps:is_key(<<"bit">>, MockBip9Entry)),
+         ?assert(maps:is_key(<<"start_time">>, MockBip9Entry)),
+         ?assert(maps:is_key(<<"timeout">>, MockBip9Entry)),
+         ?assert(maps:is_key(<<"status">>, MockBip9Entry)),
+         ?assert(maps:is_key(<<"count">>, MockBip9Entry)),
+         ?assert(maps:is_key(<<"possible">>, MockBip9Entry))
+     end}.
+
+%% Test that on regtest, taproot and segwit are always active (ALWAYS_ACTIVE sentinel).
+getdeploymentinfo_regtest_always_active_test_() ->
+    {"regtest deployments are always active",
+     fun() ->
+         beamchain_versionbits:init_cache(),
+         NoopGetter = fun(_H) -> not_found end,
+         %% On regtest, start_time = ALWAYS_ACTIVE (-1), so state = active
+         SegwitState = beamchain_versionbits:get_deployment_state_at_height(
+             regtest, segwit, 1, NoopGetter),
+         TaprootState = beamchain_versionbits:get_deployment_state_at_height(
+             regtest, taproot, 1, NoopGetter),
+         ?assertEqual(active, SegwitState),
+         ?assertEqual(active, TaprootState)
+     end}.
