@@ -24,6 +24,9 @@ db_test_() ->
           {"chain tip not found initially", fun chain_tip_not_found/0},
           {"block index store/get", fun block_index_roundtrip/0},
           {"block index lookup by hash", fun block_index_by_hash/0},
+          %% Regression test: store_block_index/6 preserves NTx (L1-5 symptom B)
+          {"block index n_tx roundtrip with store/6", fun block_index_ntx_preserved/0},
+          {"block index status update preserves n_tx", fun block_index_ntx_not_clobbered/0},
           {"tx index store/get", fun tx_index_roundtrip/0},
           {"undo data store/get", fun undo_data_roundtrip/0},
           {"batch write atomicity", fun batch_write/0},
@@ -253,6 +256,54 @@ block_index_by_hash() ->
     %% Non-existent hash
     ?assertEqual(not_found,
                  beamchain_db:get_block_index_by_hash(crypto:strong_rand_bytes(32))).
+
+%% Regression: store_block_index/6 writes and round-trips NTx correctly.
+%% Before the L1-5 fix, store_block_index only had a 5-arg form that always
+%% wrote NTx=0, so getblockheader returned nTx: 0 for every block.
+block_index_ntx_preserved() ->
+    Hash = crypto:strong_rand_bytes(32),
+    Header = #block_header{
+        version = 1,
+        prev_hash = <<0:256>>,
+        merkle_root = crypto:strong_rand_bytes(32),
+        timestamp = 1231006505,
+        bits = 16#1d00ffff,
+        nonce = 42
+    },
+    Chainwork = <<0, 0, 0, 1>>,
+    NTx = 1562,
+    ok = beamchain_db:store_block_index(30, Hash, Header, Chainwork, 2, NTx),
+    {ok, Entry} = beamchain_db:get_block_index(30),
+    ?assertEqual(NTx, maps:get(n_tx, Entry)),
+    %% Also verify lookup by hash returns correct NTx
+    {ok, EntryByHash} = beamchain_db:get_block_index_by_hash(Hash),
+    ?assertEqual(NTx, maps:get(n_tx, EntryByHash)).
+
+%% Regression: a status-only update via store_block_index/6 must not clobber
+%% the NTx that direct_atomic_connect_writes stored earlier.
+%% beamchain_block_sync.erl validate_and_connect() had this bug (L1-5 symptom B).
+block_index_ntx_not_clobbered() ->
+    Hash = crypto:strong_rand_bytes(32),
+    Header = #block_header{
+        version = 1,
+        prev_hash = <<0:256>>,
+        merkle_root = crypto:strong_rand_bytes(32),
+        timestamp = 1231006506,
+        bits = 16#1d00ffff,
+        nonce = 7
+    },
+    Chainwork = <<0, 0, 0, 2>>,
+    NTx = 999,
+    %% First write: headers-only entry with real NTx (simulating direct_atomic_connect_writes)
+    ok = beamchain_db:store_block_index(31, Hash, Header, Chainwork, 1, NTx),
+    %% Second write: status promotion that must preserve NTx (simulating validate_and_connect step 5)
+    {ok, Existing} = beamchain_db:get_block_index(31),
+    ExistingNTx = maps:get(n_tx, Existing),
+    ok = beamchain_db:store_block_index(31, Hash, Header, Chainwork, 2, ExistingNTx),
+    %% NTx must survive the status update
+    {ok, Final} = beamchain_db:get_block_index(31),
+    ?assertEqual(NTx, maps:get(n_tx, Final)),
+    ?assertEqual(2, maps:get(status, Final)).
 
 %%% ===================================================================
 %%% Transaction index tests
