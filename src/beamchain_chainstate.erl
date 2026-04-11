@@ -139,7 +139,7 @@ get_tip() ->
 get_mtp() ->
     gen_server:call(?SERVER, get_mtp).
 
-%% @doc Check if the chain tip is within 1 hour of current time.
+%% @doc Check if the chain tip is within 24 hours of current time (matching Bitcoin Core's DEFAULT_MAX_TIP_AGE).
 -spec is_synced() -> boolean().
 is_synced() ->
     gen_server:call(?SERVER, is_synced).
@@ -501,7 +501,8 @@ handle_call(is_synced, _From, #state{mtp_timestamps = []} = State) ->
 handle_call(is_synced, _From, #state{mtp_timestamps = Ts} = State) ->
     Latest = lists:last(Ts),
     Now = erlang:system_time(second),
-    {reply, (Now - Latest) < 3600, State};
+    %% 24 hours in seconds (86400 = 24 * 3600), matching Bitcoin Core's DEFAULT_MAX_TIP_AGE
+    {reply, (Now - Latest) < 86400, State};
 
 handle_call({connect_block, Block}, _From, State) ->
     case do_connect_block(Block, State) of
