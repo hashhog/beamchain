@@ -66,17 +66,27 @@ network() ->
 %% @doc Get full network params record
 -spec network_params() -> #network_params{}.
 network_params() ->
-    get(network_params).
+    case get(network_params) of
+        #network_params{} = P -> P;
+        _ -> error(network_params_not_configured)
+    end.
 
 %% @doc Get data directory path
 -spec datadir() -> string().
 datadir() ->
-    get(datadir).
+    case get(datadir) of
+        undefined -> error(datadir_not_configured);
+        Dir -> Dir
+    end.
 
 %% @doc Get network magic bytes
 -spec magic() -> binary().
 magic() ->
-    (get(network_params))#network_params.magic.
+    Params = get(network_params),
+    case Params of
+        #network_params{magic = Magic} -> Magic;
+        _ -> error(network_params_not_configured)
+    end.
 
 %% @doc Check if transaction index is enabled.
 %% Reads from config file (txindex=1) or env var (BEAMCHAIN_TXINDEX=1).
