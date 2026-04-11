@@ -14,6 +14,11 @@
 
 -include("beamchain.hrl").
 -include("beamchain_protocol.hrl").
+%% Required for the ets:fun2ms/1 parse transform used by find_peer_by_address/1.
+%% Without this include, ets:fun2ms is a stub function that throws badarg at
+%% runtime (see commit 45dc51f4, which added the fun2ms call but forgot the
+%% transform header — peer_manager crashed on every connect_tick as a result).
+-include_lib("stdlib/include/ms_transform.hrl").
 
 %% Dialyzer suppressions for false positives:
 %% try_anchor_connections/1, attempt_connection/3: can_connect returns boolean()
