@@ -8,7 +8,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /src
 COPY . .
-RUN rebar3 as prod release
+# Use host networking so rebar3 can fetch the rocksdb git dependency
+# from github.com during the Docker build.
+RUN --network=host rebar3 as prod release
 
 # ---------- runtime ----------
 FROM debian:bookworm-slim
