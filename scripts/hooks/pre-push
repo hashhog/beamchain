@@ -19,6 +19,12 @@ set -euo pipefail
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
+# rebar3 dep-fetch/upgrade reads GIT_DIR when running inside a git hook,
+# which causes it to treat the main repo's .git dir as the working tree and
+# attempt a network fetch of all git-sourced deps (e.g. rocksdb) even when
+# they are already in _build/.  Unset GIT_DIR so rebar3 sees a normal shell.
+unset GIT_DIR GIT_WORK_TREE
+
 echo "[pre-push] 1/2 rebar3 xref"
 if ! rebar3 xref; then
     cat >&2 <<'MSG'
