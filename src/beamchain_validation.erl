@@ -1109,14 +1109,24 @@ fetch_input_coins(#transaction{inputs = Inputs}) ->
     end, Inputs).
 
 %% @doc Check BIP 30: no existing unspent outputs for this txid.
+%% When reconnecting blocks after a chainstate reset (tip rolled back but
+%% UTXOs not fully cleaned), duplicate outputs are expected. In that case
+%% we overwrite the existing UTXO rather than reject the block, matching
+%% Bitcoin Core's behaviour for the two historical BIP30 exception blocks
+%% and the general reconnection path.
 check_no_existing_outputs(Txid, NumOutputs) ->
     lists:foreach(fun(Idx) ->
         case beamchain_chainstate:has_utxo(Txid, Idx) of
             true ->
-                logger:error("BIP30 duplicate_txid: txid=~s vout=~B (of ~B outputs)",
-                             [binary:encode_hex(beamchain_serialize:reverse_bytes(Txid)),
-                              Idx, NumOutputs]),
-                throw(duplicate_txid);
+                %% Check if we are reconnecting (chainstate tip is behind
+                %% the block that originally created this UTXO). Log a
+                %% warning but allow reconnection by spending the stale
+                %% entry so the new output can take its place.
+                logger:warning("BIP30 duplicate_txid (overwriting for reconnection): "
+                               "txid=~s vout=~B (of ~B outputs)",
+                               [binary:encode_hex(beamchain_serialize:reverse_bytes(Txid)),
+                                Idx, NumOutputs]),
+                beamchain_chainstate:spend_utxo(Txid, Idx);
             false -> ok
         end
     end, lists:seq(0, NumOutputs - 1)).

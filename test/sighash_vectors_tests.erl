@@ -3,8 +3,8 @@
 -include("beamchain.hrl").
 -include("beamchain_protocol.hrl").
 
-%% Path to the sighash test vectors from Bitcoin Core
--define(VECTORS_FILE, "/home/max/hashhog/ouroboros/bitcoin/src/test/data/sighash.json").
+%% Path relative to project root (test/data/ is committed to the repo).
+-define(VECTORS_FILE, "test/data/sighash.json").
 
 sighash_vectors_test_() ->
     {timeout, 120, fun run_all_vectors/0}.
@@ -34,13 +34,20 @@ run_one_vector([RawTxHex, ScriptHex, InputIndex, HashType, ExpectedHashHex]) ->
         %% Convert to unsigned 32-bit for use in sighash computation.
         HashTypeU32 = HashType band 16#ffffffff,
 
-        %% Compute the legacy sighash
+        %% Compute the legacy sighash.
+        %% sighash_legacy/4 returns raw double-SHA256 bytes (big-endian,
+        %% natural digest order).
         Computed = beamchain_script:sighash_legacy(Tx, InputIndex, ScriptCode, HashTypeU32),
 
-        %% Expected hash is in hex, compare
-        ExpectedHash = beamchain_serialize:hex_decode(ExpectedHashHex),
+        %% Bitcoin Core's sighash.json stores the expected hash in
+        %% Bitcoin display format: uint256::GetHex() reverses the byte
+        %% order before hex-encoding (the internal uint256 is little-endian,
+        %% so display is bytes reversed).  Reverse the computed digest
+        %% before comparison so we match the same convention.
+        ComputedRevBin = reverse_bytes(Computed),
+        ExpectedRaw = beamchain_serialize:hex_decode(ExpectedHashHex),
 
-        case Computed =:= ExpectedHash of
+        case ComputedRevBin =:= ExpectedRaw of
             true ->
                 ok;
             false ->
@@ -49,8 +56,8 @@ run_one_vector([RawTxHex, ScriptHex, InputIndex, HashType, ExpectedHashHex]) ->
                     "  expected: ~s~n"
                     "  computed: ~s~n",
                     [InputIndex, HashTypeU32,
-                     beamchain_serialize:hex_encode(ExpectedHash),
-                     beamchain_serialize:hex_encode(Computed)]),
+                     beamchain_serialize:hex_encode(ExpectedRaw),
+                     beamchain_serialize:hex_encode(ComputedRevBin)]),
                 fail
         end
     catch
@@ -64,3 +71,8 @@ run_one_vector([RawTxHex, ScriptHex, InputIndex, HashType, ExpectedHashHex]) ->
 run_one_vector(_Other) ->
     %% Skip any malformed entries
     ok.
+
+%% @doc Reverse the bytes of a binary (used to convert between internal
+%% digest order and Bitcoin display order).
+reverse_bytes(Bin) ->
+    list_to_binary(lists:reverse(binary_to_list(Bin))).

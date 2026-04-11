@@ -156,7 +156,7 @@ handle_info(_Info, State) ->
 terminate(_Reason, #state{sockets = Sockets}) ->
     %% Close all sockets
     maps:foreach(fun(_Topic, {Sock, _Endpoint}) ->
-        catch chumak:close(Sock)
+        catch chumak:stop(Sock)
     end, Sockets),
     logger:info("zmq: shutdown"),
     ok.
@@ -177,7 +177,7 @@ setup_sockets([{Topic, Endpoint} | Rest], Acc) ->
             setup_sockets(Rest, Acc#{Topic => {Socket, Endpoint}});
         {error, Reason} ->
             %% Clean up already-created sockets
-            maps:foreach(fun(_T, {S, _E}) -> catch chumak:close(S) end, Acc),
+            maps:foreach(fun(_T, {S, _E}) -> catch chumak:stop(S) end, Acc),
             {error, {socket_error, Topic, Reason}}
     end.
 
@@ -191,11 +191,11 @@ create_pub_socket(Endpoint) ->
                         {ok, _BindPid} ->
                             {ok, Socket};
                         {error, Reason} ->
-                            chumak:close(Socket),
+                            chumak:stop(Socket),
                             {error, {bind_failed, Reason}}
                     end;
                 {error, Reason} ->
-                    chumak:close(Socket),
+                    chumak:stop(Socket),
                     {error, {bad_endpoint, Reason}}
             end;
         {error, Reason} ->

@@ -133,7 +133,9 @@ accept(Socket, Address, Handler) ->
     gen_statem:start_link(?MODULE, {inbound, Socket, Address, Handler}, []).
 
 %% @doc Send a P2P message to this peer.
--spec send_message(pid(), {atom(), map()}) -> ok.
+%% The payload may be a map (common case) or any structured term (e.g.
+%% a #block{} or #transaction{} record for in-process relay).
+-spec send_message(pid(), {atom(), term()}) -> ok.
 send_message(Pid, {Command, Payload}) ->
     gen_statem:cast(Pid, {send, Command, Payload}).
 

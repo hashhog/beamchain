@@ -4,6 +4,15 @@
 -include("beamchain.hrl").
 -include("beamchain_protocol.hrl").
 
+%% Dialyzer suppressions for false positives:
+%% handle_call({encryptwallet}): do_encrypt_wallet always succeeds per dialyzer;
+%%   the {error,_} branch is defensive code kept for future error conditions.
+%% generate_keypool/1: master_key=undefined guard is a valid safety net.
+%% generate_address_silent/3: change_addr clauses are valid code paths even
+%%   though current callers only use receive_addr.
+-dialyzer({nowarn_function, [handle_call/3, generate_keypool/1,
+                              generate_address_silent/3]}).
+
 %% gen_server API
 -export([start_link/0, start_link/1,
          create/0, create/1, create/2,
@@ -22,7 +31,8 @@
          get_balance/1,
          get_private_key/2,
          get_wallet_info/1,
-         is_locked/1]).
+         is_locked/1,
+         import_address/5]).
 
 %% Wallet encryption API
 -export([encryptwallet/1,
@@ -286,6 +296,13 @@ get_wallet_info(Pid) when is_pid(Pid) ->
 -spec is_locked(pid()) -> boolean().
 is_locked(Pid) when is_pid(Pid) ->
     gen_server:call(Pid, is_locked).
+
+%% @doc Import a watch-only address into the wallet.
+%% Stub — importdescriptors watch-only tracking is not yet implemented.
+-spec import_address(pid(), string(), binary(), boolean(), binary()) -> ok.
+import_address(_Pid, _Address, _Label, _Internal, _Timestamp) ->
+    %% TODO: implement watch-only address tracking
+    ok.
 
 %%% ===================================================================
 %%% gen_server callbacks
@@ -1487,7 +1504,7 @@ scan_block_for_wallet(Block) ->
         end, Tx#transaction.inputs),
         %% Then, add any outputs to wallet addresses
         Txid = case Tx#transaction.txid of
-            undefined -> beamchain_serialize:txid(Tx);
+            undefined -> beamchain_serialize:tx_hash(Tx);
             T -> T
         end,
         lists:foldl(fun(Output, Idx) ->

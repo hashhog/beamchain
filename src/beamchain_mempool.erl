@@ -7,6 +7,11 @@
 -include("beamchain.hrl").
 -include("beamchain_protocol.hrl").
 
+%% Dialyzer suppressions for false positives:
+%% interpolate_diagram/2: empty-list base case is defensive; dialyzer infers
+%% the argument is always non-empty from call sites.
+-dialyzer({nowarn_function, interpolate_diagram/2}).
+
 %% API
 -export([start_link/0]).
 
@@ -15,7 +20,7 @@
 
 %% Queries
 -export([has_tx/1, get_tx/1, get_entry/1]).
--export([get_all_txids/0, get_info/0]).
+-export([get_all_txids/0, get_all_entries/0, get_info/0]).
 -export([get_sorted_by_fee/0]).
 -export([get_tx_fee_rate/1]).
 -export([get_ancestors/1]).
@@ -188,6 +193,11 @@ get_tx_fee_rate(Txid) ->
 -spec get_all_txids() -> [binary()].
 get_all_txids() ->
     [Txid || {Txid, _} <- ets:tab2list(?MEMPOOL_TXS)].
+
+%% @doc Get all entries currently in the mempool.
+-spec get_all_entries() -> [#mempool_entry{}].
+get_all_entries() ->
+    [Entry || {_Txid, Entry} <- ets:tab2list(?MEMPOOL_TXS)].
 
 %% @doc Get mempool summary info.
 -spec get_info() -> map().

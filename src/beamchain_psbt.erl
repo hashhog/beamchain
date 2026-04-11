@@ -937,7 +937,7 @@ merge_output(Base, Other) ->
 
 verify_unsigned_tx(#transaction{inputs = Inputs}) ->
     case lists:all(fun(#tx_in{script_sig = SS, witness = W}) ->
-        (SS =:= <<>> orelse SS =:= undefined) andalso
+        SS =:= <<>> andalso
         (W =:= [] orelse W =:= undefined)
     end, Inputs) of
         true -> ok;

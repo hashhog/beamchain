@@ -7,6 +7,13 @@
 -include("beamchain.hrl").
 -include("beamchain_protocol.hrl").
 
+%% Dialyzer suppressions for false positives:
+%% build_coinbase/5, build_coinbase_for_txs/6: Height=0 is a defensive
+%%   base case; dialyzer infers Height::pos_integer() from call sites.
+%% encode_coinbase_height/1: same reasoning for the Height=0 clause.
+-dialyzer({nowarn_function, [build_coinbase/5, build_coinbase_for_txs/5,
+                              encode_coinbase_height/1]}).
+
 %% API
 -export([start_link/0]).
 -export([create_block_template/1, create_block_template/2]).

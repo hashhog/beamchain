@@ -8,8 +8,8 @@
 %%% Bitcoin Core script_tests.json test harness
 %%% ===================================================================
 
--define(SCRIPT_TESTS_PATH,
-        "/home/max/hashhog/bitcoin/src/test/data/script_tests.json").
+%% Path relative to project root (test/data/ is committed to the repo).
+-define(SCRIPT_TESTS_PATH, "test/data/script_tests.json").
 
 %%% -------------------------------------------------------------------
 %%% Hex utilities
