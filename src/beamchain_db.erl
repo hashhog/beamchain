@@ -414,8 +414,9 @@ direct_atomic_connect_writes(Block, Height, Chainwork, BlockHash, Status) ->
 
     %% 2. Block index (height -> entry)
     HeightKey = encode_height(Height),
+    NTx = length(Block#block.transactions),
     IdxValue = encode_block_index_entry(BlockHash, Block#block.header,
-                                        Chainwork, Status),
+                                        Chainwork, Status, NTx),
     IdxOp = {put, IdxCF, HeightKey, IdxValue},
 
     %% 3. Reverse index (hash -> height)
@@ -803,8 +804,9 @@ handle_call({atomic_connect_writes, Block, Height, Chainwork, BlockHash, Status}
 
     %% 2. Block index (height -> entry)
     HeightKey = encode_height(Height),
+    NTx = length(Block#block.transactions),
     IdxValue = encode_block_index_entry(BlockHash, Block#block.header,
-                                        Chainwork, Status),
+                                        Chainwork, Status, NTx),
     IdxOp = {put, IdxCF, HeightKey, IdxValue},
 
     %% 3. Reverse index (hash -> height)
@@ -904,9 +906,9 @@ handle_call({update_block_status, Hash, NewStatus}, _From,
             case rocksdb:get(Db, CF, HeightKey, []) of
                 {ok, Bin} ->
                     Entry = decode_block_index_entry(Bin),
-                    %% Re-encode with new status
-                    #{hash := H, header := Header, chainwork := Chainwork} = Entry,
-                    NewValue = encode_block_index_entry(H, Header, Chainwork, NewStatus),
+                    %% Re-encode with new status, preserving existing NTx
+                    #{hash := H, header := Header, chainwork := Chainwork, n_tx := NTx} = Entry,
+                    NewValue = encode_block_index_entry(H, Header, Chainwork, NewStatus, NTx),
                     case rocksdb:put(Db, CF, HeightKey, NewValue, []) of
                         ok -> ok;
                         Error -> Error
@@ -1018,14 +1020,18 @@ decode_utxo(<<Value:64/little, Height:32/little, CoinbaseFlag:8,
         height = Height
     }.
 
-%% @doc Encode a block index entry for storage
-%% Format: hash(32) | header(80) | chainwork_len(2) | chainwork(var) | status(4)
+%% @doc Encode a block index entry with optional transaction count.
+%% Format: Hash (32) | HeaderBin (80) | CWLen (2) | Chainwork (variable) | Status (4) | NTx (4)
 encode_block_index_entry(Hash, Header, Chainwork, Status) ->
+    %% Default to 0 transactions for headers-only entries
+    encode_block_index_entry(Hash, Header, Chainwork, Status, 0).
+
+encode_block_index_entry(Hash, Header, Chainwork, Status, NTx) ->
     HeaderBin = beamchain_serialize:encode_block_header(Header),
     CWLen = byte_size(Chainwork),
     <<Hash:32/binary, HeaderBin:80/binary,
       CWLen:16/big, Chainwork:CWLen/binary,
-      Status:32/little>>.
+      Status:32/little, NTx:32/big>>.
 
 %% @doc Build tx_index write ops for atomic batch.
 %% Returns [{put, TxCF, Txid, Value}] for each transaction.
@@ -1037,13 +1043,22 @@ build_tx_index_ops([Tx | Rest], BlockHash, Height, Pos, CF, Acc) ->
     build_tx_index_ops(Rest, BlockHash, Height, Pos + 1, CF,
                        [{put, CF, Txid, Value} | Acc]).
 
-%% @doc Decode a block index entry
+%% @doc Decode a block index entry (supports both old and new formats with optional NTx field)
 decode_block_index_entry(<<Hash:32/binary, HeaderBin:80/binary,
                            CWLen:16/big, Rest/binary>>) ->
-    <<Chainwork:CWLen/binary, Status:32/little>> = Rest,
     {Header, <<>>} = beamchain_serialize:decode_block_header(HeaderBin),
-    #{hash => Hash, header => Header,
-      chainwork => Chainwork, status => Status}.
+    case Rest of
+        <<Chainwork:CWLen/binary, Status:32/little, NTx:32/big>> ->
+            %% New format with NTx
+            #{hash => Hash, header => Header,
+              chainwork => Chainwork, status => Status, n_tx => NTx};
+        <<Chainwork:CWLen/binary, Status:32/little>> ->
+            %% Old format without NTx - default to 0
+            #{hash => Hash, header => Header,
+              chainwork => Chainwork, status => Status, n_tx => 0};
+        _ ->
+            error({invalid_block_index_entry, Rest})
+    end.
 
 %% @doc Collect all block index entries from iterator
 collect_block_indexes({error, _}, _Iter, Acc) ->
