@@ -53,9 +53,15 @@ jobs:
         with:
           otp-version: "27"
           rebar3-version: "3.24"
-      # Pre-fetch deps on the runner (has full internet access) so the
-      # Docker build layer does not need outbound git access.
-      - run: rebar3 as prod deps get
+      - name: Install rocksdb build deps
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            gcc g++ make cmake automake autoconf libtool \
+            libssl-dev libsnappy-dev liblz4-dev libzstd-dev
+      # Build the release on the runner (has full internet access for git deps).
+      # The resulting _build/prod/rel/ tree is then COPYed into the Docker image.
+      - run: rebar3 as prod release
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6
         with:
