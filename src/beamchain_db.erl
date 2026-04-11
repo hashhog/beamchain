@@ -1027,12 +1027,9 @@ decode_utxo(<<Value:64/little, Height:32/little, CoinbaseFlag:8,
         height = Height
     }.
 
-%% @doc Encode a block index entry with optional transaction count.
+%% @doc Encode a block index entry.
 %% Format: Hash (32) | HeaderBin (80) | CWLen (2) | Chainwork (variable) | Status (4) | NTx (4)
-encode_block_index_entry(Hash, Header, Chainwork, Status) ->
-    %% Default to 0 transactions for headers-only entries
-    encode_block_index_entry(Hash, Header, Chainwork, Status, 0).
-
+%% NTx is 0 for header-only entries (stored before the full block arrives).
 encode_block_index_entry(Hash, Header, Chainwork, Status, NTx) ->
     HeaderBin = beamchain_serialize:encode_block_header(Header),
     CWLen = byte_size(Chainwork),
