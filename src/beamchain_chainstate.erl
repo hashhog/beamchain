@@ -37,6 +37,7 @@
 %% Flush
 -export([flush/0]).
 
+
 %% Wipe chainstate (ETS caches + RocksDB tip) for full resync
 -export([wipe_chainstate/0]).
 
@@ -496,13 +497,11 @@ init_chainstate(Role, SnapshotData) ->
 handle_call(get_mtp, _From, #state{mtp_timestamps = Ts} = State) ->
     {reply, compute_mtp(Ts), State};
 
-handle_call(is_synced, _From, #state{mtp_timestamps = []} = State) ->
-    {reply, false, State};
-handle_call(is_synced, _From, #state{mtp_timestamps = Ts} = State) ->
-    Latest = lists:last(Ts),
-    Now = erlang:system_time(second),
-    %% 24 hours in seconds (86400 = 24 * 3600), matching Bitcoin Core's DEFAULT_MAX_TIP_AGE
-    {reply, (Now - Latest) < 86400, State};
+handle_call(is_synced, _From, #state{ibd = IBD} = State) ->
+    %% Use the latched ibd flag, matching Bitcoin Core's IsInitialBlockDownload().
+    %% Once ibd flips to false via maybe_check_ibd/1 it never reverts, even
+    %% on a transient reorg that temporarily ages the tip.
+    {reply, not IBD, State};
 
 handle_call({connect_block, Block}, _From, State) ->
     case do_connect_block(Block, State) of
@@ -798,7 +797,9 @@ maybe_check_ibd(#state{mtp_timestamps = []} = State) ->
 maybe_check_ibd(#state{ibd = true, mtp_timestamps = Ts} = State) ->
     Latest = lists:last(Ts),
     Now = erlang:system_time(second),
-    case (Now - Latest) < 3600 of
+    %% Match Bitcoin Core's DEFAULT_MAX_TIP_AGE (86400s = 24h).
+    %% Once we cross this threshold, latch ibd=false permanently.
+    case (Now - Latest) < 86400 of
         true ->
             logger:info("chainstate: leaving IBD at height ~B, "
                         "shrinking cache to ~BMB (~B max entries)",
