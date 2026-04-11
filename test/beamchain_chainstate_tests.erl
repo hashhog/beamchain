@@ -31,7 +31,12 @@ chainstate_test_() ->
           {"cannot invalidate genesis block", fun test_cannot_invalidate_genesis/0},
           {"invalidating unknown block returns error", fun test_invalidate_unknown_block/0},
           {"block status is marked invalid", fun test_block_marked_invalid/0},
-          {"reconsider clears invalid flag", fun test_reconsider_clears_flag/0}
+          {"reconsider clears invalid flag", fun test_reconsider_clears_flag/0},
+          %% Regression tests: L1-5 findings 2026-04-11
+          %% Symptom A: IBD exit uses latched flag, not live tip-age re-evaluation
+          {"is_synced false on fresh chain (ibd latched)", fun test_ibd_false_initially/0},
+          {"is_synced true once ibd flag is latched false", fun test_ibd_latched_to_false/0},
+          {"ibd stays false after latch (no revert on old-timestamp tip)", fun test_ibd_no_revert/0}
          ]
      end}.
 
@@ -526,3 +531,54 @@ test_reconsider_clears_flag() ->
     %% Verify the invalid flag is cleared
     {ok, #{status := Status2}} = beamchain_db:get_block_index_by_hash(BlockHash2),
     ?assertEqual(0, Status2 band 32).
+
+%%%===================================================================
+%%% IBD latch regression tests (L1-5 Symptom A, 2026-04-11)
+%%%===================================================================
+
+%% Before the fix, is_synced() re-evaluated the tip age on every call
+%% instead of using the latched ibd flag.  A chain synced to within
+%% ~144 blocks of the network tip (well inside 24 h) would still report
+%% initialblockdownload:true because maybe_check_ibd used a 1-hour
+%% threshold (too strict) and is_synced() did not consult ibd at all.
+%%
+%% After the fix:
+%%   • is_synced() returns (not State#state.ibd)
+%%   • maybe_check_ibd latches ibd=false when tip age < 86400 s (24 h)
+
+%% Fresh chainstate (genesis only, old timestamp) must report ibd=true.
+test_ibd_false_initially() ->
+    %% Genesis block has timestamp from 2009/2011; it is far older than 24 h,
+    %% so maybe_check_ibd will NOT flip the latch.
+    ?assertEqual(false, beamchain_chainstate:is_synced()).
+
+%% When the gen_server state has ibd=false (latch fired), is_synced() must
+%% return true — even if the tip timestamp is old.
+test_ibd_latched_to_false() ->
+    %% Use sys:replace_state to flip ibd without needing a real block.
+    %% ibd is element 10 in the #state{} tuple (tag at 1, then 8 fields before ibd).
+    sys:replace_state(beamchain_chainstate,
+        fun(S) -> setelement(10, S, false) end),
+    ?assertEqual(true, beamchain_chainstate:is_synced()),
+    %% Restore so subsequent tests see the initial state
+    sys:replace_state(beamchain_chainstate,
+        fun(S) -> setelement(10, S, true) end).
+
+%% Once ibd is latched false it must not revert when is_synced() is called
+%% again — even if the tip age is old.
+%% Bitcoin Core provides the same guarantee: m_cached_is_ibd is latched once.
+test_ibd_no_revert() ->
+    %% Latch the ibd flag to false
+    sys:replace_state(beamchain_chainstate,
+        fun(S) -> setelement(10, S, false) end),
+    ?assertEqual(true, beamchain_chainstate:is_synced()),
+
+    %% Call is_synced() again — must still return true (latch is sticky).
+    %% Before the fix, is_synced() re-evaluated tip age on every call,
+    %% so a node 293 blocks (≈49 h) behind Core would still show ibd=true
+    %% even though it had previously caught up past the 24 h threshold.
+    ?assertEqual(true, beamchain_chainstate:is_synced()),
+
+    %% Restore state for cleanup
+    sys:replace_state(beamchain_chainstate,
+        fun(S) -> setelement(10, S, true) end).
