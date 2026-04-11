@@ -10,6 +10,11 @@
 -include("beamchain.hrl").
 -include("beamchain_protocol.hrl").
 
+%% Dialyzer suppressions for false positives:
+%% format_content_type/1: catch-all clause is defensive; dialyzer sees only
+%% bin|hex|json from current call sites.
+-dialyzer({nowarn_function, format_content_type/1}).
+
 %% API
 -export([start_link/0]).
 
@@ -574,14 +579,14 @@ find_transaction(Txid) ->
     %% Check mempool first
     case beamchain_mempool:get_entry(Txid) of
         {ok, Entry} ->
-            Tx = element(3, Entry),  %% tx is 3rd field in mempool_entry
+            Tx = element(4, Entry),  %% tx is 4th element in mempool_entry tuple: {tag,txid,wtxid,tx,...}
             {ok, Tx, undefined, -1, -1};
         not_found ->
             %% Check txindex
             case beamchain_config:txindex_enabled() of
                 true ->
                     case beamchain_db:get_tx_location(Txid) of
-                        {ok, BlockHash, Pos} ->
+                        {ok, #{block_hash := BlockHash, position := Pos, height := _RawHeight}} ->
                             case beamchain_db:get_block(BlockHash) of
                                 {ok, Block} ->
                                     Txs = Block#block.transactions,
@@ -810,15 +815,19 @@ format_mempool_contents(Entries) ->
     end, #{}, Entries).
 
 format_mempool_entry(Entry) ->
-    %% mempool_entry record fields
-    Fee = element(4, Entry),
-    VSize = element(6, Entry),
-    Weight = element(7, Entry),
-    TimeAdded = element(9, Entry),
-    AncestorSize = element(12, Entry),
-    AncestorFee = element(13, Entry),
-    DescendantSize = element(15, Entry),
-    DescendantFee = element(16, Entry),
+    %% mempool_entry record tuple layout (1-based including the tag atom):
+    %%   1=tag, 2=txid, 3=wtxid, 4=tx, 5=fee, 6=size, 7=vsize, 8=weight,
+    %%   9=fee_rate, 10=time_added, 11=height_added, 12=ancestor_count,
+    %%   13=ancestor_size, 14=ancestor_fee, 15=descendant_count,
+    %%   16=descendant_size, 17=descendant_fee, 18=spends_coinbase, 19=rbf_signaling
+    Fee = element(5, Entry),
+    VSize = element(7, Entry),
+    Weight = element(8, Entry),
+    TimeAdded = element(10, Entry),
+    AncestorSize = element(13, Entry),
+    AncestorFee = element(14, Entry),
+    DescendantSize = element(16, Entry),
+    DescendantFee = element(17, Entry),
     #{
         <<"vsize">> => VSize,
         <<"weight">> => Weight,
@@ -905,10 +914,7 @@ confirmations(Height) ->
 
 block_mtp(Height) when Height < 0 -> 0;
 block_mtp(_Height) ->
-    case beamchain_chainstate:get_mtp() of
-        {ok, MTP} -> MTP;
-        _ -> 0
-    end.
+    beamchain_chainstate:get_mtp().
 
 block_time(BlockHash) ->
     case beamchain_db:get_block_index_by_hash(BlockHash) of
@@ -945,10 +951,7 @@ tip_time() ->
     end.
 
 get_mtp() ->
-    case beamchain_chainstate:get_mtp() of
-        {ok, MTP} -> MTP;
-        _ -> 0
-    end.
+    beamchain_chainstate:get_mtp().
 
 get_header_count() ->
     %% In a full node, headers count equals block count
