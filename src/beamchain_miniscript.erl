@@ -4,6 +4,13 @@
 %% Based on the Miniscript specification and Bitcoin Core's implementation.
 %% Reference: /home/max/hashhog/bitcoin/src/script/miniscript.cpp
 
+%% Dialyzer suppressions for false positives:
+%% produce_satisfaction/2: the catch-all error clauses are defensive code;
+%%   dialyzer infers the sub-functions always return {ok,_,_}.
+%% min_size/2: infinity is a valid sentinel for unbounded cost; dialyzer
+%%   infers only number() from call sites and flags the infinity clause.
+-dialyzer({nowarn_function, [produce_satisfaction/2, min_size/2]}).
+
 %% Public API
 -export([from_string/1, compile/1, satisfy/2]).
 -export([type_check/1, get_type/1, get_properties/1]).

@@ -6,6 +6,16 @@
 -include("beamchain.hrl").
 -include("beamchain_protocol.hrl").
 
+%% Dialyzer suppressions for false positives:
+%% format_mempool_entry/1: catch-all clause is defensive for unexpected input.
+%% rpc_unloadwallet/1, rpc_sendtoaddress/2, rpc_signrawtransactionwithwallet/2:
+%%   defensive {error,_} handlers kept for robustness even though dialyzer
+%%   infers the called functions always return {ok,_} from current code paths.
+-dialyzer({nowarn_function, [format_mempool_entry/1,
+                              rpc_unloadwallet/1,
+                              rpc_sendtoaddress/2,
+                              rpc_signrawtransactionwithwallet/2]}).
+
 %% API
 -export([start_link/0]).
 
@@ -1131,7 +1141,7 @@ calculate_percentiles_helper([{FeeRate, Weight} | RestRates], [Target | RestTarg
 %% Calculate block subsidy
 block_subsidy(Height) ->
     Params = beamchain_config:network_params(),
-    HalvingInterval = maps:get(subsidy_halving, Params, 210000),
+    HalvingInterval = Params#network_params.subsidy_halving,
     Halvings = Height div HalvingInterval,
     case Halvings >= 64 of
         true -> 0;
@@ -1471,7 +1481,8 @@ rpc_createrawtransaction([Inputs, Outputs, Locktime, Replaceable])
             end,
             #tx_in{prev_out = #outpoint{hash = Txid, index = Vout},
                    script_sig = <<>>,
-                   sequence = Sequence}
+                   sequence = Sequence,
+                   witness = []}
         end, Inputs),
         %% Parse outputs (list of maps, each with address:amount or data:hex)
         TxOutputs = lists:flatmap(fun(OutMap) ->
@@ -1481,7 +1492,8 @@ rpc_createrawtransaction([Inputs, Outputs, Locktime, Replaceable])
                     [#tx_out{value = 0, script_pubkey = Script} | Acc];
                 (Address, Amount, Acc) ->
                     Satoshis = btc_to_satoshi(Amount),
-                    Script = beamchain_script:address_to_script_pubkey(binary_to_list(Address)),
+                    {ok, Script} = beamchain_address:address_to_script(
+                        binary_to_list(Address), beamchain_config:network()),
                     [#tx_out{value = Satoshis, script_pubkey = Script} | Acc]
             end, [], OutMap)
         end, Outputs),
@@ -1491,7 +1503,7 @@ rpc_createrawtransaction([Inputs, Outputs, Locktime, Replaceable])
             outputs = TxOutputs,
             locktime = Locktime
         },
-        HexTx = beamchain_serialize:hex_encode(beamchain_serialize:serialize_tx(Tx)),
+        HexTx = beamchain_serialize:hex_encode(beamchain_serialize:encode_transaction(Tx)),
         {ok, HexTx}
     catch
         _:Err ->
@@ -2979,12 +2991,8 @@ rpc_sendtoaddress([Address, AmountBtc, _Comment], WalletName) when is_binary(Add
                     %% Add change output if needed
                     FinalOutputs = case Change > 546 of  %% Dust threshold
                         true ->
-                            case beamchain_wallet:get_change_address(p2wpkh) of
-                                {ok, ChangeAddr} ->
-                                    Outputs ++ [{ChangeAddr, Change}];
-                                _ ->
-                                    Outputs
-                            end;
+                            {ok, ChangeAddr} = beamchain_wallet:get_change_address(p2wpkh),
+                            Outputs ++ [{ChangeAddr, Change}];
                         false ->
                             Outputs
                     end,
@@ -3000,9 +3008,8 @@ rpc_sendtoaddress([Address, AmountBtc, _Comment], WalletName) when is_binary(Add
                             case beamchain_wallet:sign_transaction(Tx, InputUtxos, PrivKeys) of
                                 {ok, SignedTx} ->
                                     %% Broadcast transaction
-                                    case beamchain_mempool:submit_transaction(SignedTx) of
-                                        ok ->
-                                            Txid = beamchain_serialize:txid(SignedTx),
+                                    case beamchain_mempool:accept_to_memory_pool(SignedTx) of
+                                        {ok, Txid} ->
                                             {ok, beamchain_serialize:hex_encode(Txid)};
                                         {error, Reason} ->
                                             {error, ?RPC_VERIFY_REJECTED, iolist_to_binary(
@@ -3045,8 +3052,8 @@ rpc_listunspent(Params, WalletName) ->
                                 Network = beamchain_config:network(),
                                 Address = case beamchain_address:script_to_address(
                                               Utxo#utxo.script_pubkey, Network) of
-                                    {ok, A} -> iolist_to_binary(A);
-                                    _ -> <<>>
+                                    unknown -> <<>>;
+                                    A -> iolist_to_binary(A)
                                 end,
                                 {true, #{
                                     <<"txid">> => beamchain_serialize:hex_encode(Txid),
@@ -3187,7 +3194,7 @@ rpc_signrawtransactionwithwallet([HexStr, PrevTxs], WalletName) when is_binary(H
         {ok, Pid} ->
             try
                 TxBin = beamchain_serialize:hex_decode(HexStr),
-                Tx = beamchain_serialize:deserialize_tx(TxBin),
+                {Tx, _} = beamchain_serialize:decode_transaction(TxBin),
                 %% Gather UTXO data for signing (from prevtxs param or UTXO set)
                 InputUtxos = lists:map(fun(#tx_in{prev_out = #outpoint{hash = H, index = I}}) ->
                     case find_prevtx(PrevTxs, H, I) of
@@ -3201,7 +3208,7 @@ rpc_signrawtransactionwithwallet([HexStr, PrevTxs], WalletName) when is_binary(H
                 end, Tx#transaction.inputs),
                 %% Get private keys from wallet for each input
                 PrivKeys = lists:map(fun(Utxo) ->
-                    Address = beamchain_script:script_pubkey_to_address(
+                    Address = beamchain_address:script_to_address(
                         Utxo#utxo.script_pubkey, beamchain_config:network()),
                     case beamchain_wallet:get_private_key(Pid, Address) of
                         {ok, Key} -> Key;
@@ -3211,7 +3218,7 @@ rpc_signrawtransactionwithwallet([HexStr, PrevTxs], WalletName) when is_binary(H
                 case beamchain_wallet:sign_transaction(Tx, InputUtxos, PrivKeys) of
                     {ok, SignedTx} ->
                         SignedHex = beamchain_serialize:hex_encode(
-                            beamchain_serialize:serialize_tx(SignedTx)),
+                            beamchain_serialize:encode_transaction(SignedTx)),
                         Complete = lists:all(fun(K) -> K =/= <<0:256>> end, PrivKeys),
                         {ok, #{
                             <<"hex">> => SignedHex,

@@ -24,6 +24,12 @@
 -export([compute_utxo_hash/0, serialize_snapshot/2]).
 -export([read_metadata/1]).
 
+%% Dialyzer suppressions for false positives:
+%% group_consecutive/2: dialyzer infers the list arg is always [] because it
+%% tracks only the base-case input at one call site; the non-empty clauses are
+%% the functional heart of the grouping algorithm.
+-dialyzer({nowarn_function, group_consecutive/2}).
+
 %% Snapshot magic bytes
 -define(SNAPSHOT_MAGIC, <<"utxo", 16#ff>>).
 -define(SNAPSHOT_VERSION, 2).

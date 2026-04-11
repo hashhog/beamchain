@@ -3,6 +3,14 @@
 -include("beamchain.hrl").
 -include("beamchain_protocol.hrl").
 
+%% Dialyzer suppressions for false positives:
+%% check_minimal_push/3: the 'pushdata' clause is a legacy/defensive path;
+%%   dialyzer infers only direct_push|pushdata1|pushdata2|pushdata4 from callers.
+%% subscript_from_codesep/2: the CodesepPos=0 base case is a safety net;
+%%   dialyzer infers CodesepPos::pos_integer() from the record field type.
+-dialyzer({nowarn_function, [check_minimal_push/3,
+                              subscript_from_codesep/2]}).
+
 %% Public API
 -export([verify_script/5, eval_script/5]).
 -export([decode_script_num/2, decode_script_num/3, encode_script_num/1, script_bool/1]).

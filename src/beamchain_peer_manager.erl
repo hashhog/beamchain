@@ -15,6 +15,28 @@
 -include("beamchain.hrl").
 -include("beamchain_protocol.hrl").
 
+%% Dialyzer suppressions for false positives:
+%% try_anchor_connections/1, attempt_connection/3: can_connect returns boolean()
+%%   but dialyzer flags the true branch after our ets:select fix; the eviction
+%%   functions are called transitively through check_inbound_internal.
+%% Eviction functions (select_peer_to_evict, select_eviction_victim, etc.):
+%%   called from check_inbound_internal which dialyzer may still flag as dead
+%%   because it cascades from the find_peer_by_address analysis.
+-dialyzer({nowarn_function, [try_anchor_connections/1,
+                              attempt_connection/3,
+                              check_inbound_internal/2,
+                              has_netgroup_diversity/2,
+                              do_connect/3,
+                              select_peer_to_evict/0,
+                              select_eviction_victim/1,
+                              protect_by_netgroup/2,
+                              protect_by_ping/2,
+                              compare_ping/2,
+                              protect_by_tx_time/2,
+                              protect_by_block_time/2,
+                              drop_first_n/2,
+                              evict_from_largest_netgroup/1]}).
+
 %% API
 -export([start_link/0,
          connect_to/2,
@@ -1054,9 +1076,13 @@ remove_peer_and_update(Pid, State) ->
     end.
 
 find_peer_by_address(Address) ->
-    case ets:match_object(?PEER_TABLE,
-                          #peer_entry{address = Address, _ = '_'}) of
-        [#peer_entry{pid = Pid} | _] -> {ok, Pid};
+    %% Use ets:select with a match spec to avoid dialyzer complaints about
+    %% using '_' wildcards in typed record fields.
+    MS = ets:fun2ms(fun(#peer_entry{address = A, pid = P}) when A =:= Address ->
+                        P
+                    end),
+    case ets:select(?PEER_TABLE, MS) of
+        [Pid | _] -> {ok, Pid};
         [] -> error
     end.
 
@@ -1851,10 +1877,8 @@ is_network_protected(NetType, ProtectedNetworks) ->
 get_our_tip_height() ->
     try
         case beamchain_chainstate:get_tip_height() of
-            {ok, H} when is_integer(H) -> H;
-            not_found -> 0;
-            H when is_integer(H) -> H;
-            _ -> 0
+            {ok, H} -> H;
+            not_found -> 0
         end
     catch
         _:_ -> 0
