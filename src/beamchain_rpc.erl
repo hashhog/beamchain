@@ -678,13 +678,53 @@ rpc_getblockheader([HashHex]) ->
 rpc_getblockheader([HashHex, Verbose]) when is_binary(HashHex) ->
     Hash = hex_to_internal_hash(HashHex),
     case beamchain_db:get_block_index_by_hash(Hash) of
-        {ok, #{height := Height, header := Header, chainwork := Chainwork}} ->
+        {ok, #{height := Height, header := Header, chainwork := Chainwork, n_tx := NTx}} ->
             case Verbose of
                 false ->
                     Hex = beamchain_serialize:hex_encode(
                         beamchain_serialize:encode_block_header(Header)),
                     {ok, Hex};
                 _ ->
+                    %% Get next block hash if it exists
+                    NextHash = case beamchain_db:get_block_index(Height + 1) of
+                        {ok, #{hash := NH}} -> hash_to_hex(NH);
+                        not_found -> null
+                    end,
+                    Bits = Header#block_header.bits,
+                    {ok, #{
+                        <<"hash">> => hash_to_hex(Hash),
+                        <<"confirmations">> => confirmations(Height),
+                        <<"height">> => Height,
+                        <<"version">> => Header#block_header.version,
+                        <<"versionHex">> => beamchain_serialize:hex_encode(
+                            <<(Header#block_header.version):32/big>>),
+                        <<"merkleroot">> => hash_to_hex(
+                            Header#block_header.merkle_root),
+                        <<"time">> => Header#block_header.timestamp,
+                        <<"mediantime">> => block_mtp(Height),
+                        <<"nonce">> => Header#block_header.nonce,
+                        <<"bits">> => beamchain_serialize:hex_encode(
+                            <<Bits:32/big>>),
+                        <<"difficulty">> => bits_to_difficulty(Bits),
+                        <<"chainwork">> => beamchain_serialize:hex_encode(
+                            Chainwork),
+                        <<"nTx">> => NTx,
+                        <<"previousblockhash">> => hash_to_hex(
+                            Header#block_header.prev_hash),
+                        <<"nextblockhash">> => NextHash
+                    }}
+            end;
+        {ok, IndexInfo} ->
+            %% Fallback for old format without n_tx in index, count from block
+            case Verbose of
+                false ->
+                    Hex = beamchain_serialize:hex_encode(
+                        beamchain_serialize:encode_block_header(maps:get(header, IndexInfo))),
+                    {ok, Hex};
+                _ ->
+                    Header = maps:get(header, IndexInfo),
+                    Chainwork = maps:get(chainwork, IndexInfo),
+                    Height = maps:get(height, IndexInfo),
                     %% Get next block hash if it exists
                     NextHash = case beamchain_db:get_block_index(Height + 1) of
                         {ok, #{hash := NH}} -> hash_to_hex(NH);
