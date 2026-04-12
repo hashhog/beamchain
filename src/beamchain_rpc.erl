@@ -389,6 +389,7 @@ handle_method(<<"getchaintxstats">>, P, _W) -> rpc_getchaintxstats(P);
 handle_method(<<"verifychain">>, _, _W) -> rpc_verifychain();
 handle_method(<<"invalidateblock">>, P, _W) -> rpc_invalidateblock(P);
 handle_method(<<"reconsiderblock">>, P, _W) -> rpc_reconsiderblock(P);
+handle_method(<<"flushchainstate">>, _, _W) -> rpc_flushchainstate();
 
 %% -- Transactions --
 handle_method(<<"getrawtransaction">>, P, _W) -> rpc_getrawtransaction(P);
@@ -496,6 +497,7 @@ rpc_help_list() ->
         <<"invalidateblock \"blockhash\"">>,
         <<"reconsiderblock \"blockhash\"">>,
         <<"verifychain ( checklevel nblocks )">>,
+        <<"flushchainstate">>,
         <<"">>,
         <<"== Control ==">>,
         <<"help ( \"command\" )">>,
@@ -936,6 +938,27 @@ rpc_verifychain() ->
     case beamchain_chainstate:get_tip() of
         {ok, _} -> {ok, true};
         not_found -> {ok, true}
+    end.
+
+%% @doc flushchainstate — synchronously flush the in-memory UTXO cache
+%% to RocksDB and return the tip height and hash that are now durably
+%% persisted.  Useful as a pre-shutdown checkpoint or before taking a
+%% snapshot of the data directory.
+rpc_flushchainstate() ->
+    ok = beamchain_chainstate:flush(),
+    case beamchain_chainstate:get_tip() of
+        {ok, {TipHash, TipHeight}} ->
+            {ok, #{
+                <<"flushed">> => true,
+                <<"height">> => TipHeight,
+                <<"hash">>   => hash_to_hex(TipHash)
+            }};
+        not_found ->
+            {ok, #{
+                <<"flushed">> => true,
+                <<"height">> => 0,
+                <<"hash">>   => <<"0000000000000000000000000000000000000000000000000000000000000000">>
+            }}
     end.
 
 %% @doc invalidateblock - mark a block and all its descendants as invalid
