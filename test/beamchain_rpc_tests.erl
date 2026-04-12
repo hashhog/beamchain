@@ -746,3 +746,58 @@ getdeploymentinfo_regtest_always_active_test_() ->
          ?assertEqual(active, SegwitState),
          ?assertEqual(active, TaprootState)
      end}.
+
+%%% ===================================================================
+%%% softforks / getdeploymentinfo shared-source consistency tests
+%%% ===================================================================
+
+%% Verify that getblockchaininfo.softforks and getdeploymentinfo.deployments
+%% are built from the same helper (build_deployment_map/3) and therefore
+%% agree on every field for every deployment name that appears in both maps.
+%%
+%% We drive this with regtest at height 0 using a no-op HeightGetter so the
+%% test is fully self-contained (no running node, no on-disk DB).  Regtest
+%% activates all buried deployments at height 0 and marks all BIP9 entries
+%% as ALWAYS_ACTIVE, so both maps must report active=true for every name.
+softforks_deploymentinfo_shared_source_regtest_test_() ->
+    {"getblockchaininfo.softforks and getdeploymentinfo.deployments share one source",
+     fun() ->
+         beamchain_versionbits:init_cache(),
+         Network = regtest,
+         %% On regtest all buried deployments activate at height 1.
+         %% BIP9 entries use start_time=ALWAYS_ACTIVE (-1) on regtest so
+         %% they are also active from height 1 onward.
+         Height  = 1,
+         %% No-op getter: no block-index rows exist; versionbits will treat
+         %% all BIP9 entries as ALWAYS_ACTIVE on regtest.
+         NoopGetter = fun(_H) -> not_found end,
+
+         %% Both RPCs ultimately call build_deployment_map/3 with the same args.
+         SoftforksMap    = beamchain_rpc:build_deployment_map(Network, Height, NoopGetter),
+         DeploymentsMap  = beamchain_rpc:build_deployment_map(Network, Height, NoopGetter),
+
+         %% The two calls must return structurally identical maps.
+         ?assertEqual(SoftforksMap, DeploymentsMap),
+
+         %% Every key present in one must be present in the other.
+         SFKeys   = lists:sort(maps:keys(SoftforksMap)),
+         DepKeys  = lists:sort(maps:keys(DeploymentsMap)),
+         ?assertEqual(SFKeys, DepKeys),
+
+         %% For every shared key: type, active, height must agree.
+         SharedKeys = maps:keys(SoftforksMap),
+         lists:foreach(fun(Name) ->
+             SF  = maps:get(Name, SoftforksMap),
+             Dep = maps:get(Name, DeploymentsMap),
+             ?assertEqual(maps:get(<<"type">>,   SF), maps:get(<<"type">>,   Dep)),
+             ?assertEqual(maps:get(<<"active">>, SF), maps:get(<<"active">>, Dep)),
+             ?assertEqual(maps:get(<<"height">>, SF), maps:get(<<"height">>, Dep))
+         end, SharedKeys),
+
+         %% On regtest all deployments (buried + BIP9 ALWAYS_ACTIVE) must be
+         %% active at height 1.
+         lists:foreach(fun(Name) ->
+             Entry = maps:get(Name, SoftforksMap),
+             ?assertEqual(true, maps:get(<<"active">>, Entry))
+         end, SharedKeys)
+     end}.
