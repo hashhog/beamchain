@@ -336,10 +336,26 @@ dispatch(Request, WalletName) ->
                 end
         end
     catch
-        _:Err ->
-            logger:warning("rpc dispatch error: ~p", [Err]),
-            error_obj(Id, ?RPC_INTERNAL_ERROR, <<"Internal error">>)
+        Class:Err:Stack ->
+            logger:warning("rpc dispatch error: ~p:~p~n~p", [Class, Err, Stack]),
+            error_obj(Id, ?RPC_INTERNAL_ERROR, format_internal_error(Class, Err))
     end.
+
+%% Format a caught exception for the -32603 response body.
+%% Includes class and a short reason description (truncated to 200 chars).
+%% Does NOT leak stack traces or absolute file paths — those go to the log only.
+format_internal_error(Class, Err) ->
+    ClassBin = atom_to_binary(Class, utf8),
+    ReasonBin = truncate_binary(
+                  iolist_to_binary(io_lib:format("~0p", [Err])),
+                  200),
+    <<"Internal error: ", ClassBin/binary, ": ", ReasonBin/binary>>.
+
+truncate_binary(Bin, Max) when byte_size(Bin) =< Max ->
+    Bin;
+truncate_binary(Bin, Max) ->
+    Head = binary:part(Bin, 0, Max),
+    <<Head/binary, "...">>.
 
 result_obj(Id, Result) ->
     #{<<"result">> => Result, <<"error">> => null, <<"id">> => Id}.
