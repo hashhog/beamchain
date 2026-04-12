@@ -36,6 +36,7 @@ start_snapshot_chainstate(SnapshotData) ->
         id => beamchain_chainstate_snapshot,
         start => {beamchain_chainstate, start_link, [snapshot, SnapshotData]},
         restart => transient,
+        shutdown => 30000,
         type => worker,
         modules => [beamchain_chainstate]
     },
@@ -49,6 +50,7 @@ start_background_chainstate() ->
         id => beamchain_chainstate_background,
         start => {beamchain_chainstate, start_link, [background]},
         restart => transient,
+        shutdown => 30000,
         type => worker,
         modules => [beamchain_chainstate]
     },
@@ -119,11 +121,16 @@ init([]) ->
         period => 10
     },
 
-    %% Start the main chainstate by default
+    %% Start the main chainstate by default.
+    %% shutdown=30000: give terminate/2 enough time to flush the UTXO
+    %% cache and any in-progress block to disk on SIGTERM.  The default
+    %% 5000 ms is not enough for large caches and caused a regression
+    %% where the last ~42 blocks had to be replayed on restart.
     MainChainstate = #{
         id => beamchain_chainstate,
         start => {beamchain_chainstate, start_link, []},
         restart => permanent,
+        shutdown => 30000,
         type => worker,
         modules => [beamchain_chainstate]
     },
