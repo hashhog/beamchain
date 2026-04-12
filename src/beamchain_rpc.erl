@@ -19,6 +19,9 @@
 %% API
 -export([start_link/0]).
 
+%% Exported for testing — shared deployment-state helper.
+-export([build_deployment_map/3]).
+
 %% Cowboy handler
 -export([init/2]).
 
@@ -599,7 +602,9 @@ rpc_getblockchaininfo() ->
                     {<<0:256>>, 0}
             end,
             Difficulty = tip_difficulty(),
-            Softforks = get_softfork_status(Network, TipHeight),
+            %% Use the shared deployment helper — same source of truth as getdeploymentinfo.
+            HeightGetter = fun(H) -> beamchain_db:get_block_index(H) end,
+            Softforks = build_deployment_map(Network, TipHeight, HeightGetter),
             {ok, #{
                 <<"chain">> => network_name(Network),
                 <<"blocks">> => TipHeight,
@@ -685,10 +690,27 @@ rpc_getdeploymentinfo_at_tip() ->
 
 rpc_getdeploymentinfo_at(BlockHash, Height) ->
     Network = beamchain_config:network(),
-    Params = beamchain_chain_params:params(Network),
-
-    %% HeightGetter used by the versionbits state machine
     HeightGetter = fun(H) -> beamchain_db:get_block_index(H) end,
+    Deployments = build_deployment_map(Network, Height, HeightGetter),
+    {ok, #{
+        <<"hash">>        => hash_to_hex(BlockHash),
+        <<"height">>      => Height,
+        <<"deployments">> => Deployments
+    }}.
+
+%% build_deployment_map/3 — shared source of truth for ALL softfork/deployment state.
+%%
+%% Both getblockchaininfo (softforks field) and getdeploymentinfo (deployments field)
+%% derive their data from this single function.  Neither RPC reads from a stale cache
+%% or a hard-coded table; both call into beamchain_chain_params + beamchain_versionbits
+%% the same way.
+%%
+%% Returns a map of deployment-name (binary) => deployment-info map.
+%% Buried entries take precedence over BIP9 entries of the same name: once a
+%% deployment is height-activated it is always-active and the activation height
+%% is the authoritative record.
+build_deployment_map(Network, Height, HeightGetter) ->
+    Params = beamchain_chain_params:params(Network),
 
     %% ---- Buried deployments ----
     BuriedDefs = [
@@ -747,13 +769,7 @@ rpc_getdeploymentinfo_at(BlockHash, Height) ->
     %% buried on this network (they are always-active and the buried record is
     %% the authoritative activation height).  BIP9 entries not also buried are
     %% kept as-is.
-    Deployments = maps:merge(Bip9Map, BuriedMap),
-
-    {ok, #{
-        <<"hash">>        => hash_to_hex(BlockHash),
-        <<"height">>      => Height,
-        <<"deployments">> => Deployments
-    }}.
+    maps:merge(Bip9Map, BuriedMap).
 
 rpc_getblockhash([Height]) when is_integer(Height), Height >= 0 ->
     case beamchain_db:get_block_index(Height) of
@@ -2472,28 +2488,6 @@ rpc_decodescript(_) ->
 %%% ===================================================================
 %%% Internal helpers
 %%% ===================================================================
-
-%% Get soft fork deployment status for getblockchaininfo.
-%% Returns a map of softfork name => status info.
-get_softfork_status(Network, TipHeight) ->
-    Params = beamchain_chain_params:params(Network),
-    %% Buried deployments (height-based activation)
-    Buried = [
-        {<<"bip34">>, maps:get(bip34_height, Params, 0)},
-        {<<"bip66">>, maps:get(bip66_height, Params, 0)},
-        {<<"bip65">>, maps:get(bip65_height, Params, 0)},
-        {<<"csv">>, maps:get(csv_height, Params, 0)},
-        {<<"segwit">>, maps:get(segwit_height, Params, 0)},
-        {<<"taproot">>, maps:get(taproot_height, Params, 0)}
-    ],
-    lists:foldl(fun({Name, ActivationHeight}, Acc) ->
-        IsActive = TipHeight >= ActivationHeight,
-        maps:put(Name, #{
-            <<"type">> => <<"buried">>,
-            <<"active">> => IsActive,
-            <<"height">> => ActivationHeight
-        }, Acc)
-    end, #{}, Buried).
 
 rpc_port(Params) ->
     case beamchain_config:get(rpcport) of
