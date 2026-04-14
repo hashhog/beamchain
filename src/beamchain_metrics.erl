@@ -48,16 +48,19 @@ init([]) ->
                     {"/metrics", ?MODULE, []}
                 ]}
             ]),
-            case cowboy:start_clear(beamchain_metrics_listener,
-                    [{port, Port}],
-                    #{env => #{dispatch => Dispatch}}) of
+            TransportOpts = #{socket_opts => [{port, Port},
+                                              {reuseaddr, true}]},
+            ProtoOpts = #{env => #{dispatch => Dispatch}},
+            case beamchain_listener:start_clear_with_retry(
+                    beamchain_metrics_listener, TransportOpts, ProtoOpts,
+                    "metrics") of
                 {ok, _} ->
-                    logger:info("metrics: Prometheus endpoint on port ~B", [Port]);
-                {error, {already_started, _}} ->
-                    logger:info("metrics: already listening on port ~B", [Port]);
+                    logger:info("metrics: Prometheus endpoint on port ~B",
+                                [Port]);
                 {error, Reason} ->
-                    logger:warning("metrics: failed to start on port ~B: ~p",
-                                   [Port, Reason])
+                    logger:error("metrics: failed to bind port ~B after "
+                                 "retries: ~p", [Port, Reason]),
+                    exit({listener_bind_failed, metrics, Port, Reason})
             end,
             {ok, #state{port = Port}}
     end.

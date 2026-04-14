@@ -100,16 +100,19 @@ init([]) ->
             {"/wallet/:wallet_name", ?MODULE, []}
         ]}
     ]),
-    case cowboy:start_clear(beamchain_rpc_listener,
-            [{port, Port}],
-            #{env => #{dispatch => Dispatch}}) of
+    TransportOpts = #{socket_opts => [{port, Port}, {reuseaddr, true}]},
+    ProtoOpts = #{env => #{dispatch => Dispatch}},
+    case beamchain_listener:start_clear_with_retry(
+            beamchain_rpc_listener, TransportOpts, ProtoOpts, "rpc") of
         {ok, _} ->
             logger:info("rpc: listening on port ~B", [Port]);
-        {error, {already_started, _}} ->
-            logger:info("rpc: already listening on port ~B", [Port]);
         {error, Reason} ->
-            logger:warning("rpc: failed to start on port ~B: ~p",
-                           [Port, Reason])
+            logger:error("rpc: failed to bind port ~B after retries: ~p",
+                         [Port, Reason]),
+            %% Crash the gen_server so the supervisor restarts it; the
+            %% rest_for_one strategy will re-attempt the RPC/REST/metrics
+            %% tail. Supervisor intensity gives us bounded further tries.
+            exit({listener_bind_failed, rpc, Port, Reason})
     end,
 
     erlang:send_after(60000, self(), cleanup_rate_limits),
