@@ -801,3 +801,90 @@ softforks_deploymentinfo_shared_source_regtest_test_() ->
              ?assertEqual(true, maps:get(<<"active">>, Entry))
          end, SharedKeys)
      end}.
+
+%%% ===================================================================
+%%% Regression tests for beamchain_listener retry + SO_REUSEADDR
+%%% ===================================================================
+
+%% Pick a free TCP port by asking the kernel to assign port 0.
+listener_free_port() ->
+    {ok, S} = gen_tcp:listen(0, [{reuseaddr, true}]),
+    {ok, Port} = inet:port(S),
+    ok = gen_tcp:close(S),
+    Port.
+
+%% Make sure cowboy + ranch + their deps are up before we drive the API.
+listener_deps_started() ->
+    {ok, _} = application:ensure_all_started(cowboy),
+    ok.
+
+rpc_listener_reuseaddr_test_() ->
+    {"RPC listener binds cleanly when port was just released (TIME_WAIT path)",
+     {timeout, 30,
+      fun() ->
+          ok = listener_deps_started(),
+          Port = listener_free_port(),
+          Ref = beamchain_listener_retry_test_1,
+          %% Briefly bind and release the port without reuseaddr so that
+          %% Linux is likely to leave it in TIME_WAIT. The new bind must
+          %% succeed because beamchain_listener passes reuseaddr=true.
+          {ok, L} = gen_tcp:listen(Port, [{reuseaddr, false}]),
+          ok = gen_tcp:close(L),
+          Result = beamchain_listener:start_clear_with_retry(
+              Ref,
+              #{socket_opts => [{port, Port}, {reuseaddr, true}]},
+              #{env => #{dispatch => cowboy_router:compile([{'_', []}])}},
+              "test-rpc"),
+          ?assertMatch({ok, _}, Result),
+          ok = cowboy:stop_listener(Ref)
+      end}}.
+
+rpc_listener_retry_then_bind_test_() ->
+    {"RPC listener retries while another owner holds the port, then binds "
+     "once the holder releases it",
+     {timeout, 30,
+      fun() ->
+          ok = listener_deps_started(),
+          Port = listener_free_port(),
+          Ref = beamchain_listener_retry_test_2,
+          %% Holder keeps the port WITHOUT reuseaddr so reuseaddr on our
+          %% side can't short-circuit the bind; the retry must do the work.
+          {ok, Holder} = gen_tcp:listen(Port, [{reuseaddr, false}]),
+          Parent = self(),
+          %% Release the port ~1.2s in — after the first ~1s attempt fails
+          %% but well before the 63s total budget.
+          spawn_link(fun() ->
+              timer:sleep(1200),
+              ok = gen_tcp:close(Holder),
+              Parent ! released
+          end),
+          Result = beamchain_listener:start_clear_with_retry(
+              Ref,
+              #{socket_opts => [{port, Port}, {reuseaddr, true}]},
+              #{env => #{dispatch => cowboy_router:compile([{'_', []}])}},
+              "test-rpc-retry"),
+          ?assertMatch({ok, _}, Result),
+          receive released -> ok after 5000 -> error(holder_did_not_release) end,
+          ok = cowboy:stop_listener(Ref)
+      end}}.
+
+rpc_listener_gives_up_on_hard_conflict_test_() ->
+    {"RPC listener returns an error when the port stays held for the whole "
+     "retry budget",
+     {timeout, 120,
+      fun() ->
+          ok = listener_deps_started(),
+          Port = listener_free_port(),
+          Ref = beamchain_listener_retry_test_3,
+          {ok, Holder} = gen_tcp:listen(Port, [{reuseaddr, false}]),
+          try
+              Result = beamchain_listener:start_clear_with_retry(
+                  Ref,
+                  #{socket_opts => [{port, Port}, {reuseaddr, false}]},
+                  #{env => #{dispatch => cowboy_router:compile([{'_', []}])}},
+                  "test-rpc-conflict"),
+              ?assertMatch({error, _}, Result)
+          after
+              gen_tcp:close(Holder)
+          end
+      end}}.

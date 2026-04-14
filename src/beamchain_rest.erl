@@ -65,16 +65,16 @@ init([]) ->
             {"/rest/[...]", ?MODULE, []}
         ]}
     ]),
-    case cowboy:start_clear(beamchain_rest_listener,
-            [{port, Port}],
-            #{env => #{dispatch => Dispatch}}) of
+    TransportOpts = #{socket_opts => [{port, Port}, {reuseaddr, true}]},
+    ProtoOpts = #{env => #{dispatch => Dispatch}},
+    case beamchain_listener:start_clear_with_retry(
+            beamchain_rest_listener, TransportOpts, ProtoOpts, "rest") of
         {ok, _} ->
             logger:info("rest: listening on port ~B", [Port]);
-        {error, {already_started, _}} ->
-            logger:info("rest: already listening on port ~B", [Port]);
         {error, Reason} ->
-            logger:warning("rest: failed to start on port ~B: ~p",
-                           [Port, Reason])
+            logger:error("rest: failed to bind port ~B after retries: ~p",
+                         [Port, Reason]),
+            exit({listener_bind_failed, rest, Port, Reason})
     end,
     {ok, #state{port = Port}}.
 
