@@ -535,6 +535,105 @@ addr_entry_roundtrip_test() ->
     {Decoded, <<>>} = beamchain_p2p_msg:decode_addr_entry(Bin),
     ?assertEqual(Entry, Decoded).
 
+%% Regression: IPv6 8-tuples from the 2026-04-13 20:27-20:53 crash log must
+%% round-trip through the exported encoder path without the function_clause
+%% that took down the peer supervisor before 2e83163 shipped.
+net_addr_ipv6_tuple_live_crash_test() ->
+    LiveCrashTuples = [
+        {9733,22986,11359,61704,12467,1306,21186,2662},
+        {8193,2161,607,22362,11913,51145,45865,11027},
+        {9728,16448,21459,50688,58534,25844,56963,12118}
+    ],
+    lists:foreach(fun(IP) ->
+        %% encode_net_addr exercises encode_ip via the handshake path.
+        NetAddr = #{services => 0, ip => IP, port => 8333},
+        NetBin = beamchain_p2p_msg:encode_net_addr(NetAddr),
+        ?assertEqual(26, byte_size(NetBin)),
+        {Decoded, <<>>} = beamchain_p2p_msg:decode_net_addr(NetBin),
+        ?assertEqual(IP, maps:get(ip, Decoded)),
+        %% Full addr entry must also encode without crashing (this is the
+        %% line-483 call site from the crash log).
+        Entry = #{timestamp => 1776055000, services => ?NODE_NETWORK,
+                  ip => IP, port => 8333},
+        AddrBin = beamchain_p2p_msg:encode_addr_entry(Entry),
+        ?assertEqual(30, byte_size(AddrBin))
+    end, LiveCrashTuples).
+
+%% Regression: BIP155 network entries (torv3/i2p/cjdns) used to crash
+%% encode_addr_entry/1 at line 483 with a function_clause because that
+%% legacy encoder only understood ip-tuples. They now return <<>> so the
+%% legacy-addr caller can filter them out; relay of non-IP networks must
+%% go through the addrv2 payload (encode_addrv2_entry) instead.
+encode_addr_entry_torv3_drops_test() ->
+    Entry = #{port => 8333, timestamp => 1776055509,
+              address => crypto:strong_rand_bytes(32),
+              services => 3145, network => torv3, network_id => 4},
+    ?assertEqual(<<>>, beamchain_p2p_msg:encode_addr_entry(Entry)).
+
+encode_addr_entry_i2p_drops_test() ->
+    Entry = #{port => 0, timestamp => 1776055509,
+              address => crypto:strong_rand_bytes(32),
+              services => 0, network => i2p, network_id => 5},
+    ?assertEqual(<<>>, beamchain_p2p_msg:encode_addr_entry(Entry)).
+
+encode_addr_entry_cjdns_drops_test() ->
+    %% cjdns addresses are 16 bytes starting with 0xFC.
+    Entry = #{port => 8333, timestamp => 1776055509,
+              address => <<16#FC, (crypto:strong_rand_bytes(15))/binary>>,
+              services => 1, network => cjdns, network_id => 6},
+    ?assertEqual(<<>>, beamchain_p2p_msg:encode_addr_entry(Entry)).
+
+encode_addr_entry_unknown_network_test() ->
+    %% Any unknown network atom must not crash.
+    Entry = #{port => 8333, timestamp => 1776055509,
+              address => <<0:64>>,
+              services => 0, network => yggdrasil, network_id => 7},
+    ?assertEqual(<<>>, beamchain_p2p_msg:encode_addr_entry(Entry)).
+
+%% BIP155-decoder-shape entries for IPv4/IPv6 (address + network) must
+%% round-trip through the legacy encoder. This lets the peer-manager relay
+%% IPv4/IPv6 entries it received via addrv2 back out on the legacy channel
+%% without having to translate shapes.
+encode_addr_entry_ipv4_bip155_shape_test() ->
+    Entry = #{port => 8333, timestamp => 1776055509,
+              address => <<192, 168, 1, 1>>,
+              services => 1, network => ipv4, network_id => 1},
+    Bin = beamchain_p2p_msg:encode_addr_entry(Entry),
+    ?assertEqual(30, byte_size(Bin)),
+    {Decoded, <<>>} = beamchain_p2p_msg:decode_addr_entry(Bin),
+    ?assertEqual({192, 168, 1, 1}, maps:get(ip, Decoded)),
+    ?assertEqual(8333, maps:get(port, Decoded)).
+
+encode_addr_entry_ipv6_bip155_shape_test() ->
+    %% 2001:4c3c:8102:2d00::2 in raw 16-byte wire form.
+    Raw = <<8193:16, 19516:16, 33026:16, 11520:16, 0:16, 0:16, 0:16, 2:16>>,
+    Entry = #{port => 8333, timestamp => 1776055509, address => Raw,
+              services => 1, network => ipv6, network_id => 2},
+    Bin = beamchain_p2p_msg:encode_addr_entry(Entry),
+    ?assertEqual(30, byte_size(Bin)),
+    {Decoded, <<>>} = beamchain_p2p_msg:decode_addr_entry(Bin),
+    ?assertEqual({8193, 19516, 33026, 11520, 0, 0, 0, 2},
+                 maps:get(ip, Decoded)).
+
+%% encode_payload(addr, ...) must drop unsupported entries and re-count so
+%% the varint matches the actual number of encoded entries on the wire.
+encode_payload_addr_skips_bad_entries_test() ->
+    Good1 = #{timestamp => 1776055509, services => 1,
+              ip => {10, 0, 0, 1}, port => 8333},
+    Bad = #{timestamp => 1776055509, services => 3145, network => torv3,
+            network_id => 4, address => crypto:strong_rand_bytes(32),
+            port => 8333},
+    Good2 = #{timestamp => 1776055509, services => 1,
+              ip => {8193, 19516, 33026, 11520, 0, 0, 0, 2}, port => 8333},
+    Bin = beamchain_p2p_msg:encode_payload(addr, #{addrs => [Good1, Bad, Good2]}),
+    %% Count varint for 2 + 2 * 30-byte entries = 61 bytes total.
+    ?assertEqual(61, byte_size(Bin)),
+    {ok, #{addrs := Decoded}} = beamchain_p2p_msg:decode_payload(addr, Bin),
+    ?assertEqual(2, length(Decoded)),
+    ?assertEqual({10, 0, 0, 1}, maps:get(ip, lists:nth(1, Decoded))),
+    ?assertEqual({8193, 19516, 33026, 11520, 0, 0, 0, 2},
+                 maps:get(ip, lists:nth(2, Decoded))).
+
 %%% ===================================================================
 %%% Full integration: encode payload -> frame -> decode frame -> decode payload
 %%% ===================================================================
