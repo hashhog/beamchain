@@ -193,7 +193,11 @@ init({outbound, {Host, Port} = Addr, Handler, _Opts}) when is_list(Host); is_bin
             },
             {ok, connecting, Data2};
         {error, Reason} ->
-            {stop, {connection_failed, Reason}}
+            %% Wrap in {shutdown, _} so SASL does not log a crash report
+            %% for an expected outcome (dead peer, timeout, refused). The
+            %% peer manager receives {error, Reason} from gen_statem:start
+            %% and calls beamchain_addrman:mark_failed/1 either way.
+            {stop, {shutdown, {connection_failed, Reason}}}
     end;
 init({outbound, {IP, Port} = Addr, Handler, _Opts}) ->
     %% Standard IP address connection (tuple IP)
@@ -221,7 +225,9 @@ init({outbound, {IP, Port} = Addr, Handler, _Opts}) ->
             },
             {ok, connecting, Data2};
         {error, Reason} ->
-            {stop, {connection_failed, Reason}}
+            %% See comment above: shutdown tuple keeps SASL quiet on expected
+            %% connect failures (timeout / econnrefused / enetunreach, etc.).
+            {stop, {shutdown, {connection_failed, Reason}}}
     end;
 
 init({inbound, Socket, Addr, Handler}) ->
