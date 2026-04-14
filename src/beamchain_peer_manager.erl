@@ -118,6 +118,13 @@
 -define(STALE_TIP_AGE_THRESHOLD, 1800).      %% 30 minutes: 3 * nPowTargetSpacing
 -define(PERIODIC_HEADER_INTERVAL, 300000).   %% 5 minutes: periodic getheaders
 
+%% Cold-start DNS warm-up: hold the connect_tick loop for up to this long on
+%% startup so that DNS seed resolution has a chance to populate addrman /
+%% discovered before we start burning through stale peers.dets entries at the
+%% 500ms fast-connect cadence. First completed DNS resolution (or this
+%% deadline, whichever fires first) releases the connect_tick loop.
+-define(DNS_WARMUP_TIMEOUT, 30000).          %% 30 seconds
+
 -record(peer_entry, {
     pid         :: pid(),
     address     :: {inet:ip_address(), inet:port_number()},
@@ -175,7 +182,12 @@
     %% Timer for periodic stale tip check
     stale_tip_timer :: reference() | undefined,
     %% Timer for periodic getheaders to random peer
-    periodic_header_timer :: reference() | undefined
+    periodic_header_timer :: reference() | undefined,
+    %% Cold-start DNS warm-up: true once the first DNS resolution has
+    %% completed, or the warm-up deadline has elapsed. While false,
+    %% connect_tick is not scheduled — anchors and inbound accepts still
+    %% operate normally.
+    dns_warmup_done = false :: boolean()
 }).
 
 %%% ===================================================================
@@ -392,10 +404,15 @@ init([]) ->
     Anchors = load_anchors(DataDir),
     %% Start listening for inbound connections
     {ListenSock, Acceptor} = start_listener(),
-    %% Kick off DNS seed resolution
+    %% Kick off DNS seed resolution and anchor connects
     self() ! bootstrap,
-    %% Start connection maintenance loop
-    Timer = erlang:send_after(?CONNECT_INTERVAL, self(), connect_tick),
+    %% Connection maintenance loop is NOT scheduled yet — the first
+    %% connect_tick is fired from the {dns_seeds_resolved,_} handler (or
+    %% from dns_warmup_deadline if DNS never returns). This prevents the
+    %% 500ms fast-connect cadence from chewing through stale peers.dets
+    %% entries while DNS is still in flight on cold start.
+    Timer = undefined,
+    erlang:send_after(?DNS_WARMUP_TIMEOUT, self(), dns_warmup_deadline),
     %% Load persisted bans from disk
     load_bans(DataDir),
     %% Schedule periodic cleanup of expired bans
@@ -580,14 +597,12 @@ handle_info({peer_banned, Pid, Address}, State) ->
 handle_info(bootstrap, State) ->
     %% First try anchor connections
     State2 = try_anchor_connections(State),
-    %% Check if addrman has enough addresses
-    case beamchain_addrman:count() of
-        {New, Tried} when New + Tried < 10 ->
-            %% Not enough addresses, resolve DNS seeds
-            gen_server:cast(self(), resolve_dns_seeds);
-        _ ->
-            ok
-    end,
+    %% Always trigger DNS seed resolution on startup, regardless of the
+    %% current addrman count. A stale-but-large peers.dets can mask the
+    %% fact that none of the persisted addresses still accept connections,
+    %% so we warm the pool with fresh seeds on every cold start and gate
+    %% the connect_tick loop on the first resolution completing.
+    gen_server:cast(self(), resolve_dns_seeds),
     {noreply, State2};
 
 %% Connection maintenance tick
@@ -604,6 +619,18 @@ handle_info(connect_tick, State) ->
     Timer = erlang:send_after(Interval, self(), connect_tick),
     {noreply, State2#state{connect_timer = Timer}};
 
+%% DNS warm-up deadline: release the connect_tick loop even if DNS never
+%% returned (broken resolver, offline testnet seeds, etc.).
+handle_info(dns_warmup_deadline, #state{dns_warmup_done = true} = State) ->
+    %% DNS already completed — deadline is a no-op.
+    {noreply, State};
+handle_info(dns_warmup_deadline, State) ->
+    logger:warning("peer manager: DNS warm-up timed out after ~Bs, "
+                   "starting connect_tick with whatever addresses are available",
+                   [?DNS_WARMUP_TIMEOUT div 1000]),
+    Timer = erlang:send_after(?CONNECT_INTERVAL, self(), connect_tick),
+    {noreply, State#state{dns_warmup_done = true, connect_timer = Timer}};
+
 %% DNS seed resolution completed
 handle_info({dns_seeds_resolved, Addrs}, State) ->
     logger:info("dns seeds: discovered ~B addresses", [length(Addrs)]),
@@ -612,7 +639,16 @@ handle_info({dns_seeds_resolved, Addrs}, State) ->
     %% Merge with existing discovered addresses, dedup
     Existing = State#state.discovered,
     Merged = lists:usort(Shuffled ++ Existing),
-    {noreply, State#state{discovered = Merged, dns_pending = false}};
+    %% If this is the first DNS completion, release the connect_tick loop.
+    State2 = State#state{discovered = Merged, dns_pending = false},
+    State3 = case State2#state.dns_warmup_done of
+        false ->
+            Timer = erlang:send_after(?CONNECT_INTERVAL, self(), connect_tick),
+            State2#state{dns_warmup_done = true, connect_timer = Timer};
+        true ->
+            State2
+    end,
+    {noreply, State3};
 
 %% Peer messages (forwarded from peer process)
 handle_info({peer_message, Pid, Command, Payload}, State) ->
