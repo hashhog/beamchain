@@ -174,8 +174,15 @@ encode_payload(pong, #{nonce := Nonce}) ->
 %% -- Address discovery ------------------------------------------------
 
 encode_payload(addr, #{addrs := Addrs}) ->
-    Count = beamchain_serialize:encode_varint(length(Addrs)),
-    Data = << <<(encode_addr_entry(A))/binary>> || A <- Addrs >>,
+    %% Legacy `addr` message carries only IPv4/IPv6 entries (fixed 30 bytes
+    %% each). Encode entries individually so encode_addr_entry can filter
+    %% unsupported network types (TorV3/I2P/cjdns/...) by returning <<>>;
+    %% then drop the empties and re-count. Callers that need to relay
+    %% BIP155 entries must use the addrv2 payload — see encode_payload/2
+    %% (addrv2, _).
+    Encoded = [E || E <- [encode_addr_entry(A) || A <- Addrs], E =/= <<>>],
+    Count = beamchain_serialize:encode_varint(length(Encoded)),
+    Data = iolist_to_binary(Encoded),
     <<Count/binary, Data/binary>>;
 
 encode_payload(getaddr, _) -> <<>>;
@@ -480,9 +487,32 @@ decode_net_addr(<<Svc:64/little, IPBin:16/binary, Port:16/big, Rest/binary>>) ->
 %%% ===================================================================
 
 -spec encode_addr_entry(map()) -> binary().
+%% Legacy-addr shape: ip is either a 4-tuple (IPv4), an 8-tuple (IPv6), or a
+%% 16-byte binary already in IPv4-mapped / IPv6 wire form. `encode_ip/1`
+%% normalises all three to a 16-byte binary.
 encode_addr_entry(#{timestamp := T, services := Svc, ip := IP, port := Port}) ->
     IPBin = encode_ip(IP),
-    <<T:32/little, Svc:64/little, IPBin:16/binary, Port:16/big>>.
+    <<T:32/little, Svc:64/little, IPBin:16/binary, Port:16/big>>;
+%% BIP155-decoder shape (network + raw address binary) — accept IPv4 and
+%% IPv6 so a decoded addrv2 entry round-trips losslessly when relayed on
+%% the legacy addr channel.
+encode_addr_entry(#{timestamp := T, services := Svc, network := ipv4,
+                    address := <<A:8, B:8, C:8, D:8>>, port := Port}) ->
+    encode_addr_entry(#{timestamp => T, services => Svc,
+                        ip => {A, B, C, D}, port => Port});
+encode_addr_entry(#{timestamp := T, services := Svc, network := ipv6,
+                    address := <<IPBin:16/binary>>, port := Port}) ->
+    <<T:32/little, Svc:64/little, IPBin/binary, Port:16/big>>;
+%% Everything else — TorV3 (32B), I2P (32B), cjdns (16B with 0xFC prefix),
+%% future / unknown BIP155 networks — cannot fit the legacy 30-byte addr
+%% entry. Drop silently (caller filters <<>>) after a throttled warning.
+%% Callers that genuinely need to relay these should use the addrv2
+%% payload / encode_addrv2_entry instead.
+encode_addr_entry(Entry) ->
+    logger:warning(
+      "beamchain_p2p_msg:encode_addr_entry/1 dropping unsupported entry "
+      "(legacy addr cannot carry this network): ~p", [Entry]),
+    <<>>.
 
 -spec decode_addr_entry(binary()) -> {map(), binary()}.
 decode_addr_entry(<<T:32/little, Svc:64/little, IPBin:16/binary,
