@@ -141,7 +141,12 @@
     %% Height -> retry count — tracks how many times validation failed
     %% for a given height. After MAX_VALIDATION_RETRIES, skip the block
     %% and halt sync to avoid infinite retry loops.
-    validation_failures = #{} :: #{non_neg_integer() => non_neg_integer()}
+    validation_failures = #{} :: #{non_neg_integer() => non_neg_integer()},
+
+    %% Consecutive stall_check ticks where next_to_validate did not advance.
+    %% Used to escalate the watchdog to force_unstick/2 when a single peer
+    %% silently dropped a block request (no notfound, no block, no timeout).
+    stuck_ticks = 0        :: non_neg_integer()
 }).
 
 %%% ===================================================================
@@ -363,18 +368,33 @@ handle_info(stall_check, #state{status = syncing,
     %% Reschedule
     Timer = erlang:send_after(?STALL_CHECK_INTERVAL, self(), stall_check),
     State4 = fill_pipeline(State3#state{stall_timer = Timer}),
-    %% Log stall detection
-    case State4#state.next_to_validate =:= NextH
-         andalso maps:size(State4#state.downloaded) > 0 of
+    %% Log stall detection and escalate if wedged at same height.
+    Stuck = State4#state.next_to_validate =:= NextH
+            andalso (maps:size(State4#state.downloaded) > 0
+                     orelse maps:size(State4#state.in_flight) > 0),
+    State5 = case Stuck of
         true ->
+            NewCount = State4#state.stuck_ticks + 1,
             logger:info("block_sync: watchdog — stuck at ~B, "
-                        "downloaded=~B in_flight=~B",
+                        "downloaded=~B in_flight=~B ticks=~B",
                         [NextH, maps:size(State4#state.downloaded),
-                         maps:size(State4#state.in_flight)]);
+                         maps:size(State4#state.in_flight), NewCount]),
+            %% Escalation: after 2 ticks (~30s) stuck, force-evict the
+            %% in_flight entry for NextH and blast-request it from all peers.
+            %% This routes around a peer that silently dropped the request
+            %% (no notfound, no block, just dead) — the existing check_stalls
+            %% would need its 30s-per-entry timeout to fire, but that relies on
+            %% RequestedAt not being refreshed by validation cycles.
+            case NewCount >= 2 of
+                true ->
+                    force_unstick(NextH, State4#state{stuck_ticks = 0});
+                false ->
+                    State4#state{stuck_ticks = NewCount}
+            end;
         false ->
-            ok
+            State4#state{stuck_ticks = 0}
     end,
-    {noreply, State4};
+    {noreply, State5};
 handle_info(stall_check, State) ->
     {noreply, State#state{stall_timer = undefined}};
 
@@ -1034,6 +1054,42 @@ check_stalls(#state{in_flight = InFlight} = State) ->
                 AccState
         end
     end, State, InFlight).
+
+%% Watchdog escalation: called when next_to_validate has not advanced for
+%% multiple stall_check ticks. Evict any in_flight entry at Height, force-
+%% kill the stuck peer (the gentle disconnect cast may not have propagated),
+%% then blast-request Height from ALL connected peers so the next arrival
+%% unblocks us regardless of which peer is actually healthy.
+force_unstick(Height, State) ->
+    {State1, StuckPeer} = case maps:find(Height, State#state.in_flight) of
+        {ok, {P, _, Hash}} ->
+            logger:warning("block_sync: force_unstick — evicting in_flight "
+                           "height ~B from peer ~p", [Height, P]),
+            beamchain_peer:disconnect(P),
+            catch exit(P, stall_unstick),
+            InFlight2 = maps:remove(Height, State#state.in_flight),
+            H2H2 = maps:remove(Hash, State#state.hash_to_height),
+            AllStats2 = decrement_peer_in_flight(P, State#state.peer_stats),
+            Peers2 = maps:remove(P, State#state.peers),
+            PeerStats3 = maps:remove(P, AllStats2),
+            {State#state{in_flight = InFlight2, hash_to_height = H2H2,
+                         peers = Peers2, peer_stats = PeerStats3}, P};
+        error ->
+            {State, undefined}
+    end,
+    %% Re-gather peers in case peer_manager has new connections since start_sync.
+    Fresh = gather_connected_peers(),
+    Merged = maps:merge(Fresh, State1#state.peers),
+    Merged2 = case StuckPeer of
+        undefined -> Merged;
+        _ -> maps:remove(StuckPeer, Merged)
+    end,
+    MergedStats = maps:merge(
+        maps:from_list([{P, #peer_stats{}} || P <- maps:keys(Merged2),
+                                              not maps:is_key(P, State1#state.peer_stats)]),
+        State1#state.peer_stats),
+    State2 = State1#state{peers = Merged2, peer_stats = MergedStats},
+    blast_request_height(Height, State2).
 
 handle_stall(Height, Peer, #state{in_flight = InFlight,
                                     hash_to_height = H2H,
