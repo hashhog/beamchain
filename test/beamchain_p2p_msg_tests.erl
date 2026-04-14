@@ -190,12 +190,41 @@ net_addr_ipv4_roundtrip_test() ->
     ?assertEqual(?NODE_NETWORK bor ?NODE_WITNESS, maps:get(services, Decoded)).
 
 net_addr_ipv6_roundtrip_test() ->
-    IPv6 = <<16#20,16#01,16#0d,16#b8, 0,0,0,0, 0,0,0,0, 0,0,0,1>>,
-    Addr = #{services => 0, ip => IPv6, port => 18333},
+    %% Real IPv6 must round-trip to an 8-tuple (matches inet conventions
+    %% and lets netgroup/1 bucket by /48 prefix instead of collapsing
+    %% every IPv6 peer into a single binary group).
+    IPv6Bin = <<16#20,16#01,16#0d,16#b8, 0,0,0,0, 0,0,0,0, 0,0,0,1>>,
+    IPv6Tuple = {16#2001, 16#0db8, 0, 0, 0, 0, 0, 1},
+    Addr = #{services => 0, ip => IPv6Bin, port => 18333},
     Bin = beamchain_p2p_msg:encode_net_addr(Addr),
     {Decoded, <<>>} = beamchain_p2p_msg:decode_net_addr(Bin),
-    ?assertEqual(IPv6, maps:get(ip, Decoded)),
+    ?assertEqual(IPv6Tuple, maps:get(ip, Decoded)),
     ?assertEqual(18333, maps:get(port, Decoded)).
+
+%% Regression: encode_ip used to crash on 8-tuple IPv6 peers
+%% (function_clause in addr-gossip -> peer session death). Wire form
+%% is always 16 bytes; IPv4 uses the IPv4-mapped IPv6 prefix.
+%% Exercised through encode_net_addr, which is the only caller on the hot
+%% addr-gossip path and is exported.
+net_addr_ipv4_wire_is_mapped_ipv6_test() ->
+    Addr = #{services => 0, ip => {192, 168, 1, 1}, port => 8333},
+    Bin = beamchain_p2p_msg:encode_net_addr(Addr),
+    %% 8 svc + 16 ip + 2 port = 26
+    ?assertEqual(26, byte_size(Bin)),
+    <<_Svc:8/binary, IPBin:16/binary, _Port:16>> = Bin,
+    ?assertMatch(<<0:80, 16#FFFF:16, 192, 168, 1, 1>>, IPBin).
+
+net_addr_ipv6_tuple_regression_test() ->
+    %% Live-captured crash address: 2001:4c3c:8102:2d00::2
+    IP = {8193, 19516, 33026, 11520, 0, 0, 0, 2},
+    Addr = #{services => 0, ip => IP, port => 8333},
+    NetBin = beamchain_p2p_msg:encode_net_addr(Addr),
+    ?assertEqual(26, byte_size(NetBin)),
+    <<_Svc:8/binary, IPBin:16/binary, _Port:16>> = NetBin,
+    ?assertEqual(<<8193:16, 19516:16, 33026:16, 11520:16,
+                   0:16, 0:16, 0:16, 2:16>>, IPBin),
+    {Decoded, <<>>} = beamchain_p2p_msg:decode_net_addr(NetBin),
+    ?assertEqual(IP, maps:get(ip, Decoded)).
 
 %%% ===================================================================
 %%% Inventory message tests
