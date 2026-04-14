@@ -593,13 +593,15 @@ decode_txs(N, Bin, Acc) ->
 encode_ip({A, B, C, D}) ->
     %% IPv4-mapped IPv6
     <<0:80, 16#FFFF:16, A:8, B:8, C:8, D:8>>;
+encode_ip({A, B, C, D, E, F, G, H}) ->
+    <<A:16, B:16, C:16, D:16, E:16, F:16, G:16, H:16>>;
 encode_ip(Bin) when byte_size(Bin) =:= 16 ->
     Bin.
 
 decode_ip(<<0:80, 16#FFFF:16, A:8, B:8, C:8, D:8>>) ->
     {A, B, C, D};
-decode_ip(<<IPv6:16/binary>>) ->
-    IPv6.
+decode_ip(<<A:16, B:16, C:16, D:16, E:16, F:16, G:16, H:16>>) ->
+    {A, B, C, D, E, F, G, H}.
 
 pad_command(Name) when byte_size(Name) =< 12 ->
     PadLen = 12 - byte_size(Name),
