@@ -1739,7 +1739,17 @@ handle_stale_tip_detected(State) ->
                                 "(height ~B, ours ~B) due to stale tip",
                                 [BestAddr2, BestH2, OurTipHeight]),
                     beamchain_header_sync:handle_peer_connected(BestPid2,
-                        #{start_height => BestH2});
+                        #{start_height => BestH2}),
+                    %% W18 fix: also nudge block_sync directly. If block_sync
+                    %% was latched in `complete` and header_sync's poll cycle
+                    %% has stalled, this re-arms the download cursor against
+                    %% the peer-announced height immediately rather than
+                    %% waiting for the next headers_complete round-trip.
+                    %% block_sync's start_sync handler is now a predicate
+                    %% (re-arms iff target > local tip), so this is safe to
+                    %% fire whenever any peer is ahead.
+                    catch beamchain_block_sync:start_sync(
+                        #{target_height => BestH2});
                 _ ->
                     %% No peer ahead — send getheaders to all to discover new blocks
                     send_periodic_getheaders()

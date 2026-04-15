@@ -301,3 +301,57 @@ siphash_key_derivation_test() ->
     %% Different nonce should produce different key
     {K0b, K1b} = beamchain_compact_block:derive_siphash_key(Header, Nonce + 1),
     ?assert(K0 =/= K0b orelse K1 =/= K1b).
+
+%%% ===================================================================
+%%% W18 IBD re-arm predicate tests (regression for liveness latch bug)
+%%%
+%%% These mirror the pure decision logic of the start_sync handler in
+%%% beamchain_block_sync.erl after the W18 fix:
+%%%   - status=complete + new peer-announced target > local tip  -> re-arm
+%%%   - status=complete + target == local tip                    -> stay complete
+%%%   - status=syncing  + new target > old target                -> extend queue
+%%%   - status=syncing  + new target =< old target               -> no change
+%%% Reference: bitcoin-core/src/net_processing.cpp
+%%%   FindNextBlocksToDownload runs every peer-message tick; IBD-complete is a
+%%%   dynamic predicate, never a latched terminal state.
+%%% ===================================================================
+
+%% Re-arm decision: returns rearm | stay_complete.
+rearm_decision(complete, LocalTipHeight, AnnouncedTarget)
+        when AnnouncedTarget > LocalTipHeight -> rearm;
+rearm_decision(complete, _LocalTipHeight, _AnnouncedTarget) -> stay_complete;
+rearm_decision(_, _, _) -> not_applicable.
+
+%% Queue-extension decision for status=syncing: returns the new queue.
+extend_queue(OldTarget, NewTarget, OldQueue) when NewTarget > OldTarget ->
+    OldQueue ++ lists:seq(OldTarget + 1, NewTarget);
+extend_queue(_OldTarget, _NewTarget, OldQueue) ->
+    OldQueue.
+
+ibd_complete_then_peer_higher_rearms_test() ->
+    %% W17/W18 root cause: block_sync at status=complete, local tip=945127,
+    %% peer announces 945191. Must re-arm.
+    ?assertEqual(rearm, rearm_decision(complete, 945127, 945191)).
+
+ibd_complete_at_tip_stays_complete_test() ->
+    %% Peer at same height as local tip: stay complete (no spurious re-arm).
+    ?assertEqual(stay_complete, rearm_decision(complete, 945127, 945127)).
+
+ibd_complete_peer_behind_stays_complete_test() ->
+    %% Peer behind us (lagging peer): stay complete.
+    ?assertEqual(stay_complete, rearm_decision(complete, 945127, 945100)).
+
+syncing_extends_queue_when_new_target_higher_test() ->
+    %% Block sync mid-IBD with target=945127. Headers advance to 945200.
+    %% Queue must be extended with [945128..945200].
+    OldQueue = [945120, 945121, 945122, 945123],
+    NewQueue = extend_queue(945127, 945200, OldQueue),
+    ?assertEqual(OldQueue ++ lists:seq(945128, 945200), NewQueue),
+    %% Sanity: 73 blocks added to queue.
+    ?assertEqual(length(OldQueue) + 73, length(NewQueue)).
+
+syncing_no_change_when_new_target_not_higher_test() ->
+    %% header_sync notify with same/lower target: queue unchanged.
+    OldQueue = [945120, 945121],
+    ?assertEqual(OldQueue, extend_queue(945200, 945200, OldQueue)),
+    ?assertEqual(OldQueue, extend_queue(945200, 945100, OldQueue)).

@@ -126,6 +126,15 @@ handle_cast({headers_complete, TipHeight}, #state{phase = complete} = State) ->
                 [TipHeight]),
     State2 = start_block_sync(TipHeight, State),
     {noreply, State2};
+%% headers_complete arriving in phase=blocks (header_sync ran another round
+%% while block download was still draining): forward the new target so
+%% block_sync can extend its download queue. W18 fix: previously this was a
+%% silent no-op, so any headers-tip advance during block download was lost.
+handle_cast({headers_complete, TipHeight}, #state{phase = blocks} = State) ->
+    logger:info("sync: headers advanced to ~B during block download, "
+                "extending block_sync target", [TipHeight]),
+    beamchain_block_sync:start_sync(#{target_height => TipHeight}),
+    {noreply, State};
 handle_cast({headers_complete, _TipHeight}, State) ->
     {noreply, State};
 
