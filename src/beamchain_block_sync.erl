@@ -297,9 +297,58 @@ handle_cast({start_sync, Opts}, #state{status = idle,
     State4 = fill_pipeline(State3),
     {noreply, State4};
 
-handle_cast({start_sync, _Opts}, State) ->
-    %% Already syncing
-    {noreply, State};
+%% start_sync arriving while in `complete` state: the previous IBD reached its
+%% target but headers have since advanced (peer announced higher tip). Re-arm
+%% the downloader against the new target. This fixes the latched-IBD-complete
+%% liveness bug (W18: post-IBD sync was a one-shot terminal transition; new
+%% peer-announced heights never re-opened the download cursor).
+%% Reference: bitcoin-core/src/net_processing.cpp — FindNextBlocksToDownload
+%% is invoked unconditionally per peer-message tick; IBD is a dynamic predicate.
+handle_cast({start_sync, Opts}, #state{status = complete} = State) ->
+    StartHeight = find_start_height(),
+    TargetHeight = maps:get(target_height, Opts, State#state.target_height),
+    case TargetHeight > StartHeight of
+        true ->
+            logger:info("block_sync: re-arming from complete — "
+                        "new target ~B (was ~B), tip ~B",
+                        [TargetHeight, State#state.target_height,
+                         StartHeight - 1]),
+            %% Reset to idle so the canonical idle-clause handles
+            %% all the bookkeeping (queue rebuild, timers, peer gather).
+            %% cancel_timers is safe even if timers are already undefined.
+            State2 = cancel_timers(State),
+            handle_cast({start_sync, Opts},
+                        State2#state{status = idle,
+                                     download_queue = [],
+                                     in_flight = #{},
+                                     hash_to_height = #{},
+                                     downloaded = #{},
+                                     stall_timer = undefined,
+                                     progress_timer = undefined});
+        false ->
+            %% Nothing to do — we are already at or past the announced target.
+            {noreply, State}
+    end;
+%% start_sync arriving mid-syncing: extend the download queue to a higher
+%% target if the new target exceeds the current one. Common path: header_sync
+%% ticks while block_sync is still draining the previous range.
+handle_cast({start_sync, Opts}, #state{status = syncing,
+                                       target_height = OldTarget,
+                                       download_queue = Queue} = State) ->
+    NewTarget = maps:get(target_height, Opts, OldTarget),
+    case NewTarget > OldTarget of
+        true ->
+            Extra = lists:seq(OldTarget + 1, NewTarget),
+            logger:info("block_sync: extending target ~B -> ~B "
+                        "(+~B blocks queued)",
+                        [OldTarget, NewTarget, length(Extra)]),
+            State2 = State#state{target_height = NewTarget,
+                                 download_queue = Queue ++ Extra},
+            State3 = fill_pipeline(State2),
+            {noreply, State3};
+        false ->
+            {noreply, State}
+    end;
 
 handle_cast(stop_sync, State) ->
     State2 = cancel_timers(State),
