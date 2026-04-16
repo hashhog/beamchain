@@ -27,6 +27,7 @@
          handle_headers/2,
          handle_peer_connected/2,
          handle_peer_disconnected/1,
+         probe_peer/1,
          get_status/0]).
 
 %% gen_server callbacks
@@ -115,6 +116,16 @@ handle_peer_connected(Peer, Info) ->
 -spec handle_peer_disconnected(pid()) -> ok.
 handle_peer_disconnected(Peer) ->
     gen_server:cast(?SERVER, {peer_disconnected, Peer}).
+
+%% @doc Unconditionally probe a peer for new headers. Used by the
+%% peer_manager stale-tip watchdog to refresh peer chain state after IBD
+%% completes: the cached peer_entry.best_height can leave every peer
+%% looking equal-height-to-us, so neither start_sync nor handle_peer_connected
+%% triggers a real GETHEADERS on the wire. probe_peer sends GETHEADERS
+%% directly, regardless of what best_height says.
+-spec probe_peer(pid()) -> ok.
+probe_peer(Peer) ->
+    gen_server:cast(?SERVER, {probe_peer, Peer}).
 
 %% @doc Get current sync status.
 -spec get_status() -> map().
@@ -216,6 +227,32 @@ handle_cast({peer_disconnected, Peer}, State) ->
         _ ->
             {noreply, State2}
     end;
+
+%% Unconditional getheaders probe. Sends GETHEADERS directly using the
+%% current locator regardless of what peer_heights says about this peer.
+%% Only runs when we're not in the middle of an active sync — we don't
+%% want to stomp on an in-progress handshake with a different sync_peer.
+handle_cast({probe_peer, Peer}, #state{status = Status,
+                                        tip_height = TipHeight,
+                                        tip_hash = TipHash} = State)
+  when Status =:= idle; Status =:= complete ->
+    Locator = build_block_locator(TipHeight, TipHash),
+    Msg = #{version => ?PROTOCOL_VERSION,
+            locators => Locator,
+            stop_hash => <<0:256>>},
+    beamchain_peer:send_message(Peer, {getheaders, Msg}),
+    logger:info("header_sync: probing peer ~p for new headers "
+                "(tip ~B, prior status ~p)",
+                [Peer, TipHeight, Status]),
+    State2 = cancel_timer(State),
+    TimerRef = erlang:send_after(?GETHEADERS_TIMEOUT, self(),
+                                 getheaders_timeout),
+    {noreply, State2#state{status = syncing,
+                            sync_peer = Peer,
+                            timer_ref = TimerRef,
+                            headers_received = 0}};
+handle_cast({probe_peer, _Peer}, State) ->
+    {noreply, State};
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
