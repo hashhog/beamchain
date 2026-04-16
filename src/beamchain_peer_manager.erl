@@ -1776,6 +1776,14 @@ find_best_worst_peers(Peers) ->
 
 %% @doc Send getheaders to a random connected peer to discover new blocks.
 %% Reference: Bitcoin Core SendMessages() periodic header fetch.
+%%
+%% W41: Call header_sync:probe_peer/1 which sends a real P2P GETHEADERS
+%% unconditionally, bypassing the peer_heights gate. The previous path
+%% went through handle_peer_connected, which only fires GETHEADERS when
+%% the peer's cached best_height > our tip — but best_height is set once
+%% at version-handshake and never refreshed, so every peer looks
+%% equal-height-to-us after IBD and no refresh ever happens. See
+%% wave40-2026-04-16/beamchain-stale-tip-rootcause.md.
 send_periodic_getheaders() ->
     AllPeers = ets:foldl(fun
         (#peer_entry{connected = true, pid = Pid}, Acc) -> [Pid | Acc];
@@ -1785,16 +1793,9 @@ send_periodic_getheaders() ->
         [] ->
             ok;
         Peers ->
-            %% Pick a random peer
             Idx = rand:uniform(length(Peers)),
             Peer = lists:nth(Idx, Peers),
-            %% Trigger header sync check with this peer
-            PeerHeight = case ets:lookup(?PEER_TABLE, Peer) of
-                [#peer_entry{best_height = H}] -> H;
-                _ -> 0
-            end,
-            beamchain_header_sync:handle_peer_connected(Peer,
-                #{start_height => PeerHeight})
+            beamchain_header_sync:probe_peer(Peer)
     end.
 
 %%% ===================================================================
