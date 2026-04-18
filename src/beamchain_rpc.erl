@@ -380,6 +380,7 @@ handle_method(<<"uptime">>, _, _W) -> rpc_uptime();
 %% -- Blockchain --
 handle_method(<<"getblockcount">>, _, _W) -> rpc_getblockcount();
 handle_method(<<"getbestblockhash">>, _, _W) -> rpc_getbestblockhash();
+handle_method(<<"getsyncstate">>, _, _W) -> rpc_getsyncstate();
 handle_method(<<"getblockchaininfo">>, _, _W) -> rpc_getblockchaininfo();
 handle_method(<<"getdeploymentinfo">>, P, _W) -> rpc_getdeploymentinfo(P);
 handle_method(<<"getblockhash">>, P, _W) -> rpc_getblockhash(P);
@@ -489,6 +490,7 @@ rpc_help_list() ->
         <<"getblock \"blockhash\" ( verbosity )">>,
         <<"getblockchaininfo">>,
         <<"getblockcount">>,
+        <<"getsyncstate">>,
         <<"getdeploymentinfo ( \"blockhash\" )">>,
         <<"getblockhash height">>,
         <<"getblockheader \"blockhash\" ( verbose )">>,
@@ -608,6 +610,39 @@ rpc_getbestblockhash() ->
         not_found ->
             {error, ?RPC_MISC_ERROR, <<"No blocks yet">>}
     end.
+
+%% hashhog W70: uniform fleet-wide sync-state report.
+%% Spec: meta-repo `spec/getsyncstate.md`.
+rpc_getsyncstate() ->
+    Network = beamchain_config:network(),
+    {TipHeight, TipHash} = case beamchain_chainstate:get_tip() of
+        {ok, {H, Height}} -> {Height, hash_to_hex(H)};
+        not_found -> {0, <<"0000000000000000000000000000000000000000000000000000000000000000">>}
+    end,
+    IsIbd = not beamchain_chainstate:is_synced(),
+    NumPeers = try beamchain_peer_manager:peer_count() catch _:_ -> 0 end,
+    InFlight = try
+        Status = beamchain_block_sync:get_status(),
+        maps:get(in_flight_count, Status, null)
+    catch _:_ -> null end,
+    Progress = case IsIbd of
+        true -> 0.999;
+        false -> 1.0
+    end,
+    {ok, #{
+        <<"tip_height">> => TipHeight,
+        <<"tip_hash">> => TipHash,
+        <<"best_header_height">> => TipHeight,
+        <<"best_header_hash">> => TipHash,
+        <<"initial_block_download">> => IsIbd,
+        <<"num_peers">> => NumPeers,
+        <<"verification_progress">> => Progress,
+        <<"blocks_in_flight">> => InFlight,
+        <<"blocks_pending_connect">> => null,
+        <<"last_block_received_time">> => null,
+        <<"chain">> => network_name(Network),
+        <<"protocol_version">> => ?PROTOCOL_VERSION
+    }}.
 
 rpc_getblockchaininfo() ->
     Network = beamchain_config:network(),
