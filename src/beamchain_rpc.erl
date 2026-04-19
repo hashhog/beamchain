@@ -2057,10 +2057,33 @@ rpc_getnetworkinfo() ->
 
 rpc_getpeerinfo() ->
     Peers = beamchain_peer_manager:get_peers(),
-    PeerInfoList = lists:map(fun(#{pid := _Pid, address := {IP, Port},
+    PeerInfoList = lists:map(fun(#{pid := Pid, address := {IP, Port},
                                    direction := Dir, connected := _Conn,
-                                   info := Info}) ->
+                                   info := StaleInfo}) ->
         Now = erlang:system_time(second),
+        %% Pull live stats from the peer gen_statem; fall back to the
+        %% manager's stored Info (set at peer_connected) on timeout so the
+        %% RPC never blocks behind a slow peer process.
+        Info = case catch gen_statem:call(Pid, info, 500) of
+            {ok, Live} when is_map(Live) -> Live;
+            _ -> StaleInfo
+        end,
+        ConnTime = case maps:get(connected_at, Info, undefined) of
+            undefined -> Now;
+            Ms -> Ms div 1000
+        end,
+        LastSend = case maps:get(last_send, Info, undefined) of
+            undefined -> Now;
+            Ms2 -> Ms2 div 1000
+        end,
+        LastRecv = case maps:get(last_recv, Info, undefined) of
+            undefined -> Now;
+            Ms3 -> Ms3 div 1000
+        end,
+        PingTime = case maps:get(latency_ms, Info, undefined) of
+            undefined -> 0.0;
+            L -> L / 1000.0
+        end,
         #{
             <<"id">> => erlang:phash2({IP, Port}),
             <<"addr">> => format_addr(IP, Port),
@@ -2069,15 +2092,16 @@ rpc_getpeerinfo() ->
                 <<(maps:get(services, Info, 0)):64/big>>),
             <<"servicesnames">> => services_to_names(
                 maps:get(services, Info, 0)),
-            <<"lastsend">> => Now,
-            <<"lastrecv">> => Now,
+            <<"relaytxes">> => maps:get(relay, Info, true),
+            <<"lastsend">> => LastSend,
+            <<"lastrecv">> => LastRecv,
             <<"last_transaction">> => 0,
             <<"last_block">> => 0,
-            <<"bytessent">> => 0,
-            <<"bytesrecv">> => 0,
-            <<"conntime">> => maps:get(connect_time, Info, Now),
+            <<"bytessent">> => maps:get(bytes_sent, Info, 0),
+            <<"bytesrecv">> => maps:get(bytes_recv, Info, 0),
+            <<"conntime">> => ConnTime,
             <<"timeoffset">> => 0,
-            <<"pingtime">> => maps:get(ping_time, Info, 0.0),
+            <<"pingtime">> => PingTime,
             <<"version">> => maps:get(version, Info, 0),
             <<"subver">> => maps:get(user_agent, Info, <<"/unknown/">>),
             <<"inbound">> => Dir =:= inbound,
