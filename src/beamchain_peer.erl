@@ -99,6 +99,7 @@
     handler_mon             :: reference() | undefined,
     %% Stats
     connected_at            :: non_neg_integer() | undefined,
+    last_send               :: non_neg_integer() | undefined,
     last_recv               :: non_neg_integer() | undefined,
     last_ping_nonce         :: non_neg_integer() | undefined,
     ping_sent_at            :: non_neg_integer() | undefined,
@@ -860,7 +861,10 @@ do_send_msg(Command, PayloadData, Data) ->
 do_send_raw(Command, Payload, #peer_data{socket = Socket, magic = Magic} = Data) ->
     Msg = beamchain_p2p_msg:encode_msg(Magic, Command, Payload),
     gen_tcp:send(Socket, Msg),
-    Data#peer_data{bytes_sent = Data#peer_data.bytes_sent + byte_size(Msg)}.
+    Data#peer_data{
+        bytes_sent = Data#peer_data.bytes_sent + byte_size(Msg),
+        last_send = erlang:system_time(millisecond)
+    }.
 
 %%% ===================================================================
 %%% Internal: Helpers
@@ -881,6 +885,8 @@ build_info(#peer_data{} = D) ->
       latency_ms    => D#peer_data.latency_ms,
       bytes_sent    => D#peer_data.bytes_sent,
       bytes_recv    => D#peer_data.bytes_recv,
+      last_send     => D#peer_data.last_send,
+      last_recv     => D#peer_data.last_recv,
       connected_at  => D#peer_data.connected_at}.
 
 %%% ===================================================================
