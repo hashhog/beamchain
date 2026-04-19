@@ -81,6 +81,7 @@
     peer_height = 0         :: integer(),
     peer_relay = true       :: boolean(),
     peer_nonce              :: non_neg_integer() | undefined,
+    peer_version_timestamp  :: integer() | undefined,  %% W49 tranche C: peer's nTime from their version msg, for getpeerinfo timeoffset
     %% Feature negotiation
     wants_headers = false   :: boolean(),
     wants_cmpct = false     :: boolean(),
@@ -552,7 +553,8 @@ handle_version_msg(_Payload, #peer_data{version_recv = true} = Data) ->
 handle_version_msg(Payload, Data) ->
     case beamchain_p2p_msg:decode_payload(version, Payload) of
         {ok, #{version := V, services := Svc, user_agent := UA,
-               start_height := Height, relay := Relay, nonce := PeerNonce}} ->
+               start_height := Height, relay := Relay, nonce := PeerNonce,
+               timestamp := PeerTs}} ->
             %% Self-connection detection
             case PeerNonce =:= Data#peer_data.our_nonce of
                 true ->
@@ -567,7 +569,8 @@ handle_version_msg(Payload, Data) ->
                         peer_user_agent = UA,
                         peer_height = Height,
                         peer_relay = Relay,
-                        peer_nonce = PeerNonce
+                        peer_nonce = PeerNonce,
+                        peer_version_timestamp = PeerTs
                     },
                     %% Inbound: send our version if we haven't yet
                     Data3 = maybe_send_version(Data2),
@@ -887,7 +890,8 @@ build_info(#peer_data{} = D) ->
       bytes_recv    => D#peer_data.bytes_recv,
       last_send     => D#peer_data.last_send,
       last_recv     => D#peer_data.last_recv,
-      connected_at  => D#peer_data.connected_at}.
+      connected_at  => D#peer_data.connected_at,
+      peer_version_timestamp => D#peer_data.peer_version_timestamp}.
 
 %%% ===================================================================
 %%% Internal: Inv trickling (privacy-preserving tx relay)

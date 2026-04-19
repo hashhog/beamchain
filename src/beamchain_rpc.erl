@@ -2100,7 +2100,10 @@ rpc_getpeerinfo() ->
             <<"bytessent">> => maps:get(bytes_sent, Info, 0),
             <<"bytesrecv">> => maps:get(bytes_recv, Info, 0),
             <<"conntime">> => ConnTime,
-            <<"timeoffset">> => 0,
+            <<"timeoffset">> => case maps:get(peer_version_timestamp, Info, undefined) of
+                undefined -> 0;
+                PeerTs -> PeerTs - Now
+            end,
             <<"pingtime">> => PingTime,
             <<"version">> => maps:get(version, Info, 0),
             <<"subver">> => maps:get(user_agent, Info, <<"/unknown/">>),
