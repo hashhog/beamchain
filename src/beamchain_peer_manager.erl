@@ -1166,6 +1166,24 @@ handle_peer_message(Pid, tx, Payload, State) ->
 handle_peer_message(Pid, notfound, Payload, State) ->
     beamchain_sync:handle_peer_message(Pid, notfound, Payload),
     {noreply, State};
+%% BIP152 compact block messages: forward to sync. Without these, a peer's
+%% cmpctblock push (the whole point of sendcmpct announce=true) was caught
+%% by peer.erl's dispatch_message catch-all, forwarded here via the
+%% {peer_message, ...} mailbox, then silently dropped by the _Command
+%% catch-all clause below — never reaching beamchain_sync's
+%% route_message/handle_cmpctblock_received pipeline. This was the
+%% upstream of the persistent lag=1-2 drift; both the announce=true
+%% (peer.erl) and unsolicited-cmpctblock (block_sync.erl) fixes were
+%% downstream of this gap and so could not fire.
+handle_peer_message(Pid, cmpctblock, Payload, State) ->
+    beamchain_sync:handle_peer_message(Pid, cmpctblock, Payload),
+    {noreply, State};
+handle_peer_message(Pid, blocktxn, Payload, State) ->
+    beamchain_sync:handle_peer_message(Pid, blocktxn, Payload),
+    {noreply, State};
+handle_peer_message(Pid, getblocktxn, Payload, State) ->
+    beamchain_sync:handle_peer_message(Pid, getblocktxn, Payload),
+    {noreply, State};
 handle_peer_message(Pid, getdata, Payload, State) ->
     handle_getdata_msg(Pid, Payload),
     {noreply, State};
