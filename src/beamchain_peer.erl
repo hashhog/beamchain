@@ -835,8 +835,12 @@ send_feature_msgs(Data) ->
     %% sendheaders and sendcmpct are sent after handshake complete.
     %% wtxidrelay and sendaddrv2 are sent before verack (see handle_version_msg).
     D1 = do_send_raw(sendheaders, <<>>, Data),
+    %% BIP152 high-bandwidth mode: announce=true asks peers to push new
+    %% blocks via cmpctblock instead of inv→getdata→block. Without it
+    %% beamchain consistently lagged 1-2 blocks behind tip on mainnet
+    %% because every new block paid a full network round-trip.
     CmpctPayload = beamchain_p2p_msg:encode_payload(sendcmpct,
-                       #{announce => false, version => 2}),
+                       #{announce => true, version => 2}),
     D2 = do_send_raw(sendcmpct, CmpctPayload, D1),
     %% BIP 133: Send feefilter if peer supports it
     maybe_send_initial_feefilter(D2).
