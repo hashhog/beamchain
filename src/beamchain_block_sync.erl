@@ -391,12 +391,15 @@ handle_cast({peer_disconnected, Peer}, State) ->
     State2 = handle_peer_disconnect(Peer, State),
     {noreply, State2};
 
-%% BIP152 compact block received
-handle_cast({cmpctblock, Peer, CmpctBlock}, #state{status = syncing} = State) ->
+%% BIP152 compact block received. Accepted regardless of sync status:
+%% during IBD it's a solicited reply to a getdata; after IBD (status =
+%% complete) it's a high-bandwidth tip-follow announcement from a peer
+%% that honored our sendcmpct announce=true. Both must be processed —
+%% dropping the post-IBD case re-introduces the 1-2 block tip lag the
+%% sendcmpct-announce fix was meant to close.
+handle_cast({cmpctblock, Peer, CmpctBlock}, State) ->
     State2 = handle_cmpctblock_received(Peer, CmpctBlock, State),
     {noreply, State2};
-handle_cast({cmpctblock, _Peer, _CmpctBlock}, State) ->
-    {noreply, State};
 
 %% BIP152 blocktxn response
 handle_cast({blocktxn, Peer, BlockTxn}, #state{status = syncing} = State) ->
@@ -1228,10 +1231,49 @@ handle_cmpctblock_received(Peer, CmpctBlock, State) ->
         {ok, Height} ->
             do_handle_cmpctblock(Peer, CmpctBlock, BlockHash, Height, State);
         error ->
-            %% Unsolicited compact block (maybe high-bandwidth mode)
-            %% For now, ignore unsolicited compact blocks during IBD
-            logger:debug("block_sync: unsolicited cmpctblock ~s from ~p",
-                         [hash_hex(BlockHash), Peer]),
+            %% Unsolicited compact block — BIP152 high-bandwidth tip-follow
+            %% announcement from a peer that honored our sendcmpct
+            %% announce=true. Try to reconstruct from mempool/recent_txns;
+            %% if reconstruction succeeds, route through the
+            %% unsolicited-block validation+connect path. If reconstruction
+            %% needs missing transactions or initialization fails, drop —
+            %% peer's BIP152 fallback will retry via inv→getdata→block.
+            do_handle_unsolicited_cmpctblock(Peer, CmpctBlock, BlockHash, State)
+    end.
+
+%% Process a cmpctblock we did NOT request (high-bandwidth tip-follow).
+%% Reconstruct via mempool; on full success, validate+connect through
+%% handle_unsolicited_block. Partial / error cases drop the cmpctblock
+%% so the peer's BIP152 fallback can retry via the legacy inv path.
+%% Tracking partial reconstructions for unsolicited cmpctblocks would
+%% require an "unsolicited" flag in pending_compact and an alternate
+%% blocktxn-response path; deferred until tip blocks routinely miss
+%% mempool reconstruction (rare).
+do_handle_unsolicited_cmpctblock(Peer, CmpctBlock, BlockHash, State) ->
+    case beamchain_compact_block:init_compact_block(CmpctBlock) of
+        {ok, CompactState} ->
+            RecentTxns = State#state.recent_txns,
+            case beamchain_compact_block:try_reconstruct(CompactState,
+                                                         RecentTxns) of
+                {ok, Block} ->
+                    logger:info("block_sync: reconstructed unsolicited "
+                                "cmpctblock ~s from ~p (BIP152 hb tip)",
+                                [hash_hex(BlockHash), Peer]),
+                    handle_unsolicited_block(Peer, Block, State);
+                {partial, _PartialState} ->
+                    logger:debug("block_sync: unsolicited cmpctblock ~s "
+                                 "missing txs; dropping (peer will fall "
+                                 "back to inv path)",
+                                 [hash_hex(BlockHash)]),
+                    State;
+                {error, Reason} ->
+                    logger:debug("block_sync: unsolicited cmpctblock "
+                                 "reconstruct error: ~p", [Reason]),
+                    State
+            end;
+        {error, Reason} ->
+            logger:debug("block_sync: unsolicited cmpctblock init error: ~p",
+                         [Reason]),
             State
     end.
 
