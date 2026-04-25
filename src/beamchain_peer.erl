@@ -532,6 +532,20 @@ do_send_version(#peer_data{address = {IP, Port}, our_nonce = Nonce} = Data) ->
     Params = beamchain_config:network_params(),
     Services = ?NODE_NETWORK bor ?NODE_WITNESS,
     Now = erlang:system_time(second),
+    %% start_height MUST report our actual current tip height. Bitcoin
+    %% Core peers use this to decide whether the remote is a synced
+    %% peer worth pushing tip blocks to (BIP152 HB-mode candidate)
+    %% or a downloader still catching up (use inv → getdata → block).
+    %% Hardcoded 0 made every peer treat us as catching-up, so peers
+    %% never honored our sendcmpct(announce=true) request and we
+    %% received zero cmpctblocks across the 10 outbound connections.
+    %% Diagnosed 2026-04-25 after a chain of three downstream BIP152
+    %% fixes (announce=true, unsolicited-cmpctblock handler, and
+    %% peer_manager forwarding) all came up dry.
+    StartHeight = case beamchain_chainstate:get_tip_height() of
+        {ok, H} -> H;
+        _ -> 0
+    end,
     Payload = beamchain_p2p_msg:encode_payload(version, #{
         version     => ?PROTOCOL_VERSION,
         services    => Services,
@@ -541,7 +555,7 @@ do_send_version(#peer_data{address = {IP, Port}, our_nonce = Nonce} = Data) ->
                          port => Params#network_params.default_port},
         nonce       => Nonce,
         user_agent  => <<"/beamchain:0.1.0/">>,
-        start_height => 0,
+        start_height => StartHeight,
         relay       => true
     }),
     Data2 = do_send_raw(version, Payload, Data),
