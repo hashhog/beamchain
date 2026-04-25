@@ -835,15 +835,26 @@ send_feature_msgs(Data) ->
     %% sendheaders and sendcmpct are sent after handshake complete.
     %% wtxidrelay and sendaddrv2 are sent before verack (see handle_version_msg).
     D1 = do_send_raw(sendheaders, <<>>, Data),
-    %% BIP152 high-bandwidth mode: announce=true asks peers to push new
-    %% blocks via cmpctblock instead of inv→getdata→block. Without it
-    %% beamchain consistently lagged 1-2 blocks behind tip on mainnet
-    %% because every new block paid a full network round-trip.
-    CmpctPayload = beamchain_p2p_msg:encode_payload(sendcmpct,
-                       #{announce => true, version => 2}),
-    D2 = do_send_raw(sendcmpct, CmpctPayload, D1),
+    %% BIP152 §"Pre-Versioning Considerations":
+    %%   "An implementation that supports both version 1 and version 2 must
+    %%    send both sendcmpct messages."
+    %% Bitcoin Core sends v1 first, then v2 — the last sendcmpct received
+    %% by the peer is the authoritative one for HB-mode preference.
+    %%   v1 with announce=false: we don't want non-witness compact blocks
+    %%   v2 with announce=true:  we DO want SegWit-aware compact blocks
+    %%                           pushed unsolicited for new tips
+    %% Sending only v2 (the prior code path) produced 6+ hours of zero
+    %% cmpctblock arrivals on mainnet on 2026-04-25 — peers strictly
+    %% check v1 support before honoring any HB request, so without the
+    %% v1 sendcmpct we never get into any peer's HB-to set.
+    CmpctV1 = beamchain_p2p_msg:encode_payload(sendcmpct,
+                  #{announce => false, version => 1}),
+    D2 = do_send_raw(sendcmpct, CmpctV1, D1),
+    CmpctV2 = beamchain_p2p_msg:encode_payload(sendcmpct,
+                  #{announce => true, version => 2}),
+    D3 = do_send_raw(sendcmpct, CmpctV2, D2),
     %% BIP 133: Send feefilter if peer supports it
-    maybe_send_initial_feefilter(D2).
+    maybe_send_initial_feefilter(D3).
 
 %%% ===================================================================
 %%% Internal: Misbehavior
