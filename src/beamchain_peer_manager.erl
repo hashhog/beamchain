@@ -70,6 +70,9 @@
          update_ping_latency/2,
          notify_tip_updated/0]).
 
+%% Exposed for testing (BIP35 mempool inv chunking)
+-export([chunk_inv_items/2]).
+
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2]).
@@ -1190,6 +1193,16 @@ handle_peer_message(Pid, getdata, Payload, State) ->
 handle_peer_message(Pid, getheaders, Payload, State) ->
     handle_getheaders_msg(Pid, Payload),
     {noreply, State};
+%% BIP35: peer requested our complete mempool. Respond with one or more inv
+%% messages enumerating every txid (or wtxid, if peer signaled wtxidrelay)
+%% currently in the mempool, chunked at MAX_INV_SIZE. Decode + the message
+%% type registry were wired in beamchain_p2p_msg, but no handler existed
+%% here — the message hit the catch-all below and was silently dropped,
+%% which the Category B (P2P) parity audit (2026-04-27) flagged as the
+%% beamchain BIP35 PARTIAL gap.
+handle_peer_message(Pid, mempool, _Payload, State) ->
+    handle_mempool_msg(Pid),
+    {noreply, State};
 handle_peer_message(_Pid, _Command, _Payload, State) ->
     {noreply, State}.
 
@@ -1344,6 +1357,83 @@ collect_headers(Height, StopHash, Remaining, Acc) ->
         not_found ->
             lists:reverse(Acc)
     end.
+
+%% BIP35: serve a "mempool" request from a peer by sending one or more
+%% inv messages enumerating mempool transactions. Models the Bitcoin Core
+%% behavior in net_processing.cpp's MEMPOOL handler:
+%%
+%%   - The peer flag wtxidrelay (BIP339) decides whether each inv entry
+%%     uses MSG_TX (txid) or MSG_WTX (wtxid). Beamchain advertises
+%%     NODE_WITNESS, so we always populate witness-aware ids.
+%%   - Inv messages are chunked at MAX_INV_SIZE (50000), the network limit.
+%%   - Bitcoin Core gates this on "do we advertise NODE_BLOOM, or does the
+%%     peer hold the Mempool permission?". Beamchain currently advertises
+%%     only NODE_NETWORK | NODE_WITNESS (see beamchain_peer.erl:533) and
+%%     has no permission system, so we always-allow with a TODO. Tighten
+%%     this when either lands.
+%%
+%% Lookups are done via the peer_entry ETS row populated at handshake;
+%% wtxidrelay was added to peer info in beamchain_peer.erl's build_info/1.
+handle_mempool_msg(Pid) ->
+    case beamchain_mempool:get_all_id_pairs() of
+        [] ->
+            ok;
+        Pairs ->
+            UseWtxid = peer_uses_wtxid(Pid),
+            Items = inv_items_from_pairs(Pairs, UseWtxid),
+            %% TODO: gate on NODE_BLOOM advertisement once beamchain
+            %% exposes a service-flag config knob, matching
+            %% net_processing.cpp::MEMPOOL.
+            send_inv_chunks(Pid, Items)
+    end.
+
+peer_uses_wtxid(Pid) ->
+    case ets:lookup(?PEER_TABLE, Pid) of
+        [#peer_entry{info = Info}] ->
+            maps:get(wtxidrelay, Info, false) =:= true;
+        _ ->
+            false
+    end.
+
+inv_items_from_pairs(Pairs, UseWtxid) ->
+    Type = case UseWtxid of
+        true  -> ?MSG_WITNESS_TX;  %% BIP339: MSG_WTX is encoded as MSG_WITNESS_TX
+        false -> ?MSG_TX
+    end,
+    [#{type => Type, hash => select_inv_hash(P, UseWtxid)} || P <- Pairs].
+
+select_inv_hash({Txid, _Wtxid}, false) -> Txid;
+select_inv_hash({_Txid, Wtxid}, true)  -> Wtxid.
+
+send_inv_chunks(Pid, Items) ->
+    Chunks = chunk_inv_items(Items, ?MAX_INV_SIZE),
+    lists:foreach(fun(Chunk) ->
+        beamchain_peer:send_message(Pid, {inv, #{items => Chunk}})
+    end, Chunks).
+
+%% @doc Split a list of inv items into chunks of at most ChunkSize entries.
+%% Pure function — exported only for unit testing.
+%% MAX_INV_SIZE is 50000 in the Bitcoin protocol; sending more in a single
+%% inv message is a protocol violation that triggers a misbehavior score
+%% bump on the receiving Core node.
+-spec chunk_inv_items([map()], pos_integer()) -> [[map()]].
+chunk_inv_items([], _ChunkSize) ->
+    [];
+chunk_inv_items(Items, ChunkSize) when ChunkSize > 0 ->
+    chunk_inv_items_loop(Items, ChunkSize, []).
+
+chunk_inv_items_loop([], _ChunkSize, Acc) ->
+    lists:reverse(Acc);
+chunk_inv_items_loop(Items, ChunkSize, Acc) ->
+    {Head, Tail} = take_n(Items, ChunkSize, []),
+    chunk_inv_items_loop(Tail, ChunkSize, [Head | Acc]).
+
+take_n([], _N, Acc) ->
+    {lists:reverse(Acc), []};
+take_n(Rest, 0, Acc) ->
+    {lists:reverse(Acc), Rest};
+take_n([H | T], N, Acc) ->
+    take_n(T, N - 1, [H | Acc]).
 
 %%% ===================================================================
 %%% Internal: ban management

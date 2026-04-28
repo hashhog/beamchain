@@ -920,6 +920,11 @@ build_info(#peer_data{} = D) ->
       last_send     => D#peer_data.last_send,
       last_recv     => D#peer_data.last_recv,
       connected_at  => D#peer_data.connected_at,
+      %% BIP339: peer signaled wtxidrelay before verack — when answering an
+      %% inv-style enumeration (e.g. BIP35 mempool), we send MSG_WTX entries
+      %% in place of MSG_TX. Surfaced via info/1 so peer_manager can decide
+      %% the inv type without poking the gen_statem state directly.
+      wtxidrelay    => D#peer_data.wtxidrelay,
       peer_version_timestamp => D#peer_data.peer_version_timestamp}.
 
 %%% ===================================================================
