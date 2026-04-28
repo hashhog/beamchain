@@ -20,7 +20,7 @@
 
 %% Queries
 -export([has_tx/1, get_tx/1, get_entry/1]).
--export([get_all_txids/0, get_all_entries/0, get_info/0]).
+-export([get_all_txids/0, get_all_entries/0, get_all_id_pairs/0, get_info/0]).
 -export([get_sorted_by_fee/0]).
 -export([get_tx_fee_rate/1]).
 -export([get_ancestors/1]).
@@ -198,6 +198,15 @@ get_all_txids() ->
 -spec get_all_entries() -> [#mempool_entry{}].
 get_all_entries() ->
     [Entry || {_Txid, Entry} <- ets:tab2list(?MEMPOOL_TXS)].
+
+%% @doc Get all (txid, wtxid) pairs currently in the mempool.
+%% Used by the BIP35 mempool-message handler in beamchain_peer_manager
+%% to build an inv response without leaking the full #mempool_entry{}
+%% record across module boundaries.
+-spec get_all_id_pairs() -> [{binary(), binary()}].
+get_all_id_pairs() ->
+    [{E#mempool_entry.txid, E#mempool_entry.wtxid}
+     || {_Txid, E} <- ets:tab2list(?MEMPOOL_TXS)].
 
 %% @doc Get mempool summary info.
 -spec get_info() -> map().

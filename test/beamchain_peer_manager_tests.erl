@@ -749,3 +749,51 @@ current_tip_detection_test_() ->
           ?assertNot(IsClose)
       end}
      ]}.
+
+%%% ===================================================================
+%%% BIP35 mempool inv chunking (pure helper)
+%%% ===================================================================
+
+chunk_inv_items_test_() ->
+    Item = fun(N) -> #{type => 1, hash => <<N:256>>} end,
+    [
+     {"empty list returns empty list", fun() ->
+         ?assertEqual([], beamchain_peer_manager:chunk_inv_items([], 50000))
+     end},
+     {"under one chunk returns single chunk", fun() ->
+         Items = [Item(N) || N <- lists:seq(1, 5)],
+         ?assertEqual([Items],
+             beamchain_peer_manager:chunk_inv_items(Items, 50000))
+     end},
+     {"exact multiple of chunk size", fun() ->
+         Items = [Item(N) || N <- lists:seq(1, 6)],
+         Chunks = beamchain_peer_manager:chunk_inv_items(Items, 3),
+         ?assertEqual(2, length(Chunks)),
+         ?assertEqual(3, length(lists:nth(1, Chunks))),
+         ?assertEqual(3, length(lists:nth(2, Chunks))),
+         %% Order is preserved across chunks
+         ?assertEqual(Items, lists:append(Chunks))
+     end},
+     {"non-multiple has short tail chunk", fun() ->
+         Items = [Item(N) || N <- lists:seq(1, 7)],
+         Chunks = beamchain_peer_manager:chunk_inv_items(Items, 3),
+         ?assertEqual(3, length(Chunks)),
+         ?assertEqual([3, 3, 1], [length(C) || C <- Chunks]),
+         ?assertEqual(Items, lists:append(Chunks))
+     end},
+     {"chunk size 1 yields one item per chunk", fun() ->
+         Items = [Item(N) || N <- lists:seq(1, 4)],
+         Chunks = beamchain_peer_manager:chunk_inv_items(Items, 1),
+         ?assertEqual(4, length(Chunks)),
+         lists:foreach(fun(C) -> ?assertEqual(1, length(C)) end, Chunks),
+         ?assertEqual(Items, lists:append(Chunks))
+     end},
+     {"max protocol chunk size respected", fun() ->
+         %% 50000 + 17 items: first chunk is full, second is the remainder.
+         Items = [Item(N) || N <- lists:seq(1, 50017)],
+         Chunks = beamchain_peer_manager:chunk_inv_items(Items, 50000),
+         ?assertEqual(2, length(Chunks)),
+         ?assertEqual(50000, length(lists:nth(1, Chunks))),
+         ?assertEqual(17, length(lists:nth(2, Chunks)))
+     end}
+    ].
