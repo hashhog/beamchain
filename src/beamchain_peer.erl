@@ -22,6 +22,11 @@
 -export([callback_mode/0, init/1, terminate/3]).
 -export([connecting/3, handshaking/3, ready/3]).
 
+%% Test-only exports (BIP-324 v2 peek-classify helper).
+-ifdef(TEST).
+-export([is_v1_version_header/2]).
+-endif.
+
 %%% -------------------------------------------------------------------
 %%% Timeouts
 %%% -------------------------------------------------------------------
@@ -114,7 +119,49 @@
     %% BIP 133 feefilter
     our_fee_filter = ?DEFAULT_MIN_RELAY_FEE :: non_neg_integer(),  %% our feefilter sent to peer
     feefilter_sent_at       :: non_neg_integer() | undefined,      %% when we last sent feefilter
-    feefilter_timer_ref     :: reference() | undefined             %% timer for periodic updates
+    feefilter_timer_ref     :: reference() | undefined,            %% timer for periodic updates
+    %% BIP-324 v2 encrypted transport (W90).
+    %%
+    %% v2_phase tracks the inbound responder state machine after the
+    %% peek-classify decision in handle_tcp_data:
+    %%
+    %%   undefined    — we have not yet classified the inbound stream;
+    %%                  next 16 bytes will decide v1 vs v2 (or v2 already
+    %%                  active for outbound, when we eventually wire it).
+    %%   v1           — v1 magic seen; remainder of the buffer feeds the
+    %%                  existing decode_msg/dispatch_message path verbatim.
+    %%   recv_pubkey  — accumulating peer's 64-byte ElligatorSwift pubkey.
+    %%   recv_garbterm — pubkey complete, scanning for the 16-byte
+    %%                  recv_garbage_terminator (peer may emit 0..4095
+    %%                  random pre-key bytes before it, per BIP-324).
+    %%   drain_decoy  — terminator seen; consuming optional decoy AEAD
+    %%                  packets up to the peer's mandatory non-decoy
+    %%                  version packet.
+    %%   ready        — cipher handshake complete; subsequent inbound and
+    %%                  outbound bytes are AEAD-wrapped per BIP-324
+    %%                  short-id encoding (beamchain_v2_msg).
+    v2_phase = undefined :: undefined | v1 | recv_pubkey | recv_garbterm |
+                            drain_decoy | ready,
+    v2_cipher            :: beamchain_transport_v2:cipher() | undefined,
+    %% Random pre-terminator garbage we sent.  Bound into the AAD of the
+    %% first encrypted packet we transmit (the version packet) so the
+    %% peer authenticates that we observed the same byte sequence on
+    %% both sides of the cipher boundary.
+    v2_sent_garbage = <<>>      :: binary(),
+    %% AAD for the next decrypt() call.  Set to the peer's pre-terminator
+    %% garbage on first decrypt (or the full pre-terminator stream if the
+    %% peer sent any), then cleared.
+    v2_next_aad = <<>>          :: binary(),
+    %% Sliding window used during recv_garbterm to find the terminator.
+    %% Bounded at MAX_GARBAGE_LEN + 16 bytes — beyond that we MUST drop
+    %% the connection (BIP-324 protocol violation).
+    v2_recv_window = <<>>       :: binary(),
+    %% After decrypt_length() commits the recv_l cipher, we need to
+    %% remember the contents length until the corresponding body
+    %% arrives — otherwise the next pass would call decrypt_length()
+    %% again and double-advance the cipher.  ``undefined`` means "no
+    %% pending body".
+    v2_pending_len = undefined  :: undefined | non_neg_integer()
 }).
 
 %%% ===================================================================
@@ -462,20 +509,82 @@ handle_tcp_data(NewBytes, #peer_data{socket = Socket, buffer = Buf} = Data) ->
         bytes_recv = BytesRecv,
         last_recv = erlang:system_time(millisecond)
     },
-    case process_buffer(Data2) of
-        {ok, Data3} ->
+    %% Inbound peers: peek-classify before we know whether the stream is
+    %% v1 (Bitcoin Core <26.0 / unencrypted) or v2 (BIP-324).  Outbound
+    %% peers stay on the v1 path for now (see "Outbound v2: NOT WIRED"
+    %% audit note in W90).
+    Data3 = maybe_classify_inbound(Data2),
+    case dispatch_buffered(Data3) of
+        {ok, Data4} ->
             inet:setopts(Socket, [{active, once}]),
-            {ok, Data3};
+            {ok, Data4};
         {stop, Reason} ->
             {stop, Reason}
     end.
 
-process_buffer(#peer_data{buffer = Buffer} = Data) ->
+%% Decide v1 vs v2 once we have at least 16 bytes buffered.
+%%
+%% Inbound: peek the first 16 bytes — if they match `magic ||
+%% "version\0\0\0\0\0"` treat as v1; otherwise treat as a v2
+%% ElligatorSwift pubkey (responder mode).
+%%
+%% Outbound: we always send our v1 ``version`` first (state_enter →
+%% do_send_version), so the peer's reply will be a v1 frame on the
+%% existing path — pin the phase to ``v1`` immediately so this
+%% function doesn't accidentally route peer-replied magic bytes
+%% through the v2 path.  Outbound v2 dialing is NOT YET WIRED (see
+%% W90 audit); when it is added, the outbound branch will instead
+%% send our 64-byte ellswift pubkey from `connecting` and pin
+%% v2_phase = recv_pubkey here.
+maybe_classify_inbound(#peer_data{direction = inbound,
+                                   v2_phase = undefined,
+                                   buffer = Buffer,
+                                   magic = Magic} = Data)
+  when byte_size(Buffer) >= 16 ->
+    <<Head:16/binary, _/binary>> = Buffer,
+    case is_v1_version_header(Head, Magic) of
+        true ->
+            Data#peer_data{v2_phase = v1};
+        false ->
+            logger:debug("peer ~p classified as v2 (BIP-324) responder",
+                         [Data#peer_data.address]),
+            Data#peer_data{v2_phase = recv_pubkey}
+    end;
+maybe_classify_inbound(#peer_data{direction = outbound,
+                                   v2_phase = undefined} = Data) ->
+    %% Outbound: pin to v1 (no outbound v2 dialer yet).
+    Data#peer_data{v2_phase = v1};
+maybe_classify_inbound(Data) ->
+    Data.
+
+%% True iff the first 16 bytes match a v1 ``version`` message header.
+%% We anchor on the literal command name rather than just the network
+%% magic so we don't get false positives from a v2 ellswift pubkey
+%% whose first 4 bytes happen to equal the magic.
+is_v1_version_header(<<Magic:4/binary, "version", 0, 0, 0, 0, 0>>, Magic) ->
+    true;
+is_v1_version_header(_, _) ->
+    false.
+
+%% Drive whichever decoder the current v2_phase requires.
+dispatch_buffered(#peer_data{v2_phase = Phase} = Data)
+  when Phase =:= undefined ->
+    %% Not enough bytes to classify yet — wait for the next TCP segment.
+    {ok, Data};
+dispatch_buffered(#peer_data{v2_phase = v1} = Data) ->
+    process_buffer_v1(Data);
+dispatch_buffered(#peer_data{v2_phase = ready} = Data) ->
+    process_buffer_v2(Data);
+dispatch_buffered(#peer_data{v2_phase = _} = Data) ->
+    %% Cipher-handshake substates: recv_pubkey, recv_garbterm, drain_decoy.
+    drive_v2_handshake(Data).
+
+process_buffer_v1(#peer_data{buffer = Buffer} = Data) ->
     case beamchain_p2p_msg:decode_msg(Buffer) of
         {ok, Command, Payload, Rest} ->
             Data2 = Data#peer_data{buffer = Rest},
             case dispatch_message(Command, Payload, Data2) of
-                {ok, Data3}    -> process_buffer(Data3);
+                {ok, Data3}    -> process_buffer_v1(Data3);
                 {stop, Reason} -> {stop, Reason}
             end;
         incomplete ->
@@ -484,6 +593,281 @@ process_buffer(#peer_data{buffer = Buffer} = Data) ->
             logger:warning("peer ~p frame error: ~p",
                            [Data#peer_data.address, Reason]),
             {stop, Reason}
+    end.
+
+
+%%% ===================================================================
+%%% Internal: BIP-324 v2 responder state machine
+%%% ===================================================================
+
+%% Drive whichever cipher-handshake substate we're currently in.  Each
+%% transition consumes some prefix of ``buffer`` and moves to the next
+%% substate; on success we eventually land in ``v2_phase = ready`` and
+%% the caller starts driving ``process_buffer_v2``.
+drive_v2_handshake(#peer_data{v2_phase = recv_pubkey,
+                              buffer = Buffer} = Data)
+  when byte_size(Buffer) >= 64 ->
+    <<TheirPubKey:64/binary, Rest/binary>> = Buffer,
+    case beamchain_transport_v2:new_cipher() of
+        {ok, Cipher0} ->
+            case beamchain_transport_v2:initialize(
+                   Cipher0, TheirPubKey, false, false) of
+                {ok, Cipher1} ->
+                    %% Send our 64-byte ellswift + send_garbage +
+                    %% send_garbage_terminator + version-packet (AAD =
+                    %% sent_garbage).  We pick a small uniformly random
+                    %% garbage payload to keep the wire-overhead low while
+                    %% still exercising the AAD-binding path.  Bitcoin
+                    %% Core picks uniform-random in [0, 4095]; small is
+                    %% strictly less observable on the wire.
+                    OurPubKey = beamchain_transport_v2:get_pubkey(Cipher1),
+                    SentGarbage = crypto:strong_rand_bytes(rand:uniform(33) - 1),
+                    SendTerm = beamchain_transport_v2:get_send_garbage_terminator(Cipher1),
+                    {ok, VerPkt, Cipher2} = beamchain_transport_v2:encrypt(
+                        Cipher1, <<>>, SentGarbage, false),
+                    Wire = <<OurPubKey/binary,
+                             SentGarbage/binary,
+                             SendTerm/binary,
+                             VerPkt/binary>>,
+                    case raw_socket_send(Data, Wire) of
+                        {ok, Data2} ->
+                            Data3 = Data2#peer_data{
+                                buffer = Rest,
+                                v2_phase = recv_garbterm,
+                                v2_cipher = Cipher2,
+                                v2_sent_garbage = SentGarbage,
+                                v2_recv_window = <<>>
+                            },
+                            drive_v2_handshake(Data3);
+                        {stop, Reason} ->
+                            {stop, Reason}
+                    end;
+                {error, Reason} ->
+                    logger:warning("peer ~p v2 cipher init failed: ~p",
+                                   [Data#peer_data.address, Reason]),
+                    {stop, {v2_init_failed, Reason}}
+            end;
+        {error, Reason} ->
+            logger:warning("peer ~p v2 cipher new failed: ~p",
+                           [Data#peer_data.address, Reason]),
+            {stop, {v2_new_failed, Reason}}
+    end;
+drive_v2_handshake(#peer_data{v2_phase = recv_pubkey, buffer = Buffer} = Data)
+  when byte_size(Buffer) < 64 ->
+    %% Need more bytes; wait for the next TCP segment.
+    {ok, Data};
+drive_v2_handshake(#peer_data{v2_phase = recv_garbterm} = Data) ->
+    drive_v2_garbterm(Data);
+drive_v2_handshake(#peer_data{v2_phase = drain_decoy} = Data) ->
+    drive_v2_drain(Data).
+
+%% Scan the incoming stream for the 16-byte recv_garbage_terminator.
+%% The peer may emit 0..MAX_GARBAGE_LEN random bytes before the
+%% terminator.  We sweep one byte at a time (matching Bitcoin Core
+%% net.cpp:1297 GetMaxBytesToProcess returning 1 in GARB_GARBTERM
+%% state) because the terminator may begin at any offset within the
+%% pre-key garbage.
+drive_v2_garbterm(#peer_data{v2_cipher = Cipher,
+                              v2_recv_window = Window,
+                              buffer = Buffer} = Data) ->
+    Term = beamchain_transport_v2:get_recv_garbage_terminator(Cipher),
+    TermLen = beamchain_transport_v2:garbage_terminator_len(),
+    MaxLen = beamchain_transport_v2:max_garbage_len() + TermLen,
+    %% Move bytes from Buffer into Window, byte-by-byte, watching for
+    %% the terminator at the trailing edge.  Bound the search at
+    %% MAX_GARBAGE_LEN + 16 — beyond that the peer is misbehaving.
+    case scan_terminator(Window, Buffer, Term, TermLen, MaxLen) of
+        {found, RecvGarbage, BufferRest} ->
+            %% AAD for our first decrypt() call is the peer's pre-terminator
+            %% garbage stream.  After that decrypt clears it.
+            Data2 = Data#peer_data{
+                buffer = BufferRest,
+                v2_phase = drain_decoy,
+                v2_recv_window = <<>>,
+                v2_next_aad = RecvGarbage
+            },
+            drive_v2_drain(Data2);
+        {incomplete, NewWindow, BufferRest} ->
+            {ok, Data#peer_data{
+                v2_recv_window = NewWindow,
+                buffer = BufferRest
+            }};
+        too_long ->
+            logger:warning("peer ~p v2 garbage terminator not seen within "
+                            "~B bytes — protocol violation",
+                            [Data#peer_data.address, MaxLen]),
+            {stop, v2_garbage_too_long}
+    end.
+
+%% Returns {found, GarbageBytes, BufferRest}, {incomplete, NewWindow,
+%% BufferRest}, or too_long.  ``Window`` is the bytes consumed from the
+%% peer so far, ``Buffer`` is the bytes still queued for inspection.
+scan_terminator(Window, <<>>, _Term, _TermLen, _MaxLen)
+  when byte_size(Window) > 0 ->
+    %% No more bytes to scan; preserve window so the next TCP segment
+    %% extends it.
+    {incomplete, Window, <<>>};
+scan_terminator(Window, <<>>, _Term, _TermLen, _MaxLen) ->
+    {incomplete, Window, <<>>};
+scan_terminator(Window, _Buffer, _Term, _TermLen, MaxLen)
+  when byte_size(Window) > MaxLen ->
+    too_long;
+scan_terminator(Window, <<Byte, BufRest/binary>>, Term, TermLen, MaxLen) ->
+    NewWindow = <<Window/binary, Byte>>,
+    case byte_size(NewWindow) >= TermLen of
+        true ->
+            Tail = binary:part(NewWindow, byte_size(NewWindow) - TermLen, TermLen),
+            case Tail =:= Term of
+                true ->
+                    %% Strip the terminator off the trailing edge; the
+                    %% bytes that come before it are the peer's pre-key
+                    %% garbage (used as AAD for our first decrypt).
+                    Garbage = binary:part(NewWindow, 0,
+                                          byte_size(NewWindow) - TermLen),
+                    {found, Garbage, BufRest};
+                false ->
+                    scan_terminator(NewWindow, BufRest, Term, TermLen, MaxLen)
+            end;
+        false ->
+            scan_terminator(NewWindow, BufRest, Term, TermLen, MaxLen)
+    end.
+
+%% Drain incoming AEAD packets (decoys + version) until we receive the
+%% mandatory non-decoy version packet.  Each decoy packet consumes its
+%% wire bytes but is otherwise discarded.  AAD is consumed on the first
+%% decrypt regardless of decoy/non-decoy (Bitcoin Core net.cpp:1243
+%% ClearShrink(m_recv_aad)) — so we clear v2_next_aad after the first
+%% decrypt call below.
+drive_v2_drain(Data) ->
+    case extract_v2_packet(Data) of
+        {ok, Contents, Ignore, Data2} ->
+            Data3 = Data2#peer_data{v2_next_aad = <<>>},
+            case Ignore of
+                true  -> drive_v2_drain(Data3);
+                false -> on_v2_version_packet(Contents, Data3)
+            end;
+        incomplete ->
+            {ok, Data};
+        {stop, Reason} ->
+            {stop, Reason}
+    end.
+
+%% First non-decoy packet is the BIP-324 version packet.  Per spec the
+%% contents are reserved for future protocol extensions; current Bitcoin
+%% Core ignores them, and so do we.  We log the size for diagnostics.
+on_v2_version_packet(Contents, #peer_data{address = Addr} = Data) ->
+    logger:debug("peer ~p v2 version packet received (~B bytes)",
+                 [Addr, byte_size(Contents)]),
+    %% Cipher handshake is now complete.  Send our own application-level
+    %% version message immediately (BIP-324 wraps it as a v2 packet) so
+    %% the peer doesn't time out on us.
+    Data1 = Data#peer_data{v2_phase = ready},
+    Data2 = do_send_version(Data1),
+    %% Process any remaining buffered bytes — peer may have pipelined
+    %% their version packet right after the version-packet decoy.
+    process_buffer_v2(Data2).
+
+%% Decode and dispatch one or more v2 application packets.  Each packet
+%% is: 3-byte enc-length || 1-byte hdr || contents || 16-byte tag.
+%% Application packets carry no AAD (per BIP-324 §"Wire format").
+process_buffer_v2(Data) ->
+    case extract_v2_packet(Data) of
+        {ok, _Contents, true, Data2} ->
+            %% Decoy — discard contents, keep going.
+            process_buffer_v2(Data2);
+        {ok, Contents, false, Data2} ->
+            case beamchain_v2_msg:decode_contents(Contents) of
+                {ok, CmdBin, Payload} ->
+                    Cmd = beamchain_p2p_msg:command_atom(CmdBin),
+                    case dispatch_message(Cmd, Payload, Data2) of
+                        {ok, Data3}    -> process_buffer_v2(Data3);
+                        {stop, Reason} -> {stop, Reason}
+                    end;
+                {error, DecodeErr} ->
+                    logger:warning("peer ~p v2 contents decode failed: ~p",
+                                   [Data#peer_data.address, DecodeErr]),
+                    {stop, {v2_decode_failed, DecodeErr}}
+            end;
+        incomplete ->
+            {ok, Data};
+        {stop, Reason} ->
+            {stop, Reason}
+    end.
+
+%% Pull one complete AEAD packet from ``buffer``.  Returns:
+%%
+%%   {ok, Contents, IgnoreFlag, NewData}  — packet decrypted & consumed.
+%%   incomplete                          — need more bytes.
+%%   {stop, Reason}                      — protocol violation; close.
+%%
+%% Handles the half-buffered case (length-field arrived but body in
+%% flight) by stashing the decrypted ContentsLen in ``v2_pending_len``
+%% so we don't double-advance the recv_l cipher on retry.  AAD is taken
+%% from ``v2_next_aad`` and cleared after a successful decrypt.
+extract_v2_packet(#peer_data{buffer = Buffer,
+                              v2_cipher = Cipher,
+                              v2_pending_len = Pending,
+                              v2_next_aad = AAD} = Data) ->
+    LenLen = beamchain_transport_v2:length_field_len(),
+    HdrLen = beamchain_transport_v2:header_len(),
+    TagLen = beamchain_transport_v2:tag_len(),
+    case Pending of
+        undefined ->
+            case Buffer of
+                <<EncLen:LenLen/binary, BufferRest/binary>> ->
+                    {ok, ContentsLen, Cipher1} =
+                        beamchain_transport_v2:decrypt_length(Cipher, EncLen),
+                    Data1 = Data#peer_data{
+                        v2_cipher = Cipher1,
+                        v2_pending_len = ContentsLen,
+                        buffer = BufferRest
+                    },
+                    extract_v2_body(Data1, ContentsLen, HdrLen, TagLen, AAD);
+                _ ->
+                    incomplete
+            end;
+        ContentsLen when is_integer(ContentsLen) ->
+            extract_v2_body(Data, ContentsLen, HdrLen, TagLen, AAD)
+    end.
+
+extract_v2_body(#peer_data{buffer = Buffer, v2_cipher = Cipher} = Data,
+                ContentsLen, HdrLen, TagLen, AAD) ->
+    BodyLen = HdrLen + ContentsLen + TagLen,
+    case Buffer of
+        <<EncBody:BodyLen/binary, Rest/binary>> ->
+            case beamchain_transport_v2:decrypt(
+                   Cipher, EncBody, AAD, ContentsLen) of
+                {ok, Contents, Ignore, Cipher1} ->
+                    Data1 = Data#peer_data{
+                        v2_cipher = Cipher1,
+                        v2_pending_len = undefined,
+                        buffer = Rest
+                    },
+                    {ok, Contents, Ignore, Data1};
+                {error, auth_failed} ->
+                    logger:warning("peer ~p v2 AEAD auth failed",
+                                   [Data#peer_data.address]),
+                    {stop, v2_auth_failed}
+            end;
+        _ ->
+            incomplete
+    end.
+
+%% Send raw bytes on the underlying TCP socket without v2-wrapping.
+%% Used exclusively during the cipher handshake (the bytes are the
+%% ellswift pubkey, garbage, and the very first AEAD packet — all of
+%% which are produced by beamchain_transport_v2 directly).
+raw_socket_send(#peer_data{socket = Socket} = Data, Bytes) ->
+    case gen_tcp:send(Socket, Bytes) of
+        ok ->
+            {ok, Data#peer_data{
+                bytes_sent = Data#peer_data.bytes_sent + byte_size(Bytes),
+                last_send  = erlang:system_time(millisecond)
+            }};
+        {error, Reason} ->
+            logger:debug("peer ~p raw_socket_send failed: ~p",
+                         [Data#peer_data.address, Reason]),
+            {stop, {tcp_send_failed, Reason}}
     end.
 
 %%% ===================================================================
@@ -890,6 +1274,23 @@ do_send_msg(Command, PayloadData, Data) ->
     Payload = beamchain_p2p_msg:encode_payload(Command, PayloadData),
     do_send_raw(Command, Payload, Data).
 
+do_send_raw(Command, Payload, #peer_data{v2_phase = ready,
+                                          v2_cipher = Cipher,
+                                          socket = Socket} = Data)
+  when Cipher =/= undefined ->
+    %% v2 path: short-id-or-long-form contents, then AEAD-encrypt with
+    %% empty AAD (BIP-324 §"Wire format" reserves AAD for the very first
+    %% post-handshake packet from each direction; we already consumed
+    %% that during the cipher-handshake).
+    Contents = beamchain_v2_msg:encode_contents(Command, Payload),
+    {ok, Wire, Cipher2} = beamchain_transport_v2:encrypt(
+        Cipher, Contents, <<>>, false),
+    gen_tcp:send(Socket, Wire),
+    Data#peer_data{
+        v2_cipher  = Cipher2,
+        bytes_sent = Data#peer_data.bytes_sent + byte_size(Wire),
+        last_send  = erlang:system_time(millisecond)
+    };
 do_send_raw(Command, Payload, #peer_data{socket = Socket, magic = Magic} = Data) ->
     Msg = beamchain_p2p_msg:encode_msg(Magic, Command, Payload),
     gen_tcp:send(Socket, Msg),
