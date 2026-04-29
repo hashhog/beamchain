@@ -468,3 +468,183 @@ v2_classify_short_input_does_not_crash_test() ->
                                                "version">>, ?MAINNET_MAGIC)),
     ?assertEqual(false,
         beamchain_peer:is_v1_version_header(<<>>, ?MAINNET_MAGIC)).
+
+%%% ===================================================================
+%%% BIP-324 v2 outbound initiator state machine
+%%%
+%%% Covers the symmetric counterpart of the responder state machine
+%%% (already exercised by beamchain_transport_v2_tests):
+%%%   pubkey send / construction → garbage send → AAD-bound version
+%%%   packet → recv_pubkey classification (v1 fallback vs v2 carry-on)
+%%%   → garbage-terminator scan → drain-decoy.
+%%%
+%%% These tests target the pure helpers that the production gen_statem
+%%% drives, so they don't need a live socket or peer process.
+%%% ===================================================================
+
+%% Pubkey send: build_v2_initiator_handshake/2 returns a 64-byte
+%% ellswift pubkey from a fresh cipher.  Two independent calls produce
+%% distinct pubkeys (the cipher generates a random keypair).
+v2_initiator_build_pubkey_test() ->
+    {ok, P1, _C1} = beamchain_peer:build_v2_initiator_handshake(random, ignored),
+    ?assertEqual(64, byte_size(P1)),
+    {ok, P2, _C2} = beamchain_peer:build_v2_initiator_handshake(random, ignored),
+    ?assertEqual(64, byte_size(P2)),
+    ?assertNotEqual(P1, P2).
+
+%% Deterministic pubkey: passing a fixed seckey + auxrand produces a
+%% reproducible pubkey, so the same secret derivation roundtrips.
+v2_initiator_deterministic_pubkey_test() ->
+    SecKey = <<1:256>>,
+    AuxRand = <<2:256>>,
+    {ok, P1, _C1} = beamchain_peer:build_v2_initiator_handshake(SecKey, AuxRand),
+    {ok, P2, _C2} = beamchain_peer:build_v2_initiator_handshake(SecKey, AuxRand),
+    ?assertEqual(64, byte_size(P1)),
+    ?assertEqual(P1, P2).
+
+%% Garbage construction: an initiator-side cipher correctly produces a
+%% 16-byte send_garbage_terminator after the ECDH-derived
+%% initialisation, AND the AEAD encrypt of an empty version_packet
+%% with AAD = our_garbage round-trips through a responder-side cipher
+%% sharing the same shared secret.
+v2_initiator_garbage_aad_roundtrip_test() ->
+    %% Build initiator + responder ciphers with matching keypairs.  We
+    %% bypass the full network stack: the public API of
+    %% beamchain_transport_v2 lets us hand-derive both sides.
+    InitSec = <<3:256>>,
+    InitAux = <<4:256>>,
+    RespSec = <<5:256>>,
+    RespAux = <<6:256>>,
+    {ok, IC0} = beamchain_transport_v2:new_cipher(InitSec, InitAux),
+    {ok, RC0} = beamchain_transport_v2:new_cipher(RespSec, RespAux),
+    InitPub = beamchain_transport_v2:get_pubkey(IC0),
+    RespPub = beamchain_transport_v2:get_pubkey(RC0),
+    Magic = <<16#FA, 16#BF, 16#B5, 16#DA>>,  %% regtest, decoupled from app config
+    {ok, IC1} = beamchain_transport_v2:initialize(IC0, RespPub, true,  false, Magic),
+    {ok, RC1} = beamchain_transport_v2:initialize(RC0, InitPub, false, false, Magic),
+    %% Initiator sends garbage + terminator + version_packet (AAD = garbage).
+    OurGarbage = <<7,7,7,7,7>>,  %% 5 bytes of fixed garbage for determinism
+    SendTerm = beamchain_transport_v2:get_send_garbage_terminator(IC1),
+    ?assertEqual(16, byte_size(SendTerm)),
+    %% Responder's recv_garbage_terminator MUST equal initiator's
+    %% send_garbage_terminator (it's the SAME 16 bytes — both sides
+    %% derive it from the shared HKDF output).
+    RecvTermAtResponder = beamchain_transport_v2:get_recv_garbage_terminator(RC1),
+    ?assertEqual(SendTerm, RecvTermAtResponder),
+    {ok, VerPkt, _IC2} = beamchain_transport_v2:encrypt(IC1, <<>>, OurGarbage, false),
+    %% Responder decrypts: AAD = our garbage, expected length 0.
+    LenLen = beamchain_transport_v2:length_field_len(),
+    <<EncLen:LenLen/binary, EncBody/binary>> = VerPkt,
+    {ok, 0, RC2} = beamchain_transport_v2:decrypt_length(RC1, EncLen),
+    {ok, Contents, Ignore, _RC3} =
+        beamchain_transport_v2:decrypt(RC2, EncBody, OurGarbage, 0),
+    ?assertEqual(<<>>, Contents),
+    ?assertEqual(false, Ignore).
+
+%% Terminator scanning: find a known terminator after a chunk of
+%% pre-key garbage.  Verifies the byte-by-byte sliding-window logic.
+v2_initiator_scan_terminator_found_test() ->
+    Term = <<"0123456789ABCDEF">>,  %% 16 bytes, distinct
+    Garbage = <<"hello-garbage-prefix">>,
+    Trailing = <<"more-bytes-after">>,
+    Buffer = <<Garbage/binary, Term/binary, Trailing/binary>>,
+    MaxLen = 4095 + 16,
+    {found, FoundGarbage, Rest} =
+        beamchain_peer:scan_terminator(<<>>, Buffer, Term, 16, MaxLen),
+    ?assertEqual(Garbage, FoundGarbage),
+    ?assertEqual(Trailing, Rest).
+
+v2_initiator_scan_terminator_zero_garbage_test() ->
+    %% Terminator with NO pre-key garbage (peer chose 0-byte garbage).
+    Term = <<"0123456789ABCDEF">>,
+    Trailing = <<"version-packet-bytes">>,
+    Buffer = <<Term/binary, Trailing/binary>>,
+    MaxLen = 4095 + 16,
+    {found, FoundGarbage, Rest} =
+        beamchain_peer:scan_terminator(<<>>, Buffer, Term, 16, MaxLen),
+    ?assertEqual(<<>>, FoundGarbage),
+    ?assertEqual(Trailing, Rest).
+
+v2_initiator_scan_terminator_incomplete_test() ->
+    %% Less than 16 bytes — incomplete.
+    Term = <<"0123456789ABCDEF">>,
+    Buffer = <<"shor">>,
+    MaxLen = 4095 + 16,
+    Result = beamchain_peer:scan_terminator(<<>>, Buffer, Term, 16, MaxLen),
+    ?assertMatch({incomplete, _, _}, Result).
+
+v2_initiator_scan_terminator_too_long_test() ->
+    %% Garbage longer than MaxLen — protocol violation.
+    Term = <<"NEVER-FOUND-XXXX">>,  %% 16 bytes, won't match
+    Buffer = binary:copy(<<"a">>, 100),
+    MaxLen = 50,
+    Result = beamchain_peer:scan_terminator(<<>>, Buffer, Term, 16, MaxLen),
+    ?assertEqual(too_long, Result).
+
+%% Fallback path: env-var / app-config + per-address cache.
+v2_outbound_default_off_test() ->
+    %% No env var set, no app env set → off.
+    os:unsetenv("BEAMCHAIN_BIP324_V2_OUTBOUND"),
+    application:unset_env(beamchain, bip324_v2_outbound),
+    ?assertEqual(false, beamchain_peer:bip324_v2_outbound_enabled()).
+
+v2_outbound_env_var_truthy_test() ->
+    application:unset_env(beamchain, bip324_v2_outbound),
+    %% Various truthy spellings.
+    lists:foreach(fun(Val) ->
+        os:putenv("BEAMCHAIN_BIP324_V2_OUTBOUND", Val),
+        ?assertEqual(true, beamchain_peer:bip324_v2_outbound_enabled())
+    end, ["1", "true", "TRUE", "yes", "on"]),
+    os:unsetenv("BEAMCHAIN_BIP324_V2_OUTBOUND").
+
+v2_outbound_env_var_falsy_test() ->
+    application:unset_env(beamchain, bip324_v2_outbound),
+    lists:foreach(fun(Val) ->
+        os:putenv("BEAMCHAIN_BIP324_V2_OUTBOUND", Val),
+        ?assertEqual(false, beamchain_peer:bip324_v2_outbound_enabled())
+    end, ["0", "false", "no", ""]),
+    os:unsetenv("BEAMCHAIN_BIP324_V2_OUTBOUND").
+
+v2_outbound_app_env_test() ->
+    %% App env honoured when env var is absent.
+    os:unsetenv("BEAMCHAIN_BIP324_V2_OUTBOUND"),
+    application:set_env(beamchain, bip324_v2_outbound, true),
+    ?assertEqual(true, beamchain_peer:bip324_v2_outbound_enabled()),
+    application:set_env(beamchain, bip324_v2_outbound, false),
+    ?assertEqual(false, beamchain_peer:bip324_v2_outbound_enabled()),
+    application:unset_env(beamchain, bip324_v2_outbound).
+
+%% Per-address v1-only cache: mark, lookup, clear.
+v2_outbound_v1_only_cache_test() ->
+    beamchain_peer:clear_v1_only_cache(),
+    A = {{192,0,2,1}, 8333},
+    B = {{192,0,2,2}, 8333},
+    ?assertEqual(false, beamchain_peer:is_v1_only(A)),
+    ?assertEqual(false, beamchain_peer:is_v1_only(B)),
+    beamchain_peer:mark_v1_only(A),
+    ?assertEqual(true, beamchain_peer:is_v1_only(A)),
+    ?assertEqual(false, beamchain_peer:is_v1_only(B)),
+    beamchain_peer:mark_v1_only(B),
+    ?assertEqual(true, beamchain_peer:is_v1_only(A)),
+    ?assertEqual(true, beamchain_peer:is_v1_only(B)),
+    beamchain_peer:clear_v1_only_cache(),
+    ?assertEqual(false, beamchain_peer:is_v1_only(A)),
+    ?assertEqual(false, beamchain_peer:is_v1_only(B)).
+
+%% IPv6 addresses round-trip through the cache.
+v2_outbound_v1_only_cache_ipv6_test() ->
+    beamchain_peer:clear_v1_only_cache(),
+    A = {{0,0,0,0,0,0,0,1}, 8333},   %% ::1
+    ?assertEqual(false, beamchain_peer:is_v1_only(A)),
+    beamchain_peer:mark_v1_only(A),
+    ?assertEqual(true, beamchain_peer:is_v1_only(A)),
+    beamchain_peer:clear_v1_only_cache().
+
+%% mark_v1_only is idempotent — repeated marks for the same address
+%% don't corrupt the cache.
+v2_outbound_v1_only_cache_idempotent_test() ->
+    beamchain_peer:clear_v1_only_cache(),
+    A = {{10,0,0,1}, 8333},
+    [beamchain_peer:mark_v1_only(A) || _ <- lists:seq(1, 5)],
+    ?assertEqual(true, beamchain_peer:is_v1_only(A)),
+    beamchain_peer:clear_v1_only_cache().
