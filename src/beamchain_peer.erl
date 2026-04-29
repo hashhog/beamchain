@@ -18,13 +18,21 @@
          disconnect/1, info/1,
          queue_tx_inv/2]).
 
+%% BIP-324 v2 outbound: per-address v1-only cache + env-var gate.
+-export([bip324_v2_outbound_enabled/0,
+         mark_v1_only/1, is_v1_only/1,
+         clear_v1_only_cache/0]).
+
 %% gen_statem callbacks
 -export([callback_mode/0, init/1, terminate/3]).
 -export([connecting/3, handshaking/3, ready/3]).
 
-%% Test-only exports (BIP-324 v2 peek-classify helper).
+%% Test-only exports (BIP-324 v2 peek-classify helper + initiator
+%% state-machine internals).
 -ifdef(TEST).
--export([is_v1_version_header/2]).
+-export([is_v1_version_header/2,
+         build_v2_initiator_handshake/2,
+         scan_terminator/5]).
 -endif.
 
 %%% -------------------------------------------------------------------
@@ -161,8 +169,28 @@
     %% arrives — otherwise the next pass would call decrypt_length()
     %% again and double-advance the cipher.  ``undefined`` means "no
     %% pending body".
-    v2_pending_len = undefined  :: undefined | non_neg_integer()
+    v2_pending_len = undefined  :: undefined | non_neg_integer(),
+    %% BIP-324 v2 outbound: true iff this is an outbound peer dialing
+    %% v2 (initiator).  Set in init/1 from the address-cache + env-var
+    %% gate; consumed in connecting → handshaking to drive the initiator
+    %% state machine instead of the v1 send-version path.
+    v2_initiator = false        :: boolean()
 }).
+
+%%% -------------------------------------------------------------------
+%%% BIP-324 v2 outbound — module-level state
+%%% -------------------------------------------------------------------
+
+%% Per-address v1-only fallback cache.  Keyed by {IP, Port} (the same
+%% tuple used everywhere else in this module for addresses).  Mirrors
+%% clearbit's `v2_fallback_set` (peer.zig:1759).  Bounded by
+%% ?V2_FALLBACK_CACHE_MAX to keep memory finite under churn — when the
+%% cap is reached we drop one arbitrary entry before inserting (the ETS
+%% iteration order is undefined, which is acceptable for an LRU-ish
+%% bound on a self-correcting cache: a v2-capable peer that gets evicted
+%% will simply be re-probed on its next outbound attempt).
+-define(V2_FALLBACK_TABLE, beamchain_peer_v1_only).
+-define(V2_FALLBACK_CACHE_MAX, 4096).
 
 %%% ===================================================================
 %%% API
@@ -210,6 +238,98 @@ info(Pid) ->
 queue_tx_inv(Pid, Txid) when is_binary(Txid), byte_size(Txid) =:= 32 ->
     gen_statem:cast(Pid, {queue_tx_inv, Txid}).
 
+%%% -------------------------------------------------------------------
+%%% BIP-324 v2 outbound: feature gate + per-address v1-only cache
+%%% -------------------------------------------------------------------
+
+%% @doc Returns true iff outbound BIP-324 v2 is enabled.  Default OFF
+%% (conservative: v2 inbound responder landed in 72732d5; outbound is
+%% wired by this commit but still gated until soak time accumulates).
+%% Operators flip on with `BEAMCHAIN_BIP324_V2_OUTBOUND=1` (or "true")
+%% in the environment, or `{bip324_v2_outbound, true}` in the
+%% application config.  Mirrors clearbit's `bip324V2Enabled/0`
+%% (peer.zig:653) modulo default polarity.
+-spec bip324_v2_outbound_enabled() -> boolean().
+bip324_v2_outbound_enabled() ->
+    case os:getenv("BEAMCHAIN_BIP324_V2_OUTBOUND") of
+        false ->
+            case application:get_env(beamchain, bip324_v2_outbound) of
+                {ok, true}  -> true;
+                _           -> false
+            end;
+        Val ->
+            case string:lowercase(Val) of
+                "1"      -> true;
+                "true"   -> true;
+                "on"     -> true;
+                "yes"    -> true;
+                _        -> false
+            end
+    end.
+
+%% @doc Mark an address as v1-only.  Future outbound attempts to this
+%% address skip the v2 probe.
+-spec mark_v1_only({inet:ip_address(), inet:port_number()}) -> ok.
+mark_v1_only(Address) ->
+    ensure_fallback_table(),
+    case ets:info(?V2_FALLBACK_TABLE, size) of
+        Size when is_integer(Size), Size >= ?V2_FALLBACK_CACHE_MAX ->
+            %% Drop one arbitrary entry to make room.  ETS iteration
+            %% order is undefined, which is fine for a bounded
+            %% self-correcting cache.
+            case ets:first(?V2_FALLBACK_TABLE) of
+                '$end_of_table' -> ok;
+                K               -> ets:delete(?V2_FALLBACK_TABLE, K)
+            end;
+        _ ->
+            ok
+    end,
+    ets:insert(?V2_FALLBACK_TABLE, {Address}),
+    ok.
+
+%% @doc True iff `Address` is in the v1-only fallback cache.
+-spec is_v1_only({inet:ip_address(), inet:port_number()}) -> boolean().
+is_v1_only(Address) ->
+    ensure_fallback_table(),
+    case ets:lookup(?V2_FALLBACK_TABLE, Address) of
+        [_] -> true;
+        []  -> false
+    end.
+
+%% @doc Empty the v1-only fallback cache.  Test-only utility.
+-spec clear_v1_only_cache() -> ok.
+clear_v1_only_cache() ->
+    case ets:info(?V2_FALLBACK_TABLE) of
+        undefined -> ok;
+        _         -> ets:delete_all_objects(?V2_FALLBACK_TABLE)
+    end,
+    ok.
+
+%% Lazily create the v1-only cache table.  ETS tables are owned by the
+%% process that creates them; on first call we create it from whichever
+%% process happened to dial first.  Subsequent processes find it
+%% existing.  We use named_table + public so any peer process can
+%% read+write without going through a coordinator.  heir_data is set so
+%% the table survives the creator dying.
+ensure_fallback_table() ->
+    case ets:info(?V2_FALLBACK_TABLE) of
+        undefined ->
+            try
+                ets:new(?V2_FALLBACK_TABLE,
+                        [named_table, public, set,
+                         {read_concurrency, true},
+                         {write_concurrency, true},
+                         {heir, none}])
+            catch
+                error:badarg ->
+                    %% Race: another process created it between our
+                    %% info/0 check and the new/2 call.  That's fine.
+                    ok
+            end;
+        _ ->
+            ok
+    end.
+
 %%% ===================================================================
 %%% gen_statem callbacks
 %%% ===================================================================
@@ -222,13 +342,15 @@ init({outbound, {Host, Port} = Addr, Handler, _Opts}) when is_list(Host); is_bin
     Nonce = generate_nonce(),
     Magic = beamchain_config:magic(),
     MonRef = erlang:monitor(process, Handler),
+    V2Init = should_init_v2_outbound(Addr),
     Data = #peer_data{
         address = Addr,
         direction = outbound,
         our_nonce = Nonce,
         magic = Magic,
         handler = Handler,
-        handler_mon = MonRef
+        handler_mon = MonRef,
+        v2_initiator = V2Init
     },
     HostStr = to_string(Host),
     ConnectOpts = #{timeout => ?CONNECT_TIMEOUT},
@@ -253,13 +375,15 @@ init({outbound, {IP, Port} = Addr, Handler, _Opts}) ->
     Nonce = generate_nonce(),
     Magic = beamchain_config:magic(),
     MonRef = erlang:monitor(process, Handler),
+    V2Init = should_init_v2_outbound(Addr),
     Data = #peer_data{
         address = Addr,
         direction = outbound,
         our_nonce = Nonce,
         magic = Magic,
         handler = Handler,
-        handler_mon = MonRef
+        handler_mon = MonRef,
+        v2_initiator = V2Init
     },
     case gen_tcp:connect(IP, Port,
                          [binary, {active, false}, {packet, raw},
@@ -308,15 +432,19 @@ init({inbound, Socket, Addr, Handler}) ->
 connecting(enter, _OldState, _Data) ->
     %% Cannot use next_event from enter callbacks in state_enter mode.
     %% Use state_timeout with 0ms to trigger immediately.
-    {keep_state_and_data, [{state_timeout, 0, send_version}]};
+    {keep_state_and_data, [{state_timeout, 0, start_handshake}]};
 
+connecting(state_timeout, start_handshake, Data) ->
+    start_handshake(Data);
+
+connecting(internal, start_handshake, Data) ->
+    start_handshake(Data);
+
+%% Backwards-compat (the old action name is referenced in some tests):
 connecting(state_timeout, send_version, Data) ->
-    Data2 = do_send_version(Data),
-    {next_state, handshaking, Data2};
-
+    start_handshake(Data);
 connecting(internal, send_version, Data) ->
-    Data2 = do_send_version(Data),
-    {next_state, handshaking, Data2};
+    start_handshake(Data);
 
 connecting(info, {tcp_closed, _}, _Data) ->
     {stop, connection_closed};
@@ -329,6 +457,22 @@ connecting(cast, disconnect, _Data) ->
 
 connecting(_EventType, _Event, _Data) ->
     keep_state_and_data.
+
+%% Begin the handshake.  Outbound v2 initiator: send our 64-byte
+%% ellswift pubkey + garbage + garbage_terminator + first AEAD packet
+%% (BIP-324 version_packet, AAD=our_garbage), then transition to
+%% handshaking with v2_phase=recv_pubkey awaiting peer's pubkey.
+%% Outbound v1: send our v1 ``version`` and pin v2_phase=v1 so
+%% maybe_classify_inbound doesn't re-route bytes through the v2 path.
+%% Inbound never reaches connecting (init goes straight to handshaking).
+start_handshake(#peer_data{v2_initiator = true} = Data) ->
+    case begin_v2_outbound(Data) of
+        {ok, Data2}     -> {next_state, handshaking, Data2};
+        {stop, Reason}  -> {stop, Reason}
+    end;
+start_handshake(#peer_data{v2_initiator = false} = Data) ->
+    Data2 = do_send_version(Data),
+    {next_state, handshaking, Data2#peer_data{v2_phase = v1}}.
 
 %%% -------------------------------------------------------------------
 %%% handshaking - waiting for remote version + verack
@@ -528,14 +672,12 @@ handle_tcp_data(NewBytes, #peer_data{socket = Socket, buffer = Buf} = Data) ->
 %% "version\0\0\0\0\0"` treat as v1; otherwise treat as a v2
 %% ElligatorSwift pubkey (responder mode).
 %%
-%% Outbound: we always send our v1 ``version`` first (state_enter →
-%% do_send_version), so the peer's reply will be a v1 frame on the
-%% existing path — pin the phase to ``v1`` immediately so this
-%% function doesn't accidentally route peer-replied magic bytes
-%% through the v2 path.  Outbound v2 dialing is NOT YET WIRED (see
-%% W90 audit); when it is added, the outbound branch will instead
-%% send our 64-byte ellswift pubkey from `connecting` and pin
-%% v2_phase = recv_pubkey here.
+%% Outbound: classification is decided in start_handshake/1 before any
+%% bytes hit the wire — the v2_initiator path pins v2_phase=recv_pubkey
+%% (and has already queued our pubkey + garbage to the peer); the v1
+%% path pins v2_phase=v1 (and has already queued our v1 ``version``).
+%% By the time we receive any peer bytes, v2_phase is no longer
+%% undefined for outbound peers, so this clause matches only inbound.
 maybe_classify_inbound(#peer_data{direction = inbound,
                                    v2_phase = undefined,
                                    buffer = Buffer,
@@ -552,10 +694,36 @@ maybe_classify_inbound(#peer_data{direction = inbound,
     end;
 maybe_classify_inbound(#peer_data{direction = outbound,
                                    v2_phase = undefined} = Data) ->
-    %% Outbound: pin to v1 (no outbound v2 dialer yet).
+    %% Defensive fallback: should never happen — start_handshake/1 sets
+    %% v2_phase before any peer bytes can arrive (the v1 path pins v1,
+    %% the v2 path pins recv_pubkey).  If we got here it means the peer
+    %% raced their first packet ahead of our state-enter timeout, which
+    %% is fine: pin to v1 (safer default; v1 magic check still gates
+    %% the path below).
     Data#peer_data{v2_phase = v1};
 maybe_classify_inbound(Data) ->
     Data.
+
+%% Detect whether the peer responded to our v2 initiator probe with v1
+%% magic.  Called from drive_v2_handshake/1 in the recv_pubkey substate
+%% as a sanity check before parsing the 64-byte pubkey.  If the first
+%% 16 bytes match a v1 ``version`` header, the peer is v1 and we must
+%% disconnect, mark v1-only, and let the manager retry on a fresh
+%% socket.  Returns:
+%%   v1_response  — peer replied with v1 magic; fall back.
+%%   v2_response  — first 16 bytes are not v1; carry on with the v2
+%%                  cipher handshake.
+classify_v2_response(Buffer, Magic) when byte_size(Buffer) >= 16 ->
+    <<Head:16/binary, _/binary>> = Buffer,
+    case is_v1_version_header(Head, Magic) of
+        true  -> v1_response;
+        false -> v2_response
+    end;
+classify_v2_response(_, _) ->
+    %% Fewer than 16 bytes — wait for more.  Caller already gates on
+    %% ``byte_size(Buffer) >= 64`` for the pubkey, so this case is
+    %% unreachable in practice.  Defensive default: assume v2.
+    v2_response.
 
 %% True iff the first 16 bytes match a v1 ``version`` message header.
 %% We anchor on the literal command name rather than just the network
@@ -604,7 +772,56 @@ process_buffer_v1(#peer_data{buffer = Buffer} = Data) ->
 %% transition consumes some prefix of ``buffer`` and moves to the next
 %% substate; on success we eventually land in ``v2_phase = ready`` and
 %% the caller starts driving ``process_buffer_v2``.
+%%
+%% Two recv_pubkey entrypoints:
+%%
+%%   * Initiator (outbound, v2_cipher already set):
+%%       We already sent our 64-byte ellswift + garbage + version
+%%       packet from start_handshake/begin_v2_outbound.  Just consume
+%%       the peer's pubkey and advance to recv_garbterm.  Sanity-check
+%%       the first 16 bytes for a v1 magic response — if the peer is
+%%       v1, mark v1-only and disconnect with a fallback reason.
+%%
+%%   * Responder (inbound, v2_cipher = undefined):
+%%       Build a fresh cipher, initialize with peer's pubkey, send our
+%%       pubkey + garbage + version packet, advance to recv_garbterm.
 drive_v2_handshake(#peer_data{v2_phase = recv_pubkey,
+                              v2_cipher = Cipher,
+                              direction = outbound,
+                              buffer = Buffer,
+                              magic = Magic} = Data)
+  when Cipher =/= undefined, byte_size(Buffer) >= 64 ->
+    case classify_v2_response(Buffer, Magic) of
+        v1_response ->
+            %% Peer responded with a v1 ``version`` header instead of a
+            %% v2 ellswift pubkey.  Mark v1-only so the manager retries
+            %% on a fresh socket (we already corrupted the v1 framing
+            %% on this one by sending our pubkey).
+            logger:info("peer ~p replied v1 to v2 probe; falling back",
+                        [Data#peer_data.address]),
+            mark_v1_only(Data#peer_data.address),
+            {stop, {shutdown, v2_fallback_to_v1}};
+        v2_response ->
+            <<TheirPubKey:64/binary, Rest/binary>> = Buffer,
+            Data1 = Data#peer_data{
+                buffer = Rest,
+                v2_recv_window = <<>>
+            },
+            %% Two-step initiator: now that we have peer's pubkey,
+            %% complete cipher init (keys depend on ECDH) and send the
+            %% remaining wire bytes (garbage + terminator +
+            %% version_packet, AAD = our garbage).
+            case finish_v2_initiator_send(TheirPubKey, Data1) of
+                {ok, Data2} ->
+                    Data3 = Data2#peer_data{v2_phase = recv_garbterm},
+                    drive_v2_handshake(Data3);
+                {stop, Reason} ->
+                    {stop, Reason}
+            end
+    end;
+drive_v2_handshake(#peer_data{v2_phase = recv_pubkey,
+                              v2_cipher = undefined,
+                              direction = inbound,
                               buffer = Buffer} = Data)
   when byte_size(Buffer) >= 64 ->
     <<TheirPubKey:64/binary, Rest/binary>> = Buffer,
@@ -868,6 +1085,125 @@ raw_socket_send(#peer_data{socket = Socket} = Data, Bytes) ->
             logger:debug("peer ~p raw_socket_send failed: ~p",
                          [Data#peer_data.address, Reason]),
             {stop, {tcp_send_failed, Reason}}
+    end.
+
+%%% ===================================================================
+%%% Internal: BIP-324 v2 outbound initiator
+%%% ===================================================================
+
+%% Decide whether this outbound peer should attempt BIP-324 v2.
+%% Gated by the env-var/app-config flag AND not in the per-address
+%% v1-only fallback cache.  Mirrors clearbit's
+%%     v2_enabled and !self.isV1Only(address)  (peer.zig:1868).
+should_init_v2_outbound(Address) ->
+    bip324_v2_outbound_enabled() andalso not is_v1_only(Address).
+
+%% Build an initialised initiator cipher and return the OUTGOING wire
+%% prefix that is computable BEFORE peer's pubkey arrives — namely the
+%% 64-byte ellswift pubkey.  Returns {ok, Pubkey, Cipher} or {error, _}.
+%%
+%% Test-only helper: production code calls begin_v2_outbound/1 which
+%% sends the pubkey directly on the socket.  The full wire shape (after
+%% peer pubkey arrives) is:
+%%     [ ellswift_pubkey (64) | garbage (0..32) | garbage_terminator (16)
+%%     | version_packet (AEAD, AAD = garbage) ]
+%% but the latter three depend on the ECDH shared secret which needs
+%% the peer's pubkey, so they are emitted in finish_v2_initiator_send/2
+%% after recv_pubkey lands.  Mirrors clearbit's two-phase initiator
+%% (V2Transport sends pubkey + queue marker first, then completes after
+%% receiving peer's pubkey).
+%%
+%% Compiled only under TEST so xref's locals_not_used check stays
+%% green in prod builds (production code path is begin_v2_outbound/1).
+-ifdef(TEST).
+build_v2_initiator_handshake(SecKey, AuxRand)
+  when byte_size(SecKey) =:= 32, byte_size(AuxRand) =:= 32 ->
+    case beamchain_transport_v2:new_cipher(SecKey, AuxRand) of
+        {ok, _Cipher0} = OK ->
+            build_v2_initiator_handshake_cont(OK);
+        {error, _} = Err ->
+            Err
+    end;
+build_v2_initiator_handshake(random, _) ->
+    case beamchain_transport_v2:new_cipher() of
+        {ok, _Cipher0} = OK ->
+            build_v2_initiator_handshake_cont(OK);
+        {error, _} = Err ->
+            Err
+    end.
+
+build_v2_initiator_handshake_cont({ok, Cipher0}) ->
+    Pubkey = beamchain_transport_v2:get_pubkey(Cipher0),
+    {ok, Pubkey, Cipher0}.
+-endif.
+
+%% Open the BIP-324 outbound handshake.  Called from start_handshake/1
+%% when v2_initiator=true.  Sends our 64-byte ellswift pubkey on the
+%% socket, sets v2_phase=recv_pubkey, and stashes the partially-init'd
+%% cipher in v2_cipher so drive_v2_handshake/1 can finish initialisation
+%% once the peer's pubkey arrives.
+%%
+%% In Bitcoin Core, the initiator can pipeline pubkey + garbage +
+%% terminator + version_packet because the cipher keys are derived from
+%% the BIP-324 ECDH which requires the peer's pubkey first.  Bitcoin
+%% Core works around this by sending the pubkey first, then computing
+%% the keys when the peer's pubkey arrives, then sending the
+%% remaining bytes — i.e. the same two-phase pattern we use here.
+%% (clearbit handles this in v2_transport.zig::V2Transport.init by
+%% queueing the first 64 bytes for sending only.)
+begin_v2_outbound(Data) ->
+    case beamchain_transport_v2:new_cipher() of
+        {ok, Cipher0} ->
+            %% Send our 64-byte ellswift pubkey now.  Garbage +
+            %% terminator + version_packet are sent in
+            %% finish_v2_initiator_send/2 once the peer's pubkey
+            %% arrives and we can complete cipher initialisation.
+            Pubkey = beamchain_transport_v2:get_pubkey(Cipher0),
+            case raw_socket_send(Data, Pubkey) of
+                {ok, Data2} ->
+                    {ok, Data2#peer_data{
+                        v2_phase = recv_pubkey,
+                        v2_cipher = Cipher0
+                    }};
+                {stop, Reason} ->
+                    %% TCP send failed before any handshake bytes
+                    %% landed — no need to mark v1-only.
+                    {stop, Reason}
+            end;
+        {error, Reason} ->
+            logger:warning("peer ~p v2 cipher new failed: ~p",
+                           [Data#peer_data.address, Reason]),
+            {stop, {shutdown, {v2_new_failed, Reason}}}
+    end.
+
+%% Finalise the initiator handshake send: derive ECDH-based cipher
+%% keys with the peer's pubkey, then send our garbage + terminator +
+%% version_packet (AAD = our garbage).  Called from
+%% drive_v2_handshake/1 in the recv_pubkey clause for outbound after
+%% we've consumed the peer's 64 bytes.
+finish_v2_initiator_send(TheirPubKey, Data) ->
+    case beamchain_transport_v2:initialize(
+           Data#peer_data.v2_cipher, TheirPubKey, true, false) of
+        {ok, Cipher1} ->
+            SentGarbage = crypto:strong_rand_bytes(rand:uniform(33) - 1),
+            SendTerm = beamchain_transport_v2:get_send_garbage_terminator(Cipher1),
+            {ok, VerPkt, Cipher2} = beamchain_transport_v2:encrypt(
+                Cipher1, <<>>, SentGarbage, false),
+            Wire = <<SentGarbage/binary, SendTerm/binary, VerPkt/binary>>,
+            case raw_socket_send(Data, Wire) of
+                {ok, Data2} ->
+                    {ok, Data2#peer_data{
+                        v2_cipher = Cipher2,
+                        v2_sent_garbage = SentGarbage
+                    }};
+                {stop, Reason} ->
+                    {stop, Reason}
+            end;
+        {error, Reason} ->
+            logger:warning("peer ~p v2 initiator init failed: ~p",
+                           [Data#peer_data.address, Reason]),
+            mark_v1_only(Data#peer_data.address),
+            {stop, {shutdown, {v2_init_failed, Reason}}}
     end.
 
 %%% ===================================================================
