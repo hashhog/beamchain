@@ -1200,8 +1200,21 @@ handle_peer_message(Pid, getheaders, Payload, State) ->
 %% here — the message hit the catch-all below and was silently dropped,
 %% which the Category B (P2P) parity audit (2026-04-27) flagged as the
 %% beamchain BIP35 PARTIAL gap.
+%%
+%% Gating mirrors Bitcoin Core net_processing.cpp's NetMsgType::MEMPOOL:
+%% if we did NOT advertise NODE_BLOOM in our version handshake, ignore
+%% the request and disconnect the peer. Beamchain has no per-peer
+%% permission system yet, so the gate reduces to a single config flag
+%% (`peerbloomfilters`, default-true).
 handle_peer_message(Pid, mempool, _Payload, State) ->
-    handle_mempool_msg(Pid),
+    case beamchain_config:node_bloom_enabled() of
+        true ->
+            handle_mempool_msg(Pid);
+        false ->
+            logger:debug("peer ~p sent mempool with bloom filters disabled, "
+                         "disconnecting", [Pid]),
+            beamchain_peer:disconnect(Pid)
+    end,
     {noreply, State};
 handle_peer_message(_Pid, _Command, _Payload, State) ->
     {noreply, State}.
@@ -1366,11 +1379,12 @@ collect_headers(Height, StopHash, Remaining, Acc) ->
 %%     uses MSG_TX (txid) or MSG_WTX (wtxid). Beamchain advertises
 %%     NODE_WITNESS, so we always populate witness-aware ids.
 %%   - Inv messages are chunked at MAX_INV_SIZE (50000), the network limit.
-%%   - Bitcoin Core gates this on "do we advertise NODE_BLOOM, or does the
-%%     peer hold the Mempool permission?". Beamchain currently advertises
-%%     only NODE_NETWORK | NODE_WITNESS (see beamchain_peer.erl:533) and
-%%     has no permission system, so we always-allow with a TODO. Tighten
-%%     this when either lands.
+%%   - The NODE_BLOOM gate (matching net_processing.cpp's
+%%     `peer.m_our_services & NODE_BLOOM` check) is applied upstream in
+%%     handle_peer_message/4 before this function is invoked, so by the
+%%     time we get here we have committed to answering. The advertised
+%%     services flag is set in beamchain_peer:do_send_version/1 from
+%%     beamchain_config:node_bloom_enabled/0 (default true).
 %%
 %% Lookups are done via the peer_entry ETS row populated at handshake;
 %% wtxidrelay was added to peer info in beamchain_peer.erl's build_info/1.
@@ -1381,9 +1395,6 @@ handle_mempool_msg(Pid) ->
         Pairs ->
             UseWtxid = peer_uses_wtxid(Pid),
             Items = inv_items_from_pairs(Pairs, UseWtxid),
-            %% TODO: gate on NODE_BLOOM advertisement once beamchain
-            %% exposes a service-flag config knob, matching
-            %% net_processing.cpp::MEMPOOL.
             send_inv_chunks(Pid, Items)
     end.
 

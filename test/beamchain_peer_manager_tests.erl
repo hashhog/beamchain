@@ -797,3 +797,109 @@ chunk_inv_items_test_() ->
          ?assertEqual(17, length(lists:nth(2, Chunks)))
      end}
     ].
+
+%%% ===================================================================
+%%% BIP35 NODE_BLOOM gate (config + service-flag advertisement)
+%%% ===================================================================
+%%% Mirrors Bitcoin Core net_processing.cpp's
+%%%   if (!(peer.m_our_services & NODE_BLOOM) &&
+%%%       !pfrom.HasPermission(NetPermissionFlags::Mempool))
+%%% gate on inbound MEMPOOL messages. Beamchain has no per-peer
+%%% permission system yet, so the gate collapses to the local
+%%% advertisement bit, which is itself controlled by the
+%%% `peerbloomfilters` config knob.
+
+node_bloom_config_setup() ->
+    %% Ensure the config ETS exists for `beamchain_config:get/2`.
+    case ets:info(beamchain_config_ets) of
+        undefined ->
+            ets:new(beamchain_config_ets,
+                    [named_table, set, public, {read_concurrency, true}]),
+            created;
+        _ ->
+            existed
+    end.
+
+node_bloom_config_cleanup(created) -> ets:delete(beamchain_config_ets);
+node_bloom_config_cleanup(existed) -> ok.
+
+node_bloom_default_test_() ->
+    {setup, fun node_bloom_config_setup/0, fun node_bloom_config_cleanup/1,
+     fun(_) ->
+        [
+         {"defaults to enabled (matches Core -peerbloomfilters)", fun() ->
+             os:unsetenv("BEAMCHAIN_PEERBLOOMFILTERS"),
+             catch ets:delete(beamchain_config_ets, peerbloomfilters),
+             ?assertEqual(true, beamchain_config:node_bloom_enabled())
+         end},
+         {"env var '0' disables", fun() ->
+             os:putenv("BEAMCHAIN_PEERBLOOMFILTERS", "0"),
+             ?assertEqual(false, beamchain_config:node_bloom_enabled()),
+             os:unsetenv("BEAMCHAIN_PEERBLOOMFILTERS")
+         end},
+         {"env var 'false' disables", fun() ->
+             os:putenv("BEAMCHAIN_PEERBLOOMFILTERS", "false"),
+             ?assertEqual(false, beamchain_config:node_bloom_enabled()),
+             os:unsetenv("BEAMCHAIN_PEERBLOOMFILTERS")
+         end},
+         {"env var '1' enables", fun() ->
+             os:putenv("BEAMCHAIN_PEERBLOOMFILTERS", "1"),
+             ?assertEqual(true, beamchain_config:node_bloom_enabled()),
+             os:unsetenv("BEAMCHAIN_PEERBLOOMFILTERS")
+         end},
+         {"config value '0' disables", fun() ->
+             os:unsetenv("BEAMCHAIN_PEERBLOOMFILTERS"),
+             ets:insert(beamchain_config_ets, {peerbloomfilters, "0"}),
+             ?assertEqual(false, beamchain_config:node_bloom_enabled()),
+             ets:delete(beamchain_config_ets, peerbloomfilters)
+         end},
+         {"config value 0 (integer) disables", fun() ->
+             os:unsetenv("BEAMCHAIN_PEERBLOOMFILTERS"),
+             ets:insert(beamchain_config_ets, {peerbloomfilters, 0}),
+             ?assertEqual(false, beamchain_config:node_bloom_enabled()),
+             ets:delete(beamchain_config_ets, peerbloomfilters)
+         end},
+         {"env var overrides config (env=1, config=0)", fun() ->
+             os:putenv("BEAMCHAIN_PEERBLOOMFILTERS", "1"),
+             ets:insert(beamchain_config_ets, {peerbloomfilters, "0"}),
+             ?assertEqual(true, beamchain_config:node_bloom_enabled()),
+             os:unsetenv("BEAMCHAIN_PEERBLOOMFILTERS"),
+             ets:delete(beamchain_config_ets, peerbloomfilters)
+         end}
+        ]
+     end}.
+
+%% The local advertisement bit must include NODE_BLOOM when the config
+%% knob is on; this is the value that flows into the version handshake's
+%% services field at beamchain_peer.erl:do_send_version/1, and is what
+%% Bitcoin Core's gate (`peer.m_our_services & NODE_BLOOM`) inspects.
+node_bloom_advertised_services_test_() ->
+    {setup, fun node_bloom_config_setup/0, fun node_bloom_config_cleanup/1,
+     fun(_) ->
+        Compute = fun() ->
+            Base = ?NODE_NETWORK bor ?NODE_WITNESS,
+            case beamchain_config:node_bloom_enabled() of
+                true  -> Base bor ?NODE_BLOOM;
+                false -> Base
+            end
+        end,
+        [
+         {"NODE_BLOOM bit advertised when enabled", fun() ->
+             os:putenv("BEAMCHAIN_PEERBLOOMFILTERS", "1"),
+             Svc = Compute(),
+             ?assertEqual(?NODE_BLOOM, Svc band ?NODE_BLOOM),
+             ?assertEqual(?NODE_NETWORK, Svc band ?NODE_NETWORK),
+             ?assertEqual(?NODE_WITNESS, Svc band ?NODE_WITNESS),
+             os:unsetenv("BEAMCHAIN_PEERBLOOMFILTERS")
+         end},
+         {"NODE_BLOOM bit cleared when disabled", fun() ->
+             os:putenv("BEAMCHAIN_PEERBLOOMFILTERS", "0"),
+             Svc = Compute(),
+             ?assertEqual(0, Svc band ?NODE_BLOOM),
+             %% Other service bits unaffected
+             ?assertEqual(?NODE_NETWORK, Svc band ?NODE_NETWORK),
+             ?assertEqual(?NODE_WITNESS, Svc band ?NODE_WITNESS),
+             os:unsetenv("BEAMCHAIN_PEERBLOOMFILTERS")
+         end}
+        ]
+     end}.

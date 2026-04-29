@@ -19,6 +19,7 @@
          prune_target/0,
          mempool_full_rbf/0,
          zmq_enabled/0,
+         node_bloom_enabled/0,
          %% Proxy configuration
          proxy/0,
          onion_proxy/0,
@@ -188,6 +189,30 @@ zmq_enabled() ->
         false ->
             %% Check config file
             lists:any(fun(K) -> get(K) =/= undefined end, ZmqConfigKeys)
+    end.
+
+%% @doc Check if NODE_BLOOM service is advertised to peers.
+%% Reads from config file (peerbloomfilters=1) or env var
+%% (BEAMCHAIN_PEERBLOOMFILTERS=1). Defaults to true (enabled), matching
+%% Bitcoin Core's `-peerbloomfilters` default. When true, beamchain
+%% advertises NODE_BLOOM in its version handshake services flag and
+%% honors BIP35 mempool requests; when false, BIP35 mempool messages
+%% are rejected and peers sending them are disconnected (mirrors
+%% net_processing.cpp::ProcessMessage's NetMsgType::MEMPOOL gate).
+-spec node_bloom_enabled() -> boolean().
+node_bloom_enabled() ->
+    case os:getenv("BEAMCHAIN_PEERBLOOMFILTERS") of
+        "0" -> false;
+        "false" -> false;
+        false ->
+            case get(peerbloomfilters, "1") of
+                "0" -> false;
+                "false" -> false;
+                0 -> false;
+                false -> false;
+                _ -> true  %% Default to enabled (Core default)
+            end;
+        _ -> true
     end.
 
 %% @doc Get SOCKS5 proxy configuration for general outbound connections.

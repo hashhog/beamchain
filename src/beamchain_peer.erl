@@ -1250,7 +1250,18 @@ dispatch_message(Command, Payload, Data) ->
 
 do_send_version(#peer_data{address = {IP, Port}, our_nonce = Nonce} = Data) ->
     Params = beamchain_config:network_params(),
-    Services = ?NODE_NETWORK bor ?NODE_WITNESS,
+    %% BIP35: advertise NODE_BLOOM only when configured. Bitcoin Core gates
+    %% acceptance of inbound `mempool` messages on whether we advertise this
+    %% bit (see net_processing.cpp::ProcessMessage NetMsgType::MEMPOOL); the
+    %% local advertisement and the inbound handler must therefore stay in
+    %% lockstep — beamchain_peer_manager:handle_peer_message(_, mempool, _)
+    %% disconnects peers that send MEMPOOL when this bit is off. Default-true
+    %% mirrors Core's `-peerbloomfilters` default.
+    BaseServices = ?NODE_NETWORK bor ?NODE_WITNESS,
+    Services = case beamchain_config:node_bloom_enabled() of
+        true  -> BaseServices bor ?NODE_BLOOM;
+        false -> BaseServices
+    end,
     Now = erlang:system_time(second),
     %% start_height MUST report our actual current tip height. Bitcoin
     %% Core peers use this to decide whether the remote is a synced
