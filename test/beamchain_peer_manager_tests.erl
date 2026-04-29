@@ -827,10 +827,10 @@ node_bloom_default_test_() ->
     {setup, fun node_bloom_config_setup/0, fun node_bloom_config_cleanup/1,
      fun(_) ->
         [
-         {"defaults to enabled (matches Core -peerbloomfilters)", fun() ->
+         {"defaults to disabled (matches Core DEFAULT_PEERBLOOMFILTERS=false)", fun() ->
              os:unsetenv("BEAMCHAIN_PEERBLOOMFILTERS"),
              catch ets:delete(beamchain_config_ets, peerbloomfilters),
-             ?assertEqual(true, beamchain_config:node_bloom_enabled())
+             ?assertEqual(false, beamchain_config:node_bloom_enabled())
          end},
          {"env var '0' disables", fun() ->
              os:putenv("BEAMCHAIN_PEERBLOOMFILTERS", "0"),
@@ -847,16 +847,16 @@ node_bloom_default_test_() ->
              ?assertEqual(true, beamchain_config:node_bloom_enabled()),
              os:unsetenv("BEAMCHAIN_PEERBLOOMFILTERS")
          end},
-         {"config value '0' disables", fun() ->
+         {"config value '1' enables", fun() ->
              os:unsetenv("BEAMCHAIN_PEERBLOOMFILTERS"),
-             ets:insert(beamchain_config_ets, {peerbloomfilters, "0"}),
-             ?assertEqual(false, beamchain_config:node_bloom_enabled()),
+             ets:insert(beamchain_config_ets, {peerbloomfilters, "1"}),
+             ?assertEqual(true, beamchain_config:node_bloom_enabled()),
              ets:delete(beamchain_config_ets, peerbloomfilters)
          end},
-         {"config value 0 (integer) disables", fun() ->
+         {"config value 1 (integer) enables", fun() ->
              os:unsetenv("BEAMCHAIN_PEERBLOOMFILTERS"),
-             ets:insert(beamchain_config_ets, {peerbloomfilters, 0}),
-             ?assertEqual(false, beamchain_config:node_bloom_enabled()),
+             ets:insert(beamchain_config_ets, {peerbloomfilters, 1}),
+             ?assertEqual(true, beamchain_config:node_bloom_enabled()),
              ets:delete(beamchain_config_ets, peerbloomfilters)
          end},
          {"env var overrides config (env=1, config=0)", fun() ->
