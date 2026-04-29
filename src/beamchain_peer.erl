@@ -1610,30 +1610,55 @@ do_send_msg(Command, PayloadData, Data) ->
     Payload = beamchain_p2p_msg:encode_payload(Command, PayloadData),
     do_send_raw(Command, Payload, Data).
 
+%% v2 application-data path.  AEAD-encrypt with empty AAD
+%% (BIP-324 §"Wire format" reserves AAD for the very first post-handshake
+%% packet from each direction; we already consumed that during the
+%% cipher-handshake).
+%%
+%% IMPORTANT: the cipher state MUST only advance (via the `Cipher2` we
+%% commit into the returned record) AFTER `gen_tcp:send` succeeds.  If we
+%% advanced unconditionally and the send failed mid-handshake (peer RST),
+%% the next outbound message would re-encrypt under a wrongly-advanced
+%% cipher and the peer's recv-cipher would auth-fail on the FIRST byte —
+%% a desync that's hard to diagnose in the wild.  On send failure we
+%% leave the old cipher in place, log, and let the recv side surface
+%% `{tcp_closed, _}` to the gen_statem, which exits via the normal
+%% `handshaking(info, {tcp_closed, _})` clause.  Net effect: behaviourally
+%% equivalent to the prior silent-failure code, but cipher state stays
+%% consistent with what's actually on the wire.
 do_send_raw(Command, Payload, #peer_data{v2_phase = ready,
                                           v2_cipher = Cipher,
                                           socket = Socket} = Data)
   when Cipher =/= undefined ->
-    %% v2 path: short-id-or-long-form contents, then AEAD-encrypt with
-    %% empty AAD (BIP-324 §"Wire format" reserves AAD for the very first
-    %% post-handshake packet from each direction; we already consumed
-    %% that during the cipher-handshake).
     Contents = beamchain_v2_msg:encode_contents(Command, Payload),
     {ok, Wire, Cipher2} = beamchain_transport_v2:encrypt(
         Cipher, Contents, <<>>, false),
-    gen_tcp:send(Socket, Wire),
-    Data#peer_data{
-        v2_cipher  = Cipher2,
-        bytes_sent = Data#peer_data.bytes_sent + byte_size(Wire),
-        last_send  = erlang:system_time(millisecond)
-    };
+    case gen_tcp:send(Socket, Wire) of
+        ok ->
+            Data#peer_data{
+                v2_cipher  = Cipher2,
+                bytes_sent = Data#peer_data.bytes_sent + byte_size(Wire),
+                last_send  = erlang:system_time(millisecond)
+            };
+        {error, Reason} ->
+            logger:debug("peer ~p v2 send ~p failed: ~p — leaving cipher "
+                         "untouched; closing on next tcp_closed",
+                         [Data#peer_data.address, Command, Reason]),
+            Data
+    end;
 do_send_raw(Command, Payload, #peer_data{socket = Socket, magic = Magic} = Data) ->
     Msg = beamchain_p2p_msg:encode_msg(Magic, Command, Payload),
-    gen_tcp:send(Socket, Msg),
-    Data#peer_data{
-        bytes_sent = Data#peer_data.bytes_sent + byte_size(Msg),
-        last_send = erlang:system_time(millisecond)
-    }.
+    case gen_tcp:send(Socket, Msg) of
+        ok ->
+            Data#peer_data{
+                bytes_sent = Data#peer_data.bytes_sent + byte_size(Msg),
+                last_send  = erlang:system_time(millisecond)
+            };
+        {error, Reason} ->
+            logger:debug("peer ~p v1 send ~p failed: ~p",
+                         [Data#peer_data.address, Command, Reason]),
+            Data
+    end.
 
 %%% ===================================================================
 %%% Internal: Helpers
