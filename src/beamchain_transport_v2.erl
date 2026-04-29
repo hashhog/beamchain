@@ -18,6 +18,10 @@
          get_session_id/1, get_send_garbage_terminator/1,
          get_recv_garbage_terminator/1]).
 
+%% Constants exposed for the responder/initiator state machines.
+-export([length_field_len/0, header_len/0, tag_len/0, max_garbage_len/0,
+         garbage_terminator_len/0]).
+
 %% HKDF helpers
 -export([hkdf_extract/2, hkdf_expand/3]).
 
@@ -35,15 +39,44 @@
 -define(IGNORE_BIT, 16#80).
 -define(CHACHA_KEY_LEN, 32).
 -define(CHACHA_NONCE_LEN, 12).
+%% BIP-324: peer may send up to MAX_GARBAGE_LEN bytes of pre-key
+%% garbage before the 16-byte send_garbage_terminator.  Beyond that the
+%% receiver must treat it as a protocol violation and disconnect.
+-define(MAX_GARBAGE_LEN, 4095).
 
 %%% -------------------------------------------------------------------
 %%% Cipher State
 %%% -------------------------------------------------------------------
 
+%% FSChaCha20 length cipher.
+%%
+%% IMPORTANT: per BIP-324, the keystream is CONTINUOUS within a rekey
+%% epoch.  Each crypt() call consumes the next ``len(input)`` bytes of a
+%% single ChaCha20 keystream that was initialised at the start of the
+%% epoch with nonce ``[0,0,0,0] || LE64(rekey_counter)`` and block
+%% counter 0.  After rekey_interval (= 224) crypt() calls the next 32
+%% keystream bytes become the new key, the rekey_counter increments, and
+%% the keystream buffer + block_counter reset for the new epoch.
+%%
+%% A naive implementation that builds a fresh nonce per call (encoding
+%% ``packet_counter`` into the nonce and starting ChaCha20 at block 0
+%% every time) produces a different keystream per packet starting at
+%% block 0, so packet N's first byte is NOT the (N*3)th byte of a single
+%% epoch keystream — diverging from Bitcoin Core / ouroboros after the
+%% very first 3-byte length encryption.  Two such implementations
+%% interop with each other (lock-step encrypt-then-decrypt happens to
+%% land on PC=0,1,2,...), but they desync against any spec-correct peer
+%% on the second packet.  See the W90 fix in clearbit cb04a1f for the
+%% same bug in Zig.
 -record(fs_chacha20, {
-    key :: binary(),              %% 32-byte ChaCha20 key
+    key :: binary(),                          %% 32-byte ChaCha20 key
     packet_counter = 0 :: non_neg_integer(),  %% counter within rekey interval
-    rekey_counter = 0 :: non_neg_integer()    %% number of rekeys performed
+    rekey_counter = 0 :: non_neg_integer(),   %% number of rekeys performed
+    %% Cached keystream bytes from the most recent ChaCha20 block.  Bytes
+    %% are consumed from the front; block_counter advances when this runs
+    %% dry and the next 64-byte block is generated.
+    keystream_buf = <<>> :: binary(),
+    block_counter = 0 :: non_neg_integer()    %% resets to 0 on rekey
 }).
 
 -record(fs_chacha20_poly1305, {
@@ -231,6 +264,28 @@ get_send_garbage_terminator(#bip324_cipher{send_garbage_terminator = T}) -> T.
 -spec get_recv_garbage_terminator(cipher()) -> binary().
 get_recv_garbage_terminator(#bip324_cipher{recv_garbage_terminator = T}) -> T.
 
+%% @doc 3-byte encrypted-length field (per packet on the wire).
+-spec length_field_len() -> pos_integer().
+length_field_len() -> ?LENGTH_LEN.
+
+%% @doc 1-byte plaintext header before contents (carries IGNORE_BIT).
+-spec header_len() -> pos_integer().
+header_len() -> ?HEADER_LEN.
+
+%% @doc 16-byte Poly1305 authentication tag appended to each packet.
+-spec tag_len() -> pos_integer().
+tag_len() -> ?TAG_LEN.
+
+%% @doc Maximum bytes of pre-key garbage allowed before the
+%% send_garbage_terminator.  Receiver MUST disconnect if the terminator
+%% is not seen within this window.
+-spec max_garbage_len() -> pos_integer().
+max_garbage_len() -> ?MAX_GARBAGE_LEN.
+
+%% @doc 16-byte garbage terminator length (constant).
+-spec garbage_terminator_len() -> pos_integer().
+garbage_terminator_len() -> ?GARBAGE_TERMINATOR_LEN.
+
 %%% ===================================================================
 %%% HKDF-SHA256 (RFC 5869)
 %%% ===================================================================
@@ -259,39 +314,72 @@ hkdf_expand(PRK, Info, L) when L =< 64 ->
 %%% ===================================================================
 
 %% @doc Encrypt/decrypt with FSChaCha20 and update state.
-%% Rekeys every REKEY_INTERVAL messages.
+%% Rekeys every REKEY_INTERVAL packets.
+%%
+%% Per BIP-324 the length cipher's keystream is continuous within a
+%% rekey epoch (see the comment on the #fs_chacha20{} record): each call
+%% consumes the next ``byte_size(Data)`` bytes of a single ChaCha20
+%% keystream initialised at the start of the epoch with nonce
+%% ``[0,0,0,0] || LE64(rekey_counter)`` and block counter 0.
 %%
 %% Erlang crypto:crypto_one_time(chacha20, ...) expects a 16-byte IV:
-%%   - First 4 bytes: block counter (32-bit LE, usually 0)
-%%   - Last 12 bytes: nonce
-%% For BIP324 FSChaCha20:
-%%   - nonce = packet_counter (4 bytes LE) || rekey_counter (8 bytes LE)
-%%   - block counter = 0 (we start from the beginning of the keystream)
+%%   - First 4 bytes: block counter (32-bit LE, advances per 64-byte block)
+%%   - Last 12 bytes: nonce  ([0,0,0,0] || LE64(rekey_counter))
 -spec fs_chacha20_crypt(#fs_chacha20{}, binary()) ->
     {binary(), #fs_chacha20{}}.
-fs_chacha20_crypt(#fs_chacha20{key = Key, packet_counter = PC,
-                               rekey_counter = RC} = State, Data) ->
-    %% Build IV: block_counter (4 bytes LE) || nonce (12 bytes)
-    %% nonce = packet_counter (4 bytes LE) || rekey_counter (8 bytes LE)
-    IV = <<0:32/little, PC:32/little, RC:64/little>>,
-    %% ChaCha20 encrypt/decrypt (symmetric)
-    Output = crypto:crypto_one_time(chacha20, Key, IV, Data, true),
-    %% Update state
-    PC2 = PC + 1,
+fs_chacha20_crypt(#fs_chacha20{} = State, Data) ->
+    Need = byte_size(Data),
+    {KS, State1} = draw_keystream(State, Need),
+    Output = crypto:exor(Data, KS),
+    %% Advance schedule.  At the rekey boundary draw 32 more keystream
+    %% bytes for the new key (still from the *current* epoch keystream),
+    %% then reset the buffer + block counter for the next epoch.
+    PC2 = State1#fs_chacha20.packet_counter + 1,
     case PC2 =:= ?REKEY_INTERVAL of
         true ->
-            %% Rekey: generate 32 bytes of keystream at nonce {0xFFFFFFFF, RC}
-            %% with block counter 0
-            RekeyIV = <<0:32/little, 16#FFFFFFFF:32/little, RC:64/little>>,
-            NewKey = crypto:crypto_one_time(chacha20, Key, RekeyIV,
-                                             <<0:256>>, true),
-            State2 = State#fs_chacha20{key = NewKey, packet_counter = 0,
-                                        rekey_counter = RC + 1},
-            {Output, State2};
+            {NewKey, State2} = draw_keystream(State1, 32),
+            State3 = State2#fs_chacha20{
+                key = NewKey,
+                packet_counter = 0,
+                rekey_counter = State2#fs_chacha20.rekey_counter + 1,
+                keystream_buf = <<>>,
+                block_counter = 0
+            },
+            {Output, State3};
         false ->
-            State2 = State#fs_chacha20{packet_counter = PC2},
-            {Output, State2}
+            State4 = State1#fs_chacha20{packet_counter = PC2},
+            {Output, State4}
     end.
+
+%% Pull N bytes of keystream from the current epoch.  Refills the 64-byte
+%% buffer as many times as needed, advancing block_counter per block.
+-spec draw_keystream(#fs_chacha20{}, non_neg_integer()) ->
+    {binary(), #fs_chacha20{}}.
+draw_keystream(#fs_chacha20{} = State, N) ->
+    draw_keystream(State, N, <<>>).
+
+draw_keystream(State, 0, Acc) ->
+    {Acc, State};
+draw_keystream(#fs_chacha20{keystream_buf = Buf} = State, N, Acc)
+  when byte_size(Buf) >= N ->
+    <<Take:N/binary, Rest/binary>> = Buf,
+    {<<Acc/binary, Take/binary>>, State#fs_chacha20{keystream_buf = Rest}};
+draw_keystream(#fs_chacha20{keystream_buf = Buf} = State, N, Acc)
+  when byte_size(Buf) > 0 ->
+    Have = byte_size(Buf),
+    draw_keystream(State#fs_chacha20{keystream_buf = <<>>},
+                   N - Have, <<Acc/binary, Buf/binary>>);
+draw_keystream(#fs_chacha20{key = Key, rekey_counter = RC,
+                            block_counter = BC} = State, N, Acc) ->
+    %% keystream_buf is empty; generate the next 64-byte block.
+    %% IV = LE32(block_counter) || LE32(0) || LE64(rekey_counter)
+    IV = <<BC:32/little, 0:32/little, RC:64/little>>,
+    Block = crypto:crypto_one_time(chacha20, Key, IV, <<0:512>>, true),
+    State2 = State#fs_chacha20{
+        keystream_buf = Block,
+        block_counter = BC + 1
+    },
+    draw_keystream(State2, N, Acc).
 
 %%% ===================================================================
 %%% Forward-Secure ChaCha20-Poly1305 (FSChaCha20Poly1305)
@@ -344,15 +432,23 @@ fs_chacha20_poly1305_decrypt(#fs_chacha20_poly1305{key = Key, packet_counter = P
             {ok, Plaintext, State2}
     end.
 
-%% Internal: rekey AEAD cipher if interval reached
+%% Internal: rekey AEAD cipher if interval reached.
+%%
+%% Per BIP-324 / Bitcoin Core (bip324_cipher.cpp::FSChaCha20Poly1305::Rekey)
+%% / ouroboros (transport_v2.FSChaCha20Poly1305._maybe_rekey), the new
+%% AEAD key is derived by AEAD-encrypting 32 zero bytes (empty AAD) with
+%% the OLD key under nonce ``\xFF\xFF\xFF\xFF || LE64(rekey_counter)``
+%% and taking the first 32 bytes of the ciphertext.  This is NOT the same
+%% as raw ChaCha20 keystream at block 0 — AEAD reserves block 0 for the
+%% Poly1305 one-time key and starts encrypting at block 1.
 maybe_rekey_aead(#fs_chacha20_poly1305{packet_counter = PC, rekey_counter = RC,
                                         key = Key} = State, _OldKey, _OldRC)
   when PC =:= ?REKEY_INTERVAL ->
-    %% Rekey: generate 32 bytes of keystream at nonce {0xFFFFFFFF, RC}
-    %% IV for ChaCha20: block_counter (4 bytes LE) || nonce (12 bytes)
-    RekeyIV = <<0:32/little, 16#FFFFFFFF:32/little, RC:64/little>>,
-    %% For AEAD rekeying, we use ChaCha20 keystream (not AEAD)
-    NewKey = crypto:crypto_one_time(chacha20, Key, RekeyIV, <<0:256>>, true),
+    RekeyNonce = <<16#FFFFFFFF:32/little, RC:64/little>>,
+    {CT, _Tag} = crypto:crypto_one_time_aead(
+        chacha20_poly1305, Key, RekeyNonce, <<0:256>>, <<>>, true),
+    %% First 32 bytes of the ciphertext become the new key.
+    <<NewKey:32/binary, _/binary>> = CT,
     State#fs_chacha20_poly1305{key = NewKey, packet_counter = 0,
                                 rekey_counter = RC + 1};
 maybe_rekey_aead(State, _OldKey, _OldRC) ->

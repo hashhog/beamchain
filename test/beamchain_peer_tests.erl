@@ -393,3 +393,78 @@ filter_by_feefilter_test(_Txids, _PeerFeeFilter) ->
     %% In real code this would look up mempool entries
     %% For test purposes, return empty (simulating no matching txs)
     [].
+
+%%% ===================================================================
+%%% W90 — BIP-324 v2 peek-classify
+%%%
+%%% These cover the inbound-only first-16-bytes classifier in
+%%% beamchain_peer:is_v1_version_header/2.  The classifier is the only
+%%% point at which we commit to v1 vs v2 for an incoming connection;
+%%% getting it wrong either disconnects healthy v1 peers (false v2
+%%% positive) or misroutes random ellswift bytes through the v1 frame
+%%% decoder (false v1 positive).
+%%% ===================================================================
+
+%% Mainnet, testnet, testnet4, regtest, signet magics.
+-define(MAINNET_MAGIC,  <<16#F9, 16#BE, 16#B4, 16#D9>>).
+-define(TESTNET4_MAGIC, <<16#1C, 16#16, 16#3F, 16#28>>).
+-define(REGTEST_MAGIC,  <<16#FA, 16#BF, 16#B5, 16#DA>>).
+
+v2_classify_v1_version_header_is_v1_test() ->
+    %% Real Bitcoin Core v1 version header: magic || "version" || 0*5.
+    Hdr = <<?MAINNET_MAGIC/binary, "version", 0, 0, 0, 0, 0>>,
+    ?assertEqual(true, beamchain_peer:is_v1_version_header(Hdr, ?MAINNET_MAGIC)),
+    %% Other networks succeed too with their own magic.
+    Hdr4 = <<?TESTNET4_MAGIC/binary, "version", 0, 0, 0, 0, 0>>,
+    ?assertEqual(true, beamchain_peer:is_v1_version_header(Hdr4, ?TESTNET4_MAGIC)),
+    HdrR = <<?REGTEST_MAGIC/binary, "version", 0, 0, 0, 0, 0>>,
+    ?assertEqual(true, beamchain_peer:is_v1_version_header(HdrR, ?REGTEST_MAGIC)).
+
+v2_classify_wrong_magic_is_not_v1_test() ->
+    %% Magic for a different network — the receiving node will treat
+    %% this as v2 (random ellswift bytes that happen to spell "version"
+    %% after the wrong magic prefix).  A real Bitcoin Core peer never
+    %% sends another network's magic, so misclassifying as v2 here is
+    %% the correct (and Bitcoin-Core-parity) behaviour.
+    Hdr = <<?MAINNET_MAGIC/binary, "version", 0, 0, 0, 0, 0>>,
+    ?assertEqual(false, beamchain_peer:is_v1_version_header(Hdr, ?TESTNET4_MAGIC)).
+
+v2_classify_random_ellswift_is_not_v1_test() ->
+    %% A 16-byte uniformly random prefix matches the v1 header pattern
+    %% with probability ~2^-128 (4 bytes magic + 12 bytes "version\0...").
+    %% Probabilistic test: 1000 random samples, expect zero v1 hits
+    %% under any of three magics.
+    lists:foreach(
+        fun(_) ->
+            Bytes = crypto:strong_rand_bytes(16),
+            ?assertEqual(false,
+                beamchain_peer:is_v1_version_header(Bytes, ?MAINNET_MAGIC)),
+            ?assertEqual(false,
+                beamchain_peer:is_v1_version_header(Bytes, ?TESTNET4_MAGIC)),
+            ?assertEqual(false,
+                beamchain_peer:is_v1_version_header(Bytes, ?REGTEST_MAGIC))
+        end,
+        lists:seq(1, 1000)).
+
+v2_classify_v1_other_command_is_not_v1_version_test() ->
+    %% A v1 frame for ANY command other than "version" is the FIRST
+    %% message the peer would send only on a misbehaving / out-of-order
+    %% connection — Bitcoin Core requires "version" first.  The peek
+    %% classifier therefore correctly rejects (returns false), which
+    %% will route the bytes into the v2 path; the v2 path then fails
+    %% AEAD auth and disconnects.  This is acceptable: the peer was
+    %% already misbehaving.
+    Hdr = <<?MAINNET_MAGIC/binary, "verack", 0, 0, 0, 0, 0, 0>>,
+    ?assertEqual(false, beamchain_peer:is_v1_version_header(Hdr, ?MAINNET_MAGIC)),
+    HdrPing = <<?MAINNET_MAGIC/binary, "ping", 0, 0, 0, 0, 0, 0, 0, 0>>,
+    ?assertEqual(false, beamchain_peer:is_v1_version_header(HdrPing, ?MAINNET_MAGIC)).
+
+v2_classify_short_input_does_not_crash_test() ->
+    %% Input shorter than 16 bytes never reaches is_v1_version_header in
+    %% production (the caller guards on byte_size(Buffer) >= 16), but a
+    %% defensive false return on partial input is still desirable.
+    ?assertEqual(false,
+        beamchain_peer:is_v1_version_header(<<?MAINNET_MAGIC/binary,
+                                               "version">>, ?MAINNET_MAGIC)),
+    ?assertEqual(false,
+        beamchain_peer:is_v1_version_header(<<>>, ?MAINNET_MAGIC)).
