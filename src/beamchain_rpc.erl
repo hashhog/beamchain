@@ -409,6 +409,7 @@ handle_method(<<"getmempoolinfo">>, _, _W) -> rpc_getmempoolinfo();
 handle_method(<<"getrawmempool">>, P, _W) -> rpc_getrawmempool(P);
 handle_method(<<"getmempoolentry">>, P, _W) -> rpc_getmempoolentry(P);
 handle_method(<<"getmempoolancestors">>, P, _W) -> rpc_getmempoolancestors(P);
+handle_method(<<"getmempooldescendants">>, P, _W) -> rpc_getmempooldescendants(P);
 handle_method(<<"savemempool">>, _, _W) -> rpc_dumpmempool();
 handle_method(<<"dumpmempool">>, _, _W) -> rpc_dumpmempool();
 handle_method(<<"loadmempool">>, _, _W) -> rpc_loadmempool();
@@ -435,10 +436,14 @@ handle_method(<<"generate">>, P, _W) -> rpc_generate(P);
 
 %% -- Fee estimation --
 handle_method(<<"estimatesmartfee">>, P, _W) -> rpc_estimatesmartfee(P);
+handle_method(<<"estimaterawfee">>, P, _W) -> rpc_estimaterawfee(P);
 
 %% -- Utility --
 handle_method(<<"validateaddress">>, P, _W) -> rpc_validateaddress(P);
 handle_method(<<"decodescript">>, P, _W) -> rpc_decodescript(P);
+handle_method(<<"signmessagewithprivkey">>, P, _W) -> rpc_signmessagewithprivkey(P);
+handle_method(<<"signmessage">>, P, W) -> rpc_signmessage(P, W);
+handle_method(<<"verifymessage">>, P, _W) -> rpc_verifymessage(P);
 
 %% -- Wallet (multi-wallet aware) --
 handle_method(<<"createwallet">>, P, _W) -> rpc_createwallet(P);
@@ -523,6 +528,7 @@ rpc_help_list() ->
         <<"== Mempool ==">>,
         <<"dumpmempool">>,
         <<"getmempoolancestors \"txid\" ( verbose )">>,
+        <<"getmempooldescendants \"txid\" ( verbose )">>,
         <<"getmempoolentry \"txid\"">>,
         <<"getmempoolinfo">>,
         <<"getrawmempool ( verbose )">>,
@@ -554,6 +560,10 @@ rpc_help_list() ->
         <<"== Util ==">>,
         <<"deriveaddresses \"descriptor\" ( range )">>,
         <<"estimatesmartfee conf_target ( \"estimate_mode\" )">>,
+        <<"estimaterawfee conf_target ( threshold )">>,
+        <<"signmessage \"address\" \"message\"">>,
+        <<"signmessagewithprivkey \"privkey\" \"message\"">>,
+        <<"verifymessage \"address\" \"signature\" \"message\"">>,
         <<"getdescriptorinfo \"descriptor\"">>,
         <<"validateaddress \"address\"">>,
         <<"">>,
@@ -2030,6 +2040,39 @@ rpc_getmempoolancestors(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"Usage: getmempoolancestors \"txid\" ( verbose )">>}.
 
+%% Mirrors Bitcoin Core rpc/mempool.cpp `getmempooldescendants`:
+%% returns the in-mempool descendants of `txid`, excluding the
+%% queried tx itself.
+rpc_getmempooldescendants([TxidHex]) when is_binary(TxidHex) ->
+    rpc_getmempooldescendants([TxidHex, false]);
+rpc_getmempooldescendants([TxidHex, Verbose]) when is_binary(TxidHex) ->
+    Txid = hex_to_internal_hash(TxidHex),
+    case beamchain_mempool:get_entry(Txid) of
+        {ok, _Entry} ->
+            DescTxids = beamchain_mempool:get_descendants(Txid),
+            case Verbose of
+                true ->
+                    Entries = lists:map(fun(DescTxid) ->
+                        case beamchain_mempool:get_entry(DescTxid) of
+                            {ok, DescEntry} ->
+                                {hash_to_hex(DescTxid),
+                                 format_mempool_entry(DescEntry)};
+                            not_found ->
+                                {hash_to_hex(DescTxid), #{}}
+                        end
+                    end, DescTxids),
+                    {ok, maps:from_list(Entries)};
+                _ ->
+                    {ok, [hash_to_hex(T) || T <- DescTxids]}
+            end;
+        not_found ->
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+             <<"Transaction not in mempool">>}
+    end;
+rpc_getmempooldescendants(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: getmempooldescendants \"txid\" ( verbose )">>}.
+
 %% Persist mempool to <datadir>/mempool.dat (Bitcoin Core compatible).
 rpc_dumpmempool() ->
     case beamchain_mempool:dump_mempool() of
@@ -2543,6 +2586,36 @@ rpc_estimatesmartfee(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"Usage: estimatesmartfee conf_target">>}.
 
+%% estimaterawfee — Core hidden RPC. Returns per-horizon raw bucket
+%% estimate. We expose a single "medium" horizon (beamchain's
+%% exponential-decay estimator collapses Core's three horizons).
+rpc_estimaterawfee([ConfTarget]) when is_integer(ConfTarget) ->
+    rpc_estimaterawfee([ConfTarget, 0.95]);
+rpc_estimaterawfee([ConfTarget, Threshold])
+  when is_integer(ConfTarget),
+       (is_float(Threshold) orelse is_integer(Threshold)) ->
+    Thr = case Threshold of
+        I when is_integer(I) -> float(I);
+        F -> F
+    end,
+    case Thr >= 0.0 andalso Thr =< 1.0 of
+        false ->
+            {error, ?RPC_INVALID_PARAMETER, <<"Invalid threshold">>};
+        true ->
+            case ConfTarget < 1 orelse ConfTarget > 1008 of
+                true ->
+                    {error, ?RPC_INVALID_PARAMETER,
+                     <<"Invalid conf_target">>};
+                false ->
+                    Result = beamchain_fee_estimator:estimate_raw_fee(
+                                ConfTarget, Thr),
+                    {ok, Result}
+            end
+    end;
+rpc_estimaterawfee(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: estimaterawfee conf_target ( threshold )">>}.
+
 %%% ===================================================================
 %%% Utility methods
 %%% ===================================================================
@@ -2627,6 +2700,122 @@ rpc_decodescript([HexStr]) when is_binary(HexStr) ->
 rpc_decodescript(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"Usage: decodescript \"hexstring\"">>}.
+
+%%% ===================================================================
+%%% Message signing / verification (Bitcoin Signed Message)
+%%% ===================================================================
+
+%% signmessagewithprivkey "privkey" "message"
+%%
+%% Mirrors Bitcoin Core rpc/signmessage.cpp signmessagewithprivkey().
+%% Returns base64-encoded recoverable ECDSA signature.
+rpc_signmessagewithprivkey([WifKey, Message])
+  when is_binary(WifKey), is_binary(Message) ->
+    case wif_to_privkey(WifKey) of
+        {ok, {PrivKey, _Compressed}} ->
+            case beamchain_crypto:sign_message(Message, PrivKey) of
+                {ok, B64} -> {ok, B64};
+                {error, _} ->
+                    {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+                     <<"Sign failed">>}
+            end;
+        {error, _} ->
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+             <<"Invalid private key">>}
+    end;
+rpc_signmessagewithprivkey(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: signmessagewithprivkey \"privkey\" \"message\"">>}.
+
+%% signmessage "address" "message" — wallet-aware variant. Looks up
+%% the privkey for `address` in the (default or named) wallet and
+%% delegates to the privkey path.
+rpc_signmessage([Address, Message], WalletName)
+  when is_binary(Address), is_binary(Message) ->
+    case resolve_wallet(WalletName) of
+        {ok, Pid} ->
+            case beamchain_wallet:get_private_key(
+                    Pid, binary_to_list(Address)) of
+                {ok, PrivKey} ->
+                    case beamchain_crypto:sign_message(Message, PrivKey) of
+                        {ok, B64} -> {ok, B64};
+                        {error, _} ->
+                            {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+                             <<"Sign failed">>}
+                    end;
+                {error, not_found} ->
+                    {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+                     <<"Private key not available">>};
+                {error, wallet_locked} ->
+                    {error, ?RPC_MISC_ERROR,
+                     <<"Error: Please enter the wallet passphrase with "
+                       "walletpassphrase first.">>};
+                {error, Reason} ->
+                    {error, ?RPC_MISC_ERROR,
+                     iolist_to_binary(io_lib:format("~p", [Reason]))}
+            end;
+        {error, _} ->
+            wallet_not_found_error(WalletName)
+    end;
+rpc_signmessage(_, _) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: signmessage \"address\" \"message\"">>}.
+
+%% verifymessage "address" "signature" "message"
+%%
+%% Mirrors Bitcoin Core rpc/signmessage.cpp verifymessage().
+%% Only legacy P2PKH addresses are supported (Core requires PKHash).
+rpc_verifymessage([Address, Signature, Message])
+  when is_binary(Address), is_binary(Signature), is_binary(Message) ->
+    Network = beamchain_config:network(),
+    NetType = case Network of mainnet -> mainnet; _ -> testnet end,
+    AddrStr = binary_to_list(Address),
+    case beamchain_address:address_to_script(AddrStr, NetType) of
+        {ok, Script} ->
+            case beamchain_address:classify_script(Script) of
+                p2pkh ->
+                    %% Extract the 20-byte HASH160 from the P2PKH script.
+                    %% Format: OP_DUP OP_HASH160 <20> ... OP_EQUALVERIFY OP_CHECKSIG
+                    <<16#76, 16#a9, 16#14, PKH:20/binary,
+                      16#88, 16#ac>> = Script,
+                    case beamchain_crypto:verify_message(Signature,
+                                                          Message, PKH) of
+                        ok -> {ok, true};
+                        {error, malformed_signature} ->
+                            {error, ?RPC_TYPE_ERROR,
+                             <<"Malformed base64 encoding">>};
+                        {error, pubkey_not_recovered} -> {ok, false};
+                        {error, not_signed} -> {ok, false};
+                        {error, _} -> {ok, false}
+                    end;
+                _ ->
+                    {error, ?RPC_TYPE_ERROR,
+                     <<"Address does not refer to key">>}
+            end;
+        {error, _} ->
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY, <<"Invalid address">>}
+    end;
+rpc_verifymessage(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: verifymessage \"address\" \"signature\" \"message\"">>}.
+
+%% Decode a WIF-encoded private key. Accepts mainnet (0x80) and
+%% testnet/regtest (0xef) prefixes; supports both compressed (33-byte
+%% payload ending in 0x01) and uncompressed (32-byte payload) forms.
+%% Returns {ok, {PrivKey32, IsCompressed}} or {error, Reason}.
+wif_to_privkey(WifBin) when is_binary(WifBin) ->
+    wif_to_privkey(binary_to_list(WifBin));
+wif_to_privkey(WifStr) when is_list(WifStr) ->
+    case beamchain_address:base58check_decode(WifStr) of
+        {ok, {Prefix, Payload}} when Prefix =:= 16#80; Prefix =:= 16#ef ->
+            case Payload of
+                <<Priv:32/binary, 16#01>> -> {ok, {Priv, true}};
+                <<Priv:32/binary>>        -> {ok, {Priv, false}};
+                _                         -> {error, invalid_payload}
+            end;
+        {ok, _} -> {error, wrong_network};
+        {error, _} = E -> E
+    end.
 
 %%% ===================================================================
 %%% Internal helpers

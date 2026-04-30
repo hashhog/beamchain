@@ -1003,6 +1003,76 @@ static ERL_NIF_TERM ecdsa_sign_nif(ErlNifEnv *env, int argc,
 }
 
 /* ------------------------------------------------------------------ */
+/* ecdsa_sign_recoverable_nif(Msg32, SecKey32)                         */
+/*   -> {ok, <<RecId:8, R:32, S:32>>} | {error, reason}                 */
+/* Produces a 65-byte compact recoverable signature (recid || r || s).  */
+/* Used by message signing (BIP137-style) per Bitcoin Core's            */
+/* CKey::SignCompact. Caller is responsible for adding the              */
+/* compressed/uncompressed header byte expected by the wire format.     */
+/* ------------------------------------------------------------------ */
+
+static ERL_NIF_TERM ecdsa_sign_recoverable_nif(ErlNifEnv *env, int argc,
+                                                const ERL_NIF_TERM argv[])
+{
+    ErlNifBinary msg, seckey;
+
+    if (!enif_inspect_binary(env, argv[0], &msg) || msg.size != 32 ||
+        !enif_inspect_binary(env, argv[1], &seckey) || seckey.size != 32)
+        return enif_make_badarg(env);
+
+    secp256k1_ecdsa_recoverable_signature rsig;
+    if (!secp256k1_ecdsa_sign_recoverable(ctx, &rsig, msg.data, seckey.data,
+                                           NULL, NULL))
+        return make_error(env, "signing_failed");
+
+    unsigned char compact[64];
+    int recid = 0;
+    if (!secp256k1_ecdsa_recoverable_signature_serialize_compact(
+            ctx, compact, &recid, &rsig))
+        return make_error(env, "serialize_failed");
+
+    unsigned char out[65];
+    out[0] = (unsigned char)recid;
+    memcpy(out + 1, compact, 64);
+    return make_ok_binary(env, out, 65);
+}
+
+/* ------------------------------------------------------------------ */
+/* ecdsa_recover_nif(Msg32, RecId, Sig64)                              */
+/*   -> {ok, PubKey33} | {error, reason}                                */
+/* Recovers a compressed public key from a 32-byte message hash, a      */
+/* recovery id (0..3), and the 64-byte compact signature.               */
+/* ------------------------------------------------------------------ */
+
+static ERL_NIF_TERM ecdsa_recover_nif(ErlNifEnv *env, int argc,
+                                       const ERL_NIF_TERM argv[])
+{
+    ErlNifBinary msg, sig;
+    int recid;
+
+    if (!enif_inspect_binary(env, argv[0], &msg) || msg.size != 32 ||
+        !enif_get_int(env, argv[1], &recid) ||
+        recid < 0 || recid > 3 ||
+        !enif_inspect_binary(env, argv[2], &sig) || sig.size != 64)
+        return enif_make_badarg(env);
+
+    secp256k1_ecdsa_recoverable_signature rsig;
+    if (!secp256k1_ecdsa_recoverable_signature_parse_compact(
+            ctx, &rsig, sig.data, recid))
+        return make_error(env, "parse_failed");
+
+    secp256k1_pubkey pk;
+    if (!secp256k1_ecdsa_recover(ctx, &pk, &rsig, msg.data))
+        return make_error(env, "recover_failed");
+
+    unsigned char out[33];
+    size_t out_len = 33;
+    secp256k1_ec_pubkey_serialize(ctx, out, &out_len, &pk,
+                                   SECP256K1_EC_COMPRESSED);
+    return make_ok_binary(env, out, 33);
+}
+
+/* ------------------------------------------------------------------ */
 /* schnorr_sign_nif(Msg32, SecKey32, AuxRand32)                        */
 /*   -> {ok, Sig64} | {error, reason}                                  */
 /* ------------------------------------------------------------------ */
@@ -1269,6 +1339,10 @@ static ErlNifFunc nif_funcs[] = {
     {"pubkey_combine_nif",         1, pubkey_combine_nif,
         ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"ecdsa_sign_nif",             2, ecdsa_sign_nif,
+        ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"ecdsa_sign_recoverable_nif", 2, ecdsa_sign_recoverable_nif,
+        ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"ecdsa_recover_nif",          3, ecdsa_recover_nif,
         ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"schnorr_sign_nif",           3, schnorr_sign_nif,
         ERL_NIF_DIRTY_JOB_CPU_BOUND},
