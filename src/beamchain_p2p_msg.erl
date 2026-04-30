@@ -107,7 +107,14 @@ command_name(reqrecon)    -> <<"reqrecon">>;
 command_name(sketch)      -> <<"sketch">>;
 command_name(reconcildiff) -> <<"reconcildiff">>;
 command_name(reqsketchext) -> <<"reqsketchext">>;
-command_name(reqtx)       -> <<"reqtx">>.
+command_name(reqtx)       -> <<"reqtx">>;
+%% BIP157 compact block filters
+command_name(getcfilters)   -> <<"getcfilters">>;
+command_name(cfilter)       -> <<"cfilter">>;
+command_name(getcfheaders)  -> <<"getcfheaders">>;
+command_name(cfheaders)     -> <<"cfheaders">>;
+command_name(getcfcheckpt)  -> <<"getcfcheckpt">>;
+command_name(cfcheckpt)     -> <<"cfcheckpt">>.
 
 -spec command_atom(binary()) -> atom().
 command_atom(<<"version">>)     -> version;
@@ -141,6 +148,13 @@ command_atom(<<"sketch">>)      -> sketch;
 command_atom(<<"reconcildiff">>) -> reconcildiff;
 command_atom(<<"reqsketchext">>) -> reqsketchext;
 command_atom(<<"reqtx">>)       -> reqtx;
+%% BIP157 compact block filters
+command_atom(<<"getcfilters">>)   -> getcfilters;
+command_atom(<<"cfilter">>)       -> cfilter;
+command_atom(<<"getcfheaders">>)  -> getcfheaders;
+command_atom(<<"cfheaders">>)     -> cfheaders;
+command_atom(<<"getcfcheckpt">>)  -> getcfcheckpt;
+command_atom(<<"cfcheckpt">>)     -> cfcheckpt;
 command_atom(Other)             -> binary_to_atom(Other, utf8).
 
 %%% ===================================================================
@@ -303,7 +317,45 @@ encode_payload(reqsketchext, _) ->
 encode_payload(reqtx, #{short_ids := ShortIds}) ->
     Count = beamchain_serialize:encode_varint(length(ShortIds)),
     IdsBin = << <<Id:32/little>> || Id <- ShortIds >>,
-    <<Count/binary, IdsBin/binary>>.
+    <<Count/binary, IdsBin/binary>>;
+
+%% -- BIP157 compact block filters ----------------------------------------
+
+%% getcfilters: filter_type(1) || start_height(4 LE) || stop_hash(32)
+encode_payload(getcfilters, #{filter_type := FT, start_height := Start,
+                              stop_hash := Stop}) ->
+    <<FT:8, Start:32/little, Stop:32/binary>>;
+
+%% cfilter: filter_type(1) || block_hash(32) || varint(len) || filter_bytes
+encode_payload(cfilter, #{filter_type := FT, block_hash := BH,
+                          filter := FB}) ->
+    Len = beamchain_serialize:encode_varint(byte_size(FB)),
+    <<FT:8, BH:32/binary, Len/binary, FB/binary>>;
+
+%% getcfheaders: filter_type(1) || start_height(4 LE) || stop_hash(32)
+encode_payload(getcfheaders, #{filter_type := FT, start_height := Start,
+                               stop_hash := Stop}) ->
+    <<FT:8, Start:32/little, Stop:32/binary>>;
+
+%% cfheaders: filter_type(1) || stop_hash(32) || prev_filter_header(32) ||
+%%            varint(N) || N*32 byte filter hashes
+encode_payload(cfheaders, #{filter_type := FT, stop_hash := Stop,
+                            prev_header := Prev,
+                            filter_hashes := FHs}) ->
+    Count = beamchain_serialize:encode_varint(length(FHs)),
+    HashBin = << <<H:32/binary>> || H <- FHs >>,
+    <<FT:8, Stop:32/binary, Prev:32/binary, Count/binary, HashBin/binary>>;
+
+%% getcfcheckpt: filter_type(1) || stop_hash(32)
+encode_payload(getcfcheckpt, #{filter_type := FT, stop_hash := Stop}) ->
+    <<FT:8, Stop:32/binary>>;
+
+%% cfcheckpt: filter_type(1) || stop_hash(32) || varint(N) || N*32 byte headers
+encode_payload(cfcheckpt, #{filter_type := FT, stop_hash := Stop,
+                            headers := Hs}) ->
+    Count = beamchain_serialize:encode_varint(length(Hs)),
+    HBin = << <<H:32/binary>> || H <- Hs >>,
+    <<FT:8, Stop:32/binary, Count/binary, HBin/binary>>.
 
 %%% ===================================================================
 %%% Payload decoding
@@ -447,7 +499,41 @@ decode_payload(reqsketchext, <<>>) ->
 decode_payload(reqtx, Bin) ->
     {Count, Rest} = beamchain_serialize:decode_varint(Bin),
     {ShortIds, _} = decode_erlay_short_ids(Count, Rest, []),
-    {ok, #{short_ids => ShortIds}}.
+    {ok, #{short_ids => ShortIds}};
+
+%% -- BIP157 compact block filters ----------------------------------------
+
+decode_payload(getcfilters,
+               <<FT:8, Start:32/little, Stop:32/binary>>) ->
+    {ok, #{filter_type => FT, start_height => Start, stop_hash => Stop}};
+
+decode_payload(cfilter, <<FT:8, BH:32/binary, Rest/binary>>) ->
+    {Len, Rest2} = beamchain_serialize:decode_varint(Rest),
+    case Rest2 of
+        <<FB:Len/binary, _/binary>> ->
+            {ok, #{filter_type => FT, block_hash => BH, filter => FB}};
+        _ ->
+            {error, truncated_cfilter}
+    end;
+
+decode_payload(getcfheaders,
+               <<FT:8, Start:32/little, Stop:32/binary>>) ->
+    {ok, #{filter_type => FT, start_height => Start, stop_hash => Stop}};
+
+decode_payload(cfheaders,
+               <<FT:8, Stop:32/binary, Prev:32/binary, Rest/binary>>) ->
+    {Count, Rest2} = beamchain_serialize:decode_varint(Rest),
+    {Hashes, _} = decode_hashes(Count, Rest2, []),
+    {ok, #{filter_type => FT, stop_hash => Stop, prev_header => Prev,
+           filter_hashes => Hashes}};
+
+decode_payload(getcfcheckpt, <<FT:8, Stop:32/binary>>) ->
+    {ok, #{filter_type => FT, stop_hash => Stop}};
+
+decode_payload(cfcheckpt, <<FT:8, Stop:32/binary, Rest/binary>>) ->
+    {Count, Rest2} = beamchain_serialize:decode_varint(Rest),
+    {Headers, _} = decode_hashes(Count, Rest2, []),
+    {ok, #{filter_type => FT, stop_hash => Stop, headers => Headers}}.
 
 %%% ===================================================================
 %%% Version message decoding

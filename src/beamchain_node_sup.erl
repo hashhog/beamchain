@@ -40,7 +40,16 @@ init([]) ->
         true -> [child_spec(beamchain_zmq, worker)];
         false -> []
     end,
-    Children = CoreChildren ++ ZmqChildren,
+    %% Optional BIP-157/158 compact block filter index (default off).
+    %% When disabled, the gen_server is NOT started — keeping the
+    %% default fleet behavior identical for users who have not opted
+    %% in (no extra RocksDB instance, no NODE_COMPACT_FILTERS bit).
+    BlockFilterChildren =
+        case beamchain_config:blockfilterindex_enabled() of
+            true -> [child_spec(beamchain_blockfilter_index, worker)];
+            false -> []
+        end,
+    Children = CoreChildren ++ ZmqChildren ++ BlockFilterChildren,
     {ok, {SupFlags, Children}}.
 
 child_spec(Module, Type) ->

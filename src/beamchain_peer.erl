@@ -1258,9 +1258,20 @@ do_send_version(#peer_data{address = {IP, Port}, our_nonce = Nonce} = Data) ->
     %% disconnects peers that send MEMPOOL when this bit is off. Default-true
     %% mirrors Core's `-peerbloomfilters` default.
     BaseServices = ?NODE_NETWORK bor ?NODE_WITNESS,
-    Services = case beamchain_config:node_bloom_enabled() of
+    Services0 = case beamchain_config:node_bloom_enabled() of
         true  -> BaseServices bor ?NODE_BLOOM;
         false -> BaseServices
+    end,
+    %% BIP-157: advertise NODE_COMPACT_FILTERS only when the
+    %% blockfilterindex is enabled AND its gen_server is alive.  We
+    %% gate on both the config flag and the index process being up,
+    %% because peers that get NODE_COMPACT_FILTERS in our services
+    %% will issue getcfilters / getcfheaders / getcfcheckpt and we
+    %% must be able to answer them (BIP-157 §"Service bit").
+    Services = case beamchain_config:blockfilterindex_enabled() andalso
+                    beamchain_blockfilter_index:is_enabled() of
+        true  -> Services0 bor ?NODE_COMPACT_FILTERS;
+        false -> Services0
     end,
     Now = erlang:system_time(second),
     %% start_height MUST report our actual current tip height. Bitcoin
