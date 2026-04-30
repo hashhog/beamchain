@@ -31,6 +31,9 @@
 %% Maintenance
 -export([trim_to_size/1, expire_old/0]).
 
+%% Persistence (Bitcoin Core mempool.dat compatible)
+-export([dump_mempool/0, load_mempool/0, get_persistable_entries/0]).
+
 %% UTXO lookups (called externally from validation)
 -export([get_mempool_utxo/2]).
 
@@ -243,6 +246,29 @@ trim_to_size(MaxBytes) ->
 expire_old() ->
     gen_server:call(?SERVER, expire_old, 30000).
 
+%% @doc Dump the current mempool to <datadir>/mempool.dat (Bitcoin
+%% Core-compatible binary format). Synchronous; safe to call from RPC
+%% or shutdown.
+-spec dump_mempool() -> {ok, non_neg_integer()} | {error, term()}.
+dump_mempool() ->
+    beamchain_mempool_persist:dump().
+
+%% @doc Load <datadir>/mempool.dat and re-submit its transactions to the
+%% running mempool. Returns a stats map: #{accepted, expired, failed,
+%% already, total}.
+-spec load_mempool() -> {ok, map()} | {error, term()}.
+load_mempool() ->
+    beamchain_mempool_persist:load().
+
+%% @doc Snapshot the current mempool as `[{#transaction{}, Time}]` for
+%% the persist module. Hides the private #mempool_entry{} record from
+%% callers so they don't need an `-include` of beamchain_mempool's
+%% internals.
+-spec get_persistable_entries() -> [{#transaction{}, integer()}].
+get_persistable_entries() ->
+    [{E#mempool_entry.tx, E#mempool_entry.time_added}
+     || {_Txid, E} <- ets:tab2list(?MEMPOOL_TXS)].
+
 %% @doc Look up a mempool UTXO (output created by a mempool tx).
 -spec get_mempool_utxo(binary(), non_neg_integer()) ->
     {ok, #utxo{}} | not_found.
@@ -285,6 +311,12 @@ init([]) ->
 
     %% Schedule periodic orphan expiry
     erlang:send_after(60000, self(), expire_orphans),
+
+    %% Defer mempool.dat load until after the supervision tree has
+    %% finished booting (chainstate, sig cache, etc.). 5s is generous
+    %% but well below any user-visible RPC latency, and keeps the
+    %% startup path identical for fresh datadirs (no file = no-op).
+    erlang:send_after(5000, self(), load_persisted),
 
     logger:info("mempool: initialized"),
     {ok, #state{
@@ -353,12 +385,41 @@ handle_info(expire_orphans, State) ->
     erlang:send_after(60000, self(), expire_orphans),
     {noreply, State};
 
+handle_info(load_persisted, State) ->
+    %% Best-effort: missing file is normal on a fresh datadir.
+    case beamchain_mempool_persist:load() of
+        {ok, Stats} ->
+            logger:info("mempool: loaded mempool.dat ~p", [Stats]);
+        {error, no_file} ->
+            ok;
+        {error, Reason} ->
+            logger:warning("mempool: load failed: ~p", [Reason])
+    end,
+    {noreply, State};
+
 handle_info(_Info, State) ->
     {noreply, State}.
 
 terminate(_Reason, _State) ->
-    logger:info("mempool: shutting down (~B transactions)",
-                [ets:info(?MEMPOOL_TXS, size)]),
+    Size = ets:info(?MEMPOOL_TXS, size),
+    %% Persist mempool.dat on graceful shutdown so we can warm-restart
+    %% with the same set of unconfirmed txs (matches Bitcoin Core).
+    case Size > 0 of
+        true ->
+            try beamchain_mempool_persist:dump() of
+                {ok, N} ->
+                    logger:info("mempool: dumped ~B txs to mempool.dat", [N]);
+                {error, R} ->
+                    logger:warning("mempool: dump failed: ~p", [R])
+            catch
+                Class:Err ->
+                    logger:warning("mempool: dump crashed: ~p:~p",
+                                   [Class, Err])
+            end;
+        false ->
+            ok
+    end,
+    logger:info("mempool: shutting down (~B transactions)", [Size]),
     ok.
 
 %%% ===================================================================
