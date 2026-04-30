@@ -340,7 +340,7 @@ init([]) ->
 
     Network = determine_network(),
     DataDir = determine_datadir(Network),
-    ConfigFile = filename:join(DataDir, "beamchain.conf"),
+    ConfigFile = determine_conffile(DataDir),
 
     %% Ensure data directory exists
     ok = filelib:ensure_dir(filename:join(DataDir, "dummy")),
@@ -454,6 +454,20 @@ determine_datadir(Network) ->
 default_datadir() ->
     Home = os:getenv("HOME", "/tmp"),
     filename:join(Home, ".beamchain").
+
+%% @doc Resolve the path of beamchain.conf.
+%% Priority: env var (BEAMCHAIN_CONF) > application env (conffile,
+%% set by --conf=) > legacy fixed path under datadir.
+%% Mirrors bitcoind's GetConfigFile() / -conf= handling in init.cpp.
+determine_conffile(DataDir) ->
+    case os:getenv("BEAMCHAIN_CONF") of
+        false ->
+            case application:get_env(beamchain, conffile) of
+                {ok, Path} when is_list(Path), Path =/= "" -> Path;
+                _ -> filename:join(DataDir, "beamchain.conf")
+            end;
+        Path -> Path
+    end.
 
 validate_network(mainnet)  -> mainnet;
 validate_network(testnet)  -> testnet;
