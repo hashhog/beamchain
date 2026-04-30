@@ -23,7 +23,7 @@
 -export([get_all_txids/0, get_all_entries/0, get_all_id_pairs/0, get_info/0]).
 -export([get_sorted_by_fee/0]).
 -export([get_tx_fee_rate/1]).
--export([get_ancestors/1]).
+-export([get_ancestors/1, get_descendants/1]).
 
 %% Block interaction
 -export([remove_for_block/1]).
@@ -1642,6 +1642,19 @@ get_ancestors(Txid) ->
             Parents = get_parent_txids(Tx),
             get_ancestors_loop(Parents, sets:from_list(Parents), []);
         not_found ->
+            []
+    end.
+
+%% @doc Get all in-mempool descendants of a transaction (recursive).
+%% Returns a deduplicated list of descendant txids (not including the
+%% queried tx itself). Returns [] if the tx is not in the mempool.
+%% Mirrors Bitcoin Core's CTxMemPool::CalculateDescendants minus the
+%% query tx (see rpc/mempool.cpp `getmempooldescendants`).
+get_descendants(Txid) ->
+    case has_tx(Txid) of
+        true ->
+            lists:usort(get_all_descendants(Txid));
+        false ->
             []
     end.
 

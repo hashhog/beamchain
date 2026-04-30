@@ -9,7 +9,7 @@
 %% API
 -export([start_link/0]).
 -export([track_tx/3, process_block/2]).
--export([estimate_fee/1, get_fee_histogram/0]).
+-export([estimate_fee/1, estimate_raw_fee/2, get_fee_histogram/0]).
 -export([save_state/0]).
 
 %% gen_server callbacks
@@ -83,6 +83,25 @@ estimate_fee(ConfTarget) when is_integer(ConfTarget),
 estimate_fee(_) ->
     {error, invalid_target}.
 
+%% @doc Raw, per-horizon fee estimate. Returns a map keyed by horizon
+%% atom (`short' / `medium' / `long') with `feerate', `decay', `scale',
+%% `pass' and `fail' bucket info — matching the Bitcoin Core
+%% estimaterawfee RPC. Threshold is the proportion (0..1) of confirmed
+%% txs required for a bucket to "pass".
+%%
+%% beamchain only tracks a single horizon (CBlockPolicyEstimator's
+%% short / medium / long are merged in our exponential-decay model),
+%% so we report `medium' as the canonical horizon and skip the others
+%% when conf_target exceeds what we have data for.
+-spec estimate_raw_fee(integer(), float()) -> map().
+estimate_raw_fee(ConfTarget, Threshold)
+  when is_integer(ConfTarget),
+       ConfTarget >= 1, ConfTarget =< ?MAX_CONF_TARGET,
+       is_float(Threshold), Threshold >= 0.0, Threshold =< 1.0 ->
+    gen_server:call(?SERVER, {estimate_raw_fee, ConfTarget, Threshold});
+estimate_raw_fee(_, _) ->
+    #{}.
+
 %% @doc Return fee rate distribution of the current mempool.
 -spec get_fee_histogram() -> [{float(), integer()}].
 get_fee_histogram() ->
@@ -134,6 +153,9 @@ init([]) ->
 
 handle_call({estimate_fee, ConfTarget}, _From, State) ->
     Result = do_estimate_fee(ConfTarget, State),
+    {reply, Result, State};
+handle_call({estimate_raw_fee, ConfTarget, Threshold}, _From, State) ->
+    Result = do_estimate_raw_fee(ConfTarget, Threshold, State),
     {reply, Result, State};
 handle_call(get_fee_histogram, _From, State) ->
     Histogram = do_get_fee_histogram(State),
@@ -319,6 +341,141 @@ sum_confirmed_within(MaxBlocks, Confirmed) ->
             false -> Acc
         end
     end, 0.0, Confirmed).
+
+%% Sum confirmed counts across all delays.
+sum_confirmed_total(Confirmed) ->
+    maps:fold(fun(_K, V, Acc) -> Acc + V end, 0.0, Confirmed).
+
+%%% ===================================================================
+%%% Internal: raw fee estimation (estimaterawfee)
+%%% ===================================================================
+
+%% Build a bucket-info map for one horizon. Returns the canonical
+%% `medium' horizon report (we only track one). If conf_target
+%% exceeds what we have data for, returns an `errors' map only.
+do_estimate_raw_fee(ConfTarget, Threshold,
+                    #state{buckets = Buckets, data = Data,
+                           num_buckets = NumBuckets,
+                           total_tracked = Total}) ->
+    Decay = ?DECAY_FACTOR,
+    Scale = 1,
+    case Total < ?MIN_TRACKED_TXS of
+        true ->
+            FailBucket = empty_bucket_info(),
+            Horizon = #{
+                <<"decay">> => Decay,
+                <<"scale">> => Scale,
+                <<"fail">>  => FailBucket,
+                <<"errors">> =>
+                    [<<"Insufficient data or no feerate found "
+                       "which meets threshold">>]
+            },
+            #{<<"medium">> => Horizon};
+        false ->
+            case scan_buckets_for_pass(0, NumBuckets, ConfTarget, Threshold,
+                                        Buckets, Data) of
+                {pass, FeeRate, Pass, Fail} ->
+                    Horizon0 = #{
+                        <<"feerate">> => fee_rate_to_btc_per_kvb(FeeRate),
+                        <<"decay">>   => Decay,
+                        <<"scale">>   => Scale,
+                        <<"pass">>    => Pass
+                    },
+                    Horizon = case Fail of
+                        none -> Horizon0;
+                        _    -> Horizon0#{<<"fail">> => Fail}
+                    end,
+                    #{<<"medium">> => Horizon};
+                {fail, Fail} ->
+                    #{<<"medium">> => #{
+                        <<"decay">>  => Decay,
+                        <<"scale">>  => Scale,
+                        <<"fail">>   => Fail,
+                        <<"errors">> =>
+                            [<<"Insufficient data or no feerate found "
+                               "which meets threshold">>]
+                      }}
+            end
+    end.
+
+%% Scan buckets ascending. Track the highest-failing bucket along the
+%% way; return the first passing bucket plus the most-recent fail bucket.
+scan_buckets_for_pass(Idx, NumBuckets, _Target, _Thr, _B, _D)
+  when Idx >= NumBuckets ->
+    {fail, empty_bucket_info()};
+scan_buckets_for_pass(Idx, NumBuckets, Target, Threshold, Buckets, Data) ->
+    scan_buckets_for_pass(Idx, NumBuckets, Target, Threshold, Buckets,
+                          Data, none).
+
+scan_buckets_for_pass(Idx, NumBuckets, _Target, _Thr, _B, _D, LastFail)
+  when Idx >= NumBuckets ->
+    case LastFail of
+        none -> {fail, empty_bucket_info()};
+        _    -> {fail, LastFail}
+    end;
+scan_buckets_for_pass(Idx, NumBuckets, Target, Threshold, Buckets, Data,
+                      LastFail) ->
+    BD = maps:get(Idx, Data, #bucket_data{}),
+    StartRange = lists:nth(Idx + 1, Buckets),
+    EndRange = case Idx + 2 =< length(Buckets) of
+        true  -> lists:nth(Idx + 2, Buckets);
+        false -> StartRange * 2.0
+    end,
+    Resolved = BD#bucket_data.total - BD#bucket_data.in_mempool,
+    Info = bucket_info(StartRange, EndRange, Target, BD),
+    case Resolved >= 1.0 of
+        true ->
+            ConfWithin = sum_confirmed_within(Target,
+                                              BD#bucket_data.confirmed),
+            SuccessRate = ConfWithin / Resolved,
+            case SuccessRate >= Threshold of
+                true ->
+                    {pass, StartRange, Info, LastFail};
+                false ->
+                    scan_buckets_for_pass(Idx + 1, NumBuckets, Target,
+                                          Threshold, Buckets, Data, Info)
+            end;
+        false ->
+            scan_buckets_for_pass(Idx + 1, NumBuckets, Target, Threshold,
+                                  Buckets, Data, LastFail)
+    end.
+
+bucket_info(Start, End, Target, BD) ->
+    #{
+        <<"startrange">>     => Start,
+        <<"endrange">>       => End,
+        <<"withintarget">>   =>
+            round_centi(sum_confirmed_within(Target,
+                                              BD#bucket_data.confirmed)),
+        <<"totalconfirmed">> =>
+            round_centi(sum_confirmed_total(BD#bucket_data.confirmed)),
+        <<"inmempool">>      => round_centi(BD#bucket_data.in_mempool),
+        <<"leftmempool">>    =>
+            round_centi(max(0.0, BD#bucket_data.total
+                                  - BD#bucket_data.in_mempool
+                                  - sum_confirmed_total(
+                                        BD#bucket_data.confirmed)))
+    }.
+
+empty_bucket_info() ->
+    #{
+        <<"startrange">>     => -1,
+        <<"endrange">>       => 0,
+        <<"withintarget">>   => 0.0,
+        <<"totalconfirmed">> => 0.0,
+        <<"inmempool">>      => 0.0,
+        <<"leftmempool">>    => 0.0
+    }.
+
+%% Round to 2 decimal places (mirrors Core's round(x*100)/100).
+round_centi(F) when is_float(F) ->
+    round(F * 100.0) / 100.0;
+round_centi(I) when is_integer(I) ->
+    float(I).
+
+%% sat/vB -> BTC/kvB
+fee_rate_to_btc_per_kvb(FeeRate) ->
+    FeeRate * 1000.0 / 100000000.0.
 
 %%% ===================================================================
 %%% Internal: mempool fallback estimation
