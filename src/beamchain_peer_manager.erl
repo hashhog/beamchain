@@ -1216,8 +1216,133 @@ handle_peer_message(Pid, mempool, _Payload, State) ->
             beamchain_peer:disconnect(Pid)
     end,
     {noreply, State};
+%% -- BIP157 compact block filter requests --------------------------------
+%%
+%% Per BIP-157, peers that did NOT advertise NODE_COMPACT_FILTERS in
+%% their version handshake services bit are not obligated to answer
+%% these messages.  We gate on local advertisement (via the index
+%% being enabled) and silently ignore the message when the index is
+%% off.  When enabled, we forward to the per-message handler which
+%% queries beamchain_blockfilter_index.
+handle_peer_message(Pid, getcfilters, Payload, State) ->
+    case beamchain_blockfilter_index:is_enabled() of
+        true  -> handle_getcfilters_msg(Pid, Payload);
+        false -> ok
+    end,
+    {noreply, State};
+handle_peer_message(Pid, getcfheaders, Payload, State) ->
+    case beamchain_blockfilter_index:is_enabled() of
+        true  -> handle_getcfheaders_msg(Pid, Payload);
+        false -> ok
+    end,
+    {noreply, State};
+handle_peer_message(Pid, getcfcheckpt, Payload, State) ->
+    case beamchain_blockfilter_index:is_enabled() of
+        true  -> handle_getcfcheckpt_msg(Pid, Payload);
+        false -> ok
+    end,
+    {noreply, State};
 handle_peer_message(_Pid, _Command, _Payload, State) ->
     {noreply, State}.
+
+%%% ===================================================================
+%%% BIP-157 message handlers
+%%% ===================================================================
+
+handle_getcfilters_msg(Pid, Payload) ->
+    case beamchain_p2p_msg:decode_payload(getcfilters, Payload) of
+        {ok, #{filter_type := FT, start_height := Start,
+               stop_hash := Stop}} ->
+            BasicFT = beamchain_blockfilter:basic_filter_type(),
+            case FT of
+                BasicFT ->
+                    case beamchain_blockfilter_index:get_filter_range(
+                            Start, Stop) of
+                        {ok, Pairs} ->
+                            lists:foreach(
+                                fun({BH, FB}) ->
+                                    beamchain_peer:send_message(Pid,
+                                        {cfilter,
+                                         #{filter_type => FT,
+                                           block_hash => BH,
+                                           filter => FB}})
+                                end, Pairs);
+                        _ -> ok
+                    end;
+                _ ->
+                    %% Unknown filter type — ignore per BIP-157.
+                    ok
+            end;
+        _ -> ok
+    end.
+
+handle_getcfheaders_msg(Pid, Payload) ->
+    case beamchain_p2p_msg:decode_payload(getcfheaders, Payload) of
+        {ok, #{filter_type := FT, start_height := Start,
+               stop_hash := Stop}} ->
+            BasicFT = beamchain_blockfilter:basic_filter_type(),
+            case FT of
+                BasicFT ->
+                    case beamchain_blockfilter_index:get_header_range(
+                            Start, Stop) of
+                        {ok, {PrevHeader, FilterHashes}} ->
+                            beamchain_peer:send_message(Pid,
+                                {cfheaders,
+                                 #{filter_type => FT,
+                                   stop_hash => Stop,
+                                   prev_header => PrevHeader,
+                                   filter_hashes => FilterHashes}});
+                        _ -> ok
+                    end;
+                _ -> ok
+            end;
+        _ -> ok
+    end.
+
+handle_getcfcheckpt_msg(Pid, Payload) ->
+    case beamchain_p2p_msg:decode_payload(getcfcheckpt, Payload) of
+        {ok, #{filter_type := FT, stop_hash := Stop}} ->
+            BasicFT = beamchain_blockfilter:basic_filter_type(),
+            case FT of
+                BasicFT ->
+                    %% Resolve stop_hash → height.  Use the index's own
+                    %% height index; if the stop block isn't indexed
+                    %% (e.g. on a fork) we silently drop the request.
+                    case stop_hash_to_height(Stop) of
+                        {ok, StopHeight} ->
+                            case beamchain_blockfilter_index:get_checkpoints(
+                                    StopHeight, Stop) of
+                                {ok, Headers} ->
+                                    beamchain_peer:send_message(Pid,
+                                        {cfcheckpt,
+                                         #{filter_type => FT,
+                                           stop_hash => Stop,
+                                           headers => Headers}});
+                                _ -> ok
+                            end;
+                        _ -> ok
+                    end;
+                _ -> ok
+            end;
+        _ -> ok
+    end.
+
+%% Best-effort stop_hash → height resolution.  For now we walk the
+%% blockfilter_index height map (which mirrors the active chain when
+%% the index is current) until we find the entry whose hash matches.
+%% TODO(BIP157): this currently re-uses get_filter_range's internal
+%% reverse scan; for very deep stop_hash values it is O(tip).  When
+%% the index gains a hash→height secondary index we should prefer it.
+stop_hash_to_height(Stop) ->
+    Tip = beamchain_blockfilter_index:tip_height(),
+    stop_hash_to_height_loop(Stop, Tip).
+
+stop_hash_to_height_loop(_Stop, H) when H < 0 -> not_found;
+stop_hash_to_height_loop(Stop, H) ->
+    case beamchain_blockfilter_index:get_block_hash_by_height(H) of
+        {ok, Stop} -> {ok, H};
+        _ -> stop_hash_to_height_loop(Stop, H - 1)
+    end.
 
 handle_addr_msg(Pid, Payload, State) ->
     case beamchain_p2p_msg:decode_payload(addr, Payload) of

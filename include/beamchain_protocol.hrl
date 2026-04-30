@@ -70,6 +70,10 @@
 -define(NODE_NETWORK, 1).
 -define(NODE_BLOOM, 4).
 -define(NODE_WITNESS, 8).
+%% BIP-157: peer serves BIP-158 basic block filters via getcfilters
+%% / getcfheaders / getcfcheckpt.  Advertised only when the local
+%% blockfilterindex is enabled.
+-define(NODE_COMPACT_FILTERS, (1 bsl 6)).        %% 0x40 = 64
 -define(NODE_NETWORK_LIMITED, 1024).
 
 %%% -------------------------------------------------------------------

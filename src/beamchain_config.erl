@@ -20,6 +20,7 @@
          mempool_full_rbf/0,
          zmq_enabled/0,
          node_bloom_enabled/0,
+         blockfilterindex_enabled/0,
          %% Proxy configuration
          proxy/0,
          onion_proxy/0,
@@ -212,6 +213,30 @@ node_bloom_enabled() ->
                 1 -> true;
                 true -> true;
                 _ -> false  %% Default to disabled (Core DEFAULT_PEERBLOOMFILTERS)
+            end;
+        _ -> true
+    end.
+
+%% @doc Check if the BIP-157/158 compact block filter index is enabled.
+%% Reads from config file (blockfilterindex=1) or env var
+%% (BEAMCHAIN_BLOCKFILTERINDEX=1).  Defaults to false (disabled),
+%% matching Bitcoin Core's `-blockfilterindex` default.  When enabled,
+%% beamchain advertises NODE_COMPACT_FILTERS in its version handshake
+%% services flag and answers BIP-157 getcfilters/getcfheaders/
+%% getcfcheckpt P2P queries from the persistent filter index.
+-spec blockfilterindex_enabled() -> boolean().
+blockfilterindex_enabled() ->
+    case os:getenv("BEAMCHAIN_BLOCKFILTERINDEX") of
+        "0" -> false;
+        "false" -> false;
+        false ->
+            case get(blockfilterindex, "0") of
+                "1" -> true;
+                "true" -> true;
+                "basic" -> true;
+                1 -> true;
+                true -> true;
+                _ -> false
             end;
         _ -> true
     end.
