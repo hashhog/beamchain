@@ -9,6 +9,10 @@
 %% Signing (NIF-backed)
 -export([ecdsa_sign/2, schnorr_sign/3, seckey_tweak_add/2]).
 
+%% Recoverable ECDSA (BIP137 / Bitcoin signed messages)
+-export([ecdsa_sign_recoverable/2, ecdsa_recover/3,
+         message_hash/1, sign_message/2, verify_message/3]).
+
 %% Public key operations (NIF-backed)
 -export([pubkey_from_privkey/1, pubkey_tweak_add/2,
          pubkey_compress/1, pubkey_decompress/1,
@@ -110,6 +114,12 @@ pubkey_combine_nif(_PubKeys) ->
     erlang:nif_error(nif_not_loaded).
 
 ecdsa_sign_nif(_Msg, _SecKey) ->
+    erlang:nif_error(nif_not_loaded).
+
+ecdsa_sign_recoverable_nif(_Msg, _SecKey) ->
+    erlang:nif_error(nif_not_loaded).
+
+ecdsa_recover_nif(_Msg, _RecId, _Sig) ->
     erlang:nif_error(nif_not_loaded).
 
 schnorr_sign_nif(_Msg, _SecKey, _AuxRand) ->
@@ -258,6 +268,133 @@ schnorr_sign(Msg, SecKey, AuxRand) when byte_size(Msg) =:= 32,
 seckey_tweak_add(SecKey, Tweak) when byte_size(SecKey) =:= 32,
                                       byte_size(Tweak) =:= 32 ->
     seckey_tweak_add_nif(SecKey, Tweak).
+
+%%% -------------------------------------------------------------------
+%%% Recoverable ECDSA / Bitcoin signed messages
+%%%
+%%% Mirrors Bitcoin Core's CKey::SignCompact / CPubKey::RecoverCompact
+%%% (see bitcoin-core/src/common/signmessage.cpp). The on-the-wire
+%%% format used by signmessage / verifymessage is:
+%%%
+%%%   <header_byte:1><r:32><s:32>
+%%%
+%%% where header_byte = 27 + recid + (4 if compressed). Internally we
+%%% use a 65-byte recoverable representation `<recid:8><r:32><s:32>`.
+%%% -------------------------------------------------------------------
+
+%% @doc Sign Msg32 with SecKey32 and return a 65-byte recoverable
+%% signature `<<RecId:8, R:32, S:32>>`. S is normalised to low-S form
+%% to match Bitcoin Core's BIP62 enforcement.
+-spec ecdsa_sign_recoverable(Msg :: binary(), SecKey :: binary()) ->
+    {ok, binary()} | {error, term()}.
+ecdsa_sign_recoverable(Msg, SecKey) when byte_size(Msg) =:= 32,
+                                          byte_size(SecKey) =:= 32 ->
+    case ecdsa_sign_recoverable_nif(Msg, SecKey) of
+        {ok, <<RecId:8, R:32/binary, S:32/binary>>} ->
+            %% Normalise to low-S. If we flipped S we also flip the
+            %% odd/even bit of RecId so recover() still finds the
+            %% correct pubkey.
+            case is_low_s(S) of
+                true ->
+                    {ok, <<RecId:8, R/binary, S/binary>>};
+                false ->
+                    SNorm = normalize_s(S),
+                    NewRecId = RecId bxor 1,
+                    {ok, <<NewRecId:8, R/binary, SNorm/binary>>}
+            end;
+        {error, _} = Err ->
+            Err
+    end.
+
+%% @doc Recover the 33-byte compressed pubkey that produced Sig64 over
+%% Msg32 with the given RecId (0..3). Returns {error, _} if recovery
+%% fails (malformed signature / invalid recid).
+-spec ecdsa_recover(Msg :: binary(), RecId :: 0..3, Sig :: binary()) ->
+    {ok, binary()} | {error, term()}.
+ecdsa_recover(Msg, RecId, Sig) when byte_size(Msg) =:= 32,
+                                     is_integer(RecId), RecId >= 0,
+                                     RecId =< 3,
+                                     byte_size(Sig) =:= 64 ->
+    ecdsa_recover_nif(Msg, RecId, Sig).
+
+%% @doc Compute the Bitcoin signed message hash:
+%%
+%%   hash256( varstr("Bitcoin Signed Message:\n") ||
+%%            varstr(Message) )
+%%
+%% where varstr is `<varint(len)><bytes>`. Matches MessageHash() in
+%% Bitcoin Core (common/signmessage.cpp).
+-spec message_hash(binary() | string()) -> binary().
+message_hash(Message) when is_list(Message) ->
+    message_hash(unicode:characters_to_binary(Message));
+message_hash(Message) when is_binary(Message) ->
+    Magic = <<"Bitcoin Signed Message:\n">>,
+    Buf = <<(beamchain_serialize:encode_varint(byte_size(Magic)))/binary,
+             Magic/binary,
+             (beamchain_serialize:encode_varint(byte_size(Message)))/binary,
+             Message/binary>>,
+    hash256(Buf).
+
+%% @doc Sign a UTF-8 message with SecKey32 and produce the base-64
+%% encoded signature used by Bitcoin's signmessage RPC. Always emits
+%% a 65-byte signature with the compressed-key header byte
+%% (27 + recid + 4).
+-spec sign_message(Message :: binary() | string(), SecKey :: binary()) ->
+    {ok, binary()} | {error, term()}.
+sign_message(Message, SecKey) when byte_size(SecKey) =:= 32 ->
+    Hash = message_hash(Message),
+    case ecdsa_sign_recoverable(Hash, SecKey) of
+        {ok, <<RecId:8, RS:64/binary>>} ->
+            Header = 27 + RecId + 4,
+            Sig65 = <<Header:8, RS/binary>>,
+            {ok, base64:encode(Sig65)};
+        {error, _} = Err ->
+            Err
+    end.
+
+%% @doc Verify a base64-encoded signed-message signature against the
+%% expected 20-byte HASH160(pubkey). Returns one of:
+%%   ok                       - signature valid for this pubkey hash
+%%   {error, malformed_signature} - bad base64 / wrong length / bad recid
+%%   {error, pubkey_not_recovered} - secp256k1 recovery failed
+%%   {error, not_signed}      - recovered pubkey does not hash to PKH
+-spec verify_message(SignatureB64 :: binary() | string(),
+                     Message :: binary() | string(),
+                     ExpectedPKH :: binary()) ->
+    ok | {error, term()}.
+verify_message(SignatureB64, Message, ExpectedPKH)
+  when byte_size(ExpectedPKH) =:= 20 ->
+    SigBin = case SignatureB64 of
+        L when is_list(L) -> list_to_binary(L);
+        B when is_binary(B) -> B
+    end,
+    try base64:decode(SigBin) of
+        <<Header:8, RS:64/binary>> when Header >= 27, Header =< 42 ->
+            RecId = (Header - 27) band 3,
+            Compressed = (Header - 27) >= 4,
+            Hash = message_hash(Message),
+            case ecdsa_recover(Hash, RecId, RS) of
+                {ok, CompressedPubKey} ->
+                    PubKey = case Compressed of
+                        true -> CompressedPubKey;
+                        false ->
+                            case pubkey_decompress(CompressedPubKey) of
+                                {ok, U} -> U;
+                                {error, _} -> CompressedPubKey
+                            end
+                    end,
+                    case hash160(PubKey) of
+                        ExpectedPKH -> ok;
+                        _ -> {error, not_signed}
+                    end;
+                {error, _} ->
+                    {error, pubkey_not_recovered}
+            end;
+        _ ->
+            {error, malformed_signature}
+    catch
+        _:_ -> {error, malformed_signature}
+    end.
 
 %%% -------------------------------------------------------------------
 %%% Public key operations
