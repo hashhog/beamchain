@@ -759,6 +759,12 @@ do_connect_block_inner(#block{header = Header} = Block,
                 %% ZMQ notification for block connect
                 beamchain_zmq:notify_block(Block, connect),
 
+                %% BIP-157/158: extend the compact-block-filter chain.
+                %% Best-effort — failure does not roll back the block.
+                %% Default-off (no-op when the index isn't running).
+                _ = (catch beamchain_blockfilter_index:add_block(
+                        Block#block{hash = BlockHash}, Height)),
+
                 %% Notify peer manager that our tip advanced (stale tip detection)
                 beamchain_peer_manager:notify_tip_updated(),
 
@@ -848,6 +854,11 @@ do_disconnect_block(#state{tip_hash = TipHash, tip_height = TipHeight,
 
                     %% ZMQ notification for block disconnect
                     beamchain_zmq:notify_block(Block, disconnect),
+
+                    %% BIP-157/158: roll back the filter index entry for
+                    %% the disconnected block.  Best-effort, default-off.
+                    _ = (catch beamchain_blockfilter_index:remove_block(
+                            TipHash, TipHeight)),
 
                     State2 = State#state{
                         tip_hash = PrevHash,
