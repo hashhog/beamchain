@@ -97,7 +97,12 @@ init([]) ->
     Dispatch = cowboy_router:compile([
         {'_', [
             {"/", ?MODULE, []},
-            {"/wallet/:wallet_name", ?MODULE, []}
+            {"/wallet/:wallet_name", ?MODULE, []},
+            %% /health: unauthenticated GET endpoint for process supervisors
+            %% (systemd, k8s, watchdog scripts). Mirrors the spirit of
+            %% Bitcoin Core's getrpcinfo + initialblockdownload status,
+            %% without requiring rpc cookie auth.
+            {"/health", beamchain_rpc, [health]}
         ]}
     ]),
     TransportOpts = #{socket_opts => [{port, Port}, {reuseaddr, true}]},
@@ -169,6 +174,18 @@ pmap(Fun, List) ->
 %%% ===================================================================
 
 %% Cowboy calls init/2 for each HTTP request.
+init(Req0, [health] = CowboyState) ->
+    %% GET /health -- liveness/readiness probe for supervisors.
+    %% Returns 200 + JSON when the chainstate is reachable, 503 otherwise.
+    %% No auth (cookie/credentials) required by design; the endpoint
+    %% exposes only public liveness info already visible via P2P.
+    case cowboy_req:method(Req0) of
+        Verb when Verb =:= <<"GET">>; Verb =:= <<"HEAD">> ->
+            handle_health(Req0, CowboyState);
+        _ ->
+            Req = cowboy_req:reply(405, #{}, <<"Method Not Allowed">>, Req0),
+            {ok, Req, CowboyState}
+    end;
 init(Req0, CowboyState) ->
     case cowboy_req:method(Req0) of
         <<"POST">> ->
@@ -177,6 +194,40 @@ init(Req0, CowboyState) ->
             Req = cowboy_req:reply(405, #{}, <<"Method Not Allowed">>, Req0),
             {ok, Req, CowboyState}
     end.
+
+handle_health(Req0, CowboyState) ->
+    {Status, Body} =
+        try
+            case beamchain_chainstate:get_tip() of
+                {ok, {Hash, Height}} ->
+                    IBD = case catch beamchain_chainstate:is_synced() of
+                        true -> false;
+                        false -> true;
+                        _    -> true
+                    end,
+                    {200, jsx:encode(#{
+                        <<"status">>     => <<"ok">>,
+                        <<"height">>     => Height,
+                        <<"bestblock">>  => bin_to_hex(Hash),
+                        <<"ibd">>        => IBD
+                    })};
+                _ ->
+                    {503, jsx:encode(#{<<"status">> => <<"warmup">>})}
+            end
+        catch
+            _:_ ->
+                {503, jsx:encode(#{<<"status">> => <<"unavailable">>})}
+        end,
+    Headers = #{<<"content-type">> => <<"application/json">>},
+    Req = cowboy_req:reply(Status, Headers, Body, Req0),
+    {ok, Req, CowboyState}.
+
+%% Lightweight binary->hex (cowboy handler-local; we don't depend on
+%% the larger crypto helpers here so /health stays cheap).
+bin_to_hex(Bin) when is_binary(Bin) ->
+    list_to_binary(
+      lists:flatten(
+        [io_lib:format("~2.16.0b", [B]) || <<B>> <= Bin])).
 
 handle_post(Req0, CowboyState) ->
     {IP, _} = cowboy_req:peer(Req0),
