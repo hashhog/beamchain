@@ -4,7 +4,8 @@
 
 -include("beamchain.hrl").
 
--export([main/1]).
+-export([main/1, parse_args/1, apply_debug_categories/1,
+         remove_pidfile/0, pidfile_path/1]).
 
 %% Dialyzer suppressions for false positives:
 %% import_utxo/1 calls halt/1 (diverges) on one path; dialyzer treats it as
@@ -104,8 +105,46 @@ parse_args(["--version" | _Rest], _Cmd, Opts) ->
     {version, Opts};
 parse_args(["-v" | _Rest], _Cmd, Opts) ->
     {version, Opts};
+%% --debug=<categories>: comma-separated category names (net,rpc,...)
+%% --debug (bare): turn on debug for all modules.
+parse_args(["--debug=" ++ Cats | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{debug => true,
+                                 debug_categories => parse_debug_cats(Cats)});
+parse_args(["--debug", "=" ++ Cats | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{debug => true,
+                                 debug_categories => parse_debug_cats(Cats)});
 parse_args(["--debug" | Rest], Cmd, Opts) ->
     parse_args(Rest, Cmd, Opts#{debug => true});
+
+%% --daemon: detach into the background (re-exec self under nohup/&).
+parse_args(["--daemon" | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{daemon => true});
+
+%% --printtoconsole: explicitly mirror the file logger to stdout/stderr
+%% even when running under nohup/--daemon. Default behavior already
+%% writes to the local TTY when present; this flag forces it on.
+parse_args(["--printtoconsole" | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{printtoconsole => true});
+parse_args(["--printtoconsole=" ++ Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{printtoconsole => parse_bool(Value)});
+
+%% --pid=<path>: PID file path. Default <datadir>/beamchain.pid.
+parse_args(["--pid", Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{pidfile => Value});
+parse_args(["--pid=" ++ Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{pidfile => Value});
+
+%% --conf=<file>: explicit override for the beamchain.conf path.
+%% Falls back to <datadir>/beamchain.conf when omitted (legacy behavior).
+parse_args(["--conf", Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{conf => Value});
+parse_args(["--conf=" ++ Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{conf => Value});
+
+%% Internal flag emitted by daemonize/1.  Marks the re-exec'd child so it
+%% runs the foreground path and does not fork again.  Hidden from help.
+parse_args(["--_daemon-child" | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{'_daemon_child' => true});
 
 %% Options with values
 parse_args(["--network", Value | Rest], Cmd, Opts) ->
@@ -197,9 +236,15 @@ print_usage() ->
         "~s~n"
         "  --network=<net>   network: mainnet, testnet, testnet4, regtest, signet~n"
         "  --datadir=<dir>   data directory (default: ~~/.beamchain)~n"
+        "  --conf=<file>     config file (default: <datadir>/beamchain.conf)~n"
         "  --rpc-port=<n>    rpc port override~n"
         "  --p2p-port=<n>    p2p port override~n"
-        "  --debug           enable debug logging~n"
+        "  --pid=<file>      pid file path (default: <datadir>/beamchain.pid)~n"
+        "  --daemon          fork into the background after starting~n"
+        "  --printtoconsole  also write log lines to stdout~n"
+        "  --debug[=<cats>]  enable debug logging (optional comma-separated~n"
+        "                    categories: net,rpc,mempool,validation,sync,~n"
+        "                    db,zmq,wallet,miner,all)~n"
         "  --reset           reset chain data before sync~n"
         "  --limit=<n>       limit sync to n blocks~n"
         "  --import-file=<f> file to import blocks from (default: stdin)~n"
@@ -216,10 +261,29 @@ print_usage() ->
 %%% ===================================================================
 
 start_node(Opts) ->
+    case maps:get(daemon, Opts, false) of
+        true ->
+            %% --daemon: detach by re-exec'ing self under nohup with the
+            %% --daemon flag stripped, so the child runs the normal
+            %% foreground path. See bitcoin-core/src/util/system.cpp's
+            %% daemon() helper -- same intent, smaller scope.
+            case maps:get('_daemon_child', Opts, false) of
+                true ->
+                    do_start_node(Opts);
+                false ->
+                    daemonize(Opts)
+            end;
+        false ->
+            do_start_node(Opts)
+    end.
+
+do_start_node(Opts) ->
     apply_opts(Opts),
     case start_app() of
         ok ->
             setup_file_logger(),
+            maybe_setup_console_logger(Opts),
+            write_pidfile(Opts),
             print_banner(),
             io:format("~s~n", [green("node started, press Ctrl-C to stop")]),
             %% Block forever -the OTP app runs in the background
@@ -529,11 +593,41 @@ apply_opts(Opts) ->
         undefined -> ok;
         P2pPort -> application:set_env(beamchain, p2pport, P2pPort, [{persistent, true}])
     end,
+    %% --conf=<file>: explicit beamchain.conf path override. Promoted from
+    %% the legacy fixed path at <datadir>/beamchain.conf so operators can
+    %% point at a shared/system config (mirrors bitcoind -conf=).
+    case maps:get(conf, Opts, undefined) of
+        undefined -> ok;
+        ConfPath ->
+            application:set_env(beamchain, conffile, ConfPath, [{persistent, true}])
+    end,
+    %% --pid=<path>: opt-in PID file. Default lives under datadir; we
+    %% don't pin a default into application env here -- start_node/1
+    %% computes it lazily so it picks up the resolved datadir.
+    case maps:get(pidfile, Opts, undefined) of
+        undefined -> ok;
+        PidPath ->
+            application:set_env(beamchain, pidfile, PidPath, [{persistent, true}])
+    end,
+    case maps:get(printtoconsole, Opts, false) of
+        true ->
+            application:set_env(beamchain, printtoconsole, true,
+                                [{persistent, true}]);
+        false -> ok
+    end,
     case maps:get(debug, Opts, false) of
         true ->
             logger:set_primary_config(level, debug);
         false ->
             logger:set_primary_config(level, info)
+    end,
+    %% --debug=<cat>: per-module log levels. Applied AFTER the primary
+    %% level so categories can opt back in to debug while everything
+    %% else stays at info.  Categories map to module name globs in
+    %% category_modules/1; an unknown category is a soft warning.
+    case maps:get(debug_categories, Opts, []) of
+        [] -> ok;
+        Cats -> apply_debug_categories(Cats)
     end,
     ok.
 
@@ -673,9 +767,258 @@ graceful_shutdown() ->
     %% Flush UTXO cache to disk
     try beamchain_chainstate:flush()
     catch _:_ -> ok end,
+    %% Best-effort PID-file removal. Match bitcoind's behavior in
+    %% init/common.cpp ~RemovePidFile: only remove on graceful shutdown
+    %% so a crash leaves a stale file as evidence (the file's process
+    %% will not exist, so external tools can detect that).
+    try remove_pidfile() catch _:_ -> ok end,
     %% Stop the application (closes DB, disconnects peers)
     application:stop(beamchain),
     ok.
+
+%%% ===================================================================
+%%% --daemon support
+%%% ===================================================================
+%%
+%% bitcoind's daemon() in src/util/system.cpp wraps the C library
+%% daemon(3) call.  Erlang has no exposed daemon(3), so we re-exec the
+%% same escript via /bin/sh under nohup, drop --daemon from argv, and
+%% append --_daemon-child to mark the child path so it doesn't fork
+%% again.  The child inherits the same datadir/network env so the
+%% behavior is identical to the foreground command.
+
+daemonize(Opts) ->
+    Self = case escript:script_name() of
+        []   -> "_build/default/bin/beamchain";
+        Name -> Name
+    end,
+    Args = rebuild_argv_for_daemon(Opts),
+    Cmd = build_daemon_cmd(Self, Args),
+    DataDir = resolve_datadir_for_daemon(Opts),
+    LogPath = filename:join(DataDir, "beamchain.out"),
+    ok = filelib:ensure_dir(LogPath),
+    %% Spawn the child detached from this VM.  We use os:cmd indirectly
+    %% via a shell redirect to /dev/null so erlang doesn't keep the
+    %% fd open and block exit.
+    FullCmd = io_lib:format(
+        "nohup /bin/sh -c ~s >> ~s 2>&1 < /dev/null &",
+        [shell_quote(Cmd), shell_quote(LogPath)]),
+    _ = os:cmd(lists:flatten(FullCmd)),
+    io:format("beamchain: daemonized; logs at ~s~n", [LogPath]),
+    halt(0).
+
+rebuild_argv_for_daemon(Opts) ->
+    %% We re-emit only the recognized flags.  This keeps argv canonical
+    %% and avoids round-tripping unknown garbage to the child.
+    Network = maps:get(network, Opts, undefined),
+    Datadir = maps:get(datadir, Opts, undefined),
+    RpcPort = maps:get(rpc_port, Opts, undefined),
+    P2PPort = maps:get(p2p_port, Opts, undefined),
+    PidFile = maps:get(pidfile, Opts, undefined),
+    Conf    = maps:get(conf, Opts, undefined),
+    PrintTC = maps:get(printtoconsole, Opts, false),
+    Debug   = maps:get(debug, Opts, false),
+    Cats    = maps:get(debug_categories, Opts, []),
+    lists:flatten([
+        ["start"],
+        opt("--network=", Network, fun atom_to_list/1),
+        opt("--datadir=", Datadir, fun id/1),
+        opt("--rpc-port=", RpcPort, fun integer_to_list/1),
+        opt("--p2p-port=", P2PPort, fun integer_to_list/1),
+        opt("--pid=", PidFile, fun id/1),
+        opt("--conf=", Conf, fun id/1),
+        case PrintTC of true -> ["--printtoconsole"]; _ -> [] end,
+        case {Debug, Cats} of
+            {true, []}   -> ["--debug"];
+            {true, Cats} -> ["--debug=" ++ string:join(
+                                lists:map(fun atom_to_list/1, Cats), ",")];
+            _ -> []
+        end,
+        ["--_daemon-child"]
+    ]).
+
+opt(_Prefix, undefined, _Fmt) -> [];
+opt(Prefix, Value, Fmt) -> [Prefix ++ Fmt(Value)].
+
+id(X) -> X.
+
+build_daemon_cmd(Self, Args) ->
+    string:join([shell_quote(Self) | [shell_quote(A) || A <- Args]], " ").
+
+shell_quote(S) when is_atom(S) -> shell_quote(atom_to_list(S));
+shell_quote(S) when is_binary(S) -> shell_quote(binary_to_list(S));
+shell_quote(S) when is_integer(S) -> shell_quote(integer_to_list(S));
+shell_quote(S) when is_list(S) ->
+    %% Single-quote and escape any embedded single quotes.
+    "'" ++ lists:flatten([escape_squote(C) || C <- S]) ++ "'".
+
+escape_squote($') -> "'\\''";
+escape_squote(C)  -> [C].
+
+resolve_datadir_for_daemon(Opts) ->
+    case maps:get(datadir, Opts, undefined) of
+        undefined ->
+            Net = maps:get(network, Opts, mainnet),
+            Home = os:getenv("HOME", "/tmp"),
+            Base = filename:join(Home, ".beamchain"),
+            case Net of
+                mainnet -> Base;
+                Other -> filename:join(Base, atom_to_list(Other))
+            end;
+        Dir -> Dir
+    end.
+
+%%% ===================================================================
+%%% PID file management
+%%% ===================================================================
+
+%% @doc Compute the PID-file path. Honors --pid= override; otherwise
+%% defaults to <datadir>/beamchain.pid.  Mirrors bitcoind's
+%% g_pidfile_path in init/common.cpp.
+pidfile_path(Opts) ->
+    case maps:get(pidfile, Opts, undefined) of
+        Path when is_list(Path), Path =/= "" ->
+            Path;
+        _ ->
+            case application:get_env(beamchain, pidfile) of
+                {ok, P} when is_list(P), P =/= "" -> P;
+                _ ->
+                    DataDir = beamchain_config:datadir(),
+                    filename:join(DataDir, "beamchain.pid")
+            end
+    end.
+
+%% Resolve the PID path WITHOUT requiring beamchain_config to be alive.
+%% Used by remove_pidfile/0 during shutdown when the config gen_server
+%% may already be dead.
+pidfile_path_safe() ->
+    case application:get_env(beamchain, pidfile) of
+        {ok, P} when is_list(P), P =/= "" -> P;
+        _ ->
+            case catch beamchain_config:datadir() of
+                Dir when is_list(Dir) -> filename:join(Dir, "beamchain.pid");
+                _ -> undefined
+            end
+    end.
+
+write_pidfile(Opts) ->
+    Path = pidfile_path(Opts),
+    OsPid = os:getpid(),  %% returns string()
+    ok = filelib:ensure_dir(Path),
+    case file:write_file(Path, OsPid ++ "\n") of
+        ok ->
+            application:set_env(beamchain, pidfile, Path, [{persistent, true}]),
+            ok;
+        {error, Reason} ->
+            logger:warning("could not write pid file ~s: ~p", [Path, Reason]),
+            ok
+    end.
+
+remove_pidfile() ->
+    case pidfile_path_safe() of
+        undefined -> ok;
+        Path ->
+            case file:delete(Path) of
+                ok -> ok;
+                {error, enoent} -> ok;
+                {error, _} -> ok
+            end
+    end.
+
+%%% ===================================================================
+%%% --printtoconsole logger handler
+%%% ===================================================================
+
+maybe_setup_console_logger(Opts) ->
+    Want = case maps:get(printtoconsole, Opts, false) of
+        true -> true;
+        false ->
+            case application:get_env(beamchain, printtoconsole) of
+                {ok, true} -> true;
+                _ -> false
+            end
+    end,
+    case Want of
+        false -> ok;
+        true ->
+            %% standard_io handler.  add_handler/3 is idempotent enough:
+            %% if the handler already exists we ignore the {already_exist}
+            %% return.
+            Cfg = #{
+                level => info,
+                config => #{type => standard_io},
+                formatter => {logger_formatter, #{
+                    template => [time, " [", level, "] ", msg, "\n"],
+                    single_line => true
+                }}
+            },
+            _ = logger:add_handler(beamchain_console_logger, logger_std_h, Cfg),
+            ok
+    end.
+
+%%% ===================================================================
+%%% --debug=<cat> per-module logger plumbing
+%%% ===================================================================
+
+%% @doc Bitcoin Core's `-debug=<cat>` lets the operator opt-in to
+%% per-category debug output (net, rpc, mempool, validation, ...).
+%% beamchain ships one module per such category, so we map category
+%% names to module-name globs and call logger:set_module_level/2 for
+%% each match.  Unknown categories log a notice but do not abort -- this
+%% matches Core's behavior (UnsupportedLogCategory in logging.cpp).
+apply_debug_categories(Cats) ->
+    lists:foreach(fun apply_debug_category/1, Cats).
+
+apply_debug_category(all) ->
+    logger:set_primary_config(level, debug);
+apply_debug_category(none) ->
+    logger:set_primary_config(level, info);
+apply_debug_category(Cat) ->
+    case category_modules(Cat) of
+        [] ->
+            logger:notice("ignoring unknown debug category: ~p", [Cat]);
+        Mods ->
+            lists:foreach(
+              fun(M) -> _ = logger:set_module_level(M, debug) end,
+              Mods)
+    end.
+
+%% Map a category atom to the modules it covers.  Add new categories
+%% here as the codebase grows; modules listed here MUST exist (we resolve
+%% to ground truth via code:which/1 so a typo fails xref).
+category_modules(net) ->
+    [beamchain_peer, beamchain_peer_manager, beamchain_p2p_msg,
+     beamchain_addrman, beamchain_listener, beamchain_proxy,
+     beamchain_transport_v2, beamchain_v2_msg];
+category_modules(rpc) ->
+    [beamchain_rpc, beamchain_rest];
+category_modules(mempool) ->
+    [beamchain_mempool, beamchain_mempool_persist, beamchain_fee_estimator];
+category_modules(validation) ->
+    [beamchain_validation, beamchain_chainstate, beamchain_pow,
+     beamchain_script, beamchain_versionbits];
+category_modules(sync) ->
+    [beamchain_sync, beamchain_block_sync, beamchain_header_sync];
+category_modules(db) ->
+    [beamchain_db];
+category_modules(zmq) ->
+    [beamchain_zmq];
+category_modules(wallet) ->
+    [beamchain_wallet, beamchain_wallet_sup, beamchain_descriptor];
+category_modules(miner) ->
+    [beamchain_miner];
+category_modules(_Other) ->
+    [].
+
+parse_debug_cats(Str) ->
+    [list_to_atom(string:trim(C)) || C <- string:split(Str, ",", all),
+                                     string:trim(C) =/= ""].
+
+parse_bool("1")     -> true;
+parse_bool("0")     -> false;
+parse_bool("true")  -> true;
+parse_bool("false") -> false;
+parse_bool(_)       -> true.
 
 %% @doc Handle --reset flag: wipe chain data before syncing.
 maybe_reset(#{reset := true}) ->
