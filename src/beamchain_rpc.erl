@@ -409,6 +409,9 @@ handle_method(<<"getmempoolinfo">>, _, _W) -> rpc_getmempoolinfo();
 handle_method(<<"getrawmempool">>, P, _W) -> rpc_getrawmempool(P);
 handle_method(<<"getmempoolentry">>, P, _W) -> rpc_getmempoolentry(P);
 handle_method(<<"getmempoolancestors">>, P, _W) -> rpc_getmempoolancestors(P);
+handle_method(<<"savemempool">>, _, _W) -> rpc_dumpmempool();
+handle_method(<<"dumpmempool">>, _, _W) -> rpc_dumpmempool();
+handle_method(<<"loadmempool">>, _, _W) -> rpc_loadmempool();
 
 %% -- Network --
 handle_method(<<"getnetworkinfo">>, _, _W) -> rpc_getnetworkinfo();
@@ -518,10 +521,13 @@ rpc_help_list() ->
         <<"submitblock \"hexdata\"">>,
         <<"">>,
         <<"== Mempool ==">>,
+        <<"dumpmempool">>,
         <<"getmempoolancestors \"txid\" ( verbose )">>,
         <<"getmempoolentry \"txid\"">>,
         <<"getmempoolinfo">>,
         <<"getrawmempool ( verbose )">>,
+        <<"loadmempool">>,
+        <<"savemempool">>,
         <<"">>,
         <<"== Network ==">>,
         <<"addnode \"node\" \"command\"">>,
@@ -2023,6 +2029,39 @@ rpc_getmempoolancestors([TxidHex, Verbose]) when is_binary(TxidHex) ->
 rpc_getmempoolancestors(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"Usage: getmempoolancestors \"txid\" ( verbose )">>}.
+
+%% Persist mempool to <datadir>/mempool.dat (Bitcoin Core compatible).
+rpc_dumpmempool() ->
+    case beamchain_mempool:dump_mempool() of
+        {ok, _N} ->
+            {ok, true};
+        {error, Reason} ->
+            {error, ?RPC_MISC_ERROR,
+             list_to_binary(io_lib:format("dumpmempool failed: ~p",
+                                          [Reason]))}
+    end.
+
+%% Load mempool from <datadir>/mempool.dat. Returns {tx_count, expired,
+%% failed, already, total} as Core-style fields.
+rpc_loadmempool() ->
+    case beamchain_mempool:load_mempool() of
+        {ok, Stats} ->
+            {ok, #{
+                <<"loaded">>  => maps:get(accepted, Stats, 0),
+                <<"expired">> => maps:get(expired, Stats, 0),
+                <<"failed">>  => maps:get(failed, Stats, 0),
+                <<"already">> => maps:get(already, Stats, 0),
+                <<"total">>   => maps:get(total, Stats, 0)
+            }};
+        {error, no_file} ->
+            {ok, #{<<"loaded">> => 0, <<"expired">> => 0,
+                   <<"failed">> => 0, <<"already">> => 0,
+                   <<"total">> => 0}};
+        {error, Reason} ->
+            {error, ?RPC_MISC_ERROR,
+             list_to_binary(io_lib:format("loadmempool failed: ~p",
+                                          [Reason]))}
+    end.
 
 %%% ===================================================================
 %%% Network methods
