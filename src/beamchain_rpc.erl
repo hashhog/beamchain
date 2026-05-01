@@ -22,6 +22,9 @@
 %% Exported for testing — shared deployment-state helper.
 -export([build_deployment_map/3]).
 
+%% Exported for testing — Core-strict assumeutxo height whitelist check.
+-export([validate_snapshot_height/2]).
+
 %% Cowboy handler
 -export([init/2]).
 
@@ -4255,6 +4258,27 @@ rpc_getdescriptorinfo(_) ->
 %%% assumeUTXO methods
 %%% ===================================================================
 
+%% @doc Core-strict whitelist check on a snapshot's base block height.
+%% Mirrors bitcoin-core/src/validation.cpp:5775-5780. Returns `ok` if the
+%% height is recognized in this network's `m_assumeutxo_data`, otherwise
+%% `{error, BinMessage}` carrying the verbatim Core refusal string.
+%% Exported so eunit can exercise the whitelist semantics without spinning
+%% up beamchain_db / beamchain_chainstate.
+-spec validate_snapshot_height(non_neg_integer(), atom()) ->
+    ok | {error, binary()}.
+validate_snapshot_height(BaseHeight, Network) ->
+    case beamchain_chain_params:get_assumeutxo(BaseHeight, Network) of
+        {ok, _AuData} ->
+            ok;
+        not_found ->
+            Msg = iolist_to_binary(
+                    io_lib:format(
+                      "Assumeutxo height in snapshot metadata not "
+                      "recognized (~b) - refusing to load snapshot",
+                      [BaseHeight])),
+            {error, Msg}
+    end.
+
 %% @doc Load a UTXO set snapshot from file.
 %% Implements Bitcoin Core's loadtxoutset RPC.
 %% The snapshot allows the node to start validating new blocks immediately
@@ -4267,27 +4291,40 @@ rpc_loadtxoutset([Path]) when is_binary(Path) ->
         {ok, #{base_hash := BaseHash, num_coins := NumCoins}} ->
             Network = beamchain_config:network(),
 
-            %% Check if we have parameters for this snapshot
-            case beamchain_chain_params:get_assumeutxo_by_hash(BaseHash, Network) of
-                {ok, _Height, _} ->
-                    %% Load the snapshot into chainstate
-                    case beamchain_chainstate:load_snapshot(PathStr) of
-                        {ok, LoadedHeight} ->
-                            {ok, #{
-                                <<"base_blockhash">> => beamchain_serialize:hex_encode(BaseHash),
-                                <<"coins_loaded">> => NumCoins,
-                                <<"base_height">> => LoadedHeight,
-                                <<"message">> => <<"Snapshot loaded successfully. Background validation started.">>
-                            }};
-                        {error, Reason} ->
-                            {error, ?RPC_MISC_ERROR,
-                             iolist_to_binary(io_lib:format("Failed to load snapshot: ~p", [Reason]))}
+            %% Mirror bitcoin-core/src/validation.cpp:5765-5780. Core looks up
+            %% the snapshot's base block in the block index to discover its
+            %% height, then refuses if that height is not in
+            %% m_assumeutxo_data. We do the same: resolve the hash via the
+            %% block index, then strictly whitelist by height.
+            case beamchain_db:get_block_index_by_hash(BaseHash) of
+                {ok, #{height := BaseHeight}} ->
+                    case validate_snapshot_height(BaseHeight, Network) of
+                        ok ->
+                            %% Load the snapshot into chainstate
+                            case beamchain_chainstate:load_snapshot(PathStr) of
+                                {ok, LoadedHeight} ->
+                                    {ok, #{
+                                        <<"base_blockhash">> => beamchain_serialize:hex_encode(BaseHash),
+                                        <<"coins_loaded">> => NumCoins,
+                                        <<"base_height">> => LoadedHeight,
+                                        <<"message">> => <<"Snapshot loaded successfully. Background validation started.">>
+                                    }};
+                                {error, Reason} ->
+                                    {error, ?RPC_MISC_ERROR,
+                                     iolist_to_binary(io_lib:format("Failed to load snapshot: ~p", [Reason]))}
+                            end;
+                        {error, Msg} ->
+                            {error, ?RPC_MISC_ERROR, Msg}
                     end;
                 not_found ->
-                    HashHex = beamchain_serialize:hex_encode(BaseHash),
+                    %% Mirrors validation.cpp:5770-5771 ("Did not find snapshot
+                    %% start blockheader %s"). The hash is rendered in display
+                    %% (big-endian) order to match Core's uint256::ToString.
+                    DisplayHash = beamchain_serialize:hex_encode(
+                                    beamchain_serialize:reverse_bytes(BaseHash)),
                     {error, ?RPC_MISC_ERROR,
-                     iolist_to_binary([<<"Unknown snapshot base block hash: ">>, HashHex,
-                                       <<". Snapshot not recognized for this network.">>])}
+                     iolist_to_binary([<<"Did not find snapshot start blockheader ">>,
+                                       DisplayHash])}
             end;
         {error, Reason} ->
             {error, ?RPC_MISC_ERROR,

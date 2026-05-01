@@ -35,7 +35,9 @@ snapshot_test_() ->
           {"assumeutxo params lookup by height", fun test_assumeutxo_by_height/0},
           {"assumeutxo params lookup by hash", fun test_assumeutxo_by_hash/0},
           {"mainnet has all 4 assumeutxo entries from Core",
-           fun test_mainnet_four_entries/0}
+           fun test_mainnet_four_entries/0},
+          {"loadtxoutset refuses heights not in m_assumeutxo_data (Core-strict)",
+           fun test_validate_snapshot_height_strict/0}
          ]
      end}.
 
@@ -387,6 +389,41 @@ test_mainnet_four_entries() ->
        display_hex_to_bin(
          "a2a5521b1b5ab65f67818e5e8eccabb7171a517f9e2382208f77687310768f96"),
        H).
+
+%% Mirrors bitcoin-core/src/validation.cpp:5775-5780. The loadtxoutset RPC
+%% must refuse any snapshot whose base_blockhash height is not present in
+%% m_assumeutxo_data with the exact Core message
+%%   "Assumeutxo height in snapshot metadata not recognized (<H>) - refusing to load snapshot"
+%% Heights in the whitelist must pass; everything else must be refused.
+test_validate_snapshot_height_strict() ->
+    %% Mainnet whitelist: 840000, 880000, 910000, 935000.
+    ?assertEqual(ok, beamchain_rpc:validate_snapshot_height(840000, mainnet)),
+    ?assertEqual(ok, beamchain_rpc:validate_snapshot_height(880000, mainnet)),
+    ?assertEqual(ok, beamchain_rpc:validate_snapshot_height(910000, mainnet)),
+    ?assertEqual(ok, beamchain_rpc:validate_snapshot_height(935000, mainnet)),
+
+    %% Heights NOT in the whitelist (incl. off-by-one near a real entry,
+    %% and a height in a totally different range) must be refused with the
+    %% Core-exact message.
+    BadHeights = [0, 1, 839999, 840001, 850000, 879999, 935001, 1000000],
+    lists:foreach(
+      fun(H) ->
+          {error, Msg} = beamchain_rpc:validate_snapshot_height(H, mainnet),
+          Expected = iolist_to_binary(
+                       io_lib:format(
+                         "Assumeutxo height in snapshot metadata not "
+                         "recognized (~b) - refusing to load snapshot",
+                         [H])),
+          ?assertEqual(Expected, Msg)
+      end, BadHeights),
+
+    %% Testnet4 whitelist: 90000, 120000.
+    ?assertEqual(ok, beamchain_rpc:validate_snapshot_height(90000, testnet4)),
+    ?assertEqual(ok, beamchain_rpc:validate_snapshot_height(120000, testnet4)),
+    ?assertMatch({error, _},
+                 beamchain_rpc:validate_snapshot_height(840000, testnet4)),
+    ?assertMatch({error, _},
+                 beamchain_rpc:validate_snapshot_height(100000, testnet4)).
 
 display_hex_to_bin(HexStr) ->
     list_to_binary(lists:reverse(binary_to_list(hex_to_bin(HexStr)))).
