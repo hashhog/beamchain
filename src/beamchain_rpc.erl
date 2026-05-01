@@ -1978,8 +1978,11 @@ rpc_gettxout(_) ->
 
 rpc_gettxoutsetinfo([]) ->
     rpc_gettxoutsetinfo([<<"none">>]);
-rpc_gettxoutsetinfo([_HashType | _]) ->
-    %% Get UTXO set statistics
+rpc_gettxoutsetinfo([HashType | _]) ->
+    %% Get UTXO set statistics. Per Core's gettxoutsetinfo (rpc/blockchain.cpp
+    %% around line 1090), hash_type ∈ {none, hash_serialized_3, muhash}
+    %% selects which UTXO-set commitment to surface. We honour this so callers
+    %% can ask for either commitment by name.
     case beamchain_chainstate:get_tip() of
         {ok, {TipHash, TipHeight}} ->
             %% Get cache statistics from chainstate
@@ -1990,14 +1993,15 @@ rpc_gettxoutsetinfo([_HashType | _]) ->
             TxOuts = CacheEntries,
             %% Approximate bogosize (150 bytes per UTXO on average)
             Bogosize = TxOuts * 150,
-            {ok, #{
+            Base = #{
                 <<"height">> => TipHeight,
                 <<"bestblock">> => hash_to_hex(TipHash),
                 <<"txouts">> => TxOuts,
                 <<"bogosize">> => Bogosize,
                 <<"total_amount">> => 0.0,  %% Would require iterating all UTXOs
                 <<"disk_size">> => 0  %% Would require DB stats
-            }};
+            },
+            {ok, maybe_attach_utxo_commitment(HashType, Base)};
         not_found ->
             {ok, #{
                 <<"height">> => 0,
@@ -2008,6 +2012,29 @@ rpc_gettxoutsetinfo([_HashType | _]) ->
                 <<"disk_size">> => 0
             }}
     end.
+
+%% Append the requested UTXO-set commitment to the gettxoutsetinfo result.
+%% Mirrors rpc/blockchain.cpp:1090-1119 — `hash_serialized_3` and `muhash`
+%% are surfaced under their own keys, `none` adds nothing.
+maybe_attach_utxo_commitment(HashType, Base) when is_binary(HashType) ->
+    case HashType of
+        <<"hash_serialized_3">> ->
+            UtxoHash = beamchain_snapshot:compute_utxo_hash(),
+            Base#{<<"hash_serialized_3">> =>
+                      beamchain_serialize:hex_encode(
+                        beamchain_serialize:reverse_bytes(UtxoHash))};
+        <<"muhash">> ->
+            %% MuHash3072 finalize digest. Order-independent; surfaced as a
+            %% display-order hex string (uint256::ToString).
+            MuHash = beamchain_chainstate:compute_utxo_muhash(),
+            Base#{<<"muhash">> =>
+                      beamchain_serialize:hex_encode(
+                        beamchain_serialize:reverse_bytes(MuHash))};
+        _ ->
+            Base
+    end;
+maybe_attach_utxo_commitment(_, Base) ->
+    Base.
 
 %%% ===================================================================
 %%% Mempool methods
@@ -4348,12 +4375,15 @@ rpc_loadtxoutset(_) ->
 %%   base_hash      : STR_HEX  - block hash at the snapshot's base
 %%   base_height    : NUM      - block height at the snapshot's base
 %%   path           : STR      - absolute path the snapshot was written to
-%%   txoutset_hash  : STR_HEX  - MuHash3072 commitment over the UTXO set
+%%   txoutset_hash  : STR_HEX  - HASH_SERIALIZED commitment over the UTXO set
 %%   nchaintx       : NUM      - chain_tx_count up to and including the base
 %%
-%% txoutset_hash is the MuHash3072 finalize digest (same commitment used by
-%% loadtxoutset strict validation against m_assumeutxo_data.hash_serialized).
-%% Display hex is uint256::ToString order (reverse of internal byte order).
+%% txoutset_hash is the HASH_SERIALIZED commitment — SHA256d via HashWriter
+%% over Core's TxOutSer per-coin layout (rpc/blockchain.cpp:3259 +
+%% kernel/coinstats.cpp:161). Same digest that
+%% m_assumeutxo_data.hash_serialized is matched against by loadtxoutset's
+%% strict-content-hash gate. Display hex is uint256::ToString order
+%% (reverse of internal byte order).
 rpc_dumptxoutset([Path]) when is_binary(Path) ->
     PathStr = binary_to_list(Path),
 
@@ -4367,10 +4397,10 @@ rpc_dumptxoutset([Path]) when is_binary(Path) ->
             Network = beamchain_config:network(),
             SnapshotBin = beamchain_snapshot:serialize_snapshot(TipHash, Network),
 
-            %% Compute MuHash3072 over the UTXO set for the txoutset_hash
-            %% return field. compute_utxo_hash/0 collects via the chainstate
-            %% iterator and routes to compute_txoutset_muhash_from_list/1
-            %% (post-MuHash3072 wiring).
+            %% Compute the HASH_SERIALIZED commitment (SHA256d via
+            %% HashWriter) over the UTXO set for the txoutset_hash return
+            %% field. compute_utxo_hash/0 collects via the chainstate
+            %% iterator and routes to compute_utxo_hash_from_list/1.
             UtxoHash = beamchain_snapshot:compute_utxo_hash(),
 
             %% Write to file
