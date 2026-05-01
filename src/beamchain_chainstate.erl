@@ -45,7 +45,7 @@
 -export([cache_stats/0, cache_memory_usage/0]).
 
 %% assumeUTXO support
--export([load_snapshot/1, compute_utxo_hash/0]).
+-export([load_snapshot/1, compute_utxo_hash/0, compute_utxo_muhash/0]).
 -export([is_snapshot_chainstate/0, get_snapshot_base_height/0]).
 
 %% gen_server callbacks
@@ -213,11 +213,22 @@ reconsider_block(Hash) when byte_size(Hash) =:= 32 ->
 load_snapshot(Path) ->
     gen_server:call(?SERVER, {load_snapshot, Path}, infinity).
 
-%% @doc Compute the SHA256 hash of the current UTXO set.
-%% Used to verify snapshot integrity after background validation.
+%% @doc Compute the HASH_SERIALIZED commitment over the current UTXO set.
+%% SHA256d via HashWriter over Core's TxOutSer per-coin layout — same
+%% commitment loadtxoutset matches against m_assumeutxo_data.hash_serialized
+%% (validation.cpp:5901-5914 + kernel/coinstats.cpp:161). Used for snapshot
+%% integrity checks after background validation and as the `txoutset_hash`
+%% field in dumptxoutset.
 -spec compute_utxo_hash() -> binary().
 compute_utxo_hash() ->
     gen_server:call(?SERVER, compute_utxo_hash, 300000).
+
+%% @doc Compute the MuHash3072 finalize digest over the current UTXO set.
+%% Surfaced by `gettxoutsetinfo hash_type=muhash`. NOT used by the
+%% loadtxoutset strict-content-hash gate — that one is HASH_SERIALIZED.
+-spec compute_utxo_muhash() -> binary().
+compute_utxo_muhash() ->
+    gen_server:call(?SERVER, compute_utxo_muhash, 300000).
 
 %% @doc Check if this chainstate was loaded from a snapshot.
 -spec is_snapshot_chainstate() -> boolean().
@@ -572,6 +583,10 @@ handle_call({load_snapshot, Path}, _From, State) ->
 handle_call(compute_utxo_hash, _From, State) ->
     Hash = do_compute_utxo_hash(),
     {reply, Hash, State};
+
+handle_call(compute_utxo_muhash, _From, State) ->
+    MuHash = do_compute_utxo_muhash(),
+    {reply, MuHash, State};
 
 handle_call(is_snapshot_chainstate, _From,
             #state{chainstate_role = Role} = State) ->
@@ -1224,20 +1239,21 @@ compute_mtp(Timestamps) ->
 %% Load a UTXO snapshot from file.
 %%
 %% After parsing the file, this routes the loaded UTXO list through
-%% beamchain_snapshot:verify_snapshot/2 which now runs MuHash3072 over the
-%% coin set and compares against m_assumeutxo_data.hash_serialized
-%% (mirrors validation.cpp:5910-5914). On mismatch we propagate the
-%% verbatim Core wording — wrapped in `{snapshot_content_hash_mismatch,
-%% BinMsg}` — so the loadtxoutset RPC can surface it directly without
-%% double-formatting.
+%% beamchain_snapshot:verify_snapshot/2 which runs HASH_SERIALIZED
+%% (SHA256d via HashWriter over TxOutSer bytes) over the coin set and
+%% compares against m_assumeutxo_data.hash_serialized (mirrors
+%% validation.cpp:5901-5914 + kernel/coinstats.cpp:161). On mismatch we
+%% propagate the verbatim Core wording — wrapped in
+%% `{snapshot_content_hash_mismatch, BinMsg}` — so the loadtxoutset RPC
+%% can surface it directly without double-formatting.
 do_load_snapshot(Path, State) ->
     Network = beamchain_config:network(),
 
     %% Parse the snapshot file
     case beamchain_snapshot:load_snapshot(Path) of
         {ok, #{base_hash := BaseHash, num_coins := NumCoins, coins := Coins} = SnapshotData} ->
-            %% Verify the snapshot against known parameters (MuHash3072
-            %% strict-content-hash check per validation.cpp:5910-5914).
+            %% Verify the snapshot against known parameters (SHA256d
+            %% strict-content-hash check per validation.cpp:5901-5914).
             case beamchain_snapshot:verify_snapshot(SnapshotData, Network) of
                 ok ->
                     %% Look up the snapshot height
@@ -1302,15 +1318,26 @@ populate_utxo_cache_from_snapshot(Coins) ->
 
 %% Compute the UTXO-set commitment over the cache.
 %%
-%% Returns the MuHash3072 finalize digest (the same commitment used by
-%% loadtxoutset strict validation against m_assumeutxo_data.hash_serialized
-%% — see beamchain_snapshot:verify_snapshot/2 and
-%% bitcoin-core/src/validation.cpp:5910-5914). MuHash3072 is order-
-%% independent so the deterministic sort below is purely cosmetic.
+%% Returns the HASH_SERIALIZED commitment — SHA256d via HashWriter over
+%% Core's TxOutSer per-coin layout. This is the same commitment used by
+%% loadtxoutset strict validation against
+%% m_assumeutxo_data.hash_serialized (see
+%% beamchain_snapshot:verify_snapshot/2 and
+%% bitcoin-core/src/validation.cpp:5901-5914 +
+%% kernel/coinstats.cpp:161). For the MuHash3072 commitment routed by
+%% `gettxoutsetinfo hash_type=muhash`, see
+%% beamchain_snapshot:compute_txoutset_muhash_from_list/1.
 do_compute_utxo_hash() ->
     %% Materialize UTXOs from the ETS cache as the standard
-    %% {Txid, Vout, #utxo{}} tuples that
-    %% beamchain_snapshot:compute_txoutset_muhash_from_list/1 expects.
+    %% {Txid, Vout, #utxo{}} tuples.
+    AllEntries = ets:tab2list(?UTXO_CACHE),
+    Coins = [{Txid, Vout, Utxo} || {{Txid, Vout}, Utxo} <- AllEntries],
+    beamchain_snapshot:compute_utxo_hash_from_list(Coins).
+
+%% MuHash3072 finalize digest over the cache UTXO set. Mirrors
+%% kernel/coinstats.cpp:165-167 (the MUHASH branch). Order-independent
+%% (the deterministic sort isn't strictly needed but is cheap).
+do_compute_utxo_muhash() ->
     AllEntries = ets:tab2list(?UTXO_CACHE),
     Coins = [{Txid, Vout, Utxo} || {{Txid, Vout}, Utxo} <- AllEntries],
     beamchain_snapshot:compute_txoutset_muhash_from_list(Coins).

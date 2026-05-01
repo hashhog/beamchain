@@ -37,16 +37,17 @@
 -export([load_snapshot/1, verify_snapshot/2]).
 -export([compute_utxo_hash/0, serialize_snapshot/2]).
 -export([read_metadata/1]).
+-export([compute_utxo_hash_from_list/1]).
+%% MuHash3072 helpers — used by `gettxoutsetinfo hash_type=muhash` (NOT by
+%% the loadtxoutset strict-content-hash check, which is HASH_SERIALIZED /
+%% SHA256d per validation.cpp:5910-5914 + kernel/coinstats.cpp:161).
 -export([compute_txoutset_muhash_from_list/1, txoutset_muhash_apply/3]).
 
-%% Legacy (DEPRECATED) hash exposed for diagnostic / dev cross-check use.
-%% MUST NOT be wired into snapshot strict-validation — see deprecation note
-%% above compute_utxo_hash_from_list/1.
+%% Backwards-compatible alias kept so any straggler caller still links. The
+%% function it routes to is the canonical SHA256d-via-HashWriter commitment
+%% used by Core's HASH_SERIALIZED — i.e. the right hash for the strict
+%% loadtxoutset gate. Not deprecated.
 -export([compute_utxo_hash_from_list_legacy/1]).
--deprecated({compute_utxo_hash_from_list_legacy, 1,
-             "Use compute_txoutset_muhash_from_list/1 instead — the legacy "
-             "SHA-256-of-coin-bytes commitment is NOT what "
-             "m_assumeutxo_data.hash_serialized checks against."}).
 
 %% Internal helpers exported for unit tests.
 -export([encode_compact_size/1, decode_compact_size/1,
@@ -105,17 +106,23 @@ read_metadata(Path) ->
     end.
 
 %% @doc Verify a loaded snapshot against expected parameters.
-%% Mirrors bitcoin-core/src/validation.cpp:5910-5914 where Core compares
-%% ComputeUTXOStats(...).hashSerialized to au_data.hash_serialized after
-%% loading every coin. The chainparams `m_assumeutxo_data.hash_serialized`
-%% values shipped in beamchain_chain_params (840k=a2a5521b..., 880k, 910k,
-%% 935k mainnet; 90k, 120k testnet4) are MuHash3072 finalize digests, so
-%% the comparator MUST use MuHash3072 — NOT the legacy SHA-256-of-coin-bytes
-%% computed by compute_utxo_hash_from_list/1 (kept for back-compat only,
-%% see deprecation note below).
+%% Mirrors bitcoin-core/src/validation.cpp:5901-5914 where Core calls
+%%   ComputeUTXOStats(CoinStatsHashType::HASH_SERIALIZED, ...)
+%% and compares the resulting `hashSerialized` to
+%% `au_data.hash_serialized` (kernel/coinstats.cpp:161 selects a
+%% `HashWriter` for the HASH_SERIALIZED branch — that's a SHA256d over
+%% the streamed `TxOutSer` bytes, NOT MuHash3072).
+%%
+%% The chainparams `m_assumeutxo_data.hash_serialized` values shipped in
+%% beamchain_chain_params (840k=a2a5521b..., 880k, 910k, 935k mainnet;
+%% 90k, 120k testnet4) are byte-for-byte the Core values, which means
+%% they are SHA256d-via-HashWriter digests. The comparator MUST use
+%% SHA256d-via-HashWriter — NOT MuHash3072 (that one drives the
+%% `gettxoutsetinfo hash_type=muhash` path; see
+%% compute_txoutset_muhash_from_list/1).
 %%
 %% On mismatch we emit the verbatim Core wording from validation.cpp:5913
-%% ("Bad snapshot content hash: expected <expected> got <actual>") with the
+%% ("Bad snapshot content hash: expected <expected>, got <actual>") with the
 %% hex strings rendered in display order (reverse of internal byte order),
 %% matching uint256::ToString.
 -spec verify_snapshot(map(), atom()) -> ok | {error, term()}.
@@ -123,7 +130,7 @@ verify_snapshot(#{base_hash := BaseHash, coins := Coins} = _Snapshot, Network) -
     %% Look up assumeutxo data by block hash
     case beamchain_chain_params:get_assumeutxo_by_hash(BaseHash, Network) of
         {ok, _Height, #{utxo_hash := ExpectedUtxoHash}} ->
-            ComputedHash = compute_txoutset_muhash_from_list(Coins),
+            ComputedHash = compute_utxo_hash_from_list(Coins),
             case ComputedHash =:= ExpectedUtxoHash of
                 true -> ok;
                 false ->
@@ -150,15 +157,20 @@ bin_to_display_hex(Bin) when is_binary(Bin) ->
     lists:flatten([io_lib:format("~2.16.0b", [B]) || <<B:8>> <= Reversed]).
 
 %% @doc Compute the UTXO-set commitment from the current chainstate.
-%% This is the MuHash3072 finalize digest (gettxoutsetinfo "muhash" / the
-%% same commitment beamchain compares against m_assumeutxo_data in
-%% verify_snapshot/2).
+%% This is the HASH_SERIALIZED commitment — SHA256d via HashWriter over
+%% Core's `TxOutSer` per-coin layout (kernel/coinstats.cpp:46-51 +
+%% kernel/coinstats.cpp:161). Same commitment that
+%% `m_assumeutxo_data.hash_serialized` checks against in
+%% loadtxoutset's strict-content-hash gate (validation.cpp:5901-5914,
+%% mirrored in verify_snapshot/2).
+%%
+%% For the MuHash3072 commitment exposed by `gettxoutsetinfo
+%% hash_type=muhash`, see compute_txoutset_muhash_from_list/1 — that's a
+%% separate Core code path and a different digest.
 -spec compute_utxo_hash() -> binary().
 compute_utxo_hash() ->
-    %% Collect all UTXOs from chainstate in deterministic order
-    %% (MuHash is order-independent so the sort is for determinism only).
     Coins = collect_all_utxos(),
-    compute_txoutset_muhash_from_list(Coins).
+    compute_utxo_hash_from_list(Coins).
 
 %%% ===================================================================
 %%% MuHash3072 over the UTXO set (gettxoutsetinfo "muhash" mode)
@@ -616,49 +628,59 @@ decompress_script(_, _) ->
     {error, bad_special_script}.
 
 %%% ===================================================================
-%%% Internal: legacy UTXO hash computation
+%%% Internal: HASH_SERIALIZED UTXO-set commitment (SHA256d via HashWriter)
 %%%
-%%% DEPRECATED. This is a SHA-256-over-concatenated-coin-bytes commitment
-%%% in a beamchain-internal byte layout — it is NOT what
-%%% m_assumeutxo_data.hash_serialized (MuHash3072) checks against, and it
-%%% is NOT byte-equivalent to any of Core's gettxoutsetinfo hash modes.
+%%% This is the "hashSerialized" commitment that
+%%%   bitcoin-core/src/validation.cpp:5901-5914 (loadtxoutset strict gate)
+%%%   bitcoin-core/src/kernel/coinstats.cpp:161  (HASH_SERIALIZED branch)
+%%% select via `HashWriter` — i.e. SHA256d over the streamed TxOutSer
+%%% bytes of every (outpoint, coin) in the UTXO set, walked in CCoinsView
+%%% cursor order (txid lexicographic; vouts within a txid taken from a
+%%% std::map<uint32_t, Coin> so naturally vout-ascending).
 %%%
-%%% Kept around so existing callers (background-validation cross-check in
-%%% beamchain_chainstate_sup, dev-only diagnostics) keep linking. New
-%%% callers MUST use compute_txoutset_muhash_from_list/1 instead. Do not
-%%% wire this back into snapshot strict-validation.
+%%% The 32-byte stored hash in chainparams (uint256, internal byte order)
+%%% is the GetHash() return — i.e. SHA256(SHA256(stream)).
+%%%
+%%% Per-coin bytes are produced by tx_out_ser/3 (see TxOutSer in
+%%% kernel/coinstats.cpp:46-51):
+%%%   COutPoint  := txid (32 bytes, internal byte order) || vout (uint32 LE)
+%%%   uint32 LE  := (height << 1) | fCoinBase
+%%%   CTxOut     := nValue (int64 LE) || CompactSize(scriptPubKey size) ||
+%%%                 raw scriptPubKey bytes
+%%%
+%%% No special-form ScriptCompression here — that lives in the on-disk
+%%% snapshot format (parse_coin/serialize_coin), not in TxOutSer.
 %%% ===================================================================
 
-%% Public DEPRECATED entry point — same body as the private legacy hasher.
-%% Routed through here so callers don't reach into private module helpers.
+%% Backwards-compatible alias — same body as compute_utxo_hash_from_list/1.
+%% Kept so any caller still importing the `_legacy` name keeps linking.
 -spec compute_utxo_hash_from_list_legacy([{binary(), non_neg_integer(),
                                            #utxo{}}]) -> binary().
 compute_utxo_hash_from_list_legacy(Coins) ->
     compute_utxo_hash_from_list(Coins).
 
-%% Compute hash from list of {Txid, Vout, Utxo} tuples (legacy beamchain
-%% layout — see DEPRECATED note above).
-compute_utxo_hash_from_list(Coins) ->
-    %% Sort by outpoint (txid, vout) for deterministic order
+%% @doc Compute the HASH_SERIALIZED UTXO-set commitment (SHA256d) over a
+%% list of {Txid, Vout, #utxo{}} tuples. Mirrors Core's
+%% `ComputeUTXOStats(HASH_SERIALIZED, ...)` walk + GetHash().
+%%
+%% Order: groups by Txid lex (matches CCoinsView cursor), and within each
+%% Txid emits vouts in ascending order (matches std::map<uint32_t, Coin>
+%% iteration in ApplyHash, kernel/coinstats.cpp:87-94).
+%%
+%% Returns the 32-byte uint256 in INTERNAL byte order, byte-for-byte
+%% equal to `CCoinsStats.hashSerialized` for an equivalent UTXO set.
+-spec compute_utxo_hash_from_list([{binary(), non_neg_integer(),
+                                    #utxo{}}]) -> binary().
+compute_utxo_hash_from_list(Coins) when is_list(Coins) ->
+    %% Sort by (Txid lex, Vout ASC) — matches Core's cursor walk order.
     Sorted = lists:sort(fun({Txid1, Vout1, _}, {Txid2, Vout2, _}) ->
         {Txid1, Vout1} =< {Txid2, Vout2}
     end, Coins),
-
-    %% Serialize each coin and hash in one shot via the NIF-backed
-    %% beamchain_crypto:sha256/1 instead of streaming crypto:hash_init/update/final.
-    %% The coin list is already fully materialized in memory, so accumulating
-    %% the binaries does not increase peak memory usage.
+    %% Stream each coin through Core's TxOutSer layout, then SHA256d.
     AllBins = lists:map(fun({Txid, Vout, Utxo}) ->
-        serialize_coin_for_hash(Txid, Vout, Utxo)
+        tx_out_ser(Txid, Vout, Utxo)
     end, Sorted),
-    beamchain_crypto:sha256(iolist_to_binary(AllBins)).
-
-serialize_coin_for_hash(Txid, Vout, #utxo{value = Value, script_pubkey = Script,
-                                          is_coinbase = IsCoinbase, height = Height}) ->
-    CoinbaseFlag = case IsCoinbase of true -> 1; false -> 0 end,
-    %% Format: txid || vout(32-bit) || value(64-bit) || height(32-bit) || coinbase(8-bit) || script
-    <<Txid:32/binary, Vout:32/big, Value:64/little, Height:32/little,
-      CoinbaseFlag:8, Script/binary>>.
+    beamchain_crypto:hash256(iolist_to_binary(AllBins)).
 
 %%% ===================================================================
 %%% Internal: UTXO collection
