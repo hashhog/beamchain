@@ -7,7 +7,8 @@
 
 -export([params/1, genesis_block/1, block_subsidy/2]).
 -export([get_last_checkpoint/2, get_checkpoint/2]).
--export([get_assumeutxo/2, get_assumeutxo_by_hash/2]).
+-export([get_assumeutxo/2, get_assumeutxo_by_hash/2,
+         list_assumeutxo_heights/1]).
 
 %% @doc Returns comprehensive chain parameters for the given network.
 -spec params(mainnet | testnet | testnet4 | regtest | signet) -> map().
@@ -452,6 +453,16 @@ get_assumeutxo_by_hash(BlockHash, Network) ->
         {found, H, D} -> {ok, H, D};
         not_found -> not_found
     end.
+
+%% @doc List the heights of every assumeutxo snapshot defined for this
+%% network, sorted ascending. Mirrors
+%% bitcoin-core/src/kernel/chainparams.cpp `GetAvailableSnapshotHeights`,
+%% used by `dumptxoutset rollback` (no explicit height) to pick the
+%% latest snapshot ≤ tip.
+-spec list_assumeutxo_heights(atom()) -> [non_neg_integer()].
+list_assumeutxo_heights(Network) ->
+    #{assumeutxo := AssumeUtxo} = params(Network),
+    lists:sort(maps:keys(AssumeUtxo)).
 
 %%% -------------------------------------------------------------------
 %%% assumeUTXO snapshot parameters
