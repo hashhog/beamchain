@@ -420,10 +420,10 @@ get_checkpoint(Height, Network) ->
 %%% -------------------------------------------------------------------
 
 %% @doc Get assumeutxo parameters for a given height.
-%% Returns {ok, #{block_hash, utxo_hash, num_coins}} or not_found.
+%% Returns {ok, #{block_hash, utxo_hash, chain_tx_count}} or not_found.
 -spec get_assumeutxo(non_neg_integer(), atom()) ->
     {ok, #{block_hash => binary(), utxo_hash => binary(),
-           num_coins => non_neg_integer()}} | not_found.
+           chain_tx_count => non_neg_integer()}} | not_found.
 get_assumeutxo(Height, Network) ->
     #{assumeutxo := AssumeUtxo} = params(Network),
     case maps:find(Height, AssumeUtxo) of
@@ -431,11 +431,14 @@ get_assumeutxo(Height, Network) ->
         error -> not_found
     end.
 
-%% @doc Get assumeutxo parameters by block hash.
-%% Returns {ok, Height, #{utxo_hash, num_coins}} or not_found.
+%% @doc Get assumeutxo parameters by block hash (in INTERNAL byte order
+%% — i.e. the bytes a Core-format snapshot file's metadata header
+%% carries, opposite of the display hex).
+%% Returns {ok, Height, #{utxo_hash, chain_tx_count}} or not_found.
 -spec get_assumeutxo_by_hash(binary(), atom()) ->
     {ok, non_neg_integer(), #{utxo_hash => binary(),
-                               num_coins => non_neg_integer()}} | not_found.
+                               chain_tx_count => non_neg_integer()}} |
+    not_found.
 get_assumeutxo_by_hash(BlockHash, Network) ->
     #{assumeutxo := AssumeUtxo} = params(Network),
     %% Search through all entries for matching block hash
@@ -454,29 +457,75 @@ get_assumeutxo_by_hash(BlockHash, Network) ->
 %%% assumeUTXO snapshot parameters
 %%% -------------------------------------------------------------------
 
-%% Mainnet assumeutxo snapshots from Bitcoin Core
+%% Mainnet assumeutxo snapshots — kept byte-for-byte in sync with
+%% bitcoin-core/src/kernel/chainparams.cpp m_assumeutxo_data (CMainParams).
+%% Hashes are stored in INTERNAL byte order (the on-wire / on-disk
+%% representation that uint256::Serialize emits) so they line up with the
+%% bytes a Bitcoin Core-format snapshot file carries in its metadata
+%% header. The Core source uses uint256{"<hex>"} which reverses display
+%% hex into internal storage; we replicate that with display_hex_to_bin/1.
+%%
+%% Mirrors the AssumeutxoData struct (kernel/chainparams.h):
+%%   * height
+%%   * hash_serialized (utxo_hash here) — the SHA-256 of the serialized
+%%     UTXO set. Verified against the loaded snapshot post-load.
+%%   * m_chain_tx_count (chain_tx_count here) — used to populate
+%%     CBlockIndex::m_chain_tx_count for the snapshot base block.
+%%   * blockhash (block_hash here) — the base block's hash; the snapshot
+%%     file's metadata header must agree.
 mainnet_assumeutxo() ->
     #{
-        %% Block 840000 - post-4th halving
+        %% Block 840,000 — post-4th halving
         840000 => #{
-            block_hash => hex_to_bin(
+            block_hash => display_hex_to_bin(
                 "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5"),
-            utxo_hash => hex_to_bin(
-                "51c8d11d30b87d4cb8b68d7e94b3c8b1c0a7b9f3c8d9e2f0a1b2c3d4e5f6a7b8"),
-            num_coins => 166845971
+            utxo_hash => display_hex_to_bin(
+                "a2a5521b1b5ab65f67818e5e8eccabb7171a517f9e2382208f77687310768f96"),
+            chain_tx_count => 991032194
+        },
+        %% Block 880,000
+        880000 => #{
+            block_hash => display_hex_to_bin(
+                "000000000000000000010b17283c3c400507969a9c2afd1dcf2082ec5cca2880"),
+            utxo_hash => display_hex_to_bin(
+                "dbd190983eaf433ef7c15f78a278ae42c00ef52e0fd2a54953782175fbadcea9"),
+            chain_tx_count => 1145604538
+        },
+        %% Block 910,000
+        910000 => #{
+            block_hash => display_hex_to_bin(
+                "0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821"),
+            utxo_hash => display_hex_to_bin(
+                "4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1568"),
+            chain_tx_count => 1226586151
+        },
+        %% Block 935,000
+        935000 => #{
+            block_hash => display_hex_to_bin(
+                "0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee"),
+            utxo_hash => display_hex_to_bin(
+                "e4b90ef9eae834f56c4b64d2d50143cee10ad87994c614d7d04125e2a6025050"),
+            chain_tx_count => 1305397408
         }
     }.
 
-%% Testnet4 assumeutxo snapshots
+%% Testnet4 assumeutxo snapshots from bitcoin-core/src/kernel/chainparams.cpp
+%% CTestNet4Params::m_assumeutxo_data (heights 90,000 and 120,000).
 testnet4_assumeutxo() ->
     #{
-        %% Block 50000 - early testnet4 snapshot for testing
-        50000 => #{
-            block_hash => hex_to_bin(
-                "0000000000004dd0a0c37946b0c3a1d0a6b5e9a4c8d7f3e2b1a0c9d8e7f6a5b4"),
-            utxo_hash => hex_to_bin(
-                "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"),
-            num_coins => 35000
+        90000 => #{
+            block_hash => display_hex_to_bin(
+                "0000000002ebe8bcda020e0dd6ccfbdfac531d2f6a81457191b99fc2df2dbe3b"),
+            utxo_hash => display_hex_to_bin(
+                "784fb5e98241de66fdd429f4392155c9e7db5c017148e66e8fdbc95746f8b9b5"),
+            chain_tx_count => 11347043
+        },
+        120000 => #{
+            block_hash => display_hex_to_bin(
+                "000000000bd2317e51b3c5794981c35ba894ce27d3e772d5c39ecd9cbce01dc8"),
+            utxo_hash => display_hex_to_bin(
+                "10b05d05ad468d0971162e1b222a4aa66caca89da2bb2a93f8f37fb29c4794b0"),
+            chain_tx_count => 14141057
         }
     }.
 
@@ -487,7 +536,7 @@ regtest_assumeutxo() ->
         110 => #{
             block_hash => <<0:256>>,  %% Placeholder - must be computed
             utxo_hash => <<0:256>>,   %% Placeholder - must be computed
-            num_coins => 110
+            chain_tx_count => 110
         }
     }.
 
@@ -507,3 +556,13 @@ hex_to_bin([H1, H2 | Rest], Acc) ->
 hex_val(C) when C >= $0, C =< $9 -> C - $0;
 hex_val(C) when C >= $a, C =< $f -> C - $a + 10;
 hex_val(C) when C >= $A, C =< $F -> C - $A + 10.
+
+%% @doc Convert a display-order hex string (block-explorer style, big-endian
+%% as written) into INTERNAL byte order (little-endian, the on-disk
+%% representation Core uses for uint256). Equivalent to
+%% bitcoin-core/src/uint256.h base_blob(string_view) which reverses the
+%% input via str_it = hex_str.rbegin().
+display_hex_to_bin(HexStr) ->
+    Bin = hex_to_bin(HexStr),
+    %% Reverse to get internal byte order
+    list_to_binary(lists:reverse(binary_to_list(Bin))).

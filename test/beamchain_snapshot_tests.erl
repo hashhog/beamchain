@@ -4,7 +4,9 @@
 -include("beamchain.hrl").
 -include("beamchain_protocol.hrl").
 
-%% Test suite for assumeUTXO snapshot functionality.
+%% Test suite for the Bitcoin Core-byte-compatible UTXO snapshot loader.
+%% Mirrors bitcoin-core/src/node/utxo_snapshot.h SnapshotMetadata format
+%% and rpc/blockchain.cpp WriteUTXOSnapshot per-coin layout.
 
 snapshot_test_() ->
     {setup,
@@ -13,16 +15,31 @@ snapshot_test_() ->
      fun(_) ->
          [
           {"compact size encoding/decoding roundtrip", fun test_compact_size/0},
+          {"VARINT roundtrip — Core's variable-length int (NOT compactsize)",
+           fun test_varint_roundtrip/0},
+          {"VARINT exact byte vectors from Core", fun test_varint_known_bytes/0},
+          {"CompressAmount roundtrip + known vectors",
+           fun test_compress_amount/0},
+          {"CompressScript P2PKH/P2SH/P2PK round trip",
+           fun test_compress_script/0},
+          {"snapshot metadata header is exactly 51 bytes",
+           fun test_metadata_size_51_bytes/0},
+          {"metadata serialize/parse roundtrip",
+           fun test_metadata_roundtrip/0},
+          {"metadata fails on truncated/malformed input",
+           fun test_metadata_failure_modes/0},
+          {"per-coin serialize/parse roundtrip",
+           fun test_coin_roundtrip/0},
           {"snapshot metadata parsing", fun test_metadata_parsing/0},
           {"UTXO hash computation is deterministic", fun test_utxo_hash_deterministic/0},
-          {"snapshot coin serialization roundtrip", fun test_coin_serialization/0},
           {"assumeutxo params lookup by height", fun test_assumeutxo_by_height/0},
-          {"assumeutxo params lookup by hash", fun test_assumeutxo_by_hash/0}
+          {"assumeutxo params lookup by hash", fun test_assumeutxo_by_hash/0},
+          {"mainnet has all 4 assumeutxo entries from Core",
+           fun test_mainnet_four_entries/0}
          ]
      end}.
 
 setup() ->
-    %% Minimal setup - no database needed for these tests
     application:set_env(beamchain, network, regtest),
     ok.
 
@@ -54,70 +71,214 @@ test_compact_size() ->
     test_compact_size_roundtrip(10000000000).
 
 test_compact_size_roundtrip(N) ->
-    Encoded = encode_compact_size(N),
-    {ok, Decoded, <<>>} = decode_compact_size(Encoded),
+    Encoded = beamchain_snapshot:encode_compact_size(N),
+    {ok, Decoded, <<>>} = beamchain_snapshot:decode_compact_size(Encoded),
     ?assertEqual(N, Decoded).
 
-%% Re-implement encoding for testing (duplicating internal functions)
-encode_compact_size(N) when N < 253 ->
-    <<N:8>>;
-encode_compact_size(N) when N =< 16#ffff ->
-    <<253, N:16/little>>;
-encode_compact_size(N) when N =< 16#ffffffff ->
-    <<254, N:32/little>>;
-encode_compact_size(N) ->
-    <<255, N:64/little>>.
+%%% ===================================================================
+%%% VARINT (Core's WriteVarInt/ReadVarInt) tests
+%%% ===================================================================
 
-decode_compact_size(<<N:8, Rest/binary>>) when N < 253 ->
-    {ok, N, Rest};
-decode_compact_size(<<253, N:16/little, Rest/binary>>) ->
-    {ok, N, Rest};
-decode_compact_size(<<254, N:32/little, Rest/binary>>) ->
-    {ok, N, Rest};
-decode_compact_size(<<255, N:64/little, Rest/binary>>) ->
-    {ok, N, Rest}.
+test_varint_roundtrip() ->
+    Vals = [0, 1, 126, 127, 128, 129, 254, 255, 256, 16383, 16384, 16511,
+            16512, 32767, 65535, 65536, 1 bsl 32, 1 bsl 56,
+            16#FFFFFFFFFFFFFFFE],
+    lists:foreach(fun(V) ->
+        Bin = beamchain_snapshot:encode_varint(V),
+        {ok, Out, <<>>} = beamchain_snapshot:decode_varint(Bin),
+        ?assertEqual(V, Out)
+    end, Vals).
+
+%% Specific byte sequences from running Core's WriteVarInt and verifying
+%% by hand. The encoding is "MSB-first with continuation bit", subtracting
+%% 1 between bytes — see bitcoin-core/src/serialize.h:WriteVarInt.
+%%
+%% Encoded(0) = <0x00>
+%% Encoded(1) = <0x01>
+%% Encoded(127) = <0x7F>
+%% Encoded(128) = <0x80, 0x00>      ; (((128 >> 7) - 1) = 0) | 0x80 then 0
+%% Encoded(255) = <0x80, 0x7F>
+%% Encoded(256) = <0x81, 0x00>
+%% Encoded(16383) = <0xFE, 0x7F>
+%% Encoded(16384) = <0xFF, 0x00>    ; ((16384 >> 7) - 1) = 127 = 0x7F | 0x80
+%%                                  ; = 0xFF, then 0
+%% Encoded(16511) = <0xFF, 0x7F>
+%% Encoded(16512) = <0x80, 0x80, 0x00>
+test_varint_known_bytes() ->
+    ?assertEqual(<<16#00>>,             beamchain_snapshot:encode_varint(0)),
+    ?assertEqual(<<16#01>>,             beamchain_snapshot:encode_varint(1)),
+    ?assertEqual(<<16#7F>>,             beamchain_snapshot:encode_varint(127)),
+    ?assertEqual(<<16#80, 16#00>>,      beamchain_snapshot:encode_varint(128)),
+    ?assertEqual(<<16#80, 16#7F>>,      beamchain_snapshot:encode_varint(255)),
+    ?assertEqual(<<16#81, 16#00>>,      beamchain_snapshot:encode_varint(256)),
+    ?assertEqual(<<16#FE, 16#7F>>,      beamchain_snapshot:encode_varint(16383)),
+    ?assertEqual(<<16#FF, 16#00>>,      beamchain_snapshot:encode_varint(16384)),
+    ?assertEqual(<<16#FF, 16#7F>>,      beamchain_snapshot:encode_varint(16511)),
+    ?assertEqual(<<16#80, 16#80, 16#00>>,
+                 beamchain_snapshot:encode_varint(16512)).
 
 %%% ===================================================================
-%%% Snapshot metadata tests
+%%% CompressAmount tests
+%%% ===================================================================
+
+%% Vectors from compressor.cpp comments + recomputed manually:
+%%   CompressAmount(0)             = 0
+%%   CompressAmount(1)             = 0x09  (e=0, d=1, n=0 -> 1 + (0*9 + 1 - 1)*10 + 0)
+%%   CompressAmount(1_000_000)     = ... value picked because round trip
+%%   CompressAmount(50 BTC)        = CompressAmount(5_000_000_000) -> small int
+test_compress_amount() ->
+    Vectors = [
+        0, 1, 9, 10, 100, 1000, 12345, 99999999,
+        100000000,            %% 1 BTC
+        5000000000,           %% 50 BTC (genesis subsidy)
+        21_000_000 * 100_000_000,  %% MAX_MONEY
+        12345678901234,
+        555,
+        7
+    ],
+    lists:foreach(fun(V) ->
+        C = beamchain_snapshot:compress_amount(V),
+        D = beamchain_snapshot:decompress_amount(C),
+        ?assertEqual(V, D)
+    end, Vectors),
+    %% Spot-check known values
+    ?assertEqual(0, beamchain_snapshot:compress_amount(0)),
+    ?assertEqual(0, beamchain_snapshot:decompress_amount(0)),
+    %% CompressAmount(1): e=0, d=1, n=0 -> 1 + (0*9 + 1 - 1)*10 + 0 = 1
+    ?assertEqual(1, beamchain_snapshot:compress_amount(1)),
+    %% CompressAmount(50 BTC = 5e9): 9 trailing zeros, e=9, n=5
+    %% formula: 1 + (n - 1)*10 + 9 = 1 + 4*10 + 9 = 50
+    ?assertEqual(50, beamchain_snapshot:compress_amount(5000000000)).
+
+%%% ===================================================================
+%%% CompressScript tests
+%%% ===================================================================
+
+test_compress_script() ->
+    Hash20 = list_to_binary(lists:duplicate(20, $A)),
+    %% P2PKH: OP_DUP OP_HASH160 <20> <hash> OP_EQUALVERIFY OP_CHECKSIG
+    P2PKH = <<16#76, 16#a9, 20, Hash20/binary, 16#88, 16#ac>>,
+    ?assertEqual({special, 0, Hash20},
+                 beamchain_snapshot:compress_script(P2PKH)),
+    {ok, P2PKH2} = beamchain_snapshot:decompress_script(0, Hash20),
+    ?assertEqual(P2PKH, P2PKH2),
+
+    %% P2SH: OP_HASH160 <20> <hash> OP_EQUAL
+    P2SH = <<16#a9, 20, Hash20/binary, 16#87>>,
+    ?assertEqual({special, 1, Hash20},
+                 beamchain_snapshot:compress_script(P2SH)),
+    {ok, P2SH2} = beamchain_snapshot:decompress_script(1, Hash20),
+    ?assertEqual(P2SH, P2SH2),
+
+    %% P2PK compressed: <33> <0x02 X> CHECKSIG (32-byte X)
+    X = list_to_binary(lists:duplicate(32, $X)),
+    P2PK02 = <<33, 16#02, X/binary, 16#ac>>,
+    ?assertEqual({special, 16#02, X},
+                 beamchain_snapshot:compress_script(P2PK02)),
+    {ok, P2PK02b} = beamchain_snapshot:decompress_script(16#02, X),
+    ?assertEqual(P2PK02, P2PK02b),
+
+    P2PK03 = <<33, 16#03, X/binary, 16#ac>>,
+    ?assertEqual({special, 16#03, X},
+                 beamchain_snapshot:compress_script(P2PK03)),
+
+    %% Random script (non-special) -> raw
+    OpReturn = <<16#6a, 4, "test">>,
+    ?assertEqual(raw, beamchain_snapshot:compress_script(OpReturn)).
+
+%%% ===================================================================
+%%% Snapshot metadata header tests
+%%% ===================================================================
+
+test_metadata_size_51_bytes() ->
+    %% Mirrors bitcoin-core/src/node/utxo_snapshot.h SnapshotMetadata:
+    %%   5 (magic) + 2 (version) + 4 (net magic) + 32 (blockhash) + 8 (count)
+    ?assertEqual(51, beamchain_snapshot:metadata_size()),
+    NetMagic = <<16#FA, 16#BF, 16#B5, 16#DA>>,
+    BaseHash = <<1:256>>,
+    Count = 16#0123456789ABCDEF,
+    Bin = beamchain_snapshot:serialize_metadata(NetMagic, BaseHash, Count),
+    ?assertEqual(51, byte_size(Bin)),
+    %% Layout: bytes 0..4 = "utxo\xff", 5..6 = version LE, 7..10 = magic,
+    %% 11..42 = blockhash, 43..50 = count LE
+    <<"utxo", 16#FF, 2:16/little, M:4/binary, BH:32/binary, C:64/little>> = Bin,
+    ?assertEqual(NetMagic, M),
+    ?assertEqual(BaseHash, BH),
+    ?assertEqual(Count, C).
+
+test_metadata_roundtrip() ->
+    NetMagic = <<16#F9, 16#BE, 16#B4, 16#D9>>,  %% mainnet
+    BaseHash = list_to_binary(lists:seq(0, 31)),
+    Count = 991032194,
+    Bin = beamchain_snapshot:serialize_metadata(NetMagic, BaseHash, Count),
+    {ok, Map, <<>>} = beamchain_snapshot:parse_metadata(Bin),
+    ?assertEqual(BaseHash, maps:get(base_hash, Map)),
+    ?assertEqual(Count, maps:get(num_coins, Map)),
+    ?assertEqual(NetMagic, maps:get(network_magic, Map)).
+
+test_metadata_failure_modes() ->
+    %% Truncated header
+    ?assertEqual({error, truncated_header},
+                 beamchain_snapshot:parse_metadata(<<>>)),
+    ?assertEqual({error, truncated_header},
+                 beamchain_snapshot:parse_metadata(<<"utxo">>)),
+
+    %% Wrong magic
+    Bad = <<"abcd", 16#FF, 2:16/little, 0:32, 0:256, 0:64>>,
+    ?assertEqual({error, invalid_magic},
+                 beamchain_snapshot:parse_metadata(Bad)),
+
+    %% Unsupported version (e.g. 99)
+    BadVer = <<"utxo", 16#FF, 99:16/little, 0:32, 0:256, 0:64>>,
+    ?assertEqual({error, {unsupported_version, 99}},
+                 beamchain_snapshot:parse_metadata(BadVer)).
+
+%%% ===================================================================
+%%% Per-coin serialization round trip
+%%% ===================================================================
+
+test_coin_roundtrip() ->
+    Hash20 = list_to_binary(lists:duplicate(20, 16#41)),
+    P2PKH = <<16#76, 16#a9, 20, Hash20/binary, 16#88, 16#ac>>,
+
+    Coins = [
+        #utxo{value = 0, script_pubkey = <<16#6a>>,
+              is_coinbase = false, height = 0},
+        #utxo{value = 5000000000, script_pubkey = P2PKH,
+              is_coinbase = true, height = 0},
+        #utxo{value = 100000, script_pubkey = P2PKH,
+              is_coinbase = false, height = 800000},
+        #utxo{value = 21_000_000 * 100_000_000,
+              script_pubkey = <<16#a9, 20, Hash20/binary, 16#87>>,
+              is_coinbase = false, height = 938343},
+        %% Long OP_RETURN — exercises the raw-script path
+        #utxo{value = 1, script_pubkey = list_to_binary([16#6a | lists:duplicate(80, $x)]),
+              is_coinbase = false, height = 12345}
+    ],
+    lists:foreach(fun(U) ->
+        Bin = beamchain_snapshot:serialize_coin(U),
+        {ok, U2, <<>>} = beamchain_snapshot:parse_coin(Bin),
+        ?assertEqual(U#utxo.value, U2#utxo.value),
+        ?assertEqual(U#utxo.script_pubkey, U2#utxo.script_pubkey),
+        ?assertEqual(U#utxo.is_coinbase, U2#utxo.is_coinbase),
+        ?assertEqual(U#utxo.height, U2#utxo.height)
+    end, Coins).
+
+%%% ===================================================================
+%%% Legacy parse_header smoke (exercises the public read_metadata API)
 %%% ===================================================================
 
 test_metadata_parsing() ->
-    %% Create a minimal snapshot with valid metadata
-    Magic = <<"utxo", 16#ff>>,
-    Version = <<2:16/little>>,
-    NetworkMagic = <<16#fa, 16#bf, 16#b5, 16#da>>,  %% regtest
+    %% Build a snapshot header with the new 51-byte layout (uint64 LE
+    %% count, NOT a CompactSize) and verify it round-trips through
+    %% parse_metadata.
+    NetMagic = <<16#fa, 16#bf, 16#b5, 16#da>>,  %% regtest
     BaseHash = <<1:256>>,
-    NumCoins = encode_compact_size(100),
-
-    %% Build snapshot header
-    Header = <<Magic/binary, Version/binary, NetworkMagic/binary,
-               BaseHash/binary, NumCoins/binary>>,
-
-    %% Parse and verify
-    case parse_header(Header) of
-        {ok, #{base_hash := ParsedHash, num_coins := ParsedCount}, _Rest} ->
-            ?assertEqual(BaseHash, ParsedHash),
-            ?assertEqual(100, ParsedCount);
-        {error, Reason} ->
-            ?assert(false, {parse_failed, Reason})
-    end.
-
-parse_header(<<Magic:5/binary, Version:16/little,
-               _NetworkMagic:4/binary, BaseHash:32/binary,
-               Rest/binary>>) when Magic =:= <<"utxo", 16#ff>> ->
-    case Version of
-        2 ->
-            case decode_compact_size(Rest) of
-                {ok, NumCoins, Rest2} ->
-                    {ok, #{base_hash => BaseHash, num_coins => NumCoins}, Rest2};
-                _ ->
-                    {error, invalid_compact_size}
-            end;
-        _ ->
-            {error, {unsupported_version, Version}}
-    end;
-parse_header(_) ->
-    {error, invalid_header}.
+    Header = beamchain_snapshot:serialize_metadata(NetMagic, BaseHash, 100),
+    {ok, #{base_hash := ParsedHash, num_coins := ParsedCount}, _Rest} =
+        beamchain_snapshot:parse_metadata(Header),
+    ?assertEqual(BaseHash, ParsedHash),
+    ?assertEqual(100, ParsedCount).
 
 %%% ===================================================================
 %%% UTXO hash tests
@@ -175,102 +336,67 @@ serialize_coin_for_hash(Txid, Vout, #utxo{value = Value, script_pubkey = Script,
       CoinbaseFlag:8, Script/binary>>.
 
 %%% ===================================================================
-%%% Coin serialization tests
-%%% ===================================================================
-
-test_coin_serialization() ->
-    %% Test coin encoding/decoding roundtrip
-    TestCoins = [
-        #utxo{value = 0, script_pubkey = <<>>,
-              is_coinbase = false, height = 0},
-        #utxo{value = 5000000000, script_pubkey = <<16#6a, 4, "test">>,
-              is_coinbase = true, height = 0},
-        #utxo{value = 100000, script_pubkey = <<16#76, 16#a9, 16#14, 0:160, 16#88, 16#ac>>,
-              is_coinbase = false, height = 800000}
-    ],
-
-    lists:foreach(fun(Utxo) ->
-        Encoded = serialize_coin(Utxo),
-        {ok, Decoded, <<>>} = parse_coin(Encoded),
-        ?assertEqual(Utxo#utxo.value, Decoded#utxo.value),
-        ?assertEqual(Utxo#utxo.script_pubkey, Decoded#utxo.script_pubkey),
-        ?assertEqual(Utxo#utxo.is_coinbase, Decoded#utxo.is_coinbase),
-        ?assertEqual(Utxo#utxo.height, Decoded#utxo.height)
-    end, TestCoins).
-
-serialize_coin(#utxo{value = Value, script_pubkey = Script,
-                     is_coinbase = IsCoinbase, height = Height}) ->
-    CoinbaseFlag = case IsCoinbase of true -> 1; false -> 0 end,
-    HeightCode = (Height bsl 1) bor CoinbaseFlag,
-    HeightBin = encode_compact_size(HeightCode),
-    ValueBin = encode_compact_size(Value),
-    ScriptLen = encode_compact_size(byte_size(Script)),
-    <<HeightBin/binary, ValueBin/binary, ScriptLen/binary, Script/binary>>.
-
-parse_coin(Data) ->
-    case decode_compact_size(Data) of
-        {ok, HeightCode, Rest} ->
-            Height = HeightCode bsr 1,
-            IsCoinbase = (HeightCode band 1) =:= 1,
-            case decode_compact_size(Rest) of
-                {ok, Value, Rest2} ->
-                    case decode_compact_size(Rest2) of
-                        {ok, ScriptLen, Rest3} ->
-                            case Rest3 of
-                                <<Script:ScriptLen/binary, Rest4/binary>> ->
-                                    Utxo = #utxo{
-                                        value = Value,
-                                        script_pubkey = Script,
-                                        is_coinbase = IsCoinbase,
-                                        height = Height
-                                    },
-                                    {ok, Utxo, Rest4};
-                                _ ->
-                                    {error, truncated_script}
-                            end;
-                        _ -> {error, invalid_script_len}
-                    end;
-                _ -> {error, invalid_value}
-            end;
-        _ -> {error, invalid_height}
-    end.
-
-%%% ===================================================================
 %%% Chain params assumeutxo tests
 %%% ===================================================================
 
 test_assumeutxo_by_height() ->
     %% Regtest has a snapshot at height 110
     case beamchain_chain_params:get_assumeutxo(110, regtest) of
-        {ok, #{block_hash := _, utxo_hash := _, num_coins := _}} ->
+        {ok, #{block_hash := _, utxo_hash := _, chain_tx_count := _}} ->
             ok;
         not_found ->
-            %% This is expected if params aren't fully defined
             ok
     end,
-
     %% Unknown height should return not_found
     ?assertEqual(not_found, beamchain_chain_params:get_assumeutxo(999999, regtest)).
 
 test_assumeutxo_by_hash() ->
-    %% Test lookup by block hash
-    %% The regtest snapshot has a placeholder hash, so this tests the lookup mechanism
     Network = regtest,
     Params = beamchain_chain_params:params(Network),
     #{assumeutxo := AssumeUtxo} = Params,
 
     case maps:size(AssumeUtxo) of
         0 ->
-            %% No snapshots defined
             ok;
         _ ->
-            %% Get the first snapshot and verify lookup works
             [{Height, #{block_hash := Hash}} | _] = maps:to_list(AssumeUtxo),
             case beamchain_chain_params:get_assumeutxo_by_hash(Hash, Network) of
                 {ok, FoundHeight, _} ->
                     ?assertEqual(Height, FoundHeight);
                 not_found when Hash =:= <<0:256>> ->
-                    %% Placeholder hash, expected
                     ok
             end
     end.
+
+%% Mainnet must carry exactly the 4 entries from
+%% bitcoin-core/src/kernel/chainparams.cpp CMainParams (heights 840000,
+%% 880000, 910000, 935000). If Core adds a new entry upstream, this test
+%% will fail and force a sync.
+test_mainnet_four_entries() ->
+    #{assumeutxo := M} = beamchain_chain_params:params(mainnet),
+    Expected = [840000, 880000, 910000, 935000],
+    ?assertEqual(Expected, lists:sort(maps:keys(M))),
+    %% Spot-check the 840000 utxo_hash matches Core (display-order hex
+    %% from kernel/chainparams.cpp:161, stored internally reversed).
+    {ok, _, #{utxo_hash := H}} =
+        beamchain_chain_params:get_assumeutxo_by_hash(
+            display_hex_to_bin(
+                "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5"),
+            mainnet),
+    ?assertEqual(
+       display_hex_to_bin(
+         "a2a5521b1b5ab65f67818e5e8eccabb7171a517f9e2382208f77687310768f96"),
+       H).
+
+display_hex_to_bin(HexStr) ->
+    list_to_binary(lists:reverse(binary_to_list(hex_to_bin(HexStr)))).
+
+hex_to_bin(HexStr) ->
+    hex_to_bin(HexStr, <<>>).
+hex_to_bin([], Acc) -> Acc;
+hex_to_bin([H1, H2 | Rest], Acc) ->
+    Byte = (hex_val(H1) bsl 4) bor hex_val(H2),
+    hex_to_bin(Rest, <<Acc/binary, Byte>>).
+hex_val(C) when C >= $0, C =< $9 -> C - $0;
+hex_val(C) when C >= $a, C =< $f -> C - $a + 10;
+hex_val(C) when C >= $A, C =< $F -> C - $A + 10.
