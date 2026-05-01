@@ -4309,6 +4309,12 @@ rpc_loadtxoutset([Path]) when is_binary(Path) ->
                                         <<"base_height">> => LoadedHeight,
                                         <<"message">> => <<"Snapshot loaded successfully. Background validation started.">>
                                     }};
+                                {error, {snapshot_content_hash_mismatch, BinMsg}} ->
+                                    %% Verbatim Core wording from
+                                    %% validation.cpp:5912-5914 — surface
+                                    %% it unwrapped so callers can match
+                                    %% byte-for-byte.
+                                    {error, ?RPC_MISC_ERROR, BinMsg};
                                 {error, Reason} ->
                                     {error, ?RPC_MISC_ERROR,
                                      iolist_to_binary(io_lib:format("Failed to load snapshot: ~p", [Reason]))}
@@ -4336,6 +4342,18 @@ rpc_loadtxoutset(_) ->
 
 %% @doc Dump the current UTXO set to a file.
 %% Creates a snapshot that can be loaded with loadtxoutset.
+%%
+%% Mirrors bitcoin-core/src/rpc/blockchain.cpp dumptxoutset which returns:
+%%   coins_written  : NUM      - number of coins in the snapshot
+%%   base_hash      : STR_HEX  - block hash at the snapshot's base
+%%   base_height    : NUM      - block height at the snapshot's base
+%%   path           : STR      - absolute path the snapshot was written to
+%%   txoutset_hash  : STR_HEX  - MuHash3072 commitment over the UTXO set
+%%   nchaintx       : NUM      - chain_tx_count up to and including the base
+%%
+%% txoutset_hash is the MuHash3072 finalize digest (same commitment used by
+%% loadtxoutset strict validation against m_assumeutxo_data.hash_serialized).
+%% Display hex is uint256::ToString order (reverse of internal byte order).
 rpc_dumptxoutset([Path]) when is_binary(Path) ->
     PathStr = binary_to_list(Path),
 
@@ -4349,14 +4367,28 @@ rpc_dumptxoutset([Path]) when is_binary(Path) ->
             Network = beamchain_config:network(),
             SnapshotBin = beamchain_snapshot:serialize_snapshot(TipHash, Network),
 
+            %% Compute MuHash3072 over the UTXO set for the txoutset_hash
+            %% return field. compute_utxo_hash/0 collects via the chainstate
+            %% iterator and routes to compute_txoutset_muhash_from_list/1
+            %% (post-MuHash3072 wiring).
+            UtxoHash = beamchain_snapshot:compute_utxo_hash(),
+
             %% Write to file
             case file:write_file(PathStr, SnapshotBin) of
                 ok ->
                     {ok, #{
-                        <<"path">> => Path,
-                        <<"base_blockhash">> => beamchain_serialize:hex_encode(TipHash),
+                        <<"coins_written">> =>
+                            count_coins_in_snapshot(SnapshotBin),
+                        <<"base_hash">> =>
+                            beamchain_serialize:hex_encode(
+                              beamchain_serialize:reverse_bytes(TipHash)),
                         <<"base_height">> => TipHeight,
-                        <<"message">> => <<"UTXO set snapshot written successfully.">>
+                        <<"path">> => Path,
+                        <<"txoutset_hash">> =>
+                            beamchain_serialize:hex_encode(
+                              beamchain_serialize:reverse_bytes(UtxoHash)),
+                        <<"nchaintx">> =>
+                            chain_tx_count_for_height(TipHeight, Network)
                     }};
                 {error, Reason} ->
                     {error, ?RPC_MISC_ERROR,
@@ -4368,3 +4400,21 @@ rpc_dumptxoutset([Path]) when is_binary(Path) ->
 rpc_dumptxoutset(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"Usage: dumptxoutset \"path/to/snapshot.dat\"">>}.
+
+%% Read the coins_count field out of the metadata header we just wrote.
+%% Cheap and avoids re-iterating the chainstate.
+count_coins_in_snapshot(SnapshotBin) ->
+    case beamchain_snapshot:parse_metadata(SnapshotBin) of
+        {ok, #{num_coins := N}, _Rest} -> N;
+        _ -> 0
+    end.
+
+%% Best-effort chain_tx_count lookup. If the height matches an
+%% m_assumeutxo_data entry we report the canonical Core value; otherwise
+%% the base block index is consulted, falling back to 0 when neither is
+%% available (regtest / pre-snapshot dev runs).
+chain_tx_count_for_height(Height, Network) ->
+    case beamchain_chain_params:get_assumeutxo(Height, Network) of
+        {ok, #{chain_tx_count := N}} -> N;
+        not_found -> 0
+    end.
