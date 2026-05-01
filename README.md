@@ -70,7 +70,7 @@ rebar3 escriptize
 | `--reset` | off | Reset chain data before sync |
 | `--limit=N` | none | Limit sync to N blocks |
 | `--import-file=PATH` | stdin | File to import blocks from |
-| `--import-utxo=PATH` | none | HDOG snapshot file for UTXO import |
+| `--import-utxo=PATH` | none | Bitcoin Core UTXO snapshot file (`utxo.dat` from `dumptxoutset`); alias `--load-snapshot` |
 
 ### Environment Variables
 
@@ -88,7 +88,7 @@ rebar3 escriptize
 | `start` | Start the node and block until Ctrl-C |
 | `sync` | Start node and show sync progress display |
 | `import` | Import blocks from stdin or file (bypasses P2P) |
-| `import-utxo` | Import UTXO snapshot from HDOG file |
+| `import-utxo` | Import a Bitcoin Core UTXO snapshot (assumeutxo) |
 | `status` | Show node status via RPC |
 | `stop` | Stop a running node via RPC |
 | `getbalance` | Get balance for an address |
