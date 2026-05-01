@@ -1221,14 +1221,23 @@ compute_mtp(Timestamps) ->
 %%% Internal: assumeUTXO support
 %%% ===================================================================
 
-%% Load a UTXO snapshot from file
+%% Load a UTXO snapshot from file.
+%%
+%% After parsing the file, this routes the loaded UTXO list through
+%% beamchain_snapshot:verify_snapshot/2 which now runs MuHash3072 over the
+%% coin set and compares against m_assumeutxo_data.hash_serialized
+%% (mirrors validation.cpp:5910-5914). On mismatch we propagate the
+%% verbatim Core wording — wrapped in `{snapshot_content_hash_mismatch,
+%% BinMsg}` — so the loadtxoutset RPC can surface it directly without
+%% double-formatting.
 do_load_snapshot(Path, State) ->
     Network = beamchain_config:network(),
 
     %% Parse the snapshot file
     case beamchain_snapshot:load_snapshot(Path) of
         {ok, #{base_hash := BaseHash, num_coins := NumCoins, coins := Coins} = SnapshotData} ->
-            %% Verify the snapshot against known parameters
+            %% Verify the snapshot against known parameters (MuHash3072
+            %% strict-content-hash check per validation.cpp:5910-5914).
             case beamchain_snapshot:verify_snapshot(SnapshotData, Network) of
                 ok ->
                     %% Look up the snapshot height
@@ -1259,6 +1268,9 @@ do_load_snapshot(Path, State) ->
                         not_found ->
                             {error, {unknown_snapshot_base, BaseHash}}
                     end;
+                {error, BinMsg} when is_binary(BinMsg) ->
+                    %% Verbatim Core "Bad snapshot content hash: ..." text.
+                    {error, {snapshot_content_hash_mismatch, BinMsg}};
                 {error, Reason} ->
                     {error, {snapshot_verification_failed, Reason}}
             end;
@@ -1288,31 +1300,20 @@ populate_utxo_cache_from_snapshot(Coins) ->
     logger:info("chainstate: loaded ~B coins into cache", [NumCoins]),
     ok.
 
-%% Compute the SHA256 hash of all UTXOs in the cache
+%% Compute the UTXO-set commitment over the cache.
+%%
+%% Returns the MuHash3072 finalize digest (the same commitment used by
+%% loadtxoutset strict validation against m_assumeutxo_data.hash_serialized
+%% — see beamchain_snapshot:verify_snapshot/2 and
+%% bitcoin-core/src/validation.cpp:5910-5914). MuHash3072 is order-
+%% independent so the deterministic sort below is purely cosmetic.
 do_compute_utxo_hash() ->
-    %% Collect all UTXOs from cache in deterministic order
+    %% Materialize UTXOs from the ETS cache as the standard
+    %% {Txid, Vout, #utxo{}} tuples that
+    %% beamchain_snapshot:compute_txoutset_muhash_from_list/1 expects.
     AllEntries = ets:tab2list(?UTXO_CACHE),
-
-    %% Sort by outpoint key
-    Sorted = lists:sort(fun({Key1, _}, {Key2, _}) ->
-        Key1 =< Key2
-    end, AllEntries),
-
-    %% Hash all entries — accumulate serialized coins and hash in one shot
-    %% via the NIF-backed beamchain_crypto:sha256/1 instead of streaming
-    %% crypto:hash_init/update/final (UTXO set fits in memory since it's
-    %% already materialized in the ETS table above).
-    AllBins = lists:map(fun({{Txid, Vout}, Utxo}) ->
-        serialize_coin_for_hash(Txid, Vout, Utxo)
-    end, Sorted),
-    beamchain_crypto:sha256(iolist_to_binary(AllBins)).
-
-%% Serialize a coin for hashing (deterministic format)
-serialize_coin_for_hash(Txid, Vout, #utxo{value = Value, script_pubkey = Script,
-                                          is_coinbase = IsCoinbase, height = Height}) ->
-    CoinbaseFlag = case IsCoinbase of true -> 1; false -> 0 end,
-    <<Txid:32/binary, Vout:32/big, Value:64/little, Height:32/little,
-      CoinbaseFlag:8, Script/binary>>.
+    Coins = [{Txid, Vout, Utxo} || {{Txid, Vout}, Utxo} <- AllEntries],
+    beamchain_snapshot:compute_txoutset_muhash_from_list(Coins).
 
 %% Start background validation chainstate
 start_background_validation() ->

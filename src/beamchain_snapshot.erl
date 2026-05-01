@@ -39,6 +39,15 @@
 -export([read_metadata/1]).
 -export([compute_txoutset_muhash_from_list/1, txoutset_muhash_apply/3]).
 
+%% Legacy (DEPRECATED) hash exposed for diagnostic / dev cross-check use.
+%% MUST NOT be wired into snapshot strict-validation — see deprecation note
+%% above compute_utxo_hash_from_list/1.
+-export([compute_utxo_hash_from_list_legacy/1]).
+-deprecated({compute_utxo_hash_from_list_legacy, 1,
+             "Use compute_txoutset_muhash_from_list/1 instead — the legacy "
+             "SHA-256-of-coin-bytes commitment is NOT what "
+             "m_assumeutxo_data.hash_serialized checks against."}).
+
 %% Internal helpers exported for unit tests.
 -export([encode_compact_size/1, decode_compact_size/1,
          encode_varint/1, decode_varint/1,
@@ -96,33 +105,60 @@ read_metadata(Path) ->
     end.
 
 %% @doc Verify a loaded snapshot against expected parameters.
-%% Checks block hash and UTXO hash (mirrors validation.cpp lines 5912-5915
-%% where Core compares ComputeUTXOStats(...).hashSerialized to
-%% au_data.hash_serialized after loading every coin).
+%% Mirrors bitcoin-core/src/validation.cpp:5910-5914 where Core compares
+%% ComputeUTXOStats(...).hashSerialized to au_data.hash_serialized after
+%% loading every coin. The chainparams `m_assumeutxo_data.hash_serialized`
+%% values shipped in beamchain_chain_params (840k=a2a5521b..., 880k, 910k,
+%% 935k mainnet; 90k, 120k testnet4) are MuHash3072 finalize digests, so
+%% the comparator MUST use MuHash3072 — NOT the legacy SHA-256-of-coin-bytes
+%% computed by compute_utxo_hash_from_list/1 (kept for back-compat only,
+%% see deprecation note below).
+%%
+%% On mismatch we emit the verbatim Core wording from validation.cpp:5913
+%% ("Bad snapshot content hash: expected <expected> got <actual>") with the
+%% hex strings rendered in display order (reverse of internal byte order),
+%% matching uint256::ToString.
 -spec verify_snapshot(map(), atom()) -> ok | {error, term()}.
 verify_snapshot(#{base_hash := BaseHash, coins := Coins} = _Snapshot, Network) ->
     %% Look up assumeutxo data by block hash
     case beamchain_chain_params:get_assumeutxo_by_hash(BaseHash, Network) of
         {ok, _Height, #{utxo_hash := ExpectedUtxoHash}} ->
-            ComputedHash = compute_utxo_hash_from_list(Coins),
+            ComputedHash = compute_txoutset_muhash_from_list(Coins),
             case ComputedHash =:= ExpectedUtxoHash of
                 true -> ok;
-                false -> {error, {utxo_hash_mismatch,
-                                  #{expected => ExpectedUtxoHash,
-                                    computed => ComputedHash}}}
+                false ->
+                    Msg = format_bad_content_hash(ExpectedUtxoHash, ComputedHash),
+                    {error, Msg}
             end;
         not_found ->
             {error, {unknown_snapshot_base, BaseHash}}
     end.
 
-%% @doc Compute the UTXO set hash from the current chainstate.
-%% SHA256 of all UTXOs in deterministic order.
+%% @doc Format the verbatim Core "Bad snapshot content hash" refusal string.
+%% Display hex is the reverse of internal byte order (uint256::ToString).
+-spec format_bad_content_hash(binary(), binary()) -> binary().
+format_bad_content_hash(Expected, Got)
+        when byte_size(Expected) =:= 32, byte_size(Got) =:= 32 ->
+    ExpectedHex = bin_to_display_hex(Expected),
+    GotHex = bin_to_display_hex(Got),
+    iolist_to_binary(
+      io_lib:format("Bad snapshot content hash: expected ~s, got ~s",
+                    [ExpectedHex, GotHex])).
+
+bin_to_display_hex(Bin) when is_binary(Bin) ->
+    Reversed = list_to_binary(lists:reverse(binary_to_list(Bin))),
+    lists:flatten([io_lib:format("~2.16.0b", [B]) || <<B:8>> <= Reversed]).
+
+%% @doc Compute the UTXO-set commitment from the current chainstate.
+%% This is the MuHash3072 finalize digest (gettxoutsetinfo "muhash" / the
+%% same commitment beamchain compares against m_assumeutxo_data in
+%% verify_snapshot/2).
 -spec compute_utxo_hash() -> binary().
 compute_utxo_hash() ->
     %% Collect all UTXOs from chainstate in deterministic order
-    %% This iterates through RocksDB in key order
+    %% (MuHash is order-independent so the sort is for determinism only).
     Coins = collect_all_utxos(),
-    compute_utxo_hash_from_list(Coins).
+    compute_txoutset_muhash_from_list(Coins).
 
 %%% ===================================================================
 %%% MuHash3072 over the UTXO set (gettxoutsetinfo "muhash" mode)
@@ -580,10 +616,28 @@ decompress_script(_, _) ->
     {error, bad_special_script}.
 
 %%% ===================================================================
-%%% Internal: UTXO hash computation
+%%% Internal: legacy UTXO hash computation
+%%%
+%%% DEPRECATED. This is a SHA-256-over-concatenated-coin-bytes commitment
+%%% in a beamchain-internal byte layout — it is NOT what
+%%% m_assumeutxo_data.hash_serialized (MuHash3072) checks against, and it
+%%% is NOT byte-equivalent to any of Core's gettxoutsetinfo hash modes.
+%%%
+%%% Kept around so existing callers (background-validation cross-check in
+%%% beamchain_chainstate_sup, dev-only diagnostics) keep linking. New
+%%% callers MUST use compute_txoutset_muhash_from_list/1 instead. Do not
+%%% wire this back into snapshot strict-validation.
 %%% ===================================================================
 
-%% Compute hash from list of {Txid, Vout, Utxo} tuples
+%% Public DEPRECATED entry point — same body as the private legacy hasher.
+%% Routed through here so callers don't reach into private module helpers.
+-spec compute_utxo_hash_from_list_legacy([{binary(), non_neg_integer(),
+                                           #utxo{}}]) -> binary().
+compute_utxo_hash_from_list_legacy(Coins) ->
+    compute_utxo_hash_from_list(Coins).
+
+%% Compute hash from list of {Txid, Vout, Utxo} tuples (legacy beamchain
+%% layout — see DEPRECATED note above).
 compute_utxo_hash_from_list(Coins) ->
     %% Sort by outpoint (txid, vout) for deterministic order
     Sorted = lists:sort(fun({Txid1, Vout1, _}, {Txid2, Vout2, _}) ->
