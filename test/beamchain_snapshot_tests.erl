@@ -32,6 +32,12 @@ snapshot_test_() ->
            fun test_coin_roundtrip/0},
           {"snapshot metadata parsing", fun test_metadata_parsing/0},
           {"UTXO hash computation is deterministic", fun test_utxo_hash_deterministic/0},
+          {"MuHash3072 over UTXO set is order-independent",
+           fun test_txoutset_muhash_order_independent/0},
+          {"MuHash3072 add/remove is identity on UTXO set",
+           fun test_txoutset_muhash_add_remove_identity/0},
+          {"TxOutSer matches Core kernel/coinstats.cpp byte format",
+           fun test_tx_out_ser_format/0},
           {"assumeutxo params lookup by height", fun test_assumeutxo_by_height/0},
           {"assumeutxo params lookup by hash", fun test_assumeutxo_by_hash/0},
           {"mainnet has all 4 assumeutxo entries from Core",
@@ -336,6 +342,87 @@ serialize_coin_for_hash(Txid, Vout, #utxo{value = Value, script_pubkey = Script,
     CoinbaseFlag = case IsCoinbase of true -> 1; false -> 0 end,
     <<Txid:32/binary, Vout:32/big, Value:64/little, Height:32/little,
       CoinbaseFlag:8, Script/binary>>.
+
+%%% ===================================================================
+%%% MuHash3072 / gettxoutsetinfo muhash tests
+%%% ===================================================================
+
+%% A small UTXO set used by the MuHash tests below.
+sample_utxo_set() ->
+    [
+        {<<1:256>>, 0, #utxo{value = 5000000000, script_pubkey = <<16#51>>,
+                             is_coinbase = true, height = 0}},
+        {<<2:256>>, 0, #utxo{value = 200000, script_pubkey = <<16#52>>,
+                             is_coinbase = false, height = 10}},
+        {<<2:256>>, 1, #utxo{value = 300000, script_pubkey = <<16#76, 16#a9, 20,
+                                                                0:160, 16#88, 16#ac>>,
+                             is_coinbase = false, height = 10}},
+        {<<3:256>>, 7, #utxo{value = 1, script_pubkey = <<>>,
+                             is_coinbase = false, height = 12345}}
+    ].
+
+%% MuHash3072 commutes; permuting the input list must not change the hash.
+test_txoutset_muhash_order_independent() ->
+    Coins = sample_utxo_set(),
+    H1 = beamchain_snapshot:compute_txoutset_muhash_from_list(Coins),
+    H2 = beamchain_snapshot:compute_txoutset_muhash_from_list(lists:reverse(Coins)),
+    [_, A, B, _] = Coins,
+    [First, _, _, Last] = Coins,
+    Shuffled = [Last, A, First, B],
+    H3 = beamchain_snapshot:compute_txoutset_muhash_from_list(Shuffled),
+    ?assertEqual(32, byte_size(H1)),
+    ?assertEqual(H1, H2),
+    ?assertEqual(H1, H3).
+
+%% Adding then removing the same UTXO must return the accumulator to its
+%% prior finalize value (the algebraic identity that motivates MuHash).
+test_txoutset_muhash_add_remove_identity() ->
+    Coins = sample_utxo_set(),
+    [Extra | _] = Coins,
+    %% A "made-up" UTXO that happens not to be in Coins.
+    SyntheticTxid = <<16#aa:256>>,
+    Synthetic = {SyntheticTxid, 99,
+                 #utxo{value = 42, script_pubkey = <<"hello">>,
+                       is_coinbase = false, height = 999}},
+    Acc = lists:foldl(
+        fun(C, A) -> beamchain_snapshot:txoutset_muhash_apply(add, C, A) end,
+        beamchain_muhash:new(),
+        Coins),
+    AccPlus = beamchain_snapshot:txoutset_muhash_apply(add, Synthetic, Acc),
+    AccBack = beamchain_snapshot:txoutset_muhash_apply(remove, Synthetic, AccPlus),
+    %% Original final hash and "added then removed" final hash must match.
+    ?assertEqual(beamchain_muhash:finalize(Acc),
+                 beamchain_muhash:finalize(AccBack)),
+    %% Sanity: a single add changes the hash.
+    ?assertNotEqual(beamchain_muhash:finalize(Acc),
+                    beamchain_muhash:finalize(AccPlus)),
+    _ = Extra.
+
+%% Cross-check tx_out_ser/3 against the layout documented in
+%% bitcoin-core/src/kernel/coinstats.cpp::TxOutSer:
+%%   txid (32) || vout (uint32 LE) ||
+%%   uint32 LE := (height << 1) | fCoinBase ||
+%%   nValue (int64 LE) || CompactSize(scriptlen) || script bytes
+test_tx_out_ser_format() ->
+    Txid = <<16#01:256>>,
+    Vout = 5,
+    Utxo = #utxo{value = 1234, script_pubkey = <<16#51, 16#52>>,
+                 is_coinbase = true, height = 7},
+    Got = beamchain_snapshot:tx_out_ser(Txid, Vout, Utxo),
+    %% (7 << 1) | 1 = 15
+    ExpectedCode = 15,
+    Expected = <<Txid:32/binary,
+                 Vout:32/little,
+                 ExpectedCode:32/little,
+                 1234:64/little,
+                 2:8,                %% CompactSize(2) for the 2-byte script
+                 16#51, 16#52>>,
+    ?assertEqual(Expected, Got),
+    %% A non-coinbase UTXO with height 0 produces code 0.
+    Utxo2 = #utxo{value = 0, script_pubkey = <<>>,
+                  is_coinbase = false, height = 0},
+    Got2 = beamchain_snapshot:tx_out_ser(<<0:256>>, 0, Utxo2),
+    ?assertEqual(<<0:256, 0:32/little, 0:32/little, 0:64/little, 0:8>>, Got2).
 
 %%% ===================================================================
 %%% Chain params assumeutxo tests

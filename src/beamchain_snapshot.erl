@@ -37,6 +37,7 @@
 -export([load_snapshot/1, verify_snapshot/2]).
 -export([compute_utxo_hash/0, serialize_snapshot/2]).
 -export([read_metadata/1]).
+-export([compute_txoutset_muhash_from_list/1, txoutset_muhash_apply/3]).
 
 %% Internal helpers exported for unit tests.
 -export([encode_compact_size/1, decode_compact_size/1,
@@ -45,7 +46,8 @@
          compress_script/1, decompress_script/2,
          serialize_coin/1, parse_coin/1,
          serialize_metadata/3, parse_metadata/1,
-         metadata_size/0]).
+         metadata_size/0,
+         tx_out_ser/3]).
 
 %% Dialyzer suppressions for false positives:
 %% group_consecutive/2: dialyzer infers the list arg is always [] because it
@@ -121,6 +123,75 @@ compute_utxo_hash() ->
     %% This iterates through RocksDB in key order
     Coins = collect_all_utxos(),
     compute_utxo_hash_from_list(Coins).
+
+%%% ===================================================================
+%%% MuHash3072 over the UTXO set (gettxoutsetinfo "muhash" mode)
+%%%
+%%% Mirrors bitcoin-core/src/kernel/coinstats.cpp ApplyCoinHash + TxOutSer.
+%%% Each UTXO is serialised as:
+%%%   COutPoint     := txid (32 bytes, internal byte order) || vout (uint32 LE)
+%%%   uint32 LE     := (height << 1) | fCoinBase
+%%%   CTxOut        := nValue (int64 LE) || CompactSize(scriptPubKey size) ||
+%%%                    scriptPubKey raw bytes
+%%% That blob is fed to MuHash3072::Insert (or Remove for spends). Order
+%%% does not matter — MuHash3072 is a commutative incremental accumulator
+%%% (see beamchain_muhash module header for the algebra).
+%%%
+%%% This is the "muhash" hash_type for `gettxoutsetinfo`, NOT the
+%%% HASH_SERIALIZED used by assumeutxo loadtxoutset (validation.cpp:5912).
+%%% Those two are independent UTXO-set commitments; we maintain the
+%%% MuHash one online so we can answer the muhash RPC without a full scan.
+%%% ===================================================================
+
+%% @doc Serialise a single UTXO to its TxOutSer wire bytes.
+%% Used as the input to MuHash3072::Insert / Remove.
+-spec tx_out_ser(binary(), non_neg_integer(), #utxo{}) -> binary().
+tx_out_ser(Txid, Vout,
+           #utxo{value = Value, script_pubkey = Script,
+                 is_coinbase = IsCoinbase, height = Height})
+        when byte_size(Txid) =:= 32,
+             is_integer(Vout), Vout >= 0,
+             is_integer(Value), Value >= 0,
+             is_binary(Script),
+             is_integer(Height), Height >= 0 ->
+    CoinbaseFlag = case IsCoinbase of true -> 1; false -> 0 end,
+    Code = (Height bsl 1) bor CoinbaseFlag,
+    ScriptLen = encode_compact_size(byte_size(Script)),
+    <<Txid:32/binary,
+      Vout:32/little,
+      Code:32/little,
+      Value:64/little,
+      ScriptLen/binary,
+      Script/binary>>.
+
+%% @doc Apply one UTXO to a MuHash3072 accumulator.
+%% Op is `add` for spent->unspent (creation) or `remove` for unspent->spent.
+%% Returns the updated accumulator.
+-spec txoutset_muhash_apply(add | remove,
+                            {binary(), non_neg_integer(), #utxo{}},
+                            beamchain_muhash:muhash()) ->
+    beamchain_muhash:muhash().
+txoutset_muhash_apply(Op, {Txid, Vout, Utxo}, Acc) ->
+    Bytes = tx_out_ser(Txid, Vout, Utxo),
+    case Op of
+        add    -> beamchain_muhash:add(Bytes, Acc);
+        remove -> beamchain_muhash:remove(Bytes, Acc)
+    end.
+
+%% @doc Compute MuHash3072 finalize digest over a list of UTXOs.
+%% Order-independent. Returns the 32-byte SHA256 of the collapsed
+%% accumulator value, byte-for-byte equivalent to Bitcoin Core's
+%% `gettxoutsetinfo muhash` -> .muhash (raw uint256 in internal byte
+%% order; reverse for display hex).
+-spec compute_txoutset_muhash_from_list([{binary(), non_neg_integer(),
+                                          #utxo{}}]) ->
+    binary().
+compute_txoutset_muhash_from_list(Coins) when is_list(Coins) ->
+    Acc = lists:foldl(
+        fun(Coin, A) -> txoutset_muhash_apply(add, Coin, A) end,
+        beamchain_muhash:new(),
+        Coins),
+    beamchain_muhash:finalize(Acc).
 
 %% @doc Serialize current UTXO set to snapshot format.
 %% Returns binary snapshot data in Bitcoin Core's exact byte format.
