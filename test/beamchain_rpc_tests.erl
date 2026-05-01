@@ -888,3 +888,107 @@ rpc_listener_gives_up_on_hard_conflict_test_() ->
               gen_tcp:close(Holder)
           end
       end}}.
+
+%%% ===================================================================
+%%% dumptxoutset rollback target resolution
+%%%
+%%% Mirrors bitcoin-core/src/rpc/blockchain.cpp:3115 — the parameter
+%%% normalization that picks the dump target before the rewind/dump/forward
+%%% dance kicks in. Tests below cover branches that don't require a
+%%% running beamchain_db gen_server (no positive height/hash lookups).
+%%% ===================================================================
+
+%% Dummy values for tip arguments — only used by branches that don't
+%% reach DB lookup, so the actual hash/height numbers don't matter.
+-define(DUMMY_TIP_HASH, <<0:256>>).
+-define(DUMMY_TIP_HEIGHT, 100).
+
+dumptxoutset_resolve_latest_default_test() ->
+    %% Empty type + empty options must resolve to the current tip.
+    Result = beamchain_rpc:resolve_dump_target(
+               <<>>, #{},
+               ?DUMMY_TIP_HASH, ?DUMMY_TIP_HEIGHT, mainnet),
+    ?assertEqual({ok, {?DUMMY_TIP_HASH, ?DUMMY_TIP_HEIGHT}}, Result).
+
+dumptxoutset_resolve_latest_explicit_test() ->
+    %% type="latest" and no options must resolve to the current tip.
+    Result = beamchain_rpc:resolve_dump_target(
+               <<"latest">>, #{},
+               ?DUMMY_TIP_HASH, ?DUMMY_TIP_HEIGHT, mainnet),
+    ?assertEqual({ok, {?DUMMY_TIP_HASH, ?DUMMY_TIP_HEIGHT}}, Result).
+
+dumptxoutset_resolve_invalid_type_rejected_test() ->
+    %% Any other type is rejected with RPC_INVALID_PARAMETER (-8).
+    Result = beamchain_rpc:resolve_dump_target(
+               <<"bogus">>, #{},
+               ?DUMMY_TIP_HASH, ?DUMMY_TIP_HEIGHT, mainnet),
+    ?assertMatch({error, -8, _}, Result).
+
+dumptxoutset_resolve_type_options_conflict_test() ->
+    %% type="latest" + options.rollback present → conflict (-8).
+    Result = beamchain_rpc:resolve_dump_target(
+               <<"latest">>, #{<<"rollback">> => 840000},
+               ?DUMMY_TIP_HASH, ?DUMMY_TIP_HEIGHT, mainnet),
+    ?assertMatch({error, -8, _}, Result).
+
+dumptxoutset_resolve_invalid_rollback_type_test() ->
+    %% Non-integer / non-binary rollback values are rejected with -8.
+    Result = beamchain_rpc:resolve_dump_target(
+               <<"rollback">>, #{<<"rollback">> => 1.5},
+               ?DUMMY_TIP_HASH, ?DUMMY_TIP_HEIGHT, mainnet),
+    ?assertMatch({error, -8, _}, Result).
+
+dumptxoutset_resolve_height_out_of_range_test() ->
+    %% Negative or above-tip rollback heights are rejected with -8 BEFORE
+    %% any DB lookup happens.
+    R1 = beamchain_rpc:resolve_dump_target(
+           <<"rollback">>, #{<<"rollback">> => -1},
+           ?DUMMY_TIP_HASH, ?DUMMY_TIP_HEIGHT, mainnet),
+    ?assertMatch({error, -8, _}, R1),
+    R2 = beamchain_rpc:resolve_dump_target(
+           <<"rollback">>, #{<<"rollback">> => ?DUMMY_TIP_HEIGHT + 1},
+           ?DUMMY_TIP_HASH, ?DUMMY_TIP_HEIGHT, mainnet),
+    ?assertMatch({error, -8, _}, R2).
+
+dumptxoutset_resolve_invalid_hash_hex_test() ->
+    %% Garbage hex is rejected with -8 (caught at parse-time, no DB
+    %% lookup attempted).
+    Result = beamchain_rpc:resolve_dump_target(
+               <<"rollback">>, #{<<"rollback">> => <<"not-hex">>},
+               ?DUMMY_TIP_HASH, ?DUMMY_TIP_HEIGHT, mainnet),
+    ?assertMatch({error, -8, _}, Result).
+
+dumptxoutset_resolve_rollback_no_snapshot_below_tip_test() ->
+    %% type="rollback" with no options on a tip lower than every
+    %% assumeutxo entry must surface RPC_MISC_ERROR (-1) — there's no
+    %% eligible snapshot height.
+    Result = beamchain_rpc:resolve_dump_target(
+               <<"rollback">>, #{},
+               ?DUMMY_TIP_HASH, 1000, mainnet),
+    ?assertMatch({error, -1, _}, Result).
+
+%%% ===================================================================
+%%% chain_params: assumeutxo height enumeration
+%%% Mirrors bitcoin-core/src/kernel/chainparams.cpp
+%%% GetAvailableSnapshotHeights() — the helper that "rollback" without
+%%% an explicit height uses to pick the latest snapshot.
+%%% ===================================================================
+
+assumeutxo_heights_mainnet_test() ->
+    Heights = beamchain_chain_params:list_assumeutxo_heights(mainnet),
+    %% 4 mainnet snapshot heights baked in (840k, 880k, 910k, 935k).
+    ?assertEqual([840000, 880000, 910000, 935000], Heights).
+
+assumeutxo_heights_testnet4_test() ->
+    Heights = beamchain_chain_params:list_assumeutxo_heights(testnet4),
+    %% 2 testnet4 snapshot heights baked in (90k, 120k).
+    ?assertEqual([90000, 120000], Heights).
+
+assumeutxo_heights_sorted_ascending_test() ->
+    %% Contract: list is sorted ascending so callers can lists:max/1
+    %% the eligible subset. Spot-check across networks.
+    lists:foreach(
+      fun(Net) ->
+              Hs = beamchain_chain_params:list_assumeutxo_heights(Net),
+              ?assertEqual(lists:sort(Hs), Hs)
+      end, [mainnet, testnet4, regtest]).
