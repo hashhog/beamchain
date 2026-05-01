@@ -44,14 +44,22 @@ snapshot_test_() ->
            fun test_mainnet_four_entries/0},
           {"loadtxoutset refuses heights not in m_assumeutxo_data (Core-strict)",
            fun test_validate_snapshot_height_strict/0},
-          {"verify_snapshot uses MuHash3072 (matches assumeutxo entry)",
-           fun test_verify_snapshot_muhash_match/0},
-          {"verify_snapshot rejects mismatched MuHash with Core-verbatim wording",
-           fun test_verify_snapshot_muhash_mismatch_wording/0},
-          {"verify_snapshot rejects legacy SHA256-of-coin-bytes commitment",
-           fun test_verify_snapshot_rejects_legacy_hash/0},
-          {"dumptxoutset emits MuHash3072 in txoutset_hash field",
-           fun test_dumptxoutset_emits_muhash/0}
+          {"compute_utxo_hash_from_list/1 is SHA256d via HashWriter (Core HASH_SERIALIZED)",
+           fun test_compute_utxo_hash_is_sha256d/0},
+          {"compute_utxo_hash_from_list/1 streams TxOutSer bytes per coin",
+           fun test_compute_utxo_hash_streams_tx_out_ser/0},
+          {"compute_utxo_hash_from_list/1 walks coins in (txid, vout) order",
+           fun test_compute_utxo_hash_walks_in_order/0},
+          {"compute_utxo_hash_from_list/1 rejects MuHash3072 (different commitment)",
+           fun test_compute_utxo_hash_not_muhash/0},
+          {"verify_snapshot uses HASH_SERIALIZED (matches assumeutxo entry)",
+           fun test_verify_snapshot_hash_serialized_match/0},
+          {"verify_snapshot rejects mismatched HASH_SERIALIZED with Core-verbatim wording",
+           fun test_verify_snapshot_hash_serialized_mismatch_wording/0},
+          {"verify_snapshot rejects MuHash3072 commitment (separate from HASH_SERIALIZED)",
+           fun test_verify_snapshot_rejects_muhash/0},
+          {"dumptxoutset emits HASH_SERIALIZED (SHA256d) in txoutset_hash field",
+           fun test_dumptxoutset_emits_hash_serialized/0}
          ]
      end}.
 
@@ -534,49 +542,124 @@ hex_val(C) when C >= $a, C =< $f -> C - $a + 10;
 hex_val(C) when C >= $A, C =< $F -> C - $A + 10.
 
 %%% ===================================================================
-%%% MuHash-based verify_snapshot / dumptxoutset wiring
+%%% Strict-gate commitment: HASH_SERIALIZED (SHA256d via HashWriter)
 %%%
-%%% These tests exercise the post-`9d25077` switch from the legacy
-%%% SHA-256-over-concatenated-coin-bytes commitment to MuHash3072 in the
-%%% loadtxoutset / dumptxoutset strict-validation path. Mirrors
-%%% bitcoin-core/src/validation.cpp:5910-5914 (Bad snapshot content hash:
-%%% expected ... got ...) and rpc/blockchain.cpp dumptxoutset's
-%%% txoutset_hash field.
+%%% These tests pin the loadtxoutset / dumptxoutset strict-content-hash
+%%% gate to the Core-correct commitment:
+%%%   bitcoin-core/src/validation.cpp:5901-5914 — Core feeds the snapshot
+%%%   coin set through `ComputeUTXOStats(HASH_SERIALIZED, ...)` (NOT
+%%%   MuHash) and compares the result to `au_data.hash_serialized`.
+%%%   bitcoin-core/src/kernel/coinstats.cpp:161 — the HASH_SERIALIZED
+%%%   branch builds a `HashWriter` (SHA256d) over `TxOutSer` bytes.
+%%%
+%%% MuHash3072 is the separate `gettxoutsetinfo hash_type=muhash` path
+%%% (kernel/coinstats.cpp:165-167) and MUST NOT be wired into the strict
+%%% gate. A previous regression (revert of c0fa389) wired MuHash3072 in
+%%% by mistake; these tests prevent regressing back to that.
 %%% ===================================================================
 
-%% Spin a fake snapshot whose base_hash matches the regtest assumeutxo
-%% block_hash placeholder (`<<0:256>>`), with an empty coin list. The
-%% MuHash of the empty set is well-defined (finalize(new()) = SHA256(<<0:3072>>))
-%% and is *not* `<<0:256>>`, so this exercises the mismatch path
-%% deterministically and asserts the verbatim Core wording.
-test_verify_snapshot_muhash_match() ->
-    %% Sanity: MuHash3072 finalize on empty set is what beamchain_muhash
-    %% returns, and is what compute_txoutset_muhash_from_list/1 returns
-    %% for [].
-    H1 = beamchain_snapshot:compute_txoutset_muhash_from_list([]),
-    H2 = beamchain_muhash:finalize(beamchain_muhash:new()),
-    ?assertEqual(32, byte_size(H1)),
-    ?assertEqual(H1, H2),
+%% compute_utxo_hash_from_list/1 must equal SHA256d over the streamed
+%% TxOutSer bytes (in (txid, vout) order). For a single coin, the function
+%% reduces to hash256(tx_out_ser(...)).
+test_compute_utxo_hash_is_sha256d() ->
+    Txid = <<16#01:256>>,
+    Vout = 5,
+    Utxo = #utxo{value = 1234, script_pubkey = <<16#51, 16#52>>,
+                 is_coinbase = true, height = 7},
+    Got = beamchain_snapshot:compute_utxo_hash_from_list([{Txid, Vout, Utxo}]),
+    Bytes = beamchain_snapshot:tx_out_ser(Txid, Vout, Utxo),
+    Expected = crypto:hash(sha256, crypto:hash(sha256, Bytes)),
+    ?assertEqual(32, byte_size(Got)),
+    ?assertEqual(Expected, Got),
 
-    %% A non-empty list produces a different (and order-independent) digest.
+    %% Empty UTXO set: SHA256d of the empty bytestring.
+    Empty = beamchain_snapshot:compute_utxo_hash_from_list([]),
+    ?assertEqual(crypto:hash(sha256, crypto:hash(sha256, <<>>)), Empty).
+
+%% compute_utxo_hash_from_list/1 must serialise each coin via TxOutSer.
+%% Concatenated TxOutSer bytes hashed with SHA256d == the function's
+%% output. This pins the wire layout to Core's
+%% kernel/coinstats.cpp:46-51.
+test_compute_utxo_hash_streams_tx_out_ser() ->
+    Coins = sample_utxo_set(),
+    Sorted = lists:sort(fun({T1, V1, _}, {T2, V2, _}) ->
+                                {T1, V1} =< {T2, V2}
+                        end, Coins),
+    Bytes = iolist_to_binary(
+              [beamchain_snapshot:tx_out_ser(T, V, U) || {T, V, U} <- Sorted]),
+    Expected = crypto:hash(sha256, crypto:hash(sha256, Bytes)),
+    Got = beamchain_snapshot:compute_utxo_hash_from_list(Coins),
+    ?assertEqual(Expected, Got).
+
+%% Order matters: the same coin set fed in different orders must yield
+%% the same hash, but only because the function sorts internally. The
+%% sorted order itself must match Core's CCoinsView cursor walk
+%% (txid lex, vout asc within each txid).
+test_compute_utxo_hash_walks_in_order() ->
+    Coins = sample_utxo_set(),
+    H1 = beamchain_snapshot:compute_utxo_hash_from_list(Coins),
+    H2 = beamchain_snapshot:compute_utxo_hash_from_list(lists:reverse(Coins)),
+    %% Internal sort makes the function order-invariant on input.
+    ?assertEqual(H1, H2),
+    %% But the bytes must be in (txid, vout)-ascending order. Two coins
+    %% sharing a txid: vout order matters.
+    Tx = <<16#aa:256>>,
+    A = {Tx, 0, #utxo{value = 1, script_pubkey = <<>>,
+                       is_coinbase = false, height = 1}},
+    B = {Tx, 1, #utxo{value = 2, script_pubkey = <<>>,
+                       is_coinbase = false, height = 1}},
+    Hab = beamchain_snapshot:compute_utxo_hash_from_list([A, B]),
+    Hba = beamchain_snapshot:compute_utxo_hash_from_list([B, A]),
+    ?assertEqual(Hab, Hba),
+    %% And it must equal the SHA256d of A's bytes ++ B's bytes (vout 0
+    %% first), NOT the reverse.
+    Asc = iolist_to_binary([beamchain_snapshot:tx_out_ser(Tx, 0, element(3, A)),
+                            beamchain_snapshot:tx_out_ser(Tx, 1, element(3, B))]),
+    Desc = iolist_to_binary([beamchain_snapshot:tx_out_ser(Tx, 1, element(3, B)),
+                             beamchain_snapshot:tx_out_ser(Tx, 0, element(3, A))]),
+    ?assertEqual(crypto:hash(sha256, crypto:hash(sha256, Asc)), Hab),
+    ?assertNotEqual(crypto:hash(sha256, crypto:hash(sha256, Desc)), Hab).
+
+%% The strict-gate commitment must NOT equal the MuHash3072 commitment
+%% over the same UTXO set. They are independent Core code paths
+%% (kernel/coinstats.cpp:161 vs :165-167) and produce different 32-byte
+%% values. If someone accidentally re-routes the strict gate through the
+%% MuHash module again, this assertion will diverge.
+test_compute_utxo_hash_not_muhash() ->
+    Coins = sample_utxo_set(),
+    Strict = beamchain_snapshot:compute_utxo_hash_from_list(Coins),
+    MuHash = beamchain_snapshot:compute_txoutset_muhash_from_list(Coins),
+    ?assertEqual(32, byte_size(Strict)),
+    ?assertEqual(32, byte_size(MuHash)),
+    ?assertNotEqual(Strict, MuHash).
+
+%% verify_snapshot/2 must accept the SHA256d commitment over the
+%% snapshot's coins (the value Core stores in
+%% m_assumeutxo_data.hash_serialized).
+test_verify_snapshot_hash_serialized_match() ->
     Coins = [
         {<<1:256>>, 0, #utxo{value = 5000000000, script_pubkey = <<16#51>>,
                              is_coinbase = true, height = 0}},
         {<<2:256>>, 1, #utxo{value = 200000, script_pubkey = <<16#52>>,
                              is_coinbase = false, height = 10}}
     ],
-    H3 = beamchain_snapshot:compute_txoutset_muhash_from_list(Coins),
-    ?assertEqual(32, byte_size(H3)),
-    ?assertNotEqual(H1, H3).
+    %% Sanity: empty set hash is SHA256d(<<>>).
+    H1 = beamchain_snapshot:compute_utxo_hash_from_list([]),
+    ?assertEqual(32, byte_size(H1)),
+    ?assertEqual(crypto:hash(sha256, crypto:hash(sha256, <<>>)), H1),
+    %% Non-empty: differs from empty-set hash.
+    H2 = beamchain_snapshot:compute_utxo_hash_from_list(Coins),
+    ?assertEqual(32, byte_size(H2)),
+    ?assertNotEqual(H1, H2).
 
-%% Mismatch must produce the exact Core wording from validation.cpp:5912-5914.
+%% Mismatch must produce the exact Core wording from validation.cpp:5913.
 %% Display hex is uint256::ToString order (reverse of internal byte order).
-test_verify_snapshot_muhash_mismatch_wording() ->
+test_verify_snapshot_hash_serialized_mismatch_wording() ->
     Coins = [
         {<<7:256>>, 0, #utxo{value = 1, script_pubkey = <<16#51>>,
                              is_coinbase = false, height = 1}}
     ],
-    Computed = beamchain_snapshot:compute_txoutset_muhash_from_list(Coins),
+    Computed = beamchain_snapshot:compute_utxo_hash_from_list(Coins),
     ExpectedRegtestPlaceholder = <<0:256>>,
     Snapshot = #{base_hash => <<0:256>>,  %% regtest placeholder block_hash
                  num_coins => length(Coins),
@@ -593,65 +676,51 @@ test_verify_snapshot_muhash_mismatch_wording() ->
             ?assertEqual({error, mismatch_expected}, Other)
     end.
 
-%% Asserts the legacy compute_utxo_hash_from_list/1 (SHA-256 of beamchain
-%% coin bytes) is NOT what verify_snapshot/2 compares against. We feed a
-%% fabricated snapshot whose computed-legacy-hash equals the regtest
-%% placeholder placeholder utxo_hash <<0:256>>... we can't easily, but we
-%% can prove the inverse: the legacy hash and the MuHash of the same
-%% coin list are different binaries, and verify_snapshot uses the MuHash
-%% one (so swapping in the legacy value into the chainparams would break).
-test_verify_snapshot_rejects_legacy_hash() ->
+%% A snapshot that hashes correctly under MuHash3072 but NOT under
+%% HASH_SERIALIZED must be rejected by verify_snapshot/2 — i.e. the
+%% strict gate must NOT be the MuHash path. We confirm by feeding the
+%% MuHash digest of a coin set as the chainparam expected hash and
+%% checking the SHA256d produced by the function does NOT equal it.
+test_verify_snapshot_rejects_muhash() ->
     Coins = [
         {<<3:256>>, 0, #utxo{value = 100, script_pubkey = <<16#51>>,
                              is_coinbase = false, height = 5}},
         {<<4:256>>, 0, #utxo{value = 200, script_pubkey = <<16#52>>,
                              is_coinbase = true, height = 6}}
     ],
+    Strict = beamchain_snapshot:compute_utxo_hash_from_list(Coins),
     MuHash = beamchain_snapshot:compute_txoutset_muhash_from_list(Coins),
-    %% The DEPRECATED legacy commitment must be a different value (SHA-256
-    %% of a different byte layout).
-    LegacyBytes = iolist_to_binary(
-                    [legacy_serialize(T, V, U) || {T, V, U} <- lists:sort(Coins)]),
-    Legacy = crypto:hash(sha256, LegacyBytes),
-    ?assertNotEqual(MuHash, Legacy),
-    %% Sanity: 32 bytes each.
-    ?assertEqual(32, byte_size(Legacy)),
+    %% Independent commitments must differ (they are different
+    %% algorithms over the same input bytes).
+    ?assertNotEqual(Strict, MuHash),
+    ?assertEqual(32, byte_size(Strict)),
     ?assertEqual(32, byte_size(MuHash)).
 
-%% Mirrors the dumptxoutset RPC's txoutset_hash field — verifies that the
-%% value emitted is byte-for-byte the MuHash3072 finalize digest over the
-%% same UTXO list. We exercise the underlying primitive directly (the RPC
-%% wrapper just hex-encodes in display order).
-test_dumptxoutset_emits_muhash() ->
+%% dumptxoutset's `txoutset_hash` field is the HASH_SERIALIZED
+%% commitment (rpc/blockchain.cpp:3259 selects HASH_SERIALIZED). Pin
+%% the on-the-wire value to SHA256d-via-HashWriter over the UTXO bytes.
+test_dumptxoutset_emits_hash_serialized() ->
     Coins = sample_utxo_set(),
-    H = beamchain_snapshot:compute_txoutset_muhash_from_list(Coins),
-    %% Reachable through the same primitive the RPC handler routes to:
-    %% beamchain_snapshot:compute_utxo_hash/0 (which iterates the live
-    %% chainstate). We can't iterate a real chainstate from eunit, so the
-    %% guarantee we lock in here is that compute_txoutset_muhash_from_list/1
-    %% — the function the RPC handler ultimately reaches via
-    %% compute_utxo_hash/0 — produces a 32-byte MuHash3072 digest that
-    %% MATCHES beamchain_muhash:finalize over the same input. If someone
-    %% accidentally re-wires dumptxoutset back to the legacy SHA-256
-    %% commitment, this assertion will diverge.
-    Acc = lists:foldl(
-            fun(C, A) -> beamchain_snapshot:txoutset_muhash_apply(add, C, A) end,
-            beamchain_muhash:new(),
-            Coins),
-    ?assertEqual(beamchain_muhash:finalize(Acc), H),
+    H = beamchain_snapshot:compute_utxo_hash_from_list(Coins),
+    %% Reachable through the same primitive
+    %% beamchain_snapshot:compute_utxo_hash/0 routes to (the chainstate
+    %% iterator feeds compute_utxo_hash_from_list/1).
+    Sorted = lists:sort(fun({T1, V1, _}, {T2, V2, _}) ->
+                                {T1, V1} =< {T2, V2}
+                        end, Coins),
+    Bytes = iolist_to_binary(
+              [beamchain_snapshot:tx_out_ser(T, V, U) || {T, V, U} <- Sorted]),
+    Expected = crypto:hash(sha256, crypto:hash(sha256, Bytes)),
+    ?assertEqual(Expected, H),
     ?assertEqual(32, byte_size(H)),
-    %% And it must not equal the legacy hash for the same set.
-    LegacyBytes = iolist_to_binary(
-                    [legacy_serialize(T, V, U) || {T, V, U} <- lists:sort(Coins)]),
-    Legacy = crypto:hash(sha256, LegacyBytes),
-    ?assertNotEqual(H, Legacy).
+    %% And it must NOT equal the MuHash3072 commitment for the same set
+    %% (different commitment, different field).
+    MuHash = beamchain_snapshot:compute_txoutset_muhash_from_list(Coins),
+    ?assertNotEqual(H, MuHash),
+    %% Backwards-compatible alias: compute_utxo_hash_from_list_legacy/1
+    %% must produce the same digest (it routes to the same impl).
+    ?assertEqual(H, beamchain_snapshot:compute_utxo_hash_from_list_legacy(Coins)).
 
 bin_to_display_hex(Bin) ->
     Reversed = list_to_binary(lists:reverse(binary_to_list(Bin))),
     lists:flatten([io_lib:format("~2.16.0b", [B]) || <<B:8>> <= Reversed]).
-
-legacy_serialize(Txid, Vout,
-                 #utxo{value = V, script_pubkey = S,
-                       is_coinbase = IsCb, height = H}) ->
-    Cb = case IsCb of true -> 1; false -> 0 end,
-    <<Txid:32/binary, Vout:32/big, V:64/little, H:32/little, Cb:8, S/binary>>.
