@@ -25,6 +25,7 @@
 -export([get_utxo/2, store_utxo/3, spend_utxo/2, has_utxo/2]).
 -export([clear_chainstate_cf/0]).
 -export([fold_utxos/2]).
+-export([scrub_unspendable/0]).
 
 %% Block index
 -export([store_block_index/5, store_block_index/6, get_block_index/1, get_block_index_by_hash/1]).
@@ -252,6 +253,77 @@ fold_utxos_loop({ok, OtherKey, _ValueBin}, Iter, Fun, Acc) ->
     logger:warning("beamchain_db: fold_utxos skipping non-outpoint key "
                    "(~B bytes)", [byte_size(OtherKey)]),
     fold_utxos_loop(rocksdb:iterator_move(Iter, next), Iter, Fun, Acc).
+
+%% @doc One-shot scrub of orphan unspendable UTXOs from the chainstate CF.
+%%
+%% Walks the chainstate column family with fold_utxos/2, deletes every
+%% entry whose scriptPubKey is unspendable per
+%% beamchain_chainstate:is_unspendable_script/1 (OP_RETURN-prefixed or
+%% > MAX_SCRIPT_SIZE bytes), and returns {Removed, BytesFreed}.
+%%
+%% Bytes-freed accounting matches encode_utxo/1's on-disk layout:
+%%   key   = 36 bytes (txid 32 + vout 4)
+%%   value = 8 (value LE) + 4 (height LE) + 1 (coinbase) + byte_size(SPK)
+%% i.e. 49 + byte_size(SPK) per coin. This is the raw sum across the
+%% scrubbed entries; actual reclaimed disk depends on RocksDB compaction.
+%%
+%% Idempotent: a second call after the first finds nothing to delete
+%% because is_unspendable_script/1 is the same predicate add_utxo/3 now
+%% applies on the write side (commit 79fa3e5).
+%%
+%% Operator-invoked only — never runs on startup. Deletes are batched in
+%% chunks via direct_write_batch/1 to keep WriteBatch footprint bounded
+%% on a multi-million-coin chainstate.
+-spec scrub_unspendable() -> {non_neg_integer(), non_neg_integer()}.
+scrub_unspendable() ->
+    Acc0 = #{batch => [], removed => 0, bytes => 0},
+    Result = fold_utxos(fun scrub_visit/2, Acc0),
+    case Result of
+        #{batch := PendingOps, removed := Removed, bytes := Bytes} ->
+            ok = scrub_flush_batch(PendingOps),
+            logger:info("[scrubunspendable] removed ~B entries", [Removed]),
+            {Removed, Bytes};
+        {error, Reason} ->
+            logger:error("beamchain_db: scrub_unspendable fold failed: ~p",
+                         [Reason]),
+            {0, 0}
+    end.
+
+%% Per-coin visitor for scrub_unspendable/0. Skips spendable coins;
+%% queues a delete op for unspendable ones and flushes every 5k entries.
+-define(SCRUB_BATCH_SIZE, 5000).
+scrub_visit({Txid, Vout, #utxo{script_pubkey = SPK}},
+            #{batch := Batch, removed := N, bytes := B} = Acc) ->
+    case beamchain_chainstate:is_unspendable_script(SPK) of
+        false ->
+            Acc;
+        true ->
+            Key = encode_outpoint(Txid, Vout),
+            %% 49 = 36 (key) + 8 (value) + 4 (height) + 1 (coinbase flag)
+            EntryBytes = 49 + byte_size(SPK),
+            NewBatch = [{delete, chainstate, Key} | Batch],
+            Acc1 = Acc#{batch := NewBatch,
+                        removed := N + 1,
+                        bytes := B + EntryBytes},
+            case length(NewBatch) >= ?SCRUB_BATCH_SIZE of
+                true ->
+                    ok = scrub_flush_batch(NewBatch),
+                    Acc1#{batch := []};
+                false ->
+                    Acc1
+            end
+    end.
+
+scrub_flush_batch([]) ->
+    ok;
+scrub_flush_batch(Ops) ->
+    case direct_write_batch(Ops) of
+        ok -> ok;
+        {error, Reason} ->
+            logger:error("beamchain_db: scrub_unspendable batch write "
+                         "failed: ~p", [Reason]),
+            error({scrub_unspendable_write_failed, Reason})
+    end.
 
 %% @doc Clear all entries in the chainstate column family (RocksDB).
 %% Used during full chainstate wipe to remove stale UTXOs that persist
