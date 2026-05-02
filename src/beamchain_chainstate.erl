@@ -22,6 +22,10 @@
 %% UTXO cache — module functions (direct ETS access, no gen_server call)
 -export([get_utxo/2, has_utxo/2, add_utxo/3, add_utxo_fresh/3, spend_utxo/2]).
 
+%% Predicate exported for use by ops tooling (scrubunspendable RPC) and
+%% the snapshot path. Mirrors Core's CScript::IsUnspendable().
+-export([is_unspendable_script/1]).
+
 %% Block connection / disconnection
 -export([connect_block/1, disconnect_block/0, reorganize/1]).
 

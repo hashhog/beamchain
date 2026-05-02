@@ -452,6 +452,7 @@ handle_method(<<"verifychain">>, _, _W) -> rpc_verifychain();
 handle_method(<<"invalidateblock">>, P, _W) -> rpc_invalidateblock(P);
 handle_method(<<"reconsiderblock">>, P, _W) -> rpc_reconsiderblock(P);
 handle_method(<<"flushchainstate">>, _, _W) -> rpc_flushchainstate();
+handle_method(<<"scrubunspendable">>, _, _W) -> rpc_scrubunspendable();
 
 %% -- Transactions --
 handle_method(<<"getrawtransaction">>, P, _W) -> rpc_getrawtransaction(P);
@@ -569,6 +570,7 @@ rpc_help_list() ->
         <<"reconsiderblock \"blockhash\"">>,
         <<"verifychain ( checklevel nblocks )">>,
         <<"flushchainstate">>,
+        <<"scrubunspendable">>,
         <<"">>,
         <<"== Control ==">>,
         <<"help ( \"command\" )">>,
@@ -1072,6 +1074,34 @@ rpc_flushchainstate() ->
                 <<"hash">>   => <<"0000000000000000000000000000000000000000000000000000000000000000">>
             }}
     end.
+
+%% @doc scrubunspendable — one-shot scrub of orphan unspendable coins.
+%%
+%% Walks the chainstate column family on disk and removes any UTXO whose
+%% scriptPubKey is unspendable per Core's CScript::IsUnspendable() —
+%% scripts beginning with OP_RETURN (0x6a) or larger than MAX_SCRIPT_SIZE
+%% (10000). These coins should never have entered the UTXO set; the
+%% IsUnspendable filter at AddCoin time was added in beamchain commit
+%% 79fa3e5, but datadirs that ingested blocks before that commit still
+%% carry orphan SegWit-witness-commitment outputs in the chainstate CF.
+%%
+%% First flushes the in-memory UTXO cache so we operate on the
+%% authoritative on-disk view, then iterates and deletes via batched
+%% RocksDB writes. Idempotent — a second call finds zero entries because
+%% AddCoin now rejects them at write time.
+%%
+%% Returns {"removed": N, "bytes_freed": X} where bytes_freed is the
+%% summed key+value byte count of removed entries (raw, pre-compaction).
+rpc_scrubunspendable() ->
+    %% Flush so the on-disk CF reflects all dirty in-memory entries — the
+    %% cache may hold spent or fresh coins that the iterator would
+    %% otherwise miss or re-process.
+    ok = beamchain_chainstate:flush(),
+    {Removed, BytesFreed} = beamchain_db:scrub_unspendable(),
+    {ok, #{
+        <<"removed">>     => Removed,
+        <<"bytes_freed">> => BytesFreed
+    }}.
 
 %% @doc invalidateblock - mark a block and all its descendants as invalid
 %% If the block is on the active chain, rewinds to just before it and switches
