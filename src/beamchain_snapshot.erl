@@ -686,16 +686,34 @@ compute_utxo_hash_from_list(Coins) when is_list(Coins) ->
 %%% Internal: UTXO collection
 %%% ===================================================================
 
-%% Collect all UTXOs from the chainstate cache and RocksDB
+%% Collect all UTXOs from the chainstate cache and RocksDB.
+%%
+%% We must walk the persisted chainstate column family — not just the ETS
+%% cache — because the cache only holds UTXOs touched since the last flush.
+%% Mirrors Core's `view->Cursor()` walk in
+%% bitcoin-core/src/kernel/coinstats.cpp ComputeUTXOStats.
+%%
+%% The flush/0 call below promotes any dirty in-memory entries to the CF
+%% atomically with the chain tip (see beamchain_chainstate:do_flush/1), so
+%% by the time we open the iterator the on-disk view is the authoritative
+%% snapshot of the UTXO set at the current tip.
 collect_all_utxos() ->
-    %% First flush cache to ensure all UTXOs are in RocksDB
+    %% First flush cache to ensure all UTXOs are in RocksDB.
     beamchain_chainstate:flush(),
 
-    %% Iterate through all UTXOs in RocksDB
-    case beamchain_db:get_meta(<<"utxo_iterator_not_impl">>) of
-        _ ->
-            %% TODO: Implement RocksDB iterator for chainstate CF
-            %% For now, return empty - this will be implemented when needed
+    %% Iterate the chainstate CF; collect into a list. Order does not
+    %% matter for the caller (compute_utxo_hash_from_list/1 sorts and
+    %% group_coins_by_txid/1 also sorts), so we accumulate in iterator
+    %% order and let downstream sort.
+    Result = beamchain_db:fold_utxos(
+        fun(Coin, Acc) -> [Coin | Acc] end,
+        []),
+    case Result of
+        Coins when is_list(Coins) ->
+            Coins;
+        {error, Reason} ->
+            logger:error("beamchain_snapshot: fold_utxos failed: ~p",
+                         [Reason]),
             []
     end.
 
