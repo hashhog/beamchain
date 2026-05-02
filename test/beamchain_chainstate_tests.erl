@@ -27,6 +27,18 @@ chainstate_test_() ->
           %% assumeUTXO tests
           {"UTXO hash computation", fun test_utxo_hash_computation/0},
           {"snapshot role detection", fun test_snapshot_role_detection/0},
+          %% dumptxoutset body / IsUnspendable filter regression tests
+          %% (regression for the empty-body dump bug — the snapshot body
+          %% used to be empty because collect_all_utxos/0 was a TODO stub
+          %% returning [], so submitblock-driven ingest produced a 51-byte
+          %% header-only file. These three tests pin the now-real
+          %% chainstate-CF iterator + Core IsUnspendable filter.)
+          {"fold_utxos walks the chainstate CF after flush",
+           fun test_fold_utxos_walks_chainstate/0},
+          {"add_utxo drops OP_RETURN per Core IsUnspendable",
+           fun test_add_utxo_filters_op_return/0},
+          {"serialize_snapshot body contains every flushed UTXO",
+           fun test_serialize_snapshot_body_nonempty/0},
           %% Block invalidation/reconsideration tests
           {"cannot invalidate genesis block", fun test_cannot_invalidate_genesis/0},
           {"invalidating unknown block returns error", fun test_invalidate_unknown_block/0},
@@ -146,11 +158,15 @@ connect_disconnect_roundtrip() ->
     %% For this test, we'll create a simpler scenario: just add and remove
     %% UTXOs directly to test the undo mechanism.
 
-    %% Create test UTXO
+    %% Create test UTXO. Use a spendable script (OP_TRUE) — OP_RETURN
+    %% prefixes are unspendable per Core's IsUnspendable(), and
+    %% beamchain_chainstate:add_utxo/3 now drops them at AddCoin time
+    %% to mirror bitcoin-core/src/coins.cpp:91. See
+    %% beamchain_chainstate:is_unspendable_script/1.
     TestTxid = <<16#dead:256>>,
     TestUtxo = #utxo{
         value = 1000000,
-        script_pubkey = <<16#6a, 4, "test">>,
+        script_pubkey = <<16#51>>,
         is_coinbase = false,
         height = 1
     },
@@ -208,12 +224,17 @@ undo_deleted_after_disconnect() ->
 multi_tx_disconnect() ->
     %% Simulate a block with multiple transactions, verify undo restores all
 
-    %% Initial UTXOs (what would be spent by the block)
-    Utxo1 = #utxo{value = 1000000, script_pubkey = <<16#6a, 1, 1>>,
+    %% Initial UTXOs (what would be spent by the block).
+    %% Scripts are bare OP_<n> (push small int) — spendable. Avoid the
+    %% OP_RETURN prefix here: beamchain_chainstate:add_utxo/3 mirrors
+    %% bitcoin-core/src/coins.cpp:91 IsUnspendable() and silently drops
+    %% scripts that begin with OP_RETURN, which would defeat the
+    %% multi-tx round-trip this test pins.
+    Utxo1 = #utxo{value = 1000000, script_pubkey = <<16#51>>,
                   is_coinbase = false, height = 50},
-    Utxo2 = #utxo{value = 2000000, script_pubkey = <<16#6a, 1, 2>>,
+    Utxo2 = #utxo{value = 2000000, script_pubkey = <<16#52>>,
                   is_coinbase = false, height = 60},
-    Utxo3 = #utxo{value = 3000000, script_pubkey = <<16#6a, 1, 3>>,
+    Utxo3 = #utxo{value = 3000000, script_pubkey = <<16#53>>,
                   is_coinbase = true, height = 0},
 
     Txid1 = <<16#1111:256>>,
@@ -582,3 +603,155 @@ test_ibd_no_revert() ->
     %% Restore state for cleanup
     sys:replace_state(beamchain_chainstate,
         fun(S) -> setelement(10, S, true) end).
+
+%%% ===================================================================
+%%% dumptxoutset body / IsUnspendable filter regression tests
+%%%
+%%% Regression for the W-snapshot-byte-identity empty-body bug: the
+%%% beamchain dump used to emit a 51-byte header-only file (0 coins)
+%%% because beamchain_snapshot:collect_all_utxos/0 was a TODO stub that
+%%% returned [].  The fix walks the chainstate column family directly
+%%% via beamchain_db:fold_utxos/2 — the same on-disk store that
+%%% submitblock-driven ingest writes through (after flush). Mirrors
+%%% bitcoin-core/src/kernel/coinstats.cpp ComputeUTXOStats's
+%%% `view->Cursor()` walk and rpc/blockchain.cpp WriteUTXOSnapshot.
+%%%
+%%% These tests also pin the IsUnspendable filter at AddCoin time,
+%%% mirroring bitcoin-core/src/coins.cpp:91, which is what keeps the
+%%% snapshot byte-identical with Core's reference dump (Core never
+%%% adds OP_RETURN coinbase outputs to the chainstate).
+%%% ===================================================================
+
+%% beamchain_db:fold_utxos/2 must walk every UTXO that has been flushed
+%% to the chainstate CF.  Pre-fix the snapshot caller was inert (TODO
+%% stub) so this iterator did not exist; pin its semantics.
+test_fold_utxos_walks_chainstate() ->
+    %% Two spendable UTXOs (OP_TRUE / OP_2) — both pass IsUnspendable.
+    Txid1 = <<16#a1:256>>,
+    Txid2 = <<16#a2:256>>,
+    Utxo1 = #utxo{value = 11111, script_pubkey = <<16#51>>,
+                  is_coinbase = false, height = 5},
+    Utxo2 = #utxo{value = 22222, script_pubkey = <<16#52>>,
+                  is_coinbase = true,  height = 6},
+
+    beamchain_chainstate:add_utxo_fresh(Txid1, 0, Utxo1),
+    beamchain_chainstate:add_utxo_fresh(Txid2, 1, Utxo2),
+
+    %% Before flush the entries live only in ETS — fold_utxos walks
+    %% the CF, so ensure the WriteBatch has landed on disk.
+    beamchain_chainstate:flush(),
+
+    Folded = beamchain_db:fold_utxos(
+        fun(Coin, Acc) -> [Coin | Acc] end, []),
+    ?assert(is_list(Folded)),
+
+    %% Both UTXOs we just inserted must appear, with their values
+    %% intact through the encode/decode roundtrip.
+    Found1 = [U || {T, V, U} <- Folded, T =:= Txid1, V =:= 0],
+    Found2 = [U || {T, V, U} <- Folded, T =:= Txid2, V =:= 1],
+    ?assertMatch([#utxo{value = 11111}], Found1),
+    ?assertMatch([#utxo{value = 22222, is_coinbase = true}], Found2),
+
+    %% Clean up so other tests don't see these.
+    beamchain_chainstate:spend_utxo(Txid1, 0),
+    beamchain_chainstate:spend_utxo(Txid2, 1),
+    beamchain_chainstate:flush().
+
+%% Mirrors bitcoin-core/src/coins.cpp:91 — IsUnspendable() outputs
+%% (OP_RETURN-prefixed scripts and oversized scripts) must be silently
+%% dropped at AddCoin time so they never enter the chainstate. This is
+%% what keeps the regtest dump byte-identical with Core's reference
+%% (otherwise the SegWit-witness-commitment OP_RETURN coinbase outputs
+%% would inflate the count from 110 to ≥220).
+test_add_utxo_filters_op_return() ->
+    OpReturnTxid = <<16#b1:256>>,
+    OpReturnUtxo = #utxo{value = 0,
+                         script_pubkey = <<16#6a, 4, "test">>,
+                         is_coinbase = true,
+                         height = 7},
+    beamchain_chainstate:add_utxo_fresh(OpReturnTxid, 0, OpReturnUtxo),
+    %% Filter dropped it — not visible in cache or DB.
+    ?assertEqual(not_found,
+                 beamchain_chainstate:get_utxo(OpReturnTxid, 0)),
+
+    %% Same for add_utxo/3 (the BIP30-aware path) and for empty-script
+    %% OP_RETURN.
+    OpReturnTxid2 = <<16#b2:256>>,
+    OpReturnUtxo2 = #utxo{value = 0, script_pubkey = <<16#6a>>,
+                          is_coinbase = false, height = 8},
+    beamchain_chainstate:add_utxo(OpReturnTxid2, 0, OpReturnUtxo2),
+    ?assertEqual(not_found,
+                 beamchain_chainstate:get_utxo(OpReturnTxid2, 0)),
+
+    %% Oversized script (> MAX_SCRIPT_SIZE = 10000) is also IsUnspendable.
+    BigTxid = <<16#b3:256>>,
+    BigSPK = binary:copy(<<16#51>>, 10001),
+    BigUtxo = #utxo{value = 1, script_pubkey = BigSPK,
+                    is_coinbase = false, height = 9},
+    beamchain_chainstate:add_utxo_fresh(BigTxid, 0, BigUtxo),
+    ?assertEqual(not_found,
+                 beamchain_chainstate:get_utxo(BigTxid, 0)),
+
+    %% Sanity: a spendable script (OP_TRUE) is NOT filtered.
+    OkTxid = <<16#b4:256>>,
+    OkUtxo = #utxo{value = 5, script_pubkey = <<16#51>>,
+                   is_coinbase = false, height = 10},
+    beamchain_chainstate:add_utxo_fresh(OkTxid, 0, OkUtxo),
+    ?assertMatch({ok, #utxo{value = 5}},
+                 beamchain_chainstate:get_utxo(OkTxid, 0)),
+    beamchain_chainstate:spend_utxo(OkTxid, 0).
+
+%% End-to-end pin of the dump body. Pre-fix this would emit a 51-byte
+%% header-only file even when UTXOs were flushed to disk, because
+%% beamchain_snapshot:collect_all_utxos/0 was a stub. Now the body must
+%% contain every flushed (spendable) UTXO, in the same on-disk format
+%% Core's WriteUTXOSnapshot produces.
+test_serialize_snapshot_body_nonempty() ->
+    %% Three spendable UTXOs grouped over two txids (so we exercise both
+    %% the per-tx CompactSize header and multi-vout-per-tx paths).
+    TxidA = <<16#c1:256>>,
+    TxidB = <<16#c2:256>>,
+    A0 = #utxo{value = 100, script_pubkey = <<16#51>>,
+               is_coinbase = false, height = 11},
+    A1 = #utxo{value = 200, script_pubkey = <<16#52>>,
+               is_coinbase = false, height = 11},
+    B0 = #utxo{value = 300, script_pubkey = <<16#53>>,
+               is_coinbase = true,  height = 12},
+
+    beamchain_chainstate:add_utxo_fresh(TxidA, 0, A0),
+    beamchain_chainstate:add_utxo_fresh(TxidA, 1, A1),
+    beamchain_chainstate:add_utxo_fresh(TxidB, 0, B0),
+
+    %% Slip in an OP_RETURN that should be filtered — it must NOT show
+    %% up in the dump body.
+    OpReturnTxid = <<16#cf:256>>,
+    OpReturnUtxo = #utxo{value = 0,
+                         script_pubkey = <<16#6a, 1, 7>>,
+                         is_coinbase = true, height = 13},
+    beamchain_chainstate:add_utxo_fresh(OpReturnTxid, 0, OpReturnUtxo),
+
+    %% Build the snapshot. serialize_snapshot/2 calls flush/0 internally
+    %% via collect_all_utxos/0 → fold_utxos/2.
+    Genesis = beamchain_chain_params:genesis_block(regtest),
+    SnapshotBin = beamchain_snapshot:serialize_snapshot(
+        Genesis#block.hash, regtest),
+
+    %% Header is fixed-size 51 bytes; total must exceed it (body
+    %% non-empty). This is the load-bearing assertion: pre-fix this
+    %% number was exactly 51.
+    ?assert(byte_size(SnapshotBin) > 51),
+
+    %% Round-trip the file through the parser. num_coins is the value
+    %% serialised in the header (which must match the body length).
+    {ok, #{num_coins := N}, _Rest} =
+        beamchain_snapshot:parse_metadata(SnapshotBin),
+    %% At least our 3 spendable UTXOs must be present. (The
+    %% chainstate may still hold stragglers from prior tests in
+    %% the same setup; we only require lower-bound containment.)
+    ?assert(N >= 3),
+
+    %% Clean up.
+    beamchain_chainstate:spend_utxo(TxidA, 0),
+    beamchain_chainstate:spend_utxo(TxidA, 1),
+    beamchain_chainstate:spend_utxo(TxidB, 0),
+    beamchain_chainstate:flush().

@@ -292,8 +292,22 @@ has_utxo(Txid, Vout) ->
 %% @doc Add a UTXO to the cache (write-behind, not persisted until flush).
 %% New UTXOs created in this session are marked FRESH (don't exist in RocksDB).
 %% If marked FRESH and spent before flush, we can skip both the DB write and delete.
+%%
+%% Mirrors bitcoin-core/src/coins.cpp:91 — `if
+%% (coin.out.scriptPubKey.IsUnspendable()) return;` — Core silently
+%% drops unspendable outputs (OP_RETURN, scripts > MAX_SCRIPT_SIZE) at
+%% AddCoin time so they never enter the chainstate. We mirror that here
+%% to keep `dumptxoutset` and `gettxoutsetinfo` byte-identical with Core.
 -spec add_utxo(binary(), non_neg_integer(), #utxo{}) -> ok.
-add_utxo(Txid, Vout, Utxo) ->
+add_utxo(Txid, Vout, #utxo{script_pubkey = SPK} = Utxo) ->
+    case is_unspendable_script(SPK) of
+        true ->
+            ok;
+        false ->
+            do_add_utxo(Txid, Vout, Utxo)
+    end.
+
+do_add_utxo(Txid, Vout, Utxo) ->
     Key = {Txid, Vout},
     %% Check if the entry already exists in DB (BIP30 duplicate case).
     %% If it exists in RocksDB, we must NOT mark as FRESH — the DB entry needs
@@ -331,14 +345,38 @@ add_utxo(Txid, Vout, Utxo) ->
 %% Fast path: skips BIP30 duplicate check and DB existence check.
 %% Use when the caller has already verified uniqueness (e.g., BIP30 check
 %% was already done in validation, or BIP34 guarantees no duplicates).
+%%
+%% IsUnspendable filter: same Core-mirror as add_utxo/3.
 -spec add_utxo_fresh(binary(), non_neg_integer(), #utxo{}) -> ok.
-add_utxo_fresh(Txid, Vout, Utxo) ->
-    Key = {Txid, Vout},
-    ets:insert(?UTXO_CACHE, {Key, Utxo}),
-    ets:insert(?UTXO_DIRTY, {Key}),
-    ets:insert(?UTXO_FRESH, {Key}),
-    ets:delete(?UTXO_SPENT, Key),
-    ok.
+add_utxo_fresh(Txid, Vout, #utxo{script_pubkey = SPK} = Utxo) ->
+    case is_unspendable_script(SPK) of
+        true ->
+            ok;
+        false ->
+            Key = {Txid, Vout},
+            ets:insert(?UTXO_CACHE, {Key, Utxo}),
+            ets:insert(?UTXO_DIRTY, {Key}),
+            ets:insert(?UTXO_FRESH, {Key}),
+            ets:delete(?UTXO_SPENT, Key),
+            ok
+    end.
+
+%% @doc Mirror of bitcoin-core/src/script/script.h CScript::IsUnspendable():
+%%   (size() > 0 && *begin() == OP_RETURN) || (size() > MAX_SCRIPT_SIZE)
+%% Used to drop coins that the consensus layer can never spend. Same
+%% predicate Core's coins.cpp:91 applies in CCoinsViewCache::AddCoin to
+%% prevent OP_RETURN outputs (e.g. the SegWit witness commitment in every
+%% coinbase since BIP141) from polluting the UTXO set.
+%% MAX_SCRIPT_SIZE comes from beamchain_protocol.hrl (= 10000, Core's
+%% script.h:40 value).
+-define(OP_RETURN, 16#6a).
+-spec is_unspendable_script(binary()) -> boolean().
+is_unspendable_script(<<?OP_RETURN, _/binary>>) ->
+    true;
+is_unspendable_script(SPK) when byte_size(SPK) > ?MAX_SCRIPT_SIZE ->
+    true;
+is_unspendable_script(_) ->
+    false.
 
 %% @doc Add a UTXO from disk (for cache miss fills). Not marked FRESH or DIRTY.
 -spec add_utxo_from_disk(binary(), non_neg_integer(), #utxo{}) -> ok.
