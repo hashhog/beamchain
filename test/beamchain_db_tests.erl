@@ -38,7 +38,11 @@ db_test_() ->
           %% Pruning tests
           {"is_block_pruned returns false initially", fun is_block_pruned_initial/0},
           {"prune_block_files with no prune target", fun prune_disabled/0},
-          {"get_block_file_info includes prune info", fun block_file_info_prune/0}
+          {"get_block_file_info includes prune info", fun block_file_info_prune/0},
+          %% scrubunspendable: orphan-OP_RETURN / oversize cleanup (commit 79fa3e5)
+          {"scrub_unspendable removes orphan OP_RETURN + oversize coins",
+           fun scrub_unspendable_removes_orphans/0},
+          {"scrub_unspendable is idempotent", fun scrub_unspendable_idempotent/0}
          ]
      end}.
 
@@ -617,3 +621,110 @@ cumulative_tx_count() ->
     ?assertEqual(50000, Count),
     %% Non-existent height
     ?assertEqual(not_found, beamchain_db:get_cumulative_tx_count(999999)).
+
+%%% ===================================================================
+%%% scrubunspendable tests
+%%% ===================================================================
+
+%% Verify scrub_unspendable/0 only removes coins whose scriptPubKey is
+%% unspendable per Core's CScript::IsUnspendable() — OP_RETURN-prefixed
+%% or > MAX_SCRIPT_SIZE — and leaves spendable coins (P2PKH, P2WPKH,
+%% etc.) intact.
+%%
+%% This simulates a pre-fix beamchain datadir that landed orphan
+%% segwit-coinbase OP_RETURN witness-commitment outputs in the
+%% chainstate CF before commit 79fa3e5 added the IsUnspendable filter
+%% on the AddCoin write path.
+scrub_unspendable_removes_orphans() ->
+    %% Use store_utxo to bypass the chainstate cache filter and write
+    %% directly into the chainstate CF — this is the on-disk shape an
+    %% existing datadir has.
+    Txid1 = crypto:strong_rand_bytes(32),
+    Txid2 = crypto:strong_rand_bytes(32),
+    Txid3 = crypto:strong_rand_bytes(32),
+    Txid4 = crypto:strong_rand_bytes(32),
+    Txid5 = crypto:strong_rand_bytes(32),
+
+    Spendable = make_test_utxo(),  %% P2PKH, will survive
+
+    %% OP_RETURN witness commitment (typical post-BIP141 coinbase output)
+    OpReturnSPK = <<16#6a, 16#24, 16#aa, 16#21, 16#a9, 16#ed,
+                    1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,
+                    17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,
+                    33,34,35,36>>,
+    OpReturnUtxo = #utxo{value = 0, script_pubkey = OpReturnSPK,
+                          is_coinbase = true, height = 100},
+
+    %% Bare OP_RETURN with no payload
+    BareOpReturnUtxo = #utxo{value = 0, script_pubkey = <<16#6a>>,
+                              is_coinbase = false, height = 101},
+
+    %% Oversize script (> MAX_SCRIPT_SIZE = 10000)
+    OversizeSPK = binary:copy(<<16#51>>, 10001),
+    OversizeUtxo = #utxo{value = 1000, script_pubkey = OversizeSPK,
+                          is_coinbase = false, height = 102},
+
+    %% Another spendable coin (will survive)
+    Spendable2 = #utxo{value = 42, script_pubkey = <<16#00, 16#14,
+                                                       0,1,2,3,4,5,6,7,
+                                                       8,9,10,11,12,13,14,15,
+                                                       16,17,18,19>>,
+                       is_coinbase = false, height = 103},
+
+    ok = beamchain_db:store_utxo(Txid1, 0, Spendable),
+    ok = beamchain_db:store_utxo(Txid2, 0, OpReturnUtxo),
+    ok = beamchain_db:store_utxo(Txid3, 0, BareOpReturnUtxo),
+    ok = beamchain_db:store_utxo(Txid4, 0, OversizeUtxo),
+    ok = beamchain_db:store_utxo(Txid5, 0, Spendable2),
+
+    %% Sanity: all five present before scrub
+    ?assert(beamchain_db:has_utxo(Txid1, 0)),
+    ?assert(beamchain_db:has_utxo(Txid2, 0)),
+    ?assert(beamchain_db:has_utxo(Txid3, 0)),
+    ?assert(beamchain_db:has_utxo(Txid4, 0)),
+    ?assert(beamchain_db:has_utxo(Txid5, 0)),
+
+    {Removed, BytesFreed} = beamchain_db:scrub_unspendable(),
+
+    %% Exactly the three unspendable entries removed.
+    ?assertEqual(3, Removed),
+    %% Bytes freed = 3 * (49 fixed) + sum of script sizes
+    Expected = 3 * 49
+               + byte_size(OpReturnSPK)
+               + 1                       %% bare OP_RETURN
+               + byte_size(OversizeSPK),
+    ?assertEqual(Expected, BytesFreed),
+
+    %% Spendable coins still present
+    ?assert(beamchain_db:has_utxo(Txid1, 0)),
+    ?assert(beamchain_db:has_utxo(Txid5, 0)),
+
+    %% Unspendable coins gone
+    ?assertEqual(false, beamchain_db:has_utxo(Txid2, 0)),
+    ?assertEqual(false, beamchain_db:has_utxo(Txid3, 0)),
+    ?assertEqual(false, beamchain_db:has_utxo(Txid4, 0)).
+
+%% A second call after the first finds nothing to delete.
+scrub_unspendable_idempotent() ->
+    Txid1 = crypto:strong_rand_bytes(32),
+    Txid2 = crypto:strong_rand_bytes(32),
+    OpReturnUtxo = #utxo{value = 0,
+                          script_pubkey = <<16#6a, 16#04, 1, 2, 3, 4>>,
+                          is_coinbase = true, height = 200},
+    Spendable = make_test_utxo(),
+
+    ok = beamchain_db:store_utxo(Txid1, 0, OpReturnUtxo),
+    ok = beamchain_db:store_utxo(Txid2, 0, Spendable),
+
+    {Removed1, _} = beamchain_db:scrub_unspendable(),
+    ?assertEqual(1, Removed1),
+
+    %% Second call: zero entries to remove.
+    {Removed2, Bytes2} = beamchain_db:scrub_unspendable(),
+    ?assertEqual(0, Removed2),
+    ?assertEqual(0, Bytes2),
+
+    %% Spendable still present.
+    ?assert(beamchain_db:has_utxo(Txid2, 0)),
+    %% OP_RETURN still gone.
+    ?assertEqual(false, beamchain_db:has_utxo(Txid1, 0)).
