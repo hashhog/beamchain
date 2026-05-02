@@ -24,6 +24,7 @@
 %% UTXO set
 -export([get_utxo/2, store_utxo/3, spend_utxo/2, has_utxo/2]).
 -export([clear_chainstate_cf/0]).
+-export([fold_utxos/2]).
 
 %% Block index
 -export([store_block_index/5, store_block_index/6, get_block_index/1, get_block_index_by_hash/1]).
@@ -193,6 +194,64 @@ has_utxo(Txid, Vout) when byte_size(Txid) =:= 32 ->
         {ok, _} -> true;
         not_found -> false
     end.
+
+%% @doc Fold over every UTXO persisted in the chainstate column family.
+%%
+%% Mirrors the cursor walk in
+%% bitcoin-core/src/kernel/coinstats.cpp ComputeUTXOStats — Core builds
+%% its `dumptxoutset` body and the HASH_SERIALIZED commitment by
+%% walking `view->Cursor()` over the full chainstate, which is the same
+%% on-disk store this CF backs.
+%%
+%% The dump path also calls beamchain_chainstate:flush/0 first to ensure
+%% every in-memory ETS UTXO has been promoted to RocksDB; that flush
+%% writes a HEAD_BLOCKS marker plus dirty puts and spent deletes in a
+%% single WriteBatch (see beamchain_chainstate:do_flush/1), so by the
+%% time this fold runs the CF is the authoritative UTXO set.
+%%
+%% Fun :: fun(({Txid :: binary(), Vout :: non_neg_integer(),
+%%             Utxo :: #utxo{}}, Acc) -> Acc).
+%% Returns the final accumulator (or {error, Reason} on iterator failure).
+%%
+%% Keys in the chainstate CF are encoded by encode_outpoint/2:
+%% txid (32 bytes) || vout (4 big-endian). Values are encoded by
+%% encode_utxo/1: value (8 LE) || height (4 LE) || coinbase flag (1) ||
+%% scriptPubKey (rest).
+-spec fold_utxos(fun(({binary(), non_neg_integer(), #utxo{}}, Acc) -> Acc),
+                 Acc) -> Acc | {error, term()}.
+fold_utxos(Fun, Acc0) when is_function(Fun, 2) ->
+    Db = persistent_term:get(beamchain_db_handle),
+    CF = persistent_term:get(beamchain_cf_chainstate),
+    case rocksdb:iterator(Db, CF, []) of
+        {ok, Iter} ->
+            try
+                fold_utxos_loop(rocksdb:iterator_move(Iter, first), Iter,
+                                Fun, Acc0)
+            after
+                _ = rocksdb:iterator_close(Iter)
+            end;
+        {error, _} = Err ->
+            Err
+    end.
+
+fold_utxos_loop({error, invalid_iterator}, _Iter, _Fun, Acc) ->
+    Acc;
+fold_utxos_loop({error, iterator_closed}, _Iter, _Fun, Acc) ->
+    Acc;
+fold_utxos_loop({error, _Reason} = Err, _Iter, _Fun, _Acc) ->
+    Err;
+fold_utxos_loop({ok, <<Txid:32/binary, Vout:32/big>>, ValueBin}, Iter,
+                Fun, Acc) ->
+    Utxo = decode_utxo(ValueBin),
+    Acc1 = Fun({Txid, Vout, Utxo}, Acc),
+    fold_utxos_loop(rocksdb:iterator_move(Iter, next), Iter, Fun, Acc1);
+fold_utxos_loop({ok, OtherKey, _ValueBin}, Iter, Fun, Acc) ->
+    %% Defensive: chainstate keys are always 36 bytes, but if a stray
+    %% entry slipped in (e.g. an older format), skip it loudly rather
+    %% than crash the whole dump.
+    logger:warning("beamchain_db: fold_utxos skipping non-outpoint key "
+                   "(~B bytes)", [byte_size(OtherKey)]),
+    fold_utxos_loop(rocksdb:iterator_move(Iter, next), Iter, Fun, Acc).
 
 %% @doc Clear all entries in the chainstate column family (RocksDB).
 %% Used during full chainstate wipe to remove stale UTXOs that persist

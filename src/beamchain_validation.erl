@@ -789,6 +789,23 @@ get_last_push(<<_:8, Rest/binary>>, Last) ->
 %% This is the main consensus enforcement function.
 -spec connect_block(#block{}, non_neg_integer(), map(), map()) ->
     ok | {error, atom()}.
+%% Special case for the genesis block, skipping connection of its
+%% transactions (its coinbase is unspendable). Mirrors
+%% bitcoin-core/src/validation.cpp:2337-2343:
+%%
+%%   // Special case for the genesis block, skipping connection of its
+%%   // transactions (its coinbase is unspendable)
+%%   if (block_hash == params.GetConsensus().hashGenesisBlock) {
+%%       if (!fJustCheck) view.SetBestBlock(pindex->GetBlockHash());
+%%       return true;
+%%   }
+%%
+%% This both keeps Core-byte-identical UTXO snapshots (the genesis
+%% coinbase output never enters the chainstate) and avoids running
+%% header/coinbase/script checks against the bootstrap genesis block,
+%% which has no parent and is treated as axiomatic by the network.
+connect_block(_Block, 0, _PrevIndex, _Params) ->
+    ok;
 connect_block(#block{header = Header, transactions = Txs} = Block,
               Height, PrevIndex, Params) ->
     try
