@@ -2905,14 +2905,126 @@ push_encode(Data) ->
             <<?OP_PUSHDATA4, Len:32/little, Data/binary>>
     end.
 
-%% Remove all occurrences of Pattern from Script.
+%% Remove all occurrences of Pattern from Script — but only at opcode
+%% boundaries. This mirrors Bitcoin Core's FindAndDelete (interpreter.cpp:229)
+%% which walks the script with GetScriptOp() and only deletes occurrences
+%% that begin at an opcode-aligned position (i.e. NOT inside a push payload).
+%%
+%% Empty pattern returns the script unchanged (Core's FindAndDelete short-
+%% circuits on `b.empty()`).
+%%
+%% Algorithm (matches Core, see interpreter.cpp:235-247):
+%%   pc = pc2 = begin
+%%   loop:
+%%     append script[pc2..pc] to result
+%%     while end-pc >= |b| and script[pc..pc+|b|] == b:
+%%       pc += |b|; nFound += 1
+%%     pc2 = pc
+%%     if !GetOp(pc, opcode) break
+%%   if nFound > 0: append script[pc2..end] to result; replace script
+find_and_delete_pattern(Script, <<>>) ->
+    %% Core: empty pattern is a no-op (interpreter.cpp:232-233)
+    Script;
 find_and_delete_pattern(Script, Pattern) ->
-    case binary:match(Script, Pattern) of
-        nomatch -> Script;
-        {Pos, Len} ->
-            Before = binary:part(Script, 0, Pos),
-            After = binary:part(Script, Pos + Len, byte_size(Script) - Pos - Len),
-            find_and_delete_pattern(<<Before/binary, After/binary>>, Pattern)
+    fad_walk(Script, Pattern, 0, 0, <<>>).
+
+%% fad_walk(Script, Pattern, Pc, Pc2, Result)
+%%   Pc  = current cursor (where we test for Pattern, then advance one opcode)
+%%   Pc2 = "kept" cursor (start of next chunk to copy into Result)
+%%   Result = accumulated output bytes
+%%
+%% Invariants from Core:
+%%   - Pc and Pc2 are byte offsets into the original Script.
+%%   - We always emit Script[Pc2..Pc] before checking for Pattern.
+%%   - When Pattern matches at Pc, we skip |Pattern| bytes (no emit) and
+%%     re-test the new Pc (loop), so consecutive matches all get deleted.
+%%   - GetOp advances Pc past the next opcode + push payload. If GetOp
+%%     fails, we exit the loop with Pc2 pointing at the start of the
+%%     trailing chunk and emit Script[Pc2..end].
+fad_walk(Script, Pattern, Pc, Pc2, Result) ->
+    %% Emit Script[Pc2..Pc] into Result.
+    Chunk = binary:part(Script, Pc2, Pc - Pc2),
+    Result1 = <<Result/binary, Chunk/binary>>,
+    %% Greedily skip every Pattern that begins at Pc.
+    {Pc3, Result2} = fad_skip(Script, Pattern, Pc, Result1),
+    %% Pc2' = Pc3 (start of the next "keep" chunk).
+    case fad_get_op(Script, Pc3) of
+        {ok, NextPc} ->
+            fad_walk(Script, Pattern, NextPc, Pc3, Result2);
+        eos ->
+            %% End-of-script: emit Script[Pc3..end] and return.
+            Tail = binary:part(Script, Pc3, byte_size(Script) - Pc3),
+            <<Result2/binary, Tail/binary>>
+    end.
+
+%% Greedy match-and-skip — drops Pattern occurrences starting at Pc.
+fad_skip(Script, Pattern, Pc, Result) ->
+    PatLen = byte_size(Pattern),
+    ScriptLen = byte_size(Script),
+    case ScriptLen - Pc >= PatLen of
+        true ->
+            case binary:part(Script, Pc, PatLen) =:= Pattern of
+                true ->
+                    %% Skip Pattern, do NOT emit, re-test next position.
+                    fad_skip(Script, Pattern, Pc + PatLen, Result);
+                false ->
+                    {Pc, Result}
+            end;
+        false ->
+            {Pc, Result}
+    end.
+
+%% Advance one opcode. Mirrors Core's GetScriptOp (script.cpp:312).
+%% Returns {ok, NewPc} on success, eos at end-of-script or on a truncated
+%% push (Core's GetScriptOp returns false in both cases, ending the do-while).
+fad_get_op(Script, Pc) ->
+    Len = byte_size(Script),
+    if
+        Pc >= Len -> eos;
+        true ->
+            <<Op>> = binary:part(Script, Pc, 1),
+            Pc1 = Pc + 1,
+            if
+                Op =< 16#4b ->
+                    %% Direct push of N bytes (N == Op).
+                    advance_push(Script, Pc1, Op);
+                Op =:= 16#4c ->
+                    %% OP_PUSHDATA1: 1-byte length prefix.
+                    case Len - Pc1 >= 1 of
+                        true ->
+                            <<N>> = binary:part(Script, Pc1, 1),
+                            advance_push(Script, Pc1 + 1, N);
+                        false -> eos
+                    end;
+                Op =:= 16#4d ->
+                    %% OP_PUSHDATA2: 2-byte LE length prefix.
+                    case Len - Pc1 >= 2 of
+                        true ->
+                            <<N:16/little>> = binary:part(Script, Pc1, 2),
+                            advance_push(Script, Pc1 + 2, N);
+                        false -> eos
+                    end;
+                Op =:= 16#4e ->
+                    %% OP_PUSHDATA4: 4-byte LE length prefix.
+                    case Len - Pc1 >= 4 of
+                        true ->
+                            <<N:32/little>> = binary:part(Script, Pc1, 4),
+                            advance_push(Script, Pc1 + 4, N);
+                        false -> eos
+                    end;
+                true ->
+                    {ok, Pc1}
+            end
+    end.
+
+%% Advance past a push payload of N bytes starting at Pc.
+%% Core: GetScriptOp returns false (and the do-while terminates) when the
+%% push payload is truncated.
+advance_push(Script, Pc, N) ->
+    Len = byte_size(Script),
+    case Len - Pc >= N of
+        true -> {ok, Pc + N};
+        false -> eos
     end.
 
 -spec sighash_witness_v0(#transaction{}, non_neg_integer(),

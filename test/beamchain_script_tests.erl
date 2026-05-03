@@ -1844,3 +1844,92 @@ taproot_control_block_below_cap_passes_size_gate_test() ->
     Witness2 = [<<>>, Script, CB2],
     R2 = beamchain_script:verify_taproot(OutputKey, Witness2, Flags, SigChecker),
     ?assertNotEqual({error, invalid_control_block}, R2).
+
+%%% -------------------------------------------------------------------
+%%% P0-B: FindAndDelete must walk opcode-aligned, not byte-aligned
+%%%
+%%% Core ref: interpreter.cpp:229-255 — pc walks via GetScriptOp(), so
+%%% FindAndDelete only deletes at opcode boundaries (it skips over push
+%%% payloads).
+%%%
+%%% Pre-fix beamchain used `binary:match`, which would delete the pattern
+%%% even when it appeared *inside* a push payload. That diverges from
+%%% Core's sighash on adversarial inputs.
+%%% -------------------------------------------------------------------
+
+%% Pattern that lies entirely INSIDE a push payload must NOT be deleted.
+%% Script:  <push 5: 02 aa bb cc dd> OP_CHECKSIG
+%% Bytes:   05 02 aa bb cc dd ac
+%% Pattern: push_encode(<<16#aa, 16#bb>>) = <<2, 16#aa, 16#bb>>
+%% Pre-fix: binary:match finds <2, aa, bb> at byte offset 1
+%%          (inside the push payload). It would delete those 3 bytes,
+%%          turning the script into <<5, cc, dd, ac>> — corrupt.
+%% Post-fix: walker only checks at opcode boundaries (offset 0, then 6).
+%%          At offset 0 we have OP_PUSHBYTES_5; pattern doesn't start
+%%          with 0x05. At offset 6 we have OP_CHECKSIG (0xac); pattern
+%%          doesn't match. So the script is returned unchanged.
+find_and_delete_inside_push_payload_not_deleted_test() ->
+    Script  = <<5, 2, 16#aa, 16#bb, 16#cc, 16#dd, 16#ac>>,
+    Sig     = <<16#aa, 16#bb>>,
+    %% Pre-fix this would have over-deleted; post-fix returns unchanged.
+    Result  = beamchain_script:find_and_delete(Script, Sig),
+    ?assertEqual(Script, Result).
+
+%% Pattern that crosses an opcode boundary (begins inside a push): MUST
+%% NOT be deleted. Script: <push 3: 01 ac 99> OP_RETURN
+%% Bytes:   03 01 ac 99 6a
+%% Pattern: push_encode(<<16#ac>>) = <<1, 16#ac>>
+%% Pre-fix: binary:match finds the pattern at offset 1 (inside the push
+%% payload, where the bytes happen to be <01 ac>). Pre-fix would delete
+%% those 2 bytes → <<03, 99, 6a>>, which is now a malformed
+%% push-3 followed by garbage.
+%% Post-fix: walker tries opcode boundaries only:
+%%   offset 0 = OP_PUSHBYTES_3; pattern <1 ac> != script[0..2] = <03 01 ac>
+%%   offset 4 = OP_RETURN (0x6a); pattern != <6a>
+%% Script returned unchanged.
+find_and_delete_pattern_at_non_opcode_boundary_not_deleted_test() ->
+    Script  = <<3, 1, 16#ac, 16#99, 16#6a>>,
+    Sig     = <<16#ac>>,
+    Result  = beamchain_script:find_and_delete(Script, Sig),
+    ?assertEqual(Script, Result).
+
+%% Mixed case: pattern appears BOTH at a boundary AND inside a push.
+%% Only the boundary occurrence should be deleted.
+%% Build:
+%%   Sig     = <<16#de, 16#ad>>
+%%   Pattern = push_encode(<<16#de, 16#ad>>) = <<2, 16#de, 16#ad>>
+%%   Script  = <push 3: 02 de ad> <push 2: de ad> OP_CHECKSIG
+%%   Bytes   = 03 02 de ad 02 de ad ac
+%% Pre-fix binary:match finds the pattern at offset 1 (inside the first
+%% push) and at offset 4 (the second push, which IS the legitimate push
+%% of the sig). It would delete BOTH, mangling the script.
+%% Post-fix: only opcode-aligned matches are deleted. Boundaries are 0
+%% (OP_PUSHBYTES_3, length 4 = 1+3), 4 (OP_PUSHBYTES_2, length 3 = 1+2),
+%% 7 (OP_CHECKSIG, length 1). At boundary 4, script[4..6] = <02 de ad>,
+%% which IS the pattern. So we delete bytes 4-6 only.
+%% Expected result: <<03, 02, de, ad, ac>> — first push intact, second
+%% push deleted (correctly), OP_CHECKSIG remains.
+find_and_delete_only_at_opcode_boundary_test() ->
+    Script   = <<3, 2, 16#de, 16#ad, 2, 16#de, 16#ad, 16#ac>>,
+    Sig      = <<16#de, 16#ad>>,
+    Result   = beamchain_script:find_and_delete(Script, Sig),
+    Expected = <<3, 2, 16#de, 16#ad, 16#ac>>,
+    ?assertEqual(Expected, Result).
+
+%% Sanity: an existing test expects that a sig push at the start of the
+%% script IS deleted. Re-verify the new walker still does that.
+find_and_delete_at_boundary_still_deleted_test() ->
+    Sig      = <<16#30, 16#06, 16#02, 16#01, 16#01, 16#02, 16#01, 16#01, 16#01>>,
+    Script   = <<9, Sig/binary, 16#ac>>,
+    Result   = beamchain_script:find_and_delete(Script, Sig),
+    ?assertEqual(<<16#ac>>, Result).
+
+%% Truncated push payload at end of script: walker must terminate cleanly,
+%% not loop forever. Pattern that doesn't match anywhere.
+find_and_delete_truncated_push_terminates_test() ->
+    %% OP_PUSHDATA1 with length 5, but only 2 bytes follow.
+    Script  = <<16#4c, 5, 16#aa, 16#bb>>,
+    Sig     = <<16#cc>>,
+    Result  = beamchain_script:find_and_delete(Script, Sig),
+    %% No match found, script returned unchanged.
+    ?assertEqual(Script, Result).
