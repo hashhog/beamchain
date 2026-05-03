@@ -37,6 +37,13 @@
     exec_stack = []   :: [boolean()],   %% IF/ELSE nesting
     op_count = 0      :: non_neg_integer(),
     codesep_pos = 16#ffffffff :: non_neg_integer(),
+    %% BIP-341: 0-based opcode index counter.  Mirrors Core's `opcode_pos`
+    %% (interpreter.cpp:433, incremented at the top of the for-loop).
+    %% Used by OP_CODESEPARATOR to record the position committed to the
+    %% tapscript sigmsg (interpreter.cpp:1055, 1565).  Counts every opcode
+    %% including push-data ops; unlike `codesep_pos` (byte offset used for
+    %% legacy scriptCode slicing), this is always the opcode index.
+    opcode_pos = 0    :: non_neg_integer(),
     flags = 0         :: non_neg_integer(),
     sig_checker       :: term(),
     sig_version = base :: base | witness_v0 | tapscript,
@@ -423,6 +430,22 @@ count_op(#script_state{op_count = Count, sig_version = SigVer} = State) ->
             {ok, State#script_state{op_count = NewCount}}
     end.
 
+%% @doc Increment the BIP-341 opcode-index counter (opcode_pos) by one.
+%% Called once per opcode — including push-data ops — before any recursive
+%% execute/3 call, so that OP_CODESEPARATOR records the correct 0-based
+%% index into the tapscript sigmsg (Core interpreter.cpp:1055, 1565).
+inc_opcode_pos(#script_state{opcode_pos = P} = State) ->
+    State#script_state{opcode_pos = P + 1}.
+
+%% @doc Increment both the op_count (201-limit) and opcode_pos (BIP-341
+%% tapscript sighash index) in one step.  Used in non-push opcode clauses
+%% that formerly called count_op/1 alone.
+count_and_inc_op(State) ->
+    case count_op(State) of
+        {ok, State1} -> {ok, inc_opcode_pos(State1)};
+        Error -> Error
+    end.
+
 %%% -------------------------------------------------------------------
 %%% Main evaluation entry point
 %%% -------------------------------------------------------------------
@@ -518,15 +541,16 @@ execute(<<>>, _Pos, #script_state{exec_stack = ExecStack} = State) ->
 %% --- Data push: 1-75 bytes ---
 execute(<<PushLen, Rest/binary>>, Pos, State)
   when PushLen >= 1, PushLen =< 16#4b ->
+    State0 = inc_opcode_pos(State),
     case Rest of
         <<Data:PushLen/binary, Rest2/binary>> ->
-            case check_push_size(Data, State) of
+            case check_push_size(Data, State0) of
                 ok ->
-                    case executing(State) of
+                    case executing(State0) of
                         true ->
-                            case check_minimal_push(direct_push, Data, State) of
+                            case check_minimal_push(direct_push, Data, State0) of
                                 ok ->
-                                    State1 = push(Data, State),
+                                    State1 = push(Data, State0),
                                     case check_stack_size(State1) of
                                         true -> execute(Rest2, Pos + 1 + PushLen, State1);
                                         false -> {error, stack_overflow}
@@ -534,7 +558,7 @@ execute(<<PushLen, Rest/binary>>, Pos, State)
                                 Error -> Error
                             end;
                         false ->
-                            execute(Rest2, Pos + 1 + PushLen, State)
+                            execute(Rest2, Pos + 1 + PushLen, State0)
                     end;
                 Error -> Error
             end;
@@ -544,65 +568,69 @@ execute(<<PushLen, Rest/binary>>, Pos, State)
 
 %% --- OP_0 (push empty) ---
 execute(<<?OP_0, Rest/binary>>, Pos, State) ->
-    case executing(State) of
+    State0 = inc_opcode_pos(State),
+    case executing(State0) of
         true ->
-            State1 = push(<<>>, State),
+            State1 = push(<<>>, State0),
             execute(Rest, Pos + 1, State1);
         false ->
-            execute(Rest, Pos + 1, State)
+            execute(Rest, Pos + 1, State0)
     end;
 
 %% --- OP_PUSHDATA1 ---
 execute(<<?OP_PUSHDATA1, Len:8, Rest/binary>>, Pos, State) ->
-    execute_pushdata(Len, Rest, Pos + 2, State, pushdata1);
+    execute_pushdata(Len, Rest, Pos + 2, inc_opcode_pos(State), pushdata1);
 
 %% --- OP_PUSHDATA2 ---
 execute(<<?OP_PUSHDATA2, Len:16/little, Rest/binary>>, Pos, State) ->
-    execute_pushdata(Len, Rest, Pos + 3, State, pushdata2);
+    execute_pushdata(Len, Rest, Pos + 3, inc_opcode_pos(State), pushdata2);
 
 %% --- OP_PUSHDATA4 ---
 execute(<<?OP_PUSHDATA4, Len:32/little, Rest/binary>>, Pos, State) ->
-    execute_pushdata(Len, Rest, Pos + 5, State, pushdata4);
+    execute_pushdata(Len, Rest, Pos + 5, inc_opcode_pos(State), pushdata4);
 
 %% --- OP_1NEGATE ---
 execute(<<?OP_1NEGATE, Rest/binary>>, Pos, State) ->
-    case executing(State) of
+    State0 = inc_opcode_pos(State),
+    case executing(State0) of
         true ->
-            State1 = push(encode_script_num(-1), State),
+            State1 = push(encode_script_num(-1), State0),
             execute(Rest, Pos + 1, State1);
         false ->
-            execute(Rest, Pos + 1, State)
+            execute(Rest, Pos + 1, State0)
     end;
 
 %% --- OP_RESERVED (0x50) - causes failure if executed ---
 execute(<<?OP_RESERVED, Rest/binary>>, Pos, State) ->
-    case executing(State) of
+    State0 = inc_opcode_pos(State),
+    case executing(State0) of
         true -> {error, op_reserved};
-        false -> execute(Rest, Pos + 1, State)
+        false -> execute(Rest, Pos + 1, State0)
     end;
 
 %% --- OP_1 through OP_16 ---
 execute(<<Op, Rest/binary>>, Pos, State)
   when Op >= ?OP_1, Op =< ?OP_16 ->
-    case executing(State) of
+    State0 = inc_opcode_pos(State),
+    case executing(State0) of
         true ->
             N = Op - ?OP_1 + 1,
-            State1 = push(encode_script_num(N), State),
+            State1 = push(encode_script_num(N), State0),
             execute(Rest, Pos + 1, State1);
         false ->
-            execute(Rest, Pos + 1, State)
+            execute(Rest, Pos + 1, State0)
     end;
 
 %% --- OP_NOP ---
 execute(<<?OP_NOP, Rest/binary>>, Pos, State) ->
-    case count_op(State) of
+    case count_and_inc_op(State) of
         {ok, State1} -> execute(Rest, Pos + 1, State1);
         Error -> Error
     end;
 
 %% --- OP_VER (causes failure if executed) ---
 execute(<<?OP_VER, Rest/binary>>, Pos, State) ->
-    case count_op(State) of
+    case count_and_inc_op(State) of
         {ok, State1} ->
             case executing(State1) of
                 true -> {error, op_ver};
@@ -619,14 +647,14 @@ execute(<<?OP_VERNOTIF, _/binary>>, _Pos, _State) ->
 
 %% --- OP_IF ---
 execute(<<?OP_IF, Rest/binary>>, Pos, State) ->
-    case count_op(State) of
+    case count_and_inc_op(State) of
         {ok, State1} -> execute_if(true, Rest, Pos + 1, State1);
         Error -> Error
     end;
 
 %% --- OP_NOTIF ---
 execute(<<?OP_NOTIF, Rest/binary>>, Pos, State) ->
-    case count_op(State) of
+    case count_and_inc_op(State) of
         {ok, State1} -> execute_if(false, Rest, Pos + 1, State1);
         Error -> Error
     end;
@@ -637,7 +665,7 @@ execute(<<?OP_ELSE, _Rest/binary>>, _Pos,
     {error, unexpected_else};
 execute(<<?OP_ELSE, Rest/binary>>, Pos,
         #script_state{exec_stack = [Top | ExRest]} = State) ->
-    case count_op(State) of
+    case count_and_inc_op(State) of
         {ok, State1} ->
             State2 = State1#script_state{
                 exec_stack = [not Top | ExRest]
@@ -652,7 +680,7 @@ execute(<<?OP_ENDIF, _Rest/binary>>, _Pos,
     {error, unexpected_endif};
 execute(<<?OP_ENDIF, Rest/binary>>, Pos,
         #script_state{exec_stack = [_ | ExRest]} = State) ->
-    case count_op(State) of
+    case count_and_inc_op(State) of
         {ok, State1} ->
             State2 = State1#script_state{exec_stack = ExRest},
             execute(Rest, Pos + 1, State2);
@@ -661,7 +689,7 @@ execute(<<?OP_ENDIF, Rest/binary>>, Pos,
 
 %% --- OP_VERIFY ---
 execute(<<?OP_VERIFY, Rest/binary>>, Pos, State) ->
-    case count_op(State) of
+    case count_and_inc_op(State) of
         {ok, State1} ->
             case executing(State1) of
                 true ->
@@ -681,7 +709,7 @@ execute(<<?OP_VERIFY, Rest/binary>>, Pos, State) ->
 
 %% --- OP_RETURN ---
 execute(<<?OP_RETURN, Rest/binary>>, Pos, State) ->
-    case count_op(State) of
+    case count_and_inc_op(State) of
         {ok, State1} ->
             case executing(State1) of
                 true -> {error, op_return};
@@ -692,102 +720,102 @@ execute(<<?OP_RETURN, Rest/binary>>, Pos, State) ->
 
 %% --- Stack operations ---
 execute(<<?OP_TOALTSTACK, Rest/binary>>, Pos, State) ->
-    case count_op(State) of
+    case count_and_inc_op(State) of
         {ok, State1} -> execute_stack_op(toaltstack, Rest, Pos + 1, State1);
         Error -> Error
     end;
 execute(<<?OP_FROMALTSTACK, Rest/binary>>, Pos, State) ->
-    case count_op(State) of
+    case count_and_inc_op(State) of
         {ok, State1} -> execute_stack_op(fromaltstack, Rest, Pos + 1, State1);
         Error -> Error
     end;
 execute(<<?OP_2DROP, Rest/binary>>, Pos, State) ->
-    case count_op(State) of
+    case count_and_inc_op(State) of
         {ok, State1} -> execute_stack_op('2drop', Rest, Pos + 1, State1);
         Error -> Error
     end;
 execute(<<?OP_2DUP, Rest/binary>>, Pos, State) ->
-    case count_op(State) of
+    case count_and_inc_op(State) of
         {ok, State1} -> execute_stack_op('2dup', Rest, Pos + 1, State1);
         Error -> Error
     end;
 execute(<<?OP_3DUP, Rest/binary>>, Pos, State) ->
-    case count_op(State) of
+    case count_and_inc_op(State) of
         {ok, State1} -> execute_stack_op('3dup', Rest, Pos + 1, State1);
         Error -> Error
     end;
 execute(<<?OP_2OVER, Rest/binary>>, Pos, State) ->
-    case count_op(State) of
+    case count_and_inc_op(State) of
         {ok, State1} -> execute_stack_op('2over', Rest, Pos + 1, State1);
         Error -> Error
     end;
 execute(<<?OP_2ROT, Rest/binary>>, Pos, State) ->
-    case count_op(State) of
+    case count_and_inc_op(State) of
         {ok, State1} -> execute_stack_op('2rot', Rest, Pos + 1, State1);
         Error -> Error
     end;
 execute(<<?OP_2SWAP, Rest/binary>>, Pos, State) ->
-    case count_op(State) of
+    case count_and_inc_op(State) of
         {ok, State1} -> execute_stack_op('2swap', Rest, Pos + 1, State1);
         Error -> Error
     end;
 execute(<<?OP_IFDUP, Rest/binary>>, Pos, State) ->
-    case count_op(State) of
+    case count_and_inc_op(State) of
         {ok, State1} -> execute_stack_op(ifdup, Rest, Pos + 1, State1);
         Error -> Error
     end;
 execute(<<?OP_DEPTH, Rest/binary>>, Pos, State) ->
-    case count_op(State) of
+    case count_and_inc_op(State) of
         {ok, State1} -> execute_stack_op(depth, Rest, Pos + 1, State1);
         Error -> Error
     end;
 execute(<<?OP_DROP, Rest/binary>>, Pos, State) ->
-    case count_op(State) of
+    case count_and_inc_op(State) of
         {ok, State1} -> execute_stack_op(drop, Rest, Pos + 1, State1);
         Error -> Error
     end;
 execute(<<?OP_DUP, Rest/binary>>, Pos, State) ->
-    case count_op(State) of
+    case count_and_inc_op(State) of
         {ok, State1} -> execute_stack_op(dup, Rest, Pos + 1, State1);
         Error -> Error
     end;
 execute(<<?OP_NIP, Rest/binary>>, Pos, State) ->
-    case count_op(State) of
+    case count_and_inc_op(State) of
         {ok, State1} -> execute_stack_op(nip, Rest, Pos + 1, State1);
         Error -> Error
     end;
 execute(<<?OP_OVER, Rest/binary>>, Pos, State) ->
-    case count_op(State) of
+    case count_and_inc_op(State) of
         {ok, State1} -> execute_stack_op(over, Rest, Pos + 1, State1);
         Error -> Error
     end;
 execute(<<?OP_PICK, Rest/binary>>, Pos, State) ->
-    case count_op(State) of
+    case count_and_inc_op(State) of
         {ok, State1} -> execute_stack_op(pick, Rest, Pos + 1, State1);
         Error -> Error
     end;
 execute(<<?OP_ROLL, Rest/binary>>, Pos, State) ->
-    case count_op(State) of
+    case count_and_inc_op(State) of
         {ok, State1} -> execute_stack_op(roll, Rest, Pos + 1, State1);
         Error -> Error
     end;
 execute(<<?OP_ROT, Rest/binary>>, Pos, State) ->
-    case count_op(State) of
+    case count_and_inc_op(State) of
         {ok, State1} -> execute_stack_op(rot, Rest, Pos + 1, State1);
         Error -> Error
     end;
 execute(<<?OP_SWAP, Rest/binary>>, Pos, State) ->
-    case count_op(State) of
+    case count_and_inc_op(State) of
         {ok, State1} -> execute_stack_op(swap, Rest, Pos + 1, State1);
         Error -> Error
     end;
 execute(<<?OP_TUCK, Rest/binary>>, Pos, State) ->
-    case count_op(State) of
+    case count_and_inc_op(State) of
         {ok, State1} -> execute_stack_op(tuck, Rest, Pos + 1, State1);
         Error -> Error
     end;
 execute(<<?OP_SIZE, Rest/binary>>, Pos, State) ->
-    case count_op(State) of
+    case count_and_inc_op(State) of
         {ok, State1} -> execute_stack_op(size, Rest, Pos + 1, State1);
         Error -> Error
     end;
@@ -795,23 +823,24 @@ execute(<<?OP_SIZE, Rest/binary>>, Pos, State) ->
 %% --- Disabled opcodes and remaining opcodes ---
 execute(<<Op, _Rest/binary>>, _Pos, #script_state{sig_version = SigVer} = _State)
   when is_integer(Op) ->
+    State0 = inc_opcode_pos(_State),
     case is_disabled_opcode(Op) of
         true when SigVer =/= tapscript ->
             %% Disabled opcodes ALWAYS fail, even in non-executing branches
             {error, disabled_opcode};
         _ ->
-            case executing(_State) of
+            case executing(State0) of
                 false ->
                     %% In non-executing branches, skip all opcodes
                     %% (except IF/NOTIF/ELSE/ENDIF which are handled above,
                     %% and disabled opcodes which always fail).
                     %% Still need to count the op.
-                    case count_op(_State) of
+                    case count_op(State0) of
                         {ok, State1} -> execute(_Rest, _Pos + 1, State1);
                         Error -> Error
                     end;
                 true ->
-                    execute_remaining(Op, _Rest, _Pos, _State)
+                    execute_remaining(Op, _Rest, _Pos, State0)
             end
     end;
 
@@ -1409,17 +1438,30 @@ execute_codesep(Rest, Pos, State) ->
             case executing(State1) of
                 false -> execute(Rest, Pos, State1);
                 true ->
-                    %% In tapscript, CONST_SCRIPTCODE flag makes this
-                    %% fail when CONST_SCRIPTCODE is set... but actually
-                    %% OP_CODESEPARATOR is valid in tapscript.
-                    %% It fails in witness_v0 if CONST_SCRIPTCODE is set.
+                    %% CONST_SCRIPTCODE (BASE sigversion, i.e., legacy
+                    %% non-segwit): reject OP_CODESEPARATOR even in an
+                    %% unexecuted branch.  The guard here is belt-and-
+                    %% suspenders — the primary check lives in the main
+                    %% execute/3 catchall clause ABOVE the fExec gate, so
+                    %% we only reach here when this DOES execute.
+                    %%
+                    %% witness_v0: OP_CODESEPARATOR is permitted but was
+                    %% historically (incorrectly) rejected here; keep the
+                    %% legacy check for backward compat but note Core only
+                    %% rejects on BASE.
                     case State1#script_state.sig_version of
-                        witness_v0 when
+                        base when
                             (State1#script_state.flags band
                              ?SCRIPT_VERIFY_CONST_SCRIPTCODE) =/= 0 ->
-                            {error, op_codeseparator_in_witness};
+                            {error, op_codeseparator_in_legacy};
                         _ ->
-                            State2 = State1#script_state{codesep_pos = Pos},
+                            %% BIP-341: codesep_pos = 0-based opcode index.
+                            %% State1#script_state.opcode_pos was already
+                            %% incremented once by inc_opcode_pos in the
+                            %% catchall execute/3 clause, so the current
+                            %% opcode's index is opcode_pos - 1.
+                            CodesepIdx = State1#script_state.opcode_pos - 1,
+                            State2 = State1#script_state{codesep_pos = CodesepIdx},
                             execute(Rest, Pos, State2)
                     end
             end;
