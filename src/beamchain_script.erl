@@ -24,6 +24,7 @@
 -export([sighash_legacy/4, sighash_witness_v0/5, sighash_taproot/7]).
 -export([find_and_delete/2]).  %% Exported for testing
 -export([verify_taproot/4]).   %% Exported for testing
+-export([parse_schnorr_sig/1]). %% Exported for testing
 
 %% Pay-to-Anchor (P2A) detection
 -export([is_pay_to_anchor/1]).
@@ -1711,8 +1712,21 @@ do_checksig_result(State, Pos) ->
         Error -> Error
     end.
 
+%% BIP-341: valid Schnorr hash_types are {0x00 (DEFAULT), 0x01, 0x02, 0x03,
+%% 0x81, 0x82, 0x83}. The 64-byte form encodes SIGHASH_DEFAULT (0x00). The
+%% 65-byte form supplies an explicit hash_type byte that MUST NOT be 0x00
+%% (BIP-341 forbids the explicit-zero form to keep DEFAULT canonical) and
+%% MUST be one of the other six allowed values.
+%% Core ref: interpreter.cpp:1516
+%%   if (!(hash_type <= 0x03 || (hash_type >= 0x81 && hash_type <= 0x83)))
+%%       return false;
+%% Core ref: interpreter.cpp:1789-1791
+%%   if (sig.size() == 65 && sig.back() == 0x00) error: TAPROOT_SIGHASH_TYPE
 parse_schnorr_sig(<<S:64/binary>>) -> {?SIGHASH_DEFAULT, S};
-parse_schnorr_sig(<<S:64/binary, HT:8>>) when HT =/= 0 -> {HT, S};
+parse_schnorr_sig(<<S:64/binary, HT:8>>)
+  when HT =:= 16#01; HT =:= 16#02; HT =:= 16#03;
+       HT =:= 16#81; HT =:= 16#82; HT =:= 16#83 ->
+    {HT, S};
 parse_schnorr_sig(_) -> {invalid, <<>>}.
 
 %%% -------------------------------------------------------------------

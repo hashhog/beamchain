@@ -1933,3 +1933,58 @@ find_and_delete_truncated_push_terminates_test() ->
     Result  = beamchain_script:find_and_delete(Script, Sig),
     %% No match found, script returned unchanged.
     ?assertEqual(Script, Result).
+
+%%% -------------------------------------------------------------------
+%%% P0-D: Schnorr / tapscript hash_type whitelist
+%%%
+%%% Core ref: interpreter.cpp:1516
+%%%   if (!(hash_type <= 0x03 || (hash_type >= 0x81 && hash_type <= 0x83)))
+%%%       return false;
+%%%
+%%% BIP-341: valid hash_types are {0x00, 0x01, 0x02, 0x03, 0x81, 0x82, 0x83}.
+%%% Note: in the 65-byte signature form, the explicit 0x00 byte is forbidden
+%%% (BIP-341 keeps DEFAULT canonical via the 64-byte form).
+%%% -------------------------------------------------------------------
+
+%% Valid 64-byte signature → DEFAULT (0x00).
+parse_schnorr_sig_default_test() ->
+    Sig = binary:copy(<<16#42>>, 64),
+    ?assertEqual({?SIGHASH_DEFAULT, Sig},
+                 beamchain_script:parse_schnorr_sig(Sig)).
+
+%% All six valid explicit hash_types are accepted.
+parse_schnorr_sig_valid_explicit_hash_types_test() ->
+    SigBody = binary:copy(<<16#42>>, 64),
+    Valid = [16#01, 16#02, 16#03, 16#81, 16#82, 16#83],
+    [?assertEqual({HT, SigBody},
+                  beamchain_script:parse_schnorr_sig(<<SigBody/binary, HT:8>>))
+     || HT <- Valid].
+
+%% Explicit 0x00 byte is REJECTED (BIP-341 forbids non-canonical DEFAULT).
+parse_schnorr_sig_explicit_zero_rejected_test() ->
+    SigBody = binary:copy(<<16#42>>, 64),
+    ?assertEqual({invalid, <<>>},
+                 beamchain_script:parse_schnorr_sig(<<SigBody/binary, 0:8>>)).
+
+%% Hash types outside the BIP-341 whitelist are REJECTED.
+%% Pre-fix: the `HT =/= 0` guard let everything in 0x01..0xff through.
+%% Post-fix: only {0x01, 0x02, 0x03, 0x81, 0x82, 0x83} are accepted.
+parse_schnorr_sig_invalid_hash_types_rejected_test() ->
+    SigBody = binary:copy(<<16#42>>, 64),
+    %% Spot-check the audit's named values + a sample of the gap range.
+    Invalid = [16#04, 16#05, 16#10, 16#7f, 16#80,
+               16#84, 16#85, 16#90, 16#fe, 16#ff],
+    [?assertEqual({invalid, <<>>},
+                  beamchain_script:parse_schnorr_sig(<<SigBody/binary, HT:8>>))
+     || HT <- Invalid].
+
+%% Wrong-length signatures are also rejected.
+parse_schnorr_sig_wrong_length_rejected_test() ->
+    %% 63 bytes (one short of DEFAULT).
+    Short = binary:copy(<<16#42>>, 63),
+    ?assertEqual({invalid, <<>>},
+                 beamchain_script:parse_schnorr_sig(Short)),
+    %% 66 bytes (one over the explicit-HT form).
+    Long = binary:copy(<<16#42>>, 66),
+    ?assertEqual({invalid, <<>>},
+                 beamchain_script:parse_schnorr_sig(Long)).
