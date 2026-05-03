@@ -16,6 +16,9 @@
 -export([decode_script_num/2, decode_script_num/3, encode_script_num/1, script_bool/1]).
 -export([check_minimal_encoding/1]).
 -export([flags_for_height/2]).
+%% Exported for testing the BIP-342 tapscript validation-weight budget
+%% gate. Not part of the stable API.
+-export([eval_tapscript/5, compact_size_len/1, serialized_witness_stack_size/1]).
 
 %% Sighash computation
 -export([sighash_legacy/4, sighash_witness_v0/5, sighash_taproot/7]).
@@ -2460,8 +2463,14 @@ verify_taproot(OutputKey, Witness, Flags, SigChecker) ->
             Script = lists:nth(length(CleanWitness) - 1, CleanWitness),
             ControlBlock = lists:last(CleanWitness),
             ScriptArgs = lists:sublist(CleanWitness, length(CleanWitness) - 2),
+            %% Pass the ORIGINAL `Witness` (annex INCLUDED) so the
+            %% BIP-342 validation-weight budget can be seeded from
+            %% ::GetSerializeSize(witness.stack) per Core's
+            %% interpreter.cpp:1981. CleanWitness has the annex
+            %% stripped; we need the pre-strip stack here.
             verify_taproot_script_path(
-                OutputKey, Script, ControlBlock, ScriptArgs, Flags, SigChecker)
+                OutputKey, Script, ControlBlock, ScriptArgs, Witness,
+                Flags, SigChecker)
     end.
 
 strip_annex(Witness) when length(Witness) >= 2 ->
@@ -2498,7 +2507,7 @@ verify_taproot_key_path(OutputKey, Sig, _Flags, SigChecker) ->
     end.
 
 verify_taproot_script_path(OutputKey, Script, ControlBlock,
-                           ScriptArgs, Flags, SigChecker) ->
+                           ScriptArgs, FullWitness, Flags, SigChecker) ->
     %% Validate control block
     CBLen = byte_size(ControlBlock),
     case CBLen >= 33 andalso (CBLen - 33) rem 32 =:= 0 of
@@ -2527,11 +2536,19 @@ verify_taproot_script_path(OutputKey, Script, ControlBlock,
                             TapLeafVer = LeafVersion,
                             case TapLeafVer of
                                 16#c0 ->
-                                    %% Known leaf version (tapscript)
-                                    WitnessSize = lists:foldl(
-                                        fun(W, Acc) -> Acc + byte_size(W) end,
-                                        0, ScriptArgs),
-                                    Budget = WitnessSize,
+                                    %% BIP-342 validation-weight budget
+                                    %% (interpreter.cpp:1981):
+                                    %%   m_validation_weight_left =
+                                    %%       GetSerializeSize(witness.stack)
+                                    %%       + VALIDATION_WEIGHT_OFFSET (50)
+                                    %% `FullWitness` is the ORIGINAL pre-pop
+                                    %% witness stack (annex INCLUDED, control
+                                    %% block + script INCLUDED, args INCLUDED),
+                                    %% which is what Core passes to
+                                    %% ::GetSerializeSize(witness.stack).
+                                    Budget =
+                                        serialized_witness_stack_size(FullWitness)
+                                        + 50,
                                     %% Reverse: wire order is bottom-to-top,
                                     %% our list HEAD = top of stack
                                     eval_tapscript(Script, lists:reverse(ScriptArgs),
@@ -2596,6 +2613,31 @@ compute_taproot_merkle(Current, <<Node:32/binary, Rest/binary>>) ->
 
 encode_compact_size(N) ->
     beamchain_serialize:encode_varint(N).
+
+%% Compute the byte length of a Bitcoin compact-size encoding for `N`.
+%% Mirrors Core's GetSizeOfCompactSize (serialize.h):
+%%   <  0xfd            -> 1 byte
+%%   <= 0xffff          -> 3 bytes (0xfd || u16)
+%%   <= 0xffffffff      -> 5 bytes (0xfe || u32)
+%%   else               -> 9 bytes (0xff || u64)
+compact_size_len(N) when N < 16#fd -> 1;
+compact_size_len(N) when N =< 16#ffff -> 3;
+compact_size_len(N) when N =< 16#ffffffff -> 5;
+compact_size_len(_) -> 9.
+
+%% Compute the on-the-wire serialized size of a witness stack the way
+%% Core's `::GetSerializeSize(witness.stack)` does it: a compact-size
+%% item count followed by, for each item, its compact-size length
+%% prefix and the item bytes themselves. Used to seed the BIP-342
+%% tapscript validation-weight budget at the leaf entry point.
+serialized_witness_stack_size(Items) ->
+    Count = length(Items),
+    Sum = lists:foldl(
+        fun(W, Acc) ->
+            L = byte_size(W),
+            Acc + compact_size_len(L) + L
+        end, 0, Items),
+    compact_size_len(Count) + Sum.
 
 encode_outpoint(#outpoint{hash = Hash, index = Index}) ->
     <<Hash/binary, Index:32/little>>.
