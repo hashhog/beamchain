@@ -42,6 +42,9 @@
 %% Checkpoint enforcement
 -export([check_against_checkpoint/3]).
 
+%% BIP-34 height encoder and consensus check (exported for testing)
+-export([encode_bip34_height/1, check_coinbase_height/2]).
+
 %% Assumevalid ancestor check (exported for testing)
 -export([skip_scripts/3, skip_scripts_eval/6]).
 
@@ -309,54 +312,59 @@ contextual_check_block(#block{header = Header, transactions = Txs},
         throw:Reason -> {error, Reason}
     end.
 
-%% @doc Check BIP 34: coinbase scriptSig must start with a push of the height.
-%% Bitcoin Core uses the direct push encoding:
-%%   <<NumBytes, Height:NumBytes*8/little>>
+%% @doc Check BIP 34: coinbase scriptSig must start with the byte-exact
+%% canonical encoding of Height, matching Bitcoin Core's ContextualCheckBlock
+%% (validation.cpp:4151-4159):
+%%
+%%   CScript expect = CScript() << nHeight;
+%%   sig.size() >= expect.size() && equal(expect, sig[:expect.size()])
+%%
+%% Canonical encoding per script.h:433-448:
+%%   0       → <<0x00>>              (OP_0, single byte)
+%%   1..16   → <<0x50 + Height>>     (OP_1..OP_16, single byte)
+%%   17+     → <<Len, LE-bytes...>>  (length-prefixed sign-magnitude CScriptNum)
+%%
+%% Non-canonical forms (length-prefixed 1..16, zero-padded, OP_PUSHDATA1
+%% prefix, missing sign byte at 0x80/0x8000/0x800000) are rejected.
 check_coinbase_height(#transaction{inputs = [#tx_in{script_sig = ScriptSig}]},
                       Height) ->
-    case Height of
-        0 ->
-            %% height 0: OP_0 is acceptable (empty push)
+    Expect = encode_bip34_height(Height),
+    ExpectLen = byte_size(Expect),
+    case ScriptSig of
+        <<Prefix:ExpectLen/binary, _/binary>> when Prefix =:= Expect ->
             ok;
-        _ when Height >= 1, Height =< 16 ->
-            %% heights 1-16: could use OP_1..OP_16 but Bitcoin Core
-            %% uses the push encoding: <<0x01, Height>>
-            case ScriptSig of
-                <<16#01, H:8, _/binary>> when H =:= Height -> ok;
-                <<OpN:8, _/binary>> when OpN =:= 16#50 + Height -> ok;
-                _ -> throw(bad_cb_height)
-            end;
         _ ->
-            %% general case: <<NumBytes, Height:NumBytes*8/little, ...>>
-            NumBytes = height_byte_len(Height),
-            case ScriptSig of
-                <<NB:8, _/binary>> when NB =:= NumBytes ->
-                    <<_:8, HeightBytes:NumBytes/binary, _/binary>> = ScriptSig,
-                    %% decode little-endian height
-                    Decoded = decode_le_uint(HeightBytes),
-                    Decoded =:= Height orelse throw(bad_cb_height),
-                    ok;
-                _ ->
-                    throw(bad_cb_height)
-            end
+            throw(bad_cb_height)
     end.
 
-%% Calculate minimum bytes needed to encode a height in CScriptNum encoding.
-%% Script numbers use the MSB as a sign bit. If the high bit of the MSByte
-%% would be set, an extra 0x00 byte is needed to keep the number positive.
-height_byte_len(N) when N =< 16#7f -> 1;
-height_byte_len(N) when N =< 16#7fff -> 2;
-height_byte_len(N) when N =< 16#7fffff -> 3;
-height_byte_len(N) when N =< 16#7fffffff -> 4;
-height_byte_len(_) -> 5.
+%% @doc Encode a block height as the canonical BIP-34 byte sequence.
+%% Mirrors Bitcoin Core's CScript() << nHeight (script.h:433-448).
+encode_bip34_height(0) ->
+    <<16#00>>;  %% OP_0
+encode_bip34_height(H) when H >= 1, H =< 16 ->
+    <<(16#50 + H)>>;  %% OP_1..OP_16
+encode_bip34_height(H) ->
+    %% CScriptNum: minimal little-endian sign-magnitude with length prefix.
+    LE = encode_le_magnitude(H),
+    Len = byte_size(LE),
+    <<Len:8, LE/binary>>.
 
-%% Decode a little-endian unsigned integer from bytes
-decode_le_uint(Bytes) ->
-    decode_le_uint(Bytes, 0, 0).
+%% Encode a positive integer as minimal little-endian bytes,
+%% appending a zero sign byte if the MSB of the last byte is set.
+encode_le_magnitude(H) ->
+    Bytes = encode_le_bytes(H, <<>>),
+    %% If the high bit of the last byte is set, we must append 0x00
+    %% (the sign bit is the MSB of the last byte in CScriptNum).
+    LastByte = binary:last(Bytes),
+    case LastByte band 16#80 of
+        0 -> Bytes;
+        _ -> <<Bytes/binary, 0>>
+    end.
 
-decode_le_uint(<<>>, _Shift, Acc) -> Acc;
-decode_le_uint(<<B:8, Rest/binary>>, Shift, Acc) ->
-    decode_le_uint(Rest, Shift + 8, Acc bor (B bsl Shift)).
+%% Accumulate little-endian bytes for a positive integer.
+encode_le_bytes(0, Acc) -> Acc;
+encode_le_bytes(H, Acc) ->
+    encode_le_bytes(H bsr 8, <<Acc/binary, (H band 16#ff)>>).
 
 %% @doc Check BIP 141 witness commitment in coinbase.
 %% The coinbase must contain an output whose scriptPubKey starts with:
