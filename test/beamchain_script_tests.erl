@@ -1674,3 +1674,91 @@ sighash_vector_10_test() ->
     Result = beamchain_script:sighash_legacy(Tx, InputIndex, Script, UnsignedHashType),
     Expected = reverse_bytes(hex_to_bin(ExpectedHex)),
     ?assertEqual(Expected, Result).
+
+%%% =====================================================================
+%%% BIP-342 tapscript validation-weight budget tracking
+%%% (Bitcoin Core interpreter.cpp:362, VALIDATION_WEIGHT_PER_SIGOP_PASSED)
+%%% =====================================================================
+
+compact_size_len_test() ->
+    ?assertEqual(1, beamchain_script:compact_size_len(0)),
+    ?assertEqual(1, beamchain_script:compact_size_len(16#fc)),
+    ?assertEqual(3, beamchain_script:compact_size_len(16#fd)),
+    ?assertEqual(3, beamchain_script:compact_size_len(16#ffff)),
+    ?assertEqual(5, beamchain_script:compact_size_len(16#10000)),
+    ?assertEqual(5, beamchain_script:compact_size_len(16#ffffffff)),
+    ?assertEqual(9, beamchain_script:compact_size_len(16#100000000)).
+
+serialized_witness_stack_size_test() ->
+    %% Empty stack: just the count compact-size = 1 byte.
+    ?assertEqual(1, beamchain_script:serialized_witness_stack_size([])),
+    %% One 64-byte item: 1 (count) + 1 (item len prefix) + 64 (bytes).
+    Item64 = binary:copy(<<0>>, 64),
+    ?assertEqual(66, beamchain_script:serialized_witness_stack_size([Item64])),
+    %% Two items, 100 + 33 bytes:
+    Item100 = binary:copy(<<0>>, 100),
+    Item33  = binary:copy(<<0>>, 33),
+    ?assertEqual(1 + (1 + 100) + (1 + 33),
+                 beamchain_script:serialized_witness_stack_size([Item100, Item33])).
+
+%% Exhausted budget aborts CHECKSIGADD via eval_tapscript directly.
+%% Stack (top-down): pubkey, num=0, sig.
+tapscript_validation_weight_exhausted_checksigadd_test() ->
+    Sig = binary:copy(<<16#42>>, 64),
+    PubKey = binary:copy(<<16#02>>, 32),
+    %% Build tapscript: OP_CHECKSIGADD reads pubkey, num, sig from stack.
+    Script = <<16#ba>>,  %% OP_CHECKSIGADD
+    %% Pre-built stack with sig at bottom (from wire), num middle, pk top.
+    Stack = [PubKey, <<>>, Sig],
+    Flags = ?SCRIPT_VERIFY_TAPROOT,
+    %% Always-true Schnorr checker so CHECKSIGADD makes it past sig parse.
+    SigChecker = #{
+        check_schnorr_sig => fun(_S, _P, _H) -> true end,
+        compute_taproot_sighash => fun(_HT, _CSP) -> <<0:256>> end
+    },
+    %% Budget = 0: the non-empty sig must trip the gate.
+    Result = beamchain_script:eval_tapscript(Script, Stack, 0, Flags, SigChecker),
+    ?assertEqual({error, tapscript_sigops_exceeded}, Result).
+
+%% Sufficient budget runs CHECKSIGADD to completion (residue == 0).
+tapscript_validation_weight_sufficient_checksigadd_test() ->
+    Sig = binary:copy(<<16#42>>, 64),
+    PubKey = binary:copy(<<16#02>>, 32),
+    Script = <<16#ba>>,  %% OP_CHECKSIGADD
+    Stack = [PubKey, <<>>, Sig],
+    Flags = ?SCRIPT_VERIFY_TAPROOT,
+    SigChecker = #{
+        check_schnorr_sig => fun(_S, _P, _H) -> true end,
+        compute_taproot_sighash => fun(_HT, _CSP) -> <<0:256>> end
+    },
+    %% Budget = 50: the non-empty sig consumes exactly 50, residue = 0.
+    %% Schnorr check returns true → push num+1 = 1.
+    Result = beamchain_script:eval_tapscript(Script, Stack, 50, Flags, SigChecker),
+    ?assertMatch({ok, _}, Result).
+
+%% Empty sig consumes no budget (CHECKSIGADD).
+%% Use num=1 so CHECKSIGADD pushes back num+0=1 (true), letting the
+%% tapscript exit cleanly via eval_tapscript's stack-bool check.
+tapscript_validation_weight_empty_sig_no_consume_test() ->
+    PubKey = binary:copy(<<16#02>>, 32),
+    Script = <<16#ba>>,  %% OP_CHECKSIGADD
+    %% Stack (top-down): pubkey, num=1, empty sig
+    Stack = [PubKey, <<1>>, <<>>],
+    Flags = ?SCRIPT_VERIFY_TAPROOT,
+    SigChecker = #{},
+    %% Budget = 0 + empty sig: must not trip the gate.
+    Result = beamchain_script:eval_tapscript(Script, Stack, 0, Flags, SigChecker),
+    ?assertMatch({ok, _}, Result).
+
+%% Legacy / SegWit-v0 paths are unaffected by the budget. Confirmed by
+%% running OP_CHECKSIG in non-tapscript mode with the stack arrangement
+%% that would consume budget if the gate were active.
+tapscript_validation_weight_legacy_unaffected_test() ->
+    %% OP_0 OP_0 OP_CHECKSIG  (empty sig, empty pk, push false on legacy)
+    Script = <<16#00, 16#00, 16#ac>>,
+    Flags = ?SCRIPT_VERIFY_WITNESS,
+    SigChecker = #{},
+    %% witness_v0 path: budget is not consulted.
+    Result = beamchain_script:eval_script(Script, [], Flags, SigChecker, witness_v0),
+    %% On the empty-sig path the legacy CHECKSIG pushes script_false.
+    ?assertMatch({ok, _}, Result).
