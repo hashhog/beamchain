@@ -992,3 +992,38 @@ assumeutxo_heights_sorted_ascending_test() ->
               Hs = beamchain_chain_params:list_assumeutxo_heights(Net),
               ?assertEqual(lists:sort(Hs), Hs)
       end, [mainnet, testnet4, regtest]).
+
+%%% ===================================================================
+%%% NetworkDisable RAII gate (dumptxoutset rollback)
+%%%
+%%% Mirrors Bitcoin Core's NetworkDisable wrapper around
+%%% TemporaryRollback in rpc/blockchain.cpp::dumptxoutset. The
+%%% persistent_term-backed flag is exercised directly; we don't drive a
+%%% full rollback here.
+%%% ===================================================================
+
+network_disable_default_false_test() ->
+    %% Defensive: clear stale state from any prior test.
+    beamchain_rpc:set_block_submission_paused(false),
+    ?assertEqual(false, beamchain_rpc:is_block_submission_paused()).
+
+network_disable_set_clear_round_trip_test() ->
+    %% Setting → reading must observe true; clearing → reading must
+    %% observe false. Mirrors NetworkDisable's RAII pause/restore
+    %% semantics.
+    beamchain_rpc:set_block_submission_paused(true),
+    ?assertEqual(true, beamchain_rpc:is_block_submission_paused()),
+    beamchain_rpc:set_block_submission_paused(false),
+    ?assertEqual(false, beamchain_rpc:is_block_submission_paused()).
+
+network_disable_set_idempotent_test() ->
+    %% Repeated set-true is a no-op; matches the persistent_term:put
+    %% atomicity contract. Critical because an exceptional return path
+    %% could trigger overlapping pause/restore cycles.
+    beamchain_rpc:set_block_submission_paused(false),
+    beamchain_rpc:set_block_submission_paused(true),
+    beamchain_rpc:set_block_submission_paused(true),
+    ?assertEqual(true, beamchain_rpc:is_block_submission_paused()),
+    beamchain_rpc:set_block_submission_paused(false),
+    beamchain_rpc:set_block_submission_paused(false),
+    ?assertEqual(false, beamchain_rpc:is_block_submission_paused()).

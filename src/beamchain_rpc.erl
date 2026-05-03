@@ -29,6 +29,15 @@
 %% Pure function; no side effects beyond DB lookups for height/hash → index.
 -export([resolve_dump_target/5]).
 
+%% NetworkDisable RAII: Bitcoin Core's `NetworkDisable` (rpc/blockchain.cpp)
+%% wraps `dumptxoutset rollback`'s rewind→dump→replay dance so peers and
+%% submitblock RPC callers cannot race a new block into the chain mid-rewind.
+%% Erlang has no destructors; we simulate with a `persistent_term` flag set
+%% by the rollback handler and cleared on exit (success or failure). The
+%% submitblock handler short-circuits when the flag is set.
+-export([is_block_submission_paused/0,
+         set_block_submission_paused/1]).
+
 %% Cowboy handler
 -export([init/2]).
 
@@ -77,6 +86,38 @@
     descendant_count, descendant_size, descendant_fee,
     spends_coinbase, rbf_signaling
 }).
+
+%%% ===================================================================
+%%% NetworkDisable: persistent-term gate for inbound block submission
+%%% ===================================================================
+
+%% Mirrors Bitcoin Core's NetworkDisable RAII guard around
+%% `TemporaryRollback` in rpc/blockchain.cpp::dumptxoutset. Set during
+%% the rewind→dump→replay dance so peers / submitblock callers cannot
+%% race a new block into the chain mid-rewind. Cleared on every exit
+%% path (success or failure).
+%%
+%% persistent_term is the right primitive here: O(1) read, atomic write,
+%% no gen_server hop, and the data is read-mostly (toggled at most a few
+%% times per node lifetime).
+
+-define(BLOCK_SUBMISSION_PAUSED_KEY, {beamchain_rpc, block_submission_paused}).
+
+is_block_submission_paused() ->
+    case persistent_term:get(?BLOCK_SUBMISSION_PAUSED_KEY, false) of
+        true -> true;
+        _ -> false
+    end.
+
+set_block_submission_paused(true) ->
+    persistent_term:put(?BLOCK_SUBMISSION_PAUSED_KEY, true);
+set_block_submission_paused(false) ->
+    %% Use erase to avoid retaining the key forever (persistent_term
+    %% retention has a process-tracking cost). Equivalent semantics for
+    %% the read path because is_block_submission_paused/0 defaults to
+    %% false on missing key.
+    _ = persistent_term:erase(?BLOCK_SUBMISSION_PAUSED_KEY),
+    ok.
 
 %%% ===================================================================
 %%% API
@@ -2514,12 +2555,22 @@ rpc_getblocktemplate(_) ->
     rpc_getblocktemplate([#{}]).
 
 rpc_submitblock([HexData]) when is_binary(HexData) ->
-    case beamchain_miner:submit_block(HexData) of
-        ok ->
-            {ok, null};
-        {error, Reason} ->
-            {error, ?RPC_VERIFY_ERROR,
-             iolist_to_binary(io_lib:format("~p", [Reason]))}
+    %% NetworkDisable gate: refuse submissions while a `dumptxoutset
+    %% rollback` rewind→dump→replay dance is in progress. Mirrors
+    %% Core's NetworkDisable RAII around TemporaryRollback in
+    %% rpc/blockchain.cpp::dumptxoutset.
+    case is_block_submission_paused() of
+        true ->
+            {ok, <<"rejected: block submission paused "
+                   "(dumptxoutset rollback in progress)">>};
+        false ->
+            case beamchain_miner:submit_block(HexData) of
+                ok ->
+                    {ok, null};
+                {error, Reason} ->
+                    {error, ?RPC_VERIFY_ERROR,
+                     iolist_to_binary(io_lib:format("~p", [Reason]))}
+            end
     end;
 rpc_submitblock(_) ->
     {error, ?RPC_INVALID_PARAMS,
@@ -4431,22 +4482,41 @@ rpc_dumptxoutset([Path, Type]) when is_binary(Path), is_binary(Type) ->
     rpc_dumptxoutset([Path, Type, #{}]);
 rpc_dumptxoutset([Path, Type, Options])
   when is_binary(Path), is_binary(Type), is_map(Options) ->
-    case beamchain_chainstate:get_tip() of
-        {ok, {TipHash, TipHeight}} ->
-            Network = beamchain_config:network(),
-            case resolve_dump_target(Type, Options, TipHash, TipHeight,
-                                     Network) of
+    %% Refuse to overwrite an existing destination — matches Core's
+    %% "<path> already exists. If you are sure this is what you want,
+    %% move it out of the way first." guard in
+    %% rpc/blockchain.cpp::dumptxoutset. We probe BEFORE any chain-state
+    %% mutation so a name collision cannot leave the chain stuck in a
+    %% half-rolled-back state.
+    PathStr = binary_to_list(Path),
+    case filelib:is_regular(PathStr) of
+        true ->
+            {error, ?RPC_INVALID_PARAMS,
+             iolist_to_binary(
+               io_lib:format(
+                 "~s already exists. If you are sure this is what you "
+                 "want, move it out of the way first.", [PathStr]))};
+        false ->
+            case beamchain_chainstate:get_tip() of
                 {ok, {TipHash, TipHeight}} ->
-                    %% Target == tip: simple dump, no rollback dance.
-                    do_dump_at_tip(Path, TipHash, TipHeight, Network);
-                {ok, {TargetHash, TargetHeight}} ->
-                    do_dump_with_rollback(Path, TargetHash, TargetHeight,
-                                          TipHash, TipHeight, Network);
-                {error, Code, Msg} ->
-                    {error, Code, Msg}
-            end;
-        not_found ->
-            {error, ?RPC_MISC_ERROR, <<"No chain tip available">>}
+                    Network = beamchain_config:network(),
+                    case resolve_dump_target(Type, Options, TipHash,
+                                             TipHeight, Network) of
+                        {ok, {TipHash, TipHeight}} ->
+                            %% Target == tip: simple dump, no rollback dance.
+                            do_dump_at_tip(Path, TipHash, TipHeight,
+                                           Network);
+                        {ok, {TargetHash, TargetHeight}} ->
+                            do_dump_with_rollback(Path, TargetHash,
+                                                  TargetHeight, TipHash,
+                                                  TipHeight, Network);
+                        {error, Code, Msg} ->
+                            {error, Code, Msg}
+                    end;
+                not_found ->
+                    {error, ?RPC_MISC_ERROR,
+                     <<"No chain tip available">>}
+            end
     end;
 rpc_dumptxoutset(_) ->
     {error, ?RPC_INVALID_PARAMS,
@@ -4563,7 +4633,15 @@ do_dump_at_tip(Path, TipHash, TipHeight, Network) ->
     ok = beamchain_chainstate:flush(),
     SnapshotBin = beamchain_snapshot:serialize_snapshot(TipHash, Network),
     UtxoHash = beamchain_snapshot:compute_utxo_hash(),
-    case file:write_file(PathStr, SnapshotBin) of
+    %% Atomic-write protocol: write to "<path>.incomplete", fsync the fd
+    %% via file:sync, then atomically rename to <path>. Mirrors Bitcoin
+    %% Core's flow in rpc/blockchain.cpp::dumptxoutset (temppath = path
+    %% + ".incomplete"; write; fsync via Fdatasync/close; rename). On
+    %% any error we best-effort delete the .incomplete temp so a crashed
+    %% dump never leaves a torn <path> behind — only the .incomplete
+    %% artifact, which can be cleaned up out-of-band.
+    TmpPathStr = PathStr ++ ".incomplete",
+    case write_snapshot_atomic(TmpPathStr, PathStr, SnapshotBin) of
         ok ->
             {ok, #{
                 <<"coins_written">> => count_coins_in_snapshot(SnapshotBin),
@@ -4582,6 +4660,45 @@ do_dump_at_tip(Path, TipHash, TipHeight, Network) ->
             {error, ?RPC_MISC_ERROR,
              iolist_to_binary(
                io_lib:format("Failed to write snapshot: ~p", [Reason]))}
+    end.
+
+%% Atomic write helper used by do_dump_at_tip. Bytes go to TmpPath, the
+%% file descriptor is fsynced, then renamed to FinalPath. Cleans up
+%% TmpPath on any failure so an aborted dump never leaves a torn final
+%% file. Mirrors bitcoin-core/src/rpc/blockchain.cpp::dumptxoutset.
+write_snapshot_atomic(TmpPath, FinalPath, Payload) ->
+    case file:open(TmpPath, [write, binary, raw]) of
+        {ok, Fd} ->
+            case file:write(Fd, Payload) of
+                ok ->
+                    %% Durability barrier: fsync before rename. A power
+                    %% loss between rename and dirty-page flush could
+                    %% otherwise leave FinalPath visible with zero-
+                    %% length / torn contents.
+                    SyncRes = file:sync(Fd),
+                    CloseRes = file:close(Fd),
+                    case {SyncRes, CloseRes} of
+                        {ok, ok} ->
+                            case file:rename(TmpPath, FinalPath) of
+                                ok -> ok;
+                                {error, RenReason} ->
+                                    _ = file:delete(TmpPath),
+                                    {error, {rename, RenReason}}
+                            end;
+                        {{error, SyncReason}, _} ->
+                            _ = file:delete(TmpPath),
+                            {error, {sync, SyncReason}};
+                        {_, {error, CloseReason}} ->
+                            _ = file:delete(TmpPath),
+                            {error, {close, CloseReason}}
+                    end;
+                {error, WriteReason} ->
+                    _ = file:close(Fd),
+                    _ = file:delete(TmpPath),
+                    {error, {write, WriteReason}}
+            end;
+        {error, OpenReason} ->
+            {error, {open, OpenReason}}
     end.
 
 %% Dump-with-rollback: disconnect blocks back to TargetHeight, dump, then
@@ -4606,37 +4723,75 @@ do_dump_at_tip(Path, TipHash, TipHeight, Network) ->
 %% LogWarning-then-throw fallback in rpc/blockchain.cpp:3208.
 do_dump_with_rollback(Path, TargetHash, TargetHeight,
                       OrigTipHash, OrigTipHeight, Network) ->
-    case rewind_to(TargetHash, TargetHeight, OrigTipHeight, []) of
-        {ok, Disconnected} ->
-            %% Disconnected = [#block{}], oldest-first (so reversing gives
-            %% replay order from TargetHeight+1 → OrigTipHeight).
-            DumpResult = do_dump_at_tip(Path, TargetHash, TargetHeight,
-                                        Network),
-            %% Always try to forward-replay even if the dump itself
-            %% failed, so we leave the node where the operator left it.
-            case replay_forward(Disconnected) of
-                ok ->
-                    DumpResult;
-                {error, ReplayReason} ->
-                    logger:error(
-                      "dumptxoutset: forward replay failed at "
-                      "height after ~B (target=~B, orig_tip=~B): ~p",
-                      [TargetHeight, TargetHeight, OrigTipHeight,
-                       ReplayReason]),
-                    case DumpResult of
-                        {ok, _} ->
-                            {error, ?RPC_MISC_ERROR,
-                             iolist_to_binary(
-                               io_lib:format(
-                                 "Snapshot written but forward replay failed: ~p",
-                                 [ReplayReason]))};
-                        Err ->
-                            Err
-                    end
-            end;
-        {error, Code, Msg} ->
-            _ = mark_orig_tip_for_log(OrigTipHash),
-            {error, Code, Msg}
+    %% Pruned-mode pre-check (Bitcoin Core
+    %% rpc/blockchain.cpp:dumptxoutset):
+    %%     if (IsPruneMode() &&
+    %%         target_index->nHeight <
+    %%         m_blockman.GetFirstBlock()->nHeight)
+    %%         throw "Block height N not available (pruned data).
+    %%                Use a height after M.";
+    %% beamchain_db:is_block_pruned/1 reflects the actual on-disk state
+    %% (set membership against pruned_files), so we use it directly to
+    %% fail fast before disconnect_block hits a missing block body.
+    case beamchain_config:prune_enabled() andalso
+         beamchain_db:is_block_pruned(TargetHash) of
+        true ->
+            {error, ?RPC_MISC_ERROR,
+             iolist_to_binary(
+               io_lib:format(
+                 "Block height ~B not available (pruned data). "
+                 "Use a height closer to the current tip.",
+                 [TargetHeight]))};
+        false ->
+            do_dump_with_rollback_unchecked(
+              Path, TargetHash, TargetHeight,
+              OrigTipHash, OrigTipHeight, Network)
+    end.
+
+do_dump_with_rollback_unchecked(Path, TargetHash, TargetHeight,
+                                OrigTipHash, OrigTipHeight, Network) ->
+    %% NetworkDisable RAII (Erlang try/after). Mirrors Bitcoin Core's
+    %% NetworkDisable wrapper around TemporaryRollback in
+    %% rpc/blockchain.cpp::dumptxoutset. Pause inbound block acceptance
+    %% for the duration of the rewind→dump→replay dance and restore on
+    %% every exit path (success, error, exception). The `after` clause
+    %% guarantees cleanup even if a callee throws.
+    set_block_submission_paused(true),
+    try
+        case rewind_to(TargetHash, TargetHeight, OrigTipHeight, []) of
+            {ok, Disconnected} ->
+                %% Disconnected = [#block{}], oldest-first (so reversing gives
+                %% replay order from TargetHeight+1 → OrigTipHeight).
+                DumpResult = do_dump_at_tip(Path, TargetHash, TargetHeight,
+                                            Network),
+                %% Always try to forward-replay even if the dump itself
+                %% failed, so we leave the node where the operator left it.
+                case replay_forward(Disconnected) of
+                    ok ->
+                        DumpResult;
+                    {error, ReplayReason} ->
+                        logger:error(
+                          "dumptxoutset: forward replay failed at "
+                          "height after ~B (target=~B, orig_tip=~B): ~p",
+                          [TargetHeight, TargetHeight, OrigTipHeight,
+                           ReplayReason]),
+                        case DumpResult of
+                            {ok, _} ->
+                                {error, ?RPC_MISC_ERROR,
+                                 iolist_to_binary(
+                                   io_lib:format(
+                                     "Snapshot written but forward replay failed: ~p",
+                                     [ReplayReason]))};
+                            Err ->
+                                Err
+                        end
+                end;
+            {error, Code, Msg} ->
+                _ = mark_orig_tip_for_log(OrigTipHash),
+                {error, Code, Msg}
+        end
+    after
+        set_block_submission_paused(false)
     end.
 
 %% Rewind the chain to TargetHash/TargetHeight, capturing the disconnected
