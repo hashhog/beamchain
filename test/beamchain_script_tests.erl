@@ -1081,26 +1081,28 @@ op_codeseparator_test() ->
 %%% NULLFAIL enforcement tests (BIP 146)
 %%% -------------------------------------------------------------------
 
-%% Test that NULLFAIL flag is set at segwit activation height for mainnet
+%% NULLFAIL is a STANDARD_SCRIPT_VERIFY_FLAG (policy only) per Bitcoin Core
+%% policy/policy.h:125.  It must NOT appear in flags_for_height (the consensus
+%% block-script-flag computer).  Ref: validation.cpp:2250-2289.
 nullfail_flag_mainnet_test() ->
-    %% Pre-segwit: NULLFAIL should NOT be set
+    %% Pre-segwit: NULLFAIL must NOT be set (policy-only regardless of height)
     FlagsPreSegwit = beamchain_script:flags_for_height(481823, mainnet),
     ?assertEqual(0, FlagsPreSegwit band ?SCRIPT_VERIFY_NULLFAIL),
-    %% At segwit activation: NULLFAIL should be set
+    %% At segwit activation: NULLFAIL must still NOT be set (policy-only)
     FlagsAtSegwit = beamchain_script:flags_for_height(481824, mainnet),
-    ?assertNotEqual(0, FlagsAtSegwit band ?SCRIPT_VERIFY_NULLFAIL),
-    %% Post-segwit: NULLFAIL should still be set
+    ?assertEqual(0, FlagsAtSegwit band ?SCRIPT_VERIFY_NULLFAIL),
+    %% Post-segwit: NULLFAIL must still NOT be set (policy-only)
     FlagsPostSegwit = beamchain_script:flags_for_height(500000, mainnet),
-    ?assertNotEqual(0, FlagsPostSegwit band ?SCRIPT_VERIFY_NULLFAIL).
+    ?assertEqual(0, FlagsPostSegwit band ?SCRIPT_VERIFY_NULLFAIL).
 
-%% Test that NULLFAIL is set for testnet/regtest (all flags active from genesis)
+%% NULLFAIL must be absent from consensus flags even on testnet/regtest.
 nullfail_flag_testnet_test() ->
     Flags = beamchain_script:flags_for_height(0, testnet),
-    ?assertNotEqual(0, Flags band ?SCRIPT_VERIFY_NULLFAIL).
+    ?assertEqual(0, Flags band ?SCRIPT_VERIFY_NULLFAIL).
 
 nullfail_flag_regtest_test() ->
     Flags = beamchain_script:flags_for_height(0, regtest),
-    ?assertNotEqual(0, Flags band ?SCRIPT_VERIFY_NULLFAIL).
+    ?assertEqual(0, Flags band ?SCRIPT_VERIFY_NULLFAIL).
 
 %% Test NULLFAIL enforcement in OP_CHECKSIG: failing sig with non-empty sig
 %% must return error when NULLFAIL flag is set
