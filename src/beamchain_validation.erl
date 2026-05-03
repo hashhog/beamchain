@@ -33,6 +33,9 @@
 %% BIP 68 sequence locks
 -export([calculate_sequence_lock_pair/3]).
 
+%% IsFinalTx (exported for testing)
+-export([is_final_tx/3]).
+
 %% Undo data serialization (exported for testing)
 -export([encode_undo_data/1, decode_undo_data/1]).
 
@@ -233,12 +236,35 @@ collect_timestamps(Index, N, Acc) ->
 %%% Contextual block validation
 %%% -------------------------------------------------------------------
 
+%% @doc Check whether a transaction is final at a given block height and time.
+%% A transaction is final if:
+%%   1. nLockTime == 0, OR
+%%   2. nLockTime < threshold (height-based if < 500_000_000, else time-based), OR
+%%   3. All inputs have sequence == 0xFFFFFFFF
+%%
+%% Reference: Bitcoin Core consensus/tx_verify.cpp IsFinalTx()
+%% Called from ContextualCheckBlock (validation.cpp:4146)
+%% LOCKTIME_THRESHOLD (500_000_000) is defined in beamchain_protocol.hrl
+-spec is_final_tx(#transaction{}, non_neg_integer(), non_neg_integer()) -> boolean().
+is_final_tx(#transaction{locktime = 0}, _Height, _BlockTime) ->
+    true;
+is_final_tx(#transaction{locktime = LockTime, inputs = Inputs}, Height, BlockTime) ->
+    %% Determine threshold: height-based or time-based
+    Threshold = if LockTime < ?LOCKTIME_THRESHOLD -> Height; true -> BlockTime end,
+    if
+        LockTime < Threshold ->
+            true;
+        true ->
+            %% Still final if all inputs have SEQUENCE_FINAL (0xFFFFFFFF)
+            lists:all(fun(#tx_in{sequence = Seq}) -> Seq =:= 16#FFFFFFFF end, Inputs)
+    end.
+
 %% @doc Validate a block with chain context.
-%% Checks BIP 34 coinbase height, witness commitment, etc.
+%% Checks BIP 34 coinbase height, IsFinalTx for all txs, witness commitment.
 -spec contextual_check_block(#block{}, non_neg_integer(), map(), map()) ->
     ok | {error, atom()}.
-contextual_check_block(#block{header = _Header, transactions = Txs},
-                       Height, _PrevIndex, Params) ->
+contextual_check_block(#block{header = Header, transactions = Txs},
+                       Height, PrevIndex, Params) ->
     try
         [CoinbaseTx | _] = Txs,
 
@@ -250,7 +276,20 @@ contextual_check_block(#block{header = _Header, transactions = Txs},
             false -> ok
         end,
 
-        %% 2. BIP 141: witness commitment in coinbase
+        %% 2. IsFinalTx: every transaction must be final (Core validation.cpp:4146).
+        %% lock_time_cutoff = MTP when BIP-113/CSV is active, block timestamp otherwise.
+        %% BIP-113 (MEDIAN_TIME_PAST) gates on csv_height (419328 mainnet).
+        CsvHeight = maps:get(csv_height, Params, 419328),
+        LockTimeCutoff = case Height >= CsvHeight of
+            true  -> median_time_past(PrevIndex);
+            false -> Header#block_header.timestamp
+        end,
+        lists:foreach(fun(Tx) ->
+            is_final_tx(Tx, Height, LockTimeCutoff)
+                orelse throw(bad_txns_nonfinal)
+        end, Txs),
+
+        %% 3. BIP 141: witness commitment in coinbase
         SegwitHeight = maps:get(segwit_height, Params, 0),
         case Height >= SegwitHeight of
             true ->

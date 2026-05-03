@@ -1012,3 +1012,92 @@ assumevalid_regtest_always_verifies_test() ->
             hdr_tip(BlockHeight + 1000),
             not_found))
     end, [0, 1, 100, 1000, 9999, 10000]).
+
+%%% ===================================================================
+%%% is_final_tx tests (Core parity: ContextualCheckBlock validation.cpp:4146)
+%%% ===================================================================
+
+%% locktime == 0 → always final regardless of sequence
+is_final_tx_zero_locktime_test() ->
+    Tx = #transaction{
+        version = 1,
+        inputs = [#tx_in{prev_out = #outpoint{hash = <<0:256>>, index = 0},
+                         script_sig = <<>>, sequence = 0, witness = []}],
+        outputs = [#tx_out{value = 100, script_pubkey = <<>>}],
+        locktime = 0
+    },
+    ?assert(beamchain_validation:is_final_tx(Tx, 1000, 900000001)).
+
+%% height-based locktime satisfied (locktime < height)
+is_final_tx_height_satisfied_test() ->
+    Tx = #transaction{
+        version = 1,
+        inputs = [#tx_in{prev_out = #outpoint{hash = <<0:256>>, index = 0},
+                         script_sig = <<>>, sequence = 0, witness = []}],
+        outputs = [#tx_out{value = 100, script_pubkey = <<>>}],
+        locktime = 100
+    },
+    ?assert(beamchain_validation:is_final_tx(Tx, 101, 900000001)).
+
+%% height-based locktime not satisfied, non-final sequence → non-final
+is_final_tx_height_not_satisfied_test() ->
+    Tx = #transaction{
+        version = 1,
+        inputs = [#tx_in{prev_out = #outpoint{hash = <<0:256>>, index = 0},
+                         script_sig = <<>>, sequence = 1, witness = []}],
+        outputs = [#tx_out{value = 100, script_pubkey = <<>>}],
+        locktime = 200
+    },
+    ?assertNot(beamchain_validation:is_final_tx(Tx, 100, 900000001)).
+
+%% SEQUENCE_FINAL on all inputs overrides non-satisfied locktime → final
+is_final_tx_sequence_final_overrides_test() ->
+    Tx = #transaction{
+        version = 1,
+        inputs = [#tx_in{prev_out = #outpoint{hash = <<0:256>>, index = 0},
+                         script_sig = <<>>, sequence = 16#FFFFFFFF, witness = []}],
+        outputs = [#tx_out{value = 100, script_pubkey = <<>>}],
+        locktime = 999999999
+    },
+    ?assert(beamchain_validation:is_final_tx(Tx, 100, 900000001)).
+
+%% contextual_check_block rejects a block with a non-final tx
+%% Use bip34_height=0 so we don't need to encode coinbase height correctly;
+%% the IsFinalTx check fires before (or after BIP-34, both are valid orderings).
+contextual_check_block_rejects_non_final_tx_test() ->
+    %% Simple coinbase (BIP-34 disabled via bip34_height=999999)
+    Coinbase = #transaction{
+        version = 1,
+        inputs = [#tx_in{prev_out = #outpoint{hash = <<0:256>>, index = 16#FFFFFFFF},
+                         script_sig = <<1, 100>>, sequence = 16#FFFFFFFF, witness = []}],
+        outputs = [#tx_out{value = 5000000000, script_pubkey = <<>>}],
+        locktime = 0
+    },
+    %% Non-final tx: locktime=200, height=100, sequence=0 (not SEQUENCE_FINAL)
+    %% locktime=200 < LOCKTIME_THRESHOLD so height-based; 200 > 100 → not final
+    NonFinalTx = #transaction{
+        version = 1,
+        inputs = [#tx_in{prev_out = #outpoint{hash = <<1:256>>, index = 0},
+                         script_sig = <<>>, sequence = 0, witness = []}],
+        outputs = [#tx_out{value = 50, script_pubkey = <<>>}],
+        locktime = 200
+    },
+    Header = #block_header{
+        version = 1, prev_hash = <<0:256>>, merkle_root = <<0:256>>,
+        timestamp = 1700000000, bits = 16#1d00ffff, nonce = 0
+    },
+    Block = #block{header = Header, transactions = [Coinbase, NonFinalTx],
+                   hash = undefined, height = undefined, size = undefined, weight = undefined},
+    %% Disable BIP-34 check so coinbase encoding doesn't interfere;
+    %% enable CSV (csv_height=1) so LockTimeCutoff = MTP
+    PrevIndex = #{mtp_timestamps => [1699999000, 1699999100, 1699999200,
+                                      1699999300, 1699999400, 1699999500,
+                                      1699999600, 1699999700, 1699999800,
+                                      1699999900, 1700000000],
+                  height => 99, header => Header},
+    Params = #{bip34_height => 999999, segwit_height => 999999, csv_height => 1},
+    %% height=100 >= csv_height=1 → LockTimeCutoff = MTP ≈ 1699999600
+    %% locktime=200 < 500_000_000 → height-based; 200 >= 100 → not satisfied
+    %% sequence=0 ≠ SEQUENCE_FINAL → non-final → bad_txns_nonfinal
+    ?assertEqual({error, bad_txns_nonfinal},
+                 beamchain_validation:contextual_check_block(Block, 100, PrevIndex, Params)).
