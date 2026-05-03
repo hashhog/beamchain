@@ -1027,3 +1027,57 @@ network_disable_set_idempotent_test() ->
     beamchain_rpc:set_block_submission_paused(false),
     beamchain_rpc:set_block_submission_paused(false),
     ?assertEqual(false, beamchain_rpc:is_block_submission_paused()).
+
+%%% ===================================================================
+%%% BIP-22 result-string mapping tests
+%%%
+%%% bip22_result/1 maps beamchain_validation.erl error atoms to the
+%%% canonical short ASCII tokens defined in BIP-22 and Bitcoin Core
+%%% BIP22ValidationResult() in src/rpc/mining.cpp.
+%%% ===================================================================
+
+bip22_result_high_hash_test() ->
+    ?assertEqual(<<"high-hash">>, beamchain_rpc:bip22_result(high_hash)).
+
+bip22_result_bad_diffbits_test() ->
+    ?assertEqual(<<"bad-diffbits">>, beamchain_rpc:bip22_result(bad_diffbits)).
+
+bip22_result_bad_txnmrklroot_test() ->
+    ?assertEqual(<<"bad-txnmrklroot">>, beamchain_rpc:bip22_result(bad_merkle_root)),
+    ?assertEqual(<<"bad-txnmrklroot">>, beamchain_rpc:bip22_result(mutated_merkle)).
+
+bip22_result_bad_witness_test() ->
+    ?assertEqual(<<"bad-witness-merkle-match">>, beamchain_rpc:bip22_result(bad_witness_commitment)),
+    ?assertEqual(<<"bad-witness-merkle-match">>, beamchain_rpc:bip22_result(missing_witness_commitment)),
+    ?assertEqual(<<"bad-witness-merkle-match">>, beamchain_rpc:bip22_result(bad_witness_nonce)).
+
+bip22_result_bad_cb_amount_test() ->
+    ?assertEqual(<<"bad-cb-amount">>, beamchain_rpc:bip22_result(bad_cb_amount)),
+    ?assertEqual(<<"bad-cb-amount">>, beamchain_rpc:bip22_result(insufficient_input)).
+
+bip22_result_bad_blk_sigops_test() ->
+    ?assertEqual(<<"bad-blk-sigops">>, beamchain_rpc:bip22_result(bad_blk_sigops)).
+
+bip22_result_bad_txns_nonfinal_test() ->
+    ?assertEqual(<<"bad-txns-nonfinal">>, beamchain_rpc:bip22_result(bad_txns_nonfinal)).
+
+bip22_result_bad_cb_height_test() ->
+    ?assertEqual(<<"bad-cb-height">>, beamchain_rpc:bip22_result(bad_cb_height)).
+
+bip22_result_time_too_old_test() ->
+    ?assertEqual(<<"time-too-old">>, beamchain_rpc:bip22_result(time_too_old)).
+
+bip22_result_time_too_new_test() ->
+    ?assertEqual(<<"time-too-new">>, beamchain_rpc:bip22_result(time_too_new)).
+
+bip22_result_duplicate_test() ->
+    ?assertEqual(<<"duplicate">>, beamchain_rpc:bip22_result(duplicate)).
+
+bip22_result_mandatory_script_test() ->
+    ?assertEqual(<<"mandatory-script-verify-flag-failed">>,
+                 beamchain_rpc:bip22_result({bad_tx, script_failed})).
+
+bip22_result_catchall_test() ->
+    ?assertEqual(<<"rejected">>, beamchain_rpc:bip22_result(unknown_error)),
+    ?assertEqual(<<"rejected">>, beamchain_rpc:bip22_result(bad_prevblk)),
+    ?assertEqual(<<"rejected">>, beamchain_rpc:bip22_result(no_transactions)).
