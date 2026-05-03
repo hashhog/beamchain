@@ -42,7 +42,8 @@
 %% by the rollback handler and cleared on exit (success or failure). The
 %% submitblock handler short-circuits when the flag is set.
 -export([is_block_submission_paused/0,
-         set_block_submission_paused/1]).
+         set_block_submission_paused/1,
+         bip22_result/1]).
 
 %% Cowboy handler
 -export([init/2]).
@@ -2560,6 +2561,32 @@ rpc_getblocktemplate([TemplateRequest]) when is_map(TemplateRequest) ->
 rpc_getblocktemplate(_) ->
     rpc_getblocktemplate([#{}]).
 
+%% bip22_result/1 maps a beamchain_miner:submit_block/1 error reason to
+%% the canonical BIP-22 result string defined in BIP-22 and Bitcoin Core
+%% BIP22ValidationResult() in src/rpc/mining.cpp.  Returns "rejected"
+%% for any reason not explicitly listed.
+%%
+%% beamchain_validation.erl uses Erlang atoms with underscores; we map
+%% to the hyphenated spec strings here, at the RPC layer.
+bip22_result(high_hash)                  -> <<"high-hash">>;
+bip22_result(bad_diffbits)               -> <<"bad-diffbits">>;
+bip22_result(bad_merkle_root)            -> <<"bad-txnmrklroot">>;
+bip22_result(mutated_merkle)             -> <<"bad-txnmrklroot">>;
+bip22_result(bad_witness_commitment)     -> <<"bad-witness-merkle-match">>;
+bip22_result(missing_witness_commitment) -> <<"bad-witness-merkle-match">>;
+bip22_result(bad_witness_nonce)          -> <<"bad-witness-merkle-match">>;
+bip22_result(bad_cb_amount)             -> <<"bad-cb-amount">>;
+bip22_result(insufficient_input)        -> <<"bad-cb-amount">>;
+bip22_result(bad_blk_sigops)            -> <<"bad-blk-sigops">>;
+bip22_result(bad_txns_nonfinal)         -> <<"bad-txns-nonfinal">>;
+bip22_result(bad_cb_height)             -> <<"bad-cb-height">>;
+bip22_result(time_too_old)              -> <<"time-too-old">>;
+bip22_result(time_too_new)              -> <<"time-too-new">>;
+bip22_result(duplicate_inputs)          -> <<"bad-txns-duplicate">>;
+bip22_result({bad_tx, _})              -> <<"mandatory-script-verify-flag-failed">>;
+bip22_result(duplicate)                 -> <<"duplicate">>;
+bip22_result(_)                         -> <<"rejected">>.
+
 rpc_submitblock([HexData]) when is_binary(HexData) ->
     %% NetworkDisable gate: refuse submissions while a `dumptxoutset
     %% rollback` rewind→dump→replay dance is in progress. Mirrors
@@ -2572,10 +2599,14 @@ rpc_submitblock([HexData]) when is_binary(HexData) ->
         false ->
             case beamchain_miner:submit_block(HexData) of
                 ok ->
+                    %% null = success per BIP-22
                     {ok, null};
                 {error, Reason} ->
-                    {error, ?RPC_VERIFY_ERROR,
-                     iolist_to_binary(io_lib:format("~p", [Reason]))}
+                    %% Return the BIP-22 string as the result field,
+                    %% not as a JSON-RPC error.  Per BIP-22 and Bitcoin
+                    %% Core BIP22ValidationResult(), consensus rejections
+                    %% are result strings, not JSON-RPC error objects.
+                    {ok, bip22_result(Reason)}
             end
     end;
 rpc_submitblock(_) ->
