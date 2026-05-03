@@ -1764,3 +1764,83 @@ tapscript_validation_weight_legacy_unaffected_test() ->
     Result = beamchain_script:eval_script(Script, [], Flags, SigChecker, witness_v0),
     %% On the empty-sig path the legacy CHECKSIG pushes script_false.
     ?assertMatch({ok, _}, Result).
+
+%%% -------------------------------------------------------------------
+%%% P0-A: Tapscript control block upper-bound size check
+%%%
+%%% Core ref: interpreter.h:245-246 / interpreter.cpp:1970
+%%%   TAPROOT_CONTROL_BASE_SIZE      = 33
+%%%   TAPROOT_CONTROL_NODE_SIZE      = 32
+%%%   TAPROOT_CONTROL_MAX_NODE_COUNT = 128
+%%%   TAPROOT_CONTROL_MAX_SIZE       = 33 + 32*128 = 4129
+%%% A control block whose merkle path has more than 128 nodes (>4129 bytes,
+%%% still 32-byte aligned) MUST be rejected with TAPROOT_WRONG_CONTROL_SIZE.
+%%% -------------------------------------------------------------------
+
+%% A 4129-byte control block (128 merkle nodes) is the maximum allowed.
+%% This is at the boundary — must NOT be rejected for being too large.
+%% (We can't easily run a full taproot script-path verify in unit-test
+%% scope without scaffolding tx + sigchecker + tweak machinery. We assert
+%% on the size-gate directly: an at-or-below-cap control block should not
+%% short-circuit with `invalid_control_block`. The downstream tweak-key
+%% mismatch is acceptable as a "we got past the size gate" signal.)
+taproot_control_block_4129_at_cap_passes_size_gate_test() ->
+    %% 33 + 32*128 = 4129 bytes: AT cap.
+    ControlBlock = binary:copy(<<0>>, 4129),
+    %% Output key, script, args don't matter — we just want to confirm we
+    %% don't get the size-gate error.
+    OutputKey = binary:copy(<<2>>, 32),
+    Script = <<16#51>>,  %% OP_1
+    Witness = [<<>>, Script, ControlBlock],
+    Flags = ?SCRIPT_VERIFY_TAPROOT,
+    SigChecker = #{},
+    Result = beamchain_script:verify_taproot(OutputKey, Witness, Flags, SigChecker),
+    %% At-cap MUST not be flagged as invalid_control_block. It will fail
+    %% later (tweak/sig mismatch), but NOT on the size gate.
+    ?assertNotEqual({error, invalid_control_block}, Result).
+
+%% A 4161-byte control block (129 merkle nodes) is 32-byte aligned and
+%% over the cap; must be rejected on the upper-bound gate.
+%% Pre-fix beamchain accepted; Core rejects with TAPROOT_WRONG_CONTROL_SIZE.
+taproot_control_block_over_max_rejected_test() ->
+    %% 33 + 32*129 = 4161 bytes: 32-byte aligned, BUT >4129 (>128 nodes).
+    ControlBlock = binary:copy(<<0>>, 4161),
+    OutputKey = binary:copy(<<2>>, 32),
+    Script = <<16#51>>,
+    Witness = [<<>>, Script, ControlBlock],
+    Flags = ?SCRIPT_VERIFY_TAPROOT,
+    SigChecker = #{},
+    Result = beamchain_script:verify_taproot(OutputKey, Witness, Flags, SigChecker),
+    %% Must be rejected on the size gate.
+    ?assertEqual({error, invalid_control_block}, Result).
+
+%% A 6433-byte control block (200 merkle nodes), per the audit note:
+%%   "200 nodes = 6433 bytes"
+%% must also be rejected on the size gate.
+taproot_control_block_200_nodes_rejected_test() ->
+    %% 33 + 32*200 = 6433 bytes.
+    ControlBlock = binary:copy(<<0>>, 6433),
+    OutputKey = binary:copy(<<2>>, 32),
+    Script = <<16#51>>,
+    Witness = [<<>>, Script, ControlBlock],
+    Flags = ?SCRIPT_VERIFY_TAPROOT,
+    SigChecker = #{},
+    Result = beamchain_script:verify_taproot(OutputKey, Witness, Flags, SigChecker),
+    ?assertEqual({error, invalid_control_block}, Result).
+
+%% Below cap stays accepted at the size-gate level.
+taproot_control_block_below_cap_passes_size_gate_test() ->
+    %% 33 bytes: minimum. 0 merkle nodes.
+    CB1 = binary:copy(<<0>>, 33),
+    OutputKey = binary:copy(<<2>>, 32),
+    Script = <<16#51>>,
+    Flags = ?SCRIPT_VERIFY_TAPROOT,
+    SigChecker = #{},
+    Witness1 = [<<>>, Script, CB1],
+    R1 = beamchain_script:verify_taproot(OutputKey, Witness1, Flags, SigChecker),
+    ?assertNotEqual({error, invalid_control_block}, R1),
+    %% 33 + 32*64 = 2081 bytes: mid-range. 64 merkle nodes.
+    CB2 = binary:copy(<<0>>, 2081),
+    Witness2 = [<<>>, Script, CB2],
+    R2 = beamchain_script:verify_taproot(OutputKey, Witness2, Flags, SigChecker),
+    ?assertNotEqual({error, invalid_control_block}, R2).

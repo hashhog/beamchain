@@ -23,6 +23,7 @@
 %% Sighash computation
 -export([sighash_legacy/4, sighash_witness_v0/5, sighash_taproot/7]).
 -export([find_and_delete/2]).  %% Exported for testing
+-export([verify_taproot/4]).   %% Exported for testing
 
 %% Pay-to-Anchor (P2A) detection
 -export([is_pay_to_anchor/1]).
@@ -2551,8 +2552,16 @@ verify_taproot_key_path(OutputKey, Sig, _Flags, SigChecker) ->
 verify_taproot_script_path(OutputKey, Script, ControlBlock,
                            ScriptArgs, FullWitness, Flags, SigChecker) ->
     %% Validate control block
+    %% Core (interpreter.cpp:1970, interpreter.h:245-246):
+    %%   TAPROOT_CONTROL_BASE_SIZE = 33
+    %%   TAPROOT_CONTROL_NODE_SIZE = 32
+    %%   TAPROOT_CONTROL_MAX_NODE_COUNT = 128
+    %%   TAPROOT_CONTROL_MAX_SIZE = 33 + 32*128 = 4129
+    %% Reject SCRIPT_ERR_TAPROOT_WRONG_CONTROL_SIZE if size < 33,
+    %% size > 4129, or (size - 33) mod 32 != 0.
     CBLen = byte_size(ControlBlock),
-    case CBLen >= 33 andalso (CBLen - 33) rem 32 =:= 0 of
+    case CBLen >= 33 andalso CBLen =< 4129
+         andalso (CBLen - 33) rem 32 =:= 0 of
         false ->
             {error, invalid_control_block};
         true ->
