@@ -3088,23 +3088,24 @@ flags_for_height(Height, mainnet) ->
         true -> F5 bor ?SCRIPT_VERIFY_TAPROOT;
         false -> F5
     end,
-    %% NULLDUMMY, NULLFAIL, and WITNESS_PUBKEYTYPE are consensus since segwit activation (BIP 141/143/146)
+    %% NULLDUMMY (BIP-147) is a consensus rule activated with segwit.
+    %% NULLFAIL and WITNESS_PUBKEYTYPE are STANDARD_SCRIPT_VERIFY_FLAGS
+    %% (policy only) per Bitcoin Core policy/policy.h:125,128.  They must
+    %% NOT appear in the block-consensus flag computer.
     case Height >= 481824 of
-        true -> F6 bor ?SCRIPT_VERIFY_NULLDUMMY bor ?SCRIPT_VERIFY_NULLFAIL
-                   bor ?SCRIPT_VERIFY_WITNESS_PUBKEYTYPE;
+        true -> F6 bor ?SCRIPT_VERIFY_NULLDUMMY;
         false -> F6
     end;
 
 flags_for_height(_Height, _Network) ->
-    %% testnet/regtest: all consensus flags active from genesis
-    %% Only consensus flags here — policy flags (CLEANSTACK, SIGPUSHONLY,
-    %% LOW_S, STRICTENC, MINIMALDATA, etc.) are NOT consensus.
+    %% testnet/regtest: all consensus flags active from genesis.
+    %% Only Bitcoin Core MANDATORY_SCRIPT_VERIFY_FLAGS here.
+    %% Policy flags (CLEANSTACK, SIGPUSHONLY, LOW_S, STRICTENC, MINIMALDATA,
+    %% NULLFAIL, WITNESS_PUBKEYTYPE, etc.) belong in the mempool path only.
     ?SCRIPT_VERIFY_P2SH
     bor ?SCRIPT_VERIFY_DERSIG
     bor ?SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY
     bor ?SCRIPT_VERIFY_CHECKSEQUENCEVERIFY
     bor ?SCRIPT_VERIFY_WITNESS
     bor ?SCRIPT_VERIFY_NULLDUMMY
-    bor ?SCRIPT_VERIFY_NULLFAIL
-    bor ?SCRIPT_VERIFY_WITNESS_PUBKEYTYPE
     bor ?SCRIPT_VERIFY_TAPROOT.
