@@ -1101,3 +1101,98 @@ contextual_check_block_rejects_non_final_tx_test() ->
     %% sequence=0 ≠ SEQUENCE_FINAL → non-final → bad_txns_nonfinal
     ?assertEqual({error, bad_txns_nonfinal},
                  beamchain_validation:contextual_check_block(Block, 100, PrevIndex, Params)).
+
+%%% ===================================================================
+%%% BIP-34 coinbase height encoding tests (Core ContextualCheckBlock parity)
+%%% Reference: Bitcoin Core validation.cpp:4151-4159, script.h:433-448
+%%% Canonical encoding: CScript() << nHeight
+%%%   height 0     → <<0x00>>          (OP_0)
+%%%   heights 1-16 → <<0x50+H>>        (OP_1..OP_16)
+%%%   heights 17+  → <<Len, LE-bytes>> (length-prefixed sign-magnitude CScriptNum)
+%%% ===================================================================
+
+%% Test encode_bip34_height/1 canonical vectors
+encode_bip34_height_op0_test() ->
+    ?assertEqual(<<16#00>>, beamchain_validation:encode_bip34_height(0)).
+
+encode_bip34_height_op1_test() ->
+    ?assertEqual(<<16#51>>, beamchain_validation:encode_bip34_height(1)).
+
+encode_bip34_height_op16_test() ->
+    ?assertEqual(<<16#60>>, beamchain_validation:encode_bip34_height(16)).
+
+encode_bip34_height_17_test() ->
+    ?assertEqual(<<16#01, 16#11>>, beamchain_validation:encode_bip34_height(17)).
+
+encode_bip34_height_127_test() ->
+    ?assertEqual(<<16#01, 16#7f>>, beamchain_validation:encode_bip34_height(127)).
+
+encode_bip34_height_128_sign_pad_test() ->
+    %% 0x80 has high bit set → needs zero sign byte → <<0x02, 0x80, 0x00>>
+    ?assertEqual(<<16#02, 16#80, 16#00>>, beamchain_validation:encode_bip34_height(128)).
+
+encode_bip34_height_32768_sign_pad_test() ->
+    %% 0x8000 → LE bytes [0x00, 0x80]; high bit of 0x80 set → sign pad
+    ?assertEqual(<<16#03, 16#00, 16#80, 16#00>>, beamchain_validation:encode_bip34_height(32768)).
+
+encode_bip34_height_500000_test() ->
+    %% 500000 = 0x07A120, LE: 0x20, 0xA1, 0x07 (no sign pad needed)
+    ?assertEqual(<<16#03, 16#20, 16#a1, 16#07>>, beamchain_validation:encode_bip34_height(500000)).
+
+%% Helper: coinbase tx with given scriptSig
+bip34_make_coinbase(ScriptSig) ->
+    #transaction{
+        version = 1,
+        inputs = [#tx_in{
+            prev_out = #outpoint{hash = <<0:256>>, index = 16#ffffffff},
+            script_sig = ScriptSig,
+            sequence = 16#ffffffff,
+            witness = undefined
+        }],
+        outputs = [#tx_out{value = 5000000000,
+                           script_pubkey = <<>>}],
+        locktime = 0,
+        txid = undefined,
+        wtxid = undefined
+    }.
+
+%% Canonical height 1: OP_1 (0x51) accepted; extra bytes after prefix OK
+bip34_accept_height1_op1_test() ->
+    Tx = bip34_make_coinbase(<<16#51, 16#00>>),
+    ?assertEqual(ok, beamchain_validation:check_coinbase_height(Tx, 1)).
+
+%% Canonical height 16: OP_16 (0x60) accepted
+bip34_accept_height16_op16_test() ->
+    Tx = bip34_make_coinbase(<<16#60, 16#00>>),
+    ?assertEqual(ok, beamchain_validation:check_coinbase_height(Tx, 16)).
+
+%% Canonical height 128 with sign-pad accepted
+bip34_accept_height128_sign_pad_test() ->
+    Tx = bip34_make_coinbase(<<16#02, 16#80, 16#00>>),
+    ?assertEqual(ok, beamchain_validation:check_coinbase_height(Tx, 128)).
+
+%% Canonical height 32768 with sign-pad accepted
+bip34_accept_height32768_sign_pad_test() ->
+    Tx = bip34_make_coinbase(<<16#03, 16#00, 16#80, 16#00>>),
+    ?assertEqual(ok, beamchain_validation:check_coinbase_height(Tx, 32768)).
+
+%% REJECT: length-prefixed <<0x01, 0x01>> for height 1 (must be OP_1)
+bip34_reject_lenprefixed_h1_test() ->
+    Tx = bip34_make_coinbase(<<16#01, 16#01>>),
+    ?assertThrow(bad_cb_height, beamchain_validation:check_coinbase_height(Tx, 1)).
+
+%% REJECT: length-prefixed <<0x01, 0x10>> for height 16 (must be OP_16)
+bip34_reject_lenprefixed_h16_test() ->
+    Tx = bip34_make_coinbase(<<16#01, 16#10>>),
+    ?assertThrow(bad_cb_height, beamchain_validation:check_coinbase_height(Tx, 16)).
+
+%% REJECT: zero-padded encoding for height 100 (<<0x02, 0x64, 0x00>> non-canonical)
+bip34_reject_zero_padded_h100_test() ->
+    Tx = bip34_make_coinbase(<<16#02, 16#64, 16#00>>),
+    ?assertThrow(bad_cb_height, beamchain_validation:check_coinbase_height(Tx, 100)).
+
+%% REJECT: missing sign byte for height 128 (<<0x01, 0x80>> is non-canonical)
+bip34_reject_missing_sign_byte_h128_test() ->
+    %% <<0x01, 0x80>> would decode as -128 in CScriptNum; canonical is <<0x02, 0x80, 0x00>>
+    Tx = bip34_make_coinbase(<<16#01, 16#80>>),
+    ?assertThrow(bad_cb_height, beamchain_validation:check_coinbase_height(Tx, 128)).
