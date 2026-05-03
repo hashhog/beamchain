@@ -724,3 +724,36 @@ test_dumptxoutset_emits_hash_serialized() ->
 bin_to_display_hex(Bin) ->
     Reversed = list_to_binary(lists:reverse(binary_to_list(Bin))),
     lists:flatten([io_lib:format("~2.16.0b", [B]) || <<B:8>> <= Reversed]).
+
+%% ---------------------------------------------------------------
+%% Atomic-write protocol regression
+%%
+%% Mirrors Bitcoin Core's rpc/blockchain.cpp::dumptxoutset which writes
+%% to "<path>.incomplete", fsyncs, and renames. After a successful write
+%% only <path> should exist; the .incomplete temp must be gone so that
+%% mid-dump observers never see a torn file. We exercise the helper
+%% directly because driving the full RPC requires a running node.
+%% ---------------------------------------------------------------
+
+atomic_write_test() ->
+    Dir = filename:join(["/tmp",
+                         "beamchain_snapshot_atomic_" ++
+                             integer_to_list(erlang:system_time())]),
+    ok = filelib:ensure_dir(filename:join(Dir, "x")),
+    try
+        Path = filename:join(Dir, "snapshot.dat"),
+        Tmp  = Path ++ ".incomplete",
+        ?assertEqual(false, filelib:is_regular(Path)),
+        ?assertEqual(false, filelib:is_regular(Tmp)),
+
+        Payload = <<"hello-snapshot">>,
+        ok = beamchain_rpc:write_snapshot_atomic(Tmp, Path, Payload),
+
+        ?assertEqual(true, filelib:is_regular(Path)),
+        ?assertEqual(false, filelib:is_regular(Tmp)),
+        ?assertEqual({ok, Payload}, file:read_file(Path))
+    after
+        _ = file:delete(filename:join(Dir, "snapshot.dat")),
+        _ = file:delete(filename:join(Dir, "snapshot.dat.incomplete")),
+        _ = file:del_dir(Dir)
+    end.

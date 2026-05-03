@@ -29,6 +29,12 @@
 %% Pure function; no side effects beyond DB lookups for height/hash → index.
 -export([resolve_dump_target/5]).
 
+%% Exported for testing — atomic dump write helper. Writes Payload to
+%% TmpPath, fsyncs, and renames to FinalPath. Cleans up TmpPath on any
+%% failure. Mirrors bitcoin-core/src/rpc/blockchain.cpp::dumptxoutset's
+%% "temppath = path + .incomplete" → fsync → rename flow.
+-export([write_snapshot_atomic/3]).
+
 %% NetworkDisable RAII: Bitcoin Core's `NetworkDisable` (rpc/blockchain.cpp)
 %% wraps `dumptxoutset rollback`'s rewind→dump→replay dance so peers and
 %% submitblock RPC callers cannot race a new block into the chain mid-rewind.
