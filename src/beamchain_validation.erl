@@ -117,6 +117,18 @@ check_block(#block{header = Header, transactions = Txs}, Params) ->
             end
         end, Txs),
 
+        %% 5b. Explicit duplicate-txid pre-check (Core BIP-22 parity).
+        %% Iterate non-coinbase transactions and accumulate txids into a set.
+        %% If any non-coinbase txid appears more than once, reject with
+        %% dup_txid before the merkle root check fires.  This ensures the
+        %% BIP-22 reason string maps to "bad-txns-inputs-missingorspent"
+        %% (matching Bitcoin Core's ConnectBlock path) rather than the
+        %% implementation-specific "bad-txnmrklroot" we would otherwise
+        %% emit.  Note: coinbase uniqueness is enforced by BIP-34 / height
+        %% commitment, not here.
+        NonCbTxids = [beamchain_serialize:tx_hash(Tx) || Tx <- RestTxs],
+        check_no_dup_txids(NonCbTxids),
+
         %% 6. verify merkle root
         TxHashes = [beamchain_serialize:tx_hash(Tx) || Tx <- Txs],
         ComputedMerkle = beamchain_serialize:compute_merkle_root(TxHashes),
@@ -673,6 +685,20 @@ decode_op_n(_) -> ?MAX_PUBKEYS_PER_MULTISIG.  %% invalid: use max
 %% @doc Check for merkle tree malleation (CVE-2012-2459).
 %% At each level of the merkle tree, if the count is odd and the last
 %% two entries are equal, the tree can be mutated.
+%% check_no_dup_txids/1 — reject if any txid appears more than once.
+%% Called before the merkle root check so that blocks with duplicate
+%% non-coinbase txids emit "bad-txns-inputs-missingorspent" (Core BIP-22
+%% canonical string) rather than "bad-txnmrklroot".
+check_no_dup_txids(Txids) ->
+    check_no_dup_txids(Txids, #{}).
+
+check_no_dup_txids([], _Seen) -> ok;
+check_no_dup_txids([Txid | Rest], Seen) ->
+    case maps:is_key(Txid, Seen) of
+        true  -> throw(dup_txid);
+        false -> check_no_dup_txids(Rest, Seen#{Txid => true})
+    end.
+
 check_merkle_malleation([]) -> ok;
 check_merkle_malleation([_]) -> ok;
 check_merkle_malleation(Hashes) ->
