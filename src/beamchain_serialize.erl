@@ -220,7 +220,12 @@ encode_tx_out(#tx_out{value = Value, script_pubkey = ScriptPubKey}) ->
     <<Value:64/little, (encode_varstr(ScriptPubKey))/binary>>.
 
 -spec decode_tx_out(binary()) -> {#tx_out{}, binary()}.
-decode_tx_out(<<Value:64/little, Rest/binary>>) ->
+decode_tx_out(<<Value:64/signed-little, Rest/binary>>) ->
+    %% Bitcoin wire format for output value is int64 (signed).  Using
+    %% signed-little ensures negative wire values (e.g. -1 = 0xffffffffffffffff)
+    %% arrive as negative integers so check_transaction's `V >= 0` guard fires
+    %% the negative_output atom rather than output_too_large.
+    %% Reference: consensus/tx_check.cpp::CheckTransaction (Core parity).
     {ScriptPubKey, Rest2} = decode_varstr(Rest),
     {#tx_out{value = Value, script_pubkey = ScriptPubKey}, Rest2}.
 
