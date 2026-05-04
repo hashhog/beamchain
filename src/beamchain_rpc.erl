@@ -2598,6 +2598,10 @@ bip22_result(duplicate_inputs)          -> <<"bad-txns-duplicate">>;
 %% stage rather than letting the value fall through to script evaluation.
 %% Reference: consensus/tx_check.cpp::CheckTransaction (Core parity).
 bip22_result({bad_tx, negative_output}) -> <<"bad-txns-vout-negative">>;
+%% Output value > MAX_MONEY: check_transaction fires output_too_large when value > MAX_MONEY.
+%% The validate_block path wraps it as {bad_tx, output_too_large}.
+%% Reference: consensus/tx_check.cpp::CheckTransaction (Core parity).
+bip22_result({bad_tx, output_too_large}) -> <<"bad-txns-vout-toolarge">>;
 bip22_result({bad_tx, _})              -> <<"mandatory-script-verify-flag-failed">>;
 bip22_result(negative_output)          -> <<"bad-txns-vout-negative">>;
 bip22_result(duplicate)                 -> <<"duplicate">>;
