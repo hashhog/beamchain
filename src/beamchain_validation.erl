@@ -292,17 +292,44 @@ contextual_check_block(#block{header = Header, transactions = Txs},
                 orelse throw(bad_txns_nonfinal)
         end, Txs),
 
-        %% 3. BIP 141: witness commitment in coinbase
+        %% 3. Coinbase scriptSig length must be 2..100 bytes (context-free,
+        %%    but placed here so it fires on the connect_block path which
+        %%    does NOT call check_block).
+        %%    Bitcoin Core consensus/tx_check.cpp:49.
+        [#tx_in{script_sig = CbSig} | _] = CoinbaseTx#transaction.inputs,
+        CbSigLen = byte_size(CbSig),
+        (CbSigLen >= 2 andalso CbSigLen =< 100)
+            orelse throw(bad_coinbase_length),
+
+        %% 4. BIP 141: witness commitment in coinbase.
+        %% Bitcoin Core CheckWitnessMalleation (validation.cpp:3870-3901) validates
+        %% the commitment whenever a commitment OP_RETURN is PRESENT in the coinbase,
+        %% regardless of whether non-coinbase transactions carry witness data.
+        %% The previous guard (HasWitnessTx on tl(Txs)) was wrong — it skipped
+        %% the recomputation when the commitment existed but no non-coinbase tx
+        %% had witness data, allowing a crafted wrong commitment to pass.
         SegwitHeight = maps:get(segwit_height, Params, 0),
         case Height >= SegwitHeight of
             true ->
-                HasWitnessTx = lists:any(fun has_witness/1, tl(Txs)),
-                case HasWitnessTx of
+                %% Check if commitment output is present in coinbase
+                WitnessCommitmentPrefix = <<16#6a, 16#24, 16#aa, 16#21, 16#a9, 16#ed>>,
+                HasCommitmentOutput = lists:any(
+                    fun(#tx_out{script_pubkey = SPK}) ->
+                        byte_size(SPK) >= 38 andalso
+                        binary:part(SPK, 0, 6) =:= WitnessCommitmentPrefix
+                    end, CoinbaseTx#transaction.outputs),
+                case HasCommitmentOutput of
                     true ->
+                        %% Commitment is present — always recompute and verify
+                        %% (matches Core: commitpos != NO_WITNESS_COMMITMENT)
                         check_witness_commitment(CoinbaseTx, Txs);
                     false ->
-                        %% no witness txs, commitment is optional
-                        ok
+                        %% No commitment output. Reject if any tx has witness data.
+                        HasWitnessTx = lists:any(fun has_witness/1, Txs),
+                        case HasWitnessTx of
+                            true -> throw(missing_witness_commitment);
+                            false -> ok
+                        end
                 end;
             false -> ok
         end,
