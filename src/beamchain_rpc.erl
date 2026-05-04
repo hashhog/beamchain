@@ -2572,6 +2572,11 @@ bip22_result(high_hash)                  -> <<"high-hash">>;
 bip22_result(bad_diffbits)               -> <<"bad-diffbits">>;
 bip22_result(bad_merkle_root)            -> <<"bad-txnmrklroot">>;
 bip22_result(mutated_merkle)             -> <<"bad-txnmrklroot">>;
+%% Duplicate non-coinbase txid: Core emits bad-txns-inputs-missingorspent
+%% from ConnectBlock when the second instance tries to spend an already-spent
+%% prevout.  Our pre-check fires before the merkle root check to emit the
+%% same canonical BIP-22 reason string (corpus: dup-txid-merkle-malleation).
+bip22_result(dup_txid)                   -> <<"bad-txns-inputs-missingorspent">>;
 bip22_result(bad_witness_commitment)     -> <<"bad-witness-merkle-match">>;
 bip22_result(missing_witness_commitment) -> <<"bad-witness-merkle-match">>;
 bip22_result(bad_witness_nonce)          -> <<"bad-witness-merkle-match">>;
