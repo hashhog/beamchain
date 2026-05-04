@@ -2602,7 +2602,11 @@ bip22_result({bad_tx, negative_output}) -> <<"bad-txns-vout-negative">>;
 %% The validate_block path wraps it as {bad_tx, output_too_large}.
 %% Reference: consensus/tx_check.cpp::CheckTransaction (Core parity).
 bip22_result({bad_tx, output_too_large}) -> <<"bad-txns-vout-toolarge">>;
-bip22_result({bad_tx, _})              -> <<"mandatory-script-verify-flag-failed">>;
+%% Connect-block script verification failure (validation.erl throws {script_verify_failed, Idx}).
+%% Core validation.cpp:2122: "block-script-verify-flag-failed (%s)"
+%% Covers disabled opcodes (OP_CAT/OP_SUBSTR/etc.), signature failures, etc.
+bip22_result({script_verify_failed, _}) -> <<"block-script-verify-flag-failed">>;
+bip22_result({bad_tx, _})              -> <<"block-script-verify-flag-failed">>;
 bip22_result(negative_output)          -> <<"bad-txns-vout-negative">>;
 bip22_result(duplicate)                 -> <<"duplicate">>;
 bip22_result(_)                         -> <<"rejected">>.
