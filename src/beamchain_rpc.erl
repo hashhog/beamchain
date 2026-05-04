@@ -2592,7 +2592,14 @@ bip22_result(bad_cb_height)             -> <<"bad-cb-height">>;
 bip22_result(time_too_old)              -> <<"time-too-old">>;
 bip22_result(time_too_new)              -> <<"time-too-new">>;
 bip22_result(duplicate_inputs)          -> <<"bad-txns-duplicate">>;
+%% Negative output value: check_transaction fires negative_output when value < 0.
+%% The validate_block path wraps it as {bad_tx, negative_output}.
+%% decode_tx_out now uses signed-little so the guard fires at CheckTransaction
+%% stage rather than letting the value fall through to script evaluation.
+%% Reference: consensus/tx_check.cpp::CheckTransaction (Core parity).
+bip22_result({bad_tx, negative_output}) -> <<"bad-txns-vout-negative">>;
 bip22_result({bad_tx, _})              -> <<"mandatory-script-verify-flag-failed">>;
+bip22_result(negative_output)          -> <<"bad-txns-vout-negative">>;
 bip22_result(duplicate)                 -> <<"duplicate">>;
 bip22_result(_)                         -> <<"rejected">>.
 
