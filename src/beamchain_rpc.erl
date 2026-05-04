@@ -2584,6 +2584,10 @@ bip22_result(bad_cb_amount)             -> <<"bad-cb-amount">>;
 bip22_result(insufficient_input)        -> <<"bad-cb-amount">>;
 bip22_result(bad_blk_sigops)            -> <<"bad-blk-sigops">>;
 bip22_result(bad_txns_nonfinal)         -> <<"bad-txns-nonfinal">>;
+%% BIP-68 SequenceLocks failure (relative locktime not met).
+%% Core validation.cpp:2558: state.Invalid(BLOCK_CONSENSUS, "bad-txns-nonfinal", ...).
+%% Same canonical string as IsFinalTx (nLockTime) per Core parity.
+bip22_result(sequence_lock_not_met)     -> <<"bad-txns-nonfinal">>;
 bip22_result(bad_coinbase_length)       -> <<"bad-cb-length">>;
 %% check_transaction wraps bad_coinbase_length as {bad_tx, bad_coinbase_length};
 %% match this before the generic {bad_tx, _} catch-all.
