@@ -87,17 +87,32 @@ import_loop(Fd, Source, Count, StartTime) ->
                         false ->
                             %% Deserialize the raw block
                             {Block, _Rest} = beamchain_serialize:decode_block(BlockData),
-                            %% Connect the block via chainstate
-                            case beamchain_chainstate:connect_block(Block) of
-                                ok ->
-                                    NewCount = Count + 1,
-                                    maybe_progress(NewCount, Height, StartTime),
-                                    import_loop(Fd, Source, NewCount, StartTime);
-                                {error, Reason3} ->
+                            %% Context-free block check (PoW, merkle root, weight,
+                            %% sigops, dup-txid scan) — mirrors Bitcoin Core CheckBlock()
+                            %% called from ProcessNewBlock. Replicates the same gate
+                            %% used by the submitblock and P2P paths (miner.erl:340,
+                            %% block_sync.erl:985).
+                            Params = beamchain_chain_params:params(
+                                         beamchain_config:network()),
+                            case beamchain_validation:check_block(Block, Params) of
+                                {error, CheckErr} ->
                                     io:format(standard_error,
-                                              "~nFailed to connect block at height ~B: ~p~n",
-                                              [Height, Reason3]),
-                                    finish(Count, StartTime)
+                                              "~nFailed check_block at height ~B: ~p~n",
+                                              [Height, CheckErr]),
+                                    finish(Count, StartTime);
+                                ok ->
+                                    %% Connect the block via chainstate
+                                    case beamchain_chainstate:connect_block(Block) of
+                                        ok ->
+                                            NewCount = Count + 1,
+                                            maybe_progress(NewCount, Height, StartTime),
+                                            import_loop(Fd, Source, NewCount, StartTime);
+                                        {error, Reason3} ->
+                                            io:format(standard_error,
+                                                      "~nFailed to connect block at height ~B: ~p~n",
+                                                      [Height, Reason3]),
+                                            finish(Count, StartTime)
+                                    end
                             end
                     end
             end

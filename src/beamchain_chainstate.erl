@@ -1015,14 +1015,25 @@ disconnect_to(TargetHash, State, AccTxs) ->
     end.
 
 %% Connect a list of blocks in order.
+%% Each block is re-checked with check_block (context-free: PoW, merkle root,
+%% weight, sigops, dup-txid scan) before being applied to the chain, matching
+%% the sequence used by do_submit_block and process_pending_block.  This
+%% guards against a tampered on-disk block silently re-entering the active
+%% chain during a reorg replay.  Mirrors Bitcoin Core's ProcessNewBlock
+%% pipeline (validation.cpp CheckBlock → ConnectBlock).
 connect_blocks([], State) ->
     {ok, State};
-connect_blocks([Block | Rest], State) ->
-    case do_connect_block(Block, State) of
-        {ok, State2} ->
-            connect_blocks(Rest, State2);
-        {error, Reason} ->
-            {error, Reason}
+connect_blocks([Block | Rest], #state{params = Params} = State) ->
+    case beamchain_validation:check_block(Block, Params) of
+        {error, CheckErr} ->
+            {error, {check_block_failed, CheckErr}};
+        ok ->
+            case do_connect_block(Block, State) of
+                {ok, State2} ->
+                    connect_blocks(Rest, State2);
+                {error, Reason} ->
+                    {error, Reason}
+            end
     end.
 
 %% Format hash for logging.
