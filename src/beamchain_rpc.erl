@@ -2579,6 +2579,7 @@ bip22_result(bad_cb_amount)             -> <<"bad-cb-amount">>;
 bip22_result(insufficient_input)        -> <<"bad-cb-amount">>;
 bip22_result(bad_blk_sigops)            -> <<"bad-blk-sigops">>;
 bip22_result(bad_txns_nonfinal)         -> <<"bad-txns-nonfinal">>;
+bip22_result(bad_coinbase_length)       -> <<"bad-cb-length">>;
 bip22_result(bad_cb_height)             -> <<"bad-cb-height">>;
 bip22_result(time_too_old)              -> <<"time-too-old">>;
 bip22_result(time_too_new)              -> <<"time-too-new">>;
