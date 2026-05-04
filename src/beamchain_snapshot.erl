@@ -745,8 +745,11 @@ serialize_grouped_coins(Grouped) ->
     iolist_to_binary(Parts).
 
 serialize_grouped_tx({Txid, Coins}) ->
-    %% Coins were prepended during grouping, so reverse for vout-asc output.
-    Ordered = lists:reverse(Coins),
+    %% Sort by vout ascending to match Bitcoin Core's write_coins_to_file,
+    %% which walks a std::map<uint32_t, Coin> (vout-ascending by construction).
+    %% Reference: bitcoin-core/src/rpc/blockchain.cpp write_coins_to_file;
+    %%            bitcoin-core/src/serialize.h WriteCompactSize.
+    Ordered = lists:sort(fun({Vout1, _}, {Vout2, _}) -> Vout1 =< Vout2 end, Coins),
     CoinsCount = encode_compact_size(length(Ordered)),
     CoinsBin = lists:map(fun({Vout, Utxo}) ->
         VoutBin = encode_compact_size(Vout),
