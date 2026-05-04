@@ -331,25 +331,38 @@ do_submit_block(HexBlock) ->
         %% 2. deserialize block
         {Block, _Rest} = beamchain_serialize:decode_block(BlockBin),
 
-        %% 3. validate and connect to chain
-        case beamchain_chainstate:connect_block(Block) of
+        %% 3. context-free block checks (PoW, merkle root, sigops, weight).
+        %% Mirrors Bitcoin Core CheckBlock() in validation.cpp — in particular
+        %% the BlockMerkleRoot() recomputation that catches bad-txnmrklroot.
+        %% This step was previously missing from the submitblock path (unlike
+        %% the block-sync path which always called check_block/2 first).
+        Params = beamchain_chain_params:params(beamchain_config:network()),
+        case beamchain_validation:check_block(Block, Params) of
             ok ->
-                %% 4. remove confirmed txs from mempool
-                Txids = [beamchain_serialize:tx_hash(Tx)
-                         || Tx <- Block#block.transactions],
-                beamchain_mempool:remove_for_block(Txids),
+                %% 4. validate and connect to chain
+                case beamchain_chainstate:connect_block(Block) of
+                    ok ->
+                        %% 5. remove confirmed txs from mempool
+                        Txids = [beamchain_serialize:tx_hash(Tx)
+                                 || Tx <- Block#block.transactions],
+                        beamchain_mempool:remove_for_block(Txids),
 
-                %% 5. announce new block to peers
-                BlockHash = beamchain_serialize:block_hash(
-                    Block#block.header),
-                broadcast_new_block(BlockHash),
+                        %% 6. announce new block to peers
+                        BlockHash = beamchain_serialize:block_hash(
+                            Block#block.header),
+                        broadcast_new_block(BlockHash),
 
-                logger:info("miner: accepted block ~s",
-                            [short_hex(BlockHash)]),
-                ok;
-            {error, Reason} ->
-                logger:warning("miner: rejected block: ~p", [Reason]),
-                {error, Reason}
+                        logger:info("miner: accepted block ~s",
+                                    [short_hex(BlockHash)]),
+                        ok;
+                    {error, Reason} ->
+                        logger:warning("miner: rejected block: ~p", [Reason]),
+                        {error, Reason}
+                end;
+            {error, CheckErr} ->
+                logger:warning("miner: rejected block (check_block): ~p",
+                               [CheckErr]),
+                {error, CheckErr}
         end
     catch
         error:Reason2 ->
