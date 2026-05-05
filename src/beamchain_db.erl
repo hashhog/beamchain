@@ -74,6 +74,10 @@
 
 %% Pruning
 -export([prune_block_files/0, is_block_pruned/1, trigger_pruning/1]).
+%% Exported for cross-module testing of the prune file-eligibility
+%% calculation (CORE-PARITY-AUDIT/_pruning-cross-impl-audit-2026-05-05.md
+%% Bug 1).
+-export([find_max_height_in_file/1]).
 
 %% Block height/time indexes
 -export([get_hash_by_height/1, get_blocks_in_time_range/2]).
@@ -1600,24 +1604,56 @@ find_prunable_files(BlocksDir, FileInfo, PrunedFiles, MinKeepHeight, CurrentFile
     lists:sort(fun({A, _}, {B, _}) -> A =< B end, FileList).
 
 %% @doc Find the maximum block height stored in a given file.
+%%
+%% Pre-fix this function always returned 0 for any non-empty file because
+%% the ETS entry layout is `{Hash, {FileNum, Offset, Size}}' (no height
+%% stored), and the previous implementation set `MaxHeight' to 0 on every
+%% match without using the height information available elsewhere. With
+%% that bug, every non-current file looked like it had max_height = 0 so
+%% every prune sweep treated all files as eligible regardless of whether
+%% they were inside the 288-block keep window — would corrupt the keep
+%% window the day pruning went live.
+%%
+%% The correct join is `HEIGHT_TO_HASH_ETS' (Height -> Hash) cross-checked
+%% against `BLOCK_INDEX_ETS' (Hash -> {FileNum, Offset, Size [, pruned]}).
+%% We fold over the height index, look up each hash's FileNum, and track
+%% the max height that lands in the requested FileNum. Returns
+%% `undefined' if no live (un-pruned) blocks belong to the file.
+%%
+%% Reference: bitcoin-core/src/node/blockstorage.cpp `BlockManager::
+%% FindFilesToPrune' uses the per-file `BlockFileInfo::nHeightLast' for
+%% the same purpose. We compute it on demand (slower, fine because prune
+%% runs are infrequent) rather than tracking it per-write — the on-write
+%% tracker is a follow-up.
+%%
+%% Audit: CORE-PARITY-AUDIT/_pruning-cross-impl-audit-2026-05-05.md
+%% (Bug 1; "beamchain `find_max_height_in_file` always returns 0").
 -spec find_max_height_in_file(non_neg_integer()) -> non_neg_integer() | undefined.
 find_max_height_in_file(FileNum) ->
-    %% Scan ETS table to find max height for blocks in this file
-    %% This is not efficient but pruning is infrequent
-    ets:foldl(fun({_Hash, {FN, _Offset, _Size}}, MaxHeight) when FN =:= FileNum ->
-        %% We don't store height in the ETS entry, so we need to look it up
-        %% For now, we'll use the file number as a rough proxy
-        %% (files are written sequentially, so higher file number = higher blocks)
-        %% A more accurate implementation would track height ranges per file
-        case MaxHeight of
-            undefined -> 0;
-            H -> H
-        end;
-    ({_Hash, {FN, _Offset, _Size, pruned}}, MaxHeight) when FN =:= FileNum ->
-        MaxHeight;
-    (_, MaxHeight) ->
-        MaxHeight
-    end, undefined, ?BLOCK_INDEX_ETS).
+    ets:foldl(fun({Height, Hash}, MaxHeight) ->
+        case ets:lookup(?BLOCK_INDEX_ETS, Hash) of
+            [{Hash, {FN, _Offset, _Size}}] when FN =:= FileNum ->
+                update_max_height(Height, MaxHeight);
+            [{Hash, {FN, _Offset, _Size, pruned}}] when FN =:= FileNum ->
+                %% Pruned entries are kept as tombstones in BLOCK_INDEX_ETS
+                %% (see mark_blocks_pruned/1). Their original FileNum is
+                %% still preserved, so they still count toward the
+                %% per-file max height — pruning the same file twice
+                %% must remain a no-op rather than reporting "file is
+                %% empty".
+                update_max_height(Height, MaxHeight);
+            _ ->
+                MaxHeight
+        end
+    end, undefined, ?HEIGHT_TO_HASH_ETS).
+
+%% @doc Helper: bump MaxHeight if Height is greater (or set it on first hit).
+-spec update_max_height(non_neg_integer(),
+                        non_neg_integer() | undefined) ->
+    non_neg_integer().
+update_max_height(Height, undefined) -> Height;
+update_max_height(Height, Current) when Height > Current -> Height;
+update_max_height(_Height, Current) -> Current.
 
 %% @doc Prune files until disk usage is below target.
 -spec prune_until_target(string(), [{non_neg_integer(), non_neg_integer()}],
