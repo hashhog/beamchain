@@ -2126,11 +2126,22 @@ rpc_getmempoolinfo() ->
     Info = beamchain_mempool:get_info(),
     Size = maps:get(size, Info, 0),
     Bytes = maps:get(bytes, Info, 0),
+    %% Compute total_fee by summing fees across all mempool entries.
+    %% Bitcoin Core src/rpc/mempool.cpp::getmempoolinfo surfaces this as
+    %% "total_fee" in BTC (float). We convert from satoshis.
+    Entries = beamchain_mempool:get_all_entries(),
+    TotalFeeSat = lists:foldl(
+        fun(Entry, Acc) -> Acc + Entry#mempool_entry.fee end,
+        0,
+        Entries
+    ),
+    TotalFeeBtc = TotalFeeSat / 100000000.0,
     {ok, #{
         <<"loaded">> => true,
         <<"size">> => Size,
         <<"bytes">> => Bytes,
         <<"usage">> => Bytes,
+        <<"total_fee">> => TotalFeeBtc,
         <<"maxmempool">> => ?DEFAULT_MEMPOOL_MAX_SIZE,
         <<"mempoolminfee">> => ?DEFAULT_MIN_RELAY_TX_FEE / 100000.0,
         <<"minrelaytxfee">> => ?DEFAULT_MIN_RELAY_TX_FEE / 100000.0,
