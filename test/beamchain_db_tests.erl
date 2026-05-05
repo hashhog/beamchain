@@ -39,6 +39,15 @@ db_test_() ->
           {"is_block_pruned returns false initially", fun is_block_pruned_initial/0},
           {"prune_block_files with no prune target", fun prune_disabled/0},
           {"get_block_file_info includes prune info", fun block_file_info_prune/0},
+          %% Bug 1 (audit 2026-05-05): find_max_height_in_file used to
+          %% always return 0; now returns the actual max height of
+          %% blocks belonging to the file.
+          {"find_max_height_in_file returns undefined for empty file",
+           fun find_max_height_empty_file/0},
+          {"find_max_height_in_file returns max of 3 known blocks",
+           fun find_max_height_three_blocks/0},
+          {"find_max_height_in_file ignores blocks in other files",
+           fun find_max_height_isolated_per_file/0},
           %% scrubunspendable: orphan-OP_RETURN / oversize cleanup (commit 79fa3e5)
           {"scrub_unspendable removes orphan OP_RETURN + oversize coins",
            fun scrub_unspendable_removes_orphans/0},
@@ -451,6 +460,81 @@ block_file_info_prune() ->
     %% With default config, prune target should be 0
     ?assertEqual(0, maps:get(prune_target_mb, Info)),
     ?assertEqual(0, maps:get(pruned_file_count, Info)).
+
+%%% ===================================================================
+%%% Bug 1 (audit 2026-05-05): find_max_height_in_file
+%%%
+%%% Pre-fix this function always returned 0 because the code did
+%%% `case MaxHeight of undefined -> 0; H -> H end' on every match
+%%% without ever using the height information available via the
+%%% HEIGHT_TO_HASH_ETS index. With that bug, every non-current file
+%%% looked like it had max_height = 0 = older than tip-288, so every
+%%% non-current file was always "prunable" — would corrupt the
+%%% MIN_BLOCKS_TO_KEEP=288 keep window the day pruning fired.
+%%%
+%%% These tests join HEIGHT_TO_HASH_ETS against BLOCK_INDEX_ETS the
+%%% same way the production code now does, and verify the function
+%%% returns the *actual* max height per file.
+%%%
+%%% Reference: bitcoin-core/src/node/blockstorage.cpp
+%%% BlockManager::FindFilesToPrune (uses BlockFileInfo::nHeightLast).
+%%% ===================================================================
+
+%% Helper: write a block at a given height, populating both indexes
+%% the way write_block + index_block do in production.
+write_block_at_height(Block, Height) ->
+    {ok, _Loc} = beamchain_db:write_block(Block, Height),
+    %% index_block populates HEIGHT_TO_HASH_ETS — this is what the
+    %% chainstate gen_server does on connect_block in production.
+    Timestamp = (Block#block.header)#block_header.timestamp,
+    ok = beamchain_db:index_block(Height, Block#block.hash, Timestamp),
+    ok.
+
+find_max_height_empty_file() ->
+    %% A file with no blocks indexed should return undefined, NOT 0
+    %% (the pre-fix bug returned undefined here too — but for the wrong
+    %% reason; pin the contract).
+    ?assertEqual(undefined, beamchain_db:find_max_height_in_file(99999)).
+
+%% Helper: read FileNum from BLOCK_INDEX_ETS for a known hash.
+%% Implements the test-only "get_block_location" we'd otherwise need.
+file_num_for_hash(Hash) ->
+    case ets:lookup(beamchain_block_index, Hash) of
+        [{Hash, {FN, _Offset, _Size}}] -> FN;
+        [{Hash, {FN, _Offset, _Size, pruned}}] -> FN;
+        _ -> error({hash_not_indexed, Hash})
+    end.
+
+find_max_height_three_blocks() ->
+    %% Write 3 blocks at heights 10, 20, 30 — all small enough to land
+    %% in the same file under the default MAX_BLOCKFILE_SIZE = 128 MB.
+    B0 = make_test_block(<<0:256>>, 30000),
+    B1 = make_test_block(B0#block.hash, 30001),
+    B2 = make_test_block(B1#block.hash, 30002),
+    ok = write_block_at_height(B0, 10),
+    ok = write_block_at_height(B1, 20),
+    ok = write_block_at_height(B2, 30),
+    %% All three blocks are tiny so they share a file. Confirm they did.
+    F0 = file_num_for_hash(B0#block.hash),
+    F1 = file_num_for_hash(B1#block.hash),
+    F2 = file_num_for_hash(B2#block.hash),
+    ?assertEqual(F0, F1),
+    ?assertEqual(F0, F2),
+    %% Pre-fix this returned 0 regardless of the heights stored.
+    %% Post-fix it must return the real max — 30.
+    ?assertEqual(30, beamchain_db:find_max_height_in_file(F0)).
+
+find_max_height_isolated_per_file() ->
+    %% Querying a file that exists but has no blocks belonging to it
+    %% must return undefined, NOT the global max.
+    B = make_test_block(<<0:256>>, 40000),
+    ok = write_block_at_height(B, 50),
+    RealFile = file_num_for_hash(B#block.hash),
+    %% Pick a file number that definitely doesn't have this block
+    OtherFile = RealFile + 17,
+    ?assertEqual(undefined, beamchain_db:find_max_height_in_file(OtherFile)),
+    %% Sanity check: the real file does have it
+    ?assertEqual(50, beamchain_db:find_max_height_in_file(RealFile)).
 
 %%% ===================================================================
 %%% Pruning tests with prune enabled
