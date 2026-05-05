@@ -2612,6 +2612,11 @@ bip22_result({bad_tx, output_too_large}) -> <<"bad-txns-vout-toolarge">>;
 bip22_result({script_verify_failed, _}) -> <<"block-script-verify-flag-failed">>;
 bip22_result({bad_tx, _})              -> <<"block-script-verify-flag-failed">>;
 bip22_result(negative_output)          -> <<"bad-txns-vout-negative">>;
+%% Coinbase maturity violation: beamchain_validation.erl::check_coinbase_maturity
+%% throws premature_spend_of_coinbase when confirmations < COINBASE_MATURITY.
+%% Core: consensus/tx_verify.cpp::CheckTxInputs →
+%% state.Invalid(TX_PREMATURE_SPEND, "bad-txns-premature-spend-of-coinbase").
+bip22_result(premature_spend_of_coinbase) -> <<"bad-txns-premature-spend-of-coinbase">>;
 bip22_result(duplicate)                 -> <<"duplicate">>;
 bip22_result(_)                         -> <<"rejected">>.
 
