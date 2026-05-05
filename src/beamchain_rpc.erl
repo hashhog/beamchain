@@ -782,6 +782,11 @@ rpc_getblockchaininfo() ->
                     {<<0:256>>, 0}
             end,
             Difficulty = tip_difficulty(),
+            %% Extract tip bits for bits/target fields
+            TipBits = case beamchain_db:get_block_index(TipHeight) of
+                {ok, #{header := TipHdr}} -> TipHdr#block_header.bits;
+                _ -> 16#1d00ffff
+            end,
             %% Use the shared deployment helper — same source of truth as getdeploymentinfo.
             HeightGetter = fun(H) -> beamchain_db:get_block_index(H) end,
             Softforks = build_deployment_map(Network, TipHeight, HeightGetter),
@@ -799,6 +804,8 @@ rpc_getblockchaininfo() ->
                 end,
                 <<"initialblockdownload">> => not Synced,
                 <<"chainwork">> => beamchain_serialize:hex_encode(Chainwork),
+                <<"bits">> => beamchain_serialize:hex_encode(<<TipBits:32/big>>),
+                <<"target">> => bits_to_target_hex(TipBits),
                 <<"pruned">> => false,
                 <<"softforks">> => Softforks,
                 <<"warnings">> => <<>>
@@ -2344,6 +2351,7 @@ rpc_getpeerinfo() ->
             <<"id">> => erlang:phash2({IP, Port}),
             <<"addr">> => format_addr(IP, Port),
             <<"addrbind">> => <<>>,
+            <<"network">> => <<"ipv4">>,
             <<"services">> => beamchain_serialize:hex_encode(
                 <<(maps:get(services, Info, 0)):64/big>>),
             <<"servicesnames">> => services_to_names(
@@ -2361,19 +2369,30 @@ rpc_getpeerinfo() ->
                 PeerTs -> PeerTs - Now
             end,
             <<"pingtime">> => PingTime,
+            <<"minping">> => PingTime,
             <<"version">> => maps:get(version, Info, 0),
             <<"subver">> => maps:get(user_agent, Info, <<"/unknown/">>),
             <<"inbound">> => Dir =:= inbound,
             <<"bip152_hb_to">> => false,
             <<"bip152_hb_from">> => false,
             <<"startingheight">> => maps:get(start_height, Info, 0),
-            <<"presynced_headers">> => 0,
+            <<"presynced_headers">> => -1,
             <<"synced_headers">> => -1,
             <<"synced_blocks">> => -1,
+            <<"inflight">> => [],
+            <<"addr_relay_enabled">> => true,
+            <<"addr_processed">> => 0,
+            <<"addr_rate_limited">> => 0,
+            <<"permissions">> => [],
+            <<"minfeefilter">> => 0.0,
+            <<"bytessent_per_msg">> => #{},
+            <<"bytesrecv_per_msg">> => #{},
             <<"connection_type">> => case Dir of
                 outbound -> <<"outbound-full-relay">>;
                 inbound -> <<"inbound">>
-            end
+            end,
+            <<"transport_protocol_type">> => <<"v1">>,
+            <<"session_id">> => <<>>
         }
     end, Peers),
     {ok, PeerInfoList}.
@@ -2535,19 +2554,37 @@ format_ip(IP) ->
 
 rpc_getmininginfo() ->
     Network = beamchain_config:network(),
-    {Blocks, Difficulty} = case beamchain_chainstate:get_tip() of
+    {Blocks, Difficulty, TipBits} = case beamchain_chainstate:get_tip() of
         {ok, {_Hash, Height}} ->
-            {Height, tip_difficulty()};
+            Bits = case beamchain_db:get_block_index(Height) of
+                {ok, #{header := Hdr}} -> Hdr#block_header.bits;
+                _ -> 16#1d00ffff
+            end,
+            {Height, tip_difficulty(), Bits};
         not_found ->
-            {0, 0.0}
+            {0, 0.0, 16#1d00ffff}
     end,
+    BitsHex = beamchain_serialize:hex_encode(<<TipBits:32/big>>),
+    TargetHex = bits_to_target_hex(TipBits),
     PooledTx = length(beamchain_mempool:get_all_txids()),
     {ok, #{
         <<"blocks">> => Blocks,
+        <<"currentblocksize">> => 0,
+        <<"currentblockweight">> => 0,
+        <<"currentblocktx">> => 0,
+        <<"bits">> => BitsHex,
         <<"difficulty">> => Difficulty,
+        <<"target">> => TargetHex,
+        <<"blockmintxfee">> => 0.00001000,
         <<"networkhashps">> => 0,
         <<"pooledtx">> => PooledTx,
         <<"chain">> => network_name(Network),
+        <<"next">> => #{
+            <<"height">> => Blocks + 1,
+            <<"bits">> => BitsHex,
+            <<"difficulty">> => Difficulty,
+            <<"target">> => TargetHex
+        },
         <<"warnings">> => <<>>
     }}.
 
@@ -3101,6 +3138,14 @@ network_name(regtest)  -> <<"regtest">>;
 network_name(signet)   -> <<"signet">>;
 network_name(N)        -> atom_to_binary(N, utf8).
 
+%% Convert compact bits to 64-char lowercase hex target string (Core format).
+bits_to_target_hex(Bits) ->
+    Target = beamchain_pow:bits_to_target(Bits),
+    Hex = iolist_to_binary(io_lib:format("~64.16.0b", [Target])),
+    %% io_lib:format ~16.0b produces uppercase; lowercase it
+    << <<(case C of C when C >= $A, C =< $F -> C + 32; _ -> C end)>>
+       || <<C>> <= Hex >>.
+
 %% Compute difficulty from compact bits.
 %% difficulty = max_target / current_target
 bits_to_difficulty(Bits) ->
@@ -3186,6 +3231,32 @@ format_block_json(#block{header = Header, transactions = Txs} = Block,
         false ->
             [hash_to_hex(beamchain_serialize:tx_hash(Tx)) || Tx <- Txs]
     end,
+    %% Build coinbase_tx from first transaction's first input (Core 27+ field)
+    CoinbaseTx = case Txs of
+        [] -> null;
+        [CbTx | _] ->
+            {CbSeq, CbScript, CbWitness} = case CbTx#transaction.inputs of
+                [Inp | _] ->
+                    Wit = case Inp#tx_in.witness of
+                        [W0 | _] -> beamchain_serialize:hex_encode(W0);
+                        _ -> undefined
+                    end,
+                    {Inp#tx_in.sequence,
+                     beamchain_serialize:hex_encode(Inp#tx_in.script_sig),
+                     Wit};
+                [] -> {16#ffffffff, <<>>, undefined}
+            end,
+            Base = #{
+                <<"version">>  => CbTx#transaction.version,
+                <<"locktime">> => CbTx#transaction.locktime,
+                <<"sequence">> => CbSeq,
+                <<"coinbase">> => CbScript
+            },
+            case CbWitness of
+                undefined -> Base;
+                W -> Base#{<<"witness">> => W}
+            end
+    end,
     #{
         <<"hash">> => hash_to_hex(Hash),
         <<"confirmations">> => confirmations(Height),
@@ -3198,6 +3269,7 @@ format_block_json(#block{header = Header, transactions = Txs} = Block,
         <<"mediantime">> => block_mtp(Height),
         <<"nonce">> => Header#block_header.nonce,
         <<"bits">> => beamchain_serialize:hex_encode(<<Bits:32/big>>),
+        <<"target">> => bits_to_target_hex(Bits),
         <<"difficulty">> => bits_to_difficulty(Bits),
         <<"chainwork">> => beamchain_serialize:hex_encode(Chainwork),
         <<"nTx">> => length(Txs),
@@ -3207,7 +3279,8 @@ format_block_json(#block{header = Header, transactions = Txs} = Block,
         <<"size">> => Size,
         <<"weight">> => Weight,
         <<"strippedsize">> => stripped_size(Block),
-        <<"tx">> => TxList
+        <<"tx">> => TxList,
+        <<"coinbase_tx">> => CoinbaseTx
     }.
 
 %% Format a transaction as JSON (for getblock verbosity=2).
