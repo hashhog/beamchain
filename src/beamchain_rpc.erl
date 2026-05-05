@@ -45,6 +45,9 @@
          set_block_submission_paused/1,
          bip22_result/1]).
 
+%% Exported for testing — verifychain RPC handler.
+-export([rpc_verifychain/1]).
+
 %% Cowboy handler
 -export([init/2]).
 
@@ -496,7 +499,7 @@ handle_method(<<"getdifficulty">>, _, _W) -> rpc_getdifficulty();
 handle_method(<<"getchaintips">>, _, _W) -> rpc_getchaintips();
 handle_method(<<"getblockstats">>, P, _W) -> rpc_getblockstats(P);
 handle_method(<<"getchaintxstats">>, P, _W) -> rpc_getchaintxstats(P);
-handle_method(<<"verifychain">>, _, _W) -> rpc_verifychain();
+handle_method(<<"verifychain">>, P, _W) -> rpc_verifychain(P);
 handle_method(<<"invalidateblock">>, P, _W) -> rpc_invalidateblock(P);
 handle_method(<<"reconsiderblock">>, P, _W) -> rpc_reconsiderblock(P);
 handle_method(<<"flushchainstate">>, _, _W) -> rpc_flushchainstate();
@@ -1108,12 +1111,250 @@ rpc_getchaintips() ->
             {ok, []}
     end.
 
-rpc_verifychain() ->
-    %% Simplified: return true if we have a chain tip
-    case beamchain_chainstate:get_tip() of
-        {ok, _} -> {ok, true};
-        not_found -> {ok, true}
+%% @doc verifychain — actually walk the chain.
+%%
+%% Mirrors bitcoin-core/src/rpc/blockchain.cpp::verifychain.
+%%
+%% Args (positional, all optional):
+%%   1. checklevel  (0..4, default 3)
+%%   2. nblocks     (0..tip_height, default 6, 0 = entire chain)
+%%
+%% Per-level work, descending from tip for nblocks blocks:
+%%   0: read block from disk
+%%   1: + check_block (header sanity, merkle root, tx structure, weight, sigops)
+%%   2: + verify undo data exists and decodes
+%%   3: + verify undo entry count matches block's spent-input count
+%%      (best-effort: full Core-parity disconnect/reconnect-into-sandbox-UTXO
+%%       is not implemented because beamchain's UTXO cache is process-global;
+%%       a true disconnect/reconnect would mutate live chainstate.)
+%%   4: + re-verify scripts for every non-coinbase tx using stored undo coins
+%%        as the prevout source (same SigChecker shape as connect_block).
+%%
+%% Returns true on success, false on any failure. Halts on first failure
+%% and logs the failing block hash + reason.
+%%
+%% Reference: Core checklevel = consensus::DEFAULT_CHECKLEVEL = 3,
+%%            nblocks = consensus::DEFAULT_CHECKBLOCKS = 6.
+rpc_verifychain(Params) ->
+    CheckLevel = case Params of
+        [] -> 3;
+        [L | _] when is_integer(L) -> L;
+        _ -> 3
+    end,
+    NBlocks = case Params of
+        [_, N | _] when is_integer(N) -> N;
+        _ -> 6
+    end,
+    case CheckLevel < 0 orelse CheckLevel > 4 of
+        true ->
+            {error, ?RPC_INVALID_PARAMETER,
+             <<"checklevel must be in range [0, 4]">>};
+        false ->
+            do_verifychain(CheckLevel, NBlocks)
     end.
+
+do_verifychain(CheckLevel, NBlocks) ->
+    case beamchain_chainstate:get_tip() of
+        not_found ->
+            %% No chain → vacuously valid (matches Core behaviour with
+            %% a fresh datadir: nothing to verify, return true).
+            {ok, true};
+        {ok, {TipHash, TipHeight}} ->
+            Network = beamchain_config:network(),
+            ChainParams = beamchain_chain_params:params(Network),
+            %% Compute how many blocks to actually walk.
+            %% nblocks=0 means the entire chain; otherwise clamp to TipHeight+1.
+            Walk = case NBlocks of
+                0 -> TipHeight + 1;
+                N when N > TipHeight + 1 -> TipHeight + 1;
+                N -> N
+            end,
+            verifychain_walk(TipHash, TipHeight, Walk, CheckLevel,
+                             ChainParams, Network)
+    end.
+
+%% Walk descending from current hash for Remaining blocks.
+verifychain_walk(_Hash, _Height, 0, _Lvl, _Params, _Network) ->
+    {ok, true};
+verifychain_walk(Hash, Height, Remaining, Lvl, Params, Network)
+        when Height < 0 ->
+    %% Walked past genesis; we're done.
+    _ = Hash, _ = Remaining, _ = Lvl, _ = Params, _ = Network,
+    {ok, true};
+verifychain_walk(Hash, Height, Remaining, Lvl, Params, Network) ->
+    case verify_one_block(Hash, Height, Lvl, Params, Network) of
+        {ok, PrevHash} ->
+            verifychain_walk(PrevHash, Height - 1, Remaining - 1,
+                             Lvl, Params, Network);
+        {error, Reason} ->
+            HashHex = hash_to_hex(Hash),
+            logger:error("verifychain: block ~s at height ~B failed: ~p",
+                         [HashHex, Height, Reason]),
+            {ok, false}
+    end.
+
+%% Verify a single block at the requested level.
+%% Returns {ok, PrevHash} on success (so the walk can continue) or
+%% {error, Reason} on failure.
+verify_one_block(Hash, Height, Lvl, Params, Network) ->
+    %% Level 0: read block from disk.
+    case beamchain_db:get_block(Hash) of
+        not_found ->
+            {error, block_not_found};
+        {ok, Block} ->
+            Header = Block#block.header,
+            PrevHash = Header#block_header.prev_hash,
+            %% Genesis sentinel: 32 zero bytes. Don't recurse past it.
+            verify_one_block_levels(Block, Hash, Height, Lvl, Params, Network,
+                                    PrevHash)
+    end.
+
+verify_one_block_levels(Block, Hash, Height, Lvl, Params, Network, PrevHash) ->
+    Steps = [
+        {1, fun() -> level1_check_block(Block, Params) end},
+        {2, fun() -> level2_check_undo(Hash) end},
+        {3, fun() -> level3_check_undo_shape(Block, Hash) end},
+        {4, fun() -> level4_check_scripts(Block, Hash, Height, Network) end}
+    ],
+    case run_levels(Lvl, Steps) of
+        ok -> {ok, PrevHash};
+        {error, _} = E -> E
+    end.
+
+run_levels(_Lvl, []) -> ok;
+run_levels(Lvl, [{N, _Fun} | Rest]) when N > Lvl -> run_levels(Lvl, Rest);
+run_levels(Lvl, [{_N, Fun} | Rest]) ->
+    case Fun() of
+        ok -> run_levels(Lvl, Rest);
+        {error, _} = E -> E
+    end.
+
+%% Level 1: context-free block validation (Core's CheckBlock).
+level1_check_block(Block, Params) ->
+    case beamchain_validation:check_block(Block, Params) of
+        ok -> ok;
+        {error, R} -> {error, {check_block_failed, R}}
+    end.
+
+%% Level 2: undo data exists and decodes.
+%%
+%% Genesis has no undo data (no inputs to spend). Every other block on
+%% the active chain stored undo data when it was connected; absence is a
+%% storage-integrity failure.
+level2_check_undo(Hash) ->
+    case beamchain_db:get_undo(Hash) of
+        {ok, UndoBin} ->
+            try
+                _ = beamchain_validation:decode_undo_data(UndoBin),
+                ok
+            catch
+                _:R -> {error, {undo_decode_failed, R}}
+            end;
+        not_found ->
+            %% Tolerate missing undo for genesis (height 0). For any
+            %% other block, missing undo is a real integrity failure —
+            %% but we can't cheaply distinguish "this is genesis" from
+            %% the block alone here; treat missing undo as ok and let
+            %% the level-3 spent-input-count check do the real work.
+            ok
+    end.
+
+%% Level 3: spent-input count from undo data matches block.
+%%
+%% Best-effort: a Core-parity check would disconnect the block, reconnect
+%% it, and confirm the resulting UTXO state matches. beamchain's UTXO
+%% cache is process-global, so a real disconnect/reconnect would mutate
+%% live state mid-RPC. We instead verify the structural invariant that
+%% the undo data has exactly one spent-coin entry per non-coinbase input.
+level3_check_undo_shape(#block{transactions = Txs}, Hash) ->
+    %% Coinbase has no inputs to undo; everything else contributes inputs.
+    [_Coinbase | RestTxs] = Txs,
+    ExpectedInputs = lists:foldl(
+        fun(Tx, Acc) -> Acc + length(Tx#transaction.inputs) end,
+        0, RestTxs),
+    case beamchain_db:get_undo(Hash) of
+        {ok, UndoBin} ->
+            try
+                Coins = beamchain_validation:decode_undo_data(UndoBin),
+                case length(Coins) of
+                    ExpectedInputs -> ok;
+                    Got ->
+                        {error, {undo_count_mismatch,
+                                 #{expected => ExpectedInputs,
+                                   got => Got}}}
+                end
+            catch
+                _:R -> {error, {undo_decode_failed, R}}
+            end;
+        not_found when ExpectedInputs =:= 0 ->
+            %% Coinbase-only block (e.g. genesis); no undo expected.
+            ok;
+        not_found ->
+            {error, missing_undo_data}
+    end.
+
+%% Level 4: re-verify scripts for every non-coinbase tx using stored
+%% undo coins. This is the heaviest check: it reproduces the script
+%% verification that ran at connect_block time, with the same SigChecker
+%% shape (Tx, InputIdx, Amount, AllPrevOuts).
+%%
+%% Assumes level 3 already passed (undo entry count matches input count).
+level4_check_scripts(_Block, _Hash, 0, _Network) ->
+    %% Genesis has no scripts to verify.
+    ok;
+level4_check_scripts(#block{transactions = Txs}, Hash, Height, Network) ->
+    case beamchain_db:get_undo(Hash) of
+        not_found ->
+            %% Either coinbase-only (already handled by level 3) or a
+            %% real failure flagged by level 3. Treat missing undo here
+            %% as a soft-pass since level 3 is the authoritative check.
+            ok;
+        {ok, UndoBin} ->
+            try
+                Coins = beamchain_validation:decode_undo_data(UndoBin),
+                Flags = beamchain_script:flags_for_height(Height, Network),
+                [_Coinbase | RestTxs] = Txs,
+                level4_verify_txs(RestTxs, Coins, Flags),
+                ok
+            catch
+                throw:{script_verify_failed, _} = R -> {error, R};
+                _:R -> {error, {script_check_exception, R}}
+            end
+    end.
+
+%% Walk non-coinbase txs in order; consume undo coins from the head.
+level4_verify_txs([], [], _Flags) -> ok;
+level4_verify_txs([], _Leftover, _Flags) -> ok;  %% level 3 should have caught
+level4_verify_txs([Tx | RestTxs], UndoCoins, Flags) ->
+    NumInputs = length(Tx#transaction.inputs),
+    {InputCoinPairs, RemainingUndo} = take_n(UndoCoins, NumInputs),
+    InputCoins = [Coin || {_OutPoint, Coin} <- InputCoinPairs],
+    AllPrevOuts = [{C#utxo.value, C#utxo.script_pubkey} || C <- InputCoins],
+    Inputs = Tx#transaction.inputs,
+    %% lists:zip on equal-length lists; level 3 ensures equal length.
+    lists:foldl(
+      fun({Input, Coin}, Idx) ->
+          ScriptSig = Input#tx_in.script_sig,
+          ScriptPubKey = Coin#utxo.script_pubkey,
+          Witness = case Input#tx_in.witness of
+              undefined -> [];
+              W -> W
+          end,
+          Amount = Coin#utxo.value,
+          SigChecker = {Tx, Idx, Amount, AllPrevOuts},
+          case beamchain_script:verify_script(
+                 ScriptSig, ScriptPubKey, Witness, Flags, SigChecker) of
+              true -> Idx + 1;
+              false -> throw({script_verify_failed, Idx})
+          end
+      end, 0, lists:zip(Inputs, InputCoins)),
+    level4_verify_txs(RestTxs, RemainingUndo, Flags).
+
+%% Take the first N elements of a list; return {Taken, Rest}.
+take_n(List, N) -> take_n(List, N, []).
+take_n(Rest, 0, Acc) -> {lists:reverse(Acc), Rest};
+take_n([], _N, Acc) -> {lists:reverse(Acc), []};
+take_n([H | T], N, Acc) -> take_n(T, N - 1, [H | Acc]).
 
 %% @doc flushchainstate — synchronously flush the in-memory UTXO cache
 %% to RocksDB and return the tip height and hash that are now durably
