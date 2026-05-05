@@ -2581,7 +2581,11 @@ bip22_result(bad_witness_commitment)     -> <<"bad-witness-merkle-match">>;
 bip22_result(missing_witness_commitment) -> <<"bad-witness-merkle-match">>;
 bip22_result(bad_witness_nonce)          -> <<"bad-witness-merkle-match">>;
 bip22_result(bad_cb_amount)             -> <<"bad-cb-amount">>;
-bip22_result(insufficient_input)        -> <<"bad-cb-amount">>;
+%% Non-coinbase tx where sum(inputs) < sum(outputs).
+%% Core consensus/tx_verify.cpp::CheckTxInputs:
+%%   state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-in-belowout", ...)
+%% beamchain_validation.erl: TotalIn >= TotalOut orelse throw(insufficient_input)
+bip22_result(insufficient_input)        -> <<"bad-txns-in-belowout">>;
 bip22_result(bad_blk_sigops)            -> <<"bad-blk-sigops">>;
 bip22_result(bad_txns_nonfinal)         -> <<"bad-txns-nonfinal">>;
 %% BIP-68 SequenceLocks failure (relative locktime not met).
