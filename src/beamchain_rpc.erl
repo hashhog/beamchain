@@ -586,6 +586,12 @@ handle_method(<<"getdescriptorinfo">>, P, _W) -> rpc_getdescriptorinfo(P);
 handle_method(<<"loadtxoutset">>, P, _W) -> rpc_loadtxoutset(P);
 handle_method(<<"dumptxoutset">>, P, _W) -> rpc_dumptxoutset(P);
 
+%% -- Wave-47b --
+handle_method(<<"getnetworkhashps">>, P, _W) -> rpc_getnetworkhashps(P);
+handle_method(<<"gettxoutproof">>, P, _W) -> rpc_gettxoutproof(P);
+handle_method(<<"verifytxoutproof">>, P, _W) -> rpc_verifytxoutproof(P);
+handle_method(<<"getrpcinfo">>, _, _W) -> rpc_getrpcinfo();
+
 handle_method(Method, _, _W) ->
     {error, ?RPC_METHOD_NOT_FOUND,
      <<"Method not found: ", Method/binary>>}.
@@ -5034,4 +5040,276 @@ chain_tx_count_for_height(Height, Network) ->
     case beamchain_chain_params:get_assumeutxo(Height, Network) of
         {ok, #{chain_tx_count := N}} -> N;
         not_found -> 0
+    end.
+
+%%% ===================================================================
+%%% Wave-47b: getnetworkhashps, gettxoutproof, verifytxoutproof, getrpcinfo
+%%% ===================================================================
+
+%% getnetworkhashps([NBlocks]) -> estimated hashes/second over recent window.
+%% Mirrors Bitcoin Core: workDiff / timeDiff over a sliding window.
+rpc_getnetworkhashps([]) ->
+    rpc_getnetworkhashps([120]);
+rpc_getnetworkhashps([NBlocks]) when is_integer(NBlocks) ->
+    case beamchain_chainstate:get_tip() of
+        {ok, {_TipHash, TipHeight}} when TipHeight >= 2 ->
+            Window = case NBlocks =< 0 of
+                true  -> 120;
+                false -> min(NBlocks, TipHeight)
+            end,
+            Hi = TipHeight,
+            Lo = Hi - Window,
+            case {beamchain_db:get_block_index(Hi),
+                  beamchain_db:get_block_index(Lo)} of
+                {{ok, #{chainwork := HiCW, header := HiHdr}},
+                 {ok, #{chainwork := LoCW, header := LoHdr}}} ->
+                    WorkDiff = chainwork_to_float(HiCW) - chainwork_to_float(LoCW),
+                    TimeDiff = HiHdr#block_header.timestamp
+                             - LoHdr#block_header.timestamp,
+                    case TimeDiff > 0 of
+                        true ->
+                            HashPS = WorkDiff / TimeDiff,
+                            {ok, trunc(HashPS)};
+                        false -> {ok, 0}
+                    end;
+                _ -> {ok, 0}
+            end;
+        _ -> {ok, 0}
+    end;
+rpc_getnetworkhashps(_) ->
+    rpc_getnetworkhashps([120]).
+
+%% Convert a 32-byte big-endian chainwork binary to a float.
+%% (float is sufficient; Bitcoin's current chainwork fits in a 64-bit mantissa
+%%  for the purposes of computing a ratio.)
+chainwork_to_float(CW) when byte_size(CW) =:= 32 ->
+    <<_:128, Lo:128/big>> = CW,
+    %% Use the lower 128 bits; the upper 128 are zero on current mainnet
+    float(Lo);
+chainwork_to_float(_) -> 0.0.
+
+%% gettxoutproof([Txids]) or ([Txids, BlockHash]) -> CMerkleBlock hex proof.
+rpc_gettxoutproof([TxidList]) ->
+    rpc_gettxoutproof([TxidList, null]);
+rpc_gettxoutproof([TxidList, null]) ->
+    %% No blockhash given — look up via tx index
+    case TxidList of
+        [FirstTxHex | _] ->
+            FirstTxid = hex_to_internal_hash(FirstTxHex),
+            case beamchain_db:get_tx_location(FirstTxid) of
+                {ok, #{block_hash := BH}} ->
+                    rpc_gettxoutproof_with_block(TxidList, BH);
+                not_found ->
+                    {error, ?RPC_MISC_ERROR,
+                     <<"Transaction not found in block index">>}
+            end;
+        _ ->
+            {error, ?RPC_INVALID_PARAMETER, <<"No txids provided">>}
+    end;
+rpc_gettxoutproof([TxidList, BlockHashHex]) when is_binary(BlockHashHex) ->
+    BH = hex_to_internal_hash(BlockHashHex),
+    rpc_gettxoutproof_with_block(TxidList, BH);
+rpc_gettxoutproof(_) ->
+    {error, ?RPC_INVALID_PARAMETER, <<"Invalid parameters">>}.
+
+rpc_gettxoutproof_with_block(TxidHexList, BlockHash) ->
+    case beamchain_db:get_block(BlockHash) of
+        not_found ->
+            {error, ?RPC_MISC_ERROR, <<"Block not found">>};
+        {ok, #block{header = Header, transactions = Txs}} ->
+            AllTxids = [beamchain_serialize:tx_hash(Tx) || Tx <- Txs],
+            NTx = length(AllTxids),
+            ReqTxids = [hex_to_internal_hash(H) || H <- TxidHexList,
+                        is_binary(H)],
+            MatchFlags = [lists:member(Txid, ReqTxids) || Txid <- AllTxids],
+            {Hashes, Bits} = w47b_traverse_and_build(NTx, AllTxids, MatchFlags),
+            HeaderBin = beamchain_serialize:encode_block_header(Header),
+            NTxLE = <<NTx:32/little>>,
+            HashesBin = iolist_to_binary(Hashes),
+            FlagBytes = w47b_bits_to_bytes(Bits),
+            Proof = iolist_to_binary([
+                HeaderBin,
+                NTxLE,
+                w47b_encode_varint(length(Hashes)),
+                HashesBin,
+                w47b_encode_varint(byte_size(FlagBytes)),
+                FlagBytes
+            ]),
+            {ok, beamchain_serialize:hex_encode(Proof)}
+    end.
+
+%% verifytxoutproof(ProofHex) -> list of matched txids.
+rpc_verifytxoutproof([ProofHex]) when is_binary(ProofHex) ->
+    Proof = beamchain_serialize:hex_decode(ProofHex),
+    case byte_size(Proof) < 84 of
+        true ->
+            {error, ?RPC_DESERIALIZATION_ERROR, <<"Proof too short">>};
+        false ->
+            <<_HeaderBin:80/binary, NTx:32/little, Rest/binary>> = Proof,
+            case NTx =:= 0 of
+                true -> {ok, []};
+                false ->
+                    case parse_proof_body(NTx, Rest) of
+                        {ok, Matched} -> {ok, Matched};
+                        {error, Msg}  ->
+                            {error, ?RPC_DESERIALIZATION_ERROR, Msg}
+                    end
+            end
+    end;
+rpc_verifytxoutproof(_) ->
+    {error, ?RPC_INVALID_PARAMETER, <<"Invalid parameters">>}.
+
+parse_proof_body(NTx, Bin) ->
+    try
+        {HashCount, After1} = w47b_read_varint(Bin),
+        HashBytes = HashCount * 32,
+        <<HashesBin:HashBytes/binary, After2/binary>> = After1,
+        Hashes = [H || <<H:32/binary>> <= HashesBin,
+                  byte_size(H) =:= 32],
+        {FlagCount, After3} = w47b_read_varint(After2),
+        <<FlagBytes:FlagCount/binary, _/binary>> = After3,
+        Matched = w47b_traverse_and_extract(NTx, Hashes, FlagBytes),
+        {ok, Matched}
+    catch _:_ ->
+        {error, <<"Invalid proof (parse error)">>}
+    end.
+
+%% getrpcinfo() -> stub
+rpc_getrpcinfo() ->
+    {ok, #{
+        <<"active_commands">> => [],
+        <<"logpath">> => <<>>
+    }}.
+
+%%% -------------------------------------------------------------------
+%%% Partial Merkle Tree helpers (Bitcoin Core CalcTreeWidth / TraverseAndBuild /
+%%% TraverseAndExtract from src/merkleblock.cpp)
+%%% -------------------------------------------------------------------
+
+%% CalcTreeWidth: (n_tx + (1<<height) - 1) >> height
+%% height 0 = leaves (width = n_tx); height nHeight = root (width = 1).
+w47b_tree_width(NTx, Height) ->
+    (NTx + (1 bsl Height) - 1) bsr Height.
+
+%% nHeight: smallest h such that w47b_tree_width(NTx,h) == 1
+w47b_n_height(NTx) ->
+    w47b_n_height(NTx, 0).
+w47b_n_height(NTx, H) ->
+    case w47b_tree_width(NTx, H) > 1 of
+        true  -> w47b_n_height(NTx, H + 1);
+        false -> H
+    end.
+
+%% CalcHash(height, pos, TxidList): height 0 = leaf, returns txid at pos;
+%% height > 0 combines children with Hash(left || right).
+w47b_calc_hash(0, Pos, Txids) ->
+    lists:nth(Pos + 1, Txids);
+w47b_calc_hash(Height, Pos, Txids) ->
+    NTx = length(Txids),
+    Left  = w47b_calc_hash(Height - 1, Pos * 2, Txids),
+    Right = case (Pos * 2 + 1) < w47b_tree_width(NTx, Height - 1) of
+        true  -> w47b_calc_hash(Height - 1, Pos * 2 + 1, Txids);
+        false -> Left
+    end,
+    beamchain_serialize:hash256(<<Left/binary, Right/binary>>).
+
+%% TraverseAndBuild: returns {Hashes, Bits} in pre-order DFS.
+w47b_traverse_and_build(NTx, Txids, MatchFlags) ->
+    NHeight = w47b_n_height(NTx),
+    {Hashes, Bits} = w47b_build(NHeight, 0, NTx, Txids, MatchFlags),
+    {lists:reverse(Hashes), lists:reverse(Bits)}.
+
+w47b_build(Height, Pos, NTx, Txids, MatchFlags) ->
+    %% fParentOfMatch: any match in range [Pos<<Height, (Pos+1)<<Height)
+    Lo = Pos bsl Height,
+    Hi = min((Pos + 1) bsl Height, NTx),
+    ParentMatch = lists:any(fun(I) -> lists:nth(I + 1, MatchFlags) end,
+                            lists:seq(Lo, Hi - 1)),
+    case Height =:= 0 orelse not ParentMatch of
+        true ->
+            Hash = w47b_calc_hash(Height, Pos, Txids),
+            {[Hash], [ParentMatch]};
+        false ->
+            {HL, BL} = w47b_build(Height - 1, Pos * 2, NTx, Txids, MatchFlags),
+            {HR, BR} = case (Pos * 2 + 1) < w47b_tree_width(NTx, Height - 1) of
+                true  -> w47b_build(Height - 1, Pos * 2 + 1, NTx, Txids, MatchFlags);
+                false -> {[], []}
+            end,
+            {HR ++ HL, BR ++ BL ++ [ParentMatch]}
+    end.
+
+%% TraverseAndExtract: parse stored hashes + bits, return matched txids.
+w47b_traverse_and_extract(NTx, Hashes, FlagBytes) ->
+    NHeight = w47b_n_height(NTx),
+    Bits = w47b_bytes_to_bits(FlagBytes),
+    {_Root, _BitPos, _HashPos, Matched} =
+        w47b_extract(NHeight, 0, NTx, Hashes, Bits, 0, 0, []),
+    lists:reverse(Matched).
+
+w47b_extract(Height, Pos, NTx, Hashes, Bits, BitPos, HashPos, Matched) ->
+    Flag = lists:nth(BitPos + 1, Bits),
+    NewBitPos = BitPos + 1,
+    case Height =:= 0 orelse not Flag of
+        true ->
+            Hash = lists:nth(HashPos + 1, Hashes),
+            NewMatched = case Height =:= 0 andalso Flag of
+                true  -> [hash_to_hex(Hash) | Matched];
+                false -> Matched
+            end,
+            {Hash, NewBitPos, HashPos + 1, NewMatched};
+        false ->
+            {LeftHash, BP2, HP2, M2} =
+                w47b_extract(Height-1, Pos*2, NTx, Hashes, Bits,
+                             NewBitPos, HashPos, Matched),
+            {RightHash, BP3, HP3, M3} =
+                case (Pos * 2 + 1) < w47b_tree_width(NTx, Height - 1) of
+                    true ->
+                        w47b_extract(Height-1, Pos*2+1, NTx, Hashes, Bits,
+                                     BP2, HP2, M2);
+                    false ->
+                        {LeftHash, BP2, HP2, M2}
+                end,
+            Combined = beamchain_serialize:hash256(
+                <<LeftHash/binary, RightHash/binary>>),
+            {Combined, BP3, HP3, M3}
+    end.
+
+%% BitsToBytes: pack bits LSB-first into bytes
+w47b_bits_to_bytes(Bits) ->
+    NBytes = (length(Bits) + 7) div 8,
+    Bytes  = lists:duplicate(NBytes, 0),
+    Packed = lists:foldl(fun({I, B}, Acc) ->
+        ByteIdx = I div 8,
+        BitIdx  = I rem 8,
+        Byte    = lists:nth(ByteIdx + 1, Acc),
+        NewByte = case B of
+            true  -> Byte bor (1 bsl BitIdx);
+            false -> Byte
+        end,
+        lists:sublist(Acc, ByteIdx) ++ [NewByte] ++
+            lists:nthtail(ByteIdx + 1, Acc)
+    end, Bytes, lists:zip(lists:seq(0, length(Bits) - 1), Bits)),
+    list_to_binary(Packed).
+
+%% BytesToBits: unpack bytes into bit list (LSB-first per byte)
+w47b_bytes_to_bits(Bytes) ->
+    Len = byte_size(Bytes) * 8,
+    [((binary:at(Bytes, I div 8)) band (1 bsl (I rem 8))) =/= 0
+     || I <- lists:seq(0, Len - 1)].
+
+%% encode varint
+w47b_encode_varint(V) when V < 16#FD ->
+    <<V:8>>;
+w47b_encode_varint(V) when V =< 16#FFFF ->
+    <<16#FD, V:16/little>>;
+w47b_encode_varint(V) ->
+    <<16#FE, V:32/little>>.
+
+%% read varint from binary, returns {Value, Rest}
+w47b_read_varint(<<First:8, Rest/binary>>) ->
+    case First of
+        16#FD -> <<V:16/little, R/binary>> = Rest, {V, R};
+        16#FE -> <<V:32/little, R/binary>> = Rest, {V, R};
+        16#FF -> <<V:64/little, R/binary>> = Rest, {V, R};
+        _     -> {First, Rest}
     end.
