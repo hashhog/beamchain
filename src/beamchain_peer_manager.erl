@@ -1421,15 +1421,51 @@ relay_addr_to_random_peers(SourcePid, Msg, _State) ->
 handle_getdata_msg(Pid, Payload) ->
     case beamchain_p2p_msg:decode_payload(getdata, Payload) of
         {ok, #{items := Items}} ->
+            %% BIP-159 peer-served-blocks gate.  When prune mode is on,
+            %% refuse to serve blocks below tip - 288.  Mirrors Core's
+            %% net_processing.cpp short-circuit; emits notfound rather
+            %% than reading a possibly-deleted block file.
+            PruneActive = beamchain_config:prune_enabled(),
+            PruneHorizon =
+                case PruneActive of
+                    true ->
+                        case beamchain_chainstate:get_tip_height() of
+                            {ok, TipH} when TipH > 288 -> TipH - 288;
+                            _ -> -1
+                        end;
+                    false -> -1
+                end,
             NotFound = lists:filtermap(fun(#{type := Type, hash := Hash}) ->
                 case Type of
                     T when T =:= ?MSG_BLOCK; T =:= ?MSG_WITNESS_BLOCK ->
-                        case beamchain_db:get_block(Hash) of
-                            {ok, Block} ->
-                                beamchain_peer:send_message(Pid, {block, Block}),
-                                false;
-                            not_found ->
-                                {true, #{type => Type, hash => Hash}}
+                        BelowHorizon =
+                            case PruneHorizon of
+                                -1 -> false;
+                                _  ->
+                                    case beamchain_db:get_block_index_by_hash(Hash) of
+                                        {ok, #{height := BH}} when BH < PruneHorizon ->
+                                            true;
+                                        _ -> false
+                                    end
+                            end,
+                        case BelowHorizon of
+                            true ->
+                                {true, #{type => Type, hash => Hash}};
+                            false ->
+                                case beamchain_db:get_block(Hash) of
+                                    {ok, Block} ->
+                                        beamchain_peer:send_message(Pid, {block, Block}),
+                                        false;
+                                    not_found ->
+                                        {true, #{type => Type, hash => Hash}};
+                                    %% beamchain_db:get_block can also return
+                                    %% {error, block_pruned} after a prune sweep
+                                    %% delivered the block file but left the index
+                                    %% entry. Translate to notfound so peers move
+                                    %% on instead of hanging the request.
+                                    {error, _} ->
+                                        {true, #{type => Type, hash => Hash}}
+                                end
                         end;
                     T when T =:= ?MSG_TX; T =:= ?MSG_WITNESS_TX ->
                         case beamchain_mempool:get_tx(Hash) of

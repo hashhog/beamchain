@@ -1268,10 +1268,20 @@ do_send_version(#peer_data{address = {IP, Port}, our_nonce = Nonce} = Data) ->
     %% because peers that get NODE_COMPACT_FILTERS in our services
     %% will issue getcfilters / getcfheaders / getcfcheckpt and we
     %% must be able to answer them (BIP-157 §"Service bit").
-    Services = case beamchain_config:blockfilterindex_enabled() andalso
-                    beamchain_blockfilter_index:is_enabled() of
+    Services1 = case beamchain_config:blockfilterindex_enabled() andalso
+                     beamchain_blockfilter_index:is_enabled() of
         true  -> Services0 bor ?NODE_COMPACT_FILTERS;
         false -> Services0
+    end,
+    %% BIP-159: advertise NODE_NETWORK_LIMITED when prune mode is on so
+    %% peers know we serve only the recent ~288-block window.  Mirrors
+    %% Core's `init.cpp` (`nLocalServices |= NODE_NETWORK_LIMITED` when
+    %% `IsPruneMode()` is true).  Core advertises NODE_NETWORK alongside
+    %% NODE_NETWORK_LIMITED in the auto-prune case (the node still has
+    %% the recent-288 window), so we keep NODE_NETWORK set as well.
+    Services = case beamchain_config:prune_enabled() of
+        true  -> Services1 bor ?NODE_NETWORK_LIMITED;
+        false -> Services1
     end,
     Now = erlang:system_time(second),
     %% start_height MUST report our actual current tip height. Bitcoin
