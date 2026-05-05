@@ -443,6 +443,15 @@ do_add_transaction(Tx, State) ->
         %% 3. check standardness (weight, version)
         check_standard(Tx),
 
+        %% 3b. IsFinalTx (BIP-113): reject non-final transactions at mempool admit.
+        %% Mempool holds txs for the *next* block, so we check against height+1 and
+        %% the current chain MTP (MEDIAN_TIME_PAST of the last 11 blocks) per BIP-113.
+        %% Mirrors Bitcoin Core MemPoolAccept::PreChecks → CheckFinalTxAtTip.
+        {ok, {TipHash, TipHeight}} = beamchain_chainstate:get_tip(),
+        Mtp = beamchain_chainstate:get_mtp(),
+        beamchain_validation:is_final_tx(Tx, TipHeight + 1, Mtp)
+            orelse throw(non_final),
+
         %% 4. look up all inputs (UTXO set + mempool)
         {InputCoins, SpendsCoinbase} = lookup_inputs(Tx),
 
@@ -503,7 +512,7 @@ do_add_transaction(Tx, State) ->
         check_descendant_limits(Tx, VSize),
 
         %% 12. check coinbase maturity for mempool spending
-        {ok, {TipHash, TipHeight}} = beamchain_chainstate:get_tip(),
+        %% TipHash and TipHeight were already fetched at step 3b above.
         check_mempool_coinbase_maturity(InputCoins, TipHeight + 1),
 
         %% 12b. BIP 68 sequence lock check
