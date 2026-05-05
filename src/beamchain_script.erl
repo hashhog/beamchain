@@ -2462,17 +2462,16 @@ verify_witness_program(1, Program, Witness, Flags, SigChecker)
     %% P2TR (Taproot)
     verify_taproot(Program, Witness, Flags, SigChecker);
 
-verify_witness_program(Version, _Program, Witness, Flags, _SigChecker)
+verify_witness_program(Version, _Program, _Witness, Flags, _SigChecker)
   when Version >= 2, Version =< 16 ->
-    %% future witness versions
+    %% Future witness versions 2–16 are reserved for future softforks.
+    %% Per BIP-141 forward-compatibility (Bitcoin Core interpreter.cpp
+    %% VerifyWitnessProgram else-branch ~line 1992): unknown witness versions
+    %% are anyone-can-spend at consensus — witness contents are NOT inspected.
+    %% DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM is standardness-only (policy).
     case (Flags band ?SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM) =/= 0 of
-        true -> {error, discourage_upgradable_witness_program};
-        false ->
-            %% unknown witness version succeeds
-            case Witness of
-                [] -> {error, witness_program_empty};
-                _ -> {ok, [script_true()]}
-            end
+        true  -> {error, discourage_upgradable_witness_program};
+        false -> {ok, [script_true()]}
     end;
 
 verify_witness_program(1, Program, _Witness, Flags, _SigChecker)
