@@ -252,3 +252,190 @@ pick_existing([Base | Rest], Name) ->
         true  -> Path;
         false -> pick_existing(Rest, Name)
     end.
+
+%%% ===================================================================
+%%% Filter index — persistence across restart
+%%%
+%%% These tests start a real beamchain_blockfilter_index gen_server
+%%% backed by RocksDB on a per-test temp dir.  The cycle is:
+%%%   1. Start the index, add a couple of blocks.
+%%%   2. Stop it (closes the RocksDB handle).
+%%%   3. Restart with the SAME datadir.
+%%%   4. Assert that the previously-stored filters / cfheaders / tip
+%%%      have survived the restart.
+%%%
+%%% This is the BIP-157 durability guarantee — without it, a peer
+%%% would see filter_hash chain holes whenever we bounce the daemon.
+%%% -------------------------------------------------------------------
+
+index_setup() ->
+    TmpDir = filename:join(
+        ["/tmp",
+         "beamchain_blockfilter_test_" ++
+             integer_to_list(erlang:unique_integer([positive]))]),
+    ok = filelib:ensure_dir(filename:join(TmpDir, "dummy")),
+    application:ensure_all_started(rocksdb),
+    application:set_env(beamchain, datadir, TmpDir, [{persistent, true}]),
+    application:set_env(beamchain, network, regtest, [{persistent, true}]),
+    %% Force the gate ON regardless of host env / config file presence.
+    os:putenv("BEAMCHAIN_BLOCKFILTERINDEX", "1"),
+    %% beamchain_config must be running because the index gen_server
+    %% calls beamchain_config:datadir/0 + blockfilterindex_enabled/0
+    %% from its init/1 handler.
+    catch gen_server:stop(beamchain_config),
+    {ok, _ConfigPid} = beamchain_config:start_link(),
+    {ok, _IdxPid} = beamchain_blockfilter_index:start_link(),
+    TmpDir.
+
+index_teardown(TmpDir) ->
+    catch beamchain_blockfilter_index:stop(),
+    catch gen_server:stop(beamchain_config),
+    os:unsetenv("BEAMCHAIN_BLOCKFILTERINDEX"),
+    os:cmd("rm -rf " ++ TmpDir),
+    ok.
+
+%% Build a tiny block with a single OP_RETURN-free coinbase output, so
+%% that the BasicFilter has at least one element to encode.  We don't
+%% need a real header for these tests — `add_block` keys by block_hash
+%% only, and we set #block.hash explicitly.
+make_filter_test_block(Tag) ->
+    Header = #block_header{
+        version = 1,
+        prev_hash = <<0:256>>,
+        merkle_root = <<0:256>>,
+        timestamp = 1231006505,
+        bits = 16#207fffff,
+        nonce = Tag
+    },
+    %% script_pubkey is a 22-byte P2WPKH-shaped payload — anything
+    %% non-OP_RETURN works; we just need it in the basic filter set.
+    SPK = <<16#00, 16#14, Tag:160/big>>,
+    Tx = #transaction{
+        version = 1,
+        inputs = [#tx_in{
+            prev_out = #outpoint{hash = <<0:256>>, index = 16#ffffffff},
+            script_sig = <<4, 1, 0, 0, 0>>,
+            sequence = 16#ffffffff,
+            witness = []
+        }],
+        outputs = [#tx_out{value = 5000000000,
+                           script_pubkey = SPK}],
+        locktime = 0
+    },
+    %% Use a synthetic block hash so the test isn't sensitive to the
+    %% block-hash function's behavior on degenerate headers.
+    BlockHash = <<Tag:256/big>>,
+    #block{header = Header, transactions = [Tx], hash = BlockHash}.
+
+filter_index_persistence_test_() ->
+    {setup,
+     fun index_setup/0,
+     fun index_teardown/1,
+     fun(_) ->
+        [
+         {"add two blocks, restart, recover filters and cfheader chain",
+          fun() ->
+            ?assert(beamchain_blockfilter_index:is_enabled()),
+            B1 = make_filter_test_block(1),
+            B2 = make_filter_test_block(2),
+            {ok, {F1, H1}} =
+                beamchain_blockfilter_index:add_block(B1, 1, []),
+            {ok, {F2, H2}} =
+                beamchain_blockfilter_index:add_block(B2, 2, []),
+            ?assertEqual(32, byte_size(H1)),
+            ?assertEqual(32, byte_size(H2)),
+            ?assertNotEqual(H1, H2),
+            %% cfheader chain: H2 = dSHA256(filter_hash(F2) || H1)
+            ?assertEqual(H2,
+                beamchain_blockfilter:compute_header(F2, H1)),
+            %% Tip exposed
+            ?assertEqual(H2, beamchain_blockfilter_index:tip_header()),
+            ?assertEqual(2,  beamchain_blockfilter_index:tip_height()),
+
+            %% --- restart cycle -------------------------------------
+            ok = beamchain_blockfilter_index:stop(),
+            %% Brief gap to let supervisor-less stop settle.
+            timer:sleep(20),
+            {ok, _Pid2} = beamchain_blockfilter_index:start_link(),
+            ?assert(beamchain_blockfilter_index:is_enabled()),
+
+            %% After restart, every entry must still be there.
+            ?assertEqual({ok, F1},
+                beamchain_blockfilter_index:get_filter(B1#block.hash)),
+            ?assertEqual({ok, F2},
+                beamchain_blockfilter_index:get_filter(B2#block.hash)),
+            ?assertEqual({ok, H1},
+                beamchain_blockfilter_index:get_header(B1#block.hash)),
+            ?assertEqual({ok, H2},
+                beamchain_blockfilter_index:get_header(B2#block.hash)),
+            ?assertEqual({ok, B1#block.hash},
+                beamchain_blockfilter_index:get_block_hash_by_height(1)),
+            ?assertEqual({ok, B2#block.hash},
+                beamchain_blockfilter_index:get_block_hash_by_height(2)),
+            ?assertEqual(H2,
+                beamchain_blockfilter_index:tip_header()),
+            ?assertEqual(2,
+                beamchain_blockfilter_index:tip_height())
+          end},
+
+         {"getblockfilter RPC — unknown filter type rejected",
+          fun() ->
+            BHHex = beamchain_serialize:hex_encode(
+                reverse_bytes(<<1:256/big>>)),
+            ?assertMatch({error, -8, _},
+                beamchain_rpc:rpc_getblockfilter([BHHex, <<"extended">>]))
+          end},
+
+         {"BIP-157 range queries — get_filter_range / get_header_range / get_checkpoints",
+          fun() ->
+            %% Build out enough blocks that get_checkpoints has something
+            %% to return.  Heights 3..5 + a checkpoint at 1000 worth of
+            %% data is overkill for an EUnit, so we just exercise the
+            %% small-range paths.
+            B3 = make_filter_test_block(3),
+            B4 = make_filter_test_block(4),
+            {ok, {F3, _}} = beamchain_blockfilter_index:add_block(B3, 3, []),
+            {ok, {F4, _}} = beamchain_blockfilter_index:add_block(B4, 4, []),
+
+            %% get_filter_range over [1, hash(B4)] returns 4 entries.
+            {ok, Pairs} =
+                beamchain_blockfilter_index:get_filter_range(
+                    1, B4#block.hash),
+            ?assertEqual(4, length(Pairs)),
+            %% Last entry corresponds to B4's filter.
+            {LastHash, LastFilter} = lists:last(Pairs),
+            ?assertEqual(B4#block.hash, LastHash),
+            ?assertEqual(F4, LastFilter),
+
+            %% get_header_range from height 3 returns prev_header (the
+            %% cfheader at height 2) plus the filter_hashes at 3 and 4.
+            {ok, {PrevHdr, FHs}} =
+                beamchain_blockfilter_index:get_header_range(
+                    3, B4#block.hash),
+            ?assertEqual(32, byte_size(PrevHdr)),
+            ?assertEqual(2, length(FHs)),
+            ?assertEqual(beamchain_blockfilter:filter_hash(F3),
+                         hd(FHs)),
+            ?assertEqual(beamchain_blockfilter:filter_hash(F4),
+                         lists:last(FHs)),
+
+            %% get_checkpoints with stop_height < 1000 returns [].
+            {ok, []} = beamchain_blockfilter_index:get_checkpoints(
+                4, B4#block.hash)
+          end},
+
+         {"getblockfilter RPC — index disabled returns RPC_MISC_ERROR",
+          fun() ->
+            %% Stop the gen_server entirely; is_enabled/0 returns
+            %% false because whereis returns undefined.  Mirrors a
+            %% node that started without --cfilter=1.
+            ok = beamchain_blockfilter_index:stop(),
+            timer:sleep(20),
+            ?assertNot(beamchain_blockfilter_index:is_enabled()),
+            BHHex = beamchain_serialize:hex_encode(
+                reverse_bytes(<<1:256/big>>)),
+            ?assertMatch({error, -1, _},
+                beamchain_rpc:rpc_getblockfilter([BHHex]))
+          end}
+        ]
+     end}.
