@@ -88,7 +88,9 @@
 -export([get_meta/1, put_meta/2, get_db_stats/0]).
 
 %% Pruning
--export([prune_block_files/0, is_block_pruned/1, trigger_pruning/1]).
+-export([prune_block_files/0, prune_block_files_manual/1,
+         is_block_pruned/1, trigger_pruning/1]).
+-export([get_prune_state/0]).
 %% Exported for cross-module testing of the prune file-eligibility
 %% calculation (CORE-PARITY-AUDIT/_pruning-cross-impl-audit-2026-05-05.md
 %% Bug 1).
@@ -145,6 +147,7 @@
     network_magic :: binary(),
     %% Pruning state
     prune_target :: non_neg_integer(),  %% Target disk usage in bytes (0 = disabled)
+    prune_manual_mode :: boolean(),     %% true = -prune=1 (RPC-only)
     pruned_files :: sets:set(non_neg_integer()),  %% Set of pruned file numbers
     file_info :: #{non_neg_integer() => #{size => non_neg_integer(),
                                            height_first => non_neg_integer(),
@@ -550,6 +553,19 @@ get_block_file_info() ->
 prune_block_files() ->
     gen_server:call(?SERVER, prune_block_files, 60000).
 
+%% @doc Manual pruneblockchain RPC entry point.
+%% Prune block files containing only blocks below the given target
+%% height, capped at chain_tip - 288 to preserve the reorg-safety
+%% window. Mirrors `bitcoin-core/src/rpc/blockchain.cpp::pruneblockchain`
+%% which calls `PruneBlockFilesManual(target_height)` from
+%% `validation.cpp`.
+%% Returns {ok, EffectiveHeight} where EffectiveHeight is the (clamped)
+%% height up to which pruning was attempted; or {error, Reason}.
+-spec prune_block_files_manual(non_neg_integer()) ->
+    {ok, non_neg_integer()} | {error, term()}.
+prune_block_files_manual(TargetHeight) ->
+    gen_server:call(?SERVER, {prune_block_files_manual, TargetHeight}, 60000).
+
 %% @doc Check if a block has been pruned.
 %% Returns true if the block data has been deleted.
 -spec is_block_pruned(binary()) -> boolean().
@@ -561,6 +577,19 @@ is_block_pruned(Hash) when byte_size(Hash) =:= 32 ->
 -spec trigger_pruning(non_neg_integer()) -> ok.
 trigger_pruning(Height) ->
     gen_server:cast(?SERVER, {trigger_pruning, Height}).
+
+%% @doc Snapshot of current prune state for getblockchaininfo / RPC.
+%% Returns:
+%%   enabled            — true iff -prune=N with N>0 (manual or auto)
+%%   manual_mode        — true iff -prune=1 (RPC-triggered only)
+%%   automatic_pruning  — true iff -prune=N with N>=550 (auto-target)
+%%   target_bytes       — auto-prune disk target in bytes (0 in manual)
+%%   prune_height       — lowest block height whose data is still on disk
+%%                        (analogue of Core's `pruneheight` field; for the
+%%                         empty-prune case this is 0)
+-spec get_prune_state() -> map().
+get_prune_state() ->
+    gen_server:call(?SERVER, get_prune_state).
 
 %%% ===================================================================
 %%% Direct-write API (bypasses gen_server for hot paths)
@@ -730,9 +759,20 @@ init([]) ->
             %% Get network magic
             NetworkMagic = beamchain_config:magic(),
 
-            %% Get pruning config (convert MB to bytes)
+            %% Get pruning config.
+            %% Manual mode (-prune=1): no auto-target; pruneblockchain
+            %%   RPC is the only trigger. We carry a sentinel target
+            %%   (1 byte) so do_prune_files's "is target = 0?" guard does
+            %%   not short-circuit the manual path; the disk-usage check
+            %%   is replaced by the RPC-supplied keep-height in that
+            %%   path.
+            %% Auto mode (-prune>=550): MB→bytes, drives auto-prune cast.
             PruneTargetMB = beamchain_config:prune_target(),
-            PruneTargetBytes = PruneTargetMB * 1024 * 1024,
+            PruneManualMode = beamchain_config:prune_manual_mode(),
+            PruneTargetBytes = case PruneManualMode of
+                true  -> 1;                          %% sentinel
+                false -> PruneTargetMB * 1024 * 1024
+            end,
 
             %% Load pruned files set from meta if it exists
             PrunedFiles = load_pruned_files(DbHandle, MetaCF),
@@ -755,6 +795,7 @@ init([]) ->
                 write_fd = undefined,
                 network_magic = NetworkMagic,
                 prune_target = PruneTargetBytes,
+                prune_manual_mode = PruneManualMode,
                 pruned_files = PrunedFiles,
                 file_info = FileInfo
             },
@@ -1086,9 +1127,49 @@ handle_call(prune_block_files, _From, State) ->
             {reply, {error, Reason}, State}
     end;
 
+handle_call({prune_block_files_manual, TargetHeight}, _From, State) ->
+    %% Manual prune: prune files whose blocks are entirely below
+    %% min(TargetHeight, ChainTip - REORG_SAFETY_BLOCKS). Mirrors Core's
+    %% PruneBlockFilesManual + FindFilesToPruneManual.
+    case do_prune_files_manual(TargetHeight, State) of
+        {ok, Count, EffectiveHeight, NewState} ->
+            {reply, {ok, #{pruned_count => Count,
+                           effective_height => EffectiveHeight}},
+             NewState};
+        {error, Reason} ->
+            {reply, {error, Reason}, State}
+    end;
+
 handle_call({is_block_pruned, Hash}, _From, State) ->
     Result = check_block_pruned(Hash, State),
     {reply, Result, State};
+
+handle_call(get_prune_state, _From,
+            #state{prune_target = TargetBytes,
+                   prune_manual_mode = ManualMode,
+                   pruned_files = PrunedFiles,
+                   file_info = FileInfo} = State) ->
+    Enabled = TargetBytes > 0,
+    %% AutomaticPruning is true iff prune mode is on AND it's not the
+    %% manual-only sentinel.  Mirrors Core's getblockchaininfo `automatic_pruning`.
+    Automatic = Enabled andalso (not ManualMode),
+    %% prune_height: lowest height whose file is NOT in the pruned set.
+    %% Core reports this as the smallest height that hasn't been pruned;
+    %% we approximate by scanning the file_info map.
+    PruneHeight = compute_prune_height(FileInfo, PrunedFiles),
+    %% target_bytes is reported as 0 for manual-only mode (matches
+    %% Core's `prune_target_size` which is the *automatic* MiB target).
+    ReportedTargetBytes = case ManualMode of
+        true  -> 0;
+        false -> TargetBytes
+    end,
+    {reply, #{
+        enabled           => Enabled,
+        manual_mode       => ManualMode,
+        automatic_pruning => Automatic,
+        target_bytes      => ReportedTargetBytes,
+        prune_height      => PruneHeight
+    }, State};
 
 %% Update block index status (for invalidateblock/reconsiderblock)
 handle_call({update_block_status, Hash, NewStatus}, _From,
@@ -1171,6 +1252,14 @@ handle_call(get_all_side_branch_indexes, _From,
 
 handle_call(_Request, _From, State) ->
     {reply, {error, not_implemented}, State}.
+
+handle_cast({trigger_pruning, _Height},
+            #state{prune_manual_mode = true} = State) ->
+    %% Manual-only mode (-prune=1): the auto cast is a no-op, only
+    %% pruneblockchain RPC fires prunes. Mirrors Core's IsPruneMode +
+    %% fAutoPrune split (validation.cpp `FindFilesToPruneAutomatic`
+    %% vs `FindFilesToPruneManual`).
+    {noreply, State};
 
 handle_cast({trigger_pruning, Height}, #state{prune_target = PruneTarget} = State)
   when PruneTarget > 0 ->
@@ -1695,6 +1784,63 @@ do_prune_files(#state{prune_target = Target, blocks_dir = BlocksDir,
             end
     end.
 
+%% @doc Manual prune entry point — prunes files entirely below the
+%% supplied target height (clamped to chain_tip - REORG_SAFETY_BLOCKS so
+%% the keep window is preserved). Counterpart to Core's
+%% `PruneBlockFilesManual`.
+-spec do_prune_files_manual(non_neg_integer(), #state{}) ->
+    {ok, non_neg_integer(), non_neg_integer(), #state{}} | {error, term()}.
+do_prune_files_manual(_TargetHeight,
+                      #state{prune_target = 0,
+                             prune_manual_mode = false} = _State) ->
+    %% Pruning mode is off entirely.
+    {error, prune_disabled};
+do_prune_files_manual(TargetHeight,
+                      #state{blocks_dir = BlocksDir,
+                             file_info = FileInfo,
+                             pruned_files = PrunedFiles,
+                             db_handle = Db, cf_meta = MetaCF,
+                             current_file = CurrentFile} = State) ->
+    case get_current_height(Db, MetaCF) of
+        undefined ->
+            {ok, 0, 0, State};
+        ChainHeight when ChainHeight =< ?REORG_SAFETY_BLOCKS ->
+            %% Not enough blocks yet to safely prune anything.
+            {ok, 0, 0, State};
+        ChainHeight ->
+            %% Clamp the operator-supplied height to the safety window.
+            SafeUpper = ChainHeight - ?REORG_SAFETY_BLOCKS,
+            EffectiveHeight = min(TargetHeight, SafeUpper),
+            case EffectiveHeight =< 0 of
+                true ->
+                    {ok, 0, EffectiveHeight, State};
+                false ->
+                    PrunableFiles = find_prunable_files(BlocksDir, FileInfo,
+                                                         PrunedFiles,
+                                                         EffectiveHeight,
+                                                         CurrentFile),
+                    %% Manual mode: prune ALL eligible files (don't stop
+                    %% at a disk-usage threshold). Equivalent to setting
+                    %% Target=0 inside prune_until_target.
+                    {Pruned, _NewUsage, NewPrunedFiles} =
+                        prune_until_target(BlocksDir, PrunableFiles,
+                                            16#FFFFFFFFFFFFFFFF, 0,
+                                            PrunedFiles),
+                    case Pruned of
+                        [] ->
+                            {ok, 0, EffectiveHeight, State};
+                        _ ->
+                            mark_blocks_pruned(Pruned),
+                            save_pruned_files(Db, MetaCF, NewPrunedFiles),
+                            logger:info("beamchain_db: manual prune up to "
+                                        "height ~p deleted ~p files",
+                                        [EffectiveHeight, length(Pruned)]),
+                            {ok, length(Pruned), EffectiveHeight,
+                             State#state{pruned_files = NewPrunedFiles}}
+                    end
+            end
+    end.
+
 %% @doc Find files that can be pruned (sorted by file number, oldest first).
 -spec find_prunable_files(string(), #{non_neg_integer() => map()},
                           sets:set(non_neg_integer()), non_neg_integer(),
@@ -1785,6 +1931,63 @@ find_max_height_in_file(FileNum) ->
 update_max_height(Height, undefined) -> Height;
 update_max_height(Height, Current) when Height > Current -> Height;
 update_max_height(_Height, Current) -> Current.
+
+%% @doc Compute the lowest block height whose data is still on disk
+%% (i.e., NOT in the pruned-files set). This is the analogue of Bitcoin
+%% Core's `BlockManager::m_blockfiles_indexed` first-non-pruned height,
+%% surfaced via `getblockchaininfo.pruneheight`.
+%%
+%% Iterates the height index and finds the smallest height whose owning
+%% file number is not pruned. Returns 0 when nothing has been pruned
+%% (matches Core's behavior for the never-pruned case).
+-spec compute_prune_height(#{non_neg_integer() => map()},
+                            sets:set(non_neg_integer())) ->
+    non_neg_integer().
+compute_prune_height(_FileInfo, PrunedFiles) ->
+    case sets:size(PrunedFiles) of
+        0 ->
+            0;  %% Never pruned — pruneheight is 0
+        _ ->
+            %% Walk HEIGHT_TO_HASH_ETS in ascending height order looking
+            %% for the first height whose file number is NOT pruned.
+            %% This is O(n) on first call but the result is rarely
+            %% queried (only via RPC).
+            case ets:info(?HEIGHT_TO_HASH_ETS) of
+                undefined ->
+                    0;
+                _ ->
+                    Heights = lists:sort(
+                                ets:select(?HEIGHT_TO_HASH_ETS,
+                                            [{{'$1', '_'}, [], ['$1']}])),
+                    find_first_unpruned_height(Heights, PrunedFiles)
+            end
+    end.
+
+%% @doc Walk a sorted list of heights and return the first one whose
+%% data is on disk. Returns the highest height + 1 (or 0) if everything
+%% is pruned, matching Core's "all pruned" semantics.
+find_first_unpruned_height([], _PrunedFiles) ->
+    0;
+find_first_unpruned_height([H | Rest], PrunedFiles) ->
+    case ets:lookup(?HEIGHT_TO_HASH_ETS, H) of
+        [{H, Hash}] ->
+            case ets:lookup(?BLOCK_INDEX_ETS, Hash) of
+                [{Hash, {FN, _Off, _Sz}}] ->
+                    case sets:is_element(FN, PrunedFiles) of
+                        false -> H;
+                        true  -> find_first_unpruned_height(Rest, PrunedFiles)
+                    end;
+                [{Hash, {FN, _Off, _Sz, pruned}}] ->
+                    %% Tombstoned entry — file is pruned regardless of set.
+                    _ = FN,
+                    find_first_unpruned_height(Rest, PrunedFiles);
+                _ ->
+                    %% Hash not in block-location index — treat as pruned.
+                    find_first_unpruned_height(Rest, PrunedFiles)
+            end;
+        _ ->
+            find_first_unpruned_height(Rest, PrunedFiles)
+    end.
 
 %% @doc Prune files until disk usage is below target.
 -spec prune_until_target(string(), [{non_neg_integer(), non_neg_integer()}],

@@ -511,6 +511,7 @@ handle_method(<<"invalidateblock">>, P, _W) -> rpc_invalidateblock(P);
 handle_method(<<"reconsiderblock">>, P, _W) -> rpc_reconsiderblock(P);
 handle_method(<<"flushchainstate">>, _, _W) -> rpc_flushchainstate();
 handle_method(<<"scrubunspendable">>, _, _W) -> rpc_scrubunspendable();
+handle_method(<<"pruneblockchain">>, P, _W) -> rpc_pruneblockchain(P);
 
 %% -- Transactions --
 handle_method(<<"getrawtransaction">>, P, _W) -> rpc_getrawtransaction(P);
@@ -636,6 +637,7 @@ rpc_help_list() ->
         <<"verifychain ( checklevel nblocks )">>,
         <<"flushchainstate">>,
         <<"scrubunspendable">>,
+        <<"pruneblockchain height">>,
         <<"">>,
         <<"== Control ==">>,
         <<"help ( \"command\" )">>,
@@ -788,6 +790,7 @@ rpc_getsyncstate() ->
 
 rpc_getblockchaininfo() ->
     Network = beamchain_config:network(),
+    PruneFields = build_prune_fields(),
     case beamchain_chainstate:get_tip() of
         {ok, {TipHash, TipHeight}} ->
             MTP = beamchain_chainstate:get_mtp(),
@@ -808,7 +811,7 @@ rpc_getblockchaininfo() ->
             %% Use the shared deployment helper — same source of truth as getdeploymentinfo.
             HeightGetter = fun(H) -> beamchain_db:get_block_index(H) end,
             Softforks = build_deployment_map(Network, TipHeight, HeightGetter),
-            {ok, #{
+            BaseInfo = #{
                 <<"chain">> => network_name(Network),
                 <<"blocks">> => TipHeight,
                 <<"headers">> => TipHeight,
@@ -824,12 +827,12 @@ rpc_getblockchaininfo() ->
                 <<"chainwork">> => beamchain_serialize:hex_encode(Chainwork),
                 <<"bits">> => beamchain_serialize:hex_encode(<<TipBits:32/big>>),
                 <<"target">> => bits_to_target_hex(TipBits),
-                <<"pruned">> => false,
                 <<"softforks">> => Softforks,
                 <<"warnings">> => <<>>
-            }};
+            },
+            {ok, maps:merge(BaseInfo, PruneFields)};
         not_found ->
-            {ok, #{
+            BaseInfo = #{
                 <<"chain">> => network_name(Network),
                 <<"blocks">> => 0,
                 <<"headers">> => 0,
@@ -840,10 +843,43 @@ rpc_getblockchaininfo() ->
                 <<"verificationprogress">> => 0.0,
                 <<"initialblockdownload">> => true,
                 <<"chainwork">> => <<"0000000000000000000000000000000000000000000000000000000000000000">>,
-                <<"pruned">> => false,
                 <<"softforks">> => #{},
                 <<"warnings">> => <<>>
-            }}
+            },
+            {ok, maps:merge(BaseInfo, PruneFields)}
+    end.
+
+%% Build the pruning subset of the getblockchaininfo response.
+%% Mirrors Bitcoin Core's blockchain.cpp::getblockchaininfo:
+%%   * `pruned` — boolean
+%%   * `pruneheight` — only when pruned=true
+%%   * `automatic_pruning` — only when pruned=true
+%%   * `prune_target_size` (bytes) — only when pruned=true and auto
+build_prune_fields() ->
+    try beamchain_db:get_prune_state() of
+        #{enabled := false} ->
+            #{<<"pruned">> => false};
+        #{enabled := true,
+          manual_mode := ManualMode,
+          automatic_pruning := AutoPruning,
+          target_bytes := TargetBytes,
+          prune_height := PruneHeight} ->
+            Base = #{
+                <<"pruned">>            => true,
+                <<"pruneheight">>       => PruneHeight,
+                <<"automatic_pruning">> => AutoPruning
+            },
+            %% Match Core: prune_target_size is reported only when an
+            %% automatic target is configured (i.e. NOT manual-only mode).
+            case ManualMode of
+                true  -> Base;
+                false -> Base#{<<"prune_target_size">> => TargetBytes}
+            end
+    catch
+        _:_ ->
+            %% Defensive: if the db gen_server is busy / down, surface
+            %% a "not pruned" answer rather than blocking the RPC call.
+            #{<<"pruned">> => false}
     end.
 
 %% getdeploymentinfo ( "blockhash" )
@@ -1413,6 +1449,77 @@ rpc_scrubunspendable() ->
         <<"removed">>     => Removed,
         <<"bytes_freed">> => BytesFreed
     }}.
+
+%% @doc pruneblockchain RPC — manually prune block-and-undo files.
+%% Mirrors `bitcoin-core/src/rpc/blockchain.cpp::pruneblockchain`:
+%%   * Param is either a block height (>0, <=tip) or a unix timestamp
+%%     (>=1e9, mapped to the latest block at-or-before that time).
+%%   * Rejects when prune mode is off entirely.
+%%   * Clamps the effective height to `tip - 288` to preserve the
+%%     reorg-safety window.
+%%   * Returns the height of the last block pruned.
+rpc_pruneblockchain([N]) when is_integer(N), N >= 0 ->
+    do_pruneblockchain(N);
+rpc_pruneblockchain([Other]) when is_float(Other), Other >= 0 ->
+    do_pruneblockchain(trunc(Other));
+rpc_pruneblockchain(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: pruneblockchain height_or_unix_timestamp">>}.
+
+do_pruneblockchain(N) ->
+    %% Reject if pruning is not enabled at all.
+    case beamchain_config:prune_enabled() of
+        false ->
+            {error, ?RPC_MISC_ERROR,
+             <<"Cannot prune blocks because node is not in prune mode.">>};
+        true ->
+            %% Resolve the parameter: heights are typically <= 5e8 for
+            %% the foreseeable future, while unix timestamps are >=1e9.
+            %% Core uses the same threshold (rpc/blockchain.cpp).
+            Height = case N >= 1000000000 of
+                false ->
+                    N;
+                true ->
+                    case beamchain_chainstate:get_tip() of
+                        not_found -> 0;
+                        {ok, {_TipHash, TipH}} ->
+                            timestamp_to_height(N, TipH)
+                    end
+            end,
+            case beamchain_db:prune_block_files_manual(Height) of
+                {ok, #{effective_height := Eff}} ->
+                    {ok, Eff};
+                {error, prune_disabled} ->
+                    {error, ?RPC_MISC_ERROR,
+                     <<"Cannot prune blocks because node is not in prune mode.">>};
+                {error, Reason} ->
+                    {error, ?RPC_DATABASE_ERROR,
+                     iolist_to_binary(io_lib:format("Manual prune failed: ~p",
+                                                    [Reason]))}
+            end
+    end.
+
+%% Map a unix timestamp to the height of the last block whose
+%% timestamp is <= the supplied value. Walks backward from the tip;
+%% O(tip-target) but fine because the manual-prune RPC is rare. Returns
+%% 0 if no block matches.
+timestamp_to_height(_T, TipH) when TipH =< 0 ->
+    0;
+timestamp_to_height(T, TipH) ->
+    timestamp_to_height_walk(T, TipH).
+
+timestamp_to_height_walk(_T, H) when H < 0 ->
+    0;
+timestamp_to_height_walk(T, H) ->
+    case beamchain_db:get_block_index(H) of
+        {ok, #{header := Hdr}} ->
+            case (Hdr#block_header.timestamp) =< T of
+                true  -> H;
+                false -> timestamp_to_height_walk(T, H - 1)
+            end;
+        _ ->
+            timestamp_to_height_walk(T, H - 1)
+    end.
 
 %% @doc invalidateblock - mark a block and all its descendants as invalid
 %% If the block is on the active chain, rewinds to just before it and switches
