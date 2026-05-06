@@ -903,3 +903,50 @@ node_bloom_advertised_services_test_() ->
          end}
         ]
      end}.
+
+%%% ===================================================================
+%%% BIP-130 announce branching: sendheaders peers get `headers`,
+%%% other peers get `inv`. Mirrors Bitcoin Core
+%%% net_processing.cpp::PeerManagerImpl::SendMessages's
+%%% m_blocks_for_headers_relay / fPreferHeaders branch and the camlcoin
+%%% reference impl at lib/peer_manager.ml::announce_block.
+%%% ===================================================================
+
+announce_branch_test_() ->
+    %% Minimal stub header — `headers` payload is encoded by p2p_msg, so
+    %% pick_announce_msg/3 only needs to thread the record through
+    %% unchanged.
+    Header = #block_header{
+        version = 1,
+        prev_hash = <<0:256>>,
+        merkle_root = <<0:256>>,
+        timestamp = 1234567890,
+        bits = 16#1d00ffff,
+        nonce = 0
+    },
+    BlockHash = <<1:256>>,
+    [
+     {"sendheaders peer (wants_headers=true) gets `headers`", fun() ->
+         {Cmd, Payload} =
+             beamchain_peer_manager:pick_announce_msg(true, Header, BlockHash),
+         ?assertEqual(headers, Cmd),
+         ?assertMatch(#{headers := [#block_header{}]}, Payload),
+         #{headers := [GotHdr]} = Payload,
+         ?assertEqual(Header, GotHdr)
+     end},
+     {"non-sendheaders peer falls back to `inv` of MSG_BLOCK", fun() ->
+         {Cmd, Payload} =
+             beamchain_peer_manager:pick_announce_msg(false, Header, BlockHash),
+         ?assertEqual(inv, Cmd),
+         ?assertMatch(#{items := [#{type := ?MSG_BLOCK, hash := BlockHash}]},
+                      Payload)
+     end},
+     {"branch is byte-for-byte different (no inv leak when peer wants headers)",
+      fun() ->
+         {CmdYes, _} =
+             beamchain_peer_manager:pick_announce_msg(true, Header, BlockHash),
+         {CmdNo, _} =
+             beamchain_peer_manager:pick_announce_msg(false, Header, BlockHash),
+         ?assertNotEqual(CmdYes, CmdNo)
+     end}
+    ].
