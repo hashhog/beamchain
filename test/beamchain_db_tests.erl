@@ -547,9 +547,40 @@ prune_enabled_test_() ->
      fun(_) ->
          [
           {"prune target is set", fun prune_target_set/0},
-          {"trigger_pruning is a no-op when chain is short", fun trigger_pruning_short_chain/0}
+          {"trigger_pruning is a no-op when chain is short", fun trigger_pruning_short_chain/0},
+          %% Wave-2026-05-05 prune wiring:
+          {"get_prune_state reflects auto mode", fun get_prune_state_auto/0},
+          {"manual prune RPC respects 288 keep window",
+           fun manual_prune_clamps_to_safety_window/0}
          ]
      end}.
+
+%%% Manual-mode (-prune=1) test fixture: trigger_pruning auto-cast must
+%%% not delete files even with a chain tip beyond the safety window.
+prune_manual_mode_test_() ->
+    {setup,
+     fun setup_with_prune_manual/0,
+     fun teardown/1,
+     fun(_) ->
+         [
+          {"manual mode reports manual_mode=true",
+           fun manual_mode_state/0},
+          {"manual mode does not auto-prune on trigger_pruning",
+           fun manual_mode_skips_auto_prune/0}
+         ]
+     end}.
+
+setup_with_prune_manual() ->
+    TmpDir = filename:join(["/tmp", "beamchain_prune_manual_test_" ++
+                            integer_to_list(erlang:unique_integer([positive]))]),
+    ok = filelib:ensure_dir(filename:join(TmpDir, "dummy")),
+    application:ensure_all_started(rocksdb),
+    application:set_env(beamchain, datadir, TmpDir),
+    application:set_env(beamchain, network, regtest),
+    os:putenv("BEAMCHAIN_PRUNE", "1"),
+    {ok, ConfigPid} = beamchain_config:start_link(),
+    {ok, DbPid} = beamchain_db:start_link(),
+    {TmpDir, ConfigPid, DbPid}.
 
 setup_with_prune() ->
     %% Use a unique temp directory for each test run
@@ -587,6 +618,58 @@ trigger_pruning_short_chain() ->
     %% Nothing should be pruned
     {ok, Count} = beamchain_db:prune_block_files(),
     ?assertEqual(0, Count).
+
+%%% New (2026-05-05): get_prune_state surfaces a usable view of the
+%%% prune subsystem for getblockchaininfo. Auto mode (-prune=550) must
+%%% report enabled=true, manual_mode=false, target_bytes>0, and a
+%%% pruneheight of 0 since nothing has been pruned yet.
+get_prune_state_auto() ->
+    State = beamchain_db:get_prune_state(),
+    ?assertEqual(true,  maps:get(enabled, State)),
+    ?assertEqual(false, maps:get(manual_mode, State)),
+    ?assertEqual(true,  maps:get(automatic_pruning, State)),
+    ?assert(maps:get(target_bytes, State) >= 550 * 1024 * 1024),
+    %% Nothing has been pruned in this fresh datadir.
+    ?assertEqual(0, maps:get(prune_height, State)).
+
+%%% Manual prune RPC must clamp the operator-supplied target height to
+%%% chain_tip - REORG_SAFETY_BLOCKS (288) so the keep window is preserved.
+%%% This is the test analogue of Core's PruneBlockFilesManual safety floor.
+manual_prune_clamps_to_safety_window() ->
+    %% Chain tip ChainHeight = 1000, ask to prune up to 999 (above safe
+    %% upper). Effective height must clamp to 1000-288 = 712.
+    Hash = crypto:strong_rand_bytes(32),
+    ok = beamchain_db:set_chain_tip(Hash, 1000),
+    {ok, #{effective_height := Eff}} =
+        beamchain_db:prune_block_files_manual(999),
+    ?assertEqual(712, Eff).
+
+%%% --------- Manual-only mode (-prune=1) ---------------------------------
+
+manual_mode_state() ->
+    %% With BEAMCHAIN_PRUNE=1 we are in manual-only mode: pruning is
+    %% enabled but auto-prune does not fire and the auto target is 0.
+    State = beamchain_db:get_prune_state(),
+    ?assertEqual(true,  maps:get(enabled, State)),
+    ?assertEqual(true,  maps:get(manual_mode, State)),
+    ?assertEqual(false, maps:get(automatic_pruning, State)),
+    ?assertEqual(0,     maps:get(target_bytes, State)).
+
+manual_mode_skips_auto_prune() ->
+    %% Even with a chain tip well past the safety window, the cast-based
+    %% trigger_pruning must NOT delete files in manual mode. Verified by
+    %% pruned_file_count remaining 0 after the cast.
+    Hash = crypto:strong_rand_bytes(32),
+    ok = beamchain_db:set_chain_tip(Hash, 5000),
+    Pre = maps:get(pruned_file_count,
+                    beamchain_db:get_block_file_info()),
+    ok = beamchain_db:trigger_pruning(5000),
+    %% Block long enough for the cast to be processed (cast → handle_cast
+    %% lands ahead of the next gen_server:call we issue below).
+    _ = beamchain_db:get_block_file_info(),
+    Post = maps:get(pruned_file_count,
+                     beamchain_db:get_block_file_info()),
+    ?assertEqual(Pre, Post).
 
 %%% ===================================================================
 %%% Block height/time index tests
