@@ -103,6 +103,14 @@
 -define(EVICT_HIGH_WATER, 8000000).
 -define(EVICT_LOW_WATER, 6000000).
 
+%% Maximum reorg depth — matches Bitcoin Core's m_chainman.MaxReorgDepth()
+%% behaviour. A reorg deeper than this many blocks is rejected outright;
+%% the node operator is expected to investigate (it indicates a major
+%% chain split or attack) rather than silently flip the tip across a
+%% large gap. Pattern D atomicity hardening per
+%% CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md.
+-define(MAX_REORG_DEPTH, 100).
+
 -record(state, {
     %% Current chain tip
     tip_hash          :: binary() | undefined,
@@ -132,7 +140,28 @@
     %% assumeUTXO support
     chainstate_role   :: main | snapshot | background,
     snapshot_base_height :: non_neg_integer() | undefined,
-    snapshot_base_hash :: binary() | undefined
+    snapshot_base_hash :: binary() | undefined,
+
+    %% Multi-block atomicity (Pattern D, beamchain
+    %% CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md).
+    %%
+    %% When a reorg is in progress, per-block disconnects and per-block
+    %% connects accumulate their disk side-effects (chain_tip update,
+    %% undo-data delete) into pending_undo_deletes / a deferred final
+    %% flush. The accumulator is committed in a single RocksDB
+    %% WriteBatch via do_flush/2 once all blocks have been processed.
+    %% Crash mid-reorg therefore leaves either the pre-reorg state
+    %% (no commit yet) or the post-reorg state (commit succeeded), never
+    %% partial. See do_reorganize/2 for the snapshot+restore protocol on
+    %% mid-reorg validation failure.
+    reorg_in_progress :: boolean(),
+
+    %% Block hashes whose on-disk undo entries should be deleted as part
+    %% of the next flush. Populated by do_disconnect_block when reorg is
+    %% in progress (or any future caller that wants to defer the undo
+    %% delete into the chainstate flush batch). Consumed and cleared by
+    %% do_flush/1.
+    pending_undo_deletes :: [binary()]
 }).
 
 %%% ===================================================================
@@ -606,7 +635,9 @@ init_chainstate(Role, SnapshotData) ->
         ibd = true,
         chainstate_role = Role,
         snapshot_base_height = SnapshotBaseHeight,
-        snapshot_base_hash = SnapshotBaseHash
+        snapshot_base_hash = SnapshotBaseHash,
+        reorg_in_progress = false,
+        pending_undo_deletes = []
     },
 
     %% On a fresh database (no chain tip), connect the genesis block
@@ -654,6 +685,10 @@ handle_call({submit_block, Block}, _From, State) ->
             {reply, {ok, reorg, DisconnectedTxs}, State2};
         {ok, Outcome, State2} ->
             {reply, {ok, Outcome}, State2};
+        {error, Reason, RolledBackState} ->
+            %% Atomic-reorg rollback path (Pattern D) —
+            %% RolledBackState mirrors pre-reorg.
+            {reply, {error, Reason}, RolledBackState};
         {error, Reason} ->
             {reply, {error, Reason}, State}
     end;
@@ -670,7 +705,14 @@ handle_call({reorganize, NewBlocks}, _From, State) ->
     case do_reorganize(NewBlocks, State) of
         {ok, State2, DisconnectedTxs} ->
             {reply, {ok, DisconnectedTxs}, State2};
+        {error, Reason, RolledBackState} ->
+            %% RolledBackState mirrors the pre-reorg snapshot — return
+            %% it so subsequent calls don't see the half-reorg ETS.
+            {reply, {error, Reason}, RolledBackState};
         {error, Reason} ->
+            %% Defensive fallback for any path that still returns the
+            %% legacy 2-tuple error (e.g. MAX_REORG_DEPTH guard before
+            %% any state mutation).
             {reply, {error, Reason}, State}
     end;
 
@@ -900,8 +942,17 @@ do_connect_block_inner(#block{header = Header} = Block,
                     mtp_timestamps = NewMTP,
                     blocks_since_flush = BlocksSinceFlush
                 },
-                State3 = maybe_check_ibd(State2),
-                State4 = maybe_flush(State3),
+                %% Skip per-block flush + IBD-exit flush when a reorg
+                %% is in progress: the multi-block atomicity guarantee
+                %% (Pattern D) requires a single final commit. The
+                %% calling do_reorganize/2 invokes do_flush after all
+                %% disconnects+connects succeed.
+                State4 = case State2#state.reorg_in_progress of
+                    true  -> State2;
+                    false ->
+                        State2a = maybe_check_ibd(State2),
+                        maybe_flush(State2a)
+                end,
 
                 %% All post-validation work complete.  Now safe to clear
                 %% the undo tracking — terminate/2 no longer needs it.
@@ -1207,9 +1258,18 @@ do_promote_side_branch(NewTipHash, State) ->
                     %% CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md
                     %% Pattern B1 closure for beamchain.
                     {ok, {reorg, DisconnectedTxs}, State2};
+                {error, Reason, RolledBackState} ->
+                    %% Reorg failed — atomicity rollback already
+                    %% restored ETS to pre-reorg state; on-disk state
+                    %% is the pre-reorg baseline thanks to the
+                    %% pre-flush. Side-branch storage still holds the
+                    %% candidate block, so a future call may retry.
+                    logger:warning("chainstate: side-branch reorg "
+                                   "failed: ~p (rolled back)", [Reason]),
+                    {error, {reorg_failed, Reason}, RolledBackState};
                 {error, Reason} ->
-                    %% Reorg failed — block remains in side-branch
-                    %% storage and chain stays on active tip.
+                    %% Defensive: legacy error path (e.g. from the
+                    %% MAX_REORG_DEPTH guard before any state mutation).
                     logger:warning("chainstate: side-branch reorg "
                                    "failed: ~p", [Reason]),
                     {error, {reorg_failed, Reason}}
@@ -1280,22 +1340,24 @@ is_on_active_chain(Hash) ->
 do_disconnect_block(#state{tip_hash = undefined}) ->
     {error, no_tip};
 do_disconnect_block(#state{tip_hash = TipHash, tip_height = TipHeight,
-                            params = Params} = State) ->
+                            params = Params,
+                            reorg_in_progress = ReorgInProgress,
+                            pending_undo_deletes = PendingUndo} = State) ->
     %% Get the tip block from DB
     case beamchain_db:get_block(TipHash) of
         {ok, Block} ->
-            %% Call validation to reverse the block's UTXO changes
+            %% Call validation to reverse the block's UTXO changes.
+            %% Validation now returns {ok, BlockHash} and does NOT touch
+            %% chain_tip / undo data on disk — those are batched into
+            %% the next flush via pending_undo_deletes (Pattern D
+            %% atomicity hardening).
             case beamchain_validation:disconnect_block(Block, TipHeight, Params) of
-                ok ->
+                {ok, DiscHash} ->
                     %% Move tip back to previous block
                     PrevHash = Block#block.header#block_header.prev_hash,
                     PrevHeight = TipHeight - 1,
 
                     ets:insert(?CHAIN_META, {tip, PrevHash, PrevHeight}),
-                    %% Do NOT call set_chain_tip here — that's a standalone
-                    %% rocksdb:put which is NOT atomic with UTXO changes.
-                    %% Instead, force a flush so the rolled-back UTXO state
-                    %% and the new tip are written in the same WriteBatch.
 
                     %% Update MTP: drop newest, restore oldest if possible
                     NewMTP = update_mtp_disconnect(PrevHeight,
@@ -1312,11 +1374,22 @@ do_disconnect_block(#state{tip_hash = TipHash, tip_height = TipHeight,
                     State2 = State#state{
                         tip_hash = PrevHash,
                         tip_height = PrevHeight,
-                        mtp_timestamps = NewMTP
+                        mtp_timestamps = NewMTP,
+                        pending_undo_deletes = [DiscHash | PendingUndo]
                     },
-                    %% Force flush: UTXO rollback + tip update in one batch
-                    State3 = do_flush(State2),
-                    {ok, State3};
+                    case ReorgInProgress of
+                        true ->
+                            %% Defer flush until end of reorg so the
+                            %% entire multi-block disconnect+reconnect
+                            %% commits atomically (Pattern D).
+                            {ok, State2};
+                        false ->
+                            %% Single-block disconnect: flush now so
+                            %% UTXO rollback + tip update + undo delete
+                            %% all land in one WriteBatch.
+                            State3 = do_flush(State2),
+                            {ok, State3}
+                    end;
                 {error, Reason} ->
                     {error, Reason}
             end;
@@ -1352,36 +1425,198 @@ update_mtp_disconnect(NewTipHeight, Timestamps) ->
 
 %% Reorganize the chain to include NewBlocks.
 %% NewBlocks must be ordered from fork_point+1 to new tip.
+%%
+%% Multi-block atomicity (Pattern D — beamchain audit row in
+%% CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md):
+%%
+%% Pre-fix, each per-block disconnect+connect committed its UTXO + tip
+%% + undo-data side effects to RocksDB independently. A crash mid-reorg
+%% therefore left the on-disk state in an arbitrary intermediate
+%% configuration (fork_point + k disconnected, k+m partially connected,
+%% with some `undo` rows already deleted). Restart could not distinguish
+%% "we were mid-reorg" from "the chain genuinely wants this configuration".
+%%
+%% Post-fix, the reorg orchestrator:
+%%   1. Pre-flushes the UTXO cache so the on-disk fork-point baseline is
+%%      committed before any reorg work begins. This is the snapshot we
+%%      can fall back to on validation failure or crash mid-reorg.
+%%   2. Captures a small in-memory snapshot of the pre-reorg
+%%      tip_hash / tip_height / mtp_timestamps in case validation throws
+%%      mid-walk.
+%%   3. Sets `reorg_in_progress = true` so per-block disconnects and
+%%      connects defer their flush — they accumulate UTXO mutations in
+%%      ETS and pending undo-deletes in `pending_undo_deletes` instead
+%%      of writing per-block.
+%%   4. Walks the disconnect side, then the connect side.
+%%   5. On success: commits ONE final atomic flush via `do_flush/1`,
+%%      which writes accumulated UTXO dirty/spent + final tip + all
+%%      pending undo-deletes in a single RocksDB WriteBatch.
+%%   6. On failure: rolls back ETS to the pre-reorg snapshot. Because
+%%      step 1 ensured the disk holds the pre-reorg state, wiping the
+%%      ETS dirty/fresh/spent tracking and the tainted UTXO_CACHE
+%%      entries forces subsequent reads to reload from RocksDB — i.e.
+%%      back to the pre-reorg state.
+%%
+%% Crash semantics:
+%%   - Crash before the final flush (step 5) → restart sees the
+%%     pre-reorg state on disk (tip + UTXO + undo-data all intact).
+%%     The new-tip side-branch blocks remain in `cf_blocks` /
+%%     side-branch index from `persist_side_branch_block`; subsequent
+%%     `submit_block` / header-sync re-evaluation will re-trigger the
+%%     reorg via `maybe_reorg_to_side_branch`.
+%%   - Crash during the final flush → RocksDB WriteBatch is itself
+%%     atomic, so either every op landed (post-reorg state) or none did
+%%     (pre-reorg state).
+%%   - Crash after the final flush → post-reorg state. ETS is rebuilt
+%%     from disk on next start.
+%%
+%% MAX_REORG_DEPTH cap: a reorg deeper than ?MAX_REORG_DEPTH blocks is
+%% rejected to mirror Core's safety guard. This is the depth of the
+%% disconnect side; the new-chain side is bounded indirectly by the
+%% chainwork comparison in `maybe_reorg_to_side_branch` plus the same
+%% cap below.
 do_reorganize([], State) ->
     {ok, State, []};
+do_reorganize(NewBlocks, _State) when length(NewBlocks) > ?MAX_REORG_DEPTH ->
+    logger:error("chainstate: refusing reorg of ~B blocks (max=~B)",
+                 [length(NewBlocks), ?MAX_REORG_DEPTH]),
+    {error, {reorg_too_deep, length(NewBlocks)}};
 do_reorganize(NewBlocks, State) ->
     %% The first new block's prev_hash is our fork point
     [FirstBlock | _] = NewBlocks,
     ForkHash = FirstBlock#block.header#block_header.prev_hash,
 
-    logger:info("chainstate: reorganizing to fork point ~s",
-                [hash_hex(ForkHash)]),
-
-    %% Step 1: disconnect blocks from current tip back to fork point
-    case disconnect_to(ForkHash, State, []) of
-        {ok, State2, DisconnectedTxs} ->
-            logger:info("chainstate: disconnected ~B blocks, connecting ~B new",
-                        [length(DisconnectedTxs), length(NewBlocks)]),
-
-            %% Step 2: connect the new chain
-            case connect_blocks(NewBlocks, State2) of
-                {ok, State3} ->
-                    {ok, State3, DisconnectedTxs};
-                {error, Reason} ->
-                    %% Failed to connect new chain — critical error.
-                    %% In a production node we'd try to reconnect the old chain.
-                    logger:error("chainstate: reorg failed on connect: ~p",
-                                 [Reason]),
-                    {error, {reorg_connect_failed, Reason}}
-            end;
+    %% Verify the disconnect side will not exceed MAX_REORG_DEPTH either.
+    %% Walk the active chain from current tip back to ForkHash and count.
+    case count_disconnect_depth(ForkHash, State#state.tip_hash, 0) of
+        {ok, DiscDepth} when DiscDepth > ?MAX_REORG_DEPTH ->
+            logger:error("chainstate: refusing reorg with ~B-block "
+                         "disconnect (max=~B)",
+                         [DiscDepth, ?MAX_REORG_DEPTH]),
+            {error, {reorg_too_deep, DiscDepth}};
+        {ok, DiscDepth} ->
+            logger:info("chainstate: reorganizing to fork point ~s "
+                        "(disconnect=~B, connect=~B; atomic-batch mode)",
+                        [hash_hex(ForkHash), DiscDepth, length(NewBlocks)]),
+            do_reorganize_atomic(NewBlocks, State);
         {error, Reason} ->
-            {error, {reorg_disconnect_failed, Reason}}
+            {error, {reorg_walk_failed, Reason}}
     end.
+
+%% Walk the active chain from CurrentTipHash back until we hit ForkHash,
+%% counting steps. Returns {ok, Depth} or {error, Reason}.
+%% Bounded at ?MAX_REORG_DEPTH+1 so a wildly-mis-targeted reorg fails
+%% fast rather than scanning the entire chain.
+count_disconnect_depth(ForkHash, ForkHash, Depth) ->
+    {ok, Depth};
+count_disconnect_depth(_ForkHash, _Hash, Depth) when Depth > ?MAX_REORG_DEPTH ->
+    {ok, Depth};
+count_disconnect_depth(_ForkHash, undefined, _Depth) ->
+    {error, fork_point_not_found_in_active_chain};
+count_disconnect_depth(ForkHash, Hash, Depth) ->
+    case beamchain_db:get_block_index_by_hash(Hash) of
+        {ok, #{header := #block_header{prev_hash = Prev}}} ->
+            count_disconnect_depth(ForkHash, Prev, Depth + 1);
+        not_found ->
+            {error, {missing_block_index, Hash}}
+    end.
+
+%% Run the multi-block disconnect+reconnect under a single atomic
+%% commit. See do_reorganize/2 docstring.
+do_reorganize_atomic(NewBlocks, State) ->
+    %% Snapshot pre-reorg in-memory state for rollback on failure.
+    Snapshot = #{
+        tip_hash       => State#state.tip_hash,
+        tip_height     => State#state.tip_height,
+        mtp_timestamps => State#state.mtp_timestamps
+    },
+
+    %% Step 1: pre-flush so disk holds a known good fork-point baseline.
+    %% If we crash before the final commit, restart sees this state.
+    StateFlushed = do_flush(State),
+
+    %% Step 2: enter reorg mode — per-block flushes are suppressed.
+    StateReorg = StateFlushed#state{reorg_in_progress = true},
+
+    %% Step 3: disconnect blocks from current tip back to fork point.
+    [FirstBlock | _] = NewBlocks,
+    ForkHash = FirstBlock#block.header#block_header.prev_hash,
+    Result =
+        try
+            case disconnect_to(ForkHash, StateReorg, []) of
+                {ok, State2, DisconnectedTxs} ->
+                    %% Step 4: connect the new chain (still reorg mode).
+                    case connect_blocks(NewBlocks, State2) of
+                        {ok, State3} ->
+                            %% Step 5: ONE final atomic commit.
+                            State4 = State3#state{reorg_in_progress = false},
+                            State5 = do_flush(State4),
+                            {ok, State5, DisconnectedTxs};
+                        {error, ConnectErr} ->
+                            {error, {reorg_connect_failed, ConnectErr}}
+                    end;
+                {error, DiscErr} ->
+                    {error, {reorg_disconnect_failed, DiscErr}}
+            end
+        catch
+            Class:Why:Stack ->
+                logger:error("chainstate: reorg crashed: ~p:~p~n~p",
+                             [Class, Why, Stack]),
+                {error, {reorg_exception, {Class, Why}}}
+        end,
+    case Result of
+        {ok, _, _} = Ok ->
+            Ok;
+        {error, ErrReason} ->
+            %% Step 6: rollback on failure. The on-disk state still
+            %% holds the pre-reorg tip + UTXO + undo (because the
+            %% pre-flush ran in step 1 and no further commit landed),
+            %% so wiping the ETS pollution from the partial walk and
+            %% restoring the tip pointer is sufficient.
+            logger:error("chainstate: reorg failed (~p), rolling back to "
+                         "pre-reorg snapshot at ~s/~B",
+                         [ErrReason,
+                          hash_hex(maps:get(tip_hash, Snapshot)),
+                          maps:get(tip_height, Snapshot)]),
+            RolledBack = rollback_reorg(Snapshot, State),
+            {error, ErrReason, RolledBack}
+    end.
+
+%% Roll back the in-memory state to the pre-reorg snapshot. The on-disk
+%% state still holds the pre-reorg tip + UTXO + undo data because
+%% do_reorganize_atomic pre-flushed before mutating; the *only* thing
+%% we need to undo is the in-memory ETS pollution from the partial
+%% reorg walk (UTXO_CACHE entries that were spent/added, dirty/fresh/
+%% spent tracking, the in-progress pending_undo_deletes accumulator,
+%% and the CHAIN_META tip pointer).
+rollback_reorg(Snapshot, OriginalState) ->
+    %% Wipe ALL ETS UTXO state. UTXO_CACHE may contain entries that
+    %% reflect the partial reorg walk (some UTXOs were spent by the
+    %% disconnect-then-failed-connect path); rather than try to undo
+    %% them surgically, drop the cache entirely. Subsequent reads will
+    %% reload from RocksDB which still holds the pre-reorg state.
+    ets:delete_all_objects(?UTXO_CACHE),
+    ets:delete_all_objects(?UTXO_DIRTY),
+    ets:delete_all_objects(?UTXO_FRESH),
+    ets:delete_all_objects(?UTXO_SPENT),
+
+    %% Restore tip pointer in CHAIN_META.
+    SnapTip = maps:get(tip_hash, Snapshot),
+    SnapHeight = maps:get(tip_height, Snapshot),
+    case SnapTip of
+        undefined -> ets:delete(?CHAIN_META, tip);
+        _ -> ets:insert(?CHAIN_META, {tip, SnapTip, SnapHeight})
+    end,
+
+    %% Return a state record matching the snapshot, with reorg flag
+    %% cleared and pending_undo_deletes wiped.
+    OriginalState#state{
+        tip_hash             = SnapTip,
+        tip_height           = SnapHeight,
+        mtp_timestamps       = maps:get(mtp_timestamps, Snapshot),
+        reorg_in_progress    = false,
+        pending_undo_deletes = []
+    }.
 
 %% Disconnect blocks until tip_hash == TargetHash.
 disconnect_to(TargetHash, #state{tip_hash = TargetHash} = State, AccTxs) ->
@@ -1459,16 +1694,28 @@ maybe_flush(State) ->
 
 %% Flush dirty entries to RocksDB in a single write batch.
 %% After flush, all entries become "clean" (match what's in RocksDB).
+%%
+%% Also commits any pending undo-data deletions accumulated by
+%% do_disconnect_block (Pattern D atomicity hardening — see
+%% CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md).
+%% UTXO mutations + tip update + undo-data deletes ALL land in a single
+%% RocksDB WriteBatch so a crash either preserves the pre-flush state in
+%% full, or commits the post-flush state in full — never partial.
 do_flush(#state{tip_hash = undefined} = State) ->
     State;
-do_flush(#state{tip_hash = TipHash, tip_height = TipHeight} = State) ->
+do_flush(#state{tip_hash = TipHash, tip_height = TipHeight,
+                pending_undo_deletes = PendingUndo} = State) ->
     DirtyCount = ets:info(?UTXO_DIRTY, size),
     SpentCount = ets:info(?UTXO_SPENT, size),
     FreshCount = ets:info(?UTXO_FRESH, size),
-    case DirtyCount =:= 0 andalso SpentCount =:= 0 of
+    UndoDeleteOps = [{delete, undo, H} || H <- PendingUndo],
+    HasPendingUndo = PendingUndo =/= [],
+    case DirtyCount =:= 0 andalso SpentCount =:= 0
+         andalso not HasPendingUndo of
         true ->
-            %% No UTXO changes to flush, but still write the tip
-            %% so the on-disk tip stays consistent with state.
+            %% No UTXO changes / no deferred undo deletes — but still
+            %% write the tip so the on-disk tip stays consistent with
+            %% state.
             TipValue = <<TipHash:32/binary, TipHeight:64/big>>,
             TipOps = [
                 {put, meta, <<"chain_tip">>, TipValue},
@@ -1481,11 +1728,12 @@ do_flush(#state{tip_hash = TipHash, tip_height = TipHeight} = State) ->
             %% Build write batch
             Ops = build_flush_ops(),
 
-            %% Add chain tip, flush height, and HEAD_BLOCKS marker
-            %% ALL in the same atomic WriteBatch — no separate puts.
+            %% Add chain tip, flush height, HEAD_BLOCKS marker, and any
+            %% deferred undo-data deletes ALL in the same atomic
+            %% WriteBatch — no separate puts.
             Marker = <<TipHash/binary, TipHeight:64/big>>,
             TipValue = <<TipHash:32/binary, TipHeight:64/big>>,
-            AllOps = Ops ++ [
+            AllOps = Ops ++ UndoDeleteOps ++ [
                 {put, meta, <<"chain_tip">>, TipValue},
                 {put, meta, <<"utxo_flush_height">>,
                  <<TipHeight:64/big>>},
@@ -1504,9 +1752,10 @@ do_flush(#state{tip_hash = TipHash, tip_height = TipHeight} = State) ->
                     %% Clear crash recovery marker (best-effort, not critical)
                     beamchain_db:put_meta(<<"HEAD_BLOCKS">>, <<>>),
 
-                    logger:debug("chainstate: flushed ~B dirty (~B fresh), ~B spent "
-                                 "at height ~B",
-                                 [DirtyCount, FreshCount, SpentCount, TipHeight]),
+                    logger:debug("chainstate: flushed ~B dirty (~B fresh), "
+                                 "~B spent, ~B undo-deletes at height ~B",
+                                 [DirtyCount, FreshCount, SpentCount,
+                                  length(PendingUndo), TipHeight]),
                     %% Verify a sample of cached entries are in RocksDB.
                     %% This catches flush bugs where writes silently fail.
                     verify_flush_sample(),
@@ -1514,7 +1763,8 @@ do_flush(#state{tip_hash = TipHash, tip_height = TipHeight} = State) ->
                     %% Evict clean entries if the cache is too large.
                     %% After flush, all remaining entries are clean (on disk).
                     maybe_evict_cache(),
-                    State#state{blocks_since_flush = 0};
+                    State#state{blocks_since_flush = 0,
+                                pending_undo_deletes = []};
                 {error, Reason} ->
                     logger:error("chainstate: flush failed: ~p", [Reason]),
                     State
