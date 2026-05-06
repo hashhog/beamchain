@@ -970,6 +970,40 @@ do_connect_block_inner(#block{header = Header} = Block,
                 %% Notify peer manager that our tip advanced (stale tip detection)
                 beamchain_peer_manager:notify_tip_updated(),
 
+                %% Pruning trigger (BIP-159 / Core auto-prune).
+                %%
+                %% Fire ONLY when:
+                %%   * pruning is enabled in config (-prune=N with N>0), AND
+                %%   * we are NOT mid-reorg (reorg_in_progress = false)
+                %%
+                %% In manual-only mode (-prune=1), the cast lands on a
+                %% no-op handler in beamchain_db (see handle_cast trigger
+                %% with prune_manual_mode=true). We still fire it so the
+                %% trigger path is exercised; the gate lives in db.
+                %%
+                %% Done AFTER notify_tip_updated so the prune-induced
+                %% file:delete + RocksDB writes don't sit in front of
+                %% other downstream tip-event consumers.
+                %%
+                %% Reorg path: do_reorganize_atomic batches multiple
+                %% connect_block calls under reorg_in_progress=true,
+                %% then clears the flag and fires a single do_flush. We
+                %% intentionally skip the prune cast for those connects
+                %% because (a) the keep-window is computed from the
+                %% post-reorg tip and (b) a half-completed reorg must
+                %% not delete files that the rollback path may need.
+                _ = case State4#state.reorg_in_progress of
+                    false ->
+                        try beamchain_config:prune_enabled() of
+                            true  -> beamchain_db:trigger_pruning(Height);
+                            false -> ok
+                        catch
+                            _:_ -> ok
+                        end;
+                    true ->
+                        ok
+                end,
+
                 {ok, State4}
             catch
                 Class:Reason2:Stack ->
