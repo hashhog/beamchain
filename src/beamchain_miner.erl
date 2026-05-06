@@ -357,7 +357,7 @@ do_submit_block(HexBlock) ->
 
                         BlockHash = beamchain_serialize:block_hash(
                             Block#block.header),
-                        broadcast_new_block(BlockHash),
+                        broadcast_new_block(Block#block.header, BlockHash),
 
                         logger:info("miner: accepted block ~s (~p)",
                                     [short_hex(BlockHash), Outcome]),
@@ -391,12 +391,13 @@ do_submit_block(HexBlock) ->
             {error, Reason2}
     end.
 
-%% Broadcast a newly mined block hash via inv to all connected peers.
-broadcast_new_block(BlockHash) ->
+%% Broadcast a newly mined block to all connected peers, branching on
+%% BIP-130 sendheaders. Peers that opted into header announces receive a
+%% `headers` push; others fall back to `inv`. See
+%% beamchain_peer_manager:announce_block/2.
+broadcast_new_block(Header, BlockHash) ->
     try
-        beamchain_peer_manager:broadcast(inv, #{
-            items => [#{type => ?MSG_BLOCK, hash => BlockHash}]
-        })
+        beamchain_peer_manager:announce_block(Header, BlockHash)
     catch
         _:_ -> ok   %% peer manager may not be running
     end.
