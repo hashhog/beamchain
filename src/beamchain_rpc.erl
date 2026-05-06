@@ -48,6 +48,11 @@
 %% Exported for testing — verifychain RPC handler.
 -export([rpc_verifychain/1]).
 
+%% Test-only exports — confirmations helpers (Pattern C1 regression tests).
+-ifdef(TEST).
+-export([confirmations/1, confirmations/2, is_block_in_active_chain/1]).
+-endif.
+
 %% Cowboy handler
 -export([init/2]).
 
@@ -1026,7 +1031,7 @@ rpc_getblockheader([HashHex, Verbose]) when is_binary(HashHex) ->
                     Bits = Header#block_header.bits,
                     {ok, #{
                         <<"hash">> => hash_to_hex(Hash),
-                        <<"confirmations">> => confirmations(Height),
+                        <<"confirmations">> => confirmations(Height, Hash),
                         <<"height">> => Height,
                         <<"version">> => Header#block_header.version,
                         <<"versionHex">> => beamchain_serialize:hex_encode(
@@ -1066,7 +1071,7 @@ rpc_getblockheader([HashHex, Verbose]) when is_binary(HashHex) ->
                     Bits = Header#block_header.bits,
                     {ok, #{
                         <<"hash">> => hash_to_hex(Hash),
-                        <<"confirmations">> => confirmations(Height),
+                        <<"confirmations">> => confirmations(Height, Hash),
                         <<"height">> => Height,
                         <<"version">> => Header#block_header.version,
                         <<"versionHex">> => beamchain_serialize:hex_encode(
@@ -2020,7 +2025,7 @@ format_getrawtransaction_result(Tx, BlockHash, Height, Verbosity, BlockHashProvi
             BlockTime = block_time(Height),
             TxJson#{
                 <<"blockhash">> => hash_to_hex(BlockHash),
-                <<"confirmations">> => confirmations(Height),
+                <<"confirmations">> => confirmations(Height, BlockHash),
                 <<"time">> => BlockTime,
                 <<"blocktime">> => BlockTime
             }
@@ -3421,11 +3426,37 @@ tip_difficulty() ->
     end.
 
 %% Number of confirmations for a block at the given height.
+%%
+%% NOTE: This 1-arg variant has no way to verify the caller's block is on the
+%% active chain.  It is correct only when the height/block is known-canonical
+%% (e.g. chainstate-derived UTXO heights in `gettxout`).  For RPC paths that
+%% accept a user-supplied block hash (`getblock`, `getblockheader`,
+%% `getrawtransaction`), use the 2-arg `confirmations/2` variant which
+%% checks active-chain ancestry.  Pattern C1 invariant from
+%% bitcoin-core/src/rpc/blockchain.cpp: post-disconnect blocks must report
+%% confirmations = 0 (or -1 in some endpoints), never the height delta.
 confirmations(BlockHeight) ->
     case beamchain_chainstate:get_tip() of
         {ok, {_, TipHeight}} -> TipHeight - BlockHeight + 1;
         not_found -> 0
     end.
+
+%% Number of confirmations, gated on active-chain ancestry.
+%% Returns 0 when the block is not on the active chain (disconnected by reorg).
+%% Mirrors Core's `tip->GetAncestor(blockindex->nHeight) == blockindex` check
+%% in src/rpc/blockchain.cpp (used by getblock / getblockheader /
+%% getrawtransaction).  Pattern C1 fix — see
+%% CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-2026-05-05.md.
+confirmations(BlockHeight, BlockHash) when is_binary(BlockHash) ->
+    case is_block_in_active_chain(BlockHash) of
+        true ->
+            confirmations(BlockHeight);
+        false ->
+            0
+    end;
+confirmations(BlockHeight, _) ->
+    %% Fallback: hash unavailable — best effort
+    confirmations(BlockHeight).
 
 %% Median time past for a specific block height.
 block_mtp(Height) when Height < 11 ->
@@ -3510,7 +3541,7 @@ format_block_json(#block{header = Header, transactions = Txs} = Block,
     end,
     #{
         <<"hash">> => hash_to_hex(Hash),
-        <<"confirmations">> => confirmations(Height),
+        <<"confirmations">> => confirmations(Height, Hash),
         <<"height">> => Height,
         <<"version">> => Header#block_header.version,
         <<"versionHex">> => beamchain_serialize:hex_encode(
