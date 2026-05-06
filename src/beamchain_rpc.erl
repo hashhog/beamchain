@@ -57,6 +57,10 @@
 -export([confirmations/1, confirmations/2, is_block_in_active_chain/1]).
 %% Test-only exports — submitpackage helpers (mempool wave 2026-05-06).
 -export([rpc_submitpackage/1, decode_package_tx/1]).
+%% Test-only exports — wallet wave (lockunspent + analyzepsbt + walletcreatefundedpsbt).
+-export([rpc_analyzepsbt/1, rpc_lockunspent/2, rpc_listlockunspent/1,
+         rpc_walletcreatefundedpsbt/2,
+         analyze_psbt/1]).
 -endif.
 
 %% Cowboy handler
@@ -86,6 +90,16 @@
 -define(RPC_VERIFY_REJECTED, -26).
 -define(RPC_VERIFY_ALREADY_IN_CHAIN, -27).
 -define(RPC_IN_WARMUP, -28).
+
+%% PSBT role enum — mirrors `bitcoin-core/src/psbt.h::PSBTRole`.
+%% Values are ordered so `min/2` ratchets toward the earliest role still
+%% needed; CREATOR is unreachable here because every PSBT we analyze has
+%% at minimum been created.  Used by `analyzepsbt` and exposed to tests.
+-define(PSBT_ROLE_CREATOR,    0).
+-define(PSBT_ROLE_UPDATER,    1).
+-define(PSBT_ROLE_SIGNER,     2).
+-define(PSBT_ROLE_FINALIZER,  3).
+-define(PSBT_ROLE_EXTRACTOR,  4).
 
 %%% -------------------------------------------------------------------
 %%% Tables and limits
@@ -583,17 +597,21 @@ handle_method(<<"dumpprivkey">>, P, W) -> rpc_dumpprivkey(P, W);
 handle_method(<<"sendtoaddress">>, P, W) -> rpc_sendtoaddress(P, W);
 handle_method(<<"listunspent">>, P, W) -> rpc_listunspent(P, W);
 handle_method(<<"listtransactions">>, P, W) -> rpc_listtransactions(P, W);
+handle_method(<<"lockunspent">>, P, W) -> rpc_lockunspent(P, W);
+handle_method(<<"listlockunspent">>, _, W) -> rpc_listlockunspent(W);
 handle_method(<<"encryptwallet">>, P, W) -> rpc_encryptwallet(P, W);
 handle_method(<<"walletpassphrase">>, P, W) -> rpc_walletpassphrase(P, W);
 handle_method(<<"walletlock">>, _, W) -> rpc_walletlock(W);
 handle_method(<<"signrawtransactionwithwallet">>, P, W) -> rpc_signrawtransactionwithwallet(P, W);
 handle_method(<<"importdescriptors">>, P, W) -> rpc_importdescriptors(P, W);
+handle_method(<<"walletcreatefundedpsbt">>, P, W) -> rpc_walletcreatefundedpsbt(P, W);
 
 %% -- PSBT --
 handle_method(<<"createpsbt">>, P, _W) -> rpc_createpsbt(P);
 handle_method(<<"decodepsbt">>, P, _W) -> rpc_decodepsbt(P);
 handle_method(<<"combinepsbt">>, P, _W) -> rpc_combinepsbt(P);
 handle_method(<<"finalizepsbt">>, P, _W) -> rpc_finalizepsbt(P);
+handle_method(<<"analyzepsbt">>, P, _W) -> rpc_analyzepsbt(P);
 
 %% -- Descriptors --
 handle_method(<<"deriveaddresses">>, P, _W) -> rpc_deriveaddresses(P);
@@ -679,6 +697,7 @@ rpc_help_list() ->
         <<"setban \"subnet\" \"command\" ( bantime )">>,
         <<"">>,
         <<"== Rawtransactions ==">>,
+        <<"analyzepsbt \"psbt\"">>,
         <<"combinepsbt [\"psbt\",...]">>,
         <<"createpsbt [{\"txid\":\"hex\",\"vout\":n},...] [{\"address\":amount},...] ( locktime )">>,
         <<"createrawtransaction [{\"txid\":\"hex\",\"vout\":n},...] [{\"address\":amount},...] ( locktime replaceable )">>,
@@ -711,14 +730,17 @@ rpc_help_list() ->
         <<"gettxout \"txid\" n ( include_mempool )">>,
         <<"getwalletinfo">>,
         <<"listaddresses">>,
+        <<"listlockunspent">>,
         <<"listtransactions ( \"label\" count skip )">>,
         <<"listunspent ( minconf maxconf )">>,
         <<"listwallets">>,
         <<"loadwallet \"name\"">>,
+        <<"lockunspent unlock ( [{\"txid\":\"hex\",\"vout\":n},...] persistent )">>,
         <<"importdescriptors \"requests\"">>,
         <<"sendtoaddress \"address\" amount ( \"comment\" )">>,
         <<"signrawtransactionwithwallet \"hexstring\" ( [{\"txid\":\"hex\",\"vout\":n,\"scriptPubKey\":\"hex\"},...] )">>,
         <<"unloadwallet ( \"name\" )">>,
+        <<"walletcreatefundedpsbt [{\"txid\":\"hex\",\"vout\":n},...] [{\"address\":amount},...] ( locktime options bip32derivs )">>,
         <<"walletlock">>,
         <<"walletpassphrase \"passphrase\" timeout">>,
         <<"">>,
@@ -4524,6 +4546,143 @@ rpc_listtransactions(_Params, WalletName) ->
             wallet_not_found_error(WalletName)
     end.
 
+%% @doc lockunspent unlock ( [{"txid":...,"vout":n},...] persistent )
+%%
+%% Mirrors `bitcoin-core/src/wallet/rpc/coins.cpp::lockunspent`. Temporarily
+%% locks (unlock=false) or unlocks (unlock=true) the listed transaction
+%% outputs so they will be skipped by automatic coin selection.
+%%
+%% - `unlock=true` with no transactions clears all locks ("UnlockAllCoins").
+%% - `unlock=true` with locks cleared in the same call must error if the
+%%   coin was never locked (Core: "expected locked output").
+%% - `unlock=false` requires the coin to be unspent in the UTXO set, and
+%%   refuses to lock an already-locked coin unless `persistent` is true
+%%   (memory locks are upgraded to disk locks).  We accept `persistent` for
+%%   parity but only store in memory; persistence is a TODO.
+rpc_lockunspent([Unlock], WalletName) when is_boolean(Unlock) ->
+    rpc_lockunspent([Unlock, null, false], WalletName);
+rpc_lockunspent([Unlock, Transactions], WalletName) ->
+    rpc_lockunspent([Unlock, Transactions, false], WalletName);
+rpc_lockunspent([Unlock, Transactions, Persistent], WalletName)
+        when is_boolean(Unlock), is_boolean(Persistent) ->
+    case resolve_wallet(WalletName) of
+        {ok, Pid} ->
+            do_lockunspent(Pid, Unlock, Transactions, Persistent);
+        {error, _} ->
+            wallet_not_found_error(WalletName)
+    end;
+rpc_lockunspent(_, _) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"lockunspent unlock ( [{\"txid\":\"hex\",\"vout\":n},...] persistent )">>}.
+
+do_lockunspent(Pid, true, null, _Persistent) ->
+    %% unlock=true, no transactions: clear all locks.
+    ok = beamchain_wallet:unlock_all_coins(Pid),
+    {ok, true};
+do_lockunspent(_Pid, false, null, _Persistent) ->
+    %% lock=true requires a transactions list per Core (param[1] not optional
+    %% on the lock path).  Mirror Core's `request.params[1].isNull()` check
+    %% which only short-circuits on the unlock path.
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Invalid parameter, transactions array required when locking">>};
+do_lockunspent(Pid, Unlock, Transactions, _Persistent)
+        when is_list(Transactions) ->
+    %% Two-phase per Core: validate every outpoint first, then mutate.
+    case parse_lock_outpoints(Transactions, Pid, Unlock) of
+        {ok, Outpoints} ->
+            lists:foreach(fun({Txid, Vout}) ->
+                case Unlock of
+                    true ->
+                        %% We've already verified is_locked above; ignore
+                        %% the {error, not_locked} race-window result.
+                        _ = beamchain_wallet:unlock_coin(Pid, Txid, Vout);
+                    false ->
+                        ok = beamchain_wallet:lock_coin(Pid, Txid, Vout)
+                end
+            end, Outpoints),
+            {ok, true};
+        {error, Code, Msg} ->
+            {error, Code, Msg}
+    end;
+do_lockunspent(_Pid, _Unlock, _BadTx, _Persistent) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Invalid parameter, transactions must be an array">>}.
+
+%% Validate every outpoint and (un)lock-state predicate before mutating.
+parse_lock_outpoints(Transactions, Pid, Unlock) ->
+    try
+        Outs = lists:map(fun(Obj) ->
+            validate_lock_outpoint(Obj, Pid, Unlock)
+        end, Transactions),
+        {ok, Outs}
+    catch
+        throw:{lock_param_error, Msg} ->
+            {error, ?RPC_INVALID_PARAMETER, Msg}
+    end.
+
+validate_lock_outpoint(Obj, Pid, Unlock) when is_map(Obj) ->
+    TxidHex = case maps:get(<<"txid">>, Obj, undefined) of
+        undefined ->
+            throw({lock_param_error,
+                   <<"Invalid parameter, missing txid">>});
+        T when is_binary(T) -> T;
+        _ ->
+            throw({lock_param_error,
+                   <<"Invalid parameter, txid must be a string">>})
+    end,
+    Vout = case maps:get(<<"vout">>, Obj, undefined) of
+        undefined ->
+            throw({lock_param_error,
+                   <<"Invalid parameter, missing vout">>});
+        V when is_integer(V), V >= 0 -> V;
+        V when is_integer(V) ->
+            throw({lock_param_error,
+                   <<"Invalid parameter, vout cannot be negative">>});
+        _ ->
+            throw({lock_param_error,
+                   <<"Invalid parameter, vout must be a number">>})
+    end,
+    Txid = try hex_to_internal_hash(TxidHex)
+           catch _:_ ->
+               throw({lock_param_error,
+                      <<"Invalid parameter, txid is not a hex string">>})
+           end,
+    case byte_size(Txid) of
+        32 -> ok;
+        _ ->
+            throw({lock_param_error,
+                   <<"Invalid parameter, txid must be 32 bytes">>})
+    end,
+    IsLocked = beamchain_wallet:is_locked_coin(Pid, {Txid, Vout}),
+    case {Unlock, IsLocked} of
+        {true, false} ->
+            throw({lock_param_error,
+                   <<"Invalid parameter, expected locked output">>});
+        {false, true} ->
+            throw({lock_param_error,
+                   <<"Invalid parameter, output already locked">>});
+        _ -> ok
+    end,
+    {Txid, Vout};
+validate_lock_outpoint(_, _, _) ->
+    throw({lock_param_error,
+           <<"Invalid parameter, transactions entries must be objects">>}).
+
+%% @doc listlockunspent: return all locked outpoints in this wallet.
+%% Mirrors `bitcoin-core/src/wallet/rpc/coins.cpp::listlockunspent`.
+%% Output objects use Core's display-order txid (big-endian hex).
+rpc_listlockunspent(WalletName) ->
+    case resolve_wallet(WalletName) of
+        {ok, Pid} ->
+            Locked = beamchain_wallet:list_locked_coins(Pid),
+            Result = [#{<<"txid">> => hash_to_hex(Txid),
+                        <<"vout">> => Vout}
+                      || {Txid, Vout} <- Locked],
+            {ok, Result};
+        {error, _} ->
+            wallet_not_found_error(WalletName)
+    end.
+
 %% @doc Encrypt the wallet with a passphrase (multi-wallet aware).
 rpc_encryptwallet([Passphrase], WalletName) when is_binary(Passphrase) ->
     case resolve_wallet(WalletName) of
@@ -4927,6 +5086,526 @@ rpc_finalizepsbt([PsbtB64, Extract]) when is_binary(PsbtB64) ->
     end;
 rpc_finalizepsbt(_) ->
     {error, ?RPC_INVALID_PARAMS, <<"finalizepsbt \"psbt\" (extract)">>}.
+
+%% @doc analyzepsbt "psbt"
+%%
+%% Analyzes a PSBT and reports per-input status (has_utxo / is_final / what
+%% is missing / role of next signer) plus aggregate fee and estimated vsize
+%% when calculable.  Mirrors `bitcoin-core/src/rpc/rawtransaction.cpp::
+%% analyzepsbt` and `bitcoin-core/src/node/psbt.cpp::AnalyzePSBT`.
+%%
+%% Beamchain follows the same input-by-input ratchet on the role enum
+%% (CREATOR < UPDATER < SIGNER < FINALIZER < EXTRACTOR) and selects the
+%% "minimum" role across inputs.  The next-role heuristic is approximate:
+%% Core's `SignPSBTInput(DUMMY_SIGNING_PROVIDER, ...)` walks the script
+%% engine to figure out exactly what is missing; we surface the same
+%% structure (`missing.signatures`, `missing.pubkeys`, `missing.redeemscript`,
+%% `missing.witnessscript`) but populate it from the PSBT input map's raw
+%% absences rather than a dummy-sign pass.
+rpc_analyzepsbt([PsbtB64]) when is_binary(PsbtB64) ->
+    try
+        PsbtBin = base64:decode(PsbtB64),
+        case beamchain_psbt:decode(PsbtBin) of
+            {ok, Psbt} ->
+                {ok, analyze_psbt(Psbt)};
+            {error, Reason} ->
+                {error, ?RPC_DESERIALIZATION_ERROR,
+                 iolist_to_binary(io_lib:format("TX decode failed ~p",
+                                                 [Reason]))}
+        end
+    catch
+        error:badarg ->
+            {error, ?RPC_DESERIALIZATION_ERROR,
+             <<"TX decode failed Invalid base64 encoding">>};
+        _:Err ->
+            {error, ?RPC_MISC_ERROR,
+             iolist_to_binary(io_lib:format("Error: ~p", [Err]))}
+    end;
+rpc_analyzepsbt(_) ->
+    {error, ?RPC_INVALID_PARAMS, <<"analyzepsbt \"psbt\"">>}.
+
+%% Build the analyzepsbt response object. Pure function, exposed via
+%% rpc_analyzepsbt; no side effects so eunit can call it directly.
+%% (The `#psbt{}` record is module-local to beamchain_psbt; we treat it
+%%  here as an opaque term passed through `beamchain_psbt:get_*` getters.)
+analyze_psbt(Psbt) ->
+    Tx = beamchain_psbt:get_unsigned_tx(Psbt),
+    NumInputs = length(Tx#transaction.inputs),
+    Indices = lists:seq(0, NumInputs - 1),
+    %% Per-input analysis + accumulator for fee math.
+    Inputs0 = lists:map(fun(Idx) ->
+        analyze_psbt_input(Psbt, Tx, Idx)
+    end, Indices),
+    %% Determine if all inputs have a UTXO (required for fee/vsize).
+    AllHaveUtxo = lists:all(fun(M) ->
+        maps:get(has_utxo_internal, M, false)
+    end, Inputs0),
+    %% Strip internal helper keys before returning.
+    Inputs = [maps:without([has_utxo_internal, in_value_internal,
+                             role_internal], M) || M <- Inputs0],
+    %% Compute aggregate next role: minimum of all input roles, defaulting
+    %% to EXTRACTOR if there are no inputs (Core's `assert(result.next >
+    %% PSBTRole::CREATOR)` is upheld by `min/2` starting at EXTRACTOR=4).
+    Roles = [maps:get(role_internal, M, ?PSBT_ROLE_UPDATER) || M <- Inputs0],
+    NextRole = case Roles of
+        [] -> ?PSBT_ROLE_EXTRACTOR;
+        _  -> lists:min(Roles)
+    end,
+    Base = #{<<"next">> => psbt_role_name(NextRole)},
+    Base1 = case Inputs of
+        [] -> Base;
+        _  -> Base#{<<"inputs">> => Inputs}
+    end,
+    case AllHaveUtxo andalso NumInputs > 0 of
+        true ->
+            InAmt = lists:sum([maps:get(in_value_internal, M, 0)
+                               || M <- Inputs0]),
+            OutAmt = lists:sum([O#tx_out.value
+                                || O <- Tx#transaction.outputs]),
+            Fee = InAmt - OutAmt,
+            EstVSize = estimate_psbt_vsize(Psbt, Tx),
+            BaseFee = Base1#{<<"fee">> => satoshi_to_btc(Fee)},
+            case EstVSize of
+                undefined -> BaseFee;
+                VSize ->
+                    %% Core's CFeeRate(fee, size) returns sat/kvB, then
+                    %% ValueFromAmount converts to BTC/kvB.  We return BTC/kvB.
+                    FeeRateSatPerKvB = case VSize of
+                        0 -> 0;
+                        _ -> (Fee * 1000) div VSize
+                    end,
+                    BaseFee#{<<"estimated_vsize">> => VSize,
+                             <<"estimated_feerate">> =>
+                                 satoshi_to_btc(FeeRateSatPerKvB)}
+            end;
+        false ->
+            Base1
+    end.
+
+%% Per-input analysis: returns a map with the user-visible JSON keys plus
+%% `has_utxo_internal`, `in_value_internal`, `role_internal` for the caller.
+analyze_psbt_input(Psbt, Tx, Idx) ->
+    InputMap = beamchain_psbt:get_input(Psbt, Idx),
+    {HasUtxo, UtxoValue, ScriptPubKey} =
+        case maps:get(witness_utxo, InputMap, undefined) of
+            {V, S} -> {true, V, S};
+            _ ->
+                case maps:get(non_witness_utxo, InputMap, undefined) of
+                    PrevTx when is_record(PrevTx, transaction) ->
+                        Input = lists:nth(Idx + 1, Tx#transaction.inputs),
+                        Vout = (Input#tx_in.prev_out)#outpoint.index,
+                        case length(PrevTx#transaction.outputs) > Vout of
+                            true ->
+                                Out = lists:nth(Vout + 1,
+                                                PrevTx#transaction.outputs),
+                                {true, Out#tx_out.value,
+                                 Out#tx_out.script_pubkey};
+                            false ->
+                                {false, 0, <<>>}
+                        end;
+                    _ ->
+                        {false, 0, <<>>}
+                end
+        end,
+    IsFinal = maps:get(final_script_sig, InputMap, undefined) =/= undefined
+              orelse
+              maps:get(final_script_witness, InputMap, undefined) =/= undefined,
+    {Role, Missing} = analyze_input_role(InputMap, HasUtxo, IsFinal,
+                                          ScriptPubKey),
+    Out0 = #{<<"has_utxo">>         => HasUtxo,
+             <<"is_final">>         => IsFinal,
+             <<"next">>             => psbt_role_name(Role),
+             has_utxo_internal      => HasUtxo,
+             in_value_internal      => UtxoValue,
+             role_internal          => Role},
+    case map_size(Missing) of
+        0 -> Out0;
+        _ -> Out0#{<<"missing">> => Missing}
+    end.
+
+%% Decide the next-role for an input.  Core walks `SignPSBTInput` with a
+%% dummy signing provider; we replicate the rough taxonomy without running
+%% the script engine:
+%%   - no UTXO          -> UPDATER (next person needs to fill it in)
+%%   - finalized        -> EXTRACTOR
+%%   - has UTXO + sigs    + redeem/witness scripts where required -> FINALIZER
+%%   - has UTXO + missing redeem/witness script -> UPDATER
+%%   - has UTXO + missing partial sigs only -> SIGNER
+analyze_input_role(_Map, false, _IsFinal, _Spk) ->
+    {?PSBT_ROLE_UPDATER, #{}};
+analyze_input_role(_Map, true, true, _Spk) ->
+    {?PSBT_ROLE_EXTRACTOR, #{}};
+analyze_input_role(InputMap, true, false, ScriptPubKey) ->
+    %% Detect script type from scriptPubKey (mirrors Core's GetSignatureFromScriptType).
+    ScriptType = beamchain_address:classify_script(ScriptPubKey),
+    PartialSigs = maps:get(partial_sigs, InputMap, #{}),
+    HasRedeem  = maps:get(redeem_script, InputMap, undefined) =/= undefined,
+    HasWitness = maps:get(witness_script, InputMap, undefined) =/= undefined,
+    HasTapKey  = maps:get(tap_key_sig, InputMap, undefined) =/= undefined,
+    %% Build the missing-set per input type.
+    case ScriptType of
+        p2tr ->
+            case HasTapKey of
+                true ->
+                    {?PSBT_ROLE_FINALIZER, #{}};
+                false ->
+                    {?PSBT_ROLE_SIGNER, #{}}
+            end;
+        p2sh ->
+            %% Need redeem script + sig.
+            Missing0 = case HasRedeem of
+                true  -> #{};
+                false -> #{<<"redeemscript">> =>
+                              %% Hash of expected redeemScript = OP_HASH160
+                              %% target.  Without solving data we surface
+                              %% the spk-derived hash160 (20 bytes).
+                              extract_p2sh_hash(ScriptPubKey)}
+            end,
+            case map_size(PartialSigs) of
+                0 ->
+                    {?PSBT_ROLE_SIGNER, Missing0};
+                _ ->
+                    case HasRedeem of
+                        true  -> {?PSBT_ROLE_FINALIZER, Missing0};
+                        false -> {?PSBT_ROLE_UPDATER, Missing0}
+                    end
+            end;
+        p2wsh ->
+            Missing0 = case HasWitness of
+                true  -> #{};
+                false -> #{<<"witnessscript">> =>
+                              extract_p2wsh_hash(ScriptPubKey)}
+            end,
+            case map_size(PartialSigs) of
+                0 ->
+                    {?PSBT_ROLE_SIGNER, Missing0};
+                _ ->
+                    case HasWitness of
+                        true  -> {?PSBT_ROLE_FINALIZER, Missing0};
+                        false -> {?PSBT_ROLE_UPDATER, Missing0}
+                    end
+            end;
+        _PkOrPwpkh ->
+            %% P2PKH / P2WPKH / P2PK / unknown — sig + pubkey suffice.
+            case map_size(PartialSigs) of
+                0 ->
+                    {?PSBT_ROLE_SIGNER, #{}};
+                _ ->
+                    {?PSBT_ROLE_FINALIZER, #{}}
+            end
+    end.
+
+%% Extract the 20-byte hash160 from a P2SH scriptPubKey (OP_HASH160 <20> ...).
+extract_p2sh_hash(<<16#a9, 20, H:20/binary, 16#87>>) ->
+    beamchain_serialize:hex_encode(H);
+extract_p2sh_hash(_) ->
+    <<>>.
+
+%% Extract the 32-byte sha256 from a P2WSH scriptPubKey (OP_0 <32>).
+extract_p2wsh_hash(<<16#00, 32, H:32/binary>>) ->
+    beamchain_serialize:hex_encode(H);
+extract_p2wsh_hash(_) ->
+    <<>>.
+
+%% Estimate vsize of the would-be-finalized tx.  Returns `undefined` when
+%% the inputs cannot be solved (mirrors Core's "if SignPSBTInput fails,
+%% size estimation fails too" branch).
+estimate_psbt_vsize(Psbt, Tx) ->
+    InputMaps = lists:map(fun(I) ->
+        beamchain_psbt:get_input(Psbt, I)
+    end, lists:seq(0, length(Tx#transaction.inputs) - 1)),
+    %% Best-effort vsize: base tx weight + per-input weight estimate based
+    %% on script type derived from the witness UTXO scriptPubKey.  Returns
+    %% `undefined` if any input is missing both partial sigs and a witness
+    %% UTXO (cannot estimate without solving data).
+    BaseWeight = (length(Tx#transaction.outputs) * 31 + 11) * 4,
+    case sum_input_weights(InputMaps, 0) of
+        undefined -> undefined;
+        InWeight  ->
+            Weight = BaseWeight + InWeight,
+            (Weight + 3) div 4
+    end.
+
+sum_input_weights([], Acc) -> Acc;
+sum_input_weights([M | Rest], Acc) ->
+    case maps:get(witness_utxo, M, undefined) of
+        {_, Spk} ->
+            W = input_weight_for_script(Spk),
+            sum_input_weights(Rest, Acc + W);
+        _ ->
+            case maps:get(non_witness_utxo, M, undefined) of
+                undefined -> undefined;
+                _ ->
+                    %% Conservative legacy P2PKH-equivalent weight (148 bytes).
+                    sum_input_weights(Rest, Acc + 148 * 4)
+            end
+    end.
+
+input_weight_for_script(Spk) ->
+    case beamchain_address:classify_script(Spk) of
+        p2wpkh -> 68 * 4;            %% ~68 vbytes
+        p2tr   -> 57 * 4;            %% ~57 vbytes (key-path)
+        p2pkh  -> 148 * 4;
+        p2sh   -> 91 * 4;            %% wrapped segwit estimate
+        p2wsh  -> 105 * 4;           %% multi-sig estimate
+        _      -> 100 * 4
+    end.
+
+psbt_role_name(?PSBT_ROLE_CREATOR)   -> <<"creator">>;
+psbt_role_name(?PSBT_ROLE_UPDATER)   -> <<"updater">>;
+psbt_role_name(?PSBT_ROLE_SIGNER)    -> <<"signer">>;
+psbt_role_name(?PSBT_ROLE_FINALIZER) -> <<"finalizer">>;
+psbt_role_name(?PSBT_ROLE_EXTRACTOR) -> <<"extractor">>.
+
+%% @doc walletcreatefundedpsbt
+%%   inputs outputs ( locktime options bip32derivs )
+%%
+%% Mirrors `bitcoin-core/src/wallet/rpc/spend.cpp::walletcreatefundedpsbt`.
+%% Implements the Creator and Updater roles: pulls UTXOs from the wallet's
+%% own UTXO set, runs `select_coins/3` with the fee rate, optionally adds
+%% caller-supplied inputs, builds the unsigned tx, and wraps it as a PSBT
+%% with witness UTXO information attached for each wallet-owned input.
+%%
+%% Returns `{ok, #{psbt, fee, changepos}}` on success.  Fees are reported in
+%% BTC and `changepos` is the index of the appended change output (-1 if no
+%% change).  We always append change at the end (Core's `changePosition`
+%% defaults to a random position; we omit randomization for parity with
+%% beamchain's existing send-path determinism).
+rpc_walletcreatefundedpsbt([Inputs, Outputs], WalletName) ->
+    rpc_walletcreatefundedpsbt([Inputs, Outputs, 0, #{}, true], WalletName);
+rpc_walletcreatefundedpsbt([Inputs, Outputs, Locktime], WalletName) ->
+    rpc_walletcreatefundedpsbt([Inputs, Outputs, Locktime, #{}, true],
+                                WalletName);
+rpc_walletcreatefundedpsbt([Inputs, Outputs, Locktime, Options], WalletName) ->
+    rpc_walletcreatefundedpsbt([Inputs, Outputs, Locktime, Options, true],
+                                WalletName);
+rpc_walletcreatefundedpsbt([Inputs, Outputs, Locktime, Options, _Bip32Derivs],
+                            WalletName)
+        when is_list(Inputs), is_integer(Locktime), is_map(Options) ->
+    case resolve_wallet(WalletName) of
+        {ok, Pid} ->
+            try
+                do_walletcreatefundedpsbt(Pid, Inputs, Outputs, Locktime,
+                                           Options)
+            catch
+                throw:{wcfp_error, Code, Msg} ->
+                    {error, Code, Msg};
+                _:Err ->
+                    {error, ?RPC_MISC_ERROR,
+                     iolist_to_binary(io_lib:format("Error: ~p", [Err]))}
+            end;
+        {error, _} ->
+            wallet_not_found_error(WalletName)
+    end;
+rpc_walletcreatefundedpsbt(_, _) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"walletcreatefundedpsbt [{\"txid\":\"hex\",\"vout\":n},...] "
+       "[{\"address\":amount},...] ( locktime options bip32derivs )">>}.
+
+do_walletcreatefundedpsbt(Pid, ManualInputs, Outputs, Locktime, Options) ->
+    Network = beamchain_config:network(),
+    %% Caller-supplied outputs may arrive as a list-of-maps (Core normalizes
+    %% to a single object internally).  Normalize to {Address, Satoshis}.
+    OutputPairs = normalize_wcfp_outputs(Outputs, Network),
+    case OutputPairs of
+        [] ->
+            throw({wcfp_error, ?RPC_INVALID_PARAMS,
+                   <<"At least one output required">>});
+        _ -> ok
+    end,
+    OutputTotal = lists:sum([Sat || {_, Sat} <- OutputPairs]),
+    %% Manual inputs: caller is asserting the UTXO exists.  Look up the
+    %% chainstate UTXO so we can include witness UTXO info in the PSBT.
+    ManualInputUtxos = lists:map(fun(InObj) ->
+        TxidHex = maps:get(<<"txid">>, InObj),
+        Vout = maps:get(<<"vout">>, InObj),
+        Txid = hex_to_internal_hash(TxidHex),
+        case beamchain_chainstate:get_utxo(Txid, Vout) of
+            {ok, U} -> {Txid, Vout, U};
+            not_found ->
+                throw({wcfp_error, ?RPC_INVALID_PARAMETER,
+                       iolist_to_binary(io_lib:format(
+                           "Input not found in UTXO set: ~s:~B",
+                           [TxidHex, Vout]))})
+        end
+    end, ManualInputs),
+    %% Coin selection.  `add_inputs` defaults to true when no manual inputs
+    %% were passed and false otherwise (Core: `m_allow_other_inputs =
+    %% rawTx.vin.size() == 0`).
+    AddInputs = maps:get(<<"add_inputs">>, Options,
+                          ManualInputs =:= []),
+    FeeRate = wcfp_fee_rate(Options),
+    %% sat/vbyte (Core's CFeeRate is sat/kvB; we accept BTC/kvB or sat/vB
+    %% depending on the option).
+    {SelectedInputs, Change} =
+        case {AddInputs, ManualInputUtxos} of
+            {true, _} ->
+                wcfp_select_coins(Pid, ManualInputUtxos, OutputTotal,
+                                   FeeRate);
+            {false, []} ->
+                throw({wcfp_error, ?RPC_INVALID_PARAMETER,
+                       <<"add_inputs is false but no inputs supplied">>});
+            {false, Manuals} ->
+                %% No auto-selection; caller must have provided enough.
+                Total = lists:sum([U#utxo.value || {_, _, U} <- Manuals]),
+                BaseFee = round(FeeRate * 80),
+                case Total >= OutputTotal + BaseFee of
+                    true ->
+                        ChangeAmt = Total - OutputTotal - BaseFee,
+                        {Manuals, ChangeAmt};
+                    false ->
+                        throw({wcfp_error, ?RPC_VERIFY_REJECTED,
+                               <<"Insufficient funds in supplied inputs">>})
+                end
+        end,
+    %% Build outputs list, optionally appending a change output.
+    {OutputsWithChange, ChangePos} = wcfp_append_change(
+        Pid, OutputPairs, Change, Network, Options),
+    %% Build the unsigned tx.
+    TxIns = lists:map(fun({Txid, Vout, _U}) ->
+        #tx_in{prev_out = #outpoint{hash = Txid, index = Vout},
+               script_sig = <<>>,
+               sequence = 16#fffffffd,
+               witness = []}
+    end, SelectedInputs),
+    TxOuts = lists:map(fun({Addr, Sat}) ->
+        case beamchain_address:address_to_script(Addr, Network) of
+            {ok, Script} -> #tx_out{value = Sat, script_pubkey = Script};
+            _ ->
+                throw({wcfp_error, ?RPC_INVALID_ADDRESS_OR_KEY,
+                       iolist_to_binary(io_lib:format("Invalid address: ~s",
+                                                       [Addr]))})
+        end
+    end, OutputsWithChange),
+    Tx = #transaction{version = 2, inputs = TxIns, outputs = TxOuts,
+                       locktime = Locktime},
+    %% Wrap as PSBT and attach witness UTXOs.
+    {ok, Psbt0} = beamchain_psbt:create(Tx),
+    Psbt = lists:foldl(fun({{_, _, U}, Idx}, Acc) ->
+        beamchain_wallet:add_witness_utxo(Acc, Idx, U)
+    end, Psbt0, lists:zip(SelectedInputs,
+                           lists:seq(0, length(SelectedInputs) - 1))),
+    PsbtBin = beamchain_psbt:encode(Psbt),
+    %% Compute actual fee = inputs - outputs.
+    InputTotal = lists:sum([U#utxo.value || {_, _, U} <- SelectedInputs]),
+    OutTotalAll = lists:sum([Sat || {_, Sat} <- OutputsWithChange]),
+    Fee = InputTotal - OutTotalAll,
+    %% lockUnspents option: lock the selected (non-manual) inputs in the
+    %% wallet so they aren't double-selected by another caller.  Core's
+    %% `lockUnspents` flag (wallet/rpc/spend.cpp).
+    case maps:get(<<"lockUnspents">>, Options, false) of
+        true ->
+            lists:foreach(fun({Txid, Vout, _U}) ->
+                ok = beamchain_wallet:lock_coin(Pid, Txid, Vout)
+            end, SelectedInputs);
+        _ ->
+            ok
+    end,
+    {ok, #{<<"psbt">>      => base64:encode(PsbtBin),
+           <<"fee">>       => satoshi_to_btc(Fee),
+           <<"changepos">> => ChangePos}}.
+
+normalize_wcfp_outputs(Outputs, _Network) when is_list(Outputs) ->
+    lists:flatmap(fun(Obj) when is_map(Obj) ->
+        maps:fold(fun(K, V, Acc) ->
+            [{binary_to_list(K), btc_to_satoshi(V)} | Acc]
+        end, [], Obj);
+    (_) ->
+        throw({wcfp_error, ?RPC_INVALID_PARAMS,
+               <<"Output entries must be objects">>})
+    end, Outputs);
+normalize_wcfp_outputs(Outputs, _Network) when is_map(Outputs) ->
+    %% Compatibility form: caller passed a single object instead of [obj].
+    maps:fold(fun(K, V, Acc) ->
+        [{binary_to_list(K), btc_to_satoshi(V)} | Acc]
+    end, [], Outputs);
+normalize_wcfp_outputs(_, _) ->
+    throw({wcfp_error, ?RPC_INVALID_PARAMS,
+           <<"outputs must be an array or object">>}).
+
+%% Resolve fee rate from options.  Order of preference matches Core's:
+%% `fee_rate` (sat/vB) > `feeRate` (BTC/kvB) > wallet estimator > 1 sat/vB.
+wcfp_fee_rate(Options) ->
+    case maps:get(<<"fee_rate">>, Options, undefined) of
+        N when is_number(N) -> float(N);
+        _ ->
+            case maps:get(<<"feeRate">>, Options, undefined) of
+                BtcKvB when is_number(BtcKvB) ->
+                    BtcKvB * 100000000.0 / 1000.0;
+                _ -> 1.0  %% sat/vB default
+            end
+    end.
+
+wcfp_select_coins(Pid, ManualInputs, OutputTotal, FeeRate) ->
+    %% Wallet-owned UTXOs minus the manual inputs and any locked coins.
+    All = beamchain_wallet:get_wallet_utxos(),
+    ManualKeys = [{Txid, Vout} || {Txid, Vout, _} <- ManualInputs],
+    Locked = sets:from_list(beamchain_wallet:list_locked_coins(Pid)),
+    Available = lists:filter(fun({Txid, Vout, _U}) ->
+        Key = {Txid, Vout},
+        not lists:member(Key, ManualKeys)
+            andalso not sets:is_element(Key, Locked)
+    end, All),
+    %% Subtract manual inputs from the target so coin-selection tops up.
+    ManualValue = lists:sum([U#utxo.value || {_, _, U} <- ManualInputs]),
+    EffectiveTarget = max(OutputTotal - ManualValue, 0),
+    case beamchain_wallet:select_coins(EffectiveTarget, FeeRate, Available)
+    of
+        {ok, AutoSelected, Change} ->
+            {ManualInputs ++ AutoSelected, Change};
+        {error, insufficient_funds} ->
+            throw({wcfp_error, ?RPC_VERIFY_REJECTED,
+                   <<"Insufficient funds">>})
+    end.
+
+%% Append change output and return the change index, mirroring Core's
+%% `changePosition` (we currently always append; randomized placement is
+%% deferred — see `bitcoin-core/src/wallet/spend.cpp::CreateTransaction`).
+wcfp_append_change(_Pid, Outputs, Change, _Network, _Options)
+        when Change =< 546 ->
+    %% Below dust — drop change into fee.
+    {Outputs, -1};
+wcfp_append_change(Pid, Outputs, Change, Network, Options) ->
+    Address = case maps:get(<<"changeAddress">>, Options, undefined) of
+        Addr when is_binary(Addr) -> binary_to_list(Addr);
+        _ ->
+            ChangeType = case maps:get(<<"change_type">>, Options, undefined)
+            of
+                <<"bech32">>      -> p2wpkh;
+                <<"bech32m">>     -> p2tr;
+                <<"legacy">>      -> p2pkh;
+                <<"p2sh-segwit">> -> p2wpkh;
+                _                 -> p2wpkh
+            end,
+            case beamchain_wallet:get_change_address(Pid, ChangeType) of
+                {ok, A} -> A;
+                _ ->
+                    throw({wcfp_error, ?RPC_MISC_ERROR,
+                           <<"Failed to derive change address">>})
+            end
+    end,
+    case beamchain_address:address_to_script(Address, Network) of
+        {ok, _Script} ->
+            ChangeOutput = {Address, Change},
+            ChangePos = case maps:get(<<"changePosition">>, Options, undefined)
+            of
+                P when is_integer(P), P >= 0, P =< length(Outputs) ->
+                    P;
+                _ ->
+                    length(Outputs)
+            end,
+            {insert_at(ChangePos, ChangeOutput, Outputs), ChangePos};
+        _ ->
+            throw({wcfp_error, ?RPC_INVALID_ADDRESS_OR_KEY,
+                   iolist_to_binary(io_lib:format(
+                       "Invalid change address: ~s", [Address]))})
+    end.
+
+insert_at(0, X, L) -> [X | L];
+insert_at(N, X, L) when N >= length(L) -> L ++ [X];
+insert_at(N, X, L) ->
+    {Before, After} = lists:split(N, L),
+    Before ++ [X | After].
 
 %% Helper: Format PSBT for decodepsbt RPC
 format_psbt_decode(Psbt) ->
