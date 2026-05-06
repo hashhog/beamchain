@@ -51,6 +51,8 @@
 %% Test-only exports — confirmations helpers (Pattern C1 regression tests).
 -ifdef(TEST).
 -export([confirmations/1, confirmations/2, is_block_in_active_chain/1]).
+%% Test-only exports — submitpackage helpers (mempool wave 2026-05-06).
+-export([rpc_submitpackage/1, decode_package_tx/1]).
 -endif.
 
 %% Cowboy handler
@@ -516,6 +518,7 @@ handle_method(<<"decoderawtransaction">>, P, _W) -> rpc_decoderawtransaction(P);
 handle_method(<<"sendrawtransaction">>, P, _W) -> rpc_sendrawtransaction(P);
 handle_method(<<"createrawtransaction">>, P, _W) -> rpc_createrawtransaction(P);
 handle_method(<<"testmempoolaccept">>, P, _W) -> rpc_testmempoolaccept(P);
+handle_method(<<"submitpackage">>, P, _W) -> rpc_submitpackage(P);
 handle_method(<<"gettxout">>, P, _W) -> rpc_gettxout(P);
 handle_method(<<"gettxoutsetinfo">>, P, _W) -> rpc_gettxoutsetinfo(P);
 
@@ -677,6 +680,7 @@ rpc_help_list() ->
         <<"finalizepsbt \"psbt\" ( extract )">>,
         <<"getrawtransaction \"txid\" ( verbose \"blockhash\" )">>,
         <<"sendrawtransaction \"hexstring\"">>,
+        <<"submitpackage [\"rawtx\",...] ( maxfeerate maxburnamount )">>,
         <<"testmempoolaccept [\"rawtx\"]">>,
         <<"">>,
         <<"== Util ==">>,
@@ -2287,6 +2291,147 @@ rpc_testmempoolaccept([RawTxs]) when is_list(RawTxs) ->
 rpc_testmempoolaccept(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"Usage: testmempoolaccept [\"rawtx\"]">>}.
+
+%% @doc submitpackage: Submit a package of related transactions atomically.
+%% Mirrors Bitcoin Core's `rpc/mempool.cpp::submitpackage`. The package is
+%% an array of raw (hex-encoded) transactions in topological order, with
+%% the child as the last element. Acceptance is all-or-nothing: if any
+%% transaction fails policy/consensus, none are admitted to the mempool.
+%%
+%% Returns a JSON object with three top-level fields, matching Core:
+%%   - "package_msg":          "success" on full acceptance, otherwise an
+%%                              error string identifying the rejection.
+%%   - "tx-results":           map keyed by wtxid; each entry carries the
+%%                              txid (and on success vsize + fees object,
+%%                              on failure an "error" string).
+%%   - "replaced-transactions": list of txids evicted via RBF (always
+%%                              empty until beamchain wires per-package
+%%                              RBF replacement reporting).
+%%
+%% Reference: bitcoin-core/src/rpc/mempool.cpp::submitpackage (height ~1302).
+rpc_submitpackage([RawTxs]) when is_list(RawTxs) ->
+    rpc_submitpackage([RawTxs, ?DEFAULT_MAX_RAW_TX_FEE_RATE / 100000000.0, 0]);
+rpc_submitpackage([RawTxs, MaxFeeRate]) when is_list(RawTxs) ->
+    rpc_submitpackage([RawTxs, MaxFeeRate, 0]);
+rpc_submitpackage([RawTxs, _MaxFeeRate, _MaxBurnAmount]) when is_list(RawTxs) ->
+    %% 1. Up-front bounds check (matches Core's RPC_INVALID_PARAMETER path).
+    Count = length(RawTxs),
+    case Count >= 1 andalso Count =< ?MAX_PACKAGE_COUNT of
+        false ->
+            Msg = iolist_to_binary(io_lib:format(
+                "Array must contain between 1 and ~B transactions.",
+                [?MAX_PACKAGE_COUNT])),
+            {error, ?RPC_INVALID_PARAMETER, Msg};
+        true ->
+            try
+                %% 2. Decode every entry; bail on the first deser failure
+                %%    so we surface a Core-shaped RPC error.
+                Txs = [decode_package_tx(Hex) || Hex <- RawTxs],
+                Wtxids = [beamchain_serialize:wtx_hash(Tx) || Tx <- Txs],
+                Txids = [beamchain_serialize:tx_hash(Tx) || Tx <- Txs],
+
+                %% 3. Hand off to the package validator. accept_package/1
+                %%    enforces topology + atomicity in beamchain_mempool.
+                {PackageMsg, AcceptedSet} =
+                    case beamchain_mempool:accept_package(Txs) of
+                        {ok, AcceptedTxids} ->
+                            {<<"success">>, sets:from_list(AcceptedTxids)};
+                        {error, Reason} ->
+                            ReasonBin = iolist_to_binary(
+                                io_lib:format("~p", [Reason])),
+                            {ReasonBin, sets:new()}
+                        end,
+
+                %% 4. Per-tx result map keyed by wtxid (Core shape).
+                TxResultMap = lists:foldl(
+                    fun({Tx, Wtxid, Txid}, Acc) ->
+                        WtxidHex = hash_to_hex(Wtxid),
+                        Inner = build_pkg_tx_result(Tx, Txid, AcceptedSet,
+                                                     PackageMsg),
+                        maps:put(WtxidHex, Inner, Acc)
+                    end,
+                    #{},
+                    lists:zip3(Txs, Wtxids, Txids)),
+
+                %% 5. Relay every accepted tx (matches Core's broadcast pass).
+                lists:foreach(fun(Txid) ->
+                    case sets:is_element(Txid, AcceptedSet) of
+                        true -> relay_transaction(Txid);
+                        false -> ok
+                    end
+                end, Txids),
+
+                {ok, #{
+                    <<"package_msg">> => PackageMsg,
+                    <<"tx-results">> => TxResultMap,
+                    %% beamchain's package validator does not yet emit
+                    %% a per-package replaced-tx list. Empty array keeps
+                    %% the field shape parity with Core.
+                    <<"replaced-transactions">> => []
+                }}
+            catch
+                throw:{decode_failed, BadHex} ->
+                    {error, ?RPC_DESERIALIZATION_ERROR,
+                     iolist_to_binary(io_lib:format(
+                         "TX decode failed: ~s Make sure the tx has at "
+                         "least one input.", [BadHex]))};
+                _:_ ->
+                    {error, ?RPC_DESERIALIZATION_ERROR,
+                     <<"TX decode failed. Make sure the tx has at least "
+                       "one input.">>}
+            end
+    end;
+rpc_submitpackage(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: submitpackage [\"rawtx\",...] ( maxfeerate maxburnamount )">>}.
+
+%% Decode one hex-encoded raw tx, throwing a tagged error on failure so
+%% the caller can return Core's RPC_DESERIALIZATION_ERROR message verbatim.
+decode_package_tx(Hex) when is_binary(Hex) ->
+    try
+        Bin = beamchain_serialize:hex_decode(Hex),
+        {Tx, _} = beamchain_serialize:decode_transaction(Bin),
+        Tx
+    catch
+        _:_ -> throw({decode_failed, Hex})
+    end;
+decode_package_tx(_) ->
+    throw({decode_failed, <<"<non-string>">>}).
+
+%% Build the inner "tx-results" entry for one transaction.
+%% Accepted txs report vsize + fees (Core's MempoolAcceptResult::VALID
+%% shape); rejected txs report an error string. When the package was
+%% rejected before any tx was even probed (e.g. structural failure),
+%% Core emits "package-not-validated" and we mirror that here.
+build_pkg_tx_result(Tx, Txid, AcceptedSet, PackageMsg) ->
+    Base = #{<<"txid">> => hash_to_hex(Txid)},
+    case sets:is_element(Txid, AcceptedSet) of
+        true ->
+            %% Accepted: pull fee/vsize from the mempool entry that
+            %% accept_package just inserted.
+            case beamchain_mempool:get_entry(Txid) of
+                {ok, #mempool_entry{vsize = VSize, fee = Fee}} ->
+                    Fees = #{<<"base">> => satoshi_to_btc(Fee)},
+                    Base#{<<"vsize">> => VSize,
+                          <<"fees">>  => Fees};
+                not_found ->
+                    %% Should not happen on the success path, but stay
+                    %% defensive — emit txid + minimal vsize fallback.
+                    VSize = beamchain_serialize:tx_vsize(Tx),
+                    Base#{<<"vsize">> => VSize,
+                          <<"fees">>  => #{<<"base">> => 0.0}}
+            end;
+        false ->
+            %% Rejected. If the package aborted before per-tx
+            %% processing (PackageMsg ≠ "success" and there are no
+            %% accepted txs), report Core's "package-not-validated"
+            %% sentinel.
+            ErrorStr = case PackageMsg of
+                <<"success">> -> <<"package-not-validated">>;
+                _             -> PackageMsg
+            end,
+            Base#{<<"error">> => ErrorStr}
+    end.
 
 rpc_gettxout([TxidHex, N]) ->
     rpc_gettxout([TxidHex, N, true]);
