@@ -382,8 +382,13 @@ decode_payload(pong, <<Nonce:64/little>>) ->
 
 decode_payload(addr, Bin) ->
     {Count, Rest} = beamchain_serialize:decode_varint(Bin),
-    {Addrs, _} = decode_addr_entries(Count, Rest, []),
-    {ok, #{addrs => Addrs}};
+    case Count > ?MAX_ADDR_TO_SEND of
+        true ->
+            {error, {oversized, addr, Count, ?MAX_ADDR_TO_SEND}};
+        false ->
+            {Addrs, _} = decode_addr_entries(Count, Rest, []),
+            {ok, #{addrs => Addrs}}
+    end;
 
 decode_payload(getaddr, <<>>) ->
     {ok, #{}};
@@ -391,32 +396,47 @@ decode_payload(getaddr, <<>>) ->
 %% -- Inventory --------------------------------------------------------
 
 decode_payload(inv, Bin) ->
-    {ok, #{items => decode_inv_list(Bin)}};
+    decode_inv_payload(inv, Bin);
 
 decode_payload(getdata, Bin) ->
-    {ok, #{items => decode_inv_list(Bin)}};
+    decode_inv_payload(getdata, Bin);
 
 decode_payload(notfound, Bin) ->
-    {ok, #{items => decode_inv_list(Bin)}};
+    decode_inv_payload(notfound, Bin);
 
 %% -- Headers/blocks ---------------------------------------------------
 
 decode_payload(getheaders, <<V:32/little, Rest/binary>>) ->
     {Count, Rest2} = beamchain_serialize:decode_varint(Rest),
-    {Locators, Rest3} = decode_hashes(Count, Rest2, []),
-    <<Stop:32/binary, _/binary>> = Rest3,
-    {ok, #{version => V, locators => Locators, stop_hash => Stop}};
+    case Count > ?MAX_LOCATOR_SZ of
+        true ->
+            {error, {oversized, getheaders, Count, ?MAX_LOCATOR_SZ}};
+        false ->
+            {Locators, Rest3} = decode_hashes(Count, Rest2, []),
+            <<Stop:32/binary, _/binary>> = Rest3,
+            {ok, #{version => V, locators => Locators, stop_hash => Stop}}
+    end;
 
 decode_payload(headers, Bin) ->
     {Count, Rest} = beamchain_serialize:decode_varint(Bin),
-    {Headers, _} = decode_headers_list(Count, Rest, []),
-    {ok, #{headers => Headers}};
+    case Count > ?MAX_HEADERS_RESULTS of
+        true ->
+            {error, {oversized, headers, Count, ?MAX_HEADERS_RESULTS}};
+        false ->
+            {Headers, _} = decode_headers_list(Count, Rest, []),
+            {ok, #{headers => Headers}}
+    end;
 
 decode_payload(getblocks, <<V:32/little, Rest/binary>>) ->
     {Count, Rest2} = beamchain_serialize:decode_varint(Rest),
-    {Locators, Rest3} = decode_hashes(Count, Rest2, []),
-    <<Stop:32/binary, _/binary>> = Rest3,
-    {ok, #{version => V, locators => Locators, stop_hash => Stop}};
+    case Count > ?MAX_LOCATOR_SZ of
+        true ->
+            {error, {oversized, getblocks, Count, ?MAX_LOCATOR_SZ}};
+        false ->
+            {Locators, Rest3} = decode_hashes(Count, Rest2, []),
+            <<Stop:32/binary, _/binary>> = Rest3,
+            {ok, #{version => V, locators => Locators, stop_hash => Stop}}
+    end;
 
 decode_payload(block, Bin) ->
     {Block, _} = beamchain_serialize:decode_block(Bin),
@@ -450,8 +470,13 @@ decode_payload(sendaddrv2, <<>>) ->
 
 decode_payload(addrv2, Bin) ->
     {Count, Rest} = beamchain_serialize:decode_varint(Bin),
-    {Addrs, _} = decode_addrv2_entries(Count, Rest, []),
-    {ok, #{addrs => Addrs}};
+    case Count > ?MAX_ADDR_TO_SEND of
+        true ->
+            {error, {oversized, addrv2, Count, ?MAX_ADDR_TO_SEND}};
+        false ->
+            {Addrs, _} = decode_addrv2_entries(Count, Rest, []),
+            {ok, #{addrs => Addrs}}
+    end;
 
 %% -- Compact blocks (BIP 152) --------------------------------------------
 
@@ -628,14 +653,23 @@ encode_inv_list(Items) ->
     Data = << <<(encode_inv_item(I))/binary>> || I <- Items >>,
     <<Count/binary, Data/binary>>.
 
-decode_inv_list(Bin) ->
-    {Count, Rest} = beamchain_serialize:decode_varint(Bin),
-    decode_inv_items(Count, Rest, []).
-
 decode_inv_items(0, _Rest, Acc) -> lists:reverse(Acc);
 decode_inv_items(N, Bin, Acc) ->
     {Item, Rest} = decode_inv_item(Bin),
     decode_inv_items(N - 1, Rest, [Item | Acc]).
+
+%% Cap inv-shaped payloads (inv / getdata / notfound) at MAX_INV_SIZE before
+%% allocating, so an adversarial peer can't trigger multi-GB allocation by
+%% sending a ~5-byte payload with varint count = 0xFEFFFFFFFF.  Mirrors
+%% Bitcoin Core net_processing.cpp:4042 / :4133 (rejects + Misbehaving).
+decode_inv_payload(MsgKind, Bin) ->
+    {Count, Rest} = beamchain_serialize:decode_varint(Bin),
+    case Count > ?MAX_INV_SIZE of
+        true ->
+            {error, {oversized, MsgKind, Count, ?MAX_INV_SIZE}};
+        false ->
+            {ok, #{items => decode_inv_items(Count, Rest, [])}}
+    end.
 
 %%% ===================================================================
 %%% Hash list / headers list helpers

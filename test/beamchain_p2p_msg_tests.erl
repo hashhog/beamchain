@@ -843,3 +843,100 @@ full_pipeline_addrv2_test() ->
     {ok, addrv2, RawPayload, <<>>} = beamchain_p2p_msg:decode_msg(Framed),
     {ok, #{addrs := DecodedAddrs}} = beamchain_p2p_msg:decode_payload(addrv2, RawPayload),
     ?assertEqual(2, length(DecodedAddrs)).
+
+%%% ===================================================================
+%%% Wire-decode count caps (DoS hardening)
+%%%
+%%% Adversarial peers must not be able to trigger an unbounded list
+%%% allocation by sending a tiny payload with a giant CompactSize count.
+%%% Mirrors Bitcoin Core net_processing.cpp gates:
+%%%   inv/getdata/notfound: MAX_INV_SZ = 50000     (:4042/:4133)
+%%%   headers:              MAX_HEADERS_RESULTS=2000 (:4741)
+%%%   addr/addrv2:          MAX_ADDR_TO_SEND = 1000 (:5637)
+%%%   getheaders/getblocks: MAX_LOCATOR_SZ   = 101
+%%% ===================================================================
+
+%% Helper: encode CompactSize then enough zero bytes to "look like" the body,
+%% so the cap rejects the count *before* allocation. We don't bother making
+%% the body well-formed because the cap fires first (the whole point of the
+%% fix is no allocation when count > MAX_X).
+oversized_count_payload(Count) ->
+    %% Just the varint — the cap rejects before reading any items.
+    beamchain_serialize:encode_varint(Count).
+
+inv_oversized_rejected_test() ->
+    Bin = oversized_count_payload(?MAX_INV_SIZE + 1),
+    ?assertMatch({error, {oversized, inv, _, ?MAX_INV_SIZE}},
+                 beamchain_p2p_msg:decode_payload(inv, Bin)).
+
+inv_attack_count_rejected_test() ->
+    %% Worst case: 1.0e9 items advertised in 5 wire bytes. Cap must fire.
+    Bin = oversized_count_payload(1_000_000_000),
+    ?assertMatch({error, {oversized, inv, 1_000_000_000, ?MAX_INV_SIZE}},
+                 beamchain_p2p_msg:decode_payload(inv, Bin)).
+
+getdata_oversized_rejected_test() ->
+    Bin = oversized_count_payload(?MAX_INV_SIZE + 1),
+    ?assertMatch({error, {oversized, getdata, _, ?MAX_INV_SIZE}},
+                 beamchain_p2p_msg:decode_payload(getdata, Bin)).
+
+notfound_oversized_rejected_test() ->
+    Bin = oversized_count_payload(?MAX_INV_SIZE + 1),
+    ?assertMatch({error, {oversized, notfound, _, ?MAX_INV_SIZE}},
+                 beamchain_p2p_msg:decode_payload(notfound, Bin)).
+
+headers_oversized_rejected_test() ->
+    Bin = oversized_count_payload(?MAX_HEADERS_RESULTS + 1),
+    ?assertMatch({error, {oversized, headers, _, ?MAX_HEADERS_RESULTS}},
+                 beamchain_p2p_msg:decode_payload(headers, Bin)).
+
+addr_oversized_rejected_test() ->
+    Bin = oversized_count_payload(?MAX_ADDR_TO_SEND + 1),
+    ?assertMatch({error, {oversized, addr, _, ?MAX_ADDR_TO_SEND}},
+                 beamchain_p2p_msg:decode_payload(addr, Bin)).
+
+addrv2_oversized_rejected_test() ->
+    Bin = oversized_count_payload(?MAX_ADDR_TO_SEND + 1),
+    ?assertMatch({error, {oversized, addrv2, _, ?MAX_ADDR_TO_SEND}},
+                 beamchain_p2p_msg:decode_payload(addrv2, Bin)).
+
+getheaders_locator_oversized_rejected_test() ->
+    %% getheaders prefix: 4-byte version + varint locator count
+    Prefix = <<?PROTOCOL_VERSION:32/little>>,
+    CountBin = beamchain_serialize:encode_varint(?MAX_LOCATOR_SZ + 1),
+    Bin = <<Prefix/binary, CountBin/binary>>,
+    ?assertMatch({error, {oversized, getheaders, _, ?MAX_LOCATOR_SZ}},
+                 beamchain_p2p_msg:decode_payload(getheaders, Bin)).
+
+getblocks_locator_oversized_rejected_test() ->
+    Prefix = <<?PROTOCOL_VERSION:32/little>>,
+    CountBin = beamchain_serialize:encode_varint(?MAX_LOCATOR_SZ + 1),
+    Bin = <<Prefix/binary, CountBin/binary>>,
+    ?assertMatch({error, {oversized, getblocks, _, ?MAX_LOCATOR_SZ}},
+                 beamchain_p2p_msg:decode_payload(getblocks, Bin)).
+
+%% Boundary: exactly MAX must NOT be rejected by the cap (it's a count
+%% gate, not a count-strictly-less-than gate). With count = MAX and an
+%% empty body the decoder will fail later (not enough wire bytes), but the
+%% failure must NOT be an `oversized` error.
+inv_at_cap_not_oversized_test() ->
+    Bin = oversized_count_payload(?MAX_INV_SIZE),
+    Result = (catch beamchain_p2p_msg:decode_payload(inv, Bin)),
+    %% Either it crashes on the missing body, or returns ok with [] —
+    %% but it must NOT return our oversized error tag.
+    case Result of
+        {error, {oversized, _, _, _}} ->
+            ?assert(false);
+        _ ->
+            ok
+    end.
+
+headers_at_cap_not_oversized_test() ->
+    Bin = oversized_count_payload(?MAX_HEADERS_RESULTS),
+    Result = (catch beamchain_p2p_msg:decode_payload(headers, Bin)),
+    case Result of
+        {error, {oversized, _, _, _}} ->
+            ?assert(false);
+        _ ->
+            ok
+    end.
