@@ -48,6 +48,10 @@
 %% Exported for testing — verifychain RPC handler.
 -export([rpc_verifychain/1]).
 
+%% Exported for EUnit so tests can drive the BIP-157 RPC handler
+%% directly without spinning up the cowboy listener.
+-export([rpc_getblockfilter/1]).
+
 %% Test-only exports — confirmations helpers (Pattern C1 regression tests).
 -ifdef(TEST).
 -export([confirmations/1, confirmations/2, is_block_in_active_chain/1]).
@@ -507,6 +511,7 @@ handle_method(<<"getchaintips">>, _, _W) -> rpc_getchaintips();
 handle_method(<<"getblockstats">>, P, _W) -> rpc_getblockstats(P);
 handle_method(<<"getchaintxstats">>, P, _W) -> rpc_getchaintxstats(P);
 handle_method(<<"verifychain">>, P, _W) -> rpc_verifychain(P);
+handle_method(<<"getblockfilter">>, P, _W) -> rpc_getblockfilter(P);
 handle_method(<<"invalidateblock">>, P, _W) -> rpc_invalidateblock(P);
 handle_method(<<"reconsiderblock">>, P, _W) -> rpc_reconsiderblock(P);
 handle_method(<<"flushchainstate">>, _, _W) -> rpc_flushchainstate();
@@ -635,6 +640,7 @@ rpc_help_list() ->
         <<"invalidateblock \"blockhash\"">>,
         <<"reconsiderblock \"blockhash\"">>,
         <<"verifychain ( checklevel nblocks )">>,
+        <<"getblockfilter \"blockhash\" ( \"filtertype\" )">>,
         <<"flushchainstate">>,
         <<"scrubunspendable">>,
         <<"pruneblockchain height">>,
@@ -791,6 +797,16 @@ rpc_getsyncstate() ->
 rpc_getblockchaininfo() ->
     Network = beamchain_config:network(),
     PruneFields = build_prune_fields(),
+    %% BIP-157/158: surface whether the local node has the basic block
+    %% filter index running.  Wallet light clients (and our own
+    %% test-suite) consult this to decide whether `getblockfilter` will
+    %% succeed without a round-trip.  Field name matches Core's recent
+    %% `getblockchaininfo` extension (`compact_filters_enabled`,
+    %% rpc/blockchain.cpp ~line 1432).
+    CompactFiltersEnabled = beamchain_blockfilter_index:is_enabled(),
+    CompactFiltersFields = #{
+        <<"compact_filters_enabled">> => CompactFiltersEnabled
+    },
     case beamchain_chainstate:get_tip() of
         {ok, {TipHash, TipHeight}} ->
             MTP = beamchain_chainstate:get_mtp(),
@@ -830,7 +846,8 @@ rpc_getblockchaininfo() ->
                 <<"softforks">> => Softforks,
                 <<"warnings">> => <<>>
             },
-            {ok, maps:merge(BaseInfo, PruneFields)};
+            {ok, maps:merge(maps:merge(BaseInfo, PruneFields),
+                            CompactFiltersFields)};
         not_found ->
             BaseInfo = #{
                 <<"chain">> => network_name(Network),
@@ -846,7 +863,8 @@ rpc_getblockchaininfo() ->
                 <<"softforks">> => #{},
                 <<"warnings">> => <<>>
             },
-            {ok, maps:merge(BaseInfo, PruneFields)}
+            {ok, maps:merge(maps:merge(BaseInfo, PruneFields),
+                            CompactFiltersFields)}
     end.
 
 %% Build the pruning subset of the getblockchaininfo response.
@@ -1519,6 +1537,79 @@ timestamp_to_height_walk(T, H) ->
             end;
         _ ->
             timestamp_to_height_walk(T, H - 1)
+    end.
+
+%% @doc getblockfilter — return the BIP-158 GCS filter and BIP-157
+%% cfheader for a block.  Mirrors Bitcoin Core's
+%% `rpc/blockchain.cpp::getblockfilter`:
+%%   * First param: block hash (display byte order, hex).
+%%   * Second param (optional): filter type. Currently only "basic"
+%%     (== filter type 0) is supported and is the default.
+%%   * Returns `{filter: <hex>, header: <hex>}`.
+%%
+%% Errors:
+%%   -1   (RPC_MISC_ERROR)            — index disabled
+%%   -8   (RPC_INVALID_PARAMETER)     — unknown filter type
+%%   -5   (RPC_INVALID_ADDRESS_OR_KEY)— block / filter not found
+%%
+%% Reference: bitcoin-core/src/rpc/blockchain.cpp ~line 1235.
+rpc_getblockfilter([HashHex]) ->
+    rpc_getblockfilter([HashHex, <<"basic">>]);
+rpc_getblockfilter([HashHex, FilterType]) when is_binary(HashHex) ->
+    case validate_filter_type(FilterType) of
+        {ok, _FT} ->
+            case beamchain_blockfilter_index:is_enabled() of
+                false ->
+                    {error, ?RPC_MISC_ERROR,
+                     <<"Index is not enabled for filtertype basic">>};
+                true ->
+                    do_getblockfilter(HashHex)
+            end;
+        {error, Msg} ->
+            {error, ?RPC_INVALID_PARAMETER, Msg}
+    end;
+rpc_getblockfilter(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: getblockfilter \"blockhash\" ( \"filtertype\" )">>}.
+
+validate_filter_type(<<"basic">>) -> {ok, 0};
+validate_filter_type(0)            -> {ok, 0};
+validate_filter_type(Other) ->
+    {error,
+        iolist_to_binary(
+          io_lib:format("Unknown filtertype ~p", [Other]))}.
+
+do_getblockfilter(HashHex) ->
+    Hash = hex_to_internal_hash(HashHex),
+    case beamchain_db:get_block_index_by_hash(Hash) of
+        {ok, _Info} ->
+            case beamchain_blockfilter_index:get_filter(Hash) of
+                {ok, FilterBytes} ->
+                    case beamchain_blockfilter_index:get_header(Hash) of
+                        {ok, Header} ->
+                            {ok, #{
+                                <<"filter">> =>
+                                    beamchain_serialize:hex_encode(FilterBytes),
+                                <<"header">> =>
+                                    %% cfheader is a 32-byte hash; surface in
+                                    %% display (reversed) byte order to match
+                                    %% Core, which prints uint256 hashes
+                                    %% big-endian via uint256::ToString().
+                                    beamchain_serialize:hex_encode(
+                                        beamchain_serialize:reverse_bytes(
+                                            Header))
+                            }};
+                        not_found ->
+                            {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+                             <<"Filter header not available for this block">>}
+                    end;
+                not_found ->
+                    {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+                     <<"Filter not available for this block">>}
+            end;
+        _ ->
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+             <<"Block not found">>}
     end.
 
 %% @doc invalidateblock - mark a block and all its descendants as invalid
