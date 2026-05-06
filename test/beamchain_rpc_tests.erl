@@ -1090,3 +1090,55 @@ bip22_result_catchall_test() ->
 bip22_result_inconclusive_test() ->
     ?assertEqual(<<"inconclusive">>,
                  beamchain_rpc:bip22_result(inconclusive)).
+
+%%% ===================================================================
+%%% submitpackage tests (mempool wave 2026-05-06)
+%%% ===================================================================
+%%
+%% submitpackage mirrors Bitcoin Core's
+%% `bitcoin-core/src/rpc/mempool.cpp::submitpackage`. We test:
+%%   1. Empty array  → RPC_INVALID_PARAMETER  (-8)
+%%   2. >25 txs      → RPC_INVALID_PARAMETER  (-8)
+%%   3. Bad usage    → RPC_INVALID_PARAMS     (-32602)
+%%   4. Bad hex      → RPC_DESERIALIZATION_ERROR (-22)
+%%
+%% These exercise the validation paths that live above the mempool
+%% gen_server, so we don't need a running mempool fixture.
+
+submitpackage_empty_array_test() ->
+    %% Empty array must be rejected with RPC_INVALID_PARAMETER (-8).
+    Result = beamchain_rpc:rpc_submitpackage([[]]),
+    ?assertMatch({error, -8, _}, Result),
+    {error, _, Msg} = Result,
+    ?assert(binary:match(Msg, <<"between 1 and">>) =/= nomatch).
+
+submitpackage_too_many_txs_test() ->
+    %% 26 entries > MAX_PACKAGE_COUNT (25) — must reject up front
+    %% before any decode is attempted, matching Core.
+    Junk = <<"00">>,  %% never reached; bounds check fires first
+    BigPackage = lists:duplicate(26, Junk),
+    Result = beamchain_rpc:rpc_submitpackage([BigPackage]),
+    ?assertMatch({error, -8, _}, Result),
+    {error, _, Msg} = Result,
+    ?assert(binary:match(Msg, <<"25">>) =/= nomatch).
+
+submitpackage_bad_usage_test() ->
+    %% Non-list first arg → RPC_INVALID_PARAMS (Core's "Usage:" path).
+    ?assertMatch({error, -32602, _},
+                 beamchain_rpc:rpc_submitpackage([<<"not-a-list">>])),
+    ?assertMatch({error, -32602, _},
+                 beamchain_rpc:rpc_submitpackage([])).
+
+submitpackage_decode_failure_test() ->
+    %% Bad hex must trip decode_package_tx/1 and surface as
+    %% RPC_DESERIALIZATION_ERROR (-22), preserving Core's message
+    %% prefix "TX decode failed".
+    %%
+    %% We exercise decode_package_tx/1 directly to keep the test
+    %% independent of the mempool gen_server: any non-hex input
+    %% must throw {decode_failed, _}.
+    ?assertThrow({decode_failed, _},
+                 beamchain_rpc:decode_package_tx(<<"not-hex-at-all">>)),
+    ?assertThrow({decode_failed, _},
+                 beamchain_rpc:decode_package_tx(<<"zz">>)).
+
