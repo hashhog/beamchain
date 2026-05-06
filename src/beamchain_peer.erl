@@ -1219,6 +1219,12 @@ dispatch_message(ping, Payload, Data) ->
 dispatch_message(pong, Payload, Data) ->
     handle_pong_msg(Payload, Data);
 dispatch_message(sendheaders, _Payload, Data) ->
+    %% BIP-130: peer prefers `headers` announces over `inv`. Surface the flag
+    %% to the handler (peer_manager) so future block announces branch
+    %% accordingly. Without this notification, peer_manager keeps spamming
+    %% `inv` and the peer must round-trip getheaders for every announcement —
+    %% the header-sync DoS amplifier this wave is closing.
+    Data#peer_data.handler ! {peer_sendheaders, self()},
     {ok, Data#peer_data{wants_headers = true}};
 dispatch_message(sendcmpct, Payload, Data) ->
     handle_sendcmpct_msg(Payload, Data);

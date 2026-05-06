@@ -57,6 +57,7 @@
          check_inbound/1,
          broadcast/2,
          broadcast/3,
+         announce_block/2,
          request_addresses/1,
          %% Misbehavior and banning
          misbehaving/3,
@@ -72,6 +73,9 @@
 
 %% Exposed for testing (BIP35 mempool inv chunking)
 -export([chunk_inv_items/2]).
+
+%% Exposed for testing (BIP-130 announce branching)
+-export([pick_announce_msg/3]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -149,7 +153,12 @@
     pending_getheaders = false :: boolean(),  %% waiting for headers response
     getheaders_sent_at = 0 :: non_neg_integer(), %% when getheaders was sent
     ping_latency = 0 :: non_neg_integer(),    %% last measured ping latency (ms)
-    network_type = ipv4 :: ipv4 | ipv6 | tor | i2p | cjdns  %% network type
+    network_type = ipv4 :: ipv4 | ipv6 | tor | i2p | cjdns,  %% network type
+    %% BIP-130: peer signaled sendheaders → announce new tips with the
+    %% `headers` message rather than `inv`. Mirrors Core
+    %% net_processing.cpp::CNodeState::fPreferHeaders. Updated by the
+    %% {peer_sendheaders, Pid} message dispatched from beamchain_peer.
+    wants_headers = false :: boolean()
 }).
 
 -record(state, {
@@ -283,6 +292,34 @@ broadcast(Command, Payload, FilterFun) ->
         end;
     (_, _) -> ok
     end, ok, ?PEER_TABLE).
+
+%% @doc Announce a newly accepted block to all connected peers, branching
+%% per BIP-130 on the peer's `sendheaders` flag.
+%%   - Peer that sent `sendheaders` → push `headers` with the new header.
+%%   - Peer that did NOT             → fall back to `inv` of MSG_BLOCK.
+%%
+%% Mirrors Bitcoin Core net_processing.cpp::PeerManagerImpl::SendMessages
+%% (the m_blocks_for_headers_relay / fPreferHeaders branch). Camlcoin's
+%% lib/peer_manager.ml::announce_block is the fleet reference impl.
+-spec announce_block(#block_header{}, binary()) -> ok.
+announce_block(Header, BlockHash) ->
+    ets:foldl(fun(#peer_entry{pid = Pid, connected = true,
+                              wants_headers = WantsHeaders}, _) ->
+        {Cmd, Payload} = pick_announce_msg(WantsHeaders, Header, BlockHash),
+        beamchain_peer:send_message(Pid, {Cmd, Payload});
+    (_, _) -> ok
+    end, ok, ?PEER_TABLE).
+
+%% @doc Pure decision function for the BIP-130 announce branch. Exposed for
+%% EUnit. Returns the {Command, Payload} pair to hand to peer:send_message/2.
+-spec pick_announce_msg(boolean(), #block_header{}, binary()) ->
+    {atom(), map()}.
+pick_announce_msg(true, Header, _BlockHash) ->
+    %% BIP-130: peer opted in via sendheaders — push the header directly.
+    {headers, #{headers => [Header]}};
+pick_announce_msg(false, _Header, BlockHash) ->
+    %% Pre-BIP-130 fallback: enumerate via inv, peer round-trips getheaders.
+    {inv, #{items => [#{type => ?MSG_BLOCK, hash => BlockHash}]}}.
 
 %% @doc Send a getaddr to a specific peer.
 -spec request_addresses(pid()) -> ok.
@@ -686,6 +723,17 @@ handle_info({peer_tx, Pid}, State) ->
     case ets:lookup(?PEER_TABLE, Pid) of
         [Entry] ->
             ets:insert(?PEER_TABLE, Entry#peer_entry{last_tx_time = Now});
+        [] ->
+            ok
+    end,
+    {noreply, State};
+
+%% BIP-130: peer signaled sendheaders. Persist on the peer_entry so
+%% announce_block/2 can branch headers vs inv per peer.
+handle_info({peer_sendheaders, Pid}, State) ->
+    case ets:lookup(?PEER_TABLE, Pid) of
+        [Entry] ->
+            ets:insert(?PEER_TABLE, Entry#peer_entry{wants_headers = true});
         [] ->
             ok
     end,
