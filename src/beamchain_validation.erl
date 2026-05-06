@@ -1407,9 +1407,34 @@ decode_undo_entries(N, <<H:32/binary, I:32/little,
 %% @doc Disconnect a block, reversing its effects on the UTXO set.
 %% Uses stored undo data to restore spent outputs.
 -spec disconnect_block(#block{}, non_neg_integer(), map()) ->
-    ok | {error, atom()}.
+    {ok, BlockHash :: binary()} | {error, atom()}.
+%% Disconnect a block from the active chain.
+%%
+%% This is the *ETS-only* phase: it mutates the in-memory UTXO cache to
+%% reverse the block's spend/create effects. It deliberately does NOT
+%% commit the new chain tip or delete the on-disk undo data — those are
+%% the caller's responsibility (chainstate's `do_disconnect_block` /
+%% `do_reorganize`) so that:
+%%
+%%  - single-block disconnects can flush UTXO + tip + undo-delete in one
+%%    RocksDB WriteBatch (single-block atomicity), and
+%%  - multi-block reorgs can accumulate the disk side-effects of all
+%%    disconnects + all connects into ONE final atomic batch
+%%    (multi-block atomicity — Pattern D).
+%%
+%% Pre-fix, this function called `set_chain_tip` and `delete_undo`
+%% inline as separate `rocksdb:put` / `rocksdb:delete` operations. A
+%% crash between those writes and the chainstate flush left the disk
+%% with: chain_tip pointing at PrevHash but UTXO set still reflecting
+%% TipHash, and/or undo data already deleted from disk so the caller
+%% couldn't replay. See
+%% CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md
+%% Pattern D.
+%%
+%% Returns {ok, BlockHash} so the caller can stage `delete_undo(Hash)`
+%% into the same batch as the chainstate flush.
 disconnect_block(#block{header = Header, transactions = Txs},
-                 Height, _Params) ->
+                 _Height, _Params) ->
     try
         BlockHash = beamchain_serialize:block_hash(Header),
 
@@ -1447,15 +1472,12 @@ disconnect_block(#block{header = Header, transactions = Txs},
             end
         end, UndoData, RevTxs),
 
-        %% 3. update chain tip to previous block
-        PrevHash = Header#block_header.prev_hash,
-        PrevHeight = Height - 1,
-        beamchain_db:set_chain_tip(PrevHash, PrevHeight),
+        %% 3. NB: chain_tip update and undo-data delete are deliberately
+        %% NOT performed here — see function docstring above. Caller
+        %% (chainstate) batches them with the next UTXO flush so the
+        %% disconnect is atomic across UTXO + tip + undo-delete.
 
-        %% 4. delete undo data (no longer needed after successful disconnect)
-        beamchain_db:delete_undo(BlockHash),
-
-        ok
+        {ok, BlockHash}
     catch
         throw:Reason -> {error, Reason}
     end.
