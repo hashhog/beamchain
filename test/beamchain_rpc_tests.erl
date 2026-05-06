@@ -1081,3 +1081,12 @@ bip22_result_catchall_test() ->
     ?assertEqual(<<"rejected">>, beamchain_rpc:bip22_result(unknown_error)),
     ?assertEqual(<<"rejected">>, beamchain_rpc:bip22_result(bad_prevblk)),
     ?assertEqual(<<"rejected">>, beamchain_rpc:bip22_result(no_transactions)).
+
+%% inconclusive: side-branch acceptance per BIP-22 + Core
+%% rpc/mining.cpp::submitblock — block stored but not on the active
+%% chain.  Wired in for Pattern Y closure 2026-05-05; see
+%% chainstate:do_side_branch_accept_with_parent/3 +
+%% miner:do_submit_block.
+bip22_result_inconclusive_test() ->
+    ?assertEqual(<<"inconclusive">>,
+                 beamchain_rpc:bip22_result(inconclusive)).

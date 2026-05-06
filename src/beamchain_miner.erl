@@ -339,22 +339,43 @@ do_submit_block(HexBlock) ->
         Params = beamchain_chain_params:params(beamchain_config:network()),
         case beamchain_validation:check_block(Block, Params) of
             ok ->
-                %% 4. validate and connect to chain
-                case beamchain_chainstate:connect_block(Block) of
-                    ok ->
-                        %% 5. remove confirmed txs from mempool
+                %% 4. submit_block decouples acceptance (block_index +
+                %% storage) from best-chain selection (UTXO connect +
+                %% tip flip).  Side-branch blocks are persisted and
+                %% become reorg candidates rather than being silently
+                %% dropped.  See chainstate:submit_block/1 docstring +
+                %% CORE-PARITY-AUDIT/_reorg-via-submitblock-fleet-result-2026-05-05.md.
+                case beamchain_chainstate:submit_block(Block) of
+                    {ok, Outcome} when Outcome =:= active;
+                                       Outcome =:= reorg ->
+                        %% Active-chain advance (either direct extension
+                        %% or a reorg flip).  Mempool + announce as
+                        %% before.
                         Txids = [beamchain_serialize:tx_hash(Tx)
                                  || Tx <- Block#block.transactions],
                         beamchain_mempool:remove_for_block(Txids),
 
-                        %% 6. announce new block to peers
                         BlockHash = beamchain_serialize:block_hash(
                             Block#block.header),
                         broadcast_new_block(BlockHash),
 
-                        logger:info("miner: accepted block ~s",
-                                    [short_hex(BlockHash)]),
+                        logger:info("miner: accepted block ~s (~p)",
+                                    [short_hex(BlockHash), Outcome]),
                         ok;
+                    {ok, side_branch} ->
+                        %% Block stored as side-branch — no tip flip,
+                        %% no mempool churn, no broadcast.  Surface as
+                        %% BIP-22 "inconclusive" via the rpc_submitblock
+                        %% layer.  Mirrors Bitcoin Core
+                        %% rpc/mining.cpp::submitblock returning
+                        %% "inconclusive" for stored-but-not-active
+                        %% blocks.
+                        BlockHash = beamchain_serialize:block_hash(
+                            Block#block.header),
+                        logger:info("miner: stored block ~s "
+                                    "as side-branch (inconclusive)",
+                                    [short_hex(BlockHash)]),
+                        {error, inconclusive};
                     {error, Reason} ->
                         logger:warning("miner: rejected block: ~p", [Reason]),
                         {error, Reason}
