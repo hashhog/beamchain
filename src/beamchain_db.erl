@@ -31,6 +31,21 @@
 -export([store_block_index/5, store_block_index/6, get_block_index/1, get_block_index_by_hash/1]).
 -export([update_block_status/2, get_all_block_indexes/0]).
 
+%% Side-branch (off-active-chain) block index, hash-keyed.
+%% Active-chain block_index is keyed by HEIGHT and so structurally cannot
+%% hold two blocks at the same height — so a side-branch's block-index
+%% entry has nowhere to live in cf_block_idx. We store side-branch
+%% entries in the meta CF under prefix "sbidx:<hash>" with a value
+%% format that prepends Height to the existing block-index encoding
+%% (Height|Hash|HeaderBin|CWLen|Chainwork|Status|NTx). When a side-branch
+%% block is reorg-promoted to the active chain, the entry is removed
+%% from the side-branch index (the active block_index entry takes
+%% over). Counterpart to Core's BlockManager::AcceptBlock which
+%% writes pindexNew->nChainWork unconditionally for every accepted
+%% block, regardless of whether it's on the active chain.
+-export([store_side_branch_index/2, get_side_branch_index/1,
+         delete_side_branch_index/1, get_all_side_branch_indexes/0]).
+
 %% Block status constants (Bitcoin Core compatible)
 %% These correspond to bits in the nStatus field of CBlockIndex.
 -define(BLOCK_VALID_HEADER, 1).         %% Parsed, version ok, hash satisfies claimed PoW
@@ -389,6 +404,44 @@ update_block_status(Hash, NewStatus) when byte_size(Hash) =:= 32 ->
 -spec get_all_block_indexes() -> {ok, [map()]} | {error, term()}.
 get_all_block_indexes() ->
     gen_server:call(?SERVER, get_all_block_indexes, 60000).
+
+%% @doc Store a side-branch block index entry (hash-keyed in meta CF).
+%% Entry must include height, hash, header, chainwork, status, n_tx.
+%% Used when a block is accepted whose parent is in the index but is
+%% NOT the active tip — i.e. a fork that hasn't yet overtaken the
+%% current best chain. See beamchain_chainstate:do_connect_block for
+%% the call-site rationale.
+-spec store_side_branch_index(binary(),
+                              #{height := non_neg_integer(),
+                                header := #block_header{},
+                                chainwork := binary(),
+                                status := integer(),
+                                n_tx := non_neg_integer()}) -> ok.
+store_side_branch_index(Hash, Entry) when byte_size(Hash) =:= 32, is_map(Entry) ->
+    gen_server:call(?SERVER, {store_side_branch_index, Hash, Entry}, 30000).
+
+%% @doc Get a side-branch block index entry by hash.
+-spec get_side_branch_index(binary()) ->
+    {ok, #{hash => binary(), height => non_neg_integer(),
+           header => #block_header{}, chainwork => binary(),
+           status => integer(), n_tx => non_neg_integer()}} | not_found.
+get_side_branch_index(Hash) when byte_size(Hash) =:= 32 ->
+    gen_server:call(?SERVER, {get_side_branch_index, Hash}, 30000).
+
+%% @doc Delete a side-branch block index entry by hash. Used when a
+%% side-branch block is reorg-promoted to the active chain — the
+%% active block_index entry now holds the canonical record.
+-spec delete_side_branch_index(binary()) -> ok.
+delete_side_branch_index(Hash) when byte_size(Hash) =:= 32 ->
+    gen_server:call(?SERVER, {delete_side_branch_index, Hash}, 30000).
+
+%% @doc Iterate all side-branch index entries. Used by
+%% find_best_valid_chain so reorg dispatch can compare side-branch
+%% chainwork against the active tip without rebuilding the chain
+%% from scratch on every comparison.
+-spec get_all_side_branch_indexes() -> {ok, [map()]} | {error, term()}.
+get_all_side_branch_indexes() ->
+    gen_server:call(?SERVER, get_all_side_branch_indexes, 60000).
 
 %% @doc Get the current chain tip
 -spec get_chain_tip() -> {ok, #{hash => binary(), height => integer()}} | not_found.
@@ -1077,6 +1130,45 @@ handle_call(get_all_block_indexes, _From,
     end,
     {reply, Result, State};
 
+%% Side-branch (off-active-chain) block index, hash-keyed in meta CF.
+handle_call({store_side_branch_index, Hash, Entry}, _From,
+            #state{db_handle = Db, cf_meta = MetaCF} = State) ->
+    Key = <<"sbidx:", Hash/binary>>,
+    Value = encode_side_branch_index_entry(Hash, Entry),
+    Result = rocksdb:put(Db, MetaCF, Key, Value, []),
+    {reply, Result, State};
+
+handle_call({get_side_branch_index, Hash}, _From,
+            #state{db_handle = Db, cf_meta = MetaCF} = State) ->
+    Key = <<"sbidx:", Hash/binary>>,
+    Result = case rocksdb:get(Db, MetaCF, Key, []) of
+        {ok, Bin} ->
+            {ok, decode_side_branch_index_entry(Bin)};
+        not_found ->
+            not_found
+    end,
+    {reply, Result, State};
+
+handle_call({delete_side_branch_index, Hash}, _From,
+            #state{db_handle = Db, cf_meta = MetaCF} = State) ->
+    Key = <<"sbidx:", Hash/binary>>,
+    Result = rocksdb:delete(Db, MetaCF, Key, []),
+    {reply, Result, State};
+
+handle_call(get_all_side_branch_indexes, _From,
+            #state{db_handle = Db, cf_meta = MetaCF} = State) ->
+    Result = case rocksdb:iterator(Db, MetaCF, []) of
+        {ok, Iter} ->
+            Entries = collect_side_branch_indexes(
+                        rocksdb:iterator_move(Iter, {seek, <<"sbidx:">>}),
+                        Iter, []),
+            rocksdb:iterator_close(Iter),
+            {ok, Entries};
+        Error ->
+            Error
+    end,
+    {reply, Result, State};
+
 handle_call(_Request, _From, State) ->
     {reply, {error, not_implemented}, State}.
 
@@ -1207,6 +1299,45 @@ collect_block_indexes({ok, Key, Value}, Iter, Acc) ->
     Entry = decode_block_index_entry(Value),
     collect_block_indexes(rocksdb:iterator_move(Iter, next), Iter,
                           [Entry#{height => Height} | Acc]).
+
+%% @doc Encode a side-branch index entry. Includes height inline since
+%% the key is the hash, not a height key.
+%% Format: Height (8) | Hash (32) | HeaderBin (80) | CWLen (2)
+%%       | Chainwork (variable) | Status (4) | NTx (4)
+encode_side_branch_index_entry(Hash, #{height := Height, header := Header,
+                                       chainwork := Chainwork,
+                                       status := Status,
+                                       n_tx := NTx}) ->
+    HeaderBin = beamchain_serialize:encode_block_header(Header),
+    CWLen = byte_size(Chainwork),
+    <<Height:64/big, Hash:32/binary, HeaderBin:80/binary,
+      CWLen:16/big, Chainwork:CWLen/binary,
+      Status:32/little, NTx:32/big>>.
+
+%% @doc Decode a side-branch index entry.
+decode_side_branch_index_entry(<<Height:64/big, Hash:32/binary,
+                                  HeaderBin:80/binary, CWLen:16/big,
+                                  Rest/binary>>) ->
+    {Header, <<>>} = beamchain_serialize:decode_block_header(HeaderBin),
+    case Rest of
+        <<Chainwork:CWLen/binary, Status:32/little, NTx:32/big>> ->
+            #{hash => Hash, height => Height, header => Header,
+              chainwork => Chainwork, status => Status, n_tx => NTx};
+        _ ->
+            error({invalid_side_branch_index_entry, Rest})
+    end.
+
+%% @doc Collect side-branch index entries while iterating the meta CF.
+%% Stops once the key prefix is no longer "sbidx:".
+collect_side_branch_indexes({error, _}, _Iter, Acc) ->
+    lists:reverse(Acc);
+collect_side_branch_indexes({ok, <<"sbidx:", _/binary>>, Value}, Iter, Acc) ->
+    Entry = decode_side_branch_index_entry(Value),
+    collect_side_branch_indexes(rocksdb:iterator_move(Iter, next), Iter,
+                                [Entry | Acc]);
+collect_side_branch_indexes({ok, _OtherKey, _Value}, _Iter, Acc) ->
+    %% Iterator moved past the "sbidx:" prefix range — stop.
+    lists:reverse(Acc).
 
 %% @doc Resolve a batch operation's CF name to a CF handle
 resolve_batch_op({put, CF, Key, Value}, State) ->
