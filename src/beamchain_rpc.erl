@@ -2917,6 +2917,10 @@ bip22_result(negative_output)          -> <<"bad-txns-vout-negative">>;
 %% state.Invalid(TX_PREMATURE_SPEND, "bad-txns-premature-spend-of-coinbase").
 bip22_result(premature_spend_of_coinbase) -> <<"bad-txns-premature-spend-of-coinbase">>;
 bip22_result(duplicate)                 -> <<"duplicate">>;
+%% "inconclusive" — block was stored as a side-branch (parent in index
+%% but not the active tip; not heavier than active).  Per BIP-22 + Core
+%% rpc/mining.cpp::submitblock, this is success-with-no-tip-flip.
+bip22_result(inconclusive)              -> <<"inconclusive">>;
 bip22_result(_)                         -> <<"rejected">>.
 
 rpc_submitblock([HexData]) when is_binary(HexData) ->

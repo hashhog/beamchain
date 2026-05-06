@@ -29,6 +29,28 @@
 %% Block connection / disconnection
 -export([connect_block/1, disconnect_block/0, reorganize/1]).
 
+%% Block submission entry point. Handles three outcomes:
+%%   {ok, active}       — block extends the active tip (happy path)
+%%   {ok, side_branch}  — block accepted on a side-branch (no reorg)
+%%   {ok, reorg}        — side-branch overtook the active tip; chain
+%%                        switched to the heavier branch (Pattern A
+%%                        dispatcher wiring)
+%%   {error, Reason}    — rejected
+%%
+%% Counterpart to bitcoin-core's `BlockManager::AcceptBlock`
+%% (validation.cpp) + `ActivateBestChain` (validation.cpp). The Core
+%% pipeline decouples block ACCEPTANCE (writes header + body + chain
+%% work to the block index regardless of whether the block is on the
+%% active chain) from BEST-CHAIN SELECTION (compares chain work and
+%% performs the disconnect→connect dance to flip the tip).  Pre-fix
+%% (Pattern Y per CORE-PARITY-AUDIT/_reorg-via-submitblock-fleet-result-
+%% 2026-05-05.md), beamchain conflated the two: any block whose
+%% prev_hash !== active tip was rejected with `bad_prevblk`, dropping
+%% it on arrival, so the existing reorganize/1 dispatcher (Pattern A)
+%% was structurally unreachable from the submitblock path.  This entry
+%% point closes both gaps.
+-export([submit_block/1]).
+
 %% Block invalidation / reconsideration
 -export([invalidate_block/1, reconsider_block/1]).
 
@@ -176,6 +198,15 @@ disconnect_block() ->
 -spec reorganize([#block{}]) -> {ok, [#transaction{}]} | {error, term()}.
 reorganize(NewBlocks) ->
     gen_server:call(?SERVER, {reorganize, NewBlocks}, 120000).
+
+%% @doc Submit a block for acceptance. Decouples acceptance from
+%% best-chain selection so side-branch blocks are stored and become
+%% candidates for a future reorg, rather than being silently dropped
+%% on arrival.
+-spec submit_block(#block{}) -> {ok, active | side_branch | reorg} |
+                                {error, term()}.
+submit_block(Block) ->
+    gen_server:call(?SERVER, {submit_block, Block}, 300000).
 
 %% @doc Flush dirty UTXO cache entries to RocksDB.
 -spec flush() -> ok.
@@ -564,6 +595,14 @@ handle_call({connect_block, Block}, _From, State) ->
             {reply, {error, Reason}, State}
     end;
 
+handle_call({submit_block, Block}, _From, State) ->
+    case do_submit_block(Block, State) of
+        {ok, Outcome, State2} ->
+            {reply, {ok, Outcome}, State2};
+        {error, Reason} ->
+            {reply, {error, Reason}, State}
+    end;
+
 handle_call(disconnect_block, _From, State) ->
     case do_disconnect_block(State) of
         {ok, State2} ->
@@ -880,6 +919,292 @@ maybe_check_ibd(#state{ibd = true, mtp_timestamps = Ts} = State) ->
     end;
 maybe_check_ibd(State) ->
     State.
+
+%%% ===================================================================
+%%% Internal: submit block (Pattern Y + Pattern A closure)
+%%%
+%%% Two-phase pipeline mirroring Bitcoin Core:
+%%%   Phase 1 (AcceptBlock):    write block body + index entry to
+%%%                              storage, regardless of whether the
+%%%                              block is on the active chain or a
+%%%                              side-branch.
+%%%   Phase 2 (ActivateBestChain): if a candidate chain has strictly
+%%%                              more cumulative work than the active
+%%%                              tip, disconnect→connect to switch to
+%%%                              the heaviest valid chain.
+%%%
+%%% Pre-fix, beamchain rejected any block whose prev_hash !== active
+%%% tip with `bad_prevblk` — Phase 1 was inseparable from Phase 2 and
+%%% side-branch storage did not exist. The reorganize/1 dispatcher
+%%% (already present) could therefore never run from submit_block.
+%%% See CORE-PARITY-AUDIT/_reorg-via-submitblock-fleet-result-2026-05-05.md
+%%% (Pattern Y) and the rustoshi reference fix at 68a422b.
+%%% ===================================================================
+
+do_submit_block(#block{header = Header} = Block,
+                #state{tip_hash = TipHash, tip_height = TipHeight} = State) ->
+    PrevHash = Header#block_header.prev_hash,
+    %% If parent IS the active tip, take the happy path: validate+
+    %% connect (UTXO update, atomic write).
+    PrevIsTip = case TipHeight >= 0 of
+        true  -> PrevHash =:= TipHash;
+        false -> true   %% Genesis or empty chain
+    end,
+    case PrevIsTip of
+        true ->
+            case do_connect_block(Block, State) of
+                {ok, State2} ->
+                    %% Active-chain extension always wins; no reorg
+                    %% evaluation needed.
+                    {ok, active, State2};
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        false ->
+            %% Side-branch arrival.  Find the parent in either index;
+            %% if not present, the block is a true orphan and we reject.
+            do_side_branch_accept(Block, State)
+    end.
+
+%% Accept a block whose parent is in the block index but is NOT the
+%% active tip.  Stores the block + side-branch index entry, then
+%% evaluates whether the new chain has strictly more work than the
+%% active chain — if yes, dispatches to do_reorganize to flip the tip.
+do_side_branch_accept(#block{header = Header} = Block, State) ->
+    PrevHash = Header#block_header.prev_hash,
+    case lookup_block_index_anywhere(PrevHash) of
+        {ok, ParentEntry} ->
+            do_side_branch_accept_with_parent(Block, ParentEntry, State);
+        not_found ->
+            %% Parent is unknown — true orphan.  Treat as bad_prevblk
+            %% so the BIP-22 mapping returns a generic "rejected"
+            %% reason (matches Core's behaviour: ProcessNewBlock skips
+            %% the block entirely until the parent header arrives).
+            {error, bad_prevblk}
+    end.
+
+do_side_branch_accept_with_parent(#block{header = Header} = Block,
+                                   ParentEntry,
+                                   #state{params = Params} = State) ->
+    BlockHash = beamchain_serialize:block_hash(Header),
+    %% Idempotency: if the block is already in the active or side-branch
+    %% index, it's a no-op.  Mirrors Core's "AlreadyHaveBlock" check.
+    case is_block_known(BlockHash) of
+        true ->
+            %% Block was already accepted; no reorg evaluation needed —
+            %% if it was going to flip the tip, that already happened.
+            {ok, side_branch, State};
+        false ->
+            ParentHeight = maps:get(height, ParentEntry),
+            Height = ParentHeight + 1,
+            ParentCW = maps:get(chainwork, ParentEntry, <<0:256>>),
+            ParentCWInt = binary:decode_unsigned(ParentCW, big),
+            BlockWork = beamchain_pow:compute_work(Header#block_header.bits),
+            NewCWInt = ParentCWInt + BlockWork,
+            NewCW = encode_chainwork(NewCWInt),
+
+            %% Contextual header check against the parent — same
+            %% predicate the active-chain path runs in
+            %% do_connect_block_inner via beamchain_validation:connect_block,
+            %% but applied here without UTXO mutation since we are not
+            %% (yet) connecting on the active chain.
+            ParentIndex = ParentEntry#{height => ParentHeight,
+                                       chainwork => ParentCW},
+            case beamchain_validation:contextual_check_block_header(
+                   Header, ParentIndex, Params) of
+                ok ->
+                    case persist_side_branch_block(
+                           Block, BlockHash, Height, NewCW) of
+                        ok ->
+                            maybe_reorg_to_side_branch(
+                              BlockHash, NewCWInt, State);
+                        {error, _} = Err ->
+                            Err
+                    end;
+                {error, Reason} ->
+                    {error, Reason}
+            end
+    end.
+
+%% Look up a block index entry by hash, checking the active-chain
+%% (height-keyed) index first, then the side-branch (hash-keyed)
+%% index.  Returns {ok, EntryWithHeight} or not_found.
+lookup_block_index_anywhere(Hash) ->
+    case beamchain_db:get_block_index_by_hash(Hash) of
+        {ok, Entry} ->
+            {ok, Entry};
+        not_found ->
+            case beamchain_db:get_side_branch_index(Hash) of
+                {ok, Entry} -> {ok, Entry};
+                not_found   -> not_found
+            end
+    end.
+
+is_block_known(Hash) ->
+    case beamchain_db:get_block_index_by_hash(Hash) of
+        {ok, _} -> true;
+        not_found ->
+            case beamchain_db:get_side_branch_index(Hash) of
+                {ok, _} -> true;
+                not_found -> false
+            end
+    end.
+
+%% Pad/encode a chainwork bignum to a 32-byte big-endian binary,
+%% matching the on-disk format used by store_block_index.
+encode_chainwork(0) ->
+    <<0:256>>;
+encode_chainwork(N) when is_integer(N), N > 0 ->
+    Bin = binary:encode_unsigned(N, big),
+    case byte_size(Bin) < 32 of
+        true  -> <<0:((32 - byte_size(Bin)) * 8), Bin/binary>>;
+        false -> Bin
+    end.
+
+%% Persist a side-branch block: store the block body (hash-keyed in
+%% cf_blocks; idempotent) and a side-branch index entry (hash-keyed in
+%% meta CF under "sbidx:" prefix).  No UTXO mutation — that happens
+%% only if/when the block is later activated via reorg.
+persist_side_branch_block(Block, BlockHash, Height, Chainwork) ->
+    case beamchain_db:store_block(Block, Height) of
+        ok ->
+            Entry = #{
+                height    => Height,
+                header    => Block#block.header,
+                chainwork => Chainwork,
+                %% VALID_TREE only: header is well-formed and contextual
+                %% header checks passed, but transactions have not been
+                %% connect-validated against UTXOs yet.  Promotion to
+                %% VALID_SCRIPTS + HAVE_DATA + HAVE_UNDO happens when
+                %% the block is activated via reorg.
+                status    => 2,
+                n_tx      => length(Block#block.transactions)
+            },
+            beamchain_db:store_side_branch_index(BlockHash, Entry);
+        Error ->
+            Error
+    end.
+
+%% After persisting a side-branch block, evaluate whether the new
+%% chain has strictly more work than the active tip.  If yes, build
+%% the chain from fork→tip and dispatch to do_reorganize.  If no,
+%% return side_branch (BIP-22 "inconclusive").
+maybe_reorg_to_side_branch(NewTipHash, NewChainWork,
+                           #state{tip_hash = ActiveTipHash} = State) ->
+    ActiveCWInt = active_tip_chainwork(ActiveTipHash),
+    case NewChainWork > ActiveCWInt of
+        true ->
+            %% Heavier chain — promote.
+            logger:info("chainstate: side-branch ~s overtook active "
+                        "tip ~s (new_cw=~B active_cw=~B); reorging",
+                        [hash_hex(NewTipHash), hash_hex(ActiveTipHash),
+                         NewChainWork, ActiveCWInt]),
+            do_promote_side_branch(NewTipHash, State);
+        false ->
+            %% Stored as side-branch; tip unchanged.
+            {ok, side_branch, State}
+    end.
+
+active_tip_chainwork(undefined) ->
+    0;
+active_tip_chainwork(TipHash) ->
+    case beamchain_db:get_block_index_by_hash(TipHash) of
+        {ok, #{chainwork := CW}} ->
+            binary:decode_unsigned(CW, big);
+        not_found ->
+            0
+    end.
+
+%% Walk back from NewTipHash collecting blocks (loaded from cf_blocks)
+%% until we hit the active chain.  Then call do_reorganize/2 with the
+%% list of blocks in fork→tip order.  After the reorg, the new
+%% active-chain entries have been persisted via direct_atomic_connect_writes
+%% (in do_connect_block_inner), so the side-branch index entries for
+%% the now-active blocks are stale and should be removed.
+do_promote_side_branch(NewTipHash, State) ->
+    case build_side_branch_chain_to_active(NewTipHash) of
+        {ok, []} ->
+            %% Already on the active chain.  Shouldn't happen given
+            %% the chainwork comparison above, but defend anyway.
+            {ok, side_branch, State};
+        {ok, NewBlocks} ->
+            case do_reorganize(NewBlocks, State) of
+                {ok, State2, _DisconnectedTxs} ->
+                    %% The promoted blocks now have entries in the
+                    %% active-chain block_index (written by
+                    %% do_connect_block_inner during the reorg), so
+                    %% their side-branch index entries are stale.
+                    lists:foreach(
+                      fun(#block{header = Hdr}) ->
+                          H = beamchain_serialize:block_hash(Hdr),
+                          beamchain_db:delete_side_branch_index(H)
+                      end, NewBlocks),
+                    {ok, reorg, State2};
+                {error, Reason} ->
+                    %% Reorg failed — block remains in side-branch
+                    %% storage and chain stays on active tip.
+                    logger:warning("chainstate: side-branch reorg "
+                                   "failed: ~p", [Reason]),
+                    {error, {reorg_failed, Reason}}
+            end;
+        {error, Reason} ->
+            logger:warning("chainstate: side-branch chain-walk "
+                           "failed: ~p", [Reason]),
+            {error, {reorg_walk_failed, Reason}}
+    end.
+
+%% Walk from NewTipHash back through side-branch / active entries
+%% until we find a hash that's on the active chain (i.e. its hash
+%% matches the active block_index entry at its height).  Returns the
+%% blocks in fork→tip order, loaded from cf_blocks.
+build_side_branch_chain_to_active(StartHash) ->
+    build_side_branch_chain_to_active(StartHash, []).
+
+build_side_branch_chain_to_active(Hash, Acc) ->
+    case beamchain_db:get_block(Hash) of
+        {ok, Block} ->
+            PrevHash = (Block#block.header)#block_header.prev_hash,
+            case is_on_active_chain(PrevHash) of
+                true ->
+                    %% Found fork point — PrevHash is the last common
+                    %% ancestor.  Acc was prepended on each recursion
+                    %% (recursion proceeds tip → fork), so prepending
+                    %% Block one more time and returning Acc directly
+                    %% yields fork→tip order, which is what
+                    %% do_reorganize/2 expects (it reads
+                    %% NewBlocks[0]'s prev_hash as the fork point).
+                    {ok, [Block | Acc]};
+                false ->
+                    case lookup_block_index_anywhere(PrevHash) of
+                        {ok, _} ->
+                            build_side_branch_chain_to_active(
+                              PrevHash, [Block | Acc]);
+                        not_found ->
+                            %% Broken chain — parent gone.
+                            {error, {broken_chain, PrevHash}}
+                    end
+            end;
+        not_found ->
+            {error, {block_data_missing, Hash}}
+    end.
+
+%% A hash is on the active chain iff the height-indexed entry for its
+%% recorded height has the same hash.  Genesis-parent (32 bytes of
+%% zero) is treated as "on active chain" — it represents the fork
+%% point at genesis when a side-branch shares only the genesis block
+%% with the active chain.
+is_on_active_chain(<<0:256>>) ->
+    true;
+is_on_active_chain(Hash) ->
+    case beamchain_db:get_block_index_by_hash(Hash) of
+        {ok, #{height := H}} ->
+            case beamchain_db:get_block_index(H) of
+                {ok, #{hash := ActiveHash}} -> ActiveHash =:= Hash;
+                _ -> false
+            end;
+        _ ->
+            false
+    end.
 
 %%% ===================================================================
 %%% Internal: disconnect block
