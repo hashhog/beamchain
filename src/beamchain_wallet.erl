@@ -91,6 +91,14 @@
 %% Keypool
 -export([get_keypool_size/0]).
 
+%% Coin lock state (lockunspent / listlockunspent).  Mirrors Core's
+%% CWallet::LockCoin / UnlockCoin / ListLockedCoins (wallet/wallet.cpp).
+-export([lock_coin/3,
+         unlock_coin/3,
+         unlock_all_coins/1,
+         is_locked_coin/2,
+         list_locked_coins/1]).
+
 -define(SERVER, ?MODULE).
 -define(HARDENED, 16#80000000).
 
@@ -137,7 +145,12 @@
     locked         :: boolean(),            %% true if wallet is locked (keys unavailable)
     encrypted_seed :: binary() | undefined, %% AES-256-CBC encrypted seed
     encryption_salt :: binary() | undefined, %% 16-byte salt for PBKDF2
-    lock_timer_ref :: reference() | undefined  %% auto-lock timer reference
+    lock_timer_ref :: reference() | undefined,  %% auto-lock timer reference
+    %% Locked coins (lockunspent / listlockunspent).  Memory-only set of
+    %% {Txid, Vout} pairs that coin selection must skip.  Mirrors Core's
+    %% CWallet::setLockedCoins (wallet/wallet.h); cleared on process exit
+    %% (we do not yet persist with persistent=true).
+    locked_coins = sets:new() :: sets:set()
 }).
 
 %% Default keypool size (1000 addresses lookahead per type)
@@ -257,6 +270,49 @@ walletlock() ->
 -spec is_locked() -> boolean().
 is_locked() ->
     gen_server:call(?SERVER, is_locked).
+
+%%% ===================================================================
+%%% Coin lock state (lockunspent / listlockunspent)
+%%% ===================================================================
+%%
+%% Mirrors Bitcoin Core's CWallet::LockCoin / UnlockCoin / ListLockedCoins
+%% (`wallet/wallet.cpp`).  Beamchain stores the lock set in memory only —
+%% Core's `persistent=true` flag is accepted at the RPC layer for parity
+%% but does not yet write to disk (TODO: persistence).  Locks are cleared
+%% on process exit, matching Core's `persistent=false` default.
+
+%% @doc Mark `{Txid, Vout}` as temporarily unspendable in the given wallet.
+%% Returns `ok` even when the coin is already locked; the RPC layer is
+%% responsible for the "already locked" error per Core's
+%% `wallet/rpc/coins.cpp:lockunspent`.
+-spec lock_coin(pid(), binary(), non_neg_integer()) -> ok.
+lock_coin(Pid, Txid, Vout) when is_pid(Pid), is_binary(Txid),
+                                is_integer(Vout), Vout >= 0 ->
+    gen_server:call(Pid, {lock_coin, Txid, Vout}).
+
+%% @doc Remove the lock on `{Txid, Vout}`.
+%% Returns `{error, not_locked}` if the coin was never locked, matching
+%% Core's "expected locked output" check.
+-spec unlock_coin(pid(), binary(), non_neg_integer()) ->
+    ok | {error, not_locked}.
+unlock_coin(Pid, Txid, Vout) when is_pid(Pid), is_binary(Txid),
+                                  is_integer(Vout), Vout >= 0 ->
+    gen_server:call(Pid, {unlock_coin, Txid, Vout}).
+
+%% @doc Clear all locks (lockunspent true with no transactions).
+-spec unlock_all_coins(pid()) -> ok.
+unlock_all_coins(Pid) when is_pid(Pid) ->
+    gen_server:call(Pid, unlock_all_coins).
+
+%% @doc Check whether `{Txid, Vout}` is currently locked.
+-spec is_locked_coin(pid(), {binary(), non_neg_integer()}) -> boolean().
+is_locked_coin(Pid, {Txid, Vout}) when is_pid(Pid), is_binary(Txid) ->
+    gen_server:call(Pid, {is_locked_coin, Txid, Vout}).
+
+%% @doc List all currently-locked coins as `[{Txid, Vout}]`.
+-spec list_locked_coins(pid()) -> [{binary(), non_neg_integer()}].
+list_locked_coins(Pid) when is_pid(Pid) ->
+    gen_server:call(Pid, list_locked_coins).
 
 %%% ===================================================================
 %%% Multi-wallet API (wallet specified by pid)
@@ -534,6 +590,30 @@ handle_call(walletlock, _From, State) ->
 %% Encryption: is_locked
 handle_call(is_locked, _From, State) ->
     {reply, State#wallet_state.locked, State};
+
+%% Coin lock state (lockunspent / listlockunspent).
+handle_call({lock_coin, Txid, Vout}, _From,
+            #wallet_state{locked_coins = Set} = State) ->
+    NewSet = sets:add_element({Txid, Vout}, Set),
+    {reply, ok, State#wallet_state{locked_coins = NewSet}};
+handle_call({unlock_coin, Txid, Vout}, _From,
+            #wallet_state{locked_coins = Set} = State) ->
+    Key = {Txid, Vout},
+    case sets:is_element(Key, Set) of
+        true ->
+            NewSet = sets:del_element(Key, Set),
+            {reply, ok, State#wallet_state{locked_coins = NewSet}};
+        false ->
+            {reply, {error, not_locked}, State}
+    end;
+handle_call(unlock_all_coins, _From, State) ->
+    {reply, ok, State#wallet_state{locked_coins = sets:new()}};
+handle_call({is_locked_coin, Txid, Vout}, _From,
+            #wallet_state{locked_coins = Set} = State) ->
+    {reply, sets:is_element({Txid, Vout}, Set), State};
+handle_call(list_locked_coins, _From,
+            #wallet_state{locked_coins = Set} = State) ->
+    {reply, sets:to_list(Set), State};
 
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_request}, State}.
