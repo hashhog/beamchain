@@ -27,6 +27,11 @@
 %% Internal exports for URL handling
 -export([parse_format/1, parse_path/1]).
 
+%% Test-only exports — confirmations helpers (Pattern C1 regression tests).
+-ifdef(TEST).
+-export([confirmations/1, confirmations/2, is_block_in_active_chain/1]).
+-endif.
+
 -define(SERVER, ?MODULE).
 
 %% REST limits (matching Bitcoin Core)
@@ -687,7 +692,7 @@ format_block_json(Block, Hash, Height, IncludeTxDetails) ->
 
     Base = #{
         <<"hash">> => hash_to_hex(Hash),
-        <<"confirmations">> => confirmations(Height),
+        <<"confirmations">> => confirmations(Height, Hash),
         <<"height">> => Height,
         <<"version">> => Header#block_header.version,
         <<"versionHex">> => beamchain_serialize:hex_encode(
@@ -746,7 +751,7 @@ format_tx_json(Tx, BlockHash, Height) ->
         _ ->
             Base#{
                 <<"blockhash">> => hash_to_hex(BlockHash),
-                <<"confirmations">> => confirmations(Height),
+                <<"confirmations">> => confirmations(Height, BlockHash),
                 <<"blocktime">> => block_time(BlockHash)
             }
     end.
@@ -791,7 +796,7 @@ format_header_json(Header, Hash, Height) ->
     Bits = Header#block_header.bits,
     #{
         <<"hash">> => hash_to_hex(Hash),
-        <<"confirmations">> => confirmations(Height),
+        <<"confirmations">> => confirmations(Height, Hash),
         <<"height">> => Height,
         <<"version">> => Header#block_header.version,
         <<"versionHex">> => beamchain_serialize:hex_encode(
@@ -903,6 +908,10 @@ encode_ccoin({ok, Utxo, _Source}) ->
 %%% Chain info helpers
 %%% ===================================================================
 
+%% Number of confirmations for a block at the given height.
+%% 1-arg variant: caller has no block-hash to verify with — used when the
+%% height is known-canonical (chainstate-derived).  See
+%% beamchain_rpc:confirmations/1 for the same caveat.
 confirmations(Height) when Height < 0 -> 0;
 confirmations(Height) ->
     case beamchain_chainstate:get_tip() of
@@ -910,6 +919,32 @@ confirmations(Height) ->
             max(0, TipHeight - Height + 1);
         not_found ->
             0
+    end.
+
+%% Number of confirmations, gated on active-chain ancestry.
+%% Returns 0 if the block at Height is NOT BlockHash (i.e. disconnected by
+%% reorg).  Pattern C1 fix mirroring Core's
+%% `tip->GetAncestor(blockindex->nHeight) == blockindex` check
+%% (src/rpc/blockchain.cpp).  See
+%% CORE-PARITY-AUDIT/_txindex-revert-on-reorg-fleet-result-2026-05-05.md.
+confirmations(Height, _) when Height < 0 -> 0;
+confirmations(Height, BlockHash) when is_binary(BlockHash) ->
+    case is_block_in_active_chain(BlockHash) of
+        true -> confirmations(Height);
+        false -> 0
+    end;
+confirmations(Height, _) ->
+    confirmations(Height).
+
+%% Check if a block hash is on the active chain.
+is_block_in_active_chain(BlockHash) ->
+    case beamchain_db:get_block_index_by_hash(BlockHash) of
+        {ok, #{height := Height}} ->
+            case beamchain_db:get_block_index(Height) of
+                {ok, #{hash := Hash}} -> Hash =:= BlockHash;
+                _ -> false
+            end;
+        _ -> false
     end.
 
 block_mtp(Height) when Height < 0 -> 0;
