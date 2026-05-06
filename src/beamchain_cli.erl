@@ -191,6 +191,21 @@ parse_args(["--limit", Value | Rest], Cmd, Opts) ->
 parse_args(["--limit=" ++ Value | Rest], Cmd, Opts) ->
     parse_args(Rest, Cmd, Opts#{limit => list_to_integer(Value)});
 
+%% --cfilter=<N>: BIP-157/158 compact block filter index.
+%%   0 = off (default, matches Bitcoin Core's `-blockfilterindex=0`)
+%%   1 = basic filter type (matches Core's `-blockfilterindex=basic`)
+%% When enabled, the node:
+%%   * computes the BasicFilter (BIP-158, M=784931 / P=19) on every
+%%     block-connect and persists it under <datadir>/indexes/blockfilter/basic
+%%   * advertises NODE_COMPACT_FILTERS (0x40) in version handshake services
+%%   * answers BIP-157 getcfilters / getcfheaders / getcfcheckpt queries
+%%   * exposes the getblockfilter JSON-RPC method
+%% Higher values are reserved for future filter types and currently rejected.
+parse_args(["--cfilter", Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{cfilter => parse_cfilter_arg(Value)});
+parse_args(["--cfilter=" ++ Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{cfilter => parse_cfilter_arg(Value)});
+
 %% Commands
 parse_args(["start" | Rest], undefined, Opts) ->
     parse_args(Rest, start, Opts);
@@ -256,6 +271,8 @@ print_usage() ->
         "  --import-file=<f> file to import blocks from (default: stdin)~n"
         "  --import-utxo=<f> Core-format UTXO snapshot file (utxo.dat from~n"
         "                    Bitcoin Core's `dumptxoutset`); alias --load-snapshot~n"
+        "  --cfilter=<n>     BIP-157/158 compact block filter index~n"
+        "                    (0=off, 1=basic; mirrors Core -blockfilterindex)~n"
         "  -h, --help        show this help~n"
         "  -v, --version     show version~n",
         [header("beamchain " ++ ?VERSION ++ " - bitcoin full node in erlang/otp"),
@@ -677,7 +694,34 @@ apply_opts(Opts) ->
         [] -> ok;
         Cats -> apply_debug_categories(Cats)
     end,
+    %% --cfilter: feed through BEAMCHAIN_BLOCKFILTERINDEX so the existing
+    %% beamchain_config:blockfilterindex_enabled/0 plumbing picks it up
+    %% before init_table/0 reads ETS.  We use the env var path (rather
+    %% than directly poking ETS) because config init runs *after*
+    %% apply_opts/1, and the env var is checked first by the gate fn.
+    case maps:get(cfilter, Opts, undefined) of
+        undefined -> ok;
+        0 -> os:putenv("BEAMCHAIN_BLOCKFILTERINDEX", "0");
+        1 -> os:putenv("BEAMCHAIN_BLOCKFILTERINDEX", "1");
+        Other ->
+            io:format(standard_error,
+                      "warning: --cfilter=~p ignored (only 0 or 1 supported)~n",
+                      [Other])
+    end,
     ok.
+
+%% Parse the --cfilter=<N> argument.  Accepts integer-as-string only;
+%% defers to apply_opts/1 for range validation so we surface a single
+%% consistent error path.
+parse_cfilter_arg(Str) ->
+    case catch list_to_integer(Str) of
+        N when is_integer(N) -> N;
+        _ ->
+            io:format(standard_error,
+                      "warning: --cfilter=~s not an integer; ignoring~n",
+                      [Str]),
+            undefined
+    end.
 
 start_app() ->
     %% When running as escript, NIF-based dependencies (rocksdb) cannot
