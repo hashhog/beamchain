@@ -17,6 +17,7 @@
          txindex_enabled/0,
          prune_enabled/0,
          prune_target/0,
+         prune_manual_mode/0,
          mempool_full_rbf/0,
          zmq_enabled/0,
          node_bloom_enabled/0,
@@ -108,41 +109,55 @@ txindex_enabled() ->
             end
     end.
 
-%% @doc Check if pruning is enabled.
+%% @doc Check if pruning is enabled (manual or automatic).
 %% Reads from config file (prune=<mb>) or env var (BEAMCHAIN_PRUNE=<mb>).
-%% Set to a positive MB value to enable, 0 to disable.
-%% Defaults to disabled (0).
+%% Set to 1 for manual-only pruning (only `pruneblockchain` RPC fires
+%% prunes), to a value >=550 for automatic pruning at that MB target,
+%% or to 0 to disable. Mirrors `bitcoin-core/src/init.cpp:524`.
 -spec prune_enabled() -> boolean().
 prune_enabled() ->
-    prune_target() > 0.
+    prune_target_raw() > 0.
 
-%% @doc Get prune target in MB.
-%% Minimum is 550 MB if enabled (enough for UTXO set + recent blocks).
-%% Returns 0 if pruning is disabled.
+%% @doc Check if pruning is in manual-only mode (-prune=1).
+%% In manual mode, automatic pruning never fires after block-connect;
+%% the operator must call the `pruneblockchain` RPC explicitly.
+-spec prune_manual_mode() -> boolean().
+prune_manual_mode() ->
+    prune_target_raw() =:= 1.
+
+%% @doc Get effective prune target in MB.
+%% Returns 0 if pruning is disabled or in manual-only mode (manual mode
+%% has no automatic target — only the RPC handler triggers prunes).
+%% Returns the (550-floored) MB target for automatic mode.
 -spec prune_target() -> non_neg_integer().
 prune_target() ->
-    Target = case os:getenv("BEAMCHAIN_PRUNE") of
+    case prune_target_raw() of
+        0 -> 0;
+        1 -> 0;                       %% manual-only mode: no auto target
+        N when N < 550 -> 550;        %% snap small auto values to 550 floor
+        N -> N
+    end.
+
+%% @doc Raw -prune value as given by the operator (no floor enforcement).
+%% Used internally to distinguish 0 (off) / 1 (manual) / >=550 (auto).
+-spec prune_target_raw() -> non_neg_integer().
+prune_target_raw() ->
+    case os:getenv("BEAMCHAIN_PRUNE") of
         false ->
             case get(prune, "0") of
                 S when is_list(S) ->
                     case catch list_to_integer(S) of
-                        N when is_integer(N) -> N;
+                        N when is_integer(N), N >= 0 -> N;
                         _ -> 0
                     end;
-                N when is_integer(N) -> N;
+                N when is_integer(N), N >= 0 -> N;
                 _ -> 0
             end;
         S ->
             case catch list_to_integer(S) of
-                N when is_integer(N) -> N;
+                N when is_integer(N), N >= 0 -> N;
                 _ -> 0
             end
-    end,
-    %% Enforce minimum of 550 MB if pruning is enabled
-    case Target of
-        0 -> 0;
-        _ when Target < 550 -> 550;
-        _ -> Target
     end.
 
 %% @doc Check if full RBF is enabled.
