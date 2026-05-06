@@ -49,7 +49,7 @@
 %% it on arrival, so the existing reorganize/1 dispatcher (Pattern A)
 %% was structurally unreachable from the submitblock path.  This entry
 %% point closes both gaps.
--export([submit_block/1]).
+-export([submit_block/1, refill_mempool_after_reorg/1]).
 
 %% Block invalidation / reconsideration
 -export([invalidate_block/1, reconsider_block/1]).
@@ -203,10 +203,60 @@ reorganize(NewBlocks) ->
 %% best-chain selection so side-branch blocks are stored and become
 %% candidates for a future reorg, rather than being silently dropped
 %% on arrival.
+%%
+%% On a reorg outcome, the public-API caller is responsible for
+%% feeding the disconnected non-coinbase txs back to the mempool —
+%% the gen_server itself cannot do this synchronously because
+%% beamchain_mempool's accept_to_memory_pool calls back into
+%% chainstate (get_tip / get_mtp / get_utxo), which would deadlock.
+%% The refill is performed here, in the caller's process, before
+%% returning.  See
+%% CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md
+%% (Pattern B1 closure for beamchain).
 -spec submit_block(#block{}) -> {ok, active | side_branch | reorg} |
                                 {error, term()}.
 submit_block(Block) ->
-    gen_server:call(?SERVER, {submit_block, Block}, 300000).
+    case gen_server:call(?SERVER, {submit_block, Block}, 300000) of
+        {ok, reorg, DisconnectedTxs} ->
+            refill_mempool_after_reorg(DisconnectedTxs),
+            {ok, reorg};
+        Other ->
+            Other
+    end.
+
+%% Re-feed the non-coinbase txs of the disconnected blocks to the
+%% mempool.  Mirrors Bitcoin Core's MaybeUpdateMempoolForReorg
+%% (validation.cpp) and camlcoin's reference helper at
+%% lib/sync.ml:2354-2363.  accept_to_memory_pool runs the same checks
+%% as a freshly received tx (BIP-113 IsFinalTx, BIP-68 SequenceLocks,
+%% standardness, conflicts against the new tip's UTXOs), so any tx
+%% that conflicts with the new chain is silently rejected here —
+%% this matches Core's behaviour.
+%%
+%% Errors per-tx are logged at debug only and do NOT propagate, since
+%% (a) refill-failure is best-effort by design (any tx invalid against
+%% the new tip is just dropped, as Core does), and (b) the parent
+%% submit_block result has already been determined and must not be
+%% retroactively flipped to an error.
+-spec refill_mempool_after_reorg([#transaction{}]) -> ok.
+refill_mempool_after_reorg([]) ->
+    ok;
+refill_mempool_after_reorg(Txs) ->
+    {Added, Skipped} = lists:foldl(
+        fun(Tx, {AccAdded, AccSkipped}) ->
+            try beamchain_mempool:accept_to_memory_pool(Tx) of
+                {ok, _Txid} ->
+                    {AccAdded + 1, AccSkipped};
+                {error, _Reason} ->
+                    {AccAdded, AccSkipped + 1}
+            catch
+                _:_ ->
+                    {AccAdded, AccSkipped + 1}
+            end
+        end, {0, 0}, Txs),
+    logger:info("chainstate: post-reorg mempool refill — re-added ~B / "
+                "skipped ~B disconnected txs", [Added, Skipped]),
+    ok.
 
 %% @doc Flush dirty UTXO cache entries to RocksDB.
 -spec flush() -> ok.
@@ -597,6 +647,11 @@ handle_call({connect_block, Block}, _From, State) ->
 
 handle_call({submit_block, Block}, _From, State) ->
     case do_submit_block(Block, State) of
+        {ok, {reorg, DisconnectedTxs}, State2} ->
+            %% Pattern B: surface disconnected non-coinbase txs to
+            %% caller for out-of-process mempool refill (avoids
+            %% chainstate↔mempool deadlock).
+            {reply, {ok, reorg, DisconnectedTxs}, State2};
         {ok, Outcome, State2} ->
             {reply, {ok, Outcome}, State2};
         {error, Reason} ->
@@ -1129,7 +1184,7 @@ do_promote_side_branch(NewTipHash, State) ->
             {ok, side_branch, State};
         {ok, NewBlocks} ->
             case do_reorganize(NewBlocks, State) of
-                {ok, State2, _DisconnectedTxs} ->
+                {ok, State2, DisconnectedTxs} ->
                     %% The promoted blocks now have entries in the
                     %% active-chain block_index (written by
                     %% do_connect_block_inner during the reorg), so
@@ -1139,7 +1194,19 @@ do_promote_side_branch(NewTipHash, State) ->
                           H = beamchain_serialize:block_hash(Hdr),
                           beamchain_db:delete_side_branch_index(H)
                       end, NewBlocks),
-                    {ok, reorg, State2};
+                    %% Pattern B (mempool refill on reorg, Core
+                    %% MaybeUpdateMempoolForReorg parity): thread the
+                    %% non-coinbase txs of the disconnected blocks back
+                    %% to the caller of submit_block/1 so the caller
+                    %% (running in a different process) can re-feed
+                    %% them to mempool.  Performing the mempool
+                    %% gen_server:call from inside the chainstate
+                    %% gen_server would deadlock — beamchain_mempool
+                    %% calls back into chainstate (get_tip / get_mtp /
+                    %% get_utxo) during accept_to_memory_pool.  See
+                    %% CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md
+                    %% Pattern B1 closure for beamchain.
+                    {ok, {reorg, DisconnectedTxs}, State2};
                 {error, Reason} ->
                     %% Reorg failed — block remains in side-branch
                     %% storage and chain stays on active tip.
