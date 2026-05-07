@@ -22,6 +22,7 @@
          zmq_enabled/0,
          node_bloom_enabled/0,
          blockfilterindex_enabled/0,
+         rest_enabled/0,
          %% Proxy configuration
          proxy/0,
          onion_proxy/0,
@@ -252,6 +253,31 @@ blockfilterindex_enabled() ->
                 1 -> true;
                 true -> true;
                 _ -> false
+            end;
+        _ -> true
+    end.
+
+%% @doc Check if the REST HTTP server is enabled.
+%% Reads from config file (rest=1) or env var (BEAMCHAIN_REST=1).
+%% Defaults to false (disabled), matching Bitcoin Core's
+%% `DEFAULT_REST_ENABLE = false` in init.cpp / httpserver.cpp.  When
+%% enabled, beamchain binds the REST HTTP listener
+%% (default RPC_PORT + 10) and serves the GET-only `/rest/*` endpoints
+%% documented in `bitcoin-core/doc/REST-interface.md`.  When disabled,
+%% the listener is never started and `/rest/*` requests are refused at
+%% the TCP layer.
+-spec rest_enabled() -> boolean().
+rest_enabled() ->
+    case os:getenv("BEAMCHAIN_REST") of
+        "0" -> false;
+        "false" -> false;
+        false ->
+            case get(rest, "0") of
+                "1" -> true;
+                "true" -> true;
+                1 -> true;
+                true -> true;
+                _ -> false  %% Default to disabled (Core DEFAULT_REST_ENABLE)
             end;
         _ -> true
     end.
