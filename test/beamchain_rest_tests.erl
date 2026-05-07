@@ -521,3 +521,192 @@ query_bool(Query, Key, Default) ->
         <<"0">> -> false;
         _ -> Default
     end.
+
+%%% ===================================================================
+%%% BIP-157 blockfilter REST tests (Core rest.cpp::rest_block_filter +
+%%% rest_filter_header parity).
+%%% ===================================================================
+
+parse_filter_type_test_() ->
+    {"BIP-157 filter type token parsing",
+     [
+      {"basic maps to type byte 0", fun() ->
+          ?assertEqual({ok, 0}, beamchain_rest:parse_filter_type(<<"basic">>))
+      end},
+      {"unknown type returns error with name echo", fun() ->
+          ?assertMatch({error, <<"Unknown filtertype foo">>},
+                       beamchain_rest:parse_filter_type(<<"foo">>))
+      end},
+      {"empty type returns error", fun() ->
+          ?assertMatch({error, <<"Unknown filtertype ", _/binary>>},
+                       beamchain_rest:parse_filter_type(<<>>))
+      end}
+     ]}.
+
+parse_filterheaders_count_test_() ->
+    {"BIP-157 cfheader count parsing (Core MAX_REST_HEADERS_RESULTS=2000)",
+     [
+      {"valid mid-range count", fun() ->
+          ?assertEqual({ok, 5}, beamchain_rest:parse_filterheaders_count(<<"5">>))
+      end},
+      {"lower bound is 1", fun() ->
+          ?assertEqual({ok, 1}, beamchain_rest:parse_filterheaders_count(<<"1">>))
+      end},
+      {"zero is rejected (Core: out of range)", fun() ->
+          ?assertMatch({error, _}, beamchain_rest:parse_filterheaders_count(<<"0">>))
+      end},
+      {"upper bound 2000 accepted", fun() ->
+          ?assertEqual({ok, 2000}, beamchain_rest:parse_filterheaders_count(<<"2000">>))
+      end},
+      {"2001 rejected", fun() ->
+          ?assertMatch({error, _}, beamchain_rest:parse_filterheaders_count(<<"2001">>))
+      end},
+      {"non-numeric rejected", fun() ->
+          ?assertMatch({error, _}, beamchain_rest:parse_filterheaders_count(<<"abc">>))
+      end},
+      {"negative rejected", fun() ->
+          ?assertMatch({error, _}, beamchain_rest:parse_filterheaders_count(<<"-1">>))
+      end}
+     ]}.
+
+encode_blockfilter_wire_test_() ->
+    {"BIP-157 BlockFilter wire encoding parity with Core "
+     "(blockfilter.h::Serialize: type || hash || varint(len) || filter)",
+     [
+      {"empty filter (varint 0)", fun() ->
+          %% Core's GCSFilter with no elements emits a single 0x00 (varint 0).
+          %% The full BlockFilter serialization is:
+          %%   type=0x00 || 32-byte hash || 0x01 (varint length=1) || 0x00
+          Hash = <<1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+                   17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+                   31, 32>>,
+          FilterBytes = <<0>>,  %% varint(0) = single zero byte
+          Wire = beamchain_rest:encode_blockfilter_wire(0, Hash, FilterBytes),
+          %% Layout: 1 (type) + 32 (hash) + 1 (varint(1)) + 1 (filter) = 35
+          ?assertEqual(35, byte_size(Wire)),
+          %% First byte is the filter type (0 = basic)
+          <<TypeByte:8, RestBytes/binary>> = Wire,
+          ?assertEqual(0, TypeByte),
+          %% Next 32 bytes are the block hash (raw / internal order)
+          <<HashOut:32/binary, AfterHash/binary>> = RestBytes,
+          ?assertEqual(Hash, HashOut),
+          %% Next is varint(1) for the encoded filter length, then the byte
+          ?assertEqual(<<1, 0>>, AfterHash)
+      end},
+      {"non-empty filter passthrough", fun() ->
+          Hash = <<0:256>>,
+          FilterBytes = <<16#02, 16#aa, 16#bb>>,
+          Wire = beamchain_rest:encode_blockfilter_wire(0, Hash, FilterBytes),
+          %% 1 + 32 + 1 (varint=3) + 3 (data) = 37
+          ?assertEqual(37, byte_size(Wire)),
+          %% Last 4 bytes: varint(3), then the filter
+          Tail = binary:part(Wire, byte_size(Wire) - 4, 4),
+          ?assertEqual(<<3, 16#02, 16#aa, 16#bb>>, Tail)
+      end},
+      {"non-zero filter type byte propagates", fun() ->
+          %% Core registers type 0 (basic) only today, but the encoder
+          %% must remain transparent to future filter types.
+          Hash = <<0:256>>,
+          Wire = beamchain_rest:encode_blockfilter_wire(7, Hash, <<0>>),
+          <<TypeByte:8, _/binary>> = Wire,
+          ?assertEqual(7, TypeByte)
+      end}
+     ]}.
+
+%%% Sanity: the new blockfilter routes resolve through parse_path the same
+%%% way Bitcoin Core's `/rest/blockfilter/...` URLs do.
+blockfilter_path_parsing_test_() ->
+    {"REST path parsing for /rest/blockfilter and /rest/blockfilterheaders",
+     [
+      {"blockfilter basic .json", fun() ->
+          Path = <<"/rest/blockfilter/basic/abcd1234.json">>,
+          ?assertEqual([<<"blockfilter">>, <<"basic">>, <<"abcd1234.json">>],
+                       beamchain_rest:parse_path(Path))
+      end},
+      {"blockfilter basic .bin", fun() ->
+          Path = <<"/rest/blockfilter/basic/abcd1234.bin">>,
+          ?assertEqual([<<"blockfilter">>, <<"basic">>, <<"abcd1234.bin">>],
+                       beamchain_rest:parse_path(Path))
+      end},
+      {"blockfilterheaders deprecated form (with count in path)", fun() ->
+          Path = <<"/rest/blockfilterheaders/basic/5/abcd1234.hex">>,
+          ?assertEqual([<<"blockfilterheaders">>, <<"basic">>,
+                        <<"5">>, <<"abcd1234.hex">>],
+                       beamchain_rest:parse_path(Path))
+      end},
+      {"blockfilterheaders preferred form (count via query param)", fun() ->
+          Path = <<"/rest/blockfilterheaders/basic/abcd1234.json">>,
+          ?assertEqual([<<"blockfilterheaders">>, <<"basic">>,
+                        <<"abcd1234.json">>],
+                       beamchain_rest:parse_path(Path))
+      end}
+     ]}.
+
+%%% ===================================================================
+%%% -rest opt-in flag tests (Core init.cpp -rest=0 default parity).
+%%% ===================================================================
+
+rest_enabled_default_off_test_() ->
+    {setup,
+     fun() ->
+         %% Make sure no env var override is sticky between tests.
+         os:unsetenv("BEAMCHAIN_REST"),
+         %% Some test runs may have a config table from a prior test;
+         %% guarantee a clean slate for `rest`.  We can't reach into the
+         %% gen_server, but we can wipe the ETS row directly.
+         catch ets:delete(beamchain_config_ets, rest)
+     end,
+     fun(_) ->
+         os:unsetenv("BEAMCHAIN_REST")
+     end,
+     [
+      {"BEAMCHAIN_REST unset and config absent => disabled (Core parity)",
+       fun() ->
+           ensure_config_table(),
+           ets:delete(beamchain_config_ets, rest),
+           os:unsetenv("BEAMCHAIN_REST"),
+           ?assertEqual(false, beamchain_config:rest_enabled())
+       end},
+      {"BEAMCHAIN_REST=1 enables",
+       fun() ->
+           ensure_config_table(),
+           os:putenv("BEAMCHAIN_REST", "1"),
+           ?assertEqual(true, beamchain_config:rest_enabled()),
+           os:unsetenv("BEAMCHAIN_REST")
+       end},
+      {"BEAMCHAIN_REST=0 disables (overrides config)",
+       fun() ->
+           ensure_config_table(),
+           ets:insert(beamchain_config_ets, {rest, "1"}),
+           os:putenv("BEAMCHAIN_REST", "0"),
+           ?assertEqual(false, beamchain_config:rest_enabled()),
+           os:unsetenv("BEAMCHAIN_REST"),
+           ets:delete(beamchain_config_ets, rest)
+       end},
+      {"config rest=1 enables when env unset",
+       fun() ->
+           ensure_config_table(),
+           os:unsetenv("BEAMCHAIN_REST"),
+           ets:insert(beamchain_config_ets, {rest, "1"}),
+           ?assertEqual(true, beamchain_config:rest_enabled()),
+           ets:delete(beamchain_config_ets, rest)
+       end},
+      {"config rest=true (string) enables",
+       fun() ->
+           ensure_config_table(),
+           os:unsetenv("BEAMCHAIN_REST"),
+           ets:insert(beamchain_config_ets, {rest, "true"}),
+           ?assertEqual(true, beamchain_config:rest_enabled()),
+           ets:delete(beamchain_config_ets, rest)
+       end}
+     ]}.
+
+%% Make sure the config ETS table exists (the test may run before the
+%% gen_server has been started).  Idempotent.
+ensure_config_table() ->
+    case ets:info(beamchain_config_ets) of
+        undefined ->
+            ets:new(beamchain_config_ets,
+                    [named_table, set, public, {read_concurrency, true}]);
+        _ -> ok
+    end.

@@ -32,9 +32,16 @@ init([]) ->
         child_spec(beamchain_wallet_sup, supervisor),
         child_spec(beamchain_wallet, worker),
         child_spec(beamchain_rpc, worker),
-        child_spec(beamchain_rest, worker),
         child_spec(beamchain_metrics, worker)
     ],
+    %% Optional REST HTTP server (default off, matches Bitcoin Core's
+    %% -rest=0).  Enable with rest=1 in beamchain.conf or
+    %% BEAMCHAIN_REST=1.  When disabled, the listener is never bound and
+    %% no /rest/* HTTP traffic is accepted.
+    RestChildren = case beamchain_config:rest_enabled() of
+        true  -> [child_spec(beamchain_rest, worker)];
+        false -> []
+    end,
     %% Optional ZMQ notifications (only if configured)
     ZmqChildren = case beamchain_config:zmq_enabled() of
         true -> [child_spec(beamchain_zmq, worker)];
@@ -49,7 +56,7 @@ init([]) ->
             true -> [child_spec(beamchain_blockfilter_index, worker)];
             false -> []
         end,
-    Children = CoreChildren ++ ZmqChildren ++ BlockFilterChildren,
+    Children = CoreChildren ++ RestChildren ++ ZmqChildren ++ BlockFilterChildren,
     {ok, {SupFlags, Children}}.
 
 child_spec(Module, Type) ->
