@@ -27,6 +27,11 @@
 %% Internal exports for URL handling
 -export([parse_format/1, parse_path/1]).
 
+%% Internal exports for blockfilter REST (BIP-157) — used by EUnit and
+%% by external tooling that wants to share the wire encoder.
+-export([parse_filter_type/1, parse_filterheaders_count/1,
+         encode_blockfilter_wire/3]).
+
 %% Test-only exports — confirmations helpers (Pattern C1 regression tests).
 -ifdef(TEST).
 -export([confirmations/1, confirmations/2, is_block_in_active_chain/1]).
@@ -38,6 +43,10 @@
 -define(MAX_GETUTXOS_OUTPOINTS, 15).
 -define(MAX_REST_HEADERS_RESULTS, 2000).
 -define(DEFAULT_REST_HEADERS_COUNT, 5).
+
+%% BIP-157 filter type byte (0 = basic).  Mirrors Bitcoin Core's
+%% BlockFilterType::BASIC in src/blockfilter.h.
+-define(FILTER_TYPE_BASIC, 0).
 
 %% HTTP status codes
 -define(HTTP_OK, 200).
@@ -185,6 +194,27 @@ route_request([<<"getutxos">>, <<"checkmempool">> | OutpointsWithFormat], _Query
 route_request([<<"getutxos">> | OutpointsWithFormat], _Query) ->
     %% GET /rest/getutxos/<outpoint>/....<format>
     rest_getutxos(OutpointsWithFormat, false);
+
+route_request([<<"blockfilter">>, FilterType, HashWithFormat], _Query) ->
+    %% GET /rest/blockfilter/<filtertype>/<hash>.<format>
+    {Hash, Format} = parse_hash_format(HashWithFormat),
+    rest_blockfilter(FilterType, Hash, Format);
+
+route_request([<<"blockfilterheaders">>, FilterType, CountBin, HashWithFormat], _Query) ->
+    %% GET /rest/blockfilterheaders/<filtertype>/<count>/<hash>.<format>
+    %% (deprecated form; mirrors Core rest_filter_header uri_parts.size() == 3)
+    {Hash, Format} = parse_hash_format(HashWithFormat),
+    rest_blockfilterheaders(FilterType, CountBin, Hash, Format);
+
+route_request([<<"blockfilterheaders">>, FilterType, HashWithFormat], Query) ->
+    %% GET /rest/blockfilterheaders/<filtertype>/<hash>.<format>?count=N
+    %% (preferred form; mirrors Core rest_filter_header uri_parts.size() == 2)
+    {Hash, Format} = parse_hash_format(HashWithFormat),
+    CountBin = case proplists:get_value(<<"count">>, Query) of
+        undefined -> <<"5">>;
+        V         -> V
+    end,
+    rest_blockfilterheaders(FilterType, CountBin, Hash, Format);
 
 route_request(_, _Query) ->
     {error, ?HTTP_NOT_FOUND, <<"Endpoint not found">>}.
@@ -471,6 +501,183 @@ rest_getutxos_impl(Outpoints, CheckMempool, Format) ->
         undefined ->
             {error, ?HTTP_BAD_REQUEST, <<"Invalid format (available: json, bin, hex)">>}
     end.
+
+%% GET /rest/blockfilter/<filtertype>/<hash>.<format>
+%%
+%% Mirrors Bitcoin Core's `rest_block_filter` (src/rest.cpp:622).
+%% Wire format (BINARY/HEX):
+%%     filter_type (1 byte) || block_hash (32 bytes, raw internal order)
+%%   || varint(len) || encoded_filter_bytes
+%% JSON format: {"filter": "<hex of encoded_filter_bytes>"}
+%%
+%% Returns 503 if -blockfilterindex=0; mirrors Core's "Index is not
+%% enabled for filtertype" 400-error semantics, but we use 503 to
+%% distinguish "config disabled" from "bad URI".  Core uses 400.
+rest_blockfilter(_FilterType, _Hash, undefined) ->
+    {error, ?HTTP_BAD_REQUEST, <<"Invalid format (available: json, bin, hex)">>};
+rest_blockfilter(FilterType, HashHex, Format) ->
+    case parse_filter_type(FilterType) of
+        {ok, FilterTypeByte} ->
+            case beamchain_config:blockfilterindex_enabled() of
+                false ->
+                    {error, ?HTTP_BAD_REQUEST,
+                     <<"Index is not enabled for filtertype ",
+                       FilterType/binary>>};
+                true ->
+                    rest_blockfilter_lookup(FilterTypeByte, HashHex, Format)
+            end;
+        {error, Bin} ->
+            {error, ?HTTP_BAD_REQUEST, Bin}
+    end.
+
+rest_blockfilter_lookup(FilterTypeByte, HashHex, Format) ->
+    Hash = hex_to_internal_hash(HashHex),
+    case beamchain_blockfilter_index:get_filter(Hash) of
+        {ok, FilterBytes} ->
+            rest_blockfilter_format(FilterTypeByte, Hash, FilterBytes, Format);
+        not_found ->
+            {error, ?HTTP_NOT_FOUND,
+             <<"Filter not found.  Either the block was not connected "
+               "to the active chain, or block filters are still being "
+               "indexed.">>};
+        {error, _} ->
+            {error, ?HTTP_NOT_FOUND, <<"Filter not found">>}
+    end.
+
+rest_blockfilter_format(FilterTypeByte, Hash, FilterBytes, json) ->
+    Json = #{<<"filter">> => beamchain_serialize:hex_encode(FilterBytes)},
+    %% Suppress dialyzer's "unused variable" complaint when the byte / hash
+    %% are only carried for the bin/hex paths.
+    _ = FilterTypeByte,
+    _ = Hash,
+    {ok, json, jsx:encode(Json)};
+rest_blockfilter_format(FilterTypeByte, Hash, FilterBytes, bin) ->
+    Bin = encode_blockfilter_wire(FilterTypeByte, Hash, FilterBytes),
+    {ok, bin, Bin};
+rest_blockfilter_format(FilterTypeByte, Hash, FilterBytes, hex) ->
+    Bin = encode_blockfilter_wire(FilterTypeByte, Hash, FilterBytes),
+    Hex = beamchain_serialize:hex_encode(Bin),
+    {ok, hex, <<Hex/binary, "\n">>}.
+
+%% Encode a BlockFilter on the wire identically to Core's
+%% BlockFilter::Serialize (blockfilter.h:151):
+%%   filter_type (uint8) || block_hash (32 raw bytes) || varint(len) ||
+%%   encoded_filter_bytes.
+%%
+%% Note: block_hash is serialized in *internal* (little-endian) order to
+%% match Core; the REST URL uses display (big-endian) order, which is
+%% why we round-trip through hex_to_internal_hash on the way in.
+encode_blockfilter_wire(FilterTypeByte, Hash, FilterBytes) ->
+    LenPrefix = beamchain_serialize:encode_varint(byte_size(FilterBytes)),
+    <<FilterTypeByte:8, Hash/binary, LenPrefix/binary, FilterBytes/binary>>.
+
+%% GET /rest/blockfilterheaders/<filtertype>/[<count>/]<hash>.<format>?count=N
+%%
+%% Mirrors Bitcoin Core's `rest_filter_header` (src/rest.cpp:500).  Walks
+%% forward up to <count> blocks starting at <hash> *along the active
+%% chain*, returning each block's cfheader (32 bytes).
+rest_blockfilterheaders(_FilterType, _CountBin, _Hash, undefined) ->
+    {error, ?HTTP_BAD_REQUEST, <<"Invalid format (available: json, bin, hex)">>};
+rest_blockfilterheaders(FilterType, CountBin, HashHex, Format) ->
+    case parse_filter_type(FilterType) of
+        {ok, _FilterTypeByte} ->
+            case parse_filterheaders_count(CountBin) of
+                {ok, Count} ->
+                    case beamchain_config:blockfilterindex_enabled() of
+                        false ->
+                            {error, ?HTTP_BAD_REQUEST,
+                             <<"Index is not enabled for filtertype ",
+                               FilterType/binary>>};
+                        true ->
+                            rest_blockfilterheaders_lookup(HashHex, Count, Format)
+                    end;
+                {error, Bin} ->
+                    {error, ?HTTP_BAD_REQUEST, Bin}
+            end;
+        {error, Bin} ->
+            {error, ?HTTP_BAD_REQUEST, Bin}
+    end.
+
+rest_blockfilterheaders_lookup(HashHex, Count, Format) ->
+    Hash = hex_to_internal_hash(HashHex),
+    case beamchain_db:get_block_index_by_hash(Hash) of
+        {ok, #{height := StartHeight}} ->
+            case collect_filter_headers(StartHeight, Count, []) of
+                {ok, Headers} ->
+                    case Headers of
+                        [] ->
+                            {error, ?HTTP_NOT_FOUND, <<"Filter not found">>};
+                        _ ->
+                            rest_blockfilterheaders_format(Headers, Format)
+                    end;
+                {error, Reason} ->
+                    {error, ?HTTP_NOT_FOUND, Reason}
+            end;
+        not_found ->
+            {error, ?HTTP_NOT_FOUND, <<"Block not found">>}
+    end.
+
+%% Walk forward N blocks starting at StartHeight, gathering cfheaders.
+%% Stops short (returns shorter list) if we run off the end of the
+%% active chain — matches Core's `while (pindex && active_chain.Contains)`.
+collect_filter_headers(_Height, 0, Acc) ->
+    {ok, lists:reverse(Acc)};
+collect_filter_headers(Height, Remaining, Acc) ->
+    case beamchain_db:get_block_index(Height) of
+        {ok, #{hash := BlockHash}} ->
+            case beamchain_blockfilter_index:get_header(BlockHash) of
+                {ok, CfHeader} when byte_size(CfHeader) =:= 32 ->
+                    collect_filter_headers(Height + 1, Remaining - 1,
+                                           [CfHeader | Acc]);
+                _ ->
+                    %% The cfheader hasn't been indexed yet (or the block
+                    %% was just connected and the index is catching up).
+                    %% Mirror Core's "Filter not found" 404 in that case.
+                    {error, <<"Filter not found.  Block filters are still "
+                              "in the process of being indexed.">>}
+            end;
+        not_found ->
+            %% Ran off the end of the chain — return what we have so far,
+            %% same as Core's loop break.
+            {ok, lists:reverse(Acc)}
+    end.
+
+rest_blockfilterheaders_format(Headers, json) ->
+    Json = [beamchain_serialize:hex_encode(
+              beamchain_serialize:reverse_bytes(H)) || H <- Headers],
+    {ok, json, jsx:encode(Json)};
+rest_blockfilterheaders_format(Headers, bin) ->
+    Bin = iolist_to_binary(Headers),
+    {ok, bin, Bin};
+rest_blockfilterheaders_format(Headers, hex) ->
+    Bin = iolist_to_binary(Headers),
+    Hex = beamchain_serialize:hex_encode(Bin),
+    {ok, hex, <<Hex/binary, "\n">>}.
+
+%% Parse the BIP-157 filter type token from the URL.  Today only
+%% "basic" (type byte 0) is registered upstream — mirrors
+%% BlockFilterTypeByName in blockfilter.cpp.
+parse_filter_type(<<"basic">>) ->
+    {ok, ?FILTER_TYPE_BASIC};
+parse_filter_type(Other) ->
+    {error, <<"Unknown filtertype ", Other/binary>>}.
+
+%% Parse the count parameter for /rest/blockfilterheaders.  Core
+%% restricts to 1..MAX_REST_HEADERS_RESULTS (2000).
+parse_filterheaders_count(Bin) when is_binary(Bin) ->
+    try binary_to_integer(Bin) of
+        N when N >= 1, N =< ?MAX_REST_HEADERS_RESULTS ->
+            {ok, N};
+        _ ->
+            {error, count_out_of_range_message()}
+    catch _:_ ->
+        {error, count_out_of_range_message()}
+    end.
+
+count_out_of_range_message() ->
+    Max = integer_to_binary(?MAX_REST_HEADERS_RESULTS),
+    <<"Header count is invalid or out of acceptable range (1-",
+      Max/binary, ")">>.
 
 %%% ===================================================================
 %%% Helper functions
