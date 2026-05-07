@@ -34,6 +34,22 @@ start_link() ->
 %%% ===================================================================
 
 init([]) ->
+    %% Resolve effective metrics port. The Prometheus endpoint is a pure
+    %% observability surface — its absence MUST NOT prevent the node
+    %% from coming up.
+    %%
+    %% Two failure modes that historically wedged the node and are now
+    %% downgraded to "metrics disabled, node continues":
+    %%   1. Port collision (eaddrinuse). Hits anyone running a
+    %%      second beamchain instance against the default 9332 — e.g.
+    %%      tools/diff-test.sh launching a regtest node on the same host
+    %%      as a live mainnet beamchain. Crashing the supervisor here
+    %%      cascades to the whole node and breaks RPC.
+    %%   2. Explicit disable (port=0). Already handled cleanly.
+    %%
+    %% In both cases we leave RPC, P2P, chainstate, and validation up.
+    %% Operators reading /metrics get a connection-refused; everything
+    %% else works.
     Port = case application:get_env(beamchain, metrics_port) of
         {ok, P} when is_integer(P) -> P;
         _ -> ?DEFAULT_METRICS_PORT
@@ -56,13 +72,15 @@ init([]) ->
                     "metrics") of
                 {ok, _} ->
                     logger:info("metrics: Prometheus endpoint on port ~B",
-                                [Port]);
+                                [Port]),
+                    {ok, #state{port = Port}};
                 {error, Reason} ->
-                    logger:error("metrics: failed to bind port ~B after "
-                                 "retries: ~p", [Port, Reason]),
-                    exit({listener_bind_failed, metrics, Port, Reason})
-            end,
-            {ok, #state{port = Port}}
+                    logger:warning("metrics: bind ~B failed (~p); "
+                                   "continuing with metrics endpoint "
+                                   "DISABLED — RPC/P2P unaffected",
+                                   [Port, Reason]),
+                    {ok, #state{port = 0}}
+            end
     end.
 
 handle_call(_Request, _From, State) ->

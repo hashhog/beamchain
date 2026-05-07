@@ -2683,31 +2683,70 @@ rpc_gettxout(_) ->
      <<"Usage: gettxout \"txid\" n ( include_mempool )">>}.
 
 rpc_gettxoutsetinfo([]) ->
-    rpc_gettxoutsetinfo([<<"none">>]);
+    %% Per Core (rpc/blockchain.cpp:1017), the default hash_type is
+    %% "hash_serialized_3" — NOT "none". Tooling like the cross-impl
+    %% diff-test harness calls gettxoutsetinfo with no args and expects a
+    %% UTXO-set commitment back; defaulting to "none" silently strips the
+    %% commitment field and breaks the harness probe.
+    rpc_gettxoutsetinfo([<<"hash_serialized_3">>]);
 rpc_gettxoutsetinfo([HashType | _]) ->
     %% Get UTXO set statistics. Per Core's gettxoutsetinfo (rpc/blockchain.cpp
     %% around line 1090), hash_type ∈ {none, hash_serialized_3, muhash}
     %% selects which UTXO-set commitment to surface. We honour this so callers
-    %% can ask for either commitment by name.
+    %% can ask for either commitment by name. Anything else → invalid.
+    case is_valid_utxo_hash_type(HashType) of
+        false ->
+            {error, ?RPC_INVALID_PARAMS,
+             <<"'", HashType/binary, "' is not a valid hash_type">>};
+        true ->
+            do_rpc_gettxoutsetinfo(HashType)
+    end.
+
+is_valid_utxo_hash_type(<<"none">>)              -> true;
+is_valid_utxo_hash_type(<<"hash_serialized_3">>) -> true;
+is_valid_utxo_hash_type(<<"muhash">>)            -> true;
+is_valid_utxo_hash_type(_)                       -> false.
+
+do_rpc_gettxoutsetinfo(HashType) ->
     case beamchain_chainstate:get_tip() of
         {ok, {TipHash, TipHeight}} ->
-            %% Get cache statistics from chainstate
-            CacheStats = beamchain_chainstate:cache_stats(),
-            CacheEntries = maps:get(cache_entries, CacheStats, 0),
-            %% Estimate total UTXOs (cache + flushed to disk)
-            %% This is approximate since we don't iterate the full DB
-            TxOuts = CacheEntries,
-            %% Approximate bogosize (150 bytes per UTXO on average)
-            Bogosize = TxOuts * 150,
-            Base = #{
-                <<"height">> => TipHeight,
-                <<"bestblock">> => hash_to_hex(TipHash),
-                <<"txouts">> => TxOuts,
-                <<"bogosize">> => Bogosize,
-                <<"total_amount">> => 0.0,  %% Would require iterating all UTXOs
-                <<"disk_size">> => 0  %% Would require DB stats
-            },
-            {ok, maybe_attach_utxo_commitment(HashType, Base)};
+            %% For "none" we keep the cheap cache-stat path so callers
+            %% asking only for {height,bestblock} don't pay for a full
+            %% disk walk. For hash_serialized_3 / muhash we MUST walk the
+            %% chainstate column family — the ETS cache is only a partial
+            %% view (clean entries can be evicted post-flush) so any
+            %% commitment computed from the cache is silently wrong.
+            case HashType of
+                <<"none">> ->
+                    CacheStats = beamchain_chainstate:cache_stats(),
+                    CacheEntries = maps:get(cache_entries, CacheStats, 0),
+                    Base = #{
+                        <<"height">>       => TipHeight,
+                        <<"bestblock">>    => hash_to_hex(TipHash),
+                        <<"txouts">>       => CacheEntries,
+                        <<"bogosize">>     => CacheEntries * 150,
+                        <<"total_amount">> => 0.0,
+                        <<"disk_size">>    => 0
+                    },
+                    {ok, Base};
+                _ ->
+                    %% Walk the on-disk UTXO set once and derive every
+                    %% scalar plus the requested commitment from a single
+                    %% pass. Core's `ComputeUTXOStats` is also one cursor
+                    %% walk per call (kernel/coinstats.cpp:75-130).
+                    {Stats, CommitHex} =
+                        compute_utxo_set_stats(HashType),
+                    Base = #{
+                        <<"height">>       => TipHeight,
+                        <<"bestblock">>    => hash_to_hex(TipHash),
+                        <<"txouts">>       => maps:get(txouts,    Stats),
+                        <<"bogosize">>     => maps:get(bogosize,  Stats),
+                        <<"total_amount">> =>
+                            maps:get(total_amount, Stats) / 100000000.0,
+                        <<"disk_size">>    => 0
+                    },
+                    {ok, Base#{HashType => CommitHex}}
+            end;
         not_found ->
             {ok, #{
                 <<"height">> => 0,
@@ -2719,28 +2758,56 @@ rpc_gettxoutsetinfo([HashType | _]) ->
             }}
     end.
 
-%% Append the requested UTXO-set commitment to the gettxoutsetinfo result.
-%% Mirrors rpc/blockchain.cpp:1090-1119 — `hash_serialized_3` and `muhash`
-%% are surfaced under their own keys, `none` adds nothing.
-maybe_attach_utxo_commitment(HashType, Base) when is_binary(HashType) ->
-    case HashType of
-        <<"hash_serialized_3">> ->
-            UtxoHash = beamchain_snapshot:compute_utxo_hash(),
-            Base#{<<"hash_serialized_3">> =>
-                      beamchain_serialize:hex_encode(
-                        beamchain_serialize:reverse_bytes(UtxoHash))};
-        <<"muhash">> ->
-            %% MuHash3072 finalize digest. Order-independent; surfaced as a
-            %% display-order hex string (uint256::ToString).
-            MuHash = beamchain_chainstate:compute_utxo_muhash(),
-            Base#{<<"muhash">> =>
-                      beamchain_serialize:hex_encode(
-                        beamchain_serialize:reverse_bytes(MuHash))};
-        _ ->
-            Base
-    end;
-maybe_attach_utxo_commitment(_, Base) ->
-    Base.
+%% Single-pass UTXO-set walk that returns both Core-parity scalars
+%% (txouts, bogosize, total_amount in sat) and the requested commitment.
+%%
+%% Mirrors bitcoin-core/src/kernel/coinstats.cpp::ComputeUTXOStats — Core
+%% iterates the chainstate cursor once and feeds every coin to ApplyHash
+%% while also tallying nTransactionOutputs / nBogoSize / nTotalAmount.
+%%
+%% bogosize per coin matches Core: 50 bytes fixed overhead (txid + vout +
+%% height/coinbase + amount + scriptlen) plus the script length itself
+%% (kernel/coinstats.cpp:78-86).
+compute_utxo_set_stats(<<"hash_serialized_3">>) ->
+    %% Flush dirty cache → disk so the cursor walk sees the authoritative
+    %% UTXO set at the current tip. Same idiom Core uses for its cursor
+    %% (the cache is force-promoted by FlushStateToDisk before the walk
+    %% in coinstats.cpp:69-72).
+    beamchain_chainstate:flush(),
+    Coins = beamchain_db:fold_utxos(
+              fun(Coin, Acc) -> [Coin | Acc] end, []),
+    CoinList = case Coins of L when is_list(L) -> L; _ -> [] end,
+    Stats = tally_coins(CoinList),
+    UtxoHash = beamchain_snapshot:compute_utxo_hash_from_list(CoinList),
+    Hex = beamchain_serialize:hex_encode(
+            beamchain_serialize:reverse_bytes(UtxoHash)),
+    {Stats, Hex};
+compute_utxo_set_stats(<<"muhash">>) ->
+    beamchain_chainstate:flush(),
+    Coins = beamchain_db:fold_utxos(
+              fun(Coin, Acc) -> [Coin | Acc] end, []),
+    CoinList = case Coins of L when is_list(L) -> L; _ -> [] end,
+    Stats = tally_coins(CoinList),
+    MuHash = beamchain_snapshot:compute_txoutset_muhash_from_list(CoinList),
+    Hex = beamchain_serialize:hex_encode(
+            beamchain_serialize:reverse_bytes(MuHash)),
+    {Stats, Hex}.
+
+tally_coins(Coins) ->
+    lists:foldl(
+      fun({_Txid, _Vout, #utxo{script_pubkey = SPK, value = Value}}, Acc) ->
+              ScriptLen = byte_size(SPK),
+              %% Core: 50 + scriptPubKey.size() — see
+              %% kernel/coinstats.cpp ComputeBogoSize (49 + 1 amount byte
+              %% per Core's accounting; we follow Core's actual constant).
+              Bogo = 50 + ScriptLen,
+              #{txouts := T, bogosize := B, total_amount := A} = Acc,
+              Acc#{txouts       => T + 1,
+                   bogosize     => B + Bogo,
+                   total_amount => A + Value}
+      end,
+      #{txouts => 0, bogosize => 0, total_amount => 0},
+      Coins).
 
 %%% ===================================================================
 %%% Mempool methods
