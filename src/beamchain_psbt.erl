@@ -863,9 +863,14 @@ finalize_legacy(InputMap) ->
     end.
 
 build_multisig_witness(PartialSigs, WitnessScript) ->
-    %% Witness: [<<>> (dummy), sig1, sig2, ..., witnessScript]
-    Sigs = maps:values(PartialSigs),
-    [<<>>] ++ Sigs ++ [WitnessScript].
+    %% Wave 28: delegate to the shared canonical witness builder so
+    %% both the PSBT finalize path and the raw-tx wallet path agree
+    %% on stack-layout (BIP-141 §"P2WSH" + the CHECKMULTISIG
+    %% off-by-one pad). Pubkey-ordered when the script parses as a
+    %% canonical M-of-N CHECKMULTISIG; falls back to map-iteration
+    %% order otherwise.
+    beamchain_witness_signer:build_p2wsh_witness_from_sigs(
+        PartialSigs, WitnessScript).
 
 build_multisig_scriptsig(Sigs, RedeemScript) ->
     %% scriptSig: OP_0 <sig1> <sig2> ... <redeemScript>
