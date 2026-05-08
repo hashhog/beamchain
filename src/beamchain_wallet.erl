@@ -68,6 +68,7 @@
 
 %% Transaction signing
 -export([sign_transaction/3,
+         sign_transaction/4,
          build_transaction/3]).
 
 %% PSBT (BIP 174/370)
@@ -956,21 +957,48 @@ build_transaction(Inputs, Outputs, Network) ->
 -spec sign_transaction(#transaction{}, [#utxo{}], [binary()]) ->
     {ok, #transaction{}}.
 sign_transaction(Tx, InputUtxos, PrivKeys) ->
+    %% Default: no per-input ScriptInfo (no witness_script / no extra keys
+    %% for multisig); P2WSH and P2SH-P2WSH inputs will fail unless callers
+    %% use sign_transaction/4 with explicit script_info.
+    ScriptInfos = [#{} || _ <- InputUtxos],
+    sign_transaction(Tx, InputUtxos, PrivKeys, ScriptInfos).
+
+%% @doc Sign a transaction with explicit per-input ScriptInfo maps. This
+%% is the entry point used by `signrawtransactionwithwallet` to pass
+%% through `witnessScript` / `redeemScript` from the prevtxs argument
+%% (and any extra wallet keys for multisig partial-sign).
+%%
+%% ScriptInfo per input may contain:
+%%   witness_script  := binary()  — for P2WSH / P2SH-P2WSH
+%%   redeem_script   := binary()  — for P2SH-* (when classification is
+%%                                   ambiguous from scriptPubKey alone)
+%%   extra_priv_keys := [binary()] — additional wallet keys, used to
+%%                                   resolve M-of-N CHECKMULTISIG
+%%                                   pubkey-order signers.
+-spec sign_transaction(#transaction{}, [#utxo{}], [binary()], [map()]) ->
+    {ok, #transaction{}} | {error, term()}.
+sign_transaction(Tx, InputUtxos, PrivKeys, ScriptInfos) ->
     NumInputs = length(Tx#transaction.inputs),
     NumInputs = length(InputUtxos),
     NumInputs = length(PrivKeys),
+    NumInputs = length(ScriptInfos),
     %% Build prev_outs list for taproot sighash (needs all amounts + scripts)
     PrevOuts = [{U#utxo.value, U#utxo.script_pubkey} || U <- InputUtxos],
-    SignedInputs = lists:map(fun(Idx) ->
-        Input = lists:nth(Idx + 1, Tx#transaction.inputs),
-        Utxo = lists:nth(Idx + 1, InputUtxos),
-        PrivKey = lists:nth(Idx + 1, PrivKeys),
-        sign_input(Tx, Idx, Input, Utxo, PrivKey, PrevOuts)
-    end, lists:seq(0, NumInputs - 1)),
-    {ok, Tx#transaction{inputs = SignedInputs}}.
+    try
+        SignedInputs = lists:map(fun(Idx) ->
+            Input = lists:nth(Idx + 1, Tx#transaction.inputs),
+            Utxo = lists:nth(Idx + 1, InputUtxos),
+            PrivKey = lists:nth(Idx + 1, PrivKeys),
+            ScriptInfo = lists:nth(Idx + 1, ScriptInfos),
+            sign_input(Tx, Idx, Input, Utxo, PrivKey, PrevOuts, ScriptInfo)
+        end, lists:seq(0, NumInputs - 1)),
+        {ok, Tx#transaction{inputs = SignedInputs}}
+    catch
+        throw:{sign_error, Reason} -> {error, Reason}
+    end.
 
 %% Sign a single input based on the scriptPubKey type.
-sign_input(Tx, InputIndex, Input, Utxo, PrivKey, PrevOuts) ->
+sign_input(Tx, InputIndex, Input, Utxo, PrivKey, PrevOuts, ScriptInfo) ->
     ScriptPubKey = Utxo#utxo.script_pubkey,
     case beamchain_address:classify_script(ScriptPubKey) of
         p2wpkh ->
@@ -979,11 +1007,22 @@ sign_input(Tx, InputIndex, Input, Utxo, PrivKey, PrevOuts) ->
             sign_p2pkh(Tx, InputIndex, Input, Utxo, PrivKey);
         p2tr ->
             sign_p2tr(Tx, InputIndex, Input, PrivKey, PrevOuts);
+        p2wsh ->
+            sign_p2wsh_input(Tx, InputIndex, Input, Utxo, PrivKey, ScriptInfo);
         p2sh ->
-            %% P2SH-P2WPKH (wrapped segwit)
-            sign_p2sh_p2wpkh(Tx, InputIndex, Input, Utxo, PrivKey);
+            %% P2SH may wrap either P2WPKH or P2WSH (or be legacy P2SH).
+            %% Disambiguate via the witness/redeem-script fields in
+            %% ScriptInfo: presence of witness_script => P2SH-P2WSH;
+            %% otherwise default to P2SH-P2WPKH (the existing path).
+            case maps:get(witness_script, ScriptInfo, undefined) of
+                undefined ->
+                    sign_p2sh_p2wpkh(Tx, InputIndex, Input, Utxo, PrivKey);
+                _WitnessScript ->
+                    sign_p2sh_p2wsh_input(Tx, InputIndex, Input, Utxo,
+                                          PrivKey, ScriptInfo)
+            end;
         _Other ->
-            error({unsupported_script_type, _Other})
+            throw({sign_error, {unsupported_script_type, _Other}})
     end.
 
 %% --- P2WPKH signing ---
@@ -1057,6 +1096,77 @@ sign_p2sh_p2wpkh(Tx, InputIndex, Input, Utxo, PrivKey) ->
         script_sig = ScriptSig,
         witness    = [SigWithType, PubKey]
     }.
+
+%% --- P2WSH signing (native segwit script-hash) ---
+%%
+%% Wave 28: promote the PSBT-only P2WSH signer at
+%% beamchain_psbt.erl:620-666 into the raw-tx flow. Both call sites
+%% delegate to `beamchain_witness_signer` to prevent parallel-impl
+%% drift on witness-stack layout (BIP-141 §"P2WSH" + the legacy
+%% CHECKMULTISIG off-by-one pad).
+sign_p2wsh_input(Tx, InputIndex, Input, Utxo, PrivKey, ScriptInfo) ->
+    WitnessScript = maps:get(witness_script, ScriptInfo, undefined),
+    case WitnessScript of
+        undefined ->
+            throw({sign_error, missing_witness_script});
+        _ ->
+            Signers = signers_for_p2wsh(WitnessScript, PrivKey, ScriptInfo),
+            case beamchain_witness_signer:sign_p2wsh(
+                   Tx, InputIndex, Utxo#utxo.value, WitnessScript,
+                   Signers, ?SIGHASH_ALL) of
+                {ok, Witness} ->
+                    Input#tx_in{
+                        script_sig = <<>>,
+                        witness    = Witness
+                    };
+                {error, Reason} ->
+                    throw({sign_error, Reason})
+            end
+    end.
+
+%% --- P2SH-P2WSH signing (wrapped P2WSH) ---
+sign_p2sh_p2wsh_input(Tx, InputIndex, Input, Utxo, PrivKey, ScriptInfo) ->
+    WitnessScript = maps:get(witness_script, ScriptInfo, undefined),
+    case WitnessScript of
+        undefined ->
+            throw({sign_error, missing_witness_script});
+        _ ->
+            Signers = signers_for_p2wsh(WitnessScript, PrivKey, ScriptInfo),
+            case beamchain_witness_signer:sign_p2sh_p2wsh(
+                   Tx, InputIndex, Utxo#utxo.value, WitnessScript,
+                   Signers, ?SIGHASH_ALL) of
+                {ok, ScriptSig, Witness} ->
+                    Input#tx_in{
+                        script_sig = ScriptSig,
+                        witness    = Witness
+                    };
+                {error, Reason} ->
+                    throw({sign_error, Reason})
+            end
+    end.
+
+%% Build the signers list aligned with the witness-script pubkey-order.
+%% PrivKey is the wallet's primary key for this input (which may match
+%% one slot of a multisig); ScriptInfo may carry `extra_priv_keys` for
+%% additional wallet-owned keys to satisfy M-of-N.
+%%
+%% Guard <<0:256>> placeholder (W19 §8): the
+%% signrawtransactionwithwallet handler emits <<0:256>> for inputs the
+%% wallet doesn't own. Filter it out here so we don't sign with the
+%% null key.
+signers_for_p2wsh(WitnessScript, PrimaryKey, ScriptInfo) ->
+    Extras = maps:get(extra_priv_keys, ScriptInfo, []),
+    Pool = [K || K <- [PrimaryKey | Extras],
+                 is_binary(K), K =/= <<0:256>>],
+    case beamchain_witness_signer:find_signers_for_script(WitnessScript, Pool) of
+        [] ->
+            %% Fall back to single-key: the primary key, if usable.
+            case is_binary(PrimaryKey) andalso PrimaryKey =/= <<0:256>> of
+                true -> [PrimaryKey];
+                false -> []
+            end;
+        Signers -> Signers
+    end.
 
 %%% ===================================================================
 %%% Signing helpers

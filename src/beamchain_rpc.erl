@@ -4894,17 +4894,21 @@ rpc_signrawtransactionwithwallet([HexStr, PrevTxs], WalletName) when is_binary(H
             try
                 TxBin = beamchain_serialize:hex_decode(HexStr),
                 {Tx, _} = beamchain_serialize:decode_transaction(TxBin),
-                %% Gather UTXO data for signing (from prevtxs param or UTXO set)
-                InputUtxos = lists:map(fun(#tx_in{prev_out = #outpoint{hash = H, index = I}}) ->
+                %% Gather UTXO data + optional witness/redeem-script info
+                %% from prevtxs (Wave 28: needed for P2WSH / P2SH-P2WSH
+                %% raw-tx signing). Falls back to UTXO set lookup.
+                Lookups = lists:map(fun(#tx_in{prev_out = #outpoint{hash = H, index = I}}) ->
                     case find_prevtx(PrevTxs, H, I) of
-                        {ok, Utxo} -> Utxo;
+                        {ok, Utxo, Info} -> {Utxo, Info};
                         not_found ->
                             case beamchain_chainstate:get_utxo(H, I) of
-                                {ok, Utxo} -> Utxo;
+                                {ok, Utxo} -> {Utxo, #{}};
                                 not_found -> throw({missing_input, H, I})
                             end
                     end
                 end, Tx#transaction.inputs),
+                InputUtxos = [U || {U, _} <- Lookups],
+                ScriptInfos = [I || {_, I} <- Lookups],
                 %% Get private keys from wallet for each input
                 PrivKeys = lists:map(fun(Utxo) ->
                     Address = beamchain_address:script_to_address(
@@ -4914,7 +4918,8 @@ rpc_signrawtransactionwithwallet([HexStr, PrevTxs], WalletName) when is_binary(H
                         _ -> <<0:256>>  %% Placeholder for keys not in this wallet
                     end
                 end, InputUtxos),
-                case beamchain_wallet:sign_transaction(Tx, InputUtxos, PrivKeys) of
+                case beamchain_wallet:sign_transaction(
+                       Tx, InputUtxos, PrivKeys, ScriptInfos) of
                     {ok, SignedTx} ->
                         SignedHex = beamchain_serialize:hex_encode(
                             beamchain_serialize:encode_transaction(SignedTx)),
@@ -4940,23 +4945,46 @@ rpc_signrawtransactionwithwallet(_, _) ->
      <<"Usage: signrawtransactionwithwallet \"hexstring\" ( prevtxs )">>}.
 
 %% Helper: find a previous tx output from the prevtxs parameter.
+%% Returns {ok, #utxo{}, ScriptInfo} where ScriptInfo carries
+%% witness_script / redeem_script when present (Wave 28: needed for
+%% P2WSH / P2SH-P2WSH raw-tx signing).
 find_prevtx([], _Hash, _Index) -> not_found;
 find_prevtx([#{<<"txid">> := TxidHex, <<"vout">> := Vout,
                <<"scriptPubKey">> := ScriptHex} = Map | Rest], Hash, Index) ->
     case {hex_to_internal_hash(TxidHex), Vout} of
         {Hash, Index} ->
             Amount = maps:get(<<"amount">>, Map, 0),
-            {ok, #utxo{
+            ScriptInfo = collect_script_info(Map),
+            {ok,
+             #utxo{
                 value = btc_to_satoshi(Amount),
                 script_pubkey = beamchain_serialize:hex_decode(ScriptHex),
                 height = 0,
                 is_coinbase = false
-            }};
+             },
+             ScriptInfo};
         _ ->
             find_prevtx(Rest, Hash, Index)
     end;
 find_prevtx([_ | Rest], Hash, Index) ->
     find_prevtx(Rest, Hash, Index).
+
+%% Build a script_info map from a prevtx entry. Both `witnessScript`
+%% and `redeemScript` are accepted (Bitcoin Core RPC parity); both are
+%% hex-decoded. Missing fields are simply absent from the map.
+collect_script_info(Map) ->
+    Acc0 = #{},
+    Acc1 = case maps:get(<<"witnessScript">>, Map, undefined) of
+        undefined -> Acc0;
+        WSHex when is_binary(WSHex) ->
+            Acc0#{witness_script => beamchain_serialize:hex_decode(WSHex)}
+    end,
+    Acc2 = case maps:get(<<"redeemScript">>, Map, undefined) of
+        undefined -> Acc1;
+        RSHex when is_binary(RSHex) ->
+            Acc1#{redeem_script => beamchain_serialize:hex_decode(RSHex)}
+    end,
+    Acc2.
 
 %% @doc importdescriptors: Import descriptors into the wallet.
 %% Takes an array of descriptor request objects.
