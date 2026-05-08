@@ -392,3 +392,175 @@ w31_p2sh_p2wsh_negative_forged_witnessscript_test() ->
     Result = beamchain_witness_signer:sign_p2sh_p2wsh(
         Tx, 0, 1_000_000, ForgedWS, SPK, [priv_a(), priv_b()], ?SIGHASH_ALL),
     ?assertEqual({error, p2sh_commitment_mismatch}, Result).
+
+%%% ===================================================================
+%%% Wave 38: P2WSH bare witness-script commitment + tautology removal
+%%% ===================================================================
+%%
+%% W37 audit identified three sites where the W31 P2SH-commitment
+%% idiom was either missing or fake:
+%%   Site 1 — beamchain_psbt:sign_with_utxo (bare P2WSH branch)
+%%             never checked sha256(witnessScript) == SPK[2..34].
+%%   Site 2 — beamchain_witness_signer:sign_p2wsh/6 took no SPK and
+%%             did no check; W38 adds a /7 wrapper that does.
+%%   Site 3 — beamchain_witness_signer:sign_p2sh_p2wsh/6 had a
+%%             `verify_p2wsh_commitment(WS, sha256(WS))` tautology
+%%             whose two arguments were derived on the line above
+%%             — proves nothing. Removed.
+%%
+%% Fixtures use ASYMMETRIC witness scripts (different M, different
+%% pubkey order) so a swap can't accidentally hash to the same value.
+
+%% --------------------------------------------------------------------
+%% Vector W38-A (negative bare P2WSH PSBT): the PSBT signer is given
+%% an InputMap that pairs the prevout's honest scriptPubKey (committing
+%% to HonestWS) with a forged witness_script (ForgedWS). The signer
+%% must decline (no partial_sig added) and leave the input unchanged.
+%% --------------------------------------------------------------------
+w38_psbt_bare_p2wsh_forged_witnessscript_test() ->
+    PkA = beamchain_wallet:privkey_to_pubkey(priv_a()),
+    PkB = beamchain_wallet:privkey_to_pubkey(priv_b()),
+    PkC = beamchain_wallet:privkey_to_pubkey(priv_c()),
+    %% Asymmetric: 2-of-3 honest vs. 1-of-2 forgery in different
+    %% pubkey order — no palindrome.
+    HonestWS = multisig_redeem_script(2, [PkA, PkB, PkC]),
+    ForgedWS = multisig_redeem_script(1, [PkC, PkA]),
+    SPK = p2wsh_spk(HonestWS),
+    ?assertNotEqual(crypto:hash(sha256, HonestWS),
+                    crypto:hash(sha256, ForgedWS)),
+    Amount = 4_242_424,
+    Tx = unsigned_tx(),
+    {ok, Psbt0} = beamchain_psbt:create(Tx),
+    %% Wire the witness_utxo (honest SPK, honest amount) and a FORGED
+    %% witness_script.
+    {ok, Psbt1} = beamchain_psbt:update(
+        Psbt0,
+        [{input, 0, #{witness_utxo   => {Amount, SPK},
+                      witness_script => ForgedWS}}]),
+    {ok, Psbt2} = beamchain_psbt:sign(Psbt1, [{0, priv_a()}]),
+    Input0 = beamchain_psbt:get_input(Psbt2, 0),
+    %% No partial_sig recorded — the signer declined.
+    ?assertEqual(#{}, maps:get(partial_sigs, Input0, #{})),
+    %% witness_script is unchanged (input was returned as-is).
+    ?assertEqual(ForgedWS, maps:get(witness_script, Input0)),
+    %% Helper agrees the program doesn't commit:
+    <<16#00, 32, HonestProg:32/binary>> = SPK,
+    ?assertEqual({error, p2wsh_commitment_mismatch},
+                 beamchain_crypto:verify_p2wsh_commitment(ForgedWS, HonestProg)).
+
+%% --------------------------------------------------------------------
+%% Vector W38-A' (positive bare P2WSH PSBT): the same PSBT path with
+%% the matching honest witness script must produce a partial_sig.
+%% Sanity-check that W38 didn't break the happy path.
+%% --------------------------------------------------------------------
+w38_psbt_bare_p2wsh_honest_witnessscript_test() ->
+    PkA = beamchain_wallet:privkey_to_pubkey(priv_a()),
+    PkB = beamchain_wallet:privkey_to_pubkey(priv_b()),
+    PkC = beamchain_wallet:privkey_to_pubkey(priv_c()),
+    HonestWS = multisig_redeem_script(2, [PkA, PkB, PkC]),
+    SPK = p2wsh_spk(HonestWS),
+    Amount = 4_242_424,
+    Tx = unsigned_tx(),
+    {ok, Psbt0} = beamchain_psbt:create(Tx),
+    {ok, Psbt1} = beamchain_psbt:update(
+        Psbt0,
+        [{input, 0, #{witness_utxo   => {Amount, SPK},
+                      witness_script => HonestWS}}]),
+    {ok, Psbt2} = beamchain_psbt:sign(Psbt1, [{0, priv_a()}]),
+    Input0 = beamchain_psbt:get_input(Psbt2, 0),
+    Sigs = maps:get(partial_sigs, Input0, #{}),
+    ?assertEqual(1, maps:size(Sigs)),
+    SigA = maps:get(PkA, Sigs),
+    ?assertEqual(?SIGHASH_ALL, binary:last(SigA)).
+
+%% --------------------------------------------------------------------
+%% Vector W38-B (negative raw-tx P2WSH /7): direct call to the new
+%% sign_p2wsh/7 with a forged witness script must surface the
+%% commitment-mismatch error rather than emit a witness stack.
+%% --------------------------------------------------------------------
+w38_raw_tx_p2wsh_forged_witnessscript_test() ->
+    PkA = beamchain_wallet:privkey_to_pubkey(priv_a()),
+    PkB = beamchain_wallet:privkey_to_pubkey(priv_b()),
+    PkC = beamchain_wallet:privkey_to_pubkey(priv_c()),
+    HonestWS = multisig_redeem_script(2, [PkA, PkB, PkC]),
+    ForgedWS = multisig_redeem_script(1, [PkC, PkA]),
+    SPK = p2wsh_spk(HonestWS),
+    ?assertNotEqual(crypto:hash(sha256, HonestWS),
+                    crypto:hash(sha256, ForgedWS)),
+    Amount = 12_345_678,
+    Tx = unsigned_tx(),
+    Result = beamchain_witness_signer:sign_p2wsh(
+        Tx, 0, Amount, ForgedWS, SPK,
+        [priv_a(), priv_b(), priv_c()], ?SIGHASH_ALL),
+    ?assertEqual({error, p2wsh_commitment_mismatch}, Result),
+    %% Malformed SPK (not bare P2WSH) is also rejected:
+    P2pkhSpk = <<16#76, 16#a9, 20,
+                 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,
+                 16#88, 16#ac>>,
+    ?assertEqual({error, p2wsh_spk_format},
+                 beamchain_witness_signer:sign_p2wsh(
+                   Tx, 0, Amount, HonestWS, P2pkhSpk,
+                   [priv_a(), priv_b(), priv_c()], ?SIGHASH_ALL)).
+
+%% --------------------------------------------------------------------
+%% Vector W38-B' (positive raw-tx P2WSH /7): honest witness script +
+%% matching SPK must produce a witness stack identical to the /6
+%% baseline. Sanity-check that the /7 wrapper is only adding the
+%% commitment guard, not perturbing the signed bytes.
+%% --------------------------------------------------------------------
+w38_raw_tx_p2wsh_honest_parity_test() ->
+    PkA = beamchain_wallet:privkey_to_pubkey(priv_a()),
+    PkB = beamchain_wallet:privkey_to_pubkey(priv_b()),
+    PkC = beamchain_wallet:privkey_to_pubkey(priv_c()),
+    HonestWS = multisig_redeem_script(2, [PkA, PkB, PkC]),
+    SPK = p2wsh_spk(HonestWS),
+    Amount = 999_111,
+    Tx = unsigned_tx(),
+    Signers = [priv_a(), priv_b(), undefined],
+    {ok, Witness6} = beamchain_witness_signer:sign_p2wsh(
+        Tx, 0, Amount, HonestWS, Signers, ?SIGHASH_ALL),
+    {ok, Witness7} = beamchain_witness_signer:sign_p2wsh(
+        Tx, 0, Amount, HonestWS, SPK, Signers, ?SIGHASH_ALL),
+    ?assertEqual(Witness6, Witness7).
+
+%% --------------------------------------------------------------------
+%% Vector W38-C (tautology removal): the deleted "check" in
+%% sign_p2sh_p2wsh/6 was H == H by construction. Demonstrate that the
+%% /6 path can in fact be driven by an attacker who controls
+%% WitnessScript and never sees a commitment failure (it never could),
+%% AND confirm the /7 path catches the same forgery against a real SPK.
+%% This pins down what the deleted check was *not* doing — it does
+%% NOT increase /6 safety, that's by design and noted in the doc above.
+%% Callers with access to SPK must use /7.
+%% --------------------------------------------------------------------
+w38_sign_p2sh_p2wsh_6_tautology_was_noop_test() ->
+    PkA = beamchain_wallet:privkey_to_pubkey(priv_a()),
+    PkB = beamchain_wallet:privkey_to_pubkey(priv_b()),
+    %% Two unrelated witness scripts. The /6 path has no SPK input,
+    %% so it doesn't matter that ForgedWS doesn't commit to anything
+    %% real on-chain — the /6 path always succeeds shape-wise. The
+    %% post-W38 sign_p2sh_p2wsh/6 emits a redeem script derived from
+    %% the caller's WitnessScript and signs over it; the deleted
+    %% tautology proved nothing about the prevout.
+    HonestWS = multisig_redeem_script(2, [PkA, PkB]),
+    ForgedWS = multisig_redeem_script(1, [PkB, PkA]),
+    HonestRedeem = p2sh_p2wsh_redeem_script(HonestWS),
+    HonestSpk    = p2sh_spk(HonestRedeem),
+    Amount = 555_555,
+    Tx = unsigned_tx(),
+    Signers = [priv_a(), priv_b()],
+    %% /6 succeeds with the forgery (no SPK = no chain-anchored check).
+    %% ForgedWS is 1-of-2, so witness = [<<>>, sigA, WS] (length 3).
+    {ok, ScriptSig6, Witness6} = beamchain_witness_signer:sign_p2sh_p2wsh(
+        Tx, 0, Amount, ForgedWS, Signers, ?SIGHASH_ALL),
+    ?assertEqual(3, length(Witness6)),
+    ?assertEqual(ForgedWS, lists:last(Witness6)),
+    %% scriptSig is push of OP_0 <sha256(ForgedWS)>:
+    ForgedRedeem = p2sh_p2wsh_redeem_script(ForgedWS),
+    ?assertEqual(<<34, ForgedRedeem/binary>>, ScriptSig6),
+    %% /7 with the same forgery against the honest SPK must surface
+    %% the OUTER P2SH-commitment mismatch (hash160(ForgedRedeem) /=
+    %% hash160(HonestRedeem) /= SPK[2..22]).
+    Result7 = beamchain_witness_signer:sign_p2sh_p2wsh(
+        Tx, 0, Amount, ForgedWS, HonestSpk, Signers, ?SIGHASH_ALL),
+    ?assertEqual({error, p2sh_commitment_mismatch}, Result7).

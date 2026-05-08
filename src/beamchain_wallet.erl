@@ -1118,9 +1118,15 @@ sign_p2wsh_input(Tx, InputIndex, Input, Utxo, PrivKey, ScriptInfo) ->
         undefined ->
             throw({sign_error, missing_witness_script});
         _ ->
+            %% W38: route through the /7 entry that asserts
+            %% sha256(WitnessScript) == scriptPubKey[2..34], catching a
+            %% forged witness script that doesn't commit to the
+            %% prevout. Mirrors the W31 /7 wiring for sign_p2sh_p2wsh
+            %% just below.
             Signers = signers_for_p2wsh(WitnessScript, PrivKey, ScriptInfo),
             case beamchain_witness_signer:sign_p2wsh(
                    Tx, InputIndex, Utxo#utxo.value, WitnessScript,
+                   Utxo#utxo.script_pubkey,
                    Signers, ?SIGHASH_ALL) of
                 {ok, Witness} ->
                     Input#tx_in{
