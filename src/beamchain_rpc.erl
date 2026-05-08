@@ -593,6 +593,7 @@ handle_method(<<"getrawchangeaddress">>, P, W) -> rpc_getrawchangeaddress(P, W);
 handle_method(<<"getbalance">>, _, W) -> rpc_getbalance(W);
 handle_method(<<"listaddresses">>, _, W) -> rpc_listaddresses(W);
 handle_method(<<"getwalletinfo">>, _, W) -> rpc_getwalletinfo(W);
+handle_method(<<"getwalletmnemonic">>, _, W) -> rpc_getwalletmnemonic(W);
 handle_method(<<"dumpprivkey">>, P, W) -> rpc_dumpprivkey(P, W);
 handle_method(<<"sendtoaddress">>, P, W) -> rpc_sendtoaddress(P, W);
 handle_method(<<"listunspent">>, P, W) -> rpc_listunspent(P, W);
@@ -729,6 +730,7 @@ rpc_help_list() ->
         <<"getrawchangeaddress ( \"address_type\" )">>,
         <<"gettxout \"txid\" n ( include_mempool )">>,
         <<"getwalletinfo">>,
+        <<"getwalletmnemonic">>,
         <<"listaddresses">>,
         <<"listlockunspent">>,
         <<"listtransactions ( \"label\" count skip )">>,
@@ -4444,6 +4446,41 @@ rpc_getwalletinfo(WalletName) ->
                             BaseInfo
                     end,
                     {ok, InfoWithEncryption};
+                {error, Reason} ->
+                    {error, ?RPC_MISC_ERROR, iolist_to_binary(
+                        io_lib:format("~p", [Reason]))}
+            end;
+        {error, _} ->
+            wallet_not_found_error(WalletName)
+    end.
+
+%% @doc Return the BIP-39 mnemonic backing the wallet, if any.
+%%
+%% This is intentionally a separate RPC from `dumpprivkey` because the
+%% mnemonic recovers ALL private keys at once. Operators must store the
+%% output offline; treat it as the most sensitive material in the
+%% wallet. The RPC returns {error,no_mnemonic} for raw-seed wallets.
+rpc_getwalletmnemonic(WalletName) ->
+    case resolve_wallet(WalletName) of
+        {ok, Pid} ->
+            case beamchain_wallet:getwalletmnemonic(Pid) of
+                {ok, Words} ->
+                    Joined = iolist_to_binary(
+                        lists:join(<<" ">>, Words)),
+                    {ok, #{
+                        <<"mnemonic">> => Joined,
+                        <<"wordcount">> => length(Words),
+                        <<"warning">> => <<"BACKUP THIS MNEMONIC OFFLINE. "
+                                           "Anyone with this phrase can "
+                                           "spend all wallet funds.">>
+                    }};
+                {error, no_mnemonic} ->
+                    {error, ?RPC_MISC_ERROR,
+                     <<"Wallet was not created from a BIP-39 mnemonic">>};
+                {error, wallet_locked} ->
+                    {error, ?RPC_MISC_ERROR,
+                     <<"Error: Please enter the wallet passphrase with "
+                       "walletpassphrase first.">>};
                 {error, Reason} ->
                     {error, ?RPC_MISC_ERROR, iolist_to_binary(
                         io_lib:format("~p", [Reason]))}

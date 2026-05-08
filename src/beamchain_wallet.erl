@@ -16,6 +16,9 @@
 %% gen_server API
 -export([start_link/0, start_link/1,
          create/0, create/1, create/2,
+         create_with_mnemonic/1, create_with_mnemonic/2,
+         restore_from_mnemonic/2,
+         getwalletmnemonic/0, getwalletmnemonic/1,
          load/1, load/2,
          get_new_address/0, get_new_address/1,
          get_change_address/0, get_change_address/1,
@@ -150,7 +153,12 @@
     %% {Txid, Vout} pairs that coin selection must skip.  Mirrors Core's
     %% CWallet::setLockedCoins (wallet/wallet.h); cleared on process exit
     %% (we do not yet persist with persistent=true).
-    locked_coins = sets:new() :: sets:set()
+    locked_coins = sets:new() :: sets:set(),
+    %% BIP-39 mnemonic backing the seed, when the wallet was created or
+    %% restored via beamchain_bip39. `undefined` for raw-seed wallets.
+    %% Held in memory only for getwalletmnemonic export; not yet
+    %% persisted to the wallet file.
+    mnemonic = undefined :: [binary()] | undefined
 }).
 
 %% Default keypool size (1000 addresses lookahead per type)
@@ -187,6 +195,62 @@ create(Seed) ->
 -spec create(binary(), binary() | undefined) -> {ok, binary()} | {error, term()}.
 create(Seed, Passphrase) ->
     gen_server:call(?SERVER, {create, Seed, Passphrase}).
+
+%% @doc Create a new wallet backed by a fresh BIP-39 mnemonic.
+%% NWords must be 12, 15, 18, 21, or 24. Returns the mnemonic word list
+%% so the caller can display it once for backup; subsequent retrieval
+%% requires the in-memory `getwalletmnemonic' API.
+%%
+%% The optional `Bip39Passphrase' (NOT the wallet-encryption passphrase)
+%% is mixed into the seed per BIP-39 §"From mnemonic to seed". A
+%% non-empty value yields a different seed and is permanent — there is
+%% no recovery if it is lost.
+-spec create_with_mnemonic(12 | 15 | 18 | 21 | 24) ->
+          {ok, [binary()]} | {error, term()}.
+create_with_mnemonic(NWords) ->
+    create_with_mnemonic(NWords, <<>>).
+
+-spec create_with_mnemonic(12 | 15 | 18 | 21 | 24, binary()) ->
+          {ok, [binary()]} | {error, term()}.
+create_with_mnemonic(NWords, Bip39Passphrase)
+  when is_binary(Bip39Passphrase) ->
+    case beamchain_bip39:generate_mnemonic(NWords) of
+        {ok, Mnemonic} ->
+            Seed = beamchain_bip39:mnemonic_to_seed(Mnemonic, Bip39Passphrase),
+            case gen_server:call(?SERVER,
+                                 {create_bip39, Seed, Mnemonic, undefined}) of
+                {ok, _} -> {ok, Mnemonic};
+                Err     -> Err
+            end;
+        Err ->
+            Err
+    end.
+
+%% @doc Restore a wallet from an existing BIP-39 mnemonic + optional
+%% BIP-39 passphrase. The mnemonic is checksum-validated before the
+%% seed is derived; bad checksum returns {error, bad_checksum}.
+-spec restore_from_mnemonic([binary()], binary()) ->
+          {ok, binary()} | {error, term()}.
+restore_from_mnemonic(Mnemonic, Bip39Passphrase)
+  when is_list(Mnemonic), is_binary(Bip39Passphrase) ->
+    case beamchain_bip39:validate_mnemonic(Mnemonic) of
+        ok ->
+            Seed = beamchain_bip39:mnemonic_to_seed(Mnemonic, Bip39Passphrase),
+            gen_server:call(?SERVER,
+                            {create_bip39, Seed, Mnemonic, undefined});
+        Err ->
+            Err
+    end.
+
+%% @doc Return the mnemonic backing the active wallet, or
+%% {error, no_mnemonic} for raw-seed wallets / locked wallets.
+-spec getwalletmnemonic() -> {ok, [binary()]} | {error, term()}.
+getwalletmnemonic() ->
+    gen_server:call(?SERVER, getwalletmnemonic).
+
+-spec getwalletmnemonic(pid()) -> {ok, [binary()]} | {error, term()}.
+getwalletmnemonic(Pid) when is_pid(Pid) ->
+    gen_server:call(Pid, getwalletmnemonic).
 
 %% @doc Load a wallet from file.
 -spec load(string()) -> ok | {error, term()}.
@@ -419,12 +483,45 @@ handle_call({create, Seed, Passphrase}, _From, State) ->
         wallet_file = WalletFile,
         passphrase  = Passphrase,
         keypool_size = ?DEFAULT_KEYPOOL_SIZE,
-        gap_limit    = ?DEFAULT_GAP_LIMIT
+        gap_limit    = ?DEFAULT_GAP_LIMIT,
+        mnemonic    = undefined
     },
     %% Generate initial keypool of lookahead addresses
     NewState = generate_keypool(NewState0),
     ok = save_wallet(NewState),
     {reply, {ok, Seed}, NewState};
+
+handle_call({create_bip39, Seed, Mnemonic, Passphrase}, _From, State) ->
+    %% BIP-39 path: identical to {create,_,_} except we also remember
+    %% the mnemonic in state for in-memory export. The seed is what
+    %% drives BIP-32 master-key derivation.
+    MasterKey = master_from_seed(Seed),
+    WalletDir = wallet_dir(State#wallet_state.network),
+    ok = filelib:ensure_dir(WalletDir ++ "/"),
+    WalletFile = WalletDir ++ "/wallet.json",
+    NewState0 = State#wallet_state{
+        master_key  = MasterKey,
+        seed        = Seed,
+        wallet_file = WalletFile,
+        passphrase  = Passphrase,
+        keypool_size = ?DEFAULT_KEYPOOL_SIZE,
+        gap_limit    = ?DEFAULT_GAP_LIMIT,
+        mnemonic    = Mnemonic
+    },
+    NewState = generate_keypool(NewState0),
+    ok = save_wallet(NewState),
+    {reply, {ok, Seed}, NewState};
+
+handle_call(getwalletmnemonic, _From, State) ->
+    case State#wallet_state.mnemonic of
+        undefined ->
+            {reply, {error, no_mnemonic}, State};
+        Words when is_list(Words) ->
+            case State#wallet_state.locked of
+                true  -> {reply, {error, wallet_locked}, State};
+                false -> {reply, {ok, Words}, State}
+            end
+    end;
 
 handle_call({load, FilePath, Passphrase}, _From, State) ->
     case load_wallet_file(FilePath, Passphrase) of
