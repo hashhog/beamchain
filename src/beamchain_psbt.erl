@@ -594,7 +594,7 @@ sign_with_utxo(Psbt, Tx, InputIndex, InputMap, PrivKey, Value, ScriptPubKey) ->
             SigHash = beamchain_script:sighash_taproot(
                 Tx, InputIndex, PrevOuts, TapSigHashType,
                 undefined, undefined, 16#ffffffff),
-            TweakedPrivKey = taproot_tweak_privkey(PrivKey),
+            TweakedPrivKey = beamchain_crypto:taproot_tweak_seckey(PrivKey),
             AuxRand = crypto:strong_rand_bytes(32),
             {ok, SchnorrSig} = beamchain_crypto:schnorr_sign(
                 SigHash, TweakedPrivKey, AuxRand),
@@ -1019,20 +1019,7 @@ push_data(Data, Acc) ->
             <<Acc/binary, 16#4e, Len:32/little, Data/binary>>
     end.
 
-%% Taproot private key tweaking (same as in beamchain_wallet)
-taproot_tweak_privkey(PrivKey) ->
-    {ok, <<Prefix:8, XOnly:32/binary>>} =
-        beamchain_crypto:pubkey_from_privkey(PrivKey),
-    Tweak = beamchain_crypto:tagged_hash(<<"TapTweak">>, XOnly),
-    PrivKey2 = case Prefix of
-        16#02 -> PrivKey;
-        16#03 -> negate_privkey(PrivKey)
-    end,
-    {ok, TweakedPriv} = beamchain_crypto:seckey_tweak_add(PrivKey2, Tweak),
-    TweakedPriv.
-
-negate_privkey(PrivKey) ->
-    N = 16#FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141,
-    KeyInt = binary:decode_unsigned(PrivKey, big),
-    Negated = N - KeyInt,
-    <<Negated:256/big>>.
+%% NOTE: BIP-341 taproot_tweak_seckey/1 + negate_seckey/1 used to live
+%% here (byte-identical to the wallet copies). They have been hoisted
+%% into `beamchain_crypto` (Wave 27-E refactor). Call
+%% `beamchain_crypto:taproot_tweak_seckey/1` directly.

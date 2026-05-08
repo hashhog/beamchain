@@ -663,3 +663,72 @@ batch_schnorr_verify_mixed_test() ->
     ?assertEqual([true, false],
                  beamchain_crypto:batch_schnorr_verify([{Msg, Sig, XOnly1},
                                                          {Msg, Sig, XOnly2}])).
+
+%%% ===================================================================
+%%% BIP-341 / BIP-86 Taproot key tweak tests
+%%% ===================================================================
+
+%% BIP-86 test vector (account 0, receive address 0 — m/86'/0'/0'/0/0):
+%%   secret key (derived): 41f41d69260df4cf277826a9b65a3717e4eeddbeedf637f212ca096576479361
+%%   internal pubkey (x):  cc8a4bc64d897bddc5fbc2f670f7a8ba0b386779106cf1223c6fc5d7cd6fc115
+%%   output key (x, post-tweak):
+%%                         a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c
+%% Source: https://github.com/bitcoin/bips/blob/master/bip-0086.mediawiki
+taproot_tweak_seckey_bip86_vector_test() ->
+    SecKey = hex("41f41d69260df4cf277826a9b65a3717e4eeddbeedf637f212ca096576479361"),
+    ExpectedInternalX =
+        hex("cc8a4bc64d897bddc5fbc2f670f7a8ba0b386779106cf1223c6fc5d7cd6fc115"),
+    ExpectedOutputX =
+        hex("a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c"),
+
+    %% Sanity: the untweaked secret key derives the published internal x-only
+    %% pubkey (drops the parity prefix byte).
+    {ok, <<_:8, InternalX:32/binary>>} =
+        beamchain_crypto:pubkey_from_privkey(SecKey),
+    ?assertEqual(ExpectedInternalX, InternalX),
+
+    %% Apply the BIP-341 TapTweak. The tweaked secret should sign for the
+    %% Taproot output key, so its x-only pubkey must match the spec.
+    Tweaked = beamchain_crypto:taproot_tweak_seckey(SecKey),
+    ?assertEqual(32, byte_size(Tweaked)),
+    {ok, <<_:8, TweakedX:32/binary>>} =
+        beamchain_crypto:pubkey_from_privkey(Tweaked),
+    ?assertEqual(ExpectedOutputX, TweakedX).
+
+taproot_tweak_seckey_deterministic_test() ->
+    %% Same input must yield the same tweaked key (no randomness).
+    SecKey = <<1:256/big>>,
+    T1 = beamchain_crypto:taproot_tweak_seckey(SecKey),
+    T2 = beamchain_crypto:taproot_tweak_seckey(SecKey),
+    ?assertEqual(T1, T2),
+    ?assertEqual(32, byte_size(T1)).
+
+taproot_tweak_seckey_signs_for_output_key_test() ->
+    %% Round-trip: tweak a random seckey, derive the output x-only pubkey,
+    %% sign a message with the tweaked key, verify under the output key.
+    SecKey = crypto:strong_rand_bytes(32),
+    Tweaked = beamchain_crypto:taproot_tweak_seckey(SecKey),
+    {ok, <<_:8, OutputX:32/binary>>} =
+        beamchain_crypto:pubkey_from_privkey(Tweaked),
+    Msg = beamchain_crypto:hash256(<<"taproot key-path test">>),
+    AuxRand = <<0:256>>,
+    {ok, Sig} = beamchain_crypto:schnorr_sign(Msg, Tweaked, AuxRand),
+    ?assert(beamchain_crypto:schnorr_verify(Msg, Sig, OutputX)).
+
+negate_seckey_involution_test() ->
+    %% N - (N - k) = k (mod N): negation is its own inverse.
+    SecKey = hex("0102030405060708091011121314151617181920212223242526272829303132"),
+    Once = beamchain_crypto:negate_seckey(SecKey),
+    Twice = beamchain_crypto:negate_seckey(Once),
+    ?assertEqual(SecKey, Twice),
+    ?assertNotEqual(SecKey, Once),
+    ?assertEqual(32, byte_size(Once)).
+
+negate_seckey_known_value_test() ->
+    %% k = 1 → N - 1
+    %% n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+    %% n - 1 = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364140
+    K = <<1:256/big>>,
+    Expected =
+        hex("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364140"),
+    ?assertEqual(Expected, beamchain_crypto:negate_seckey(K)).
