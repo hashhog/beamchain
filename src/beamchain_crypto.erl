@@ -28,6 +28,10 @@
 -export([sha256/1, hash256/1, hash160/1,
          tagged_hash/2, hmac_sha512/2]).
 
+%% Commitment checks (W31): assert redeem/witness script matches the
+%% scriptPubKey/witness-program prior to signing or finalising.
+-export([verify_p2sh_commitment/2, verify_p2wsh_commitment/2]).
+
 %% Hardware introspection
 -export([sha256_hardware_info/0]).
 
@@ -526,6 +530,59 @@ tagged_hash(Tag, Data) ->
 -spec hmac_sha512(Key :: binary(), Data :: binary()) -> binary().
 hmac_sha512(Key, Data) ->
     crypto:mac(hmac, sha512, Key, Data).
+
+%%% -------------------------------------------------------------------
+%%% Commitment checks (W31)
+%%% -------------------------------------------------------------------
+%%
+%% Both the raw-tx and PSBT signers were happy to sign with whatever
+%% redeem/witness script the caller handed them, without confirming
+%% that script actually committed to the prevout's scriptPubKey /
+%% witness program. A malicious caller could supply a forged redeem
+%% script whose hash160 didn't match the on-chain P2SH hash and the
+%% wallet would still produce a valid-looking signature (the verify
+%% step would reject it later, but a partially-cooperative signer
+%% could leak signatures over arbitrary attacker-chosen scripts).
+%%
+%% The two helpers below assert the BIP-16 / BIP-141 commitment
+%% explicitly. Mirrors camlcoin's `Cstruct.equal (Crypto.hash160
+%% redeem) script_hash` check at lib/wallet.ml:1262.
+
+%% @doc Assert that ScriptPubKey is exactly `OP_HASH160 <20> H
+%% OP_EQUAL` and that H == hash160(RedeemScript). Returns `ok` on
+%% match, `{error, Reason}` on any mismatch.
+-spec verify_p2sh_commitment(RedeemScript :: binary(),
+                             ScriptPubKey :: binary()) ->
+    ok | {error, p2sh_spk_format | p2sh_commitment_mismatch}.
+verify_p2sh_commitment(RedeemScript, ScriptPubKey) when is_binary(RedeemScript) ->
+    case ScriptPubKey of
+        <<16#a9, 16#14, H:20/binary, 16#87>> ->
+            case hash160(RedeemScript) of
+                H -> ok;
+                _ -> {error, p2sh_commitment_mismatch}
+            end;
+        _ ->
+            {error, p2sh_spk_format}
+    end.
+
+%% @doc Assert that WitnessProgram is the 32-byte SHA-256 of
+%% WitnessScript. WitnessProgram is the raw 32 bytes (i.e. for a
+%% scriptPubKey `OP_0 <32> H` pass H, not the whole 34-byte SPK; for a
+%% P2SH-P2WSH wrap pass H out of the redeem script `OP_0 <32> H`).
+-spec verify_p2wsh_commitment(WitnessScript :: binary(),
+                              WitnessProgram :: binary()) ->
+    ok | {error, p2wsh_program_size | p2wsh_commitment_mismatch}.
+verify_p2wsh_commitment(WitnessScript, WitnessProgram)
+  when is_binary(WitnessScript), is_binary(WitnessProgram) ->
+    case byte_size(WitnessProgram) of
+        32 ->
+            case sha256(WitnessScript) of
+                WitnessProgram -> ok;
+                _ -> {error, p2wsh_commitment_mismatch}
+            end;
+        _ ->
+            {error, p2wsh_program_size}
+    end.
 
 %%% -------------------------------------------------------------------
 %%% Hardware introspection

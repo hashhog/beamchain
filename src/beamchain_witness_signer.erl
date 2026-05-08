@@ -16,6 +16,7 @@
 %% Public API
 -export([sign_p2wsh/6,
          sign_p2sh_p2wsh/6,
+         sign_p2sh_p2wsh/7,
          build_p2wsh_witness_from_sigs/2,
          classify_witness_script/1,
          find_signers_for_script/2]).
@@ -77,6 +78,16 @@ sign_p2wsh(Tx, InputIndex, Amount, WitnessScript, Signers, HashType) ->
 %% the witness is the same as bare P2WSH.
 %%
 %% Returns `{ok, ScriptSig, WitnessStack}`.
+%%
+%% Two arities:
+%%   - sign_p2sh_p2wsh/6 (legacy): takes no ScriptPubKey; the W31
+%%     P2WSH-inner check is satisfied trivially because we re-derive
+%%     the witness program from WitnessScript ourselves. Callers that
+%%     have access to the prevout's scriptPubKey should prefer the /7
+%%     form, which additionally verifies the P2SH commitment.
+%%   - sign_p2sh_p2wsh/7 (W31): also asserts that hash160 of the
+%%     emitted redeemScript matches scriptPubKey[2..22], catching a
+%%     forged WitnessScript that doesn't commit to the prevout.
 -spec sign_p2sh_p2wsh(#transaction{}, non_neg_integer(), non_neg_integer(),
                       binary(), [binary() | undefined], non_neg_integer()) ->
     {ok, binary(), [binary()]} | {error, term()}.
@@ -84,10 +95,33 @@ sign_p2sh_p2wsh(Tx, InputIndex, Amount, WitnessScript, Signers, HashType) ->
     case sign_p2wsh(Tx, InputIndex, Amount, WitnessScript, Signers, HashType) of
         {ok, Witness} ->
             %% scriptSig: single push of the P2WSH redeem script
-            %% (`OP_0 <SHA256(witnessScript)>`).
-            RedeemScript = <<0, 32, (crypto:hash(sha256, WitnessScript))/binary>>,
+            %% (`OP_0 <SHA256(witnessScript)>`). The W31 P2WSH-inner
+            %% commitment is satisfied by construction here: we hash the
+            %% caller's WitnessScript ourselves and stuff it into the
+            %% redeem script we're emitting.
+            WitnessProg = crypto:hash(sha256, WitnessScript),
+            ok = beamchain_crypto:verify_p2wsh_commitment(
+                   WitnessScript, WitnessProg),
+            RedeemScript = <<0, 32, WitnessProg/binary>>,
             ScriptSig = push_data(RedeemScript),
             {ok, ScriptSig, Witness};
+        {error, _} = Err ->
+            Err
+    end.
+
+-spec sign_p2sh_p2wsh(#transaction{}, non_neg_integer(), non_neg_integer(),
+                      binary(), binary(),
+                      [binary() | undefined], non_neg_integer()) ->
+    {ok, binary(), [binary()]} | {error, term()}.
+sign_p2sh_p2wsh(Tx, InputIndex, Amount, WitnessScript, ScriptPubKey,
+                Signers, HashType) ->
+    %% W31 outer P2SH commitment: hash160(redeemScript) == SPK[2..22].
+    WitnessProg = crypto:hash(sha256, WitnessScript),
+    RedeemScript = <<0, 32, WitnessProg/binary>>,
+    case beamchain_crypto:verify_p2sh_commitment(RedeemScript, ScriptPubKey) of
+        ok ->
+            sign_p2sh_p2wsh(Tx, InputIndex, Amount, WitnessScript,
+                            Signers, HashType);
         {error, _} = Err ->
             Err
     end.

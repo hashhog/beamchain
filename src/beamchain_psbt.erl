@@ -614,7 +614,7 @@ sign_with_utxo(Psbt, Tx, InputIndex, InputMap, PrivKey, Value, ScriptPubKey) ->
                     InputMap;
                 RedeemScript ->
                     sign_p2sh(Tx, InputIndex, InputMap, PrivKey, PubKey,
-                              Value, RedeemScript, SigHashType)
+                              Value, RedeemScript, ScriptPubKey, SigHashType)
             end;
 
         p2wsh ->
@@ -639,11 +639,31 @@ sign_with_utxo(Psbt, Tx, InputIndex, InputMap, PrivKey, Value, ScriptPubKey) ->
     NewInputs = replace_nth(InputIndex + 1, NewInputMap, Psbt#psbt.inputs),
     Psbt#psbt{inputs = NewInputs}.
 
-sign_p2sh(Tx, InputIndex, InputMap, PrivKey, PubKey, Value, RedeemScript, SigHashType) ->
+sign_p2sh(Tx, InputIndex, InputMap, PrivKey, PubKey, Value, RedeemScript,
+          ScriptPubKey, SigHashType) ->
+    %% W31: refuse to sign with a redeem script that doesn't commit to
+    %% the prevout's P2SH hash. Skip the input rather than throw — PSBT
+    %% sign is best-effort across multiple inputs, so a forged redeem
+    %% script in one input shouldn't take down the whole signing pass.
+    case beamchain_crypto:verify_p2sh_commitment(RedeemScript, ScriptPubKey) of
+        ok ->
+            sign_p2sh_verified(Tx, InputIndex, InputMap, PrivKey, PubKey,
+                               Value, RedeemScript, SigHashType);
+        {error, _Reason} ->
+            %% Mismatch — drop the input back unchanged. Caller can
+            %% inspect partial_sigs to see we declined.
+            InputMap
+    end.
+
+sign_p2sh_verified(Tx, InputIndex, InputMap, PrivKey, PubKey, Value,
+                   RedeemScript, SigHashType) ->
     %% Check if this is P2SH-P2WPKH or P2SH-P2WSH
     case RedeemScript of
         <<0, 20, _WitnessProg:20/binary>> ->
-            %% P2SH-P2WPKH
+            %% P2SH-P2WPKH (W31 site 4): outer P2SH commitment was
+            %% verified by sign_p2sh/9; the witness program is
+            %% hash160(pubkey) so the W31 inner check is implicit in
+            %% how we already build ScriptCode below.
             PkHash = beamchain_crypto:hash160(PubKey),
             ScriptCode = <<16#76, 16#a9, 20, PkHash/binary, 16#88, 16#ac>>,
             SigHash = beamchain_script:sighash_witness_v0(
@@ -652,21 +672,33 @@ sign_p2sh(Tx, InputIndex, InputMap, PrivKey, PubKey, Value, RedeemScript, SigHas
             SigWithType = <<DerSig/binary, SigHashType>>,
             Sigs = maps:get(partial_sigs, InputMap, #{}),
             InputMap#{partial_sigs => Sigs#{PubKey => SigWithType}};
-        <<0, 32, _WitnessProg:32/binary>> ->
-            %% P2SH-P2WSH - need witness script
+        <<0, 32, WitnessProg:32/binary>> ->
+            %% P2SH-P2WSH (W31 site 5): also assert
+            %% sha256(witnessScript) == redeem-script witness program.
             case maps:get(witness_script, InputMap, undefined) of
                 undefined ->
                     InputMap;
                 WitnessScript ->
-                    SigHash = beamchain_script:sighash_witness_v0(
-                        Tx, InputIndex, WitnessScript, Value, SigHashType),
-                    {ok, DerSig} = beamchain_crypto:ecdsa_sign(SigHash, PrivKey),
-                    SigWithType = <<DerSig/binary, SigHashType>>,
-                    Sigs = maps:get(partial_sigs, InputMap, #{}),
-                    InputMap#{partial_sigs => Sigs#{PubKey => SigWithType}}
+                    case beamchain_crypto:verify_p2wsh_commitment(
+                           WitnessScript, WitnessProg) of
+                        ok ->
+                            SigHash = beamchain_script:sighash_witness_v0(
+                                Tx, InputIndex, WitnessScript, Value,
+                                SigHashType),
+                            {ok, DerSig} =
+                                beamchain_crypto:ecdsa_sign(SigHash, PrivKey),
+                            SigWithType = <<DerSig/binary, SigHashType>>,
+                            Sigs = maps:get(partial_sigs, InputMap, #{}),
+                            InputMap#{partial_sigs =>
+                                Sigs#{PubKey => SigWithType}};
+                        {error, _} ->
+                            %% Inner P2WSH commitment failed; decline.
+                            InputMap
+                    end
             end;
         _ ->
-            %% Legacy P2SH
+            %% Legacy P2SH (W31 site 6): outer commitment already
+            %% verified by sign_p2sh/9 above.
             SigHash = beamchain_script:sighash_legacy(
                 Tx, InputIndex, RedeemScript, SigHashType),
             {ok, DerSig} = beamchain_crypto:ecdsa_sign(SigHash, PrivKey),
