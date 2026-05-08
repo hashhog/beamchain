@@ -15,6 +15,7 @@
 
 %% Public API
 -export([sign_p2wsh/6,
+         sign_p2wsh/7,
          sign_p2sh_p2wsh/6,
          sign_p2sh_p2wsh/7,
          build_p2wsh_witness_from_sigs/2,
@@ -73,6 +74,34 @@ sign_p2wsh(Tx, InputIndex, Amount, WitnessScript, Signers, HashType) ->
             sign_single_witness(SigHash, WitnessScript, Signers, HashType)
     end.
 
+%% @doc W38: 7-arity wrapper around sign_p2wsh/6 that asserts the
+%% prevout's scriptPubKey is a well-formed bare P2WSH (`OP_0 <32> H`)
+%% AND that sha256(WitnessScript) == H before delegating. Mirrors the
+%% W31 P2SH-outer-commitment idiom in sign_p2sh_p2wsh/7 below: we want
+%% callers with access to the prevout's scriptPubKey to refuse to sign
+%% over a caller-supplied witness script that doesn't commit to chain.
+%% Without this guard the signer would happily emit a signature over an
+%% attacker-controlled script.
+-spec sign_p2wsh(#transaction{}, non_neg_integer(), non_neg_integer(),
+                 binary(), binary(),
+                 [binary() | undefined], non_neg_integer()) ->
+    {ok, [binary()]} | {error, term()}.
+sign_p2wsh(Tx, InputIndex, Amount, WitnessScript, ScriptPubKey, Signers,
+           HashType) ->
+    case ScriptPubKey of
+        <<16#00, 32, WitnessProg:32/binary>> ->
+            case beamchain_crypto:verify_p2wsh_commitment(
+                   WitnessScript, WitnessProg) of
+                ok ->
+                    sign_p2wsh(Tx, InputIndex, Amount, WitnessScript,
+                               Signers, HashType);
+                {error, _} = Err ->
+                    Err
+            end;
+        _ ->
+            {error, p2wsh_spk_format}
+    end.
+
 %% @doc Sign a P2SH-wrapped P2WSH input. ScriptSig is a single push of
 %% redeemScript (which is itself the P2WSH `OP_0 <32-byte-hash>`), and
 %% the witness is the same as bare P2WSH.
@@ -80,14 +109,18 @@ sign_p2wsh(Tx, InputIndex, Amount, WitnessScript, Signers, HashType) ->
 %% Returns `{ok, ScriptSig, WitnessStack}`.
 %%
 %% Two arities:
-%%   - sign_p2sh_p2wsh/6 (legacy): takes no ScriptPubKey; the W31
-%%     P2WSH-inner check is satisfied trivially because we re-derive
-%%     the witness program from WitnessScript ourselves. Callers that
-%%     have access to the prevout's scriptPubKey should prefer the /7
-%%     form, which additionally verifies the P2SH commitment.
-%%   - sign_p2sh_p2wsh/7 (W31): also asserts that hash160 of the
-%%     emitted redeemScript matches scriptPubKey[2..22], catching a
-%%     forged WitnessScript that doesn't commit to the prevout.
+%%   - sign_p2sh_p2wsh/6 (legacy): takes no ScriptPubKey, so it cannot
+%%     verify the outer P2SH commitment. The inner P2WSH commitment is
+%%     satisfied by construction (we hash the caller's WitnessScript
+%%     ourselves into the emitted redeem-script's witness program), but
+%%     the caller is trusting that hash160(emitted-redeem) matches the
+%%     prevout's on-chain SPK. Callers that have access to the
+%%     prevout's scriptPubKey MUST prefer the /7 form.
+%%   - sign_p2sh_p2wsh/7 (W31): asserts that hash160 of the emitted
+%%     redeemScript matches scriptPubKey[2..22], catching a forged
+%%     WitnessScript that doesn't commit to the prevout. The inner
+%%     P2WSH commitment is satisfied by construction as in the /6
+%%     form.
 -spec sign_p2sh_p2wsh(#transaction{}, non_neg_integer(), non_neg_integer(),
                       binary(), [binary() | undefined], non_neg_integer()) ->
     {ok, binary(), [binary()]} | {error, term()}.
@@ -95,13 +128,17 @@ sign_p2sh_p2wsh(Tx, InputIndex, Amount, WitnessScript, Signers, HashType) ->
     case sign_p2wsh(Tx, InputIndex, Amount, WitnessScript, Signers, HashType) of
         {ok, Witness} ->
             %% scriptSig: single push of the P2WSH redeem script
-            %% (`OP_0 <SHA256(witnessScript)>`). The W31 P2WSH-inner
-            %% commitment is satisfied by construction here: we hash the
-            %% caller's WitnessScript ourselves and stuff it into the
-            %% redeem script we're emitting.
+            %% (`OP_0 <SHA256(witnessScript)>`).
+            %%
+            %% W38: the previous `verify_p2wsh_commitment(WitnessScript,
+            %% sha256(WitnessScript))` here was a `H == H` tautology
+            %% — it could never reject anything because both sides were
+            %% derived from WitnessScript on the same line. It looked
+            %% like a defensive check, wasn't, and proved nothing about
+            %% the prevout's scriptPubKey. Removed. Callers that need
+            %% an actual outer commitment check must use the /7 arity
+            %% below.
             WitnessProg = crypto:hash(sha256, WitnessScript),
-            ok = beamchain_crypto:verify_p2wsh_commitment(
-                   WitnessScript, WitnessProg),
             RedeemScript = <<0, 32, WitnessProg/binary>>,
             ScriptSig = push_data(RedeemScript),
             {ok, ScriptSig, Witness};

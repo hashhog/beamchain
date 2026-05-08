@@ -618,17 +618,44 @@ sign_with_utxo(Psbt, Tx, InputIndex, InputMap, PrivKey, Value, ScriptPubKey) ->
             end;
 
         p2wsh ->
-            %% P2WSH - need witness script
+            %% P2WSH - need witness script. W38: assert that
+            %% sha256(witnessScript) matches the 32-byte witness
+            %% program in the prevout's scriptPubKey before signing,
+            %% mirroring the W31 P2SH-P2WSH inner-commitment idiom at
+            %% sign_p2sh_verified/8 below. Without this the signer
+            %% would happily emit a sig over any caller-supplied
+            %% witness script. Decline (return InputMap unchanged) on
+            %% mismatch — PSBT sign is best-effort across multiple
+            %% inputs.
             case maps:get(witness_script, InputMap, undefined) of
                 undefined ->
                     InputMap;
                 WitnessScript ->
-                    SigHash = beamchain_script:sighash_witness_v0(
-                        Tx, InputIndex, WitnessScript, Value, SigHashType),
-                    {ok, DerSig} = beamchain_crypto:ecdsa_sign(SigHash, PrivKey),
-                    SigWithType = <<DerSig/binary, SigHashType>>,
-                    Sigs = maps:get(partial_sigs, InputMap, #{}),
-                    InputMap#{partial_sigs => Sigs#{PubKey => SigWithType}}
+                    case ScriptPubKey of
+                        <<16#00, 32, WitnessProg:32/binary>> ->
+                            case beamchain_crypto:verify_p2wsh_commitment(
+                                   WitnessScript, WitnessProg) of
+                                ok ->
+                                    SigHash = beamchain_script:sighash_witness_v0(
+                                        Tx, InputIndex, WitnessScript, Value,
+                                        SigHashType),
+                                    {ok, DerSig} =
+                                        beamchain_crypto:ecdsa_sign(
+                                          SigHash, PrivKey),
+                                    SigWithType =
+                                        <<DerSig/binary, SigHashType>>,
+                                    Sigs = maps:get(partial_sigs, InputMap, #{}),
+                                    InputMap#{partial_sigs =>
+                                        Sigs#{PubKey => SigWithType}};
+                                {error, _} ->
+                                    %% Forged witness script — decline.
+                                    InputMap
+                            end;
+                        _ ->
+                            %% scriptPubKey isn't a well-formed bare
+                            %% P2WSH SPK (`OP_0 <32> H`); decline.
+                            InputMap
+                    end
             end;
 
         _ ->
