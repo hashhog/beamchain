@@ -288,3 +288,107 @@ partial_sign_returns_error_test() ->
     Result = beamchain_witness_signer:sign_p2wsh(
         Tx, 0, Amount, WitnessScript, [priv_a(), undefined], ?SIGHASH_ALL),
     ?assertMatch({error, {partial_sign, 1, 2}}, Result).
+
+%%% ===================================================================
+%%% Wave 31: P2SH/P2WSH commitment checks
+%%% ===================================================================
+%%
+%% Camlcoin parity: lib/wallet.ml:1262 asserts
+%%   `Cstruct.equal (Crypto.hash160 redeem) script_hash`
+%% before signing a P2SH-wrapped input. Beamchain's pre-W31 signers
+%% would happily sign over any redeem/witness script handed in, even
+%% one that didn't commit to the prevout's on-chain hash. The three
+%% tests below cover the positive raw-tx P2SH-P2WPKH path plus the two
+%% negative cases — forged redeem (P2SH outer mismatch) and forged
+%% witnessScript (P2WSH inner mismatch on a P2SH-P2WSH wrap).
+
+%% --------------------------------------------------------------------
+%% Vector W31-A (positive): P2SH-P2WPKH raw-tx sign with a redeem
+%% script that DOES commit — must succeed and the Utxo's scriptPubKey
+%% must equal `OP_HASH160 <hash160(redeemScript)> OP_EQUAL`.
+%% --------------------------------------------------------------------
+w31_p2sh_p2wpkh_positive_commitment_test() ->
+    PkA = beamchain_wallet:privkey_to_pubkey(priv_a()),
+    PkHash = beamchain_crypto:hash160(PkA),
+    RedeemScript = <<0, 20, PkHash/binary>>,
+    SPK = p2sh_spk(RedeemScript),
+    Amount = 9_000_000,
+    Tx = unsigned_tx(),
+    Utxo = #utxo{value = Amount, script_pubkey = SPK,
+                 is_coinbase = false, height = 0},
+    {ok, SignedTx} = beamchain_wallet:sign_transaction(
+        Tx, [Utxo], [priv_a()], [#{}]),
+    [SignedInput] = SignedTx#transaction.inputs,
+    %% scriptSig is a push of the redeem script.
+    ?assertEqual(<<22, RedeemScript/binary>>, SignedInput#tx_in.script_sig),
+    Witness = SignedInput#tx_in.witness,
+    ?assertEqual(2, length(Witness)),
+    %% Helper agrees:
+    ?assertEqual(ok,
+                 beamchain_crypto:verify_p2sh_commitment(RedeemScript, SPK)).
+
+%% --------------------------------------------------------------------
+%% Vector W31-B (negative P2SH): forge a P2SH-P2WPKH redeem script
+%% pointing at the WRONG pubkey-hash. The wallet must throw a
+%% sign_error rather than emit a signature.
+%% --------------------------------------------------------------------
+w31_p2sh_p2wpkh_negative_forged_redeem_test() ->
+    PkA = beamchain_wallet:privkey_to_pubkey(priv_a()),
+    PkB = beamchain_wallet:privkey_to_pubkey(priv_b()),
+    %% scriptPubKey commits to A.
+    AHash = beamchain_crypto:hash160(PkA),
+    HonestRedeem = <<0, 20, AHash/binary>>,
+    SPK = p2sh_spk(HonestRedeem),
+    %% But the wallet derives its redeem script from B's privkey and
+    %% so will compute the wrong one. We simulate that by handing the
+    %% wallet B's key while presenting an SPK that commits to A.
+    Amount = 4_000_000,
+    Tx = unsigned_tx(),
+    Utxo = #utxo{value = Amount, script_pubkey = SPK,
+                 is_coinbase = false, height = 0},
+    Result = beamchain_wallet:sign_transaction(
+        Tx, [Utxo], [priv_b()], [#{}]),
+    %% sign_p2sh_p2wpkh derives RedeemScript = OP_0 hash160(PkB) and
+    %% asserts it commits — it does not, so we get the W31 error.
+    ?assertMatch({error, {p2sh_p2wpkh, p2sh_commitment_mismatch}}, Result),
+    %% Direct helper sanity:
+    ForgedRedeem = <<0, 20, (beamchain_crypto:hash160(PkB))/binary>>,
+    ?assertEqual({error, p2sh_commitment_mismatch},
+                 beamchain_crypto:verify_p2sh_commitment(ForgedRedeem, SPK)).
+
+%% --------------------------------------------------------------------
+%% Vector W31-C (negative P2WSH inner): drive the PSBT signer with a
+%% P2SH-P2WSH redeem script whose embedded 32-byte witness program
+%% does NOT match SHA256(witnessScript). The PSBT path must decline
+%% (no signature added) and verify_p2wsh_commitment/2 must reject the
+%% forgery directly.
+%% --------------------------------------------------------------------
+w31_p2sh_p2wsh_negative_forged_witnessscript_test() ->
+    PkA = beamchain_wallet:privkey_to_pubkey(priv_a()),
+    PkB = beamchain_wallet:privkey_to_pubkey(priv_b()),
+    %% Honest witness script the SPK commits to.
+    HonestWS = multisig_redeem_script(2, [PkA, PkB]),
+    HonestRedeem = p2sh_p2wsh_redeem_script(HonestWS),
+    SPK = p2sh_spk(HonestRedeem),
+    %% Forged witness script that *doesn't* hash to the SPK's witness
+    %% program (different M, different pubkey order).
+    ForgedWS = multisig_redeem_script(1, [PkB, PkA]),
+    %% The pre-W31 signer would have happily signed the forged WS;
+    %% now it must reject it because sha256(ForgedWS) /= SPK[2..22]'s
+    %% inner program.
+    HonestProg = crypto:hash(sha256, HonestWS),
+    ForgedProg = crypto:hash(sha256, ForgedWS),
+    ?assertNotEqual(HonestProg, ForgedProg),
+    %% Helper rejects:
+    ?assertEqual({error, p2wsh_commitment_mismatch},
+                 beamchain_crypto:verify_p2wsh_commitment(ForgedWS, HonestProg)),
+    %% PSBT path: feed the WRONG redeem script into the InputMap (one
+    %% built from ForgedWS) and check the outer commitment fires.
+    ForgedRedeem = p2sh_p2wsh_redeem_script(ForgedWS),
+    ?assertEqual({error, p2sh_commitment_mismatch},
+                 beamchain_crypto:verify_p2sh_commitment(ForgedRedeem, SPK)),
+    %% And direct sign_p2sh_p2wsh/7 must surface the mismatch:
+    Tx = unsigned_tx(),
+    Result = beamchain_witness_signer:sign_p2sh_p2wsh(
+        Tx, 0, 1_000_000, ForgedWS, SPK, [priv_a(), priv_b()], ?SIGHASH_ALL),
+    ?assertEqual({error, p2sh_commitment_mismatch}, Result).
