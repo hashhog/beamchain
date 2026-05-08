@@ -9,6 +9,9 @@
 %% Signing (NIF-backed)
 -export([ecdsa_sign/2, schnorr_sign/3, seckey_tweak_add/2]).
 
+%% BIP-341 Taproot key tweaking helpers (pure Erlang on top of the NIFs)
+-export([taproot_tweak_seckey/1, negate_seckey/1]).
+
 %% Recoverable ECDSA (BIP137 / Bitcoin signed messages)
 -export([ecdsa_sign_recoverable/2, ecdsa_recover/3,
          message_hash/1, sign_message/2, verify_message/3]).
@@ -268,6 +271,41 @@ schnorr_sign(Msg, SecKey, AuxRand) when byte_size(Msg) =:= 32,
 seckey_tweak_add(SecKey, Tweak) when byte_size(SecKey) =:= 32,
                                       byte_size(Tweak) =:= 32 ->
     seckey_tweak_add_nif(SecKey, Tweak).
+
+%% @doc Apply the BIP-341 TapTweak to a secret key for Taproot key-path
+%% spending (no script-path merkle root, i.e. BIP-86).
+%%
+%% Mirrors Bitcoin Core's `key.cpp::ComputeTapTweakHash` /
+%% `CKey::ComputeTapTweak` semantics: if the corresponding internal
+%% public key has odd Y, the secret key is negated (mod n) before the
+%% tweak `t = tagged_hash("TapTweak", x_only_pubkey)` is added. The
+%% returned key signs for the tweaked output key used in P2TR
+%% scriptPubKeys.
+%%
+%% This is the canonical hoist of what previously lived as
+%% `taproot_tweak_privkey/1` in both `beamchain_wallet` and
+%% `beamchain_psbt` (byte-identical copies). See BIP-341 "Constructing
+%% and spending Taproot outputs".
+-spec taproot_tweak_seckey(SecKey :: binary()) -> binary().
+taproot_tweak_seckey(SecKey) when byte_size(SecKey) =:= 32 ->
+    {ok, <<Prefix:8, XOnly:32/binary>>} = pubkey_from_privkey(SecKey),
+    Tweak = tagged_hash(<<"TapTweak">>, XOnly),
+    %% If the internal pubkey has odd Y, negate the secret key first.
+    SecKey2 = case Prefix of
+        16#02 -> SecKey;            %% even Y, no negation
+        16#03 -> negate_seckey(SecKey)
+    end,
+    {ok, Tweaked} = seckey_tweak_add(SecKey2, Tweak),
+    Tweaked.
+
+%% @doc Negate a secret key: result = (n - key) mod n, where n is the
+%% secp256k1 group order. Used by BIP-341 when the internal pubkey has
+%% odd Y. Mirrors libsecp256k1's `secp256k1_ec_seckey_negate`.
+-spec negate_seckey(SecKey :: binary()) -> binary().
+negate_seckey(SecKey) when byte_size(SecKey) =:= 32 ->
+    KeyInt = binary:decode_unsigned(SecKey, big),
+    Negated = ?SECP256K1_N - KeyInt,
+    <<Negated:256/big>>.
 
 %%% -------------------------------------------------------------------
 %%% Recoverable ECDSA / Bitcoin signed messages
