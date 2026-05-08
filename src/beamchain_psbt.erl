@@ -179,9 +179,15 @@ combine([First | Rest]) ->
 -spec finalize(#psbt{}) -> {ok, #psbt{}} | {error, term()}.
 finalize(Psbt) ->
     try
-        NewInputs = lists:map(fun(InputMap) ->
-            finalize_input(InputMap)
-        end, Psbt#psbt.inputs),
+        Tx = Psbt#psbt.unsigned_tx,
+        %% W41: thread the spending TxIn through finalize_input so
+        %% do_finalize_input can run the same Bug A1/A2 consistency
+        %% checks as sign/build_prevouts (otherwise an attacker who
+        %% controls the updater could finalise a forged prev-tx
+        %% combination that we rejected at sign-time).
+        NewInputs = lists:zipwith(fun(Input, InputMap) ->
+            finalize_input(InputMap, Input)
+        end, Tx#transaction.inputs, Psbt#psbt.inputs),
         {ok, Psbt#psbt{inputs = NewInputs}}
     catch
         throw:{finalize_error, Reason} ->
@@ -540,17 +546,23 @@ parse_output_pairs([{Key, Value} | Rest], Acc) ->
 
 sign_input(Psbt, Tx, InputIndex, PrivKey) ->
     InputMap = lists:nth(InputIndex + 1, Psbt#psbt.inputs),
-    %% Determine script type from UTXO info
-    case get_utxo_info(InputMap) of
+    Input = lists:nth(InputIndex + 1, Tx#transaction.inputs),
+    %% W41 (Bug A1+A2): consistency-check NON_WITNESS_UTXO txid AND any
+    %% (witness_utxo / non_witness_utxo) cross-disagreement before we
+    %% feed an attacker-controlled (Value, ScriptPubKey) into the
+    %% sighash. See get_utxo_info_checked/2 below + Core's
+    %% PSBTInput::IsSane (psbt.cpp ~80, ~337, ~425). On mismatch we
+    %% drop the input back unchanged rather than throwing — PSBT sign
+    %% is best-effort across multiple inputs (matches the W31/W38
+    %% verify_p2*_commitment pattern in sign_p2sh and the p2wsh arm).
+    case get_utxo_info_checked(InputMap, Input) of
         {witness_utxo, Value, ScriptPubKey} ->
             sign_with_utxo(Psbt, Tx, InputIndex, InputMap, PrivKey, Value, ScriptPubKey);
-        {non_witness_utxo, PrevTx} ->
-            Input = lists:nth(InputIndex + 1, Tx#transaction.inputs),
-            #outpoint{index = VoutIdx} = Input#tx_in.prev_out,
-            Output = lists:nth(VoutIdx + 1, PrevTx#transaction.outputs),
-            ScriptPubKey = Output#tx_out.script_pubkey,
-            Value = Output#tx_out.value,
+        {non_witness_utxo, Value, ScriptPubKey} ->
             sign_with_utxo(Psbt, Tx, InputIndex, InputMap, PrivKey, Value, ScriptPubKey);
+        {error, _Reason} ->
+            %% Forged or inconsistent UTXO data — decline this input.
+            Psbt;
         undefined ->
             %% Cannot sign without UTXO info
             Psbt
@@ -734,27 +746,109 @@ sign_p2sh_verified(Tx, InputIndex, InputMap, PrivKey, PubKey, Value,
             InputMap#{partial_sigs => Sigs#{PubKey => SigWithType}}
     end.
 
-get_utxo_info(InputMap) ->
-    case maps:get(witness_utxo, InputMap, undefined) of
-        {Value, ScriptPubKey} ->
-            {witness_utxo, Value, ScriptPubKey};
-        undefined ->
-            case maps:get(non_witness_utxo, InputMap, undefined) of
-                undefined -> undefined;
-                Tx -> {non_witness_utxo, Tx}
+%% Resolve the (Value, ScriptPubKey) the input claims to spend.
+%%
+%% Pre-W41 this happily preferred witness_utxo whenever set and never
+%% checked that non_witness_utxo's txid matched the outpoint hash —
+%% i.e. the CVE-2020-14199 "lying-amount" oracle that the W40-A audit
+%% flagged. Bug A1 (txid mismatch) and Bug A2 (witness/non-witness
+%% disagreement) are both gated here; sign / build_prevouts /
+%% finalize all funnel through this one helper so each fix lands
+%% exactly once.
+%%
+%% Mirrors Bitcoin Core psbt.cpp `PSBTInput::IsSane` semantics: when
+%% non_witness_utxo is present, its hash MUST equal the outpoint txid;
+%% when both are present, the witness_utxo MUST equal
+%% non_witness_utxo->vout[prevout.n].
+%%
+%% Returns:
+%%   {witness_utxo,     Value, ScriptPubKey}
+%%   {non_witness_utxo, Value, ScriptPubKey}
+%%   {error, non_witness_utxo_txid_mismatch}
+%%   {error, non_witness_utxo_vout_oob}
+%%   {error, utxo_value_mismatch}
+%%   {error, utxo_script_mismatch}
+%%   undefined
+get_utxo_info_checked(InputMap, #tx_in{prev_out = #outpoint{hash = ExpectedTxid,
+                                                            index = VoutIdx}}) ->
+    Witness = maps:get(witness_utxo, InputMap, undefined),
+    NonWitness = maps:get(non_witness_utxo, InputMap, undefined),
+    case {Witness, NonWitness} of
+        {undefined, undefined} ->
+            undefined;
+        {undefined, PrevTx} ->
+            %% Bug A1: validate the supplied prev-tx really is the
+            %% one named by the outpoint.
+            case beamchain_crypto:verify_non_witness_utxo_txid(
+                   PrevTx, ExpectedTxid) of
+                ok ->
+                    case nth_output(PrevTx, VoutIdx) of
+                        {ok, #tx_out{value = V, script_pubkey = SPK}} ->
+                            {non_witness_utxo, V, SPK};
+                        {error, _} = E ->
+                            E
+                    end;
+                {error, _} = E ->
+                    E
+            end;
+        {{WV, WSPK}, undefined} ->
+            {witness_utxo, WV, WSPK};
+        {{WV, WSPK}, PrevTx} ->
+            %% Bug A1 + A2: validate the prev-tx txid AND that
+            %% witness_utxo agrees with non_witness_utxo->vout[n].
+            case beamchain_crypto:verify_non_witness_utxo_txid(
+                   PrevTx, ExpectedTxid) of
+                ok ->
+                    case nth_output(PrevTx, VoutIdx) of
+                        {ok, #tx_out{value = NV, script_pubkey = NSPK}} ->
+                            if
+                                NV =/= WV ->
+                                    {error, utxo_value_mismatch};
+                                NSPK =/= WSPK ->
+                                    {error, utxo_script_mismatch};
+                                true ->
+                                    %% Both agree — prefer witness_utxo
+                                    %% (matches Core's GetUTXO).
+                                    {witness_utxo, WV, WSPK}
+                            end;
+                        {error, _} = E ->
+                            E
+                    end;
+                {error, _} = E ->
+                    E
             end
     end.
+
+%% 0-indexed safe nth — returns {error, non_witness_utxo_vout_oob} if
+%% the spending input names a vout that doesn't exist in the supplied
+%% prev-tx (also a divergence from Core, which rejects in IsSane).
+nth_output(#transaction{outputs = Outputs}, VoutIdx)
+  when is_integer(VoutIdx), VoutIdx >= 0 ->
+    if
+        VoutIdx < length(Outputs) ->
+            {ok, lists:nth(VoutIdx + 1, Outputs)};
+        true ->
+            {error, non_witness_utxo_vout_oob}
+    end;
+nth_output(_, _) ->
+    {error, non_witness_utxo_vout_oob}.
 
 build_prevouts(Psbt) ->
     Tx = Psbt#psbt.unsigned_tx,
     lists:zipwith(fun(Input, InputMap) ->
-        case get_utxo_info(InputMap) of
+        %% W41: route through get_utxo_info_checked/2 so a forged
+        %% non_witness_utxo can't poison the taproot prevouts vector
+        %% (which feeds sighash_taproot's amounts/scriptpubkeys hash).
+        case get_utxo_info_checked(InputMap, Input) of
             {witness_utxo, Value, ScriptPubKey} ->
                 {Value, ScriptPubKey};
-            {non_witness_utxo, PrevTx} ->
-                #outpoint{index = VoutIdx} = Input#tx_in.prev_out,
-                Output = lists:nth(VoutIdx + 1, PrevTx#transaction.outputs),
-                {Output#tx_out.value, Output#tx_out.script_pubkey};
+            {non_witness_utxo, Value, ScriptPubKey} ->
+                {Value, ScriptPubKey};
+            {error, _} ->
+                %% Inconsistent — emit a sentinel so any sighash that
+                %% touches this slot won't validate. Same shape we
+                %% already used for the `undefined` arm.
+                {0, <<>>};
             undefined ->
                 {0, <<>>}
         end
@@ -764,25 +858,27 @@ build_prevouts(Psbt) ->
 %%% Internal: Finalization
 %%% ===================================================================
 
-finalize_input(InputMap) ->
+finalize_input(InputMap, Input) ->
     %% If already finalized, return as-is
     case maps:is_key(final_script_sig, InputMap) orelse
          maps:is_key(final_script_witness, InputMap) of
         true ->
             InputMap;
         false ->
-            do_finalize_input(InputMap)
+            do_finalize_input(InputMap, Input)
     end.
 
-do_finalize_input(InputMap) ->
-    %% Determine script type from UTXO
-    case get_utxo_info(InputMap) of
+do_finalize_input(InputMap, Input) ->
+    %% W41: same get_utxo_info_checked/2 chokepoint — Bug A1/A2 errors
+    %% surface as `{finalize_error, Reason}` so a forged-prev-tx PSBT
+    %% can't be finalised into a misleading on-chain transaction.
+    case get_utxo_info_checked(InputMap, Input) of
         {witness_utxo, _Value, ScriptPubKey} ->
             finalize_with_script(InputMap, ScriptPubKey);
-        {non_witness_utxo, _Tx} ->
-            %% For non-witness, we need to know the script somehow
-            %% This is a simplified case
-            finalize_legacy(InputMap);
+        {non_witness_utxo, _Value, ScriptPubKey} ->
+            finalize_with_script(InputMap, ScriptPubKey);
+        {error, Reason} ->
+            throw({finalize_error, Reason});
         undefined ->
             throw({finalize_error, missing_utxo})
     end.
@@ -902,24 +998,10 @@ finalize_p2wsh(InputMap) ->
             }
     end.
 
-finalize_legacy(InputMap) ->
-    PartialSigs = maps:get(partial_sigs, InputMap, #{}),
-    case maps:to_list(PartialSigs) of
-        [{PubKey, Sig}] ->
-            ScriptSig = push_data(Sig, push_data(PubKey, <<>>)),
-            InputMap#{final_script_sig => ScriptSig};
-        [] ->
-            throw({finalize_error, missing_signature});
-        _ ->
-            %% Assume multisig
-            RedeemScript = maps:get(redeem_script, InputMap, undefined),
-            case RedeemScript of
-                undefined ->
-                    throw({finalize_error, missing_redeem_script});
-                _ ->
-                    finalize_legacy_p2sh(InputMap, RedeemScript)
-            end
-    end.
+%% W41: `finalize_legacy/1` removed — `do_finalize_input/2` now always
+%% has the resolved scriptPubKey (via get_utxo_info_checked/2) so it
+%% can dispatch through `finalize_with_script/2`. The fallback was the
+%% only thing that hid the missing A1/A2 checks.
 
 build_multisig_witness(PartialSigs, WitnessScript) ->
     %% Wave 28: delegate to the shared canonical witness builder so

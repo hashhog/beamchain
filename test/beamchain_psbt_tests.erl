@@ -409,3 +409,227 @@ taproot_key_sig() ->
     InputMap = beamchain_psbt:get_input(Decoded, 0),
     ?assertEqual(KeySig, maps:get(tap_key_sig, InputMap)).
 
+%%% ===================================================================
+%%% W41 — NON_WITNESS_UTXO consistency (Bug A1 + A2)
+%%%
+%%% Ported from W40-A audit notes (see commit message).  Mirrors
+%%% Bitcoin Core's `PSBTInput::IsSane` invariant in psbt.cpp ~80,
+%%% ~337, ~425:
+%%%   - `non_witness_utxo->GetHash() == tx->vin[i].prevout.hash` (A1)
+%%%   - if both witness_utxo and non_witness_utxo are present, they
+%%%     must agree on amount + scriptPubKey for prevout.n (A2)
+%%%
+%%% Fixtures here are deliberately ASYMMETRIC (different output
+%%% values, different scriptPubKeys, different vouts) so a
+%%% mistakenly-reversed txid byte order or a wrong-vout indexing bug
+%%% would surface as a test failure.
+%%% ===================================================================
+
+%% Build a prev-tx with two outputs of distinct values + scripts so
+%% indexing bugs can't accidentally pass.
+sample_prev_tx() ->
+    #transaction{
+        version = 2,
+        inputs = [
+            #tx_in{
+                prev_out = #outpoint{
+                    hash = <<16#aa:256>>, %% asymmetric
+                    index = 7
+                },
+                script_sig = <<>>,
+                sequence = 16#ffffffff,
+                witness = []
+            }
+        ],
+        outputs = [
+            #tx_out{
+                value = 50000,
+                script_pubkey =
+                    <<16#00, 20,
+                      9,9,9,9,9,9,9,9,9,9,
+                      9,9,9,9,9,9,9,9,9,9>> %% P2WPKH(0x09..)
+            },
+            #tx_out{
+                value = 77777,
+                script_pubkey =
+                    <<16#00, 20,
+                      8,8,8,8,8,8,8,8,8,8,
+                      8,8,8,8,8,8,8,8,8,8>> %% P2WPKH(0x08..) — distinct
+            }
+        ],
+        locktime = 0,
+        txid = undefined,
+        wtxid = undefined
+    }.
+
+%% Spending tx that names PrevTx's real txid + vout 0.
+spending_tx_for(PrevTx, VoutIdx) ->
+    Txid = beamchain_serialize:tx_hash(PrevTx),
+    #transaction{
+        version = 2,
+        inputs = [
+            #tx_in{
+                prev_out = #outpoint{hash = Txid, index = VoutIdx},
+                script_sig = <<>>,
+                sequence = 16#fffffffd,
+                witness = []
+            }
+        ],
+        outputs = [
+            #tx_out{
+                value = 30000,
+                script_pubkey = <<16#00, 20,
+                                  1,1,1,1,1,1,1,1,1,1,
+                                  1,1,1,1,1,1,1,1,1,1>>
+            }
+        ],
+        locktime = 0,
+        txid = undefined,
+        wtxid = undefined
+    }.
+
+w41_consistency_test_() ->
+    {"W41 PSBT NON_WITNESS_UTXO consistency", [
+        {"verify_non_witness_utxo_txid happy path",
+         fun w41_verify_helper_match/0},
+        {"verify_non_witness_utxo_txid mismatch",
+         fun w41_verify_helper_mismatch/0},
+        {"sign declines on forged prev-tx (A1)",
+         fun w41_sign_rejects_a1/0},
+        {"finalize errors on forged prev-tx (A1)",
+         fun w41_finalize_rejects_a1/0},
+        {"sign declines on amount disagreement (A2)",
+         fun w41_sign_rejects_a2_value/0},
+        {"sign declines on scriptPubKey disagreement (A2)",
+         fun w41_sign_rejects_a2_script/0},
+        {"finalize errors on A2 disagreement",
+         fun w41_finalize_rejects_a2/0},
+        {"both UTXOs present and consistent — accepts",
+         fun w41_consistent_both_ok/0}
+    ]}.
+
+w41_verify_helper_match() ->
+    PrevTx = sample_prev_tx(),
+    Txid = beamchain_serialize:tx_hash(PrevTx),
+    ?assertEqual(ok,
+                 beamchain_crypto:verify_non_witness_utxo_txid(PrevTx, Txid)).
+
+w41_verify_helper_mismatch() ->
+    PrevTx = sample_prev_tx(),
+    %% Asymmetric wrong txid — definitely not a palindrome.
+    Wrong = <<16#01, 16#02, 16#03, 16#04, 16#05, 16#06, 16#07, 16#08,
+              16#09, 16#0a, 16#0b, 16#0c, 16#0d, 16#0e, 16#0f, 16#10,
+              16#11, 16#12, 16#13, 16#14, 16#15, 16#16, 16#17, 16#18,
+              16#19, 16#1a, 16#1b, 16#1c, 16#1d, 16#1e, 16#1f, 16#20>>,
+    ?assertEqual({error, non_witness_utxo_txid_mismatch},
+                 beamchain_crypto:verify_non_witness_utxo_txid(PrevTx, Wrong)).
+
+%% A1: spending tx outpoint names a txid that doesn't match the prev-tx
+%% the updater handed us. sign() must NOT produce a partial signature
+%% (best-effort policy — drop the input).
+w41_sign_rejects_a1() ->
+    PrevTx = sample_prev_tx(),
+    Tx = spending_tx_for(PrevTx, 0),
+    %% Tamper with PrevTx so its hash no longer matches the outpoint:
+    %% reorder its outputs (different tx_hash, same total value).
+    [O0, O1] = PrevTx#transaction.outputs,
+    ForgedPrevTx = PrevTx#transaction{outputs = [O1, O0]},
+    {ok, Psbt} = beamchain_psbt:create(Tx),
+    {ok, Updated} = beamchain_psbt:update(Psbt, [
+        {input, 0, #{non_witness_utxo => ForgedPrevTx}}
+    ]),
+    PrivKey = <<1:256>>,
+    {ok, Signed} = beamchain_psbt:sign(Updated, [{0, PrivKey}]),
+    InputMap = beamchain_psbt:get_input(Signed, 0),
+    %% No partial signature should have been produced.
+    ?assertEqual(#{}, maps:get(partial_sigs, InputMap, #{})),
+    ?assertNot(maps:is_key(tap_key_sig, InputMap)).
+
+w41_finalize_rejects_a1() ->
+    PrevTx = sample_prev_tx(),
+    Tx = spending_tx_for(PrevTx, 0),
+    [O0, O1] = PrevTx#transaction.outputs,
+    ForgedPrevTx = PrevTx#transaction{outputs = [O1, O0]},
+    {ok, Psbt} = beamchain_psbt:create(Tx),
+    {ok, Updated} = beamchain_psbt:update(Psbt, [
+        {input, 0, #{non_witness_utxo => ForgedPrevTx}}
+    ]),
+    ?assertEqual({error, non_witness_utxo_txid_mismatch},
+                 beamchain_psbt:finalize(Updated)).
+
+%% A2: witness_utxo claims a different value from the corresponding
+%% non_witness_utxo->vout[n]. Updater is lying about the amount —
+%% reject (CVE-2020-14199 fix shape).
+w41_sign_rejects_a2_value() ->
+    PrevTx = sample_prev_tx(),
+    Tx = spending_tx_for(PrevTx, 0),
+    [#tx_out{script_pubkey = SPK0} | _] = PrevTx#transaction.outputs,
+    %% The real value at vout 0 is 50000; witness_utxo lies as 99999.
+    {ok, Psbt} = beamchain_psbt:create(Tx),
+    {ok, Updated} = beamchain_psbt:update(Psbt, [
+        {input, 0, #{
+            non_witness_utxo => PrevTx,
+            witness_utxo => {99999, SPK0}
+        }}
+    ]),
+    PrivKey = <<2:256>>,
+    {ok, Signed} = beamchain_psbt:sign(Updated, [{0, PrivKey}]),
+    InputMap = beamchain_psbt:get_input(Signed, 0),
+    ?assertEqual(#{}, maps:get(partial_sigs, InputMap, #{})).
+
+w41_sign_rejects_a2_script() ->
+    PrevTx = sample_prev_tx(),
+    Tx = spending_tx_for(PrevTx, 0),
+    [#tx_out{value = V0} | _] = PrevTx#transaction.outputs,
+    %% Lie about the scriptPubKey while keeping the value.
+    LyingSPK = <<16#00, 20, 7,7,7,7,7,7,7,7,7,7,
+                          7,7,7,7,7,7,7,7,7,7>>,
+    {ok, Psbt} = beamchain_psbt:create(Tx),
+    {ok, Updated} = beamchain_psbt:update(Psbt, [
+        {input, 0, #{
+            non_witness_utxo => PrevTx,
+            witness_utxo => {V0, LyingSPK}
+        }}
+    ]),
+    PrivKey = <<3:256>>,
+    {ok, Signed} = beamchain_psbt:sign(Updated, [{0, PrivKey}]),
+    InputMap = beamchain_psbt:get_input(Signed, 0),
+    ?assertEqual(#{}, maps:get(partial_sigs, InputMap, #{})).
+
+w41_finalize_rejects_a2() ->
+    PrevTx = sample_prev_tx(),
+    Tx = spending_tx_for(PrevTx, 0),
+    [#tx_out{script_pubkey = SPK0} | _] = PrevTx#transaction.outputs,
+    {ok, Psbt} = beamchain_psbt:create(Tx),
+    {ok, Updated} = beamchain_psbt:update(Psbt, [
+        {input, 0, #{
+            non_witness_utxo => PrevTx,
+            witness_utxo => {12345, SPK0} %% real is 50000
+        }}
+    ]),
+    ?assertEqual({error, utxo_value_mismatch},
+                 beamchain_psbt:finalize(Updated)).
+
+%% Sanity / no-regression: when both UTXOs are present and consistent,
+%% the consistency-check helper accepts it. We assert via the round-trip
+%% encode/decode of the witness_utxo (same as the existing
+%% encode_with_witness_utxo test) — the load-bearing part is that
+%% finalize doesn't error out.
+w41_consistent_both_ok() ->
+    PrevTx = sample_prev_tx(),
+    Tx = spending_tx_for(PrevTx, 1), %% pick vout 1 to exercise non-zero index
+    [_, #tx_out{value = V1, script_pubkey = SPK1}] =
+        PrevTx#transaction.outputs,
+    {ok, Psbt} = beamchain_psbt:create(Tx),
+    {ok, Updated} = beamchain_psbt:update(Psbt, [
+        {input, 0, #{
+            non_witness_utxo => PrevTx,
+            witness_utxo => {V1, SPK1}
+        }}
+    ]),
+    %% finalize will still fail (no partial_sigs), but with a *signing*
+    %% error (missing_signature), not a UTXO-consistency error — that's
+    %% the load-bearing distinction.
+    ?assertMatch({error, missing_signature},
+                 beamchain_psbt:finalize(Updated)).
+
