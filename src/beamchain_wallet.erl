@@ -1084,6 +1084,14 @@ sign_p2sh_p2wpkh(Tx, InputIndex, Input, Utxo, PrivKey) ->
     PkHash = beamchain_crypto:hash160(PubKey),
     %% Redeem script: OP_0 <20-byte-hash> (P2WPKH witness program)
     RedeemScript = <<0, 20, PkHash/binary>>,
+    %% W31: assert hash160(redeemScript) == scriptPubKey[2..22] before
+    %% signing — refuse to sign over a redeem script that doesn't
+    %% commit to the prevout's P2SH hash.
+    case beamchain_crypto:verify_p2sh_commitment(
+           RedeemScript, Utxo#utxo.script_pubkey) of
+        ok -> ok;
+        {error, Reason} -> throw({sign_error, {p2sh_p2wpkh, Reason}})
+    end,
     %% scriptCode for BIP 143: same as P2WPKH
     ScriptCode = <<16#76, 16#a9, 20, PkHash/binary, 16#88, 16#ac>>,
     SigHash = beamchain_script:sighash_witness_v0(
@@ -1131,9 +1139,15 @@ sign_p2sh_p2wsh_input(Tx, InputIndex, Input, Utxo, PrivKey, ScriptInfo) ->
         undefined ->
             throw({sign_error, missing_witness_script});
         _ ->
+            %% W31: route through the /7 entry that asserts
+            %% hash160(redeemScript) == scriptPubKey[2..22]. The
+            %% inner SHA256 commitment is enforced by the /6 path
+            %% (we re-derive the redeem-script witness program from
+            %% WitnessScript ourselves).
             Signers = signers_for_p2wsh(WitnessScript, PrivKey, ScriptInfo),
             case beamchain_witness_signer:sign_p2sh_p2wsh(
                    Tx, InputIndex, Utxo#utxo.value, WitnessScript,
+                   Utxo#utxo.script_pubkey,
                    Signers, ?SIGHASH_ALL) of
                 {ok, ScriptSig, Witness} ->
                     Input#tx_in{
