@@ -32,6 +32,11 @@
 %% scriptPubKey/witness-program prior to signing or finalising.
 -export([verify_p2sh_commitment/2, verify_p2wsh_commitment/2]).
 
+%% PSBT NON_WITNESS_UTXO consistency (W41): assert the supplied
+%% previous transaction actually hashes to the outpoint txid the input
+%% claims to spend.
+-export([verify_non_witness_utxo_txid/2]).
+
 %% Hardware introspection
 -export([sha256_hardware_info/0]).
 
@@ -582,6 +587,36 @@ verify_p2wsh_commitment(WitnessScript, WitnessProgram)
             end;
         _ ->
             {error, p2wsh_program_size}
+    end.
+
+%% W41 / Bug A1 — PSBT NON_WITNESS_UTXO consistency.
+%%
+%% BIP-174 requires that the full previous transaction supplied via
+%% PSBT_IN_NON_WITNESS_UTXO actually hashes to the txid the spending
+%% input names in its outpoint. Without this check a malicious updater
+%% could feed the signer a forged prev-tx whose outputs lie about the
+%% amount being spent (the CVE-2020-14199 oracle). Bitcoin Core enforces
+%% this at psbt.cpp `PSBTInput::IsSane` (and inline at the GetUTXO call
+%% sites in psbt.cpp ~80, ~337, ~425):
+%%   if (input.non_witness_utxo->GetHash() !=
+%%       tx->vin[input_index].prevout.hash) return error;
+%%
+%% Beamchain stores both `tx_hash(Tx)` (double-SHA256 of the no-witness
+%% serialisation, see beamchain_serialize:tx_hash/1) and the outpoint
+%% `hash` field in identical internal byte order — so this is a direct
+%% binary equality check, no reversal needed (the user-facing reversal
+%% only matters for hex display).
+%%
+%% Mirrors the W38 idiom of `verify_p2wsh_commitment/2` above: cheap,
+%% caller-driven, returns ok or `{error, Reason}`.
+-spec verify_non_witness_utxo_txid(PrevTx :: term(),
+                                   ExpectedTxid :: binary()) ->
+    ok | {error, non_witness_utxo_txid_mismatch}.
+verify_non_witness_utxo_txid(PrevTx, ExpectedTxid)
+  when is_binary(ExpectedTxid), byte_size(ExpectedTxid) =:= 32 ->
+    case beamchain_serialize:tx_hash(PrevTx) of
+        ExpectedTxid -> ok;
+        _ -> {error, non_witness_utxo_txid_mismatch}
     end.
 
 %%% -------------------------------------------------------------------
