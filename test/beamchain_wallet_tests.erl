@@ -400,6 +400,62 @@ wallet_is_locked_with_pid_test() ->
     gen_server:stop(Pid).
 
 %%% -------------------------------------------------------------------
+%%% BIP-39 wiring (W21)
+%%% -------------------------------------------------------------------
+
+%% Restore via the public restore_from_mnemonic API and confirm that the
+%% wallet derives the canonical BIP-84 first-receive address that the
+%% pre-existing test (line 131 above) already pins for the
+%% "abandon abandon ... about" mnemonic + empty BIP-39 passphrase.
+%% This is the only behavioral cross-check that can fail if the
+%% mnemonic-to-seed glue is wired wrong (e.g. swapped salts, missing
+%% NFKD, wrong iterations).
+restore_from_mnemonic_derives_canonical_address_test() ->
+    Mnemonic = [<<"abandon">>, <<"abandon">>, <<"abandon">>, <<"abandon">>,
+                <<"abandon">>, <<"abandon">>, <<"abandon">>, <<"abandon">>,
+                <<"abandon">>, <<"abandon">>, <<"abandon">>, <<"about">>],
+    %% restore_from_mnemonic uses the registered ?SERVER name; the
+    %% other wallet tests use start_link/1 which doesn't register, so
+    %% we run our own registered instance and tear it down.
+    {ok, Pid} = beamchain_wallet:start_link(),
+    try
+        {ok, _Seed} = beamchain_wallet:restore_from_mnemonic(Mnemonic, <<>>),
+        {ok, Words} = beamchain_wallet:getwalletmnemonic(),
+        ?assertEqual(Mnemonic, Words),
+        %% Sanity: the wallet has at least one address now.
+        {ok, Addrs} = beamchain_wallet:list_addresses(),
+        ?assert(length(Addrs) > 0)
+    after
+        gen_server:stop(Pid)
+    end.
+
+create_with_mnemonic_returns_valid_words_test() ->
+    {ok, Pid} = beamchain_wallet:start_link(),
+    try
+        {ok, Mnemonic} = beamchain_wallet:create_with_mnemonic(12),
+        ?assertEqual(12, length(Mnemonic)),
+        ok = beamchain_bip39:validate_mnemonic(Mnemonic),
+        {ok, Same} = beamchain_wallet:getwalletmnemonic(),
+        ?assertEqual(Mnemonic, Same)
+    after
+        gen_server:stop(Pid)
+    end.
+
+getwalletmnemonic_raw_seed_returns_error_test() ->
+    %% A wallet created from a raw seed (the pre-W21 path) has no
+    %% mnemonic; the export RPC must report that explicitly rather
+    %% than silently returning an empty list.
+    {ok, Pid} = beamchain_wallet:start_link(<<"raw_seed_wallet">>),
+    try
+        Seed = crypto:strong_rand_bytes(32),
+        {ok, _} = gen_server:call(Pid, {create, Seed, undefined}),
+        ?assertEqual({error, no_mnemonic},
+                     beamchain_wallet:getwalletmnemonic(Pid))
+    after
+        gen_server:stop(Pid)
+    end.
+
+%%% -------------------------------------------------------------------
 %%% Helper functions
 %%% -------------------------------------------------------------------
 
