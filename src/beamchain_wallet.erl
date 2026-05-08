@@ -1028,7 +1028,7 @@ sign_p2tr(Tx, InputIndex, Input, PrivKey, PrevOuts) ->
         undefined, undefined, 16#ffffffff),
     %% For key-path spending, we need to tweak the private key
     %% with the same TapTweak used to create the output key
-    TweakedPrivKey = taproot_tweak_privkey(PrivKey),
+    TweakedPrivKey = beamchain_crypto:taproot_tweak_seckey(PrivKey),
     AuxRand = crypto:strong_rand_bytes(32),
     {ok, SchnorrSig} = beamchain_crypto:schnorr_sign(
         SigHash, TweakedPrivKey, AuxRand),
@@ -1062,25 +1062,11 @@ sign_p2sh_p2wpkh(Tx, InputIndex, Input, Utxo, PrivKey) ->
 %%% Signing helpers
 %%% ===================================================================
 
-%% Apply the BIP 341 TapTweak to a private key for key-path spending.
-taproot_tweak_privkey(PrivKey) ->
-    {ok, <<Prefix:8, XOnly:32/binary>>} =
-        beamchain_crypto:pubkey_from_privkey(PrivKey),
-    Tweak = beamchain_crypto:tagged_hash(<<"TapTweak">>, XOnly),
-    %% If the public key has odd Y, negate the private key first
-    PrivKey2 = case Prefix of
-        16#02 -> PrivKey;  %% even Y, no negation needed
-        16#03 -> negate_privkey(PrivKey)
-    end,
-    {ok, TweakedPriv} = beamchain_crypto:seckey_tweak_add(PrivKey2, Tweak),
-    TweakedPriv.
-
-%% Negate a private key: result = N - key (mod N)
-negate_privkey(PrivKey) ->
-    N = 16#FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141,
-    KeyInt = binary:decode_unsigned(PrivKey, big),
-    Negated = N - KeyInt,
-    <<Negated:256/big>>.
+%% NOTE: BIP-341 taproot_tweak_seckey/1 + negate_seckey/1 used to live
+%% here as `taproot_tweak_privkey/1` + `negate_privkey/1`. They have been
+%% hoisted into `beamchain_crypto` (Wave 27-E refactor) so the wallet
+%% and PSBT modules share one canonical implementation. Call
+%% `beamchain_crypto:taproot_tweak_seckey/1` directly.
 
 %% Push data onto a script: creates proper push opcode
 push_data(Data, Acc) ->
@@ -1209,7 +1195,7 @@ sign_psbt_input(Psbt, InputIndex, PrivKey) ->
                     SigHash = beamchain_script:sighash_taproot(
                         Tx, InputIndex, PrevOuts, ?SIGHASH_DEFAULT,
                         undefined, undefined, 16#ffffffff),
-                    TweakedPrivKey = taproot_tweak_privkey(PrivKey),
+                    TweakedPrivKey = beamchain_crypto:taproot_tweak_seckey(PrivKey),
                     AuxRand = crypto:strong_rand_bytes(32),
                     {ok, SchnorrSig} = beamchain_crypto:schnorr_sign(
                         SigHash, TweakedPrivKey, AuxRand),
