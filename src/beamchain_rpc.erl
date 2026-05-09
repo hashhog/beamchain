@@ -3702,27 +3702,9 @@ rpc_validateaddress(_) ->
 rpc_decodescript([HexStr]) when is_binary(HexStr) ->
     try
         Script = beamchain_serialize:hex_decode(HexStr),
-        Type = beamchain_address:classify_script(Script),
         Network = beamchain_config:network(),
         NetType = case Network of mainnet -> mainnet; _ -> testnet end,
-        Address = beamchain_address:script_to_address(Script, NetType),
-        %% P2SH address of this script
-        ScriptHash = beamchain_crypto:hash160(Script),
-        P2SHScript = <<16#a9, 16#14, ScriptHash/binary, 16#87>>,
-        P2SH = beamchain_address:script_to_address(P2SHScript, NetType),
-        {ok, #{
-            <<"asm">> => beamchain_serialize:hex_encode(Script),
-            <<"type">> => script_type_name(Type),
-            <<"address">> => case Address of
-                unknown -> null;
-                "OP_RETURN" -> null;
-                Addr -> iolist_to_binary(Addr)
-            end,
-            <<"p2sh">> => case P2SH of
-                unknown -> null;
-                Addr2 -> iolist_to_binary(Addr2)
-            end
-        }}
+        {ok, ds_build_result(Script, NetType)}
     catch
         _:_ ->
             {error, ?RPC_DESERIALIZATION_ERROR,
@@ -3731,6 +3713,144 @@ rpc_decodescript([HexStr]) when is_binary(HexStr) ->
 rpc_decodescript(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"Usage: decodescript \"hexstring\"">>}.
+
+%% ── decodescript helpers ──────────────────────────────────────────────────────
+
+%% ds_classify/1 — like classify_script but applies Core's Solver semantics for
+%% OP_RETURN scripts: if the bytes after OP_RETURN are not IsPushOnly (e.g. a
+%% truncated push), Solver returns NONSTANDARD rather than NULL_DATA.
+ds_classify(<<16#6a, Rest/binary>> = _Script) ->
+    case ds_is_push_only(Rest) of
+        true  -> op_return;
+        false -> nonstandard
+    end;
+ds_classify(Script) ->
+    beamchain_address:classify_script(Script).
+
+%% ds_is_push_only/1 — mirrors CScript::IsPushOnly: all opcodes must be
+%% push opcodes (OP_0 / OP_1NEGATE / OP_1..OP_16 / direct pushes) and all
+%% push lengths must be satisfied within the remaining bytes.
+ds_is_push_only(<<>>) -> true;
+ds_is_push_only(<<16#00, Rest/binary>>) ->            %% OP_0
+    ds_is_push_only(Rest);
+ds_is_push_only(<<16#4f, Rest/binary>>) ->            %% OP_1NEGATE
+    ds_is_push_only(Rest);
+ds_is_push_only(<<Op, Rest/binary>>) when Op >= 16#51, Op =< 16#60 ->  %% OP_1..OP_16
+    ds_is_push_only(Rest);
+ds_is_push_only(<<16#4c, Len:8, Data:Len/binary, Rest/binary>>) ->    %% OP_PUSHDATA1
+    _ = Data, ds_is_push_only(Rest);
+ds_is_push_only(<<16#4d, Len:16/little, Data:Len/binary, Rest/binary>>) -> %% OP_PUSHDATA2
+    _ = Data, ds_is_push_only(Rest);
+ds_is_push_only(<<16#4e, Len:32/little, Data:Len/binary, Rest/binary>>) -> %% OP_PUSHDATA4
+    _ = Data, ds_is_push_only(Rest);
+ds_is_push_only(<<Len, Data:Len/binary, Rest/binary>>) when Len >= 16#01, Len =< 16#4b ->
+    _ = Data, ds_is_push_only(Rest);
+ds_is_push_only(_) -> false.   %% truncated push or non-push opcode
+
+%% ds_is_unspendable/1 — mirrors CScript::IsUnspendable: starts with OP_RETURN.
+ds_is_unspendable(<<16#6a, _/binary>>) -> true;
+ds_is_unspendable(_)                   -> false.
+
+%% ds_has_op_checksigadd/1 — contains OP_CHECKSIGADD (0xba) or OP_SUCCESS.
+%% For decodescript we only need to exclude scripts with OP_CHECKSIGADD.
+ds_has_op_checksigadd(Script) ->
+    binary:match(Script, <<16#ba>>) =/= nomatch.
+
+%% ds_can_wrap/2 — Core's can_wrap predicate.
+ds_can_wrap(p2pkh,   Script) -> not ds_is_unspendable(Script) andalso not ds_has_op_checksigadd(Script);
+ds_can_wrap(p2wpkh,  Script) -> not ds_is_unspendable(Script) andalso not ds_has_op_checksigadd(Script);
+ds_can_wrap(p2wsh,   Script) -> not ds_is_unspendable(Script) andalso not ds_has_op_checksigadd(Script);
+ds_can_wrap(nonstandard, Script) -> not ds_is_unspendable(Script) andalso not ds_has_op_checksigadd(Script);
+%% NULL_DATA / P2SH / P2TR / WITNESS_UNKNOWN → cannot wrap
+ds_can_wrap(op_return, _)    -> false;
+ds_can_wrap(p2sh, _)         -> false;
+ds_can_wrap(p2tr, _)         -> false;
+ds_can_wrap({witness, _, _}, _) -> false;
+ds_can_wrap(_, _)            -> false.
+
+%% ds_can_wrap_p2wsh/1 — Core's can_wrap_P2WSH predicate (called only when can_wrap=true).
+%% PUBKEY/MULTISIG: only if all pubkeys compressed (beamchain's classify returns nonstandard
+%% for multisig, so we only need to handle p2pkh and nonstandard).
+%% PUBKEYHASH / NONSTANDARD → true
+%% Already-segwit (p2wpkh, p2wsh) → false
+ds_can_wrap_p2wsh(p2pkh)       -> true;
+ds_can_wrap_p2wsh(nonstandard) -> true;
+ds_can_wrap_p2wsh(_)           -> false.
+
+%% ds_p2sh_wrap_address/2 — P2SH(script): base58-encode Hash160(script).
+ds_p2sh_wrap_address(Script, NetType) ->
+    H160 = beamchain_crypto:hash160(Script),
+    P2SHScript = <<16#a9, 16#14, H160/binary, 16#87>>,
+    Addr = beamchain_address:script_to_address(P2SHScript, NetType),
+    iolist_to_binary(Addr).
+
+%% ds_build_p2wpkh_script/1 — OP_0 <20-byte hash>
+ds_build_p2wpkh_script(Hash20) when byte_size(Hash20) =:= 20 ->
+    <<16#00, 16#14, Hash20/binary>>.
+
+%% ds_build_p2wsh_script/1 — OP_0 <SHA256(script)>
+ds_build_p2wsh_script(Script) ->
+    H = beamchain_crypto:sha256(Script),
+    <<16#00, 16#20, H/binary>>.
+
+%% ds_build_result/2 — produce the full decodescript JSON map.
+ds_build_result(Script, NetType) ->
+    TypeAtom = ds_classify(Script),
+    TypeBin  = script_type_name(TypeAtom),
+    Asm      = script_to_asm_core(Script),
+    Desc     = infer_spk_descriptor(Script, NetType),
+    Base = #{
+        <<"asm">>  => Asm,
+        <<"desc">> => Desc,
+        <<"type">> => TypeBin
+    },
+    %% address: only when script_to_address succeeds (no null, no hex field)
+    Base1 = case beamchain_address:script_to_address(Script, NetType) of
+        unknown     -> Base;
+        "OP_RETURN" -> Base;
+        Addr        -> Base#{<<"address">> => iolist_to_binary(Addr)}
+    end,
+    %% p2sh wrap (and optionally segwit inner)
+    case ds_can_wrap(TypeAtom, Script) of
+        false ->
+            Base1;
+        true ->
+            P2SH = ds_p2sh_wrap_address(Script, NetType),
+            Base2 = Base1#{<<"p2sh">> => P2SH},
+            case ds_can_wrap_p2wsh(TypeAtom) of
+                false ->
+                    Base2;
+                true ->
+                    SegwitScript = case TypeAtom of
+                        p2pkh ->
+                            %% Extract 20-byte hash from P2PKH: skip OP_DUP OP_HASH160 <len>
+                            <<_:3/binary, H20:20/binary, _/binary>> = Script,
+                            ds_build_p2wpkh_script(H20);
+                        _ ->
+                            %% nonstandard (including truncated-OP_RETURN): P2WSH
+                            ds_build_p2wsh_script(Script)
+                    end,
+                    SegwitType = beamchain_address:classify_script(SegwitScript),
+                    SegwitTypeBin = script_type_name(SegwitType),
+                    SegwitAsm  = script_to_asm_core(SegwitScript),
+                    SegwitDesc = infer_spk_descriptor(SegwitScript, NetType),
+                    SegwitHex  = beamchain_serialize:hex_encode(SegwitScript),
+                    SegwitBase = #{
+                        <<"asm">>  => SegwitAsm,
+                        <<"desc">> => SegwitDesc,
+                        <<"hex">>  => SegwitHex,
+                        <<"type">> => SegwitTypeBin
+                    },
+                    SegwitBase1 = case beamchain_address:script_to_address(SegwitScript, NetType) of
+                        unknown     -> SegwitBase;
+                        "OP_RETURN" -> SegwitBase;
+                        SegAddr     -> SegwitBase#{<<"address">> => iolist_to_binary(SegAddr)}
+                    end,
+                    SegwitP2SH = ds_p2sh_wrap_address(SegwitScript, NetType),
+                    SegwitInner = SegwitBase1#{<<"p2sh-segwit">> => SegwitP2SH},
+                    Base2#{<<"segwit">> => SegwitInner}
+            end
+    end.
 
 %%% ===================================================================
 %%% Message signing / verification (Bitcoin Signed Message)
@@ -5833,6 +5953,12 @@ script_asm_tokens(<<16#4e, Len:32/little, Data:Len/binary, Rest/binary>>, Acc) -
 script_asm_tokens(<<Len, Data:Len/binary, Rest/binary>>, Acc)
   when Len >= 16#01, Len =< 16#4b ->
     script_asm_tokens(Rest, [script_asm_push_token(Data) | Acc]);
+%% Truncated pushes (PUSHDATA1/2/4 or direct push where data length > available):
+%% any OP_PUSHDATA* or push opcode where the length-prefixed binary match above
+%% failed — emit "[error]" and stop, matching Core's ScriptToAsmStr behaviour.
+script_asm_tokens(<<Op, _Rest/binary>>, Acc)
+  when Op >= 16#01, Op =< 16#4e ->
+    lists:reverse([<<"[error]">> | Acc]);
 %% All other opcodes → name
 script_asm_tokens(<<Op, Rest/binary>>, Acc) ->
     script_asm_tokens(Rest, [opcode_name(Op) | Acc]).
