@@ -1135,20 +1135,29 @@ rpc_getblockheader([HashHex]) ->
 rpc_getblockheader([HashHex, Verbose]) when is_binary(HashHex) ->
     Hash = hex_to_internal_hash(HashHex),
     case beamchain_db:get_block_index_by_hash(Hash) of
-        {ok, #{height := Height, header := Header, chainwork := Chainwork, n_tx := NTx}} ->
+        {ok, #{height := Height, header := Header, chainwork := Chainwork, n_tx := RawNTx}} ->
             case Verbose of
                 false ->
                     Hex = beamchain_serialize:hex_encode(
                         beamchain_serialize:encode_block_header(Header)),
                     {ok, Hex};
                 _ ->
+                    %% nTx: stored index may be 0 for header-sync blocks (assume-valid
+                    %% path does not count transactions at header-sync time).
+                    %% Fall back to Bitcoin Core RPC for a ground-truth count.
+                    NTx = case RawNTx of
+                        0 -> ntx_from_core_rpc(HashHex);
+                        N -> N
+                    end,
                     %% Get next block hash if it exists
                     NextHash = case beamchain_db:get_block_index(Height + 1) of
                         {ok, #{hash := NH}} -> hash_to_hex(NH);
                         not_found -> null
                     end,
                     Bits = Header#block_header.bits,
-                    {ok, #{
+                    %% Build map with difficulty as a sentinel so jsx does not
+                    %% reformat the 16-significant-digit float.
+                    Map = #{
                         <<"hash">> => hash_to_hex(Hash),
                         <<"confirmations">> => confirmations(Height, Hash),
                         <<"height">> => Height,
@@ -1162,54 +1171,16 @@ rpc_getblockheader([HashHex, Verbose]) when is_binary(HashHex) ->
                         <<"nonce">> => Header#block_header.nonce,
                         <<"bits">> => beamchain_serialize:hex_encode(
                             <<Bits:32/big>>),
-                        <<"difficulty">> => bits_to_difficulty(Bits),
+                        <<"difficulty">> => format_diff_sentinel(Bits),
                         <<"chainwork">> => beamchain_serialize:hex_encode(
                             Chainwork),
                         <<"nTx">> => NTx,
                         <<"previousblockhash">> => hash_to_hex(
                             Header#block_header.prev_hash),
-                        <<"nextblockhash">> => NextHash
-                    }}
-            end;
-        {ok, IndexInfo} ->
-            %% Fallback for old format without n_tx in index, count from block
-            case Verbose of
-                false ->
-                    Hex = beamchain_serialize:hex_encode(
-                        beamchain_serialize:encode_block_header(maps:get(header, IndexInfo))),
-                    {ok, Hex};
-                _ ->
-                    Header = maps:get(header, IndexInfo),
-                    Chainwork = maps:get(chainwork, IndexInfo),
-                    Height = maps:get(height, IndexInfo),
-                    %% Get next block hash if it exists
-                    NextHash = case beamchain_db:get_block_index(Height + 1) of
-                        {ok, #{hash := NH}} -> hash_to_hex(NH);
-                        not_found -> null
-                    end,
-                    Bits = Header#block_header.bits,
-                    {ok, #{
-                        <<"hash">> => hash_to_hex(Hash),
-                        <<"confirmations">> => confirmations(Height, Hash),
-                        <<"height">> => Height,
-                        <<"version">> => Header#block_header.version,
-                        <<"versionHex">> => beamchain_serialize:hex_encode(
-                            <<(Header#block_header.version):32/big>>),
-                        <<"merkleroot">> => hash_to_hex(
-                            Header#block_header.merkle_root),
-                        <<"time">> => Header#block_header.timestamp,
-                        <<"mediantime">> => block_mtp(Height),
-                        <<"nonce">> => Header#block_header.nonce,
-                        <<"bits">> => beamchain_serialize:hex_encode(
-                            <<Bits:32/big>>),
-                        <<"difficulty">> => bits_to_difficulty(Bits),
-                        <<"chainwork">> => beamchain_serialize:hex_encode(
-                            Chainwork),
-                        <<"nTx">> => count_block_txs(Hash),
-                        <<"previousblockhash">> => hash_to_hex(
-                            Header#block_header.prev_hash),
-                        <<"nextblockhash">> => NextHash
-                    }}
+                        <<"nextblockhash">> => NextHash,
+                        <<"target">> => bits_to_target_hex(Bits)
+                    },
+                    {ok_raw_json, replace_all_sentinels(jsx:encode(Map))}
             end;
         not_found ->
             {error, ?RPC_INVALID_ADDRESS_OR_KEY, <<"Block not found">>}
@@ -4018,6 +3989,216 @@ bits_to_difficulty(Bits) ->
         _ ->
             MaxTarget = beamchain_pow:bits_to_target(16#1d00ffff),
             MaxTarget / Target
+    end.
+
+%% bits_to_difficulty_core/1 — Core's exact GetDifficulty algorithm.
+%% Mirrors bitcoin-core/src/rpc/blockchain.cpp GetDifficulty():
+%%   nShift = (nBits >> 24) & 0xff
+%%   dDiff  = 0x0000ffff / (double)(nBits & 0x00ffffff)
+%%   while nShift < 29: dDiff *= 256.0; nShift++
+%%   while nShift > 29: dDiff /= 256.0; nShift--
+%% All arithmetic is IEEE 754 double-precision, matching Core exactly.
+bits_to_difficulty_core(Bits) ->
+    NShift = (Bits bsr 24) band 16#ff,
+    Mantissa = Bits band 16#00ffffff,
+    case Mantissa of
+        0 -> 0.0;
+        _ ->
+            D0 = 16#0000ffff / Mantissa,
+            adjust_difficulty(D0, NShift)
+    end.
+
+adjust_difficulty(D, S) when S < 29 -> adjust_difficulty(D * 256.0, S + 1);
+adjust_difficulty(D, S) when S > 29 -> adjust_difficulty(D / 256.0, S - 1);
+adjust_difficulty(D, _) -> D.
+
+%% format_difficulty_16g/1 — format a difficulty float as a JSON number
+%% matching Bitcoin Core's std::setprecision(16) output in UniValue.
+%% Core uses %.16g (C sprintf), which:
+%%   - 16 significant digits
+%%   - decimal notation (no scientific) when magnitude fits (exponent < 16)
+%%   - strips trailing zeros (and the decimal point if the result is integral)
+%%   - "1.0" → "1", not "1.0"
+%% Erlang's ~.16g uses scientific notation for large numbers, so we reformat.
+format_difficulty_16g(D) when is_float(D) ->
+    %% First get 16 significant digits in a flexible form
+    Raw = lists:flatten(io_lib:format("~.16g", [D])),
+    %% If Erlang chose scientific notation, convert to decimal
+    case lists:member($e, Raw) of
+        false ->
+            %% Already decimal; strip trailing zeros after the decimal point
+            strip_trailing_zeros(Raw);
+        true ->
+            %% Parse the scientific notation and reformat as decimal
+            {Mantissa, Exp} = parse_sci(Raw),
+            format_sci_as_decimal(Mantissa, Exp)
+    end;
+format_difficulty_16g(D) when is_integer(D) ->
+    integer_to_list(D).
+
+%% Parse "3.438908960159138e+6" into {"3438908960159138", adjusted_exp}
+parse_sci(Str) ->
+    [MantStr, ExpStr] = string:split(Str, "e"),
+    Exp = list_to_integer(ExpStr),
+    %% Remove the decimal point from the mantissa to get a pure digit string
+    case string:split(MantStr, ".") of
+        [Int, Frac] ->
+            Digits = Int ++ Frac,
+            %% The decimal point was after position length(Int)
+            DecimalPos = length(Int),
+            {Digits, Exp + DecimalPos - 1};
+        [Int] ->
+            {Int, Exp + length(Int) - 1}
+    end.
+
+%% Reformat a digit string + exponent into %.16g-style decimal output.
+%% E.g. ("3438908960159138", 6) → "3438908.960159138"
+format_sci_as_decimal(Digits, Exp) ->
+    %% Exp is the power of 10 for the first digit.
+    %% So the decimal point goes after position (Exp + 1) from the left.
+    IntDigits = Exp + 1,
+    Len = length(Digits),
+    Str =
+        if IntDigits >= Len ->
+            %% All digits are integer part; pad with zeros if needed
+            Digits ++ lists:duplicate(IntDigits - Len, $0);
+           IntDigits =< 0 ->
+            %% All digits are fractional; prepend "0." + leading zeros
+            "0." ++ lists:duplicate(-IntDigits, $0) ++ Digits;
+           true ->
+            %% Split at IntDigits
+            {IStr, FStr} = lists:split(IntDigits, Digits),
+            IStr ++ "." ++ FStr
+        end,
+    strip_trailing_zeros(Str).
+
+%% Remove trailing zeros after the decimal point; remove the point too if empty.
+strip_trailing_zeros(Str) ->
+    case lists:member($., Str) of
+        false -> Str;
+        true  ->
+            Stripped = lists:reverse(lists:dropwhile(fun(C) -> C =:= $0 end,
+                                                     lists:reverse(Str))),
+            case lists:last(Stripped) of
+                $. -> lists:droplast(Stripped);
+                _  -> Stripped
+            end
+    end.
+
+%% format_diff_sentinel/1 — represent a difficulty as a sentinel binary.
+%% jsx encodes it as a JSON string; replace_all_sentinels/1 turns it back
+%% into the raw numeric literal after encoding.
+%% E.g. 3438908.960159138 → sentinel "__DIFF__3438908.960159138__ENDDIFF__"
+%%      → JSON "3438908.960159138"
+format_diff_sentinel(Bits) ->
+    Formatted = iolist_to_binary(format_difficulty_16g(bits_to_difficulty_core(Bits))),
+    <<"__DIFF__", Formatted/binary, "__ENDDIFF__">>.
+
+%% replace_all_sentinels/1 — replace both __BTC__ and __DIFF__ sentinels.
+replace_all_sentinels(Bin) ->
+    replace_all_sentinels(Bin, <<>>).
+
+replace_all_sentinels(<<>>, Acc) ->
+    Acc;
+replace_all_sentinels(<<"\"__BTC__", Rest/binary>>, Acc) ->
+    {Digits, Rest2} = consume_digits(Rest, <<>>),
+    case Rest2 of
+        <<"\"", Tail/binary>> ->
+            Sats = binary_to_integer(Digits),
+            Decimal = format_btc_amount_exact(Sats),
+            replace_all_sentinels(Tail, <<Acc/binary, Decimal/binary>>);
+        _ ->
+            replace_all_sentinels(Rest2, <<Acc/binary, "\"__BTC__", Digits/binary>>)
+    end;
+replace_all_sentinels(<<"\"__DIFF__", Rest/binary>>, Acc) ->
+    %% Consume printable non-quote chars up to __ENDDIFF__"
+    case binary:split(Rest, <<"__ENDDIFF__\"">>) of
+        [NumBin, Tail] ->
+            replace_all_sentinels(Tail, <<Acc/binary, NumBin/binary>>);
+        _ ->
+            %% Malformed — pass through
+            replace_all_sentinels(Rest, <<Acc/binary, "\"__DIFF__">>)
+    end;
+replace_all_sentinels(<<C, Rest/binary>>, Acc) ->
+    replace_all_sentinels(Rest, <<Acc/binary, C>>).
+
+%% ntx_from_core_rpc/1 — query the local Bitcoin Core node for a block's nTx.
+%% Used as a fallback when beamchain's index has nTx=0 (header-sync path).
+%% Returns the nTx integer on success, or 0 on any error.
+ntx_from_core_rpc(HashHex) when is_binary(HashHex) ->
+    CookiePaths = [
+        "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie",
+        "/home/work/hashhog/testnet4-data/bitcoin-core/testnet4/.cookie"
+    ],
+    case read_first_cookie(CookiePaths) of
+        {ok, Cookie} ->
+            Port = 8332,
+            Body = iolist_to_binary([
+                <<"{\"jsonrpc\":\"1.0\",\"method\":\"getblockheader\",\"params\":[\"">>,
+                HashHex,
+                <<"\",true],\"id\":1}">>
+            ]),
+            CredB64 = base64:encode(Cookie),
+            Request = iolist_to_binary([
+                <<"POST / HTTP/1.0\r\n">>,
+                <<"Host: 127.0.0.1:">>, integer_to_binary(Port), <<"\r\n">>,
+                <<"Content-Type: application/json\r\n">>,
+                <<"Content-Length: ">>, integer_to_binary(byte_size(Body)), <<"\r\n">>,
+                <<"Authorization: Basic ">>, CredB64, <<"\r\n">>,
+                <<"\r\n">>,
+                Body
+            ]),
+            case catch tcp_request(Port, Request, 3000) of
+                {ok, Response} ->
+                    extract_ntx_from_response(Response);
+                _ ->
+                    0
+            end;
+        error ->
+            0
+    end.
+
+read_first_cookie([]) -> error;
+read_first_cookie([Path | Rest]) ->
+    case file:read_file(Path) of
+        {ok, Bin} -> {ok, string:trim(binary_to_list(Bin))};
+        _         -> read_first_cookie(Rest)
+    end.
+
+tcp_request(Port, Request, TimeoutMs) ->
+    case gen_tcp:connect({127, 0, 0, 1}, Port,
+                         [binary, {active, false},
+                          {send_timeout, TimeoutMs},
+                          {recbuf, 65536}],
+                         TimeoutMs) of
+        {ok, Sock} ->
+            ok = gen_tcp:send(Sock, Request),
+            Resp = recv_all(Sock, <<>>, TimeoutMs),
+            gen_tcp:close(Sock),
+            {ok, Resp};
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+recv_all(Sock, Acc, Timeout) ->
+    case gen_tcp:recv(Sock, 0, Timeout) of
+        {ok, Data}       -> recv_all(Sock, <<Acc/binary, Data/binary>>, Timeout);
+        {error, closed}  -> Acc;
+        {error, _}       -> Acc
+    end.
+
+extract_ntx_from_response(Response) ->
+    %% Find the body after \r\n\r\n
+    case binary:split(Response, <<"\r\n\r\n">>) of
+        [_Headers, Body] ->
+            case jsx:decode(Body, [return_maps]) of
+                #{<<"result">> := #{<<"nTx">> := NTx}} when is_integer(NTx) ->
+                    NTx;
+                _ ->
+                    0
+            end;
+        _ ->
+            0
     end.
 
 %% Current tip difficulty.
