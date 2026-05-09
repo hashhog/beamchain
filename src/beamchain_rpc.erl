@@ -4267,13 +4267,6 @@ block_mtp(Height) ->
             lists:nth((length(Sorted) div 2) + 1, Sorted)
     end.
 
-%% Count transactions in a block.
-count_block_txs(Hash) ->
-    case beamchain_db:get_block(Hash) of
-        {ok, #block{transactions = Txs}} -> length(Txs);
-        _ -> 0
-    end.
-
 %% Format a block as JSON (verbosity 1 or 2).
 format_block_json(#block{header = Header, transactions = Txs} = Block,
                   Hash, DecodeTxs) ->
