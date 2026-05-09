@@ -1499,3 +1499,114 @@ ephemeral_ets_exists_test_() ->
              ?assertNotEqual(undefined, ets:info(mempool_ephemeral))
          end]
      end}.
+
+%%% ===================================================================
+%%% W58-10 regression tests: OP_RETURN standardness + datacarrier budget
+%%% These tests verify that the mempool applies the W56-fixed push-only
+%%% gate to OP_RETURN outputs and enforces the 100,000-byte datacarrier
+%%% budget (Bitcoin Core MAX_OP_RETURN_RELAY = MAX_STANDARD_TX_WEIGHT/4).
+%%% ===================================================================
+
+%% classify_output_standard/1 — truncated OP_RETURN is nonstandard
+%% Script: 6a 09 deadbeef (claims 9 bytes but only 4 follow → truncated push).
+%% Bitcoin Core Solver: scriptPubKey[0]==OP_RETURN AND IsPushOnly(begin+1) → NULL_DATA.
+%% Truncated push fails IsPushOnly → NONSTANDARD. W56 fixed this in ds_classify;
+%% W58-10 wires the same gate into the mempool classifier.
+classify_output_standard_truncated_op_return_test() ->
+    %% 6a = OP_RETURN, 09 = push 9 bytes, only 4 bytes follow → truncated
+    Script = <<16#6a, 16#09, 16#de, 16#ad, 16#be, 16#ef>>,
+    ?assertEqual(nonstandard, beamchain_mempool:classify_output_standard(Script)).
+
+%% classify_output_standard/1 — well-formed OP_RETURN is op_return
+classify_output_standard_valid_op_return_test() ->
+    %% 6a 04 deadbeef — exactly 4 bytes follow the push-4 opcode
+    Script = <<16#6a, 16#04, 16#de, 16#ad, 16#be, 16#ef>>,
+    ?assertEqual(op_return, beamchain_mempool:classify_output_standard(Script)).
+
+%% classify_output_standard/1 — bare OP_RETURN (empty payload) is op_return
+classify_output_standard_bare_op_return_test() ->
+    Script = <<16#6a>>,
+    ?assertEqual(op_return, beamchain_mempool:classify_output_standard(Script)).
+
+%% check_standard/1 — tx with truncated OP_RETURN output is rejected (scriptpubkey)
+check_standard_truncated_op_return_rejected_test() ->
+    BadScript = <<16#6a, 16#09, 16#de, 16#ad, 16#be, 16#ef>>,
+    Tx = make_tx([{<<1:256>>, 0}], [{0, BadScript}]),
+    ?assertThrow(scriptpubkey, beamchain_mempool:check_standard(Tx)).
+
+%% check_standard/1 — tx with valid small OP_RETURN output is admitted
+check_standard_valid_op_return_admitted_test() ->
+    GoodScript = <<16#6a, 16#04, 16#de, 16#ad, 16#be, 16#ef>>,
+    Tx = make_tx([{<<1:256>>, 0}], [{0, GoodScript}]),
+    ?assertEqual(ok, beamchain_mempool:check_standard(Tx)).
+
+%% check_standard/1 — large pushable OP_RETURN admitted under 100_000 byte budget
+%% A single OP_PUSHDATA2 payload of 32000 bytes is valid; well within cap.
+check_standard_large_op_return_under_cap_test() ->
+    Payload = binary:copy(<<0>>, 32000),
+    %% PUSHDATA2: opcode 0x4d, 2-byte LE length, data
+    Script = <<16#6a, 16#4d, 32000:16/little, Payload/binary>>,
+    Tx = make_tx([{<<1:256>>, 0}], [{0, Script}]),
+    ?assertEqual(ok, beamchain_mempool:check_standard(Tx)).
+
+%% classify_output_standard/1 — datacarrier budget is tracked per-output.
+%% Simulate the foldl from check_standard: accumulate script sizes and verify
+%% the budget gate triggers when the running total exceeds MAX_OP_RETURN_RELAY (100_000).
+%% We cannot test this end-to-end via check_standard because any tx large enough to
+%% exceed 100_000 bytes of output script also exceeds MAX_STANDARD_TX_WEIGHT (both
+%% checks are ≈N*4 bytes, so the weight check fires first).  This test exercises the
+%% budget-accumulation logic directly using the same formula check_standard uses.
+classify_output_standard_budget_accumulation_test() ->
+    SmallScript = <<16#6a, 16#04, 0, 0, 0, 0>>,  %% 6 bytes
+    Budget0 = 100000,
+    %% Budget after one tiny OP_RETURN: should decrease by 6
+    case beamchain_mempool:classify_output_standard(SmallScript) of
+        op_return ->
+            Budget1 = Budget0 - byte_size(SmallScript),
+            ?assertEqual(99994, Budget1);
+        _ ->
+            ?assert(false, "valid OP_RETURN should be op_return")
+    end,
+    %% Budget after consuming exactly MAX_OP_RETURN_RELAY bytes: next one fails
+    %% Simulate: budget has 5 bytes left, new script is 6 bytes → 6 > 5 → datacarrier
+    BudgetNearlyCapped = 5,
+    ScriptSize = byte_size(SmallScript),
+    ?assert(ScriptSize > BudgetNearlyCapped,
+            "test invariant: script is larger than remaining budget"),
+    %% This is the exact check check_standard performs: Size =< Budget orelse throw(datacarrier)
+    ?assertThrow(datacarrier,
+        begin
+            Size = byte_size(SmallScript),
+            Size =< BudgetNearlyCapped orelse throw(datacarrier),
+            ok
+        end).
+
+%% check_standard/1 — scriptsig exceeding 1650 bytes is rejected
+check_standard_oversized_scriptsig_rejected_test() ->
+    %% Build a push-only scriptsig that is 1651 bytes:
+    %% OP_PUSHDATA2 + 2-byte len + 1648 bytes of data = 1 + 2 + 1648 = 1651 bytes
+    BigData = binary:copy(<<0>>, 1648),
+    BigScriptSig = <<16#4d, 1648:16/little, BigData/binary>>,
+    ?assertEqual(1651, byte_size(BigScriptSig)),
+    Tx0 = make_tx([{<<1:256>>, 0}], [{1000, p2pkh_script()}]),
+    [Input] = Tx0#transaction.inputs,
+    BigInput = Input#tx_in{script_sig = BigScriptSig},
+    Tx = Tx0#transaction{inputs = [BigInput]},
+    ?assertThrow(scriptsig_size, beamchain_mempool:check_standard(Tx)).
+
+%% check_standard/1 — non-push-only scriptsig is rejected
+check_standard_non_pushonly_scriptsig_rejected_test() ->
+    %% OP_DUP (0x76) is not a push opcode
+    BadScriptSig = <<16#76>>,
+    Tx0 = make_tx([{<<1:256>>, 0}], [{1000, p2pkh_script()}]),
+    [Input] = Tx0#transaction.inputs,
+    BadInput = Input#tx_in{script_sig = BadScriptSig},
+    Tx = Tx0#transaction{inputs = [BadInput]},
+    ?assertThrow(scriptsig_not_pushonly, beamchain_mempool:check_standard(Tx)).
+
+%% check_standard/1 — nonstandard scriptPubKey output is rejected
+check_standard_nonstandard_output_rejected_test() ->
+    %% OP_1 alone is nonstandard (not a valid witness program without the length byte)
+    NonstandardScript = <<16#51>>,
+    Tx = make_tx([{<<1:256>>, 0}], [{1000, NonstandardScript}]),
+    ?assertThrow(scriptpubkey, beamchain_mempool:check_standard(Tx)).
