@@ -2303,10 +2303,26 @@ format_getrawtransaction_result(Tx, BlockHash, Height, Verbosity, BlockHashProvi
     {ok, TxJson3}.
 
 rpc_decoderawtransaction([HexStr]) when is_binary(HexStr) ->
+    %% Decode a raw transaction hex to a TxToUniv-shaped JSON object.
+    %%
+    %% Reference: bitcoin-core/src/rpc/rawtransaction.cpp decoderawtransaction()
+    %% → core_io.cpp TxToUniv(tx, block_hash=uint256(), entry, include_hex=false)
+    %%
+    %% Shape: {txid, hash, version, size, vsize, weight, locktime, vin[], vout[]}.
+    %% No top-level "hex" field (Core's include_hex=false).
+    %%
+    %% Uses format_psbt_tx_json (the same helper as decodepsbt) so that:
+    %%   - amounts are Core-exact 8-decimal via sentinel + replace_btc_sentinels
+    %%   - scriptPubKey has {asm, desc, hex, address?, type} with rawtr() for P2TR
+    %%   - vin has scriptSig.asm (sighash-decode), txinwitness, coinbase detection
+    %%
+    %% Returns {ok_raw_json, Bin} so the sentinel numerics bypass jsx re-encoding.
     try
         Bin = beamchain_serialize:hex_decode(HexStr),
         {Tx, _Rest} = beamchain_serialize:decode_transaction(Bin),
-        {ok, format_tx_json(Tx)}
+        TxJson = format_psbt_tx_json(Tx),
+        Encoded = jsx:encode(TxJson),
+        {ok_raw_json, replace_btc_sentinels(Encoded)}
     catch
         _:_ ->
             {error, ?RPC_DESERIALIZATION_ERROR,
@@ -6001,12 +6017,22 @@ format_psbt_spk_json(Script, Network) ->
 %% format_psbt_vin/1 — like format_vin but scriptSig always includes asm.
 %% In the PSBT unsigned tx, scriptSig is always empty; Core still emits
 %% {"asm":"","hex":""} for shape-parity.
+%%
+%% For decoderawtransaction: coinbase vin emits txinwitness when non-empty
+%% (e.g. block 800000 coinbase witness commitment), matching Core TxToUniv.
 format_psbt_vin(#tx_in{prev_out = #outpoint{hash = <<0:256>>,
                                              index = 16#ffffffff},
-                       script_sig = ScriptSig, sequence = Seq}) ->
-    %% Coinbase — same as format_vin
-    #{<<"coinbase">> => beamchain_serialize:hex_encode(ScriptSig),
-      <<"sequence">> => Seq};
+                       script_sig = ScriptSig, sequence = Seq,
+                       witness = Witness}) ->
+    %% Coinbase — {coinbase, txinwitness?, sequence} per Core TxToUniv order
+    Base = #{<<"coinbase">> => beamchain_serialize:hex_encode(ScriptSig),
+             <<"sequence">> => Seq},
+    case Witness of
+        W when is_list(W), W =/= [] ->
+            Base#{<<"txinwitness">> =>
+                [beamchain_serialize:hex_encode(Item) || Item <- W]};
+        _ -> Base
+    end;
 format_psbt_vin(#tx_in{prev_out = #outpoint{hash = Hash, index = Idx},
                        script_sig = ScriptSig, sequence = Seq,
                        witness = Witness}) ->
