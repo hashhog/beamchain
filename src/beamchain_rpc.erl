@@ -6097,17 +6097,60 @@ format_psbt_tx_json(#transaction{} = Tx) ->
 %% jsx:encode the whole map, then replace sentinels with exact decimals.
 encode_psbt_decode(Psbt) ->
     Tx = beamchain_psbt:get_unsigned_tx(Psbt),
-    Map = #{
+    Inputs  = format_psbt_inputs(Psbt),
+    Outputs = format_psbt_outputs(Psbt),
+    %% Fee calculation: sum input UTXOs − sum output values.
+    %% Mirrors Core's have_all_utxos / total_in / output_value logic.
+    {HaveAllUtxos, TotalIn} = psbt_sum_inputs(Tx, Psbt),
+    TotalOut = lists:foldl(fun(#tx_out{value = V}, Acc) ->
+        Acc + V
+    end, 0, Tx#transaction.outputs),
+    BaseMap = #{
         <<"tx">>           => format_psbt_tx_json(Tx),
         <<"global_xpubs">> => [],
         <<"psbt_version">> => beamchain_psbt:get_version(Psbt),
         <<"proprietary">>  => [],
         <<"unknown">>      => #{},
-        <<"inputs">>       => format_psbt_inputs(Psbt),
-        <<"outputs">>      => format_psbt_outputs(Psbt)
+        <<"inputs">>       => Inputs,
+        <<"outputs">>      => Outputs
     },
+    Map = case HaveAllUtxos of
+        true  -> BaseMap#{<<"fee">> => format_amount_sentinel(TotalIn - TotalOut)};
+        false -> BaseMap
+    end,
     Encoded = jsx:encode(Map),
     replace_btc_sentinels(Encoded).
+
+%% psbt_sum_inputs/2 — compute total input satoshis from PSBT UTXOs.
+%% For non_witness_utxo: index the prevout n into the utxo tx's vout list.
+%% For witness_utxo: take the value directly.
+%% Returns {HaveAllUtxos :: boolean(), TotalSats :: non_neg_integer()}.
+psbt_sum_inputs(Tx, Psbt) ->
+    Inputs = Tx#transaction.inputs,
+    InputCount = length(Inputs),
+    lists:foldl(fun(Idx, {HaveAll, Acc}) ->
+        TxIn = lists:nth(Idx + 1, Inputs),
+        InputMap = beamchain_psbt:get_input(Psbt, Idx),
+        PrevN = TxIn#tx_in.prev_out#outpoint.index,
+        case maps:get(witness_utxo, InputMap, undefined) of
+            {Value, _ScriptPubKey} ->
+                {HaveAll, Acc + Value};
+            undefined ->
+                case maps:get(non_witness_utxo, InputMap, undefined) of
+                    undefined ->
+                        {false, Acc};
+                    NonWitTx ->
+                        Vouts = NonWitTx#transaction.outputs,
+                        case PrevN < length(Vouts) of
+                            true ->
+                                TxOut = lists:nth(PrevN + 1, Vouts),
+                                {HaveAll, Acc + TxOut#tx_out.value};
+                            false ->
+                                {false, Acc}
+                        end
+                end
+        end
+    end, {true, 0}, lists:seq(0, InputCount - 1)).
 
 
 format_psbt_inputs(Psbt) ->
@@ -6119,61 +6162,63 @@ format_psbt_inputs(Psbt) ->
 
 format_psbt_input(_Input, InputMap) ->
     Base = #{},
-    %% Witness UTXO
+    %% Witness UTXO — {amount, scriptPubKey} with full SPK shape + sentinel amount
     B1 = case maps:get(witness_utxo, InputMap, undefined) of
         {Value, ScriptPubKey} ->
             Base#{<<"witness_utxo">> => #{
-                <<"amount">> => Value / 100000000.0,
-                <<"scriptPubKey">> => #{
-                    <<"hex">> => beamchain_serialize:hex_encode(ScriptPubKey)
-                }
+                <<"amount">> => format_amount_sentinel(Value),
+                <<"scriptPubKey">> => format_psbt_spk_json(ScriptPubKey, beamchain_config:network())
             }};
         _ -> Base
     end,
-    %% Partial sigs
-    B2 = case maps:get(partial_sigs, InputMap, undefined) of
+    %% Non-witness UTXO — full TxToUniv shape, no top-level hex
+    B2 = case maps:get(non_witness_utxo, InputMap, undefined) of
         undefined -> B1;
-        Sigs when map_size(Sigs) > 0 ->
-            SigList = maps:fold(fun(PubKey, Sig, Acc) ->
-                [#{<<"pubkey">> => beamchain_serialize:hex_encode(PubKey),
-                   <<"signature">> => beamchain_serialize:hex_encode(Sig)} | Acc]
-            end, [], Sigs),
-            B1#{<<"partial_signatures">> => SigList};
-        _ -> B1
+        NonWitTx ->
+            B1#{<<"non_witness_utxo">> => format_psbt_tx_json(NonWitTx)}
     end,
-    %% Sighash type
-    B3 = case maps:get(sighash_type, InputMap, undefined) of
+    %% Partial signatures — Core shape: object {pubkeyHex => sigHex}
+    B3 = case maps:get(partial_sigs, InputMap, undefined) of
         undefined -> B2;
-        SH -> B2#{<<"sighash">> => sighash_name(SH)}
+        Sigs when map_size(Sigs) > 0 ->
+            SigObj = maps:fold(fun(PubKey, Sig, Acc) ->
+                Acc#{beamchain_serialize:hex_encode(PubKey) =>
+                     beamchain_serialize:hex_encode(Sig)}
+            end, #{}, Sigs),
+            B2#{<<"partial_signatures">> => SigObj};
+        _ -> B2
     end,
-    %% Redeem script
-    B4 = case maps:get(redeem_script, InputMap, undefined) of
+    %% Sighash type — Core SighashToStr string, empty string for unknowns
+    B4 = case maps:get(sighash_type, InputMap, undefined) of
         undefined -> B3;
-        RS -> B3#{<<"redeem_script">> => #{
-            <<"hex">> => beamchain_serialize:hex_encode(RS)
-        }}
+        SH -> B3#{<<"sighash">> => psbt_sighash_to_str(SH)}
     end,
-    %% Witness script
-    B5 = case maps:get(witness_script, InputMap, undefined) of
+    %% Redeem script — {asm, hex, type} only (no desc/address)
+    B5 = case maps:get(redeem_script, InputMap, undefined) of
         undefined -> B4;
-        WS -> B4#{<<"witness_script">> => #{
-            <<"hex">> => beamchain_serialize:hex_encode(WS)
-        }}
+        RS -> B4#{<<"redeem_script">> => build_script_type_json(RS)}
     end,
-    %% Final scriptsig
-    B6 = case maps:get(final_script_sig, InputMap, undefined) of
+    %% Witness script — {asm, hex, type} only
+    B6 = case maps:get(witness_script, InputMap, undefined) of
         undefined -> B5;
-        FSS -> B5#{<<"final_scriptSig">> => #{
+        WS -> B5#{<<"witness_script">> => build_script_type_json(WS)}
+    end,
+    %% Final scriptSig — {asm (sighash-decode), hex}
+    B7 = case maps:get(final_script_sig, InputMap, undefined) of
+        undefined -> B6;
+        FSS -> B6#{<<"final_scriptSig">> => #{
+            <<"asm">> => script_to_asm_sighash(FSS),
             <<"hex">> => beamchain_serialize:hex_encode(FSS)
         }}
     end,
-    %% Final witness
-    B7 = case maps:get(final_script_witness, InputMap, undefined) of
-        undefined -> B6;
-        FSW -> B6#{<<"final_scriptwitness">> =>
+    %% Final scriptwitness — array of hex, omit when empty
+    B8 = case maps:get(final_script_witness, InputMap, undefined) of
+        undefined -> B7;
+        [] -> B7;
+        FSW -> B7#{<<"final_scriptwitness">> =>
             [beamchain_serialize:hex_encode(W) || W <- FSW]}
     end,
-    B7.
+    B8.
 
 format_psbt_outputs(Psbt) ->
     Tx = beamchain_psbt:get_unsigned_tx(Psbt),
@@ -6186,15 +6231,11 @@ format_psbt_output(OutputMap) ->
     Base = #{},
     B1 = case maps:get(redeem_script, OutputMap, undefined) of
         undefined -> Base;
-        RS -> Base#{<<"redeem_script">> => #{
-            <<"hex">> => beamchain_serialize:hex_encode(RS)
-        }}
+        RS -> Base#{<<"redeem_script">> => build_script_type_json(RS)}
     end,
     B2 = case maps:get(witness_script, OutputMap, undefined) of
         undefined -> B1;
-        WS -> B1#{<<"witness_script">> => #{
-            <<"hex">> => beamchain_serialize:hex_encode(WS)
-        }}
+        WS -> B1#{<<"witness_script">> => build_script_type_json(WS)}
     end,
     B2.
 
@@ -6207,6 +6248,131 @@ sighash_name(N) when N band ?SIGHASH_ANYONECANPAY =/= 0 ->
     <<Base/binary, "|ANYONECANPAY">>;
 sighash_name(N) ->
     iolist_to_binary(io_lib:format("UNKNOWN(~B)", [N])).
+
+%% psbt_sighash_to_str/1 — Core's SighashToStr for decodepsbt.
+%% Reference: bitcoin-core/src/core_io.cpp SighashToStr.
+%% Only the 6 defined values; anything else returns "" (empty binary).
+%% Note: PSBT_IN_SIGHASH_TYPE stores 32-bit LE; low byte is the flag.
+psbt_sighash_to_str(N) ->
+    Low = N band 16#ff,
+    case Low of
+        16#01 -> <<"ALL">>;
+        16#02 -> <<"NONE">>;
+        16#03 -> <<"SINGLE">>;
+        16#81 -> <<"ALL|ANYONECANPAY">>;
+        16#82 -> <<"NONE|ANYONECANPAY">>;
+        16#83 -> <<"SINGLE|ANYONECANPAY">>;
+        _     -> <<>>
+    end.
+
+%% build_script_type_json/1 — {asm, hex, type} for redeem_script / witness_script.
+%% Matches Core's ScriptToUniv(script, out) with include_hex=true, include_address=false.
+%% No desc or address fields.
+build_script_type_json(Script) ->
+    Type    = beamchain_address:classify_script(Script),
+    TypeBin = script_type_name(Type),
+    #{
+        <<"asm">>  => script_to_asm_core(Script),
+        <<"hex">>  => beamchain_serialize:hex_encode(Script),
+        <<"type">> => TypeBin
+    }.
+
+%% is_valid_der_sig_encoding/1 — check if a binary looks like a DER sig + sighash byte.
+%% Reference: bitcoin-core/src/script/interpreter.cpp IsValidSignatureEncoding.
+%% Used by script_to_asm_sighash to decide whether to strip the sighash byte.
+is_valid_der_sig_encoding(Vch) when is_binary(Vch) ->
+    Len = byte_size(Vch),
+    case Len >= 9 andalso Len =< 73 of
+        false -> false;
+        true ->
+            <<B0, B1, B2, B3, _/binary>> = Vch,
+            LenR = B3,
+            case B0 =:= 16#30 andalso B1 =:= Len - 3 andalso B2 =:= 16#02 of
+                false -> false;
+                true ->
+                    case 5 + LenR < Len of
+                        false -> false;
+                        true ->
+                            LenS = binary:at(Vch, 5 + LenR),
+                            case LenR + LenS + 7 =:= Len andalso LenR > 0 of
+                                false -> false;
+                                true ->
+                                    B4 = binary:at(Vch, 4),
+                                    B5 = binary:at(Vch, 5),
+                                    case (B4 band 16#80) =:= 0 andalso
+                                         not (LenR > 1 andalso B4 =:= 0 andalso (B5 band 16#80) =:= 0) of
+                                        false -> false;
+                                        true ->
+                                            BLenR4 = binary:at(Vch, LenR + 4),
+                                            case BLenR4 =:= 16#02 andalso LenS > 0 of
+                                                false -> false;
+                                                true ->
+                                                    BLenR6 = binary:at(Vch, LenR + 6),
+                                                    BLenR7 = case LenS > 1 of
+                                                        true  -> binary:at(Vch, LenR + 7);
+                                                        false -> 16#80  %% dummy to skip the check
+                                                    end,
+                                                    (BLenR6 band 16#80) =:= 0 andalso
+                                                    not (LenS > 1 andalso BLenR6 =:= 0 andalso (BLenR7 band 16#80) =:= 0)
+                                            end
+                                    end
+                            end
+                    end
+            end
+    end;
+is_valid_der_sig_encoding(_) -> false.
+
+%% script_to_asm_sighash/1 — ScriptToAsmStr(script, fAttemptSighashDecode=true).
+%% For push operands >= 5 bytes that pass IsValidSignatureEncoding:
+%%   strip the last byte (sighash flag), map via psbt_sighash_to_str,
+%%   emit hex(stripped) + optional "[TYPE]" suffix.
+%% All other operands: same as script_to_asm_core.
+script_to_asm_sighash(Script) when is_binary(Script) ->
+    Tokens = script_asm_tokens_sighash(Script, []),
+    iolist_to_binary(lists:join(<<" ">>, Tokens)).
+
+script_asm_tokens_sighash(<<>>, Acc) ->
+    lists:reverse(Acc);
+script_asm_tokens_sighash(<<16#00, Rest/binary>>, Acc) ->
+    script_asm_tokens_sighash(Rest, [<<"0">> | Acc]);
+script_asm_tokens_sighash(<<16#4f, Rest/binary>>, Acc) ->
+    script_asm_tokens_sighash(Rest, [<<"-1">> | Acc]);
+script_asm_tokens_sighash(<<Op, Rest/binary>>, Acc) when Op >= 16#51, Op =< 16#60 ->
+    N = Op - 16#50,
+    script_asm_tokens_sighash(Rest, [integer_to_binary(N) | Acc]);
+script_asm_tokens_sighash(<<16#4c, Len:8, Data:Len/binary, Rest/binary>>, Acc) ->
+    script_asm_tokens_sighash(Rest, [script_asm_push_token_sighash(Data) | Acc]);
+script_asm_tokens_sighash(<<16#4d, Len:16/little, Data:Len/binary, Rest/binary>>, Acc) ->
+    script_asm_tokens_sighash(Rest, [script_asm_push_token_sighash(Data) | Acc]);
+script_asm_tokens_sighash(<<16#4e, Len:32/little, Data:Len/binary, Rest/binary>>, Acc) ->
+    script_asm_tokens_sighash(Rest, [script_asm_push_token_sighash(Data) | Acc]);
+script_asm_tokens_sighash(<<Len, Data:Len/binary, Rest/binary>>, Acc)
+  when Len >= 16#01, Len =< 16#4b ->
+    script_asm_tokens_sighash(Rest, [script_asm_push_token_sighash(Data) | Acc]);
+script_asm_tokens_sighash(<<Op, Rest/binary>>, Acc) ->
+    script_asm_tokens_sighash(Rest, [opcode_name(Op) | Acc]).
+
+%% For push data in sighash-decode mode:
+%%   size <= 4: CScriptNum decimal (same as normal)
+%%   size >= 5 and passes DER check: strip last byte, hex + "[TYPE]" suffix
+%%   size >= 5 but not DER: raw hex (same as normal)
+script_asm_push_token_sighash(Data) when byte_size(Data) =< 4 ->
+    script_num_to_binary(Data);
+script_asm_push_token_sighash(Data) ->
+    case is_valid_der_sig_encoding(Data) of
+        true ->
+            DataLen = byte_size(Data),
+            Stripped = binary:part(Data, 0, DataLen - 1),
+            SigHashByte = binary:at(Data, DataLen - 1),
+            Hex = beamchain_serialize:hex_encode(Stripped),
+            TypeStr = psbt_sighash_to_str(SigHashByte),
+            case TypeStr of
+                <<>> -> Hex;
+                _    -> <<Hex/binary, "[", TypeStr/binary, "]">>
+            end;
+        false ->
+            beamchain_serialize:hex_encode(Data)
+    end.
 
 %%% ===================================================================
 %%% Descriptor methods
