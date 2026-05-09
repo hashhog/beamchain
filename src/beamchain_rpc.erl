@@ -6109,19 +6109,6 @@ encode_psbt_decode(Psbt) ->
     Encoded = jsx:encode(Map),
     replace_btc_sentinels(Encoded).
 
-%% format_psbt_decode/1 kept for internal compatibility (unused by decodepsbt
-%% since W52; encode_psbt_decode is the live path).
-format_psbt_decode(Psbt) ->
-    Tx = beamchain_psbt:get_unsigned_tx(Psbt),
-    #{
-        <<"tx">>           => format_psbt_tx_json(Tx),
-        <<"global_xpubs">> => [],
-        <<"psbt_version">> => beamchain_psbt:get_version(Psbt),
-        <<"proprietary">>  => [],
-        <<"unknown">>      => #{},
-        <<"inputs">>       => format_psbt_inputs(Psbt),
-        <<"outputs">>      => format_psbt_outputs(Psbt)
-    }.
 
 format_psbt_inputs(Psbt) ->
     Tx = beamchain_psbt:get_unsigned_tx(Psbt),
