@@ -49,6 +49,9 @@
 %% Ephemeral anchor policy - exported for testing
 -export([check_dust/2, find_ephemeral_anchor/2]).
 
+%% Output standardness classifier and check_standard - exported for testing
+-export([classify_output_standard/1, check_standard/1]).
+
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2]).
@@ -1087,13 +1090,60 @@ lookup_inputs(#transaction{inputs = Inputs}) ->
 %%% Internal: standardness checks
 %%% ===================================================================
 
-check_standard(#transaction{version = V} = Tx) ->
+check_standard(#transaction{version = V, inputs = Inputs, outputs = Outputs} = Tx) ->
     %% version must be 1, 2, or 3 (v3 = TRUC)
+    %% mirrors Bitcoin Core TX_MIN_STANDARD_VERSION / TX_MAX_STANDARD_VERSION
     (V =:= 1 orelse V =:= 2 orelse V =:= 3) orelse throw(version),
-    %% weight limit
+    %% weight limit — mirrors Bitcoin Core MAX_STANDARD_TX_WEIGHT
     Weight = beamchain_serialize:tx_weight(Tx),
     Weight =< ?MAX_STANDARD_TX_WEIGHT orelse throw(tx_size),
+    %% input scriptSig checks — mirrors Bitcoin Core IsStandardTx input loop:
+    %%   (1) scriptSig size <= MAX_STANDARD_SCRIPTSIG_SIZE (1650 bytes)
+    %%   (2) scriptSig must be push-only
+    lists:foreach(fun(#tx_in{script_sig = SS}) ->
+        byte_size(SS) =< ?MAX_STANDARD_SCRIPTSIG_SIZE orelse throw(scriptsig_size),
+        beamchain_script:is_push_only(SS) orelse throw(scriptsig_not_pushonly)
+    end, Inputs),
+    %% output standardness + datacarrier budget — mirrors Bitcoin Core IsStandardTx output loop:
+    %%   (1) each output scriptPubKey must be standard (nonstandard → reject)
+    %%   (2) OP_RETURN (nulldata) outputs consume from MAX_OP_RETURN_RELAY budget
+    %%   The W56-fixed OP_RETURN classifier: remainder after 0x6a must be push-only;
+    %%   if not, it is nonstandard (matching Core's Solver / IsPushOnly gate).
+    DatacarrierLeft = lists:foldl(fun(#tx_out{script_pubkey = SPK}, Budget) ->
+        case classify_output_standard(SPK) of
+            op_return ->
+                Size = byte_size(SPK),
+                Size =< Budget orelse throw(datacarrier),
+                Budget - Size;
+            nonstandard ->
+                throw(scriptpubkey);
+            _Known ->
+                Budget
+        end
+    end, ?MAX_OP_RETURN_RELAY, Outputs),
+    _ = DatacarrierLeft,
     ok.
+
+%% @doc Classify a scriptPubKey for mempool standardness, applying the
+%% W56 push-only gate for OP_RETURN outputs (mirrors Bitcoin Core Solver).
+%%   <<16#6a, Rest/binary>> is NULL_DATA only if Rest is entirely push opcodes.
+%%   A truncated or non-push remainder makes it NONSTANDARD.
+classify_output_standard(<<16#6a, Rest/binary>>) ->
+    case beamchain_script:is_push_only(Rest) of
+        true  -> op_return;
+        false -> nonstandard
+    end;
+classify_output_standard(<<16#76, 16#a9, 16#14, _:20/binary, 16#88, 16#ac>>) -> p2pkh;
+classify_output_standard(<<16#a9, 16#14, _:20/binary, 16#87>>)               -> p2sh;
+classify_output_standard(<<16#00, 16#14, _:20/binary>>)                       -> p2wpkh;
+classify_output_standard(<<16#00, 16#20, _:32/binary>>)                       -> p2wsh;
+classify_output_standard(<<16#51, 16#20, _:32/binary>>)                       -> p2tr;
+classify_output_standard(<<16#51, 16#02, 16#4e, 16#73>>)                      -> p2a;
+%% Future witness versions (v2..v16, programs 2..40 bytes) are standard per Core
+classify_output_standard(<<WitVer:8, Len:8, _:Len/binary>>)
+  when (WitVer >= 16#51 andalso WitVer =< 16#60), (Len >= 2 andalso Len =< 40) ->
+    {witness, WitVer - 16#50};
+classify_output_standard(_) -> nonstandard.
 
 %%% ===================================================================
 %%% Internal: mempool conflict detection + RBF
