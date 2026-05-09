@@ -354,7 +354,8 @@ process_body(Req0, CowboyState, WalletName) ->
         Batch when is_list(Batch) ->
             %% Batch request: process each independently with parallel execution
             Responses = handle_batch(Batch, WalletName),
-            reply_json(Responses, Req1, CowboyState);
+            %% Serialize batch: mix of normal maps and {raw_json, Bin} items.
+            reply_json_batch(Responses, Req1, CowboyState);
         _ ->
             reply_json(error_obj(null, ?RPC_PARSE_ERROR,
                 <<"Parse error">>), Req1, CowboyState)
@@ -379,10 +380,29 @@ handle_batch_element(_NonObject, _WalletName) ->
     %% Non-object array elements are invalid requests
     error_obj(null, ?RPC_INVALID_REQUEST, <<"Invalid Request">>).
 
+reply_json({raw_json, Binary}, Req0, CowboyState) ->
+    %% Pre-encoded JSON (from decodepsbt raw-json path): skip jsx:encode.
+    Req = cowboy_req:reply(200, #{
+        <<"content-type">> => <<"application/json">>
+    }, Binary, Req0),
+    {ok, Req, CowboyState};
 reply_json(Body, Req0, CowboyState) ->
     Req = cowboy_req:reply(200, #{
         <<"content-type">> => <<"application/json">>
     }, jsx:encode(Body), Req0),
+    {ok, Req, CowboyState}.
+
+%% reply_json_batch/3 — serialize a batch response list that may contain
+%% a mix of normal Erlang maps and {raw_json, Bin} pre-encoded items.
+reply_json_batch(Responses, Req0, CowboyState) ->
+    Parts = lists:map(fun
+        ({raw_json, Bin}) -> Bin;
+        (R)               -> jsx:encode(R)
+    end, Responses),
+    Batch = iolist_to_binary(["[", lists:join(",", Parts), "]"]),
+    Req = cowboy_req:reply(200, #{
+        <<"content-type">> => <<"application/json">>
+    }, Batch, Req0),
     {ok, Req, CowboyState}.
 
 %%% ===================================================================
@@ -468,6 +488,11 @@ dispatch(Request, WalletName) ->
                 case handle_method(Method, Params, WalletName) of
                     {ok, Result} ->
                         result_obj(Id, Result);
+                    {ok_raw_json, JsonBin} ->
+                        %% Pre-encoded JSON result: bypass jsx encoding.
+                        %% Used by decodepsbt to emit exact numeric literals
+                        %% (e.g. "1.00000000") that jsx would reformat.
+                        {raw_json, raw_result_obj(Id, JsonBin)};
                     {error, Code, Msg} ->
                         error_obj(Id, Code, Msg)
                 end
@@ -496,6 +521,18 @@ truncate_binary(Bin, Max) ->
 
 result_obj(Id, Result) ->
     #{<<"result">> => Result, <<"error">> => null, <<"id">> => Id}.
+
+%% raw_result_obj/2 — builds the JSON-RPC wrapper around a pre-encoded
+%% JSON binary.  Used when the result value contains exact numeric literals
+%% that jsx would reformat (e.g. "1.00000000" → "1.0").
+raw_result_obj(Id, JsonBin) ->
+    IdJson = jsx:encode(Id),
+    <<"{"
+      "\"result\":", JsonBin/binary,
+      ",\"error\":null"
+      ",\"id\":", IdJson/binary,
+      "}">>.
+
 
 error_obj(Id, Code, Message) ->
     #{<<"result">> => null,
@@ -5116,7 +5153,7 @@ rpc_decodepsbt([PsbtB64]) when is_binary(PsbtB64) ->
         PsbtBin = base64:decode(PsbtB64),
         case beamchain_psbt:decode(PsbtBin) of
             {ok, Psbt} ->
-                {ok, format_psbt_decode(Psbt)};
+                {ok_raw_json, encode_psbt_decode(Psbt)};
             {error, Reason} ->
                 {error, ?RPC_DESERIALIZATION_ERROR,
                  iolist_to_binary(io_lib:format("PSBT decode failed: ~p", [Reason]))}
@@ -5739,18 +5776,351 @@ insert_at(N, X, L) ->
     {Before, After} = lists:split(N, L),
     Before ++ [X | After].
 
-%% Helper: Format PSBT for decodepsbt RPC
+%% ── W52 decodepsbt JSON shape helpers ──────────────────────────────────────
+%% Reference: bitcoin-core/src/core_io.cpp ScriptToAsmStr / ScriptToUniv /
+%% ValueFromAmount; script/descriptor.cpp InferDescriptor (no-keys path).
+
+%% script_to_asm_core/1 — Core-style ScriptToAsmStr(script, false).
+%% Rules (core_io.cpp):
+%%   OP_0 (0x00)        → "0"
+%%   OP_1NEGATE (0x4f)  → "-1"
+%%   OP_1..OP_16        → "1".."16"
+%%   Push data ≤4 bytes → CScriptNum decimal (signed little-endian)
+%%   Push data >4 bytes → raw hex lowercase (no 0x prefix)
+%%   All other opcodes  → GetOpName string (e.g. "OP_DUP")
+%% Empty script → ""
+script_to_asm_core(<<>>) -> <<>>;
+script_to_asm_core(Script) when is_binary(Script) ->
+    Tokens = script_asm_tokens(Script, []),
+    iolist_to_binary(lists:join(<<" ">>, Tokens)).
+
+%% Parse a script binary into a list of ASM token strings.
+script_asm_tokens(<<>>, Acc) ->
+    lists:reverse(Acc);
+script_asm_tokens(<<16#00, Rest/binary>>, Acc) ->
+    script_asm_tokens(Rest, [<<"0">> | Acc]);
+script_asm_tokens(<<16#4f, Rest/binary>>, Acc) ->
+    script_asm_tokens(Rest, [<<"-1">> | Acc]);
+script_asm_tokens(<<Op, Rest/binary>>, Acc) when Op >= 16#51, Op =< 16#60 ->
+    N = Op - 16#50,
+    script_asm_tokens(Rest, [integer_to_binary(N) | Acc]);
+%% OP_PUSHDATA1: next byte is length
+script_asm_tokens(<<16#4c, Len:8, Data:Len/binary, Rest/binary>>, Acc) ->
+    script_asm_tokens(Rest, [script_asm_push_token(Data) | Acc]);
+%% OP_PUSHDATA2: next 2 bytes (LE) are length
+script_asm_tokens(<<16#4d, Len:16/little, Data:Len/binary, Rest/binary>>, Acc) ->
+    script_asm_tokens(Rest, [script_asm_push_token(Data) | Acc]);
+%% OP_PUSHDATA4: next 4 bytes (LE) are length
+script_asm_tokens(<<16#4e, Len:32/little, Data:Len/binary, Rest/binary>>, Acc) ->
+    script_asm_tokens(Rest, [script_asm_push_token(Data) | Acc]);
+%% Direct push data opcodes 0x01..0x4b (opcode = length)
+script_asm_tokens(<<Len, Data:Len/binary, Rest/binary>>, Acc)
+  when Len >= 16#01, Len =< 16#4b ->
+    script_asm_tokens(Rest, [script_asm_push_token(Data) | Acc]);
+%% All other opcodes → name
+script_asm_tokens(<<Op, Rest/binary>>, Acc) ->
+    script_asm_tokens(Rest, [opcode_name(Op) | Acc]).
+
+%% For push data: ≤4 bytes → CScriptNum decimal; >4 bytes → hex.
+script_asm_push_token(Data) when byte_size(Data) =< 4 ->
+    script_num_to_binary(Data);
+script_asm_push_token(Data) ->
+    beamchain_serialize:hex_encode(Data).
+
+%% Decode CScriptNum: signed little-endian with sign bit in MSB of last byte.
+script_num_to_binary(<<>>) -> <<"0">>;
+script_num_to_binary(Data) ->
+    Len = byte_size(Data),
+    %% Build unsigned little-endian value
+    Raw = lists:foldl(fun(I, Acc) ->
+        Byte = binary:at(Data, I),
+        Acc bor (Byte bsl (8 * I))
+    end, 0, lists:seq(0, Len - 1)),
+    LastByte = binary:at(Data, Len - 1),
+    %% Check sign bit (0x80 of last byte)
+    case LastByte band 16#80 of
+        0 ->
+            integer_to_binary(Raw);
+        _ ->
+            %% Clear sign bit, negate
+            Unsigned = Raw band (bnot (16#80 bsl (8 * (Len - 1)))),
+            integer_to_binary(-Unsigned)
+    end.
+
+%% opcode_name/1 — maps opcode byte to Core's GetOpName string.
+opcode_name(16#61) -> <<"OP_NOP">>;
+opcode_name(16#62) -> <<"OP_VER">>;
+opcode_name(16#63) -> <<"OP_IF">>;
+opcode_name(16#64) -> <<"OP_NOTIF">>;
+opcode_name(16#65) -> <<"OP_VERIF">>;
+opcode_name(16#66) -> <<"OP_VERNOTIF">>;
+opcode_name(16#67) -> <<"OP_ELSE">>;
+opcode_name(16#68) -> <<"OP_ENDIF">>;
+opcode_name(16#69) -> <<"OP_VERIFY">>;
+opcode_name(16#6a) -> <<"OP_RETURN">>;
+opcode_name(16#6b) -> <<"OP_TOALTSTACK">>;
+opcode_name(16#6c) -> <<"OP_FROMALTSTACK">>;
+opcode_name(16#6d) -> <<"OP_2DROP">>;
+opcode_name(16#6e) -> <<"OP_2DUP">>;
+opcode_name(16#6f) -> <<"OP_3DUP">>;
+opcode_name(16#70) -> <<"OP_2OVER">>;
+opcode_name(16#71) -> <<"OP_2ROT">>;
+opcode_name(16#72) -> <<"OP_2SWAP">>;
+opcode_name(16#73) -> <<"OP_IFDUP">>;
+opcode_name(16#74) -> <<"OP_DEPTH">>;
+opcode_name(16#75) -> <<"OP_DROP">>;
+opcode_name(16#76) -> <<"OP_DUP">>;
+opcode_name(16#77) -> <<"OP_NIP">>;
+opcode_name(16#78) -> <<"OP_OVER">>;
+opcode_name(16#79) -> <<"OP_PICK">>;
+opcode_name(16#7a) -> <<"OP_ROLL">>;
+opcode_name(16#7b) -> <<"OP_ROT">>;
+opcode_name(16#7c) -> <<"OP_SWAP">>;
+opcode_name(16#7d) -> <<"OP_TUCK">>;
+opcode_name(16#7e) -> <<"OP_CAT">>;
+opcode_name(16#7f) -> <<"OP_SUBSTR">>;
+opcode_name(16#80) -> <<"OP_LEFT">>;
+opcode_name(16#81) -> <<"OP_RIGHT">>;
+opcode_name(16#82) -> <<"OP_SIZE">>;
+opcode_name(16#83) -> <<"OP_INVERT">>;
+opcode_name(16#84) -> <<"OP_AND">>;
+opcode_name(16#85) -> <<"OP_OR">>;
+opcode_name(16#86) -> <<"OP_XOR">>;
+opcode_name(16#87) -> <<"OP_EQUAL">>;
+opcode_name(16#88) -> <<"OP_EQUALVERIFY">>;
+opcode_name(16#89) -> <<"OP_RESERVED1">>;
+opcode_name(16#8a) -> <<"OP_RESERVED2">>;
+opcode_name(16#8b) -> <<"OP_1ADD">>;
+opcode_name(16#8c) -> <<"OP_1SUB">>;
+opcode_name(16#8d) -> <<"OP_2MUL">>;
+opcode_name(16#8e) -> <<"OP_2DIV">>;
+opcode_name(16#8f) -> <<"OP_NEGATE">>;
+opcode_name(16#90) -> <<"OP_ABS">>;
+opcode_name(16#91) -> <<"OP_NOT">>;
+opcode_name(16#92) -> <<"OP_0NOTEQUAL">>;
+opcode_name(16#93) -> <<"OP_ADD">>;
+opcode_name(16#94) -> <<"OP_SUB">>;
+opcode_name(16#95) -> <<"OP_MUL">>;
+opcode_name(16#96) -> <<"OP_DIV">>;
+opcode_name(16#97) -> <<"OP_MOD">>;
+opcode_name(16#98) -> <<"OP_LSHIFT">>;
+opcode_name(16#99) -> <<"OP_RSHIFT">>;
+opcode_name(16#9a) -> <<"OP_BOOLAND">>;
+opcode_name(16#9b) -> <<"OP_BOOLOR">>;
+opcode_name(16#9c) -> <<"OP_NUMEQUAL">>;
+opcode_name(16#9d) -> <<"OP_NUMEQUALVERIFY">>;
+opcode_name(16#9e) -> <<"OP_NUMNOTEQUAL">>;
+opcode_name(16#9f) -> <<"OP_LESSTHAN">>;
+opcode_name(16#a0) -> <<"OP_GREATERTHAN">>;
+opcode_name(16#a1) -> <<"OP_LESSTHANOREQUAL">>;
+opcode_name(16#a2) -> <<"OP_GREATERTHANOREQUAL">>;
+opcode_name(16#a3) -> <<"OP_MIN">>;
+opcode_name(16#a4) -> <<"OP_MAX">>;
+opcode_name(16#a5) -> <<"OP_WITHIN">>;
+opcode_name(16#a6) -> <<"OP_RIPEMD160">>;
+opcode_name(16#a7) -> <<"OP_SHA1">>;
+opcode_name(16#a8) -> <<"OP_SHA256">>;
+opcode_name(16#a9) -> <<"OP_HASH160">>;
+opcode_name(16#aa) -> <<"OP_HASH256">>;
+opcode_name(16#ab) -> <<"OP_CODESEPARATOR">>;
+opcode_name(16#ac) -> <<"OP_CHECKSIG">>;
+opcode_name(16#ad) -> <<"OP_CHECKSIGVERIFY">>;
+opcode_name(16#ae) -> <<"OP_CHECKMULTISIG">>;
+opcode_name(16#af) -> <<"OP_CHECKMULTISIGVERIFY">>;
+opcode_name(16#b0) -> <<"OP_NOP1">>;
+opcode_name(16#b1) -> <<"OP_CHECKLOCKTIMEVERIFY">>;
+opcode_name(16#b2) -> <<"OP_CHECKSEQUENCEVERIFY">>;
+opcode_name(16#b3) -> <<"OP_NOP4">>;
+opcode_name(16#b4) -> <<"OP_NOP5">>;
+opcode_name(16#b5) -> <<"OP_NOP6">>;
+opcode_name(16#b6) -> <<"OP_NOP7">>;
+opcode_name(16#b7) -> <<"OP_NOP8">>;
+opcode_name(16#b8) -> <<"OP_NOP9">>;
+opcode_name(16#b9) -> <<"OP_NOP10">>;
+opcode_name(16#ba) -> <<"OP_CHECKSIGADD">>;
+opcode_name(16#50) -> <<"OP_RESERVED">>;
+opcode_name(N)     -> iolist_to_binary(io_lib:format("OP_UNKNOWN(~B)", [N])).
+
+%% infer_spk_descriptor/2 — BIP-380 descriptor with 8-char checksum.
+%% Mirrors Core's InferDescriptor (script/descriptor.cpp) in the no-keys path:
+%%   if ExtractDestination succeeds → addr(<address>)#<csum>
+%%   else                           → raw(<hex>)#<csum>
+%% Network is mainnet | testnet (atom from beamchain_config:network()).
+infer_spk_descriptor(Script, Network) ->
+    NetType = case Network of mainnet -> mainnet; _ -> testnet end,
+    Addr = beamchain_address:script_to_address(Script, NetType),
+    Payload = case Addr of
+        unknown   -> "raw(" ++ binary_to_list(beamchain_serialize:hex_encode(Script)) ++ ")";
+        "OP_RETURN" -> "raw(" ++ binary_to_list(beamchain_serialize:hex_encode(Script)) ++ ")";
+        A         -> "addr(" ++ A ++ ")"
+    end,
+    try beamchain_descriptor:add_checksum(Payload) of
+        S -> list_to_binary(S)
+    catch
+        _:_ -> list_to_binary(Payload)
+    end.
+
+%% format_psbt_spk_json/3 — emit Core-shape scriptPubKey for decodepsbt.
+%% Shape: {asm, desc, hex, address?, type}
+%% `address` is suppressed when script type is `pubkey` (bare P2PK),
+%% matching Core's ScriptToUniv suppression rule.
+format_psbt_spk_json(Script, Network) ->
+    Type    = beamchain_address:classify_script(Script),
+    TypeBin = script_type_name(Type),
+    Asm     = script_to_asm_core(Script),
+    Desc    = infer_spk_descriptor(Script, Network),
+    Hex     = beamchain_serialize:hex_encode(Script),
+    Base = #{
+        <<"asm">>  => Asm,
+        <<"desc">> => Desc,
+        <<"hex">>  => Hex,
+        <<"type">> => TypeBin
+    },
+    %% Suppress address for bare-pubkey / multisig / nonstandard / OP_RETURN —
+    %% mirrors Core's `if (type != TxoutType::PUBKEY)` guard in ScriptToUniv.
+    NetType = case Network of mainnet -> mainnet; _ -> testnet end,
+    case beamchain_address:script_to_address(Script, NetType) of
+        unknown     -> Base;
+        "OP_RETURN" -> Base;
+        Addr        -> Base#{<<"address">> => iolist_to_binary(Addr)}
+    end.
+
+%% format_psbt_vin/1 — like format_vin but scriptSig always includes asm.
+%% In the PSBT unsigned tx, scriptSig is always empty; Core still emits
+%% {"asm":"","hex":""} for shape-parity.
+format_psbt_vin(#tx_in{prev_out = #outpoint{hash = <<0:256>>,
+                                             index = 16#ffffffff},
+                       script_sig = ScriptSig, sequence = Seq}) ->
+    %% Coinbase — same as format_vin
+    #{<<"coinbase">> => beamchain_serialize:hex_encode(ScriptSig),
+      <<"sequence">> => Seq};
+format_psbt_vin(#tx_in{prev_out = #outpoint{hash = Hash, index = Idx},
+                       script_sig = ScriptSig, sequence = Seq,
+                       witness = Witness}) ->
+    Asm = script_to_asm_core(ScriptSig),
+    Base = #{
+        <<"txid">>      => hash_to_hex(Hash),
+        <<"vout">>      => Idx,
+        <<"scriptSig">> => #{
+            <<"asm">> => Asm,
+            <<"hex">> => beamchain_serialize:hex_encode(ScriptSig)
+        },
+        <<"sequence">>  => Seq
+    },
+    case Witness of
+        W when is_list(W), W =/= [] ->
+            Base#{<<"txinwitness">> =>
+                [beamchain_serialize:hex_encode(Item) || Item <- W]};
+        _ -> Base
+    end.
+
+%% format_amount_sentinel/1 — represent a satoshi amount as a sentinel binary
+%% that jsx encodes as a JSON string.  After jsx:encode, replace_btc_sentinels/1
+%% turns "\"__BTC__<sats>\"" back into the exact Core-format decimal.
+%% E.g. 100000000 sats → sentinel <<"\"__BTC__100000000\"">> → "1.00000000" in JSON.
+format_amount_sentinel(Sats) when is_integer(Sats) ->
+    iolist_to_binary(["__BTC__", integer_to_list(Sats)]).
+
+%% format_btc_amount_exact/1 — Core's ValueFromAmount ("%s%d.%08d").
+format_btc_amount_exact(Sats) ->
+    Neg  = Sats < 0,
+    Abs  = if Neg -> -Sats; true -> Sats end,
+    Whole = Abs div 100000000,
+    Frac  = Abs rem 100000000,
+    Sign  = if Neg -> "-"; true -> "" end,
+    iolist_to_binary([Sign, integer_to_list(Whole), ".",
+                      string:right(integer_to_list(Frac), 8, $0)]).
+
+%% replace_btc_sentinels/1 — scan a JSON binary for sentinel strings of the
+%% form "\"__BTC__<digits>\"" and replace each with the exact decimal amount.
+%% The sentinel can only appear in a value position (never a key), and only
+%% within a decodepsbt response, so a simple binary replace loop is safe.
+replace_btc_sentinels(Bin) ->
+    replace_btc_sentinels(Bin, <<>>).
+
+replace_btc_sentinels(<<>>, Acc) ->
+    Acc;
+replace_btc_sentinels(<<"\"__BTC__", Rest/binary>>, Acc) ->
+    %% Consume digits up to closing quote
+    {Digits, Rest2} = consume_digits(Rest, <<>>),
+    case Rest2 of
+        <<"\"", Tail/binary>> ->
+            Sats = binary_to_integer(Digits),
+            Decimal = format_btc_amount_exact(Sats),
+            replace_btc_sentinels(Tail, <<Acc/binary, Decimal/binary>>);
+        _ ->
+            %% Malformed sentinel — pass through unchanged (defensive)
+            replace_btc_sentinels(Rest2, <<Acc/binary, "\"__BTC__", Digits/binary>>)
+    end;
+replace_btc_sentinels(<<C, Rest/binary>>, Acc) ->
+    replace_btc_sentinels(Rest, <<Acc/binary, C>>).
+
+consume_digits(<<D, Rest/binary>>, Acc) when D >= $0, D =< $9 ->
+    consume_digits(Rest, <<Acc/binary, D>>);
+consume_digits(Rest, Acc) ->
+    {Acc, Rest}.
+
+%% format_psbt_vouts/2 — like format_vouts but scriptPubKey has asm + desc,
+%% and value is a sentinel for post-encode numeric fixup.
+format_psbt_vouts([], _N, _Network) -> [];
+format_psbt_vouts([#tx_out{value = Value, script_pubkey = Script} | Rest], N, Network) ->
+    Vout = #{
+        <<"value">>        => format_amount_sentinel(Value),
+        <<"n">>            => N,
+        <<"scriptPubKey">> => format_psbt_spk_json(Script, Network)
+    },
+    [Vout | format_psbt_vouts(Rest, N + 1, Network)].
+
+%% format_psbt_tx_json/1 — like format_tx_json but without the top-level
+%% `hex` field.  Core's decodepsbt emits the unsigned tx via TxToUniv with
+%% include_hex=false (rpc/rawtransaction.cpp).
+format_psbt_tx_json(#transaction{} = Tx) ->
+    Network = beamchain_config:network(),
+    Txid   = beamchain_serialize:tx_hash(Tx),
+    Wtxid  = beamchain_serialize:wtx_hash(Tx),
+    TxBin  = beamchain_serialize:encode_transaction(Tx),
+    #{
+        <<"txid">>     => hash_to_hex(Txid),
+        <<"hash">>     => hash_to_hex(Wtxid),
+        <<"version">>  => Tx#transaction.version,
+        <<"size">>     => byte_size(TxBin),
+        <<"vsize">>    => beamchain_serialize:tx_vsize(Tx),
+        <<"weight">>   => beamchain_serialize:tx_weight(Tx),
+        <<"locktime">> => Tx#transaction.locktime,
+        <<"vin">>      => [format_psbt_vin(In) || In <- Tx#transaction.inputs],
+        <<"vout">>     => format_psbt_vouts(Tx#transaction.outputs, 0, Network)
+    }.
+
+%% encode_psbt_decode/1 — build the decodepsbt response as a JSON binary
+%% with Core-exact numeric literals (e.g. "1.00000000", not "1.0").
+%% Strategy: build an Erlang map with sentinel binaries for amount values,
+%% jsx:encode the whole map, then replace sentinels with exact decimals.
+encode_psbt_decode(Psbt) ->
+    Tx = beamchain_psbt:get_unsigned_tx(Psbt),
+    Map = #{
+        <<"tx">>           => format_psbt_tx_json(Tx),
+        <<"global_xpubs">> => [],
+        <<"psbt_version">> => beamchain_psbt:get_version(Psbt),
+        <<"proprietary">>  => [],
+        <<"unknown">>      => #{},
+        <<"inputs">>       => format_psbt_inputs(Psbt),
+        <<"outputs">>      => format_psbt_outputs(Psbt)
+    },
+    Encoded = jsx:encode(Map),
+    replace_btc_sentinels(Encoded).
+
+%% format_psbt_decode/1 kept for internal compatibility (unused by decodepsbt
+%% since W52; encode_psbt_decode is the live path).
 format_psbt_decode(Psbt) ->
     Tx = beamchain_psbt:get_unsigned_tx(Psbt),
     #{
-        <<"tx">> => format_tx_json(Tx),
-        <<"global_xpubs">> => [],  %% Simplified
+        <<"tx">>           => format_psbt_tx_json(Tx),
+        <<"global_xpubs">> => [],
         <<"psbt_version">> => beamchain_psbt:get_version(Psbt),
-        <<"proprietary">> => [],
-        <<"unknown">> => #{},
-        <<"inputs">> => format_psbt_inputs(Psbt),
-        <<"outputs">> => format_psbt_outputs(Psbt),
-        <<"fee">> => null  %% Would need UTXO lookup
+        <<"proprietary">>  => [],
+        <<"unknown">>      => #{},
+        <<"inputs">>       => format_psbt_inputs(Psbt),
+        <<"outputs">>      => format_psbt_outputs(Psbt)
     }.
 
 format_psbt_inputs(Psbt) ->
