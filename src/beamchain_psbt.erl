@@ -69,6 +69,7 @@
 -define(PSBT_OUT_TAP_INTERNAL_KEY,    16#05).
 -define(PSBT_OUT_TAP_TREE,            16#06).
 -define(PSBT_OUT_TAP_BIP32_DERIVATION, 16#07).
+-define(PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS, 16#08).
 -define(PSBT_OUT_PROPRIETARY,         16#fc).
 
 %%% -------------------------------------------------------------------
@@ -507,6 +508,37 @@ parse_input_pairs([{<<?PSBT_IN_FINAL_SCRIPTWITNESS>>, FSW} | Rest], Acc) ->
     parse_input_pairs(Rest, Acc#{final_script_witness => Witness});
 parse_input_pairs([{<<?PSBT_IN_TAP_KEY_SIG>>, TKS} | Rest], Acc) ->
     parse_input_pairs(Rest, Acc#{tap_key_sig => TKS});
+%% PSBT_IN_TAP_SCRIPT_SIG (0x14): key = type(1) + xonly(32) + leaf_hash(32)
+%%   value = Schnorr signature.  Stored as map {xonly_pubkey, leaf_hash} => sig.
+parse_input_pairs([{<<16#14, XOnly:32/binary, LeafHash:32/binary>>, Sig} | Rest], Acc) ->
+    Sigs = maps:get(tap_script_sigs, Acc, #{}),
+    parse_input_pairs(Rest, Acc#{tap_script_sigs => Sigs#{{XOnly, LeafHash} => Sig}});
+%% PSBT_IN_TAP_LEAF_SCRIPT (0x15): key = type(1) + control_block
+%%   value = script || leaf_version (last byte).
+%%   Stored as map control_block => {script, leaf_ver}.
+parse_input_pairs([{<<16#15, ControlBlock/binary>>, LeafData} | Rest], Acc) ->
+    DataLen = byte_size(LeafData),
+    {Script, LeafVer} = case DataLen >= 1 of
+        true ->
+            SLen = DataLen - 1,
+            <<S:SLen/binary, LV>> = LeafData,
+            {S, LV};
+        false ->
+            {<<>>, 16#c0}
+    end,
+    Leafs = maps:get(tap_leaf_scripts, Acc, #{}),
+    parse_input_pairs(Rest, Acc#{tap_leaf_scripts => Leafs#{ControlBlock => {Script, LeafVer}}});
+%% PSBT_IN_TAP_BIP32_DERIVATION (0x16): key = type(1) + xonly(32)
+%%   value = leaf_hash_count(varint) + leaf_hashes(32B each) + fingerprint(4B) + path.
+%%   Stored as map xonly => {fingerprint, path, leaf_hashes}.
+parse_input_pairs([{<<16#16, XOnly:32/binary>>, Value} | Rest], Acc) ->
+    {NLeaves, Rest1} = beamchain_serialize:decode_varint(Value),
+    <<LeafHashesBin:(NLeaves * 32)/binary, PathData/binary>> = Rest1,
+    LeafHashes = [LH || <<LH:32/binary>> <= LeafHashesBin],
+    {Fingerprint, Path} = decode_bip32_path(PathData),
+    Derivs = maps:get(tap_bip32_derivation, Acc, #{}),
+    parse_input_pairs(Rest, Acc#{tap_bip32_derivation =>
+        Derivs#{XOnly => {Fingerprint, Path, LeafHashes}}});
 parse_input_pairs([{<<?PSBT_IN_TAP_INTERNAL_KEY>>, TIK} | Rest], Acc) ->
     parse_input_pairs(Rest, Acc#{tap_internal_key => TIK});
 parse_input_pairs([{<<?PSBT_IN_TAP_MERKLE_ROOT>>, TMR} | Rest], Acc) ->
@@ -572,6 +604,29 @@ parse_output_pairs([{<<?PSBT_OUT_BIP32_DERIVATION, PubKey/binary>>, PathData} | 
     parse_output_pairs(Rest, Acc#{bip32_derivation => Derivs#{PubKey => {Fingerprint, Path}}});
 parse_output_pairs([{<<?PSBT_OUT_TAP_INTERNAL_KEY>>, TIK} | Rest], Acc) ->
     parse_output_pairs(Rest, Acc#{tap_internal_key => TIK});
+%% PSBT_OUT_TAP_TREE (0x06): key = type(1), value = sequence of
+%%   (depth:1 + leaf_ver:1 + script_len:varint + script).
+%%   Stored as list of {depth, leaf_ver, script} tuples in wire order.
+parse_output_pairs([{<<?PSBT_OUT_TAP_TREE>>, Value} | Rest], Acc) ->
+    Leaves = decode_tap_tree(Value, []),
+    parse_output_pairs(Rest, Acc#{tap_tree => Leaves});
+%% PSBT_OUT_TAP_BIP32_DERIVATION (0x07): key = type(1) + xonly(32)
+%%   value = leaf_hash_count(varint) + leaf_hashes + fingerprint(4B) + path.
+parse_output_pairs([{<<16#07, XOnly:32/binary>>, Value} | Rest], Acc) ->
+    {NLeaves, Rest1} = beamchain_serialize:decode_varint(Value),
+    <<LeafHashesBin:(NLeaves * 32)/binary, PathData/binary>> = Rest1,
+    LeafHashes = [LH || <<LH:32/binary>> <= LeafHashesBin],
+    {Fingerprint, Path} = decode_bip32_path(PathData),
+    Derivs = maps:get(tap_bip32_derivation, Acc, #{}),
+    parse_output_pairs(Rest, Acc#{tap_bip32_derivation =>
+        Derivs#{XOnly => {Fingerprint, Path, LeafHashes}}});
+%% PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS (0x08): key = type(1) + agg_pubkey(33)
+%%   value = participant_pubkeys concatenated (33 bytes each).
+parse_output_pairs([{<<16#08, AggPubKey:33/binary>>, Value} | Rest], Acc) ->
+    ParticipantPubKeys = [PK || <<PK:33/binary>> <= Value],
+    MuSig2 = maps:get(musig2_participant_pubkeys, Acc, #{}),
+    parse_output_pairs(Rest, Acc#{musig2_participant_pubkeys =>
+        MuSig2#{AggPubKey => ParticipantPubKeys}});
 parse_output_pairs([{Key, Value} | Rest], Acc) ->
     %% Unknown key type - preserve it
     Unk = maps:get(unknown, Acc, #{}),
@@ -1234,6 +1289,16 @@ push_data(Data, Acc) ->
         true ->
             <<Acc/binary, 16#4e, Len:32/little, Data/binary>>
     end.
+
+%% decode_tap_tree/2 — parse PSBT_OUT_TAP_TREE value.
+%% Wire format (BIP-371 §Output-typed fields): repeated entries of
+%%   depth (1 byte) + leaf_version (1 byte) + script (varint-length-prefixed).
+decode_tap_tree(<<>>, Acc) ->
+    lists:reverse(Acc);
+decode_tap_tree(<<Depth, LeafVer, Rest/binary>>, Acc) ->
+    {ScriptLen, Rest2} = beamchain_serialize:decode_varint(Rest),
+    <<Script:ScriptLen/binary, Rest3/binary>> = Rest2,
+    decode_tap_tree(Rest3, [{Depth, LeafVer, Script} | Acc]).
 
 %% NOTE: BIP-341 taproot_tweak_seckey/1 + negate_seckey/1 used to live
 %% here (byte-identical to the wallet copies). They have been hoisted
