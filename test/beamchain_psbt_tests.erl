@@ -633,3 +633,233 @@ w41_consistent_both_ok() ->
     ?assertMatch({error, missing_signature},
                  beamchain_psbt:finalize(Updated)).
 
+%%% ===================================================================
+%%% W46: encoder gate + script-order multisig finalize
+%%% ===================================================================
+%%% Bug pattern: encode_input_map/1 used to emit producer fields
+%%% (partial_sigs / sighash_type / redeem_script / witness_script /
+%%% bip32_derivation / tap_*) unconditionally, leaking ~hundreds of bytes
+%%% of producer state into the wire bytes after finalize. Core gates
+%%% these behind `if (final_script_sig.empty() && final_script_witness.IsNull())`
+%%% (bitcoin-core/src/psbt.h:313). Same shape as W41 lunarblock.
+%%%
+%%% Bug pattern: finalize_legacy_p2sh/2 built scriptSig from
+%%% `maps:values(PartialSigs)` — Erlang map iteration order is undefined,
+%%% so multisig signature order was non-deterministic and frequently
+%%% wrong (Core requires script-pubkey order via `std::vector` walk in
+%%% sign.cpp:ProduceSignature).
+
+%% Two valid 33-byte compressed pubkeys for multisig fixture.
+w46_pubkey1() -> <<2, 16#aa:256>>.
+w46_pubkey2() -> <<3, 16#bb:256>>.
+
+%% 2-of-2 redeem script: OP_2 <33-byte pk1> <33-byte pk2> OP_2 OP_CHECKMULTISIG
+w46_redeem_script() ->
+    PK1 = w46_pubkey1(),
+    PK2 = w46_pubkey2(),
+    <<16#52, 33, PK1/binary, 33, PK2/binary, 16#52, 16#ae>>.
+
+%% Build a prev-tx whose vout 0 pays a P2SH(redeem_script) output,
+%% so finalize_legacy_p2sh can satisfy the UTXO-consistency check.
+w46_p2sh_prev_tx() ->
+    RS = w46_redeem_script(),
+    Hash160 = beamchain_crypto:hash160(RS),
+    P2SHScript = <<16#a9, 16#14, Hash160/binary, 16#87>>,
+    #transaction{
+        version = 2,
+        inputs = [#tx_in{
+            prev_out = #outpoint{hash = <<16#cc:256>>, index = 0},
+            script_sig = <<>>,
+            sequence = 16#ffffffff,
+            witness = []
+        }],
+        outputs = [#tx_out{value = 60000, script_pubkey = P2SHScript}],
+        locktime = 0,
+        txid = undefined,
+        wtxid = undefined
+    }.
+
+w46_spending_tx(PrevTx) ->
+    Txid = beamchain_serialize:tx_hash(PrevTx),
+    #transaction{
+        version = 2,
+        inputs = [#tx_in{
+            prev_out = #outpoint{hash = Txid, index = 0},
+            script_sig = <<>>,
+            sequence = 16#fffffffd,
+            witness = []
+        }],
+        outputs = [#tx_out{
+            value = 30000,
+            script_pubkey = <<16#00, 20, 7,7,7,7,7,7,7,7,7,7,
+                                          7,7,7,7,7,7,7,7,7,7>>
+        }],
+        locktime = 0,
+        txid = undefined,
+        wtxid = undefined
+    }.
+
+w46_test_() ->
+    {"W46 encoder gate + script-order finalize", [
+        {"encoder drops producer fields after finalize",
+         fun w46_encoder_gate_drops_producer_fields/0},
+        {"legacy P2SH multisig sigs in script-pubkey order",
+         fun w46_legacy_p2sh_script_order/0},
+        {"encode is deterministic across repeated calls",
+         fun w46_encode_deterministic/0},
+        {"partial_sigs sorted by HASH160 on the wire",
+         fun w46_partial_sigs_sorted_by_keyid/0}
+    ]}.
+
+%% Test 1: encoder gate. Build a P2SH multisig PSBT, finalize, encode,
+%% decode again — the producer fields must be absent from the decoded
+%% input map.
+w46_encoder_gate_drops_producer_fields() ->
+    PrevTx = w46_p2sh_prev_tx(),
+    Tx = w46_spending_tx(PrevTx),
+    RS = w46_redeem_script(),
+    PK1 = w46_pubkey1(),
+    PK2 = w46_pubkey2(),
+    %% Opaque DER-shaped sigs; finalize doesn't actually verify them.
+    Sig1 = <<48, 68, 2, 32, 16#11:256, 2, 32, 16#22:256, 1>>,
+    Sig2 = <<48, 68, 2, 32, 16#33:256, 2, 32, 16#44:256, 1>>,
+    {ok, Psbt} = beamchain_psbt:create(Tx),
+    {ok, Updated} = beamchain_psbt:update(Psbt, [
+        {input, 0, #{
+            non_witness_utxo => PrevTx,
+            redeem_script => RS,
+            partial_sigs => #{PK1 => Sig1, PK2 => Sig2},
+            sighash_type => 1,
+            bip32_derivation => #{PK1 => {<<0,0,0,0>>, [44, 0, 0]}}
+        }}
+    ]),
+    {ok, Finalized} = beamchain_psbt:finalize(Updated),
+    Encoded = beamchain_psbt:encode(Finalized),
+    {ok, Decoded} = beamchain_psbt:decode(Encoded),
+    InputMap = beamchain_psbt:get_input(Decoded, 0),
+    %% Producer fields must NOT survive the round-trip on a finalized input.
+    ?assertNot(maps:is_key(partial_sigs, InputMap)),
+    ?assertNot(maps:is_key(sighash_type, InputMap)),
+    ?assertNot(maps:is_key(redeem_script, InputMap)),
+    ?assertNot(maps:is_key(witness_script, InputMap)),
+    ?assertNot(maps:is_key(bip32_derivation, InputMap)),
+    %% Final fields must be present.
+    ?assert(maps:is_key(final_script_sig, InputMap)).
+
+%% Test 2: legacy P2SH multisig — supply partial_sigs in REVERSE
+%% pubkey order; assert the assembled scriptSig still places sigs in
+%% script-pubkey order.
+w46_legacy_p2sh_script_order() ->
+    PrevTx = w46_p2sh_prev_tx(),
+    Tx = w46_spending_tx(PrevTx),
+    RS = w46_redeem_script(),
+    PK1 = w46_pubkey1(),
+    PK2 = w46_pubkey2(),
+    Sig1 = <<48, 68, 2, 32, 16#11:256, 2, 32, 16#22:256, 1>>,
+    Sig2 = <<48, 68, 2, 32, 16#33:256, 2, 32, 16#44:256, 1>>,
+    {ok, Psbt} = beamchain_psbt:create(Tx),
+    %% Insert the partial_sigs in REVERSE (PK2 first, then PK1).
+    {ok, Updated} = beamchain_psbt:update(Psbt, [
+        {input, 0, #{
+            non_witness_utxo => PrevTx,
+            redeem_script => RS,
+            %% Erlang map literal — order here is irrelevant; test is
+            %% that the finalizer walks the redeem-script's pubkey list.
+            partial_sigs => #{PK2 => Sig2, PK1 => Sig1}
+        }}
+    ]),
+    {ok, Finalized} = beamchain_psbt:finalize(Updated),
+    InputMap = beamchain_psbt:get_input(Finalized, 0),
+    ScriptSig = maps:get(final_script_sig, InputMap),
+    %% Layout: OP_0 <push Sig1> <push Sig2> <push RS>. Sig1 must come
+    %% before Sig2 because PK1 is listed first in RS.
+    %% OP_0 = 0x00, push-len(Sig1)=70, Sig1, push-len(Sig2)=70, Sig2, ...
+    SigLen = byte_size(Sig1),
+    %% Sanity: both sigs same length (canonical DER + sighash byte).
+    ?assertEqual(SigLen, byte_size(Sig2)),
+    Expected =
+        <<0, SigLen:8, Sig1/binary, SigLen:8, Sig2/binary,
+          (push_len(byte_size(RS)))/binary, RS/binary>>,
+    ?assertEqual(Expected, ScriptSig).
+
+%% Tiny helper: BIP-62 / minimal-push prefix. For 0..75 the prefix is
+%% one byte == length; for 76..255 it's OP_PUSHDATA1 + len. Our redeem
+%% script is 71 bytes so the simple form applies, but keep this generic.
+push_len(L) when L =< 75 -> <<L:8>>;
+push_len(L) when L =< 255 -> <<76, L:8>>;
+push_len(L) when L =< 65535 -> <<77, L:16/little>>.
+
+%% Test 3: determinism across repeated encode calls. Erlang map iteration
+%% order is implementation-defined; we want byte-identical output every
+%% time. Build a PSBT with multiple partial_sigs and bip32_derivations,
+%% encode twice, compare bytes.
+w46_encode_deterministic() ->
+    PrevTx = w46_p2sh_prev_tx(),
+    Tx = w46_spending_tx(PrevTx),
+    RS = w46_redeem_script(),
+    PK1 = w46_pubkey1(),
+    PK2 = w46_pubkey2(),
+    Sig1 = <<48, 68, 2, 32, 16#11:256, 2, 32, 16#22:256, 1>>,
+    Sig2 = <<48, 68, 2, 32, 16#33:256, 2, 32, 16#44:256, 1>>,
+    {ok, Psbt} = beamchain_psbt:create(Tx),
+    {ok, Updated} = beamchain_psbt:update(Psbt, [
+        {input, 0, #{
+            non_witness_utxo => PrevTx,
+            redeem_script => RS,
+            partial_sigs => #{PK2 => Sig2, PK1 => Sig1},
+            bip32_derivation => #{
+                PK2 => {<<1,2,3,4>>, [44, 0, 1]},
+                PK1 => {<<1,2,3,4>>, [44, 0, 0]}
+            }
+        }}
+    ]),
+    A = beamchain_psbt:encode(Updated),
+    B = beamchain_psbt:encode(Updated),
+    ?assertEqual(A, B),
+    %% And re-decoding then re-encoding stays identical too (idempotent
+    %% combine-PSBT path, T2 in psbt-multi-input-test.sh).
+    {ok, Reloaded} = beamchain_psbt:decode(A),
+    C = beamchain_psbt:encode(Reloaded),
+    ?assertEqual(A, C).
+
+%% Test 4: partial_sigs wire-order is HASH160(pubkey)-sorted, matching
+%% Core's std::map<CKeyID, SigPair>. Construct two pubkeys whose HASH160
+%% sort order differs from their raw-pubkey-bytes sort order, so the
+%% test catches the wrong sort key.
+w46_partial_sigs_sorted_by_keyid() ->
+    PrevTx = w46_p2sh_prev_tx(),
+    Tx = w46_spending_tx(PrevTx),
+    PKa = w46_pubkey1(),
+    PKb = w46_pubkey2(),
+    Sa = <<1, 2, 3, 4>>,
+    Sb = <<5, 6, 7, 8>>,
+    {ok, Psbt} = beamchain_psbt:create(Tx),
+    {ok, Updated} = beamchain_psbt:update(Psbt, [
+        {input, 0, #{
+            non_witness_utxo => PrevTx,
+            partial_sigs => #{PKb => Sb, PKa => Sa}
+        }}
+    ]),
+    Encoded = beamchain_psbt:encode(Updated),
+    %% Decode and find the order in which the encoder emitted them by
+    %% scanning the encoded bytes for the two sig payloads.
+    PosA = binary_position(Encoded, Sa),
+    PosB = binary_position(Encoded, Sb),
+    ?assert(PosA =/= notfound),
+    ?assert(PosB =/= notfound),
+    %% Compute the expected order by HASH160 of each pubkey.
+    KIDa = beamchain_crypto:hash160(PKa),
+    KIDb = beamchain_crypto:hash160(PKb),
+    ExpectedOrder = case KIDa < KIDb of
+        true -> {PosA, PosB};
+        false -> {PosB, PosA}
+    end,
+    {First, Second} = ExpectedOrder,
+    ?assert(First < Second).
+
+binary_position(Hay, Needle) ->
+    case binary:match(Hay, Needle) of
+        nomatch -> notfound;
+        {Pos, _Len} -> Pos
+    end.
+
