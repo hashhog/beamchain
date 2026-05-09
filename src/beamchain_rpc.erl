@@ -6239,16 +6239,6 @@ format_psbt_output(OutputMap) ->
     end,
     B2.
 
-sighash_name(?SIGHASH_ALL) -> <<"ALL">>;
-sighash_name(?SIGHASH_NONE) -> <<"NONE">>;
-sighash_name(?SIGHASH_SINGLE) -> <<"SINGLE">>;
-sighash_name(?SIGHASH_DEFAULT) -> <<"DEFAULT">>;
-sighash_name(N) when N band ?SIGHASH_ANYONECANPAY =/= 0 ->
-    Base = sighash_name(N band 16#1f),
-    <<Base/binary, "|ANYONECANPAY">>;
-sighash_name(N) ->
-    iolist_to_binary(io_lib:format("UNKNOWN(~B)", [N])).
-
 %% psbt_sighash_to_str/1 — Core's SighashToStr for decodepsbt.
 %% Reference: bitcoin-core/src/core_io.cpp SighashToStr.
 %% Only the 6 defined values; anything else returns "" (empty binary).
