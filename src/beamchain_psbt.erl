@@ -360,54 +360,83 @@ parse_global([{Key, Value} | Rest], Tx, XPubs, Ver, Unk) ->
 %%% ===================================================================
 
 encode_input_map(InputMap) ->
+    %% W46: BIP-174 / Core `psbt.h` SerializeInput gates the producer
+    %% fields (partial_sigs, sighash_type, redeem_script, witness_script,
+    %% bip32_derivation, tap_*) behind
+    %%     if (final_script_sig.empty() && final_script_witness.IsNull())
+    %% so a finalized input never re-emits hundreds of bytes of producer
+    %% state. Without this gate, finalize+encode leaked drift vs. Core on
+    %% every multi-sig path (W42-A diagnostic, same shape as W41 lunarblock).
+    Finalized = is_input_finalized(InputMap),
+    ProducerKVs = case Finalized of
+        true ->
+            [];
+        false ->
+            [
+                %% Partial signatures — Core sorts std::map<CKeyID, SigPair>
+                %% by HASH160(pubkey) on the wire. W46.
+                case maps:get(partial_sigs, InputMap, undefined) of
+                    undefined -> [];
+                    Sigs ->
+                        SortedSigs = sort_partial_sigs_by_keyid(Sigs),
+                        [encode_kv(<<?PSBT_IN_PARTIAL_SIG, PK/binary>>, S)
+                         || {PK, S} <- SortedSigs]
+                end,
+                %% Sighash type
+                case maps:get(sighash_type, InputMap, undefined) of
+                    undefined -> [];
+                    SigHash ->
+                        [encode_kv(<<?PSBT_IN_SIGHASH_TYPE>>, <<SigHash:32/little>>)]
+                end,
+                %% Redeem script
+                case maps:get(redeem_script, InputMap, undefined) of
+                    undefined -> [];
+                    RS -> [encode_kv(<<?PSBT_IN_REDEEM_SCRIPT>>, RS)]
+                end,
+                %% Witness script
+                case maps:get(witness_script, InputMap, undefined) of
+                    undefined -> [];
+                    WS -> [encode_kv(<<?PSBT_IN_WITNESS_SCRIPT>>, WS)]
+                end,
+                %% BIP32 derivation paths — Core sorts
+                %% std::map<CPubKey, KeyOriginInfo> by raw pubkey bytes. W46.
+                case maps:get(bip32_derivation, InputMap, undefined) of
+                    undefined -> [];
+                    Derivs ->
+                        Sorted = lists:keysort(1, maps:to_list(Derivs)),
+                        [begin
+                             PathBin = encode_bip32_path(FP, P),
+                             encode_kv(<<?PSBT_IN_BIP32_DERIVATION, PubKey/binary>>, PathBin)
+                         end || {PubKey, {FP, P}} <- Sorted]
+                end,
+                %% Taproot key signature (producer field per BIP-371)
+                case maps:get(tap_key_sig, InputMap, undefined) of
+                    undefined -> [];
+                    TKS -> [encode_kv(<<?PSBT_IN_TAP_KEY_SIG>>, TKS)]
+                end,
+                %% Taproot internal key (producer field per BIP-371)
+                case maps:get(tap_internal_key, InputMap, undefined) of
+                    undefined -> [];
+                    TIK -> [encode_kv(<<?PSBT_IN_TAP_INTERNAL_KEY>>, TIK)]
+                end
+            ]
+    end,
     KVs = lists:flatten([
-        %% Non-witness UTXO
+        %% Non-witness UTXO (retained per BIP-174 even after finalize)
         case maps:get(non_witness_utxo, InputMap, undefined) of
             undefined -> [];
             NwUtxo ->
                 TxBin = beamchain_serialize:encode_transaction(NwUtxo, no_witness),
                 [encode_kv(<<?PSBT_IN_NON_WITNESS_UTXO>>, TxBin)]
         end,
-        %% Witness UTXO
+        %% Witness UTXO (retained per BIP-174 even after finalize)
         case maps:get(witness_utxo, InputMap, undefined) of
             undefined -> [];
             {Value, ScriptPubKey} ->
                 UtxoBin = encode_witness_utxo(Value, ScriptPubKey),
                 [encode_kv(<<?PSBT_IN_WITNESS_UTXO>>, UtxoBin)]
         end,
-        %% Partial signatures
-        case maps:get(partial_sigs, InputMap, undefined) of
-            undefined -> [];
-            Sigs ->
-                maps:fold(fun(PubKey, Sig, Acc) ->
-                    [encode_kv(<<?PSBT_IN_PARTIAL_SIG, PubKey/binary>>, Sig) | Acc]
-                end, [], Sigs)
-        end,
-        %% Sighash type
-        case maps:get(sighash_type, InputMap, undefined) of
-            undefined -> [];
-            SigHash ->
-                [encode_kv(<<?PSBT_IN_SIGHASH_TYPE>>, <<SigHash:32/little>>)]
-        end,
-        %% Redeem script
-        case maps:get(redeem_script, InputMap, undefined) of
-            undefined -> [];
-            RS -> [encode_kv(<<?PSBT_IN_REDEEM_SCRIPT>>, RS)]
-        end,
-        %% Witness script
-        case maps:get(witness_script, InputMap, undefined) of
-            undefined -> [];
-            WS -> [encode_kv(<<?PSBT_IN_WITNESS_SCRIPT>>, WS)]
-        end,
-        %% BIP32 derivation paths
-        case maps:get(bip32_derivation, InputMap, undefined) of
-            undefined -> [];
-            Derivs ->
-                maps:fold(fun(PubKey, {Fingerprint, Path}, Acc) ->
-                    PathBin = encode_bip32_path(Fingerprint, Path),
-                    [encode_kv(<<?PSBT_IN_BIP32_DERIVATION, PubKey/binary>>, PathBin) | Acc]
-                end, [], Derivs)
-        end,
+        ProducerKVs,
         %% Final scriptSig
         case maps:get(final_script_sig, InputMap, undefined) of
             undefined -> [];
@@ -417,16 +446,6 @@ encode_input_map(InputMap) ->
         case maps:get(final_script_witness, InputMap, undefined) of
             undefined -> [];
             FSW -> [encode_kv(<<?PSBT_IN_FINAL_SCRIPTWITNESS>>, encode_witness_stack(FSW))]
-        end,
-        %% Taproot key signature
-        case maps:get(tap_key_sig, InputMap, undefined) of
-            undefined -> [];
-            TKS -> [encode_kv(<<?PSBT_IN_TAP_KEY_SIG>>, TKS)]
-        end,
-        %% Taproot internal key
-        case maps:get(tap_internal_key, InputMap, undefined) of
-            undefined -> [];
-            TIK -> [encode_kv(<<?PSBT_IN_TAP_INTERNAL_KEY>>, TIK)]
         end,
         %% Unknown keys
         case maps:get(unknown, InputMap, undefined) of
@@ -438,6 +457,24 @@ encode_input_map(InputMap) ->
         end
     ]),
     iolist_to_binary(KVs ++ [<<0>>]).
+
+%% W46: shared finalized-detector. Same predicate as `finalize_input/2`
+%% (lines 861-869) — once either final_script_sig or final_script_witness
+%% is set, the producer fields must not appear on the wire.
+is_input_finalized(InputMap) ->
+    maps:is_key(final_script_sig, InputMap) orelse
+    maps:is_key(final_script_witness, InputMap).
+
+%% W46: sort partial_sigs by HASH160(pubkey). Core uses
+%% std::map<CKeyID, SigPair> where CKeyID = HASH160(CPubKey), so the
+%% wire-order is keyed by HASH160 even though the wire-key bytes are the
+%% raw pubkey. Reference: bitcoin-core/src/psbt.h:270 and the iteration
+%% at psbt.h:315.
+sort_partial_sigs_by_keyid(Sigs) ->
+    Tagged = [{beamchain_crypto:hash160(PK), PK, S}
+              || {PK, S} <- maps:to_list(Sigs)],
+    Sorted = lists:keysort(1, Tagged),
+    [{PK, S} || {_KeyID, PK, S} <- Sorted].
 
 parse_input_map(Pairs) ->
     parse_input_pairs(Pairs, #{}).
@@ -903,10 +940,10 @@ finalize_p2wpkh(InputMap) ->
     PartialSigs = maps:get(partial_sigs, InputMap, #{}),
     case maps:to_list(PartialSigs) of
         [{PubKey, Sig}] ->
-            InputMap#{
+            drop_producer_fields(InputMap#{
                 final_script_sig => <<>>,
                 final_script_witness => [Sig, PubKey]
-            };
+            });
         [] ->
             throw({finalize_error, missing_signature});
         _ ->
@@ -918,7 +955,7 @@ finalize_p2pkh(InputMap) ->
     case maps:to_list(PartialSigs) of
         [{PubKey, Sig}] ->
             ScriptSig = push_data(Sig, push_data(PubKey, <<>>)),
-            InputMap#{final_script_sig => ScriptSig};
+            drop_producer_fields(InputMap#{final_script_sig => ScriptSig});
         [] ->
             throw({finalize_error, missing_signature});
         _ ->
@@ -930,10 +967,10 @@ finalize_p2tr(InputMap) ->
         undefined ->
             throw({finalize_error, missing_taproot_signature});
         Sig ->
-            InputMap#{
+            drop_producer_fields(InputMap#{
                 final_script_sig => <<>>,
                 final_script_witness => [Sig]
-            }
+            })
     end.
 
 finalize_p2sh(InputMap) ->
@@ -947,10 +984,10 @@ finalize_p2sh(InputMap) ->
             case maps:to_list(PartialSigs) of
                 [{PubKey, Sig}] ->
                     ScriptSig = push_data(RedeemScript, <<>>),
-                    InputMap#{
+                    drop_producer_fields(InputMap#{
                         final_script_sig => ScriptSig,
                         final_script_witness => [Sig, PubKey]
-                    };
+                    });
                 [] ->
                     throw({finalize_error, missing_signature})
             end;
@@ -971,18 +1008,51 @@ finalize_p2sh_p2wsh(InputMap, RedeemScript) ->
             PartialSigs = maps:get(partial_sigs, InputMap, #{}),
             Witness = build_multisig_witness(PartialSigs, WitnessScript),
             ScriptSig = push_data(RedeemScript, <<>>),
-            InputMap#{
+            drop_producer_fields(InputMap#{
                 final_script_sig => ScriptSig,
                 final_script_witness => Witness
-            }
+            })
     end.
 
 finalize_legacy_p2sh(InputMap, RedeemScript) ->
     PartialSigs = maps:get(partial_sigs, InputMap, #{}),
-    %% Build scriptSig: OP_0 <sig1> <sig2> ... <redeemScript>
-    SigParts = maps:values(PartialSigs),
-    ScriptSig = build_multisig_scriptsig(SigParts, RedeemScript),
-    InputMap#{final_script_sig => ScriptSig}.
+    %% W46: scriptSig sigs must be in script-pubkey order, not Erlang
+    %% map-iteration order (which is undefined). Same fix already lives
+    %% on the witness path via build_p2wsh_witness_from_sigs/2; the
+    %% legacy P2SH path was the missing twin. Reference: Core
+    %% src/script/sign.cpp:ProduceSignature + the multisig scriptSig
+    %% layout in BIP-11 / `OP_0 <sig1> ... <sigM> <redeemScript>` where
+    %% sig_i corresponds to the i-th matched script-order pubkey.
+    SortedSigs = case beamchain_witness_signer:parse_multisig_script(RedeemScript) of
+        {ok, M, _N, PubKeys} ->
+            Collected = [maps:get(PK, PartialSigs)
+                         || PK <- PubKeys, maps:is_key(PK, PartialSigs)],
+            lists:sublist(Collected, M);
+        error ->
+            %% Non-canonical multisig — fall back to map-iteration order
+            %% (no script-pubkey order to follow). This matches the W28
+            %% witness-path fallback in build_multisig_witness/2.
+            maps:values(PartialSigs)
+    end,
+    ScriptSig = build_multisig_scriptsig(SortedSigs, RedeemScript),
+    %% W46 belt-and-suspenders: drop producer fields after finalize so
+    %% the encoder gate at encode_input_map/1 isn't the only line of
+    %% defense (mirrors W41 lunarblock psbt.lua:1191-1195).
+    drop_producer_fields(InputMap#{final_script_sig => ScriptSig}).
+
+%% W46: drop producer-only fields once an input is finalized. Per
+%% BIP-174: "producer fields ... should be cleared once a signer creates
+%% the FINAL_SCRIPTSIG / FINAL_SCRIPTWITNESS values". non_witness_utxo
+%% and witness_utxo are deliberately retained (extractor needs them for
+%% amount verification).
+drop_producer_fields(InputMap) ->
+    maps:without([partial_sigs,
+                  sighash_type,
+                  redeem_script,
+                  witness_script,
+                  bip32_derivation,
+                  tap_key_sig,
+                  tap_internal_key], InputMap).
 
 finalize_p2wsh(InputMap) ->
     WitnessScript = maps:get(witness_script, InputMap, undefined),
@@ -992,10 +1062,10 @@ finalize_p2wsh(InputMap) ->
         _ ->
             PartialSigs = maps:get(partial_sigs, InputMap, #{}),
             Witness = build_multisig_witness(PartialSigs, WitnessScript),
-            InputMap#{
+            drop_producer_fields(InputMap#{
                 final_script_sig => <<>>,
                 final_script_witness => Witness
-            }
+            })
     end.
 
 %% W41: `finalize_legacy/1` removed — `do_finalize_input/2` now always
