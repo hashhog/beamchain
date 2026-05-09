@@ -5942,17 +5942,30 @@ opcode_name(16#50) -> <<"OP_RESERVED">>;
 opcode_name(N)     -> iolist_to_binary(io_lib:format("OP_UNKNOWN(~B)", [N])).
 
 %% infer_spk_descriptor/2 — BIP-380 descriptor with 8-char checksum.
-%% Mirrors Core's InferDescriptor (script/descriptor.cpp) in the no-keys path:
+%% Mirrors Core's InferDescriptor (script/descriptor.cpp) in the no-keys path.
+%%
+%% For witness_v1_taproot (OP_1 <32-byte x-only key>), Core wraps the x-only
+%% key in RawTrDescriptor rather than AddressDescriptor, emitting:
+%%   rawtr(<32-byte-hex>)#<checksum>
+%%
+%% For all other standard scripts:
 %%   if ExtractDestination succeeds → addr(<address>)#<csum>
 %%   else                           → raw(<hex>)#<csum>
+%%
 %% Network is mainnet | testnet (atom from beamchain_config:network()).
 infer_spk_descriptor(Script, Network) ->
     NetType = case Network of mainnet -> mainnet; _ -> testnet end,
-    Addr = beamchain_address:script_to_address(Script, NetType),
-    Payload = case Addr of
-        unknown   -> "raw(" ++ binary_to_list(beamchain_serialize:hex_encode(Script)) ++ ")";
-        "OP_RETURN" -> "raw(" ++ binary_to_list(beamchain_serialize:hex_encode(Script)) ++ ")";
-        A         -> "addr(" ++ A ++ ")"
+    Payload = case Script of
+        %% OP_1 (0x51) + push 32 bytes (0x20) + 32-byte x-only pubkey
+        <<16#51, 16#20, XOnly:32/binary>> ->
+            "rawtr(" ++ binary_to_list(beamchain_serialize:hex_encode(XOnly)) ++ ")";
+        _ ->
+            Addr = beamchain_address:script_to_address(Script, NetType),
+            case Addr of
+                unknown     -> "raw(" ++ binary_to_list(beamchain_serialize:hex_encode(Script)) ++ ")";
+                "OP_RETURN" -> "raw(" ++ binary_to_list(beamchain_serialize:hex_encode(Script)) ++ ")";
+                A           -> "addr(" ++ A ++ ")"
+            end
     end,
     try beamchain_descriptor:add_checksum(Payload) of
         S -> list_to_binary(S)
@@ -6218,7 +6231,94 @@ format_psbt_input(_Input, InputMap) ->
         FSW -> B7#{<<"final_scriptwitness">> =>
             [beamchain_serialize:hex_encode(W) || W <- FSW]}
     end,
-    B8.
+    %% BIP-32 derivation paths (regular, non-taproot).
+    %% Core emits bip32_derivs sorted by raw pubkey bytes (std::map<CPubKey,...>).
+    %% Path notation: 'h' for hardened, matching Core's WriteHDKeypath default.
+    B9 = case maps:get(bip32_derivation, InputMap, undefined) of
+        undefined -> B8;
+        Derivs when map_size(Derivs) > 0 ->
+            SortedDerivs = lists:keysort(1, maps:to_list(Derivs)),
+            DerivsArr = [#{
+                <<"pubkey">>            => beamchain_serialize:hex_encode(PK),
+                <<"master_fingerprint">> => beamchain_serialize:hex_encode(FP),
+                <<"path">>              => format_bip32_path(Path)
+            } || {PK, {FP, Path}} <- SortedDerivs],
+            B8#{<<"bip32_derivs">> => DerivsArr};
+        _ -> B8
+    end,
+    %% Taproot key-path signature (0x13)
+    B10 = case maps:get(tap_key_sig, InputMap, undefined) of
+        undefined -> B9;
+        TKS -> B9#{<<"taproot_key_path_sig">> => beamchain_serialize:hex_encode(TKS)}
+    end,
+    %% Taproot script-path sigs (0x14) — array of {pubkey, leaf_hash, sig}
+    %% sorted by (xonly_pubkey, leaf_hash), matching Core's std::map iteration.
+    B11 = case maps:get(tap_script_sigs, InputMap, undefined) of
+        undefined -> B10;
+        TapScriptSigs when map_size(TapScriptSigs) > 0 ->
+            SortedSigKeys = lists:sort(maps:keys(TapScriptSigs)),
+            SigsArr = [#{
+                <<"pubkey">>    => beamchain_serialize:hex_encode(XOnly),
+                <<"leaf_hash">> => beamchain_serialize:hex_encode(LH),
+                <<"sig">>       => beamchain_serialize:hex_encode(maps:get({XOnly, LH}, TapScriptSigs))
+            } || {XOnly, LH} <- SortedSigKeys],
+            B10#{<<"taproot_script_path_sigs">> => SigsArr};
+        _ -> B10
+    end,
+    %% Taproot leaf scripts (0x15) — array of {script, leaf_ver, control_blocks[]}
+    %% Core's m_tap_scripts is std::map<(script, leaf_ver), set<control_block>>.
+    %% We group by (script, leaf_ver) and collect all control blocks.
+    B12 = case maps:get(tap_leaf_scripts, InputMap, undefined) of
+        undefined -> B11;
+        TapLeafScripts when map_size(TapLeafScripts) > 0 ->
+            %% Group control blocks by (script, leaf_ver)
+            ScriptMap = maps:fold(fun(CtrlBlock, {Script, LeafVer}, Acc) ->
+                Key = {Script, LeafVer},
+                CBs = maps:get(Key, Acc, []),
+                Acc#{Key => [CtrlBlock | CBs]}
+            end, #{}, TapLeafScripts),
+            %% Sort by (script_hex, leaf_ver) for determinism
+            SortedLeafKeys = lists:sort(maps:keys(ScriptMap)),
+            ScriptsArr = [begin
+                CBList = lists:sort(maps:get({Sc, LV}, ScriptMap)),
+                #{
+                    <<"script">>         => beamchain_serialize:hex_encode(Sc),
+                    <<"leaf_ver">>        => LV,
+                    <<"control_blocks">>  =>
+                        [beamchain_serialize:hex_encode(CB) || CB <- CBList]
+                }
+            end || {Sc, LV} <- SortedLeafKeys],
+            B11#{<<"taproot_scripts">> => ScriptsArr};
+        _ -> B11
+    end,
+    %% Taproot BIP-32 derivations (0x16) — array of
+    %%   {pubkey, master_fingerprint, path, leaf_hashes[]}
+    %% sorted by xonly pubkey (std::map<XOnlyPubKey,...> iteration order).
+    B13 = case maps:get(tap_bip32_derivation, InputMap, undefined) of
+        undefined -> B12;
+        TapBip32 when map_size(TapBip32) > 0 ->
+            SortedTapBip32 = lists:keysort(1, maps:to_list(TapBip32)),
+            TapBip32Arr = [#{
+                <<"pubkey">>            => beamchain_serialize:hex_encode(XOnly),
+                <<"master_fingerprint">> => beamchain_serialize:hex_encode(FP),
+                <<"path">>              => format_bip32_path(Path),
+                <<"leaf_hashes">>       =>
+                    [beamchain_serialize:hex_encode(LH) || LH <- LeafHashes]
+            } || {XOnly, {FP, Path, LeafHashes}} <- SortedTapBip32],
+            B12#{<<"taproot_bip32_derivs">> => TapBip32Arr};
+        _ -> B12
+    end,
+    %% Taproot internal key (0x17)
+    B14 = case maps:get(tap_internal_key, InputMap, undefined) of
+        undefined -> B13;
+        TIK -> B13#{<<"taproot_internal_key">> => beamchain_serialize:hex_encode(TIK)}
+    end,
+    %% Taproot merkle root (0x18)
+    B15 = case maps:get(tap_merkle_root, InputMap, undefined) of
+        undefined -> B14;
+        TMR -> B14#{<<"taproot_merkle_root">> => beamchain_serialize:hex_encode(TMR)}
+    end,
+    B15.
 
 format_psbt_outputs(Psbt) ->
     Tx = beamchain_psbt:get_unsigned_tx(Psbt),
@@ -6237,7 +6337,80 @@ format_psbt_output(OutputMap) ->
         undefined -> B1;
         WS -> B1#{<<"witness_script">> => build_script_type_json(WS)}
     end,
-    B2.
+    %% BIP-32 derivation paths (regular, non-taproot) — sorted by raw pubkey.
+    B3 = case maps:get(bip32_derivation, OutputMap, undefined) of
+        undefined -> B2;
+        OutDerivs when map_size(OutDerivs) > 0 ->
+            SortedOutDerivs = lists:keysort(1, maps:to_list(OutDerivs)),
+            OutDerivsArr = [#{
+                <<"pubkey">>            => beamchain_serialize:hex_encode(PK),
+                <<"master_fingerprint">> => beamchain_serialize:hex_encode(FP),
+                <<"path">>              => format_bip32_path(Path)
+            } || {PK, {FP, Path}} <- SortedOutDerivs],
+            B2#{<<"bip32_derivs">> => OutDerivsArr};
+        _ -> B2
+    end,
+    %% Taproot internal key (0x05)
+    B4 = case maps:get(tap_internal_key, OutputMap, undefined) of
+        undefined -> B3;
+        TIK -> B3#{<<"taproot_internal_key">> => beamchain_serialize:hex_encode(TIK)}
+    end,
+    %% Taproot tree (0x06) — array of {depth, leaf_ver, script}
+    B5 = case maps:get(tap_tree, OutputMap, undefined) of
+        undefined -> B4;
+        TapTree when is_list(TapTree), TapTree =/= [] ->
+            TapTreeArr = [#{
+                <<"depth">>    => Depth,
+                <<"leaf_ver">> => LeafVer,
+                <<"script">>   => beamchain_serialize:hex_encode(Script)
+            } || {Depth, LeafVer, Script} <- TapTree],
+            B4#{<<"taproot_tree">> => TapTreeArr};
+        _ -> B4
+    end,
+    %% Taproot BIP-32 derivations (0x07) — sorted by xonly pubkey.
+    B6 = case maps:get(tap_bip32_derivation, OutputMap, undefined) of
+        undefined -> B5;
+        OutTapBip32 when map_size(OutTapBip32) > 0 ->
+            SortedOutTap = lists:keysort(1, maps:to_list(OutTapBip32)),
+            OutTapArr = [#{
+                <<"pubkey">>            => beamchain_serialize:hex_encode(XOnly),
+                <<"master_fingerprint">> => beamchain_serialize:hex_encode(FP),
+                <<"path">>              => format_bip32_path(Path),
+                <<"leaf_hashes">>       =>
+                    [beamchain_serialize:hex_encode(LH) || LH <- LeafHashes]
+            } || {XOnly, {FP, Path, LeafHashes}} <- SortedOutTap],
+            B5#{<<"taproot_bip32_derivs">> => OutTapArr};
+        _ -> B5
+    end,
+    %% MuSig2 participant pubkeys (0x08) — sorted by aggregate pubkey.
+    %% Core iterates std::map<CPubKey, vector<CPubKey>> in ascending key order.
+    B7 = case maps:get(musig2_participant_pubkeys, OutputMap, undefined) of
+        undefined -> B6;
+        MuSig2Map when map_size(MuSig2Map) > 0 ->
+            SortedMuSig2 = lists:keysort(1, maps:to_list(MuSig2Map)),
+            MuSig2Arr = [#{
+                <<"aggregate_pubkey">>    => beamchain_serialize:hex_encode(AggPK),
+                <<"participant_pubkeys">> =>
+                    [beamchain_serialize:hex_encode(PK) || PK <- Participants]
+            } || {AggPK, Participants} <- SortedMuSig2],
+            B6#{<<"musig2_participant_pubkeys">> => MuSig2Arr};
+        _ -> B6
+    end,
+    B7.
+
+%% format_bip32_path/1 — render a BIP-32 derivation path as "m/…".
+%% Hardened components use 'h' suffix (Core's WriteHDKeypath with apostrophe=false,
+%% src/util/bip32.cpp:56).  An empty path emits just "m".
+format_bip32_path([]) ->
+    <<"m">>;
+format_bip32_path(Path) ->
+    Parts = lists:map(fun(Idx) ->
+        case Idx band 16#80000000 of
+            0 -> integer_to_list(Idx);
+            _ -> integer_to_list(Idx band 16#7fffffff) ++ "h"
+        end
+    end, Path),
+    iolist_to_binary(["m/" | lists:join("/", Parts)]).
 
 %% psbt_sighash_to_str/1 — Core's SighashToStr for decodepsbt.
 %% Reference: bitcoin-core/src/core_io.cpp SighashToStr.
