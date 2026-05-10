@@ -465,6 +465,18 @@ do_add_transaction(Tx, State) ->
         %% Mirrors Bitcoin Core policy/policy.cpp:265-351.
         is_witness_standard(Tx, InputCoins) orelse throw(bad_witness_nonstandard),
 
+        %% 4c. sigops limit: reject transactions whose sigop cost exceeds
+        %% MAX_STANDARD_TX_SIGOPS_COST (16000 = 80000 / 5).
+        %% Mirrors Bitcoin Core validation.cpp:908+941-943:
+        %%   nSigOpsCost = GetTransactionSigOpCost(tx, view, STANDARD_SCRIPT_VERIFY_FLAGS);
+        %%   if (nSigOpsCost > MAX_STANDARD_TX_SIGOPS_COST) return Invalid(...);
+        %% Uses STANDARD_SCRIPT_VERIFY_FLAGS (P2SH + witness) to count all
+        %% three categories: legacy, P2SH, and witness sigops.
+        MempoolSigopFlags = all_standard_flags(),
+        TxSigopCost = beamchain_validation:get_tx_sigop_cost(Tx, InputCoins, MempoolSigopFlags),
+        TxSigopCost =< ?MAX_STANDARD_TX_SIGOPS_COST
+            orelse throw({too_many_sigops, TxSigopCost}),
+
         %% 5. check for double-spends in mempool (+ RBF)
         %% Returns {ok, EvictedTxids, EvictedVBytes} - store for cluster cleanup later
         {ok, RbfEvictedTxids, RbfEvictedVBytes} = check_mempool_conflicts(Tx, InputCoins),
@@ -811,6 +823,14 @@ compute_package_metrics(TxPairs, PackageTxMap, _State) ->
     lists:foldl(fun({Txid, Tx}, {FeeAcc, VSizeAcc, EntriesAcc}) ->
         %% Look up inputs (UTXO set + mempool + package)
         {InputCoins, SpendsCoinbase} = lookup_inputs_with_package(Tx, PackageTxMap),
+
+        %% Sigops limit: per-tx cost must not exceed MAX_STANDARD_TX_SIGOPS_COST.
+        %% Mirrors Bitcoin Core validation.cpp:908+941-943 applied to each
+        %% package transaction.
+        PkgSigopFlags = all_standard_flags(),
+        PkgSigopCost = beamchain_validation:get_tx_sigop_cost(Tx, InputCoins, PkgSigopFlags),
+        PkgSigopCost =< ?MAX_STANDARD_TX_SIGOPS_COST
+            orelse throw({too_many_sigops, PkgSigopCost}),
 
         %% Compute fee
         TotalIn = lists:foldl(fun(C, A) -> A + C#utxo.value end, 0, InputCoins),
