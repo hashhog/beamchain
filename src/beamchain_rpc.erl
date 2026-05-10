@@ -3762,34 +3762,49 @@ rpc_validateaddress([Address]) when is_binary(Address) ->
                 {witness, _, _} -> true;
                 _ -> false
             end,
+            %% isscript: P2SH, P2WSH, P2TR (witness_program > 20 bytes), and any
+            %% unknown witness type with program > 20 bytes (Core parity)
             IsScript = case Type of
                 p2sh -> true;
                 p2wsh -> true;
+                p2tr -> true;
+                {witness, _, WProg} when byte_size(WProg) > 20 -> true;
                 _ -> false
             end,
-            {ok, #{
+            BaseResult = #{
                 <<"isvalid">> => true,
                 <<"address">> => Address,
                 <<"scriptPubKey">> => beamchain_serialize:hex_encode(Script),
                 <<"isscript">> => IsScript,
-                <<"iswitness">> => IsWitness,
-                <<"witness_version">> => case Type of
-                    p2wpkh -> 0;
-                    p2wsh -> 0;
-                    p2tr -> 1;
-                    {witness, V, _} -> V;
-                    _ -> null
-                end,
-                <<"witness_program">> => case Script of
-                    <<_WitVer:8, Len:8, Prog:Len/binary>> when IsWitness ->
-                        beamchain_serialize:hex_encode(Prog);
-                    _ -> null
-                end
-            }};
+                <<"iswitness">> => IsWitness
+            },
+            %% Only add witness_version and witness_program for witness script types
+            case IsWitness of
+                true ->
+                    WitnessVersion = case Type of
+                        p2wpkh -> 0;
+                        p2wsh -> 0;
+                        p2tr -> 1;
+                        {witness, V, _} -> V;
+                        _ -> 0
+                    end,
+                    WitnessProgram = case Script of
+                        <<_WitVer:8, WLen:8, WProgHex:WLen/binary>> ->
+                            beamchain_serialize:hex_encode(WProgHex);
+                        _ -> <<>>
+                    end,
+                    {ok, BaseResult#{
+                        <<"witness_version">> => WitnessVersion,
+                        <<"witness_program">> => WitnessProgram
+                    }};
+                false ->
+                    {ok, BaseResult}
+            end;
         {error, _} ->
             {ok, #{
                 <<"isvalid">> => false,
-                <<"address">> => Address
+                <<"error">> => <<"Invalid or unsupported Segwit (Bech32) or Base58 encoding.">>,
+                <<"error_locations">> => []
             }}
     end;
 rpc_validateaddress(_) ->
