@@ -149,6 +149,7 @@
 -define(MAX_ANCESTOR_SIZE, 101000).           %% 101 kvB
 -define(MAX_DESCENDANT_SIZE, 101000).         %% 101 kvB
 -define(MAX_STANDARD_TX_WEIGHT, 400000).      %% 100 kvB
+-define(MIN_STANDARD_TX_NONWITNESS_SIZE, 65). %% CVE-2017-12842: min non-witness byte size
 -define(MAX_STANDARD_SCRIPTSIG_SIZE, 1650).   %% Bitcoin Core MAX_STANDARD_SCRIPTSIG_SIZE
 %% MAX_OP_RETURN_RELAY = MAX_STANDARD_TX_WEIGHT / WITNESS_SCALE_FACTOR = 400000 / 4
 %% Budget in bytes for all OP_RETURN outputs combined (scriptPubKey bytes).

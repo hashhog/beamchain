@@ -1097,6 +1097,12 @@ check_standard(#transaction{version = V, inputs = Inputs, outputs = Outputs} = T
     %% weight limit — mirrors Bitcoin Core MAX_STANDARD_TX_WEIGHT
     Weight = beamchain_serialize:tx_weight(Tx),
     Weight =< ?MAX_STANDARD_TX_WEIGHT orelse throw(tx_size),
+    %% CVE-2017-12842: non-witness (base) serialization must be >= 65 bytes.
+    %% A 64-byte transaction is indistinguishable from an internal merkle node,
+    %% allowing an attacker to fake SPV proofs. Bitcoin Core policy.h:
+    %% MIN_STANDARD_TX_NONWITNESS_SIZE = 65.
+    NonWitnessSize = byte_size(beamchain_serialize:encode_transaction(Tx, no_witness)),
+    NonWitnessSize >= ?MIN_STANDARD_TX_NONWITNESS_SIZE orelse throw(tx_size),
     %% input scriptSig checks — mirrors Bitcoin Core IsStandardTx input loop:
     %%   (1) scriptSig size <= MAX_STANDARD_SCRIPTSIG_SIZE (1650 bytes)
     %%   (2) scriptSig must be push-only
