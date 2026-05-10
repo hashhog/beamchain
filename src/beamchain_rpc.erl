@@ -2874,15 +2874,16 @@ do_rpc_gettxoutsetinfo(HashType) ->
                 <<"none">> ->
                     CacheStats = beamchain_chainstate:cache_stats(),
                     CacheEntries = maps:get(cache_entries, CacheStats, 0),
+                    %% Core uses ValueFromAmount for total_amount; use sentinel.
                     Base = #{
                         <<"height">>       => TipHeight,
                         <<"bestblock">>    => hash_to_hex(TipHash),
                         <<"txouts">>       => CacheEntries,
                         <<"bogosize">>     => CacheEntries * 150,
-                        <<"total_amount">> => 0.0,
+                        <<"total_amount">> => format_amount_sentinel(0),
                         <<"disk_size">>    => 0
                     },
-                    {ok, Base};
+                    {ok_raw_json, replace_btc_sentinels(jsx:encode(Base))};
                 _ ->
                     %% Walk the on-disk UTXO set once and derive every
                     %% scalar plus the requested commitment from a single
@@ -2890,26 +2891,30 @@ do_rpc_gettxoutsetinfo(HashType) ->
                     %% walk per call (kernel/coinstats.cpp:75-130).
                     {Stats, CommitHex} =
                         compute_utxo_set_stats(HashType),
+                    %% total_amount in Stats is integer satoshis; use sentinel
+                    %% so replace_btc_sentinels emits exact 8-decimal form.
                     Base = #{
                         <<"height">>       => TipHeight,
                         <<"bestblock">>    => hash_to_hex(TipHash),
                         <<"txouts">>       => maps:get(txouts,    Stats),
                         <<"bogosize">>     => maps:get(bogosize,  Stats),
                         <<"total_amount">> =>
-                            maps:get(total_amount, Stats) / 100000000.0,
+                            format_amount_sentinel(maps:get(total_amount, Stats)),
                         <<"disk_size">>    => 0
                     },
-                    {ok, Base#{HashType => CommitHex}}
+                    Map = Base#{HashType => CommitHex},
+                    {ok_raw_json, replace_btc_sentinels(jsx:encode(Map))}
             end;
         not_found ->
-            {ok, #{
+            Map = #{
                 <<"height">> => 0,
                 <<"bestblock">> => <<"0000000000000000000000000000000000000000000000000000000000000000">>,
                 <<"txouts">> => 0,
                 <<"bogosize">> => 0,
-                <<"total_amount">> => 0.0,
+                <<"total_amount">> => format_amount_sentinel(0),
                 <<"disk_size">> => 0
-            }}
+            },
+            {ok_raw_json, replace_btc_sentinels(jsx:encode(Map))}
     end.
 
 %% Single-pass UTXO-set walk that returns both Core-parity scalars
@@ -3009,7 +3014,8 @@ rpc_getrawmempool([Verbose]) ->
                         false
                 end
             end, Txids),
-            {ok, maps:from_list(Entries)};
+            Map = maps:from_list(Entries),
+            {ok_raw_json, replace_btc_sentinels(jsx:encode(Map))};
         _ ->
             {ok, [hash_to_hex(T) || T <- Txids]}
     end;
@@ -3021,7 +3027,8 @@ rpc_getmempoolentry([TxidHex]) when is_binary(TxidHex) ->
     Txid = hex_to_internal_hash(TxidHex),
     case beamchain_mempool:get_entry(Txid) of
         {ok, Entry} ->
-            {ok, format_mempool_entry(Entry)};
+            Map = format_mempool_entry(Entry),
+            {ok_raw_json, replace_btc_sentinels(jsx:encode(Map))};
         not_found ->
             {error, ?RPC_INVALID_ADDRESS_OR_KEY,
              <<"Transaction not in mempool">>}
@@ -3047,7 +3054,8 @@ rpc_getmempoolancestors([TxidHex, Verbose]) when is_binary(TxidHex) ->
                                 {hash_to_hex(AncTxid), #{}}
                         end
                     end, AncestorTxids),
-                    {ok, maps:from_list(Entries)};
+                    Map = maps:from_list(Entries),
+                    {ok_raw_json, replace_btc_sentinels(jsx:encode(Map))};
                 _ ->
                     {ok, [hash_to_hex(T) || T <- AncestorTxids]}
             end;
@@ -3080,7 +3088,8 @@ rpc_getmempooldescendants([TxidHex, Verbose]) when is_binary(TxidHex) ->
                                 {hash_to_hex(DescTxid), #{}}
                         end
                     end, DescTxids),
-                    {ok, maps:from_list(Entries)};
+                    Map = maps:from_list(Entries),
+                    {ok_raw_json, replace_btc_sentinels(jsx:encode(Map))};
                 _ ->
                     {ok, [hash_to_hex(T) || T <- DescTxids]}
             end;
@@ -4754,11 +4763,15 @@ format_mempool_entry(#mempool_entry{fee = Fee, vsize = Vsize,
         ancestor_fee = AncFee,
         descendant_count = DescCount, descendant_size = DescSize,
         descendant_fee = DescFee, rbf_signaling = Bip125}) ->
+    %% All fee fields use format_amount_sentinel so callers can emit them
+    %% via replace_btc_sentinels and get Core-exact 8-decimal formatting.
+    %% Core's entryToJSON (rpc/mempool.cpp:528-532) uses ValueFromAmount for
+    %% every fee scalar — plain floats produce wrong formatting (e.g. 1.0e-4).
     #{
         <<"vsize">> => Vsize,
         <<"weight">> => Weight,
-        <<"fee">> => satoshi_to_btc(Fee),
-        <<"modifiedfee">> => satoshi_to_btc(Fee),
+        <<"fee">> => format_amount_sentinel(Fee),
+        <<"modifiedfee">> => format_amount_sentinel(Fee),
         <<"time">> => TimeAdded,
         <<"height">> => HeightAdded,
         <<"descendantcount">> => DescCount,
@@ -4771,10 +4784,10 @@ format_mempool_entry(#mempool_entry{fee = Fee, vsize = Vsize,
         <<"spentby">> => [],
         <<"bip125-replaceable">> => Bip125,
         <<"fees">> => #{
-            <<"base">> => satoshi_to_btc(Fee),
-            <<"modified">> => satoshi_to_btc(Fee),
-            <<"ancestor">> => satoshi_to_btc(AncFee),
-            <<"descendant">> => satoshi_to_btc(DescFee)
+            <<"base">> => format_amount_sentinel(Fee),
+            <<"modified">> => format_amount_sentinel(Fee),
+            <<"ancestor">> => format_amount_sentinel(AncFee),
+            <<"descendant">> => format_amount_sentinel(DescFee)
         }
     };
 format_mempool_entry(_) ->
@@ -4913,7 +4926,9 @@ rpc_getbalance(WalletName) ->
         {ok, Pid} ->
             case beamchain_wallet:get_balance(Pid) of
                 {ok, Satoshis} ->
-                    {ok, satoshi_to_btc(Satoshis)};
+                    %% Core returns ValueFromAmount (8-decimal). Use
+                    %% format_btc_amount_exact so jsx never touches the scalar.
+                    {ok_raw_json, format_btc_amount_exact(Satoshis)};
                 {error, no_wallet} ->
                     {error, ?RPC_MISC_ERROR, <<"No wallet loaded">>};
                 {error, Reason} ->
@@ -4961,12 +4976,14 @@ rpc_getwalletinfo(WalletName) ->
                         <<"walletname">> => WalletNameDisplay,
                         <<"walletversion">> => 1,
                         <<"format">> => <<"json">>,
-                        <<"balance">> => satoshi_to_btc(Balance),
-                        <<"unconfirmed_balance">> => 0.0,
-                        <<"immature_balance">> => 0.0,
+                        %% Core uses ValueFromAmount for balance; use sentinel
+                        %% so replace_btc_sentinels emits exact 8-decimal form.
+                        <<"balance">> => format_amount_sentinel(Balance),
+                        <<"unconfirmed_balance">> => format_amount_sentinel(0),
+                        <<"immature_balance">> => format_amount_sentinel(0),
                         <<"txcount">> => 0,
                         <<"keypoolsize">> => maps:get(addresses, Info, 0),
-                        <<"paytxfee">> => 0.0,
+                        <<"paytxfee">> => format_amount_sentinel(0),
                         <<"private_keys_enabled">> => true,
                         <<"avoid_reuse">> => false,
                         <<"scanning">> => false
@@ -4982,7 +4999,8 @@ rpc_getwalletinfo(WalletName) ->
                         false ->
                             BaseInfo
                     end,
-                    {ok, InfoWithEncryption};
+                    {ok_raw_json,
+                     replace_btc_sentinels(jsx:encode(InfoWithEncryption))};
                 {error, Reason} ->
                     {error, ?RPC_MISC_ERROR, iolist_to_binary(
                         io_lib:format("~p", [Reason]))}
@@ -5158,7 +5176,9 @@ rpc_listunspent(Params, WalletName) ->
                                     <<"txid">> => beamchain_serialize:hex_encode(Txid),
                                     <<"vout">> => Vout,
                                     <<"address">> => Address,
-                                    <<"amount">> => satoshi_to_btc(Utxo#utxo.value),
+                                    %% Core uses ValueFromAmount; use sentinel for
+                                    %% exact 8-decimal formatting via ok_raw_json.
+                                    <<"amount">> => format_amount_sentinel(Utxo#utxo.value),
                                     <<"confirmations">> => Confs,
                                     <<"spendable">> => true,
                                     <<"solvable">> => true,
@@ -5168,7 +5188,7 @@ rpc_listunspent(Params, WalletName) ->
                                 false
                         end
                     end, Utxos),
-                    {ok, Filtered};
+                    {ok_raw_json, replace_btc_sentinels(jsx:encode(Filtered))};
                 not_found ->
                     {ok, []}
             end;
@@ -5776,7 +5796,8 @@ rpc_analyzepsbt([PsbtB64]) when is_binary(PsbtB64) ->
         PsbtBin = base64:decode(PsbtB64),
         case beamchain_psbt:decode(PsbtBin) of
             {ok, Psbt} ->
-                {ok, analyze_psbt(Psbt)};
+                Map = analyze_psbt(Psbt),
+                {ok_raw_json, replace_btc_sentinels(jsx:encode(Map))};
             {error, Reason} ->
                 {error, ?RPC_DESERIALIZATION_ERROR,
                  iolist_to_binary(io_lib:format("TX decode failed ~p",
@@ -5833,7 +5854,9 @@ analyze_psbt(Psbt) ->
                                 || O <- Tx#transaction.outputs]),
             Fee = InAmt - OutAmt,
             EstVSize = estimate_psbt_vsize(Psbt, Tx),
-            BaseFee = Base1#{<<"fee">> => satoshi_to_btc(Fee)},
+            %% Core uses ValueFromAmount for fee and estimated_feerate.
+            %% Use sentinel so rpc_analyzepsbt can emit exact 8-decimal form.
+            BaseFee = Base1#{<<"fee">> => format_amount_sentinel(Fee)},
             case EstVSize of
                 undefined -> BaseFee;
                 VSize ->
@@ -5845,7 +5868,7 @@ analyze_psbt(Psbt) ->
                     end,
                     BaseFee#{<<"estimated_vsize">> => VSize,
                              <<"estimated_feerate">> =>
-                                 satoshi_to_btc(FeeRateSatPerKvB)}
+                                 format_amount_sentinel(FeeRateSatPerKvB)}
             end;
         false ->
             Base1
@@ -6170,9 +6193,11 @@ do_walletcreatefundedpsbt(Pid, ManualInputs, Outputs, Locktime, Options) ->
         _ ->
             ok
     end,
-    {ok, #{<<"psbt">>      => base64:encode(PsbtBin),
-           <<"fee">>       => satoshi_to_btc(Fee),
-           <<"changepos">> => ChangePos}}.
+    %% Core uses ValueFromAmount for fee; use sentinel + ok_raw_json.
+    Map = #{<<"psbt">>      => base64:encode(PsbtBin),
+            <<"fee">>       => format_amount_sentinel(Fee),
+            <<"changepos">> => ChangePos},
+    {ok_raw_json, replace_btc_sentinels(jsx:encode(Map))}.
 
 normalize_wcfp_outputs(Outputs, _Network) when is_list(Outputs) ->
     lists:flatmap(fun(Obj) when is_map(Obj) ->
