@@ -164,6 +164,7 @@ address_to_script(Address, Network) ->
 
 -spec classify_script(binary()) ->
     p2pkh | p2sh | p2wpkh | p2wsh | p2tr | op_return |
+    {multisig, non_neg_integer(), non_neg_integer(), [binary()]} |
     {witness, non_neg_integer(), binary()} | nonstandard.
 
 %% P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
@@ -190,8 +191,17 @@ classify_script(<<16#51, 16#20, _:32/binary>>) ->
 classify_script(<<16#6a, _/binary>>) ->
     op_return;
 
-%% Other witness programs (future versions)
-classify_script(<<WitVer:8, Len:8, Program:Len/binary>>)
+%% Bare multisig: OP_M <pk1>...<pkN> OP_N OP_CHECKMULTISIG
+%% M and N are OP_1..OP_16 (0x51..0x60); each pubkey is 33 or 65 bytes.
+%% Delegate to the witness_signer parser which already handles this pattern.
+classify_script(Script) ->
+    case beamchain_witness_signer:parse_multisig_script(Script) of
+        {ok, M, N, PubKeys} -> {multisig, M, N, PubKeys};
+        error -> nonstandard_or_witness(Script)
+    end.
+
+%% Internal: classify non-multisig scripts that fall through the main patterns.
+nonstandard_or_witness(<<WitVer:8, Len:8, Program:Len/binary>>)
   when (WitVer =:= 16#00 orelse (WitVer >= 16#51 andalso WitVer =< 16#60)),
        (Len >= 2 andalso Len =< 40) ->
     Version = case WitVer of
@@ -199,8 +209,7 @@ classify_script(<<WitVer:8, Len:8, Program:Len/binary>>)
         V     -> V - 16#50
     end,
     {witness, Version, Program};
-
-classify_script(_) ->
+nonstandard_or_witness(_) ->
     nonstandard.
 
 %%% -------------------------------------------------------------------

@@ -1118,8 +1118,10 @@ rpc_getblock([HashHex, Verbosity]) when is_binary(HashHex) ->
                     %% JSON with txids
                     {ok, format_block_json(Block, Hash, false)};
                 2 ->
-                    %% JSON with decoded txs
-                    {ok, format_block_json(Block, Hash, true)};
+                    %% JSON with fully decoded txs; use sentinel path for
+                    %% difficulty (DIFF) and BTC amounts (BTC sentinels).
+                    Map = format_block_json(Block, Hash, true),
+                    {ok_raw_json, replace_all_sentinels(jsx:encode(Map))};
                 _ ->
                     {error, ?RPC_INVALID_PARAMETER,
                      <<"Invalid verbosity value">>}
@@ -4287,10 +4289,26 @@ format_block_json(#block{header = Header, transactions = Txs} = Block,
     BlockBin = beamchain_serialize:encode_block(Block),
     Size = byte_size(BlockBin),
     Weight = block_weight(Block),
+    %% Load undo data for fee computation (only needed when DecodeTxs=true).
+    %% Undo data maps each spent outpoint to its {value, scriptPubKey}.
+    UndoMap = case DecodeTxs of
+        true ->
+            case beamchain_db:get_undo(Hash) of
+                {ok, UndoBin} ->
+                    try
+                        Entries = beamchain_validation:decode_undo_data(UndoBin),
+                        maps:from_list([{{Op#outpoint.hash, Op#outpoint.index}, Coin#utxo.value}
+                                        || {Op, Coin} <- Entries])
+                    catch _:_ -> #{}
+                    end;
+                not_found -> #{}
+            end;
+        false -> #{}
+    end,
     %% Transaction list
     TxList = case DecodeTxs of
         true ->
-            [format_tx_json(Tx) || Tx <- Txs];
+            [format_tx_json_with_fee(Tx, UndoMap) || Tx <- Txs];
         false ->
             [hash_to_hex(beamchain_serialize:tx_hash(Tx)) || Tx <- Txs]
     end,
@@ -4333,7 +4351,7 @@ format_block_json(#block{header = Header, transactions = Txs} = Block,
         <<"nonce">> => Header#block_header.nonce,
         <<"bits">> => beamchain_serialize:hex_encode(<<Bits:32/big>>),
         <<"target">> => bits_to_target_hex(Bits),
-        <<"difficulty">> => bits_to_difficulty(Bits),
+        <<"difficulty">> => format_diff_sentinel(Bits),
         <<"chainwork">> => beamchain_serialize:hex_encode(Chainwork),
         <<"nTx">> => length(Txs),
         <<"previousblockhash">> => hash_to_hex(
@@ -4348,10 +4366,17 @@ format_block_json(#block{header = Header, transactions = Txs} = Block,
 
 %% Format a transaction as JSON (for getblock verbosity=2).
 format_tx_json(#transaction{} = Tx) ->
+    format_tx_json_with_fee(Tx, #{}).
+
+%% Format a transaction as JSON with optional fee computation.
+%% UndoMap: #{  {PrevTxHashBin, VoutIdx} => SatoshiValue  }
+%% Fee is omitted for coinbase txs (no inputs to look up) or when undo
+%% data is unavailable for any input (fallback: omit field, not error).
+format_tx_json_with_fee(#transaction{} = Tx, UndoMap) ->
     Txid = beamchain_serialize:tx_hash(Tx),
     Wtxid = beamchain_serialize:wtx_hash(Tx),
     TxBin = beamchain_serialize:encode_transaction(Tx),
-    #{
+    Base = #{
         <<"txid">> => hash_to_hex(Txid),
         <<"hash">> => hash_to_hex(Wtxid),
         <<"version">> => Tx#transaction.version,
@@ -4362,21 +4387,67 @@ format_tx_json(#transaction{} = Tx) ->
         <<"vin">> => [format_vin(In) || In <- Tx#transaction.inputs],
         <<"vout">> => format_vouts(Tx#transaction.outputs, 0),
         <<"hex">> => beamchain_serialize:hex_encode(TxBin)
-    }.
+    },
+    %% Add fee for non-coinbase txs when undo data is available.
+    %% Fee = sum(prevout values) - sum(output values), in satoshis.
+    %% Emitted as a BTC sentinel for 8-decimal-place formatting.
+    case is_coinbase_tx(Tx) of
+        true -> Base;
+        false ->
+            case compute_tx_fee(Tx, UndoMap) of
+                {ok, FeeSats} ->
+                    Base#{<<"fee">> => format_amount_sentinel(FeeSats)};
+                error -> Base
+            end
+    end.
+
+%% Check if a transaction is a coinbase (first input spends null outpoint).
+is_coinbase_tx(#transaction{inputs = [#tx_in{prev_out = #outpoint{hash = <<0:256>>,
+                                                                    index = 16#ffffffff}} | _]}) ->
+    true;
+is_coinbase_tx(_) -> false.
+
+%% Compute fee for a non-coinbase tx using undo map.
+%% Returns {ok, FeeSats} or error if any prevout is missing from undo.
+compute_tx_fee(#transaction{inputs = Inputs, outputs = Outputs}, UndoMap) ->
+    TotalOut = lists:foldl(fun(#tx_out{value = V}, Acc) -> Acc + V end, 0, Outputs),
+    try
+        TotalIn = lists:foldl(fun(#tx_in{prev_out = #outpoint{hash = H, index = I}}, Acc) ->
+            case maps:get({H, I}, UndoMap, not_found) of
+                not_found -> throw(missing_undo);
+                V -> Acc + V
+            end
+        end, 0, Inputs),
+        {ok, TotalIn - TotalOut}
+    catch
+        throw:missing_undo -> error
+    end.
 
 format_vin(#tx_in{prev_out = #outpoint{hash = <<0:256>>,
                                         index = 16#ffffffff},
-                  script_sig = ScriptSig, sequence = Seq}) ->
-    %% Coinbase
-    #{<<"coinbase">> => beamchain_serialize:hex_encode(ScriptSig),
-      <<"sequence">> => Seq};
+                  script_sig = ScriptSig, sequence = Seq,
+                  witness = Witness}) ->
+    %% Coinbase — {coinbase, txinwitness?, sequence} per Core TxToUniv order.
+    %% Emit txinwitness when non-empty (e.g. segwit commitment in coinbase).
+    Base = #{<<"coinbase">> => beamchain_serialize:hex_encode(ScriptSig),
+             <<"sequence">> => Seq},
+    case Witness of
+        W when is_list(W), W =/= [] ->
+            Base#{<<"txinwitness">> =>
+                [beamchain_serialize:hex_encode(Item) || Item <- W]};
+        _ -> Base
+    end;
 format_vin(#tx_in{prev_out = #outpoint{hash = Hash, index = Idx},
                   script_sig = ScriptSig, sequence = Seq,
                   witness = Witness}) ->
+    %% Use sighash-decode mode (fAttemptSighashDecode=true) for scriptSig asm,
+    %% matching Core's TxToUniv behaviour for getblock/decoderawtransaction.
+    Asm = script_to_asm_sighash(ScriptSig),
     Base = #{
         <<"txid">> => hash_to_hex(Hash),
         <<"vout">> => Idx,
         <<"scriptSig">> => #{
+            <<"asm">> => Asm,
             <<"hex">> => beamchain_serialize:hex_encode(ScriptSig)
         },
         <<"sequence">> => Seq
@@ -4392,36 +4463,25 @@ format_vin(#tx_in{prev_out = #outpoint{hash = Hash, index = Idx},
 format_vouts([], _N) -> [];
 format_vouts([#tx_out{value = Value, script_pubkey = Script} | Rest], N) ->
     Network = beamchain_config:network(),
-    NetType = case Network of
-        mainnet -> mainnet;
-        _ -> testnet
-    end,
-    Type = beamchain_address:classify_script(Script),
-    Address = beamchain_address:script_to_address(Script, NetType),
+    %% Use format_psbt_spk_json for Core-shape scriptPubKey (asm + desc + hex + address? + type).
+    %% Use BTC sentinel for value so replace_all_sentinels emits 8-decimal-place format.
     Vout = #{
-        <<"value">> => satoshi_to_btc(Value),
+        <<"value">> => format_amount_sentinel(Value),
         <<"n">> => N,
-        <<"scriptPubKey">> => #{
-            <<"hex">> => beamchain_serialize:hex_encode(Script),
-            <<"type">> => script_type_name(Type),
-            <<"address">> => case Address of
-                unknown -> null;
-                "OP_RETURN" -> null;
-                Addr -> iolist_to_binary(Addr)
-            end
-        }
+        <<"scriptPubKey">> => format_psbt_spk_json(Script, Network)
     },
     [Vout | format_vouts(Rest, N + 1)].
 
-script_type_name(p2pkh)     -> <<"pubkeyhash">>;
-script_type_name(p2sh)      -> <<"scripthash">>;
-script_type_name(p2wpkh)    -> <<"witness_v0_keyhash">>;
-script_type_name(p2wsh)     -> <<"witness_v0_scripthash">>;
-script_type_name(p2tr)      -> <<"witness_v1_taproot">>;
-script_type_name(op_return)  -> <<"nulldata">>;
+script_type_name(p2pkh)                 -> <<"pubkeyhash">>;
+script_type_name(p2sh)                  -> <<"scripthash">>;
+script_type_name(p2wpkh)                -> <<"witness_v0_keyhash">>;
+script_type_name(p2wsh)                 -> <<"witness_v0_scripthash">>;
+script_type_name(p2tr)                  -> <<"witness_v1_taproot">>;
+script_type_name(op_return)             -> <<"nulldata">>;
+script_type_name({multisig, _, _, _})   -> <<"multisig">>;
 script_type_name({witness, V, _}) ->
     iolist_to_binary(io_lib:format("witness_v~B", [V]));
-script_type_name(_)          -> <<"nonstandard">>.
+script_type_name(_)                     -> <<"nonstandard">>.
 
 satoshi_to_btc(Satoshis) ->
     Satoshis / 100000000.0.
@@ -6276,11 +6336,19 @@ infer_spk_descriptor(Script, Network) ->
         <<16#51, 16#20, XOnly:32/binary>> ->
             "rawtr(" ++ binary_to_list(beamchain_serialize:hex_encode(XOnly)) ++ ")";
         _ ->
-            Addr = beamchain_address:script_to_address(Script, NetType),
-            case Addr of
-                unknown     -> "raw(" ++ binary_to_list(beamchain_serialize:hex_encode(Script)) ++ ")";
-                "OP_RETURN" -> "raw(" ++ binary_to_list(beamchain_serialize:hex_encode(Script)) ++ ")";
-                A           -> "addr(" ++ A ++ ")"
+            %% Check for bare multisig: multi(M,pk1,...) descriptor per BIP-383.
+            case beamchain_witness_signer:parse_multisig_script(Script) of
+                {ok, M, _N, PubKeys} ->
+                    PkStrs = [binary_to_list(beamchain_serialize:hex_encode(PK)) || PK <- PubKeys],
+                    lists:flatten(["multi(", integer_to_list(M), ",",
+                                   lists:join(",", PkStrs), ")"]);
+                error ->
+                    Addr = beamchain_address:script_to_address(Script, NetType),
+                    case Addr of
+                        unknown     -> "raw(" ++ binary_to_list(beamchain_serialize:hex_encode(Script)) ++ ")";
+                        "OP_RETURN" -> "raw(" ++ binary_to_list(beamchain_serialize:hex_encode(Script)) ++ ")";
+                        A           -> "addr(" ++ A ++ ")"
+                    end
             end
     end,
     try beamchain_descriptor:add_checksum(Payload) of
