@@ -2250,9 +2250,49 @@ format_getrawtransaction_result(Tx, _BlockHash, _Height, 0, _BlockHashProvided,
     Hex = beamchain_serialize:hex_encode(
         beamchain_serialize:encode_transaction(Tx)),
     {ok, Hex};
+format_getrawtransaction_result(Tx, BlockHash, Height, 2, BlockHashProvided,
+                                 InActiveChain) ->
+    %% Verbosity 2: JSON with per-vin prevout enrichment and fee.
+    %% Load undo data from the block to build outpoint→coin map.
+    %% Falls back gracefully (no prevout/fee fields) if undo unavailable.
+    UndoCoinMap = case BlockHash of
+        undefined -> #{};
+        _ ->
+            case beamchain_db:get_undo(BlockHash) of
+                {ok, UndoBin} ->
+                    try
+                        Entries = beamchain_validation:decode_undo_data(UndoBin),
+                        maps:from_list([{{Op#outpoint.hash, Op#outpoint.index}, Coin}
+                                        || {Op, Coin} <- Entries])
+                    catch _:_ -> #{}
+                    end;
+                not_found -> #{}
+            end
+    end,
+    Network = beamchain_config:network(),
+    TxJson = format_getrawtx_v2_tx_json(Tx, UndoCoinMap, Network),
+    TxJson2 = case BlockHash of
+        undefined ->
+            TxJson;
+        _ ->
+            BlockTime = block_time(Height),
+            TxJson#{
+                <<"blockhash">> => hash_to_hex(BlockHash),
+                <<"confirmations">> => confirmations(Height, BlockHash),
+                <<"time">> => BlockTime,
+                <<"blocktime">> => BlockTime
+            }
+    end,
+    TxJson3 = case BlockHashProvided of
+        true when BlockHash =/= undefined ->
+            TxJson2#{<<"in_active_chain">> => InActiveChain};
+        _ ->
+            TxJson2
+    end,
+    {ok_raw_json, replace_btc_sentinels(jsx:encode(TxJson3))};
 format_getrawtransaction_result(Tx, BlockHash, Height, Verbosity, BlockHashProvided,
                                  InActiveChain) when Verbosity >= 1 ->
-    %% Verbosity 1+: return JSON object
+    %% Verbosity 1: return JSON object (sentinel path for correct numeric formatting)
     TxJson = format_tx_json(Tx),
     TxJson2 = case BlockHash of
         undefined ->
@@ -2273,7 +2313,90 @@ format_getrawtransaction_result(Tx, BlockHash, Height, Verbosity, BlockHashProvi
         _ ->
             TxJson2
     end,
-    {ok, TxJson3}.
+    {ok_raw_json, replace_btc_sentinels(jsx:encode(TxJson3))}.
+
+%% format_getrawtx_v2_tx_json/3 — build the verbosity=2 tx JSON map.
+%% Like format_tx_json/1 but with per-vin prevout enrichment and fee.
+%% UndoCoinMap: #{ {PrevTxHashBin, VoutIdx} => #utxo{} }
+format_getrawtx_v2_tx_json(#transaction{} = Tx, UndoCoinMap, Network) ->
+    Txid   = beamchain_serialize:tx_hash(Tx),
+    Wtxid  = beamchain_serialize:wtx_hash(Tx),
+    TxBin  = beamchain_serialize:encode_transaction(Tx),
+    Base = #{
+        <<"txid">>     => hash_to_hex(Txid),
+        <<"hash">>     => hash_to_hex(Wtxid),
+        <<"version">>  => Tx#transaction.version,
+        <<"size">>     => byte_size(TxBin),
+        <<"vsize">>    => beamchain_serialize:tx_vsize(Tx),
+        <<"weight">>   => beamchain_serialize:tx_weight(Tx),
+        <<"locktime">> => Tx#transaction.locktime,
+        <<"vin">>      => [format_vin_with_prevout(In, UndoCoinMap, Network)
+                           || In <- Tx#transaction.inputs],
+        <<"vout">>     => format_vouts(Tx#transaction.outputs, 0),
+        <<"hex">>      => beamchain_serialize:hex_encode(TxBin)
+    },
+    %% Add fee for non-coinbase txs when undo data is available.
+    case is_coinbase_tx(Tx) of
+        true -> Base;
+        false ->
+            ValueMap = maps:map(fun(_K, Coin) -> Coin#utxo.value end, UndoCoinMap),
+            case compute_tx_fee(Tx, ValueMap) of
+                {ok, FeeSats} ->
+                    Base#{<<"fee">> => format_amount_sentinel(FeeSats)};
+                error -> Base
+            end
+    end.
+
+%% format_vin_with_prevout/3 — like format_vin but adds prevout field
+%% for non-coinbase inputs when coin data is available from the undo map.
+%% Coinbase inputs never get a prevout field.
+format_vin_with_prevout(#tx_in{prev_out = #outpoint{hash = <<0:256>>,
+                                                      index = 16#ffffffff},
+                               script_sig = ScriptSig, sequence = Seq,
+                               witness = Witness}, _UndoCoinMap, _Network) ->
+    %% Coinbase — same as format_vin, no prevout
+    Base = #{<<"coinbase">> => beamchain_serialize:hex_encode(ScriptSig),
+             <<"sequence">> => Seq},
+    case Witness of
+        W when is_list(W), W =/= [] ->
+            Base#{<<"txinwitness">> =>
+                [beamchain_serialize:hex_encode(Item) || Item <- W]};
+        _ -> Base
+    end;
+format_vin_with_prevout(#tx_in{prev_out = #outpoint{hash = Hash, index = Idx},
+                               script_sig = ScriptSig, sequence = Seq,
+                               witness = Witness} = _In,
+                        UndoCoinMap, Network) ->
+    Asm = script_to_asm_sighash(ScriptSig),
+    Base0 = #{
+        <<"txid">>      => hash_to_hex(Hash),
+        <<"vout">>      => Idx,
+        <<"scriptSig">> => #{
+            <<"asm">> => Asm,
+            <<"hex">> => beamchain_serialize:hex_encode(ScriptSig)
+        },
+        <<"sequence">>  => Seq
+    },
+    Base1 = case Witness of
+        W when is_list(W), W =/= [] ->
+            Base0#{<<"txinwitness">> =>
+                [beamchain_serialize:hex_encode(Item) || Item <- W]};
+        _ -> Base0
+    end,
+    %% Add prevout if coin data is available from undo map
+    case maps:get({Hash, Idx}, UndoCoinMap, not_found) of
+        not_found ->
+            Base1;
+        #utxo{value = Value, script_pubkey = SPK,
+              is_coinbase = IsCb, height = CoinHeight} ->
+            Prevout = #{
+                <<"generated">> => IsCb,
+                <<"height">>    => CoinHeight,
+                <<"value">>     => format_amount_sentinel(Value),
+                <<"scriptPubKey">> => format_psbt_spk_json(SPK, Network)
+            },
+            Base1#{<<"prevout">> => Prevout}
+    end.
 
 rpc_decoderawtransaction([HexStr]) when is_binary(HexStr) ->
     %% Decode a raw transaction hex to a TxToUniv-shaped JSON object.
