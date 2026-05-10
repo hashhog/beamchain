@@ -52,6 +52,9 @@
 %% Output standardness classifier and check_standard - exported for testing
 -export([classify_output_standard/1, check_standard/1]).
 
+%% Witness standardness (IsWitnessStandard) - exported for testing
+-export([is_witness_standard/2]).
+
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2]).
@@ -457,6 +460,10 @@ do_add_transaction(Tx, State) ->
 
         %% 4. look up all inputs (UTXO set + mempool)
         {InputCoins, SpendsCoinbase} = lookup_inputs(Tx),
+
+        %% 4b. witness standardness (IsWitnessStandard) — requires prevout coins
+        %% Mirrors Bitcoin Core policy/policy.cpp:265-351.
+        is_witness_standard(Tx, InputCoins) orelse throw(bad_witness_nonstandard),
 
         %% 5. check for double-spends in mempool (+ RBF)
         %% Returns {ok, EvictedTxids, EvictedVBytes} - store for cluster cleanup later
@@ -1150,6 +1157,215 @@ classify_output_standard(<<WitVer:8, Len:8, _:Len/binary>>)
   when (WitVer >= 16#51 andalso WitVer =< 16#60), (Len >= 2 andalso Len =< 40) ->
     {witness, WitVer - 16#50};
 classify_output_standard(_) -> nonstandard.
+
+%%% ===================================================================
+%%% Internal: IsWitnessStandard (Bitcoin Core policy/policy.cpp:265-351)
+%%% ===================================================================
+
+%% @doc Check that all witness fields in Tx satisfy policy limits.
+%% InputCoins is a list of #utxo{} in the same order as Tx#transaction.inputs.
+%% Mirrors Bitcoin Core IsWitnessStandard (policy.cpp:265-351).
+%%
+%% Gates:
+%%   1. Coinbase inputs are exempt (policy.cpp:267-268).
+%%   2. Inputs with empty witness are skipped (policy.cpp:273-275).
+%%   3. P2A (pay-to-anchor) prevout with any witness → reject (policy.cpp:282-285).
+%%   4. P2SH prevout: extract redeemScript via eval_script on scriptSig;
+%%      failure or empty stack → reject (policy.cpp:287-299).
+%%   5. Non-witness-program prevScript paired with non-empty witness → reject
+%%      (policy.cpp:303-306).
+%%   6. P2WSH (v0, 32-byte program): script ≤ 3600 B; stack items (excl. script)
+%%      ≤ 100; each non-script item ≤ 80 B (policy.cpp:308-319).
+%%   7. P2TR (v1, 32-byte, not P2SH-wrapped): annex (0x50 first byte) → reject;
+%%      script-path (≥2 stack elements): control block leaf 0xc0 → each stack item
+%%      ≤ 80 B; empty stack → reject (policy.cpp:321-349).
+-spec is_witness_standard(#transaction{}, [#utxo{}]) -> boolean().
+is_witness_standard(#transaction{inputs = Inputs}, InputCoins) ->
+    %% Gate 1: coinbases are exempt — but coinbase txs never reach the mempool,
+    %% so the list will always be non-empty prevout coins here.  We match Core's
+    %% IsCoinBase() guard anyway for safety: a coinbase tx has a single input
+    %% whose prev_out hash is all-zeros and index is 16#ffffffff.
+    case is_coinbase_tx(Inputs) of
+        true ->
+            true;
+        false ->
+            check_witness_standard_inputs(lists:zip(Inputs, InputCoins), false)
+    end.
+
+%% @private Scan (Input, Coin) pairs; P2SH flag propagated into recursive call.
+check_witness_standard_inputs([], _) ->
+    true;
+check_witness_standard_inputs([{Input, Coin} | Rest], _) ->
+    Witness = Input#tx_in.witness,
+    %% Gate 2: skip inputs with empty / absent witness (policy.cpp:273-275)
+    case witness_is_empty(Witness) of
+        true ->
+            check_witness_standard_inputs(Rest, false);
+        false ->
+            %% Resolve the effective prevScript and p2sh flag
+            PrevScript = Coin#utxo.script_pubkey,
+            %% Gate 3: P2A with any witness → nonstandard (policy.cpp:282-285)
+            case beamchain_script:is_pay_to_anchor(PrevScript) of
+                true ->
+                    false;
+                false ->
+                    %% Gate 4: P2SH wrapping — extract redeemScript
+                    {EffectivePrevScript, IsP2SH} =
+                        case is_p2sh_script(PrevScript) of
+                            true ->
+                                ScriptSig = Input#tx_in.script_sig,
+                                case beamchain_script:eval_script(
+                                        ScriptSig, [], ?SCRIPT_VERIFY_NONE,
+                                        no_checker, base) of
+                                    {ok, [RS | _]} ->
+                                        {RS, true};
+                                    {ok, []} ->
+                                        %% empty stack after scriptSig eval → reject
+                                        {<<>>, reject};
+                                    {error, _} ->
+                                        {<<>>, reject}
+                                end;
+                            false ->
+                                {PrevScript, false}
+                        end,
+                    case IsP2SH of
+                        reject ->
+                            false;
+                        _ ->
+                            check_witness_script(EffectivePrevScript, IsP2SH,
+                                                 Witness, Rest)
+                    end
+            end
+    end.
+
+%% @private Check one input's witness against its resolved prevScript.
+check_witness_script(PrevScript, IsP2SH, Witness, Rest) ->
+    case extract_witness_version_program(PrevScript) of
+        none ->
+            %% Gate 5: non-witness prevScript with non-empty witness → reject
+            %% (policy.cpp:303-306)
+            false;
+        {ok, WitnessVersion, WitnessProgram} ->
+            %% Gate 6: P2WSH limits (v0, 32-byte program) — policy.cpp:308-319
+            case {WitnessVersion, byte_size(WitnessProgram)} of
+                {0, 32} ->
+                    %% Last element is the witness script
+                    case Witness of
+                        [] ->
+                            %% no items at all — script is missing, invalid
+                            false;
+                        _ ->
+                            WitnessScript = lists:last(Witness),
+                            StackItems = lists:droplast(Witness),
+                            byte_size(WitnessScript) =< ?MAX_STANDARD_P2WSH_SCRIPT_SIZE
+                                andalso length(StackItems) =< ?MAX_STANDARD_P2WSH_STACK_ITEMS
+                                andalso lists:all(
+                                    fun(Item) ->
+                                        byte_size(Item) =< ?MAX_STANDARD_P2WSH_STACK_ITEM_SIZE
+                                    end, StackItems)
+                                andalso check_witness_standard_inputs(Rest, false)
+                    end;
+                %% Gate 7: P2TR limits (v1, 32-byte, not P2SH-wrapped)
+                %% policy.cpp:321-349
+                {1, 32} when IsP2SH =:= false ->
+                    check_taproot_witness(Witness, Rest);
+                _ ->
+                    %% Other witness versions / program sizes — no extra policy limits
+                    check_witness_standard_inputs(Rest, false)
+            end
+    end.
+
+%% @private Taproot-specific witness policy (policy.cpp:324-349).
+check_taproot_witness(Stack, Rest) ->
+    %% Determine if there is an annex (last element starts with ANNEX_TAG,
+    %% and there are at least 2 elements so the annex is not the only item).
+    {AnnexPresent, EffStack} =
+        case Stack of
+            [_ | _] when length(Stack) >= 2 ->
+                Last = lists:last(Stack),
+                case Last of
+                    <<AnnexFirstByte, _/binary>> when AnnexFirstByte =:= ?ANNEX_TAG ->
+                        %% annex present → nonstandard (policy.cpp:327-330)
+                        {annex, Stack};
+                    _ ->
+                        {false, Stack}
+                end;
+            _ ->
+                {false, Stack}
+        end,
+    case AnnexPresent of
+        annex ->
+            false;
+        false ->
+            case length(EffStack) of
+                0 ->
+                    %% Gate 7e: 0 stack elements — invalid by consensus, reject here too
+                    %% (policy.cpp:345-348)
+                    false;
+                1 ->
+                    %% Key-path spend: no extra policy limits (policy.cpp:342-344)
+                    check_witness_standard_inputs(Rest, false);
+                _ ->
+                    %% Script-path spend: pop control block (last), then script
+                    %% The remaining items are the actual script arguments.
+                    %% policy.cpp:331-341
+                    ControlBlock = lists:last(EffStack),
+                    case ControlBlock of
+                        <<>> ->
+                            %% Empty control block — invalid
+                            false;
+                        <<LeafVersion, _/binary>> ->
+                            LeafType = LeafVersion band ?TAPROOT_LEAF_MASK,
+                            case LeafType =:= ?TAPROOT_LEAF_TAPSCRIPT of
+                                true ->
+                                    %% Tapscript: every non-cb, non-script item ≤ 80 B
+                                    %% Stack is [args..., script, control_block]; we check
+                                    %% all args (everything except the last two).
+                                    ScriptAndBelow = lists:droplast(EffStack), %% drop CB
+                                    Args = lists:droplast(ScriptAndBelow),     %% drop script
+                                    lists:all(
+                                        fun(Item) ->
+                                            byte_size(Item) =<
+                                                ?MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE
+                                        end, Args)
+                                    andalso check_witness_standard_inputs(Rest, false);
+                                false ->
+                                    %% Non-tapscript leaf version — no extra size limits
+                                    check_witness_standard_inputs(Rest, false)
+                            end
+                    end
+            end
+    end.
+
+%% @private True when a tx's inputs form a coinbase transaction
+%% (single input, all-zero txid, vout=0xffffffff).
+is_coinbase_tx([#tx_in{prev_out = #outpoint{hash = <<0:256>>,
+                                             index = 16#ffffffff}}]) ->
+    true;
+is_coinbase_tx(_) ->
+    false.
+
+%% @private True when a witness is absent or the empty list.
+witness_is_empty(undefined) -> true;
+witness_is_empty([])        -> true;
+witness_is_empty(_)         -> false.
+
+%% @private True when scriptPubKey is P2SH (OP_HASH160 <20> OP_EQUAL).
+is_p2sh_script(<<16#a9, 16#14, _:20/binary, 16#87>>) -> true;
+is_p2sh_script(_)                                     -> false.
+
+%% @private Decode witness version + program from scriptPubKey.
+%% Returns {ok, Version, Program} or 'none'.
+%% Version 0 = OP_0; Version N = OP_1..OP_16 (N = opcode - 16#50).
+extract_witness_version_program(<<16#00, Len, Program/binary>>)
+  when Len >= 2, Len =< 40, byte_size(Program) =:= Len ->
+    {ok, 0, Program};
+extract_witness_version_program(<<WitVerOp, Len, Program/binary>>)
+  when WitVerOp >= 16#51, WitVerOp =< 16#60,
+       Len >= 2, Len =< 40, byte_size(Program) =:= Len ->
+    {ok, WitVerOp - 16#50, Program};
+extract_witness_version_program(_) ->
+    none.
 
 %%% ===================================================================
 %%% Internal: mempool conflict detection + RBF
