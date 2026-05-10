@@ -1606,7 +1606,49 @@ check_standard_non_pushonly_scriptsig_rejected_test() ->
 
 %% check_standard/1 — nonstandard scriptPubKey output is rejected
 check_standard_nonstandard_output_rejected_test() ->
-    %% OP_1 alone is nonstandard (not a valid witness program without the length byte)
-    NonstandardScript = <<16#51>>,
+    %% OP_1 followed by 4 zero bytes: nonstandard (no matching standard template).
+    %% The 5-byte script brings non-witness size to exactly 65 bytes, ensuring the
+    %% CVE-2017-12842 size gate passes so we reach the scriptpubkey gate.
+    %% non-witness: 4(ver)+1(in_cnt)+41(input)+1(out_cnt)+(8+1+5)(output)+4(locktime)=65
+    NonstandardScript = <<16#51, 0, 0, 0, 0>>,
     Tx = make_tx([{<<1:256>>, 0}], [{1000, NonstandardScript}]),
+    NonWit = beamchain_serialize:encode_transaction(Tx, no_witness),
+    ?assertEqual(65, byte_size(NonWit)),
     ?assertThrow(scriptpubkey, beamchain_mempool:check_standard(Tx)).
+
+%%% ===================================================================
+%%% CVE-2017-12842: 65-byte minimum non-witness size (W71)
+%%% A 64-byte base transaction is indistinguishable from an internal
+%%% merkle node, allowing fake SPV proofs. Bitcoin Core policy:
+%%% MIN_STANDARD_TX_NONWITNESS_SIZE = 65.
+%%% ===================================================================
+
+%% check_standard/1 — a 64-byte non-witness tx is rejected
+%% Construct the smallest possible non-standard base tx:
+%%   version(4) + input_count(1) + input(41) + output_count(1) + output(9) + locktime(4) = 60
+%% We need exactly 64 bytes. Pad with a 4-byte OP_RETURN output script to hit 64
+%% total, then verify that 64 bytes is rejected but 65 bytes is accepted.
+check_standard_64byte_nonwitness_rejected_test() ->
+    %% Build a tx with non-witness size = 64 bytes.
+    %% non-witness layout: 4(ver) + 1(in_cnt) + 41(input) + 1(out_cnt) + N(outputs) + 4(locktime)
+    %% baseline with one p2pkh output (9+25=34 bytes for one output):
+    %%   4 + 1 + 41 + 1 + 34 + 4 = 85 bytes — too large.
+    %% Use zero-value empty-script output (9 bytes: 8 value + 1 varint len):
+    %%   4 + 1 + 41 + 1 + 9 + 4 = 60 bytes — still below 64.
+    %% Use a 4-byte script to get to 64: 4+1+41+1+(8+1+4)+4 = 64 bytes.
+    Script64 = <<0, 0, 0, 0>>,   %% 4 bytes — output = 8+1+4 = 13, total = 64
+    Tx64 = make_tx([{<<1:256>>, 0}], [{0, Script64}]),
+    NonWit64 = beamchain_serialize:encode_transaction(Tx64, no_witness),
+    ?assertEqual(64, byte_size(NonWit64)),
+    ?assertThrow(tx_size, beamchain_mempool:check_standard(Tx64)).
+
+%% check_standard/1 — a 65-byte non-witness tx passes the size gate
+check_standard_65byte_nonwitness_accepted_test() ->
+    %% Add one more byte to the script to get to 65.
+    Script65 = <<0, 0, 0, 0, 0>>,   %% 5 bytes — output = 8+1+5 = 14, total = 65
+    Tx65 = make_tx([{<<1:256>>, 0}], [{0, Script65}]),
+    NonWit65 = beamchain_serialize:encode_transaction(Tx65, no_witness),
+    ?assertEqual(65, byte_size(NonWit65)),
+    %% This output script is nonstandard — but the tx_size gate runs first.
+    %% So we expect scriptpubkey, not tx_size.
+    ?assertThrow(scriptpubkey, beamchain_mempool:check_standard(Tx65)).
