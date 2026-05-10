@@ -143,6 +143,9 @@
 
 -define(DEFAULT_MIN_RELAY_TX_FEE, 1000).     %% sat/kvB
 -define(DEFAULT_MEMPOOL_MAX_SIZE, 300000000). %% 300 MB
+%% BIP-125 RBF constants (Core: util/rbf.h, policy/rbf.h)
+-define(MAX_BIP125_RBF_SEQUENCE, 16#fffffffd). %% nSequence =< this → signals opt-in RBF
+-define(MAX_RBF_EVICTIONS, 100).               %% Core: MAX_REPLACEMENT_CANDIDATES
 -define(MEMPOOL_EXPIRY_HOURS, 336).           %% 14 days
 -define(MAX_ANCESTOR_COUNT, 25).
 -define(MAX_DESCENDANT_COUNT, 25).

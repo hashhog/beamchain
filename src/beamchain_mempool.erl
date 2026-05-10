@@ -70,7 +70,7 @@
 -define(DUST_RELAY_TX_FEE, 3000).          % 3000 sat/kvB for dust calc
 -define(MAX_ORPHAN_TXS, 100).
 -define(ORPHAN_TX_EXPIRE_TIME, 1200).      % 20 minutes
--define(MAX_RBF_EVICTIONS, 100).
+%% MAX_RBF_EVICTIONS = 100 is now in beamchain_protocol.hrl as ?MAX_RBF_EVICTIONS.
 -define(MAX_CLUSTER_SIZE, 100).            % Max transactions per cluster
 
 %%% -------------------------------------------------------------------
@@ -531,9 +531,20 @@ do_add_transaction(Tx, State) ->
 
         %% 13. build entry
         Now = erlang:system_time(second),
-        RbfSignaling = lists:any(fun(#tx_in{sequence = Seq}) ->
-            Seq < 16#fffffffe
+        %% BIP 125 signaling: any input with nSequence =< MAX_BIP125_RBF_SEQUENCE
+        %% signals opt-in RBF.  Also propagate from mempool ancestors: if any
+        %% in-mempool parent signals, this tx is also considered replaceable.
+        %% Core: IsRBFOptIn / util/rbf.h MAX_BIP125_RBF_SEQUENCE = 0xFFFFFFFD.
+        SelfSignals = lists:any(fun(#tx_in{sequence = Seq}) ->
+            Seq =< ?MAX_BIP125_RBF_SEQUENCE
         end, Tx#transaction.inputs),
+        RbfSignaling = SelfSignals orelse
+            lists:any(fun(ParentTxid) ->
+                case ets:lookup(?MEMPOOL_TXS, ParentTxid) of
+                    [{_, PE}] -> PE#mempool_entry.rbf_signaling;
+                    [] -> false
+                end
+            end, get_parent_txids(Tx)),
 
         Entry = #mempool_entry{
             txid = Txid,
@@ -815,9 +826,18 @@ compute_package_metrics(TxPairs, PackageTxMap, _State) ->
         FeeRate = Fee / max(1, VSize),
 
         Wtxid = beamchain_serialize:wtx_hash(Tx),
-        RbfSignaling = lists:any(fun(#tx_in{sequence = Seq}) ->
-            Seq < 16#fffffffe
+        %% BIP 125 signaling: any input with nSequence =< MAX_BIP125_RBF_SEQUENCE
+        %% signals opt-in RBF.  Also propagate from mempool ancestors.
+        PkgSelfSignals = lists:any(fun(#tx_in{sequence = Seq}) ->
+            Seq =< ?MAX_BIP125_RBF_SEQUENCE
         end, Tx#transaction.inputs),
+        RbfSignaling = PkgSelfSignals orelse
+            lists:any(fun(ParentTxid) ->
+                case ets:lookup(?MEMPOOL_TXS, ParentTxid) of
+                    [{_, PE}] -> PE#mempool_entry.rbf_signaling;
+                    [] -> false
+                end
+            end, get_parent_txids(Tx)),
 
         Entry = #mempool_entry{
             txid = Txid,
@@ -1419,12 +1439,23 @@ do_rbf(NewTx, ConflictTxids) ->
     %% 2. new tx must not add new unconfirmed parents (Rule 2)
     %% The replacement transaction may only include an unconfirmed input
     %% if that input was included in one of the original transactions.
+    %% Core: validation.cpp HasNoNewUnconfirmedParents check.
     NewParents = get_parent_txids(NewTx),
     OldParents = lists:usort(lists:flatmap(fun(E) ->
         get_parent_txids(E#mempool_entry.tx)
     end, ConflictEntries)),
     NewUnconfirmed = NewParents -- OldParents -- ConflictTxids,
     NewUnconfirmed =:= [] orelse throw(rbf_new_unconfirmed_inputs),
+
+    %% 2b. EntriesAndTxidsDisjoint (Core: policy/rbf.cpp EntriesAndTxidsDisjoint).
+    %% None of the replacement tx's in-mempool ancestors may be a direct conflict.
+    %% If an ancestor is also a conflict, the replacement would spend the output
+    %% of a tx it is trying to evict — an impossible state.
+    DirectConflictSet = sets:from_list(ConflictTxids),
+    lists:foreach(fun(AncTxid) ->
+        (not sets:is_element(AncTxid, DirectConflictSet))
+            orelse throw(rbf_spends_conflicting_tx)
+    end, NewParents),
 
     %% 3. collect all descendants of conflicting txs (Rule 5)
     %% Max 100 transactions can be evicted (conflicting txs + descendants)
@@ -1462,21 +1493,20 @@ do_rbf(NewTx, ConflictTxids) ->
 
     %% 5. additional fee must cover incremental relay fee for new tx (Rule 4)
     %% additional_fees >= relay_fee * new_tx_vsize
-    %% incremental relay fee = 1 sat/vB
+    %% Core: policy/rbf.cpp PaysForRBF — relay_fee.GetFee(replacement_vsize).
+    %% ?MIN_RELAY_TX_FEE = 1000 sat/kvB → 1 sat/vB.
     NewVSize = beamchain_serialize:tx_vsize(NewTx),
-    MinAdditionalFee = NewVSize,  %% 1 sat/vB * vsize
+    MinAdditionalFee = (NewVSize * ?MIN_RELAY_TX_FEE + 999) div 1000,
     (NewFee - EvictedFeeTotal) >= MinAdditionalFee
         orelse throw(rbf_insufficient_additional_fee),
 
-    %% 6. new tx fee rate must be higher than all directly conflicting txs
-    %% (additional check for fee rate, not just absolute fee)
-    NewFeeRate = NewFee / max(1, NewVSize),
-    lists:foreach(fun(E) ->
-        NewFeeRate > E#mempool_entry.fee_rate
-            orelse throw(rbf_insufficient_fee_rate)
-    end, ConflictEntries),
+    %% Note: Core does NOT require the replacement's fee-rate to exceed each
+    %% individual conflict's fee-rate; Rules 3+4 above are the only fee gates.
+    %% A per-conflict fee-rate check was present in earlier beamchain code and
+    %% has been removed as a non-Core policy gate (it would reject valid
+    %% replacements where the new tx is larger but pays more absolute fee).
 
-    %% 7. cluster-based RBF check: new tx's diagram must dominate old cluster's diagram
+    %% 6. cluster-based RBF check: new tx's diagram must dominate old cluster's diagram
     %% This ensures the replacement improves the mempool's fee-rate quality
     check_cluster_rbf_diagram(NewFee, NewVSize, AllEvictTxids),
 
