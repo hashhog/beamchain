@@ -1196,3 +1196,172 @@ bip34_reject_missing_sign_byte_h128_test() ->
     %% <<0x01, 0x80>> would decode as -128 in CScriptNum; canonical is <<0x02, 0x80, 0x00>>
     Tx = bip34_make_coinbase(<<16#01, 16#80>>),
     ?assertThrow(bad_cb_height, beamchain_validation:check_coinbase_height(Tx, 128)).
+
+%%% ===================================================================
+%%% W74 — P2SH sigop counting: push-only scriptSig guard
+%%% Reference: Bitcoin Core script.cpp GetSigOpCount(const CScript&):197-198
+%%%   if (opcode > OP_16) return 0;
+%%% ===================================================================
+
+%% Helper: build a minimal utxo/input pair for P2SH sigop tests.
+%% P2SH scriptPubKey: OP_HASH160 <20-byte-hash> OP_EQUAL
+make_p2sh_utxo() ->
+    #utxo{value = 1000, script_pubkey = <<16#a9, 16#14, 0:160, 16#87>>,
+          is_coinbase = false, height = 1}.
+
+%% Push-only scriptSig ending with a 1-of-1 multisig redeem script.
+%% Redeem script: OP_1 <33-byte-key> OP_1 OP_CHECKMULTISIG → accurate sigops = 1.
+make_p2sh_input(ScriptSig) ->
+    #tx_in{prev_out = #outpoint{hash = <<1:256>>, index = 0},
+           script_sig = ScriptSig, sequence = 16#ffffffff, witness = []}.
+
+%% Redeem script that contributes 1 accurate sigop (OP_1 OP_CHECKSIG).
+redeem_script_1_sigop() ->
+    <<16#51, 16#ac>>.  %% OP_1 OP_CHECKSIG
+
+%% ScriptSig that pushes the 2-byte redeem script: <<0x02, RedeemScript>>
+push_redeem_script(RedeemScript) ->
+    Len = byte_size(RedeemScript),
+    <<Len:8, RedeemScript/binary>>.
+
+%% Gate 1: push-only scriptSig → P2SH sigops counted normally.
+p2sh_sigops_push_only_test() ->
+    RedeemScript = redeem_script_1_sigop(),
+    ScriptSig = push_redeem_script(RedeemScript),
+    Input = make_p2sh_input(ScriptSig),
+    Coin = make_p2sh_utxo(),
+    Tx = #transaction{version = 1, inputs = [Input], outputs = [], locktime = 0,
+                      txid = undefined, wtxid = undefined},
+    %% count_p2sh_sigops should return 1 (OP_1 OP_CHECKSIG in redeem script)
+    ?assertEqual(1, beamchain_validation:count_p2sh_sigops(Tx, [Coin])).
+
+%% Gate 2: scriptSig with non-push opcode (OP_DUP = 0x76) → returns 0.
+%% Core: if (opcode > OP_16) return 0.  OP_DUP = 0x76 > OP_16 = 0x60 → 0.
+p2sh_sigops_non_push_opcode_returns_zero_test() ->
+    RedeemScript = redeem_script_1_sigop(),
+    %% OP_DUP (0x76) before the push — non-push opcode → Core aborts, sigops = 0
+    ScriptSig = <<16#76, (byte_size(RedeemScript)):8, RedeemScript/binary>>,
+    Input = make_p2sh_input(ScriptSig),
+    Coin = make_p2sh_utxo(),
+    Tx = #transaction{version = 1, inputs = [Input], outputs = [], locktime = 0,
+                      txid = undefined, wtxid = undefined},
+    ?assertEqual(0, beamchain_validation:count_p2sh_sigops(Tx, [Coin])).
+
+%% Gate 3: opcode 0x61 (just above OP_16=0x60) → returns 0.
+p2sh_sigops_opcode_above_op16_returns_zero_test() ->
+    RedeemScript = redeem_script_1_sigop(),
+    %% 0x61 > 0x60 (OP_16); Core returns 0 immediately.
+    ScriptSig = <<16#61, (byte_size(RedeemScript)):8, RedeemScript/binary>>,
+    Input = make_p2sh_input(ScriptSig),
+    Coin = make_p2sh_utxo(),
+    Tx = #transaction{version = 1, inputs = [Input], outputs = [], locktime = 0,
+                      txid = undefined, wtxid = undefined},
+    ?assertEqual(0, beamchain_validation:count_p2sh_sigops(Tx, [Coin])).
+
+%% Gate 4: opcode OP_1NEGATE (0x4f) is a valid push → sigops counted.
+p2sh_sigops_op1negate_is_valid_push_test() ->
+    %% OP_1NEGATE (0x4f) ≤ OP_16 (0x60) — Core does NOT abort; vData = <<0x81>>.
+    %% The "last push" will be the byte <<0x81>>, not the intended redeem script.
+    %% Sigops of <<0x81>> = 0 (no checksig opcodes).
+    ScriptSig = <<16#4f>>,
+    Input = make_p2sh_input(ScriptSig),
+    Coin = make_p2sh_utxo(),
+    Tx = #transaction{version = 1, inputs = [Input], outputs = [], locktime = 0,
+                      txid = undefined, wtxid = undefined},
+    ?assertEqual(0, beamchain_validation:count_p2sh_sigops(Tx, [Coin])).
+
+%% Gate 5: non-P2SH prevout → 0 P2SH sigops regardless of scriptSig.
+p2sh_sigops_non_p2sh_prevout_test() ->
+    %% P2PKH scriptPubKey: not P2SH
+    P2PKH_Coin = #utxo{value = 1000,
+                        script_pubkey = <<16#76, 16#a9, 16#14, 0:160, 16#88, 16#ac>>,
+                        is_coinbase = false, height = 1},
+    %% Even a push-only scriptSig with a high-sigop redeem script → 0
+    RedeemScript = <<16#ae>>,  %% OP_CHECKMULTISIG
+    ScriptSig = push_redeem_script(RedeemScript),
+    Input = make_p2sh_input(ScriptSig),
+    Tx = #transaction{version = 1, inputs = [Input], outputs = [], locktime = 0,
+                      txid = undefined, wtxid = undefined},
+    ?assertEqual(0, beamchain_validation:count_p2sh_sigops(Tx, [P2PKH_Coin])).
+
+%% Gate 6: get_tx_sigop_cost correctly scales (legacy+p2sh)*4 + witness.
+get_tx_sigop_cost_p2sh_test() ->
+    %% P2SH redeem script: OP_2 (0x52) OP_CHECKSIG (0xac).
+    %% OP_2 is a small-number push; OP_CHECKSIG counts as 1 accurate sigop.
+    %% scriptSig: <<0x02, OP_2, OP_CHECKSIG>> — data-push of 2 bytes (no checksig)
+    %% ScriptPubKey: P2SH (OP_HASH160 <20-bytes> OP_EQUAL — no checksig)
+    %% Legacy sigops (inaccurate scan): 0 from scriptSig + 0 from scriptPubKey = 0
+    %% P2SH sigops (accurate on redeem script): OP_CHECKSIG = 1
+    %% Witness sigops: 0 (no witness data)
+    %% Total cost = (0 + 1) * WITNESS_SCALE_FACTOR + 0 = 1 * 4 = 4
+    RedeemScript = <<16#52, 16#ac>>,  %% OP_2 OP_CHECKSIG → 1 accurate sigop
+    ScriptSig = push_redeem_script(RedeemScript),
+    Input = make_p2sh_input(ScriptSig),
+    Coin = make_p2sh_utxo(),
+    Tx = #transaction{version = 1, inputs = [Input],
+                      outputs = [#tx_out{value = 0, script_pubkey = <<16#6a>>}],
+                      locktime = 0, txid = undefined, wtxid = undefined},
+    Flags = ?SCRIPT_VERIFY_P2SH bor ?SCRIPT_VERIFY_WITNESS,
+    ?assertEqual(4, beamchain_validation:get_tx_sigop_cost(Tx, [Coin], Flags)).
+
+%% Gate 7: get_tx_sigop_cost without SCRIPT_VERIFY_P2SH skips P2SH counting.
+get_tx_sigop_cost_no_p2sh_flag_test() ->
+    RedeemScript = <<16#52, 16#ac>>,  %% OP_2 OP_CHECKSIG
+    ScriptSig = push_redeem_script(RedeemScript),
+    Input = make_p2sh_input(ScriptSig),
+    Coin = make_p2sh_utxo(),
+    Tx = #transaction{version = 1, inputs = [Input],
+                      outputs = [#tx_out{value = 0, script_pubkey = <<16#6a>>}],
+                      locktime = 0, txid = undefined, wtxid = undefined},
+    %% Without P2SH flag: only legacy sigops (0) * 4 = 0
+    ?assertEqual(0, beamchain_validation:get_tx_sigop_cost(Tx, [Coin], 0)).
+
+%% Gate 8: MAX_STANDARD_TX_SIGOPS_COST constant is 16000.
+max_standard_tx_sigops_cost_test() ->
+    ?assertEqual(16000, ?MAX_STANDARD_TX_SIGOPS_COST).
+
+%% Gate 9: MAX_BLOCK_SIGOPS_COST constant is 80000.
+max_block_sigops_cost_test() ->
+    ?assertEqual(80000, ?MAX_BLOCK_SIGOPS_COST).
+
+%% Gate 10: WITNESS_SCALE_FACTOR is 4 and relationship holds.
+sigops_cost_relationship_test() ->
+    %% MAX_STANDARD_TX_SIGOPS_COST = MAX_BLOCK_SIGOPS_COST / 5
+    ?assertEqual(?MAX_BLOCK_SIGOPS_COST div 5, ?MAX_STANDARD_TX_SIGOPS_COST),
+    %% WITNESS_SCALE_FACTOR = 4
+    ?assertEqual(4, ?WITNESS_SCALE_FACTOR).
+
+%% Gate 11: P2WPKH input contributes exactly 1 witness sigop.
+p2wpkh_witness_sigop_test() ->
+    %% P2WPKH scriptPubKey: OP_0 <20 bytes>
+    P2WPKH_Coin = #utxo{value = 1000,
+                         script_pubkey = <<16#00, 16#14, 0:160>>,
+                         is_coinbase = false, height = 1},
+    Input = make_p2sh_input(<<>>),  %% empty scriptSig for segwit
+    Tx = #transaction{version = 1, inputs = [Input],
+                      outputs = [#tx_out{value = 0, script_pubkey = <<16#6a>>}],
+                      locktime = 0, txid = undefined, wtxid = undefined},
+    Flags = ?SCRIPT_VERIFY_P2SH bor ?SCRIPT_VERIFY_WITNESS,
+    %% Legacy = 0, P2SH = 0, Witness = 1 → cost = (0+0)*4 + 1 = 1
+    ?assertEqual(1, beamchain_validation:get_tx_sigop_cost(Tx, [P2WPKH_Coin], Flags)).
+
+%% Gate 12: OP_CHECKSIG in a P2WSH witness script counts 1 accurate sigop.
+p2wsh_witness_script_sigop_test() ->
+    %% P2WSH scriptPubKey: OP_0 <32 bytes>
+    P2WSH_Coin = #utxo{value = 1000,
+                        script_pubkey = <<16#00, 16#20, 0:256>>,
+                        is_coinbase = false, height = 1},
+    %% Witness: [<signature>, <witness_script>]
+    %% Witness script: OP_1 OP_CHECKSIG = 1 accurate sigop
+    WitnessScript = <<16#51, 16#ac>>,
+    SigBytes = <<16#01>>,  %% dummy sig
+    SegwitInput = #tx_in{prev_out = #outpoint{hash = <<2:256>>, index = 0},
+                         script_sig = <<>>, sequence = 16#ffffffff,
+                         witness = [SigBytes, WitnessScript]},
+    Tx = #transaction{version = 1, inputs = [SegwitInput],
+                      outputs = [#tx_out{value = 0, script_pubkey = <<16#6a>>}],
+                      locktime = 0, txid = undefined, wtxid = undefined},
+    Flags = ?SCRIPT_VERIFY_P2SH bor ?SCRIPT_VERIFY_WITNESS,
+    %% Legacy = 0, P2SH = 0, Witness = 1 (OP_CHECKSIG in witness script)
+    %% → cost = (0+0)*4 + 1 = 1
+    ?assertEqual(1, beamchain_validation:get_tx_sigop_cost(Tx, [P2WSH_Coin], Flags)).

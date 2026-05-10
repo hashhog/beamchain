@@ -735,17 +735,28 @@ merkle_pairs_check([A, B | Rest]) ->
 %% @doc Count P2SH sigops for a transaction.
 %% For each P2SH input, deserializes the redeem script from scriptSig
 %% and counts sigops in it using accurate mode.
-%% Reference: Bitcoin Core script.cpp GetSigOpCount(scriptSig)
+%% Reference: Bitcoin Core script.cpp GetSigOpCount(const CScript& scriptSig)
+%%
+%% Core iterates every opcode in scriptSig and returns 0 immediately if
+%% any opcode > OP_16 (0x60) is encountered (i.e. not a push).  Only
+%% push-only scriptSigs are valid for P2SH (BIP-16 consensus rule), so a
+%% non-push opcode means the redeem script cannot be correctly identified
+%% and sigops must be treated as 0 for that input, exactly as Core does.
 -spec count_p2sh_sigops(#transaction{}, [#utxo{}]) -> non_neg_integer().
 count_p2sh_sigops(#transaction{inputs = Inputs}, InputCoins) ->
     lists:foldl(fun({Input, Coin}, Acc) ->
         case is_p2sh_script(Coin#utxo.script_pubkey) of
             true ->
-                %% get the redeem script (last push in scriptSig)
-                case get_last_push(Input#tx_in.script_sig) of
+                %% Extract the redeem script (last data item pushed by scriptSig).
+                %% Return 0 for this input if scriptSig contains any non-push opcode.
+                %% Mirrors Core: if (opcode > OP_16) return 0; (script.cpp:197-198)
+                case get_p2sh_redeem_script(Input#tx_in.script_sig) of
                     {ok, RedeemScript} ->
                         %% P2SH uses accurate sigop counting
                         Acc + count_sigops_accurate(RedeemScript);
+                    not_pushonly ->
+                        %% Core returns 0 for non-push-only scriptSig
+                        Acc;
                     error ->
                         Acc
                 end;
@@ -753,6 +764,71 @@ count_p2sh_sigops(#transaction{inputs = Inputs}, InputCoins) ->
                 Acc
         end
     end, 0, lists:zip(Inputs, InputCoins)).
+
+%% @doc Extract the redeem script (last data push) from a P2SH scriptSig.
+%% Returns {ok, RedeemScript} on success, not_pushonly if any opcode > OP_16
+%% (= 0x60) is encountered, or error if the script is malformed/truncated.
+%%
+%% Mirrors Bitcoin Core CScript::GetSigOpCount(const CScript& scriptSig):
+%%   while (pc < end()) {
+%%     if (!GetOp(pc, opcode, vData)) return 0;
+%%     if (opcode > OP_16) return 0;      ← any non-push kills the count
+%%   }
+%%   return CScript(vData).GetSigOpCount(true);
+%%
+%% OP_16 = 0x60 in Core's opcode enum; so only opcodes > 0x60 trigger
+%% early return 0.  Opcodes 0x00..0x60 are all either push opcodes or
+%% small-number encodings that Core allows through.
+get_p2sh_redeem_script(Script) ->
+    get_p2sh_redeem_script(Script, error).
+
+get_p2sh_redeem_script(<<>>, Last) -> Last;
+%% OP_0 (0x00): pushes empty bytes
+get_p2sh_redeem_script(<<16#00:8, Rest/binary>>, _Last) ->
+    get_p2sh_redeem_script(Rest, {ok, <<>>});
+%% direct push: 0x01..0x4b (1–75 bytes)
+get_p2sh_redeem_script(<<N:8, Rest/binary>>, _Last) when N >= 1, N =< 16#4b ->
+    case Rest of
+        <<Data:N/binary, Rest2/binary>> ->
+            get_p2sh_redeem_script(Rest2, {ok, Data});
+        _ -> error
+    end;
+%% OP_PUSHDATA1 (0x4c)
+get_p2sh_redeem_script(<<16#4c:8, Len:8, Rest/binary>>, _Last) ->
+    case Rest of
+        <<Data:Len/binary, Rest2/binary>> ->
+            get_p2sh_redeem_script(Rest2, {ok, Data});
+        _ -> error
+    end;
+%% OP_PUSHDATA2 (0x4d)
+get_p2sh_redeem_script(<<16#4d:8, Len:16/little, Rest/binary>>, _Last) ->
+    case Rest of
+        <<Data:Len/binary, Rest2/binary>> ->
+            get_p2sh_redeem_script(Rest2, {ok, Data});
+        _ -> error
+    end;
+%% OP_PUSHDATA4 (0x4e)
+get_p2sh_redeem_script(<<16#4e:8, Len:32/little, Rest/binary>>, _Last) ->
+    case Rest of
+        <<Data:Len/binary, Rest2/binary>> ->
+            get_p2sh_redeem_script(Rest2, {ok, Data});
+        _ -> error
+    end;
+%% OP_1NEGATE (0x4f): push -1 (sign-magnitude: <<0x81>>)
+get_p2sh_redeem_script(<<16#4f:8, Rest/binary>>, _Last) ->
+    get_p2sh_redeem_script(Rest, {ok, <<16#81>>});
+%% OP_RESERVED (0x50): not a data push; Core's GetOp doesn't fill vData but
+%% 0x50 ≤ OP_16 (0x60) so Core does NOT return 0 here.  vData retains its
+%% previous value.  Mirror: keep Last unchanged.
+get_p2sh_redeem_script(<<16#50:8, Rest/binary>>, Last) ->
+    get_p2sh_redeem_script(Rest, Last);
+%% OP_1..OP_16 (0x51..0x60): push small integers 1..16
+get_p2sh_redeem_script(<<OpN:8, Rest/binary>>, _Last)
+        when OpN >= 16#51, OpN =< 16#60 ->
+    get_p2sh_redeem_script(Rest, {ok, <<(OpN - 16#50):8>>});
+%% Any opcode > 0x60: Core returns 0 immediately.  Map to not_pushonly.
+get_p2sh_redeem_script(<<Op:8, _Rest/binary>>, _Last) when Op > 16#60 ->
+    not_pushonly.
 
 %% @doc Count witness sigops for a transaction.
 %% P2WPKH: 1 sigop
