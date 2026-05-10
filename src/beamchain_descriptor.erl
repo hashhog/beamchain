@@ -82,6 +82,7 @@
 -record(desc_tr, {internal_key :: #const_key{} | #bip32_key{}, tree :: list()}).
 -record(desc_addr, {address :: string()}).
 -record(desc_raw, {script :: binary()}).
+-record(desc_rawtr, {key :: #const_key{} | #bip32_key{}}).
 -record(desc_combo, {key :: #const_key{} | #bip32_key{}}).
 
 %%% ===================================================================
@@ -198,6 +199,7 @@ is_range(#desc_multi{keys = Keys}) -> lists:any(fun is_key_range/1, Keys);
 is_range(#desc_tr{internal_key = Key, tree = Tree}) ->
     is_key_range(Key) orelse lists:any(fun({_, D}) -> is_range(D) end, Tree);
 is_range(#desc_combo{key = Key}) -> is_key_range(Key);
+is_range(#desc_rawtr{key = Key}) -> is_key_range(Key);
 is_range(#desc_addr{}) -> false;
 is_range(#desc_raw{}) -> false.
 
@@ -206,6 +208,7 @@ is_range(#desc_raw{}) -> false.
 is_solvable(#desc_addr{}) -> false;
 is_solvable(#desc_raw{}) -> false;
 is_solvable(_) -> true.
+%% Note: desc_rawtr is solvable (issolvable=true per BIP-386)
 
 %% @doc Check if descriptor has private keys.
 -spec has_private_keys(tuple()) -> boolean().
@@ -218,6 +221,7 @@ has_private_keys(#desc_multi{keys = Keys}) -> lists:any(fun key_has_private/1, K
 has_private_keys(#desc_tr{internal_key = Key, tree = Tree}) ->
     key_has_private(Key) orelse lists:any(fun({_, D}) -> has_private_keys(D) end, Tree);
 has_private_keys(#desc_combo{key = Key}) -> key_has_private(Key);
+has_private_keys(#desc_rawtr{key = Key}) -> key_has_private(Key);
 has_private_keys(_) -> false.
 
 %%% ===================================================================
@@ -415,6 +419,17 @@ parse_func("combo", Rest) ->
             {ok, #desc_combo{key = Key}, Remaining};
         {ok, _, _} ->
             {error, combo_missing_close_paren};
+        {error, _} = Err ->
+            Err
+    end;
+
+%% BIP-386: rawtr(XONLY_KEY) — x-only pubkey used directly as P2TR output key (no tweak)
+parse_func("rawtr", Rest) ->
+    case parse_key(Rest, true) of
+        {ok, Key, ")" ++ Remaining} ->
+            {ok, #desc_rawtr{key = Key}, Remaining};
+        {ok, _, _} ->
+            {error, rawtr_missing_close_paren};
         {error, _} = Err ->
             Err
     end;
@@ -839,6 +854,11 @@ derive_key(#desc_combo{key = Key} = Desc, Index) ->
         {ok, DerivedKey} -> {ok, Desc#desc_combo{key = DerivedKey}};
         {error, _} = Err -> Err
     end;
+derive_key(#desc_rawtr{key = Key} = Desc, Index) ->
+    case derive_single_key(Key, Index) of
+        {ok, DerivedKey} -> {ok, Desc#desc_rawtr{key = DerivedKey}};
+        {error, _} = Err -> Err
+    end;
 derive_key(Desc, _Index) ->
     %% addr and raw don't need derivation
     {ok, Desc}.
@@ -1019,6 +1039,15 @@ script_from_desc(#desc_tr{internal_key = Key, tree = Tree}, _Network) ->
     Tweak = beamchain_crypto:tagged_hash(<<"TapTweak">>, TweakData),
     {ok, OutputKey, _Parity} = beamchain_crypto:xonly_pubkey_tweak_add(XOnly, Tweak),
     {ok, <<16#51, 16#20, OutputKey/binary>>};
+
+script_from_desc(#desc_rawtr{key = Key}, _Network) ->
+    %% BIP-386: rawtr(KEY) -> OP_1 <32-byte-x-only-pubkey> (no tweak applied)
+    PubKey = get_pubkey(Key),
+    XOnly = case byte_size(PubKey) of
+        33 -> <<_:8, X:32/binary>> = PubKey, X;
+        32 -> PubKey
+    end,
+    {ok, <<16#51, 16#20, XOnly/binary>>};
 
 script_from_desc(#desc_addr{address = Addr}, Network) ->
     beamchain_address:address_to_script(Addr, Network);
@@ -1290,6 +1319,8 @@ format_descriptor(#desc_addr{address = Addr}) ->
     "addr(" ++ Addr ++ ")";
 format_descriptor(#desc_raw{script = Script}) ->
     "raw(" ++ binary_to_hex(Script) ++ ")";
+format_descriptor(#desc_rawtr{key = Key}) ->
+    "rawtr(" ++ format_key(Key) ++ ")";
 format_descriptor(#desc_combo{key = Key}) ->
     "combo(" ++ format_key(Key) ++ ")".
 
