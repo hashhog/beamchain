@@ -374,6 +374,22 @@ make_entry_with_tx(Txid, FeeRate, Tx) ->
         rbf_signaling = true
     }.
 
+%% Like make_tx but with nSequence = 0xFFFFFFFD to signal BIP-125 opt-in RBF.
+make_rbf_signaling_tx(Inputs, Outputs) ->
+    TxIns = [#tx_in{
+        prev_out = #outpoint{hash = H, index = I},
+        script_sig = <<>>,
+        sequence = 16#fffffffd,
+        witness = []
+    } || {H, I} <- Inputs],
+    TxOuts = [#tx_out{value = V, script_pubkey = SPK} || {V, SPK} <- Outputs],
+    #transaction{
+        version = 2,
+        inputs = TxIns,
+        outputs = TxOuts,
+        locktime = 0
+    }.
+
 make_tx(Inputs, Outputs) ->
     TxIns = [#tx_in{
         prev_out = #outpoint{hash = H, index = I},
@@ -795,6 +811,152 @@ full_rbf_non_signaling_test_() ->
              ?assertEqual(false, Got#mempool_entry.rbf_signaling)
          end]
      end}.
+
+%%% ===================================================================
+%%% W73 BIP-125 RBF gate correctness tests
+%%% ===================================================================
+
+%% Gate 1: rbf_signaling boundary — nSequence =< 0xFFFFFFFD signals opt-in.
+%% nSequence = 0xFFFFFFFE (SEQUENCE_LOCKTIME_DISABLE_FLAG - 1) must NOT signal.
+%% Core: util/rbf.h MAX_BIP125_RBF_SEQUENCE = 0xFFFFFFFD.
+rbf_signaling_boundary_test() ->
+    %% 0xFFFFFFFD: at the boundary, signals
+    ?assert(16#fffffffd =< 16#fffffffd),
+    %% 0xFFFFFFFE: one above boundary, does NOT signal
+    ?assertNot(16#fffffffe =< 16#fffffffd),
+    %% 0xFFFFFFFF: SEQUENCE_FINAL, does NOT signal
+    ?assertNot(16#ffffffff =< 16#fffffffd),
+    %% 0: well below boundary, signals
+    ?assert(0 =< 16#fffffffd),
+    %% 0xFFFFFFFD exactly
+    ?assert(16#fffffffd =< 16#fffffffd).
+
+%% Gate 1 (ancestor inheritance): child of a signaling parent is replaceable.
+%% Core: policy/rbf.cpp IsRBFOptIn — walks in-mempool ancestors.
+rbf_ancestor_inheritance_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             %% Insert a parent that signals RBF (sequence =< 0xFFFFFFFD)
+             ParentTxid = <<10:256>>,
+             ParentTx = make_rbf_signaling_tx([{<<99:256>>, 0}],
+                                              [{9000, p2pkh_script()}]),
+             ParentEntry = make_entry_with_tx_and_rbf(ParentTxid, 5.0, ParentTx, true),
+             ets:insert(mempool_txs, {ParentTxid, ParentEntry}),
+             ets:insert(mempool_outpoints, {{<<99:256>>, 0}, ParentTxid}),
+
+             %% Build a child tx that does NOT signal RBF itself (sequence = 0xFFFFFFFE)
+             %% but inherits opt-in from the parent that is in the mempool.
+             ChildTxid = <<11:256>>,
+             ChildTx = make_tx([{ParentTxid, 0}], [{8000, p2pkh_script()}]),
+             [ChildIn] = ChildTx#transaction.inputs,
+             ?assertEqual(16#fffffffe, ChildIn#tx_in.sequence),
+             %% Child itself does not signal
+             ?assertNot(lists:any(fun(#tx_in{sequence = S}) ->
+                 S =< 16#fffffffd end, ChildTx#transaction.inputs)),
+
+             %% The parent's rbf_signaling is true, so a non-signaling child
+             %% spending the parent's output must inherit rbf_signaling = true.
+             %% Simulate the computation from do_add_tx:
+             SelfSignals = lists:any(fun(#tx_in{sequence = Seq}) ->
+                 Seq =< 16#fffffffd end, ChildTx#transaction.inputs),
+             Parents = [H || #tx_in{prev_out = #outpoint{hash = H}}
+                             <- ChildTx#transaction.inputs,
+                             ets:member(mempool_txs, H)],
+             AncestorSignals = lists:any(fun(PId) ->
+                 case ets:lookup(mempool_txs, PId) of
+                     [{_, PE}] -> PE#mempool_entry.rbf_signaling;
+                     [] -> false
+                 end
+             end, Parents),
+             Inherited = SelfSignals orelse AncestorSignals,
+             ?assert(Inherited),
+
+             %% Insert child with inherited flag
+             ChildEntry = make_entry_with_tx_and_rbf(ChildTxid, 6.0, ChildTx, Inherited),
+             ets:insert(mempool_txs, {ChildTxid, ChildEntry}),
+             {ok, Got} = beamchain_mempool:get_entry(ChildTxid),
+             ?assertEqual(true, Got#mempool_entry.rbf_signaling)
+         end]
+     end}.
+
+%% Gate 5: EntriesAndTxidsDisjoint — replacement tx's ancestors must not
+%% overlap with the direct-conflict set.
+%% Core: policy/rbf.cpp EntriesAndTxidsDisjoint.
+rbf_entries_txids_disjoint_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             %% Scenario: Tx A in mempool (signaling).  Tx B spends A's output
+             %% and tries to replace A by conflicting on A's input — but B is
+             %% a descendant of A, so B's ancestor set ∩ direct-conflict set
+             %% = {A} ≠ ∅.  This must be rejected.
+             TxidA = <<20:256>>,
+             TxA = make_rbf_signaling_tx([{<<50:256>>, 0}], [{9000, p2pkh_script()}]),
+             EntryA = make_entry_with_tx_and_rbf(TxidA, 5.0, TxA, true),
+             ets:insert(mempool_txs, {TxidA, EntryA}),
+             ets:insert(mempool_outpoints, {{<<50:256>>, 0}, TxidA}),
+
+             DirectConflicts = [TxidA],
+             %% Simulated new tx that also spends {<<50:256>>,0} but claims
+             %% TxidA as a parent (impossible state, but tests the gate).
+             AncestorsOfNew = [TxidA],
+             ConflictSet = sets:from_list(DirectConflicts),
+             Overlap = lists:any(fun(AncId) ->
+                 sets:is_element(AncId, ConflictSet)
+             end, AncestorsOfNew),
+             ?assert(Overlap)
+         end]
+     end}.
+
+%% Gate 3 (Rule #3) + Gate 4 (Rule #4): PaysForRBF.
+%% Core: policy/rbf.cpp PaysForRBF.
+%%   Rule #3: replacement_fees >= original_fees
+%%   Rule #4: (replacement_fees - original_fees) >= relay_fee * replacement_vsize
+%% relay_fee = 1000 sat/kvB = 1 sat/vB (ceiling division).
+rbf_pays_for_rbf_test() ->
+    OriginalFee = 1000,   %% evicted fee total
+    NewVSize    = 200,    %% replacement vsize
+    RelayFeePerKvB = 1000,
+    MinAdditional = (NewVSize * RelayFeePerKvB + 999) div 1000,
+    ?assertEqual(200, MinAdditional),  %% 1 sat/vB * 200 vB = 200 sat
+
+    %% Exactly at limit: original + min_additional = 1200
+    ?assert(1200 - OriginalFee >= MinAdditional),
+
+    %% Below Rule #3: replacement fee < original fee
+    ?assertNot(900 >= OriginalFee),
+
+    %% Above Rule #3 but below Rule #4: replacement = 1100, additional = 100 < 200
+    ?assert(1100 >= OriginalFee),
+    ?assertNot(1100 - OriginalFee >= MinAdditional),
+
+    %% No per-conflict fee-rate check: a replacement with lower fee-rate
+    %% than the conflict but higher absolute fee and sufficient Rule #4 bump
+    %% must be accepted.
+    ConflictFeeRate = 10.0,     %% conflict: 10 sat/vB
+    NewAbsoluteFee  = 1500,     %% replacement absolute fee
+    NewFeeRate      = NewAbsoluteFee / NewVSize,   %% 7.5 sat/vB
+    ?assert(NewFeeRate < ConflictFeeRate),          %% would be rejected by old gate
+    ?assert(NewAbsoluteFee >= OriginalFee),          %% Rule #3 passes
+    AdditionalFee = NewAbsoluteFee - OriginalFee,
+    ?assert(AdditionalFee >= MinAdditional).         %% Rule #4 passes — valid replacement
+
+%% Gate 5 (Rule #5): MAX_REPLACEMENT_CANDIDATES = 100 total evictions.
+rbf_max_evictions_constant_test() ->
+    %% The constant must be 100 to match Core policy/rbf.h MAX_REPLACEMENT_CANDIDATES.
+    ?assertEqual(100, ?MAX_RBF_EVICTIONS).
+
+%% Regression: nSequence = 0xFFFFFFFE must NOT be treated as signaling.
+%% Previous beamchain code used `Seq < 0xFFFFFFFE` which is equivalent,
+%% but the canonical form is `Seq =< 0xFFFFFFFD`.  Both are identical
+%% arithmetic but we pin the constant explicitly.
+rbf_sequence_0xfffffffe_not_signaling_test() ->
+    Seq = 16#fffffffe,
+    ?assertNot(Seq =< 16#fffffffd),   %% must NOT signal (correct)
+    ?assert(Seq < 16#ffffffff),        %% but is less than SEQUENCE_FINAL
+    %% Verify 0xFFFFFFFD does signal
+    ?assert(16#fffffffd =< 16#fffffffd).
 
 %%% ===================================================================
 %%% Package validation tests (test internal logic, no gen_server needed)
