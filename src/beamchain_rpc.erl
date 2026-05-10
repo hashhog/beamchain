@@ -2818,13 +2818,14 @@ rpc_gettxout([TxidHex, N, IncludeMempool]) when is_binary(TxidHex),
     end,
     case MempoolResult of
         {ok, #utxo{value = V, script_pubkey = Script}} ->
-            {ok, format_utxo_result(V, Script, 0, true)};
+            Map = format_utxo_result(V, Script, true),
+            {ok_raw_json, replace_btc_sentinels(jsx:encode(Map))};
         not_found ->
             case beamchain_chainstate:get_utxo(Txid, N) of
                 {ok, #utxo{value = V, script_pubkey = Script,
-                           is_coinbase = IsCb, height = Height}} ->
-                    {ok, format_utxo_result(V, Script,
-                        confirmations(Height), IsCb)};
+                           is_coinbase = IsCb}} ->
+                    Map = format_utxo_result(V, Script, IsCb),
+                    {ok_raw_json, replace_btc_sentinels(jsx:encode(Map))};
                 not_found ->
                     {ok, null}
             end
@@ -4668,28 +4669,17 @@ block_time(Height) ->
     end.
 
 %% Format a UTXO for gettxout response.
-format_utxo_result(Value, Script, Confirmations, IsCoinbase) ->
+%% Returns Core-shape: {coinbase, scriptPubKey, value} — bestblock and
+%% confirmations are STRIPPED per the method spec (W61).
+%% value uses the sentinel pattern so jsx encodes it as a JSON string and
+%% replace_btc_sentinels rewrites it to the exact Core-format decimal.
+%% scriptPubKey uses format_psbt_spk_json so asm + desc are included.
+format_utxo_result(Value, Script, IsCoinbase) ->
     Network = beamchain_config:network(),
-    NetType = case Network of mainnet -> mainnet; _ -> testnet end,
-    Type = beamchain_address:classify_script(Script),
-    Address = beamchain_address:script_to_address(Script, NetType),
     #{
-        <<"bestblock">> => case beamchain_chainstate:get_tip() of
-            {ok, {H, _}} -> hash_to_hex(H);
-            _ -> <<>>
-        end,
-        <<"confirmations">> => Confirmations,
-        <<"value">> => satoshi_to_btc(Value),
-        <<"scriptPubKey">> => #{
-            <<"hex">> => beamchain_serialize:hex_encode(Script),
-            <<"type">> => script_type_name(Type),
-            <<"address">> => case Address of
-                unknown -> null;
-                "OP_RETURN" -> null;
-                Addr -> iolist_to_binary(Addr)
-            end
-        },
-        <<"coinbase">> => IsCoinbase
+        <<"coinbase">>    => IsCoinbase,
+        <<"value">>       => format_amount_sentinel(Value),
+        <<"scriptPubKey">> => format_psbt_spk_json(Script, Network)
     }.
 
 %% Format IP:Port as binary string.
