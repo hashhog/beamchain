@@ -7073,13 +7073,11 @@ rpc_deriveaddresses([DescStr, Range]) when is_binary(DescStr) ->
     try
         case beamchain_descriptor:parse(binary_to_list(DescStr)) of
             {ok, Desc} ->
-                case beamchain_descriptor:is_solvable(Desc) of
-                    false ->
-                        {error, ?RPC_INVALID_ADDRESS_OR_KEY,
-                         <<"Descriptor is not solvable">>};
-                    true ->
-                        derive_addresses_range(Desc, Range, Network)
-                end;
+                %% Bitcoin Core does NOT gate deriveaddresses on IsSolvable().
+                %% addr() and raw() are not solvable but can still expand to
+                %% a known script (and thus a known address).  Only reject if
+                %% Expand itself fails (e.g. ranged descriptor without keys).
+                derive_addresses_range(Desc, Range, Network);
             {error, Reason} ->
                 {error, ?RPC_INVALID_PARAMETER,
                  iolist_to_binary(io_lib:format("Invalid descriptor: ~p", [Reason]))}
