@@ -652,6 +652,7 @@ handle_method(<<"finalizepsbt">>, P, _W) -> rpc_finalizepsbt(P);
 handle_method(<<"analyzepsbt">>, P, _W) -> rpc_analyzepsbt(P);
 
 %% -- Descriptors --
+handle_method(<<"createmultisig">>, P, _W) -> rpc_createmultisig(P);
 handle_method(<<"deriveaddresses">>, P, _W) -> rpc_deriveaddresses(P);
 handle_method(<<"getdescriptorinfo">>, P, _W) -> rpc_getdescriptorinfo(P);
 
@@ -749,6 +750,7 @@ rpc_help_list() ->
         <<"testmempoolaccept [\"rawtx\"]">>,
         <<"">>,
         <<"== Util ==">>,
+        <<"createmultisig nrequired [\"key\",...] ( \"address_type\" )">>,
         <<"deriveaddresses \"descriptor\" ( range )">>,
         <<"estimatesmartfee conf_target ( \"estimate_mode\" )">>,
         <<"estimaterawfee conf_target ( threshold )">>,
@@ -7062,6 +7064,215 @@ script_asm_push_token_sighash(Data) ->
 %%% ===================================================================
 %%% Descriptor methods
 %%% ===================================================================
+
+%% createmultisig nrequired ["key",...] ( "address_type" )
+%% Creates a multi-signature address with n signature(s) of m key(s) required.
+%% Reference: Bitcoin Core rpc/output_script.cpp createmultisig (~line 89)
+%%
+%% Returns {address, redeemScript, descriptor} with Core byte-identity.
+%%
+%% address_type:
+%%   "legacy"     (default) → P2SH(HASH160(redeemScript)), sh(multi(...))#cs
+%%   "bech32"              → P2WSH(SHA256(redeemScript)),  wsh(multi(...))#cs
+%%   "p2sh-segwit"         → P2SH(P2WSH(redeemScript)),   sh(wsh(multi(...)))#cs
+%%
+%% redeemScript = OP_M <push><pk1> ... <push><pkN> OP_N OP_CHECKMULTISIG
+%% (pubkeys in input order; no BIP-67 sorting — Core's GetScriptForMultisig).
+rpc_createmultisig([NRequired, Keys]) ->
+    rpc_createmultisig([NRequired, Keys, <<"legacy">>]);
+rpc_createmultisig([NRequired, Keys, AddrType]) when is_integer(NRequired),
+                                                      is_list(Keys),
+                                                      is_binary(AddrType) ->
+    %% 1. Validate nrequired lower bound.
+    case NRequired < 1 of
+        true ->
+            {error, ?RPC_INVALID_PARAMS,
+             <<"a multisignature address must require at least one key to redeem">>};
+        false ->
+            cm_parse_keys(NRequired, Keys, AddrType)
+    end;
+rpc_createmultisig(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"createmultisig nrequired [\"key\",...] ( \"address_type\" )">>}.
+
+%% Parse and validate pubkeys, then build the output.
+cm_parse_keys(NRequired, Keys, AddrType) ->
+    case cm_validate_keys(Keys, []) of
+        {error, _} = Err ->
+            Err;
+        {ok, PubKeys} ->
+            NKeys = length(PubKeys),
+            %% Check key count constraints (mirrors Core: nRequired ≤ nKeys ≤ 16).
+            if
+                NKeys < NRequired ->
+                    Msg = iolist_to_binary(
+                            io_lib:format(
+                              "not enough keys supplied (got ~b keys, "
+                              "but need at least ~b to redeem)",
+                              [NKeys, NRequired])),
+                    {error, ?RPC_INVALID_PARAMS, Msg};
+                NKeys > 16 ->
+                    {error, ?RPC_INVALID_PARAMS,
+                     <<"Number of keys involved in the multisignature address "
+                       "creation > 16\nReduce the number">>};
+                true ->
+                    cm_build(NRequired, PubKeys, AddrType)
+            end
+    end.
+
+%% Validate each key in the list; return {ok, [binary()]} or {error,...}.
+cm_validate_keys([], Acc) ->
+    {ok, lists:reverse(Acc)};
+cm_validate_keys([HexKey | Rest], Acc) when is_binary(HexKey) ->
+    case cm_hex_to_pubkey(HexKey) of
+        {ok, PubKeyBin} ->
+            cm_validate_keys(Rest, [PubKeyBin | Acc]);
+        {error, _} = Err ->
+            Err
+    end;
+cm_validate_keys([_BadKey | _], _Acc) ->
+    {error, ?RPC_INVALID_ADDRESS_OR_KEY, <<"Pubkey must be a hex string">>}.
+
+cm_hex_to_pubkey(HexKey) ->
+    %% Expect 33-byte (66 hex chars) or 65-byte (130 hex chars) pubkey.
+    Len = byte_size(HexKey),
+    case Len =:= 66 orelse Len =:= 130 of
+        false ->
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+             iolist_to_binary(io_lib:format(
+               "Pubkey \"~s\" must have a length of either 33 or 65 bytes",
+               [HexKey]))};
+        true ->
+            cm_hex_to_pubkey_decode(HexKey)
+    end.
+
+cm_hex_to_pubkey_decode(HexKey) ->
+    try beamchain_serialize:hex_decode(HexKey) of
+        PK ->
+            cm_hex_to_pubkey_validate(HexKey, PK)
+    catch
+        _:_ ->
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+             iolist_to_binary(io_lib:format(
+               "Pubkey \"~s\" must be a hex string", [HexKey]))}
+    end.
+
+cm_hex_to_pubkey_validate(HexKey, PK) ->
+    %% Structural check: 0x02/0x03 prefix (33B) or 0x04 prefix (65B).
+    case beamchain_crypto:validate_pubkey(PK) of
+        false ->
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+             iolist_to_binary(io_lib:format(
+               "Pubkey \"~s\" must be cryptographically valid.", [HexKey]))};
+        true ->
+            cm_hex_to_pubkey_curve_check(HexKey, PK)
+    end.
+
+cm_hex_to_pubkey_curve_check(HexKey, PK) ->
+    %% For compressed keys, additionally verify the point is on the curve via
+    %% secp256k1 decompress (mirrors Core's CPubKey::IsFullyValid()).
+    case byte_size(PK) of
+        33 ->
+            case beamchain_crypto:pubkey_decompress(PK) of
+                {ok, _} -> {ok, PK};
+                {error, _} ->
+                    {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+                     iolist_to_binary(io_lib:format(
+                       "Pubkey \"~s\" must be cryptographically valid.", [HexKey]))}
+            end;
+        _Uncompressed ->
+            %% 65-byte uncompressed: structural check is enough.
+            {ok, PK}
+    end.
+
+%% Build the address, redeemScript, and descriptor.
+cm_build(NRequired, PubKeys, AddrType0) ->
+    Network = beamchain_config:network(),
+
+    %% Check for uncompressed keys — Core forces "legacy" in that case.
+    HasUncompressed = lists:any(fun(PK) -> byte_size(PK) =:= 65 end, PubKeys),
+    {AddrType, Warnings} =
+        case HasUncompressed andalso AddrType0 =/= <<"legacy">> of
+            true ->
+                {<<"legacy">>,
+                 [<<"Unable to make chosen address type, please ensure "
+                    "no uncompressed public keys are present.">>]};
+            false ->
+                {AddrType0, []}
+        end,
+
+    %% Validate address_type before building.
+    ValidTypes = [<<"legacy">>, <<"bech32">>, <<"p2sh-segwit">>],
+    case lists:member(AddrType, ValidTypes) of
+        false ->
+            Msg = iolist_to_binary(io_lib:format(
+                    "Unknown address type '~s'", [AddrType])),
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY, Msg};
+        true ->
+            %% Build redeemScript.
+            RedeemScript = cm_redeem_script(NRequired, PubKeys),
+            RedeemScriptHex = beamchain_serialize:hex_encode(RedeemScript),
+
+            %% Build descriptor inner string (multi(M,pk1,...,pkN)).
+            PkHexStrs = [binary_to_list(beamchain_serialize:hex_encode(PK)) || PK <- PubKeys],
+            MultiInner = "multi(" ++ integer_to_list(NRequired) ++ "," ++
+                         string:join(PkHexStrs, ",") ++ ")",
+
+            %% Build address + full descriptor per type.
+            {Address, Descriptor} = cm_address_and_desc(
+                AddrType, RedeemScript, MultiInner, Network),
+
+            Result = #{
+                <<"address">>      => list_to_binary(Address),
+                <<"redeemScript">> => RedeemScriptHex,
+                <<"descriptor">>   => list_to_binary(Descriptor)
+            },
+            FinalResult = case Warnings of
+                [] -> Result;
+                _  -> Result#{<<"warnings">> => Warnings}
+            end,
+            {ok, FinalResult}
+    end.
+
+%% Build redeemScript binary.
+%% OP_M <push><pk1> ... <push><pkN> OP_N OP_CHECKMULTISIG
+%% OP_M = 0x50 + M, OP_N = 0x50 + N.
+cm_redeem_script(M, PubKeys) ->
+    OpM = 16#50 + M,
+    N = length(PubKeys),
+    OpN = 16#50 + N,
+    KeyPushes = iolist_to_binary([<<(byte_size(PK)):8, PK/binary>> || PK <- PubKeys]),
+    <<OpM:8, KeyPushes/binary, OpN:8, 16#ae:8>>.
+
+%% Derive address string and descriptor string with checksum.
+cm_address_and_desc(<<"legacy">>, RedeemScript, MultiInner, Network) ->
+    %% P2SH: OP_HASH160 <20-byte HASH160(redeemScript)> OP_EQUAL
+    Hash = beamchain_crypto:hash160(RedeemScript),
+    P2SHScript = <<16#a9, 16#14, Hash/binary, 16#87>>,
+    Address = beamchain_address:script_to_address(P2SHScript, Network),
+    DescInner = "sh(" ++ MultiInner ++ ")",
+    Descriptor = beamchain_descriptor:add_checksum(DescInner),
+    {Address, Descriptor};
+
+cm_address_and_desc(<<"bech32">>, RedeemScript, MultiInner, Network) ->
+    %% P2WSH: OP_0 <32-byte SHA256(redeemScript)>
+    Hash = beamchain_crypto:sha256(RedeemScript),
+    P2WSHScript = <<16#00, 16#20, Hash/binary>>,
+    Address = beamchain_address:script_to_address(P2WSHScript, Network),
+    DescInner = "wsh(" ++ MultiInner ++ ")",
+    Descriptor = beamchain_descriptor:add_checksum(DescInner),
+    {Address, Descriptor};
+
+cm_address_and_desc(<<"p2sh-segwit">>, RedeemScript, MultiInner, Network) ->
+    %% P2SH-wrapped P2WSH: HASH160 of the witness script (0x00 0x20 <sha256>).
+    Hash = beamchain_crypto:sha256(RedeemScript),
+    WitnessScript = <<16#00, 16#20, Hash/binary>>,
+    H160 = beamchain_crypto:hash160(WitnessScript),
+    P2SHScript = <<16#a9, 16#14, H160/binary, 16#87>>,
+    Address = beamchain_address:script_to_address(P2SHScript, Network),
+    DescInner = "sh(wsh(" ++ MultiInner ++ "))",
+    Descriptor = beamchain_descriptor:add_checksum(DescInner),
+    {Address, Descriptor}.
 
 %% deriveaddresses "descriptor" ( range )
 %% Derives one or more addresses from an output descriptor.
