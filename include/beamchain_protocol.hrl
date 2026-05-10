@@ -157,6 +157,15 @@
 -define(MAX_P2SH_SIGOPS, 15).
 -define(MAX_STANDARD_TX_SIGOPS_COST, 16000).
 
+%%% IsWitnessStandard limits (Bitcoin Core policy/policy.h)
+-define(MAX_STANDARD_P2WSH_SCRIPT_SIZE, 3600).    %% policy.h:MAX_STANDARD_P2WSH_SCRIPT_SIZE
+-define(MAX_STANDARD_P2WSH_STACK_ITEMS, 100).     %% policy.h:MAX_STANDARD_P2WSH_STACK_ITEMS
+-define(MAX_STANDARD_P2WSH_STACK_ITEM_SIZE, 80).  %% policy.h:MAX_STANDARD_P2WSH_STACK_ITEM_SIZE
+-define(MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE, 80). %% policy.h:MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE
+-define(ANNEX_TAG, 16#50).                        %% policy.h:ANNEX_TAG — first byte of witness annex
+-define(TAPROOT_LEAF_MASK, 16#fe).                %% script/interpreter.h:TAPROOT_LEAF_MASK
+-define(TAPROOT_LEAF_TAPSCRIPT, 16#c0).           %% script/interpreter.h:TAPROOT_LEAF_TAPSCRIPT
+
 %%% -------------------------------------------------------------------
 %%% Package relay constants
 %%% -------------------------------------------------------------------
