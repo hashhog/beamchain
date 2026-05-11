@@ -9,6 +9,7 @@
 -export([compact_to_target/1, target_to_compact/1]).  %% aliases
 -export([check_pow/3, compute_work/1]).
 -export([get_next_work_required/3]).
+-export([permitted_difficulty_transition/4]).
 
 %%% -------------------------------------------------------------------
 %%% Compact bits <-> 256-bit target conversion
@@ -18,13 +19,24 @@
 %% Format: 0xAABBBBBB where AA = exponent, BBBBBB = mantissa.
 %% target = mantissa * 2^(8 * (exponent - 3))
 %% Negative targets (high bit of mantissa set) are treated as zero.
+%% Overflow (exponent too large for the mantissa width) returns 0.
+%% Mirrors Core arith_uint256::SetCompact + DeriveTarget (pow.cpp:146-158).
 -spec bits_to_target(non_neg_integer()) -> non_neg_integer().
 bits_to_target(Bits) ->
     Exponent = (Bits bsr 24) band 16#ff,
-    Mantissa = Bits band 16#7fffff,
-    %% check negative bit
-    Negative = (Bits band 16#800000) =/= 0,
-    case Negative orelse Mantissa =:= 0 of
+    %% Core uses the full 23-bit mantissa word (0x007fffff mask), not 0x7fffff
+    Mantissa = Bits band 16#007fffff,
+    %% check negative bit (bit 23 of the compact word)
+    Negative = (Bits band 16#00800000) =/= 0,
+    %% Overflow check mirrors Core SetCompact pfOverflow:
+    %%   nWord != 0 && ((nSize > 34) ||
+    %%                  (nWord > 0xff   && nSize > 33) ||
+    %%                  (nWord > 0xffff && nSize > 32))
+    Overflow = (Mantissa =/= 0) andalso
+               ((Exponent > 34) orelse
+                (Mantissa > 16#ff   andalso Exponent > 33) orelse
+                (Mantissa > 16#ffff andalso Exponent > 32)),
+    case Negative orelse Mantissa =:= 0 orelse Overflow of
         true -> 0;
         false ->
             if
@@ -160,10 +172,12 @@ calculate_retarget(PrevIndex, Params) ->
     ActualTimespan = min(TargetTimespan * 4, ActualTimespan1),
 
     %% new_target = old_target * actual_timespan / target_timespan
-    %% BIP94 (testnet4): use the first block of the period's bits for OldTarget
-    %% because the first block cannot use the min-difficulty exception.
-    IsBIP94 = maps:get(network, Params, mainnet) =:= testnet4,
-    OldTarget = case IsBIP94 of
+    %% BIP94: use the first block of the period's bits for OldTarget because
+    %% the first block cannot use the min-difficulty exception.
+    %% Core uses params.enforce_BIP94 (a boolean), NOT a network-name check.
+    %% Regtest can enable BIP94 via opts; never rely on network =:= testnet4.
+    EnforceBIP94 = maps:get(enforce_bip94, Params, false),
+    OldTarget = case EnforceBIP94 of
         true  -> bits_to_target(FirstHeader#block_header.bits);
         false -> bits_to_target(PrevHeader#block_header.bits)
     end,
@@ -204,6 +218,76 @@ pow_limit_bits(Params) ->
     PowLimit = maps:get(pow_limit, Params),
     PowLimitInt = binary:decode_unsigned(PowLimit, big),
     target_to_bits(PowLimitInt).
+
+%%% -------------------------------------------------------------------
+%%% PermittedDifficultyTransition
+%%% -------------------------------------------------------------------
+
+%% @doc Return false if the difficulty transition at Height from OldBits to
+%% NewBits is not permitted by consensus rules.
+%%
+%% At a retarget boundary (Height rem 2016 == 0):
+%%   the new target must lie within [old/4 .. old*4], clamped to pow_limit,
+%%   and rounded through GetCompact/SetCompact just like Core does.
+%% Off a retarget boundary:
+%%   the bits must be unchanged.
+%% On networks with fPowAllowMinDifficultyBlocks (testnet/regtest):
+%%   always returns true — min-difficulty exceptions are permitted.
+%%
+%% Mirrors Core pow.cpp:89-136 PermittedDifficultyTransition.
+-spec permitted_difficulty_transition(map(), non_neg_integer(),
+                                      non_neg_integer(), non_neg_integer())
+    -> boolean().
+permitted_difficulty_transition(Params, Height, OldBits, NewBits) ->
+    AllowMinDiff = maps:get(pow_allow_min_difficulty, Params, false),
+    case AllowMinDiff of
+        true ->
+            %% testnet / regtest: any transition is permitted
+            true;
+        false ->
+            case Height rem ?DIFFICULTY_ADJUSTMENT_INTERVAL of
+                0 ->
+                    %% Retarget block: check that NewBits is within [old/4 .. old*4]
+                    TargetTimespan = maps:get(pow_target_timespan, Params,
+                                             ?POW_TARGET_TIMESPAN),
+                    SmallestTimespan = TargetTimespan div 4,
+                    LargestTimespan  = TargetTimespan * 4,
+                    PowLimit = maps:get(pow_limit, Params),
+                    PowLimitInt = binary:decode_unsigned(PowLimit, big),
+
+                    ObservedNewTarget = bits_to_target(NewBits),
+
+                    %% Calculate the largest (easiest) permitted target:
+                    %%   old_target * largest_timespan / target_timespan, clamped
+                    LargestTarget0 = (bits_to_target(OldBits) * LargestTimespan)
+                                     div TargetTimespan,
+                    LargestTarget1 = min(LargestTarget0, PowLimitInt),
+                    %% Round through compact encoding (mirrors Core's
+                    %%   maximum_new_target.SetCompact(largest_difficulty_target.GetCompact()))
+                    MaximumNewTarget = bits_to_target(target_to_bits(LargestTarget1)),
+
+                    case MaximumNewTarget < ObservedNewTarget of
+                        true -> false;  %% new target is easier than max permitted
+                        false ->
+                            %% Calculate the smallest (hardest) permitted target:
+                            %%   old_target * smallest_timespan / target_timespan, clamped
+                            SmallestTarget0 = (bits_to_target(OldBits) * SmallestTimespan)
+                                              div TargetTimespan,
+                            SmallestTarget1 = min(SmallestTarget0, PowLimitInt),
+                            %% Round through compact encoding
+                            MinimumNewTarget = bits_to_target(
+                                                   target_to_bits(SmallestTarget1)),
+
+                            case MinimumNewTarget > ObservedNewTarget of
+                                true  -> false;  %% new target is harder than min permitted
+                                false -> true
+                            end
+                    end;
+                _ ->
+                    %% Non-retarget block: bits must be unchanged
+                    OldBits =:= NewBits
+            end
+    end.
 
 %%% -------------------------------------------------------------------
 %%% Aliases for compact_to_target / target_to_compact
