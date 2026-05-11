@@ -832,18 +832,26 @@ execute(<<Op, _Rest/binary>>, _Pos, #script_state{sig_version = SigVer} = _State
             %% Disabled opcodes ALWAYS fail, even in non-executing branches
             {error, disabled_opcode};
         _ ->
-            case executing(State0) of
+            %% CONST_SCRIPTCODE: OP_CODESEPARATOR in base (non-segwit) scripts
+            %% is rejected even when inside an unexecuted branch.
+            %% Core: interpreter.cpp:474-476 — this check runs before fExec.
+            case Op =:= ?OP_CODESEPARATOR andalso SigVer =:= base andalso
+                 (State0#script_state.flags band ?SCRIPT_VERIFY_CONST_SCRIPTCODE) =/= 0 of
+                true -> {error, op_codeseparator_in_legacy};
                 false ->
-                    %% In non-executing branches, skip all opcodes
-                    %% (except IF/NOTIF/ELSE/ENDIF which are handled above,
-                    %% and disabled opcodes which always fail).
-                    %% Still need to count the op.
-                    case count_op(State0) of
-                        {ok, State1} -> execute(_Rest, _Pos + 1, State1);
-                        Error -> Error
-                    end;
-                true ->
-                    execute_remaining(Op, _Rest, _Pos, State0)
+                    case executing(State0) of
+                        false ->
+                            %% In non-executing branches, skip all opcodes
+                            %% (except IF/NOTIF/ELSE/ENDIF which are handled above,
+                            %% and disabled opcodes which always fail).
+                            %% Still need to count the op.
+                            case count_op(State0) of
+                                {ok, State1} -> execute(_Rest, _Pos + 1, State1);
+                                Error -> Error
+                            end;
+                        true ->
+                            execute_remaining(Op, _Rest, _Pos, State0)
+                    end
             end
     end;
 
@@ -1441,17 +1449,15 @@ execute_codesep(Rest, Pos, State) ->
             case executing(State1) of
                 false -> execute(Rest, Pos, State1);
                 true ->
-                    %% CONST_SCRIPTCODE (BASE sigversion, i.e., legacy
-                    %% non-segwit): reject OP_CODESEPARATOR even in an
-                    %% unexecuted branch.  The guard here is belt-and-
-                    %% suspenders — the primary check lives in the main
-                    %% execute/3 catchall clause ABOVE the fExec gate, so
-                    %% we only reach here when this DOES execute.
+                    %% CONST_SCRIPTCODE: OP_CODESEPARATOR in base (non-segwit)
+                    %% is already rejected in the main catch-all execute/3 clause
+                    %% BEFORE the fExec gate (Core interpreter.cpp:474-476), so by
+                    %% the time we reach here the flag was either not set or the
+                    %% sig_version is not base.  The check below is belt-and-
+                    %% suspenders for the executing branch.
                     %%
-                    %% witness_v0: OP_CODESEPARATOR is permitted but was
-                    %% historically (incorrectly) rejected here; keep the
-                    %% legacy check for backward compat but note Core only
-                    %% rejects on BASE.
+                    %% witness_v0: OP_CODESEPARATOR is permitted; Core only
+                    %% rejects on BASE with CONST_SCRIPTCODE.
                     case State1#script_state.sig_version of
                         base when
                             (State1#script_state.flags band
@@ -1519,27 +1525,38 @@ do_checksig_ecdsa(Rest, Pos, State) ->
                                 {error, _} = E -> E;
                                 ok ->
                                     %% FindAndDelete: for legacy scripts, remove the
-                                    %% signature from the scriptCode before computing sighash
-                                    State2 = case State1#script_state.sig_version of
+                                    %% signature from the scriptCode before computing sighash.
+                                    %% CONST_SCRIPTCODE (interpreter.cpp:329-332): if any
+                                    %% deletion occurred, reject with sig_findanddelete.
+                                    State2Result = case State1#script_state.sig_version of
                                         base ->
-                                            S2 = find_and_delete(State1#script_state.script, Sig),
-                                            State1#script_state{script = S2};
+                                            OldScript = State1#script_state.script,
+                                            S2 = find_and_delete(OldScript, Sig),
+                                            case S2 =/= OldScript andalso
+                                                 (Flags band ?SCRIPT_VERIFY_CONST_SCRIPTCODE) =/= 0 of
+                                                true  -> {error, sig_findanddelete};
+                                                false -> {ok, State1#script_state{script = S2}}
+                                            end;
                                         _ ->
-                                            State1
+                                            {ok, State1}
                                     end,
-                                    SigChecker = State2#script_state.sig_checker,
-                                    SigHash = compute_sig_hash(State2, HashTypeByte, Pos),
-                                    Valid = check_ecdsa_sig(SigChecker, SigBody, PubKey, SigHash),
-                                    case Valid of
-                                        true ->
-                                            execute(Rest, Pos, push(script_true(), State1));
-                                        false ->
-                                            case Flags band ?SCRIPT_VERIFY_NULLFAIL of
-                                                0 ->
-                                                    execute(Rest, Pos,
-                                                            push(script_false(), State1));
-                                                _ ->
-                                                    {error, nullfail}
+                                    case State2Result of
+                                        {error, _} = FadErr -> FadErr;
+                                        {ok, State2} ->
+                                            SigChecker = State2#script_state.sig_checker,
+                                            SigHash = compute_sig_hash(State2, HashTypeByte, Pos),
+                                            Valid = check_ecdsa_sig(SigChecker, SigBody, PubKey, SigHash),
+                                            case Valid of
+                                                true ->
+                                                    execute(Rest, Pos, push(script_true(), State1));
+                                                false ->
+                                                    case Flags band ?SCRIPT_VERIFY_NULLFAIL of
+                                                        0 ->
+                                                            execute(Rest, Pos,
+                                                                    push(script_false(), State1));
+                                                        _ ->
+                                                            {error, nullfail}
+                                                    end
                                             end
                                     end
                             end
@@ -1690,22 +1707,32 @@ do_checksig_result(State, Pos) ->
                             case check_sig_encoding(SigBody, HashTypeByte, PubKey, Flags) of
                                 {error, _} = E -> E;
                                 ok ->
-                                    %% FindAndDelete for legacy scripts
-                                    State2 = case State1#script_state.sig_version of
+                                    %% FindAndDelete for legacy scripts.
+                                    %% CONST_SCRIPTCODE: reject if deletion occurred.
+                                    State2Result = case State1#script_state.sig_version of
                                         base ->
-                                            S2 = find_and_delete(State1#script_state.script, Sig),
-                                            State1#script_state{script = S2};
+                                            OldScript2 = State1#script_state.script,
+                                            S2 = find_and_delete(OldScript2, Sig),
+                                            case S2 =/= OldScript2 andalso
+                                                 (Flags band ?SCRIPT_VERIFY_CONST_SCRIPTCODE) =/= 0 of
+                                                true  -> {error, sig_findanddelete};
+                                                false -> {ok, State1#script_state{script = S2}}
+                                            end;
                                         _ ->
-                                            State1
+                                            {ok, State1}
                                     end,
-                                    SigHash = compute_sig_hash(State2, HashTypeByte, Pos),
-                                    Valid = check_ecdsa_sig(
-                                        State2#script_state.sig_checker, SigBody, PubKey, SigHash),
-                                    case Valid of
-                                        false when (Flags band ?SCRIPT_VERIFY_NULLFAIL) =/= 0 ->
-                                            {error, nullfail};
-                                        _ ->
-                                            {ok, Valid, State1}
+                                    case State2Result of
+                                        {error, _} = FadErr2 -> FadErr2;
+                                        {ok, State2} ->
+                                            SigHash = compute_sig_hash(State2, HashTypeByte, Pos),
+                                            Valid = check_ecdsa_sig(
+                                                State2#script_state.sig_checker, SigBody, PubKey, SigHash),
+                                            case Valid of
+                                                false when (Flags band ?SCRIPT_VERIFY_NULLFAIL) =/= 0 ->
+                                                    {error, nullfail};
+                                                _ ->
+                                                    {ok, Valid, State1}
+                                            end
                                     end
                             end
                     end
@@ -1849,29 +1876,42 @@ do_checkmultisig_eval(State, Pos) ->
                                                         true -> {error, nulldummy_failed};
                                                         false ->
                                                             %% FindAndDelete: for legacy scripts, remove
-                                                            %% all sigs from the scriptCode before verifying
-                                                            State7 = case State6#script_state.sig_version of
-                                                                base ->
-                                                                    CleanedScript = lists:foldl(
-                                                                        fun(S, Sc) -> find_and_delete(Sc, S) end,
-                                                                        State6#script_state.script,
-                                                                        Sigs),
-                                                                    State6#script_state{script = CleanedScript};
-                                                                _ ->
-                                                                    State6
-                                                            end,
-                                                            Result = verify_multisig_sigs(
-                                                                PubKeys, Sigs, State7, Pos),
-                                                            case Result of
-                                                                true ->
-                                                                    {ok, true, State6};
-                                                                {error, _} = E ->
-                                                                    E;
-                                                                false ->
-                                                                    case (Flags band ?SCRIPT_VERIFY_NULLFAIL) =/= 0 andalso
-                                                                         lists:any(fun(S) -> S =/= <<>> end, Sigs) of
-                                                                        true -> {error, nullfail};
-                                                                        false -> {ok, false, State6}
+                                                            %% all sigs from the scriptCode before verifying.
+                                                            %% CONST_SCRIPTCODE (interpreter.cpp:1145-1149):
+                                                            %% reject if any deletion occurred.
+                                                            case (fun() ->
+                                                                case State6#script_state.sig_version of
+                                                                    base ->
+                                                                        OrigScript = State6#script_state.script,
+                                                                        CleanedScript = lists:foldl(
+                                                                            fun(S, Sc) -> find_and_delete(Sc, S) end,
+                                                                            OrigScript,
+                                                                            Sigs),
+                                                                        case CleanedScript =/= OrigScript andalso
+                                                                             (Flags band ?SCRIPT_VERIFY_CONST_SCRIPTCODE) =/= 0 of
+                                                                            true  -> {error, sig_findanddelete};
+                                                                            false ->
+                                                                                {ok, State6#script_state{script = CleanedScript}}
+                                                                        end;
+                                                                    _ ->
+                                                                        {ok, State6}
+                                                                end
+                                                            end)() of
+                                                                {error, _} = FadErr3 -> FadErr3;
+                                                                {ok, State7} ->
+                                                                    Result = verify_multisig_sigs(
+                                                                        PubKeys, Sigs, State7, Pos),
+                                                                    case Result of
+                                                                        true ->
+                                                                            {ok, true, State6};
+                                                                        {error, _} = E ->
+                                                                            E;
+                                                                        false ->
+                                                                            case (Flags band ?SCRIPT_VERIFY_NULLFAIL) =/= 0 andalso
+                                                                                 lists:any(fun(S) -> S =/= <<>> end, Sigs) of
+                                                                                true -> {error, nullfail};
+                                                                                false -> {ok, false, State6}
+                                                                            end
                                                                     end
                                                             end
                                                     end;
@@ -2237,10 +2277,18 @@ check_hash_type(HT) ->
 
 %% @doc Check signature encoding (DER, LOW_S, STRICTENC) - returns ok or {error, Reason}.
 %% This consolidates all encoding checks done before signature verification.
+%%
+%% SigBody is the DER bytes WITHOUT the trailing sighash byte.
+%% Core's IsValidSignatureEncoding operates on the full sig (SigBody ++ [sighash])
+%% and enforces size in [9, 73].  We enforce the equivalent on SigBody: [8, 72].
+%% Core: interpreter.cpp:122-123 (sig.size() < 9 / > 73).
 check_sig_encoding(SigBody, HashTypeByte, PubKey, Flags) ->
     DerOk = case Flags band (?SCRIPT_VERIFY_DERSIG bor ?SCRIPT_VERIFY_LOW_S bor ?SCRIPT_VERIFY_STRICTENC) of
         0 -> true;
-        _ -> beamchain_crypto:check_strict_der(SigBody)
+        _ ->
+            %% Bug fix: enforce max-size before calling check_strict_der.
+            %% Full sig (SigBody + hashtype) must be <= 73 bytes, so SigBody <= 72.
+            byte_size(SigBody) =< 72 andalso beamchain_crypto:check_strict_der(SigBody)
     end,
     case DerOk of
         false -> {error, sig_der};
