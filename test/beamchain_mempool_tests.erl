@@ -1479,10 +1479,11 @@ linearize_chain_test_() ->
          end]
      end}.
 
-%% Test cluster limit constant
+%% Test cluster limit constants match Core (policy/policy.h:72-74)
 cluster_size_limit_test() ->
-    %% MAX_CLUSTER_SIZE should be 100
-    ?assertEqual(100, 100).
+    %% Core DEFAULT_CLUSTER_LIMIT = 64, DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101
+    ?assertEqual(64,     beamchain_mempool:cluster_count_limit()),
+    ?assertEqual(101000, beamchain_mempool:cluster_vbytes_limit()).
 
 %% Test get_cluster_txids for non-existent cluster
 cluster_txids_not_found_test_() ->
