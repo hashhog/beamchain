@@ -439,3 +439,130 @@ filter_index_persistence_test_() ->
           end}
         ]
      end}.
+
+%%% ===================================================================
+%%% W90 BUG-1: gcs_match/6 and gcs_match_any/6 with explicit P/M
+%%% Core: GCSFilter::MatchInternal uses m_params.m_P + m_F = N * m_params.m_M.
+%%% Previously gcs_match/4 + gcs_match_any/4 hardcoded ?BASIC_P=19 and
+%%% ?BASIC_M=784931, silently giving wrong results for non-basic params.
+%%% -------------------------------------------------------------------
+
+gcs_match_explicit_params_test() ->
+    %% Use a tiny M=8 (lower false-positive rate) to verify P/M are forwarded.
+    K0 = 16#AABBCCDDEEFF0011,
+    K1 = 16#1122334455667788,
+    P = 8,
+    M = 128,
+    Els = [<<"foo">>, <<"bar">>, <<"baz">>],
+    Filter = beamchain_blockfilter:gcs_encode(Els, K0, K1, {P, M}),
+    %% All encoded elements must match with the same params.
+    [?assert(beamchain_blockfilter:gcs_match(Filter, El, K0, K1, P, M))
+     || El <- Els],
+    %% gcs_match_any/6 must find any member.
+    ?assert(beamchain_blockfilter:gcs_match_any(
+        Filter, [<<"nope">>, <<"bar">>, <<"also-nope">>], K0, K1, P, M)),
+    %% Using wrong M would produce wrong F and mis-map hashes — the match
+    %% function with wrong M may falsely report absent.  Verify the
+    %% explicit-param API works by round-tripping.
+    ?assertEqual(false,
+        beamchain_blockfilter:gcs_match_any(
+            Filter, [<<"gone">>, <<"missing">>], K0, K1, P, M)).
+
+gcs_match_basic_wrapper_consistent_test() ->
+    %% The 4-arg wrappers (basic filter defaults) must agree with explicit
+    %% P=19 M=784931 calls.
+    K0 = 42, K1 = 99,
+    Els = [<<"alpha">>, <<"beta">>],
+    Filter = beamchain_blockfilter:gcs_encode(Els, K0, K1, {19, 784931}),
+    ?assertEqual(
+        beamchain_blockfilter:gcs_match(Filter, <<"alpha">>, K0, K1),
+        beamchain_blockfilter:gcs_match(Filter, <<"alpha">>, K0, K1,
+                                         19, 784931)),
+    ?assertEqual(
+        beamchain_blockfilter:gcs_match_any(Filter, [<<"beta">>], K0, K1),
+        beamchain_blockfilter:gcs_match_any(Filter, [<<"beta">>], K0, K1,
+                                             19, 784931)).
+
+%%% ===================================================================
+%%% W90 BUG-5: reverse hash→height index (O(1) lookup)
+%%% Core: LookupBlockIndex(stop_hash) is O(1) hash table.
+%%% Previous stop_hash_to_height was O(tip) linear scan.
+%%% -------------------------------------------------------------------
+
+reverse_index_test_() ->
+    {setup,
+     fun index_setup/0,
+     fun index_teardown/1,
+     fun(_) ->
+        [
+         {"get_height_by_hash returns correct height after add_block",
+          fun() ->
+            ?assert(beamchain_blockfilter_index:is_enabled()),
+            B1 = make_filter_test_block(10),
+            B2 = make_filter_test_block(11),
+            {ok, _} = beamchain_blockfilter_index:add_block(B1, 10, []),
+            {ok, _} = beamchain_blockfilter_index:add_block(B2, 11, []),
+            %% O(1) reverse lookup must return the correct height.
+            ?assertEqual({ok, 10},
+                beamchain_blockfilter_index:get_height_by_hash(
+                    B1#block.hash)),
+            ?assertEqual({ok, 11},
+                beamchain_blockfilter_index:get_height_by_hash(
+                    B2#block.hash)),
+            %% Unknown hash returns not_found.
+            ?assertEqual(not_found,
+                beamchain_blockfilter_index:get_height_by_hash(
+                    <<99:256/big>>))
+          end},
+
+         {"get_height_by_hash returns not_found after remove_block",
+          fun() ->
+            B3 = make_filter_test_block(12),
+            {ok, _} = beamchain_blockfilter_index:add_block(B3, 12, []),
+            ?assertEqual({ok, 12},
+                beamchain_blockfilter_index:get_height_by_hash(
+                    B3#block.hash)),
+            %% remove_block must clean up the reverse entry.
+            ok = beamchain_blockfilter_index:remove_block(B3#block.hash, 12),
+            ?assertEqual(not_found,
+                beamchain_blockfilter_index:get_height_by_hash(
+                    B3#block.hash))
+          end},
+
+         {"do_checkpoints rejects forged stop_hash not in index",
+          fun() ->
+            %% BUG-5b: previously StopHash was ignored by do_checkpoints,
+            %% allowing a peer to pass any hash and still get checkpoint data.
+            FakeHash = <<16#DEADBEEF:32, 0:224>>,
+            ?assertMatch({error, _},
+                beamchain_blockfilter_index:get_checkpoints(10, FakeHash))
+          end},
+
+         {"do_checkpoints succeeds with correct stop_hash",
+          fun() ->
+            B10 = make_filter_test_block(20),
+            {ok, _} = beamchain_blockfilter_index:add_block(B10, 20, []),
+            %% height 20, no multiple-of-1000 checkpoints yet → empty list.
+            ?assertEqual({ok, []},
+                beamchain_blockfilter_index:get_checkpoints(
+                    20, B10#block.hash))
+          end},
+
+         {"get_filter_range uses O(1) stop_hash resolution",
+          fun() ->
+            B5 = make_filter_test_block(5),
+            {ok, _} = beamchain_blockfilter_index:add_block(B5, 5, []),
+            %% With the reverse index, range_heights no longer needs to scan.
+            {ok, Pairs} =
+                beamchain_blockfilter_index:get_filter_range(
+                    5, B5#block.hash),
+            ?assertEqual(1, length(Pairs)),
+            {Bh, _} = hd(Pairs),
+            ?assertEqual(B5#block.hash, Bh),
+            %% Unknown stop_hash → error.
+            ?assertMatch({error, stop_hash_not_indexed},
+                beamchain_blockfilter_index:get_filter_range(
+                    1, <<88:256/big>>))
+          end}
+        ]
+     end}.
