@@ -995,7 +995,7 @@ check_bip94(Height, Header, #state{params = Params} = State) ->
                     PrevHeader = prev_header(State),
                     Header#block_header.timestamp >=
                         PrevHeader#block_header.timestamp - 600
-                        orelse throw(bip94_timestamp);
+                        orelse throw(time_timewarp_attack);
                 false ->
                     ok
             end;
