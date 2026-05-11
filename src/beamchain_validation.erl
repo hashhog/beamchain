@@ -40,6 +40,9 @@
 %% Undo data serialization (exported for testing)
 -export([encode_undo_data/1, decode_undo_data/1]).
 
+%% split_last_n exported for testing (regression guard for inverted-semantics bug)
+-export([split_last_n/2]).
+
 %% Checkpoint enforcement
 -export([check_against_checkpoint/3]).
 
@@ -1629,48 +1632,162 @@ decode_undo_entries(N, <<H:32/binary, I:32/little,
 %% Returns {ok, BlockHash} so the caller can stage `delete_undo(Hash)`
 %% into the same batch as the chainstate flush.
 disconnect_block(#block{header = Header, transactions = Txs},
-                 _Height, _Params) ->
+                 Height, Params) ->
     try
         BlockHash = beamchain_serialize:block_hash(Header),
 
         %% 1. load undo data
+        %% Core:2185-2188 — ReadBlockUndo failure → DISCONNECT_FAILED.
         UndoData = case beamchain_db:get_undo(BlockHash) of
             {ok, UndoBin} -> decode_undo_data(UndoBin);
             not_found -> throw(missing_undo_data)
         end,
 
-        %% 2. process transactions in reverse order
-        RevTxs = lists:reverse(Txs),
-        lists:foldl(fun(Tx, RemainingUndo) ->
-            Txid = beamchain_serialize:tx_hash(Tx),
-
-            %% 2a. remove created outputs from UTXO set
-            NumOutputs = length(Tx#transaction.outputs),
-            lists:foreach(fun(Idx) ->
-                beamchain_chainstate:spend_utxo(Txid, Idx)
-            end, lists:seq(0, NumOutputs - 1)),
-
-            %% 2b. restore spent inputs from undo data
+        %% 1b. Validate undo record count.
+        %% Core:2190-2193 — blockUndo.vtxundo.size() + 1 != block.vtx.size()
+        %% → DISCONNECT_FAILED.
+        %% Our undo data is per-input (not per-tx), so we check total entry
+        %% count equals the sum of inputs across all non-coinbase transactions.
+        ExpectedUndoCount = lists:foldl(fun(Tx, Acc) ->
             case is_coinbase_tx(Tx) of
+                true  -> Acc;
+                false -> Acc + length(Tx#transaction.inputs)
+            end
+        end, 0, Txs),
+        length(UndoData) =:= ExpectedUndoCount
+            orelse throw(undo_data_inconsistent),
+
+        %% 2. BIP-30 exception for the two historical duplicate-coinbase blocks.
+        %% Core:2201-2209 — for blocks 91722 and 91812 identified by BOTH height
+        %% AND hash, the coinbase output mismatch is silently ignored (fClean
+        %% stays true for those blocks). We apply the same exception during
+        %% disconnect so that disconnecting these two blocks does not erroneously
+        %% mark the disconnect as UNCLEAN.
+        %% Note: beamchain uses BIP-30 exceptions from Params for connect_block;
+        %% for the two historically hard-coded mainnet exceptions Core uses the
+        %% exact hashes below (validation.cpp:2201-2202). We check both.
+        Bip30Exceptions = maps:get(bip30_exceptions, Params, []),
+        IsBip30DisconnectException =
+            lists:any(fun({ExH, ExHash}) ->
+                Height =:= ExH andalso BlockHash =:= ExHash
+            end, Bip30Exceptions)
+            orelse
+            (Height =:= 91722 andalso
+             BlockHash =:= <<16#8e,16#d0,16#4d,16#57,16#f2,16#d3,16#9c,16#6c,
+                             16#5a,16#5e,16#95,16#c6,16#16,16#dc,16#16,16#e1,
+                             16#f2,16#19,16#84,16#f8,16#67,16#7e,16#26,16#dc,
+                             16#a2,16#71,16#02,16#00,16#00,16#00,16#00,16#00>>)
+            orelse
+            (Height =:= 91812 andalso
+             BlockHash =:= <<16#2f,16#6f,16#30,16#f6,16#d3,16#8d,16#de,16#b8,
+                             16#db,16#35,16#14,16#f5,16#cf,16#36,16#af,16#f2,
+                             16#6a,16#96,16#af,16#e3,16#67,16#7e,16#0a,16#40,
+                             16#ed,16#f0,16#af,16#00,16#00,16#00,16#00,16#00>>),
+
+        %% 3. process transactions in reverse order
+        %% Core:2205 — for (int i = block.vtx.size() - 1; i >= 0; i--)
+        RevTxs = lists:reverse(Txs),
+        {_, Dirty} = lists:foldl(fun(Tx, {RemainingUndo, DirtyAcc}) ->
+            Txid = beamchain_serialize:tx_hash(Tx),
+            IsCoinbase = is_coinbase_tx(Tx),
+
+            %% 3a. Remove created outputs from UTXO set.
+            %% Core:2213-2214 — only non-unspendable outputs are spent.
+            %% Core:2216-2222 — if coin is missing, wrong value/script, wrong
+            %% height, or wrong coinbase flag → fClean = false (DISCONNECT_UNCLEAN)
+            %% unless this is a BIP-30 exception block.
+            NewDirty = lists:foldl(fun({Vout, TxOut}, DirtyInner) ->
+                SPK = TxOut#tx_out.script_pubkey,
+                case beamchain_chainstate:is_unspendable_script(SPK) of
+                    true ->
+                        %% Core skips unspendable outputs (OP_RETURN etc.)
+                        DirtyInner;
+                    false ->
+                        %% Spend the coin and verify it matches what we expect.
+                        %% Core:2217 — view.SpendCoin(out, &coin)
+                        %% Core:2218 — check is_spent, value match, height, coinbase flag
+                        case beamchain_chainstate:spend_utxo(Txid, Vout) of
+                            {ok, SpentCoin} ->
+                                %% Verify the coin matches the block output.
+                                %% Mismatch → DISCONNECT_UNCLEAN (DirtyInner becomes true).
+                                case IsBip30DisconnectException andalso IsCoinbase of
+                                    true ->
+                                        %% BIP-30 exception: ignore mismatch for
+                                        %% these coinbase outputs.
+                                        DirtyInner;
+                                    false ->
+                                        Mismatch =
+                                            SpentCoin#utxo.value =/= TxOut#tx_out.value
+                                            orelse SpentCoin#utxo.script_pubkey =/= SPK
+                                            orelse SpentCoin#utxo.height =/= Height
+                                            orelse SpentCoin#utxo.is_coinbase =/= IsCoinbase,
+                                        DirtyInner orelse Mismatch
+                                end;
+                            not_found ->
+                                %% Coin not present — output was already spent or
+                                %% never created. → DISCONNECT_UNCLEAN unless BIP-30.
+                                case IsBip30DisconnectException andalso IsCoinbase of
+                                    true  -> DirtyInner;
+                                    false -> true
+                                end
+                        end
+                end
+            end, DirtyAcc, lists:zip(lists:seq(0, length(Tx#transaction.outputs) - 1),
+                                     Tx#transaction.outputs)),
+
+            %% 3b. restore spent inputs from undo data
+            %% Core:2227 — if (i > 0) { // not coinbases
+            case IsCoinbase of
                 true ->
                     %% coinbase has no inputs to restore
-                    RemainingUndo;
+                    {RemainingUndo, NewDirty};
                 false ->
                     NumInputs = length(Tx#transaction.inputs),
-                    %% take NumInputs entries from the end of undo data
-                    %% (since we're processing in reverse)
-                    {ToRestore, Rest} = split_last_n(RemainingUndo, NumInputs),
-                    lists:foreach(fun({#outpoint{hash = H, index = I}, Coin}) ->
-                        beamchain_chainstate:add_utxo(H, I, Coin)
-                    end, ToRestore),
-                    Rest
-            end
-        end, UndoData, RevTxs),
+                    %% Core:2229-2232 — txundo.vprevout.size() != tx.vin.size()
+                    %% → DISCONNECT_FAILED.
+                    %% We take the last NumInputs entries from the undo list
+                    %% (undo was built in forward tx order; we're iterating
+                    %% txs in reverse, so current tx's undo is at the end).
+                    length(RemainingUndo) >= NumInputs
+                        orelse throw(tx_undo_data_inconsistent),
+                    {Rest, TxUndo} = lists:split(
+                                       length(RemainingUndo) - NumInputs,
+                                       RemainingUndo),
 
-        %% 3. NB: chain_tip update and undo-data delete are deliberately
+                    %% 3c. Apply undo entries in reverse input order.
+                    %% Core:2233 — for (unsigned int j = tx.vin.size(); j > 0;) { --j; ...}
+                    RevTxUndo = lists:reverse(TxUndo),
+                    NewDirty2 = lists:foldl(
+                        fun({#outpoint{hash = H, index = I}, Coin}, DirtyInner2) ->
+                            %% Core:2153 (ApplyTxInUndo) — if view.HaveCoin(out)
+                            %% → fClean = false (DISCONNECT_UNCLEAN).
+                            AlreadyExists = beamchain_chainstate:has_utxo(H, I),
+                            beamchain_chainstate:add_utxo(H, I, Coin),
+                            DirtyInner2 orelse AlreadyExists
+                        end, NewDirty, RevTxUndo),
+                    {Rest, NewDirty2}
+            end
+        end, {UndoData, false}, RevTxs),
+
+        %% 4. NB: chain_tip update and undo-data delete are deliberately
         %% NOT performed here — see function docstring above. Caller
         %% (chainstate) batches them with the next UTXO flush so the
         %% disconnect is atomic across UTXO + tip + undo-delete.
+
+        %% Propagate DISCONNECT_UNCLEAN as a warning-level log.
+        %% Core returns DISCONNECT_UNCLEAN (not DISCONNECT_FAILED); we still
+        %% succeed but log a warning so operators can detect UTXO corruption.
+        case Dirty of
+            true ->
+                logger:warning("disconnect_block: UNCLEAN disconnect of block "
+                               "~s at height ~B — UTXO set was inconsistent "
+                               "with block data (Core: DISCONNECT_UNCLEAN)",
+                               [binary:encode_hex(
+                                    beamchain_serialize:reverse_bytes(BlockHash)),
+                                Height]);
+            false ->
+                ok
+        end,
 
         {ok, BlockHash}
     catch
@@ -1811,12 +1928,15 @@ check_chainwork_and_time(_BlockHeight, HdrEntry, BlockEntry, Params) ->
             TimeDelta > ?POW_TARGET_TIMESPAN
     end.
 
-%% Split a list, taking the last N elements.
-%% Returns {LastN, Rest} where Rest ++ LastN = List.
-%% If N >= length(List), returns {List, []}.
+%% Split a list into {First, Last} where Last has N elements.
+%% Returns {First (Len-N elements), Last (N elements)}.
+%% If N >= length(List), returns {[], List}.
+%%
+%% NOTE: this helper is no longer used by disconnect_block (which now uses
+%% lists:split directly for clarity), but is kept for any external callers.
 split_last_n(List, N) ->
     Len = length(List),
     case Len =< N of
-        true -> {List, []};
-        false -> {lists:sublist(List, Len - N), lists:nthtail(Len - N, List)}
+        true  -> {[], List};
+        false -> lists:split(Len - N, List)
     end.
