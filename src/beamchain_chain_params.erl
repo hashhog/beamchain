@@ -71,12 +71,23 @@ params(mainnet) ->
             "seed.bitcoin.wiz.biz"
         ],
 
-        %% BIP30 exception heights: blocks that contain duplicate coinbase txids
-        %% which overwrite earlier coinbases. Bitcoin Core's IsBIP30Repeat()
-        %% in validation.cpp exempts these two heights from the BIP30 check.
-        %% NOTE: 91722/91812 are the ORIGINAL blocks whose coinbases were
-        %% overwritten; 91842/91880 are the REPEAT blocks that must be exempted.
-        bip30_exceptions => [91842, 91880],
+        %% BIP30 exception pairs {Height, BlockHash}: blocks whose coinbase txids
+        %% duplicate an earlier coinbase.  Bitcoin Core's IsBIP30Repeat()
+        %% (validation.cpp:6189-6193) exempts these two blocks from the BIP30
+        %% check, matching on both height AND block hash.
+        %% 91842 and 91880 are the REPEAT blocks; 91722 and 91812 are the
+        %% ORIGINALS (whose coinbases were overwritten — never in UTXO set).
+        bip30_exceptions => [
+            {91842, hex_to_bin("00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec")},
+            {91880, hex_to_bin("00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721")}
+        ],
+
+        %% BIP34 canonical activation hash.  Bitcoin Core checks this via
+        %% pindexBIP34height->GetBlockHash() == BIP34Hash (validation.cpp:2462)
+        %% to confirm we are on the known canonical chain before skipping
+        %% BIP30 checks above the BIP34 activation height.
+        bip34_hash => hex_to_bin(
+            "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8"),
 
         %% address encoding
         pubkey_prefix => 0,
