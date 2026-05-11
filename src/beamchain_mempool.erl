@@ -44,6 +44,12 @@
 -export([uf_union/3, uf_get_cluster_members/2]).  %% Union-find utilities for debugging
 %% Policy constant accessors — for tests to verify Core parity without include leakage
 -export([cluster_count_limit/0, cluster_vbytes_limit/0]).
+%% W86 eviction constant accessors — for tests (Core parity guards)
+-export([incremental_relay_fee_constant/0,
+         rolling_fee_halflife_constant/0,
+         mempool_expiry_hours_constant/0]).
+%% W86 eviction helpers exported for unit tests
+-export([compute_chunk_feerate/1]).
 %% Internal functions exported for unit-testing
 -export([compute_ancestors_for_test/3,
          check_descendant_limits_for_test/2,
@@ -145,7 +151,15 @@
     %% Union-find: txid -> cluster_id (root txid of cluster)
     union_find     :: map(),               %% txid -> parent_txid (for find)
     cluster_count  :: non_neg_integer(),   %% number of clusters
-    zmq_seq        :: non_neg_integer()    %% ZMQ sequence number for mempool events
+    zmq_seq        :: non_neg_integer(),   %% ZMQ sequence number for mempool events
+    %% Rolling minimum fee rate state (mirrors Bitcoin Core CTxMemPool):
+    %%   rollingMinimumFeeRate  — current floor (sat/kvB), decays toward 0 after blocks
+    %%   block_since_last_bump  — true after a block lands; triggers decay in GetMinFee
+    %%   last_rolling_fee_update — wall-clock second of last decay computation
+    %% Core: txmempool.h:196-197, txmempool.cpp:829-858, ROLLING_FEE_HALFLIFE=43200s
+    rolling_min_fee    :: float(),         %% sat/kvB (Core rollingMinimumFeeRate)
+    block_since_bump   :: boolean(),       %% Core blockSinceLastRollingFeeBump
+    last_fee_update    :: integer()        %% Core lastRollingFeeUpdate (unix seconds)
 }).
 
 %%% ===================================================================
@@ -342,7 +356,10 @@ init([]) ->
         total_count = 0,
         union_find = #{},
         cluster_count = 0,
-        zmq_seq = 0
+        zmq_seq = 0,
+        rolling_min_fee = 0.0,
+        block_since_bump = false,
+        last_fee_update = erlang:system_time(second)
     }}.
 
 handle_call({add_tx, Tx}, _From, State) ->
@@ -362,13 +379,14 @@ handle_call({accept_package, Package}, _From, State) ->
     end;
 
 handle_call(get_info, _From, State) ->
+    {MinFee, State2} = get_min_fee(State),
     Info = #{
         size => State#state.total_count,
         bytes => State#state.total_bytes,
         max_size => State#state.max_size,
-        min_fee => calc_min_fee(State)
+        min_fee => MinFee
     },
-    {reply, Info, State};
+    {reply, Info, State2};
 
 handle_call({remove_for_block, Txids}, _From, State) ->
     State2 = do_remove_for_block(Txids, State),
@@ -1053,8 +1071,9 @@ do_package_rbf(_TxPairs, TotalFee, TotalVSize, ConflictTxids) ->
     end, 0, AllEvictEntries),
     TotalFee >= EvictedFeeTotal orelse throw(rbf_insufficient_fee),
 
-    %% Additional fee must cover incremental relay fee
-    MinAdditionalFee = TotalVSize,  %% 1 sat/vB * vsize
+    %% Additional fee must cover incremental relay fee.
+    %% Core DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB; GetFee(vsize) = ceil(vsize/10).
+    MinAdditionalFee = (TotalVSize * ?DEFAULT_INCREMENTAL_RELAY_FEE + 999) div 1000,
     (TotalFee - EvictedFeeTotal) >= MinAdditionalFee
         orelse throw(rbf_insufficient_additional_fee),
 
@@ -1171,6 +1190,17 @@ cluster_count_limit() -> ?MAX_CLUSTER_COUNT.
 
 %% @doc Max vbytes in a cluster — Core DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000 (policy.h:74)
 cluster_vbytes_limit() -> ?MAX_CLUSTER_VBYTES.
+
+%% @doc Core DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB (policy.h:48).
+%% Used by RBF Rule 4 (PaysForRBF) and TrimToSize rolling-fee bump.
+incremental_relay_fee_constant() -> ?DEFAULT_INCREMENTAL_RELAY_FEE.
+
+%% @doc Core ROLLING_FEE_HALFLIFE = 43200 s (12 h) (txmempool.h:212).
+%% Governs exponential decay of the rolling minimum fee rate.
+rolling_fee_halflife_constant() -> 43200.
+
+%% @doc Core DEFAULT_MEMPOOL_EXPIRY_HOURS = 336 (kernel/mempool_options.h:23).
+mempool_expiry_hours_constant() -> ?MEMPOOL_EXPIRY_HOURS.
 
 %% @doc Test-exported wrapper for compute_ancestors/3.
 compute_ancestors_for_test(Tx, Fee, VSize) ->
@@ -1567,9 +1597,10 @@ do_rbf(NewTx, ConflictTxids, SigopCost) ->
     %% Core: policy/rbf.cpp PaysForRBF — relay_fee.GetFee(replacement_vsize).
     %% Use sigop-adjusted vsize (matching Core's ws.m_vsize = GetTxSize() which
     %% calls GetVirtualTransactionSize(nTxWeight, sigOpCost, nBytesPerSigOp)).
-    %% ?MIN_RELAY_TX_FEE = 1000 sat/kvB → 1 sat/vB.
+    %% Core DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB (NOT 1000 = MIN_RELAY_TX_FEE).
+    %% relay_fee.GetFee(vsize) = ceil(vsize * 100 / 1000) = ceil(vsize / 10).
     NewVSize = beamchain_serialize:tx_sigop_vsize(NewTx, SigopCost),
-    MinAdditionalFee = (NewVSize * ?MIN_RELAY_TX_FEE + 999) div 1000,
+    MinAdditionalFee = (NewVSize * ?DEFAULT_INCREMENTAL_RELAY_FEE + 999) div 1000,
     (NewFee - EvictedFeeTotal) >= MinAdditionalFee
         orelse throw(rbf_insufficient_additional_fee),
 
@@ -2251,6 +2282,14 @@ find_orphaned_ephemeral_parents(Txid) ->
 %%% ===================================================================
 
 do_remove_for_block(Txids, State) ->
+    %% Set blockSinceLastRollingFeeBump = true and update lastRollingFeeUpdate.
+    %% Mirrors Bitcoin Core CTxMemPool::removeForBlock (txmempool.cpp:426-427):
+    %%   lastRollingFeeUpdate = GetTime();
+    %%   blockSinceLastRollingFeeBump = true;
+    %% This enables rolling fee decay on the next GetMinFee call.
+    Now = erlang:system_time(second),
+    State0 = State#state{block_since_bump = true, last_fee_update = Now},
+
     %% 1. remove confirmed transactions and update clusters
     {RemovedBytes, RemovedCount, State2} = lists:foldl(
         fun(Txid, {Bytes, Count, St}) ->
@@ -2262,7 +2301,7 @@ do_remove_for_block(Txids, State) ->
                     {Bytes, Count, St}
             end
         end,
-        {0, 0, State},
+        {0, 0, State0},
         Txids),
 
     %% 2. remove any mempool txs that conflict with the block
@@ -2327,9 +2366,27 @@ remove_block_conflicts(ConfirmedTxids, State) ->
 
 %% Remove transactions from the worst cluster linearization tails until
 %% total size fits within MaxBytes.
+%%
+%% Mirrors Bitcoin Core CTxMemPool::TrimToSize (txmempool.cpp:861-911):
+%%   - Evict the worst-feerate chunk (cluster tail).
+%%   - Bump rolling minimum fee: evicted_feerate + incremental_relay_feerate
+%%     (Core lines 877-879: removed += m_opts.incremental_relay_feerate;
+%%      trackPackageRemoved(removed)).
+%%   - Log removed count + max fee rate removed (Core lines 908-910).
 do_trim_to_size(MaxBytes, State) ->
+    do_trim_to_size(MaxBytes, State, 0, 0.0).
+
+do_trim_to_size(MaxBytes, State, NRemoved, MaxFeeRateRemoved) ->
     case State#state.total_bytes =< MaxBytes of
         true ->
+            %% Log if we removed anything (Core txmempool.cpp:908-910).
+            case NRemoved > 0 of
+                true ->
+                    logger:debug("mempool: trim removed ~B txs, rolling min fee "
+                                 "bumped to ~.3f sat/kvB",
+                                 [NRemoved, MaxFeeRateRemoved]);
+                false -> ok
+            end,
             State;
         false ->
             %% Find the worst cluster (lowest aggregate fee rate)
@@ -2346,7 +2403,7 @@ do_trim_to_size(MaxBytes, State) ->
                             State2 = State#state{
                                 cluster_count = max(0, State#state.cluster_count - 1)
                             },
-                            do_trim_to_size(MaxBytes, State2);
+                            do_trim_to_size(MaxBytes, State2, NRemoved, MaxFeeRateRemoved);
                         _ ->
                             %% Remove the last transaction in the linearization
                             %% (lowest priority within this cluster)
@@ -2359,23 +2416,53 @@ do_trim_to_size(MaxBytes, State) ->
                                 find_orphaned_ephemeral_parents(ETxid)
                             end, DescAndSelf)),
                             AllRemove = lists:usort(DescAndSelf ++ EphParents),
+                            %% Compute the evicted chunk's fee rate for rolling bump.
+                            %% Core: feerate = removed_fee / removed_vsize, then
+                            %%   removed += incremental_relay_feerate (line 877).
+                            ChunkFeeRate = compute_chunk_feerate(AllRemove),
+                            %% removed += incremental_relay (sat/kvB) — Core line 877
+                            RemovedRate = ChunkFeeRate + float(?DEFAULT_INCREMENTAL_RELAY_FEE),
+                            %% trackPackageRemoved — Core line 878
+                            State1 = track_package_removed(RemovedRate, State),
+                            NewMaxRate = max(MaxFeeRateRemoved, RemovedRate),
                             {RemovedBytes, RemovedCount, State2} = lists:foldl(
                                 fun(RTxid, {Bytes, Count, St}) ->
-                                    case remove_entry(RTxid) of
-                                        #mempool_entry{vsize = VSize} ->
-                                            St2 = cluster_remove_tx(RTxid, St),
-                                            {Bytes + VSize, Count + 1, St2};
-                                        not_found ->
-                                            {Bytes, Count, St}
+                                    case remove_entry_with_zmq(RTxid, mempool_remove, St) of
+                                        {#mempool_entry{vsize = VSize}, St2} ->
+                                            St3 = cluster_remove_tx(RTxid, St2),
+                                            {Bytes + VSize, Count + 1, St3};
+                                        {not_found, St2} ->
+                                            {Bytes, Count, St2}
                                     end
-                                end, {0, 0, State}, AllRemove),
+                                end, {0, 0, State1}, AllRemove),
                             State3 = State2#state{
                                 total_bytes = max(0, State2#state.total_bytes - RemovedBytes),
                                 total_count = max(0, State2#state.total_count - RemovedCount)
                             },
-                            do_trim_to_size(MaxBytes, State3)
+                            do_trim_to_size(MaxBytes, State3,
+                                            NRemoved + RemovedCount, NewMaxRate)
                     end
             end
+    end.
+
+%% @doc Compute the aggregate fee rate (sat/kvB) of a set of txids.
+%% Used by do_trim_to_size to compute the evicted-chunk fee rate before bumping
+%% the rolling minimum fee (mirrors Core's feeperweight computation in TrimToSize).
+compute_chunk_feerate([]) ->
+    0.0;
+compute_chunk_feerate(Txids) ->
+    {TotalFee, TotalVSize} = lists:foldl(
+        fun(Txid, {F, V}) ->
+            case ets:lookup(?MEMPOOL_TXS, Txid) of
+                [{_, E}] -> {F + E#mempool_entry.fee, V + E#mempool_entry.vsize};
+                []       -> {F, V}
+            end
+        end,
+        {0, 0},
+        Txids),
+    case TotalVSize of
+        0 -> 0.0;
+        _ -> TotalFee * 1000.0 / TotalVSize  %% fee * 1000 / vsize → sat/kvB
     end.
 
 %% @doc Find the cluster with the lowest aggregate fee rate.
@@ -2402,22 +2489,51 @@ find_worst_cluster() ->
     end.
 
 %% Expire transactions older than 14 days (336 hours).
+%% Mirrors Bitcoin Core CTxMemPool::Expire (txmempool.cpp:811-827).
+%%
+%% Key correctness points vs the old implementation:
+%%   1. Core calls CalculateDescendants for each expired tx before removing
+%%      (lines 821-824) — descendants of expired txs must be removed too;
+%%      otherwise a child tx remains orphaned with spent inputs (BUG was here).
+%%   2. ZMQ notifications for all removed txs (EXPIRY reason).
+%%   3. Deduplicate the removal set so a tx that is a descendant of two
+%%      expired roots isn't double-removed.
 do_expire_old(State) ->
     CutoffTime = erlang:system_time(second) - (?MEMPOOL_EXPIRY_HOURS * 3600),
     AllEntries = ets:tab2list(?MEMPOOL_TXS),
-    {ExpiredCount, ExpiredBytes, State2} = lists:foldl(
-        fun({Txid, Entry}, {Count, Bytes, St}) ->
+
+    %% Collect the directly-expired txids first (Core's `toremove` set, line 817-820).
+    DirectlyExpired = lists:filtermap(
+        fun({Txid, Entry}) ->
             case Entry#mempool_entry.time_added < CutoffTime of
-                true ->
-                    remove_entry(Txid),
-                    St2 = cluster_remove_tx(Txid, St),
-                    {Count + 1, Bytes + Entry#mempool_entry.vsize, St2};
-                false ->
-                    {Count, Bytes, St}
+                true  -> {true, Txid};
+                false -> false
+            end
+        end,
+        AllEntries),
+
+    %% Expand to include all descendants of expired txs (Core CalculateDescendants,
+    %% lines 821-824).  Deduplicate so no tx appears twice in AllExpired.
+    AllExpired = lists:usort(lists:flatmap(
+        fun(Txid) ->
+            [Txid | get_all_descendants(Txid)]
+        end,
+        DirectlyExpired)),
+
+    %% Remove with ZMQ notification.
+    {ExpiredCount, ExpiredBytes, State2} = lists:foldl(
+        fun(Txid, {Count, Bytes, St}) ->
+            case remove_entry_with_zmq(Txid, mempool_remove, St) of
+                {#mempool_entry{vsize = VSize}, St2} ->
+                    St3 = cluster_remove_tx(Txid, St2),
+                    {Count + 1, Bytes + VSize, St3};
+                {not_found, St2} ->
+                    {Count, Bytes, St2}
             end
         end,
         {0, 0, State},
-        AllEntries),
+        AllExpired),
+
     case ExpiredCount > 0 of
         true ->
             logger:debug("mempool: expired ~B old txs (~B vB)",
@@ -2428,7 +2544,7 @@ do_expire_old(State) ->
         total_bytes = max(0, State2#state.total_bytes - ExpiredBytes),
         total_count = max(0, State2#state.total_count - ExpiredCount)
     },
-    {ExpiredCount, State3}.
+    {length(DirectlyExpired), State3}.
 
 do_expire_orphans() ->
     Now = erlang:system_time(second),
@@ -3492,13 +3608,83 @@ split_cluster(OldClusterId, Components, #state{union_find = UF, cluster_count = 
 %%% Internal: helpers
 %%% ===================================================================
 
-calc_min_fee(#state{total_bytes = TotalBytes, max_size = MaxSize}) ->
-    case TotalBytes > (MaxSize div 2) of
-        true ->
-            Ratio = TotalBytes / MaxSize,
-            1.0 * (1.0 + Ratio * 10.0);
+%% @doc Compute the current rolling minimum fee rate (sat/vB).
+%% Mirrors Bitcoin Core CTxMemPool::GetMinFee (txmempool.cpp:829-851).
+%%
+%% Gates:
+%%   1. If no block has arrived since last bump OR rolling_min_fee == 0,
+%%      return the raw floor without decay (Core line 831-832).
+%%   2. After 10 seconds, decay exponentially with a halflife that depends on
+%%      how full the mempool is (Core line 836-841):
+%%        - DynamicMemoryUsage < sizelimit/4 → halflife / 4
+%%        - DynamicMemoryUsage < sizelimit/2 → halflife / 2
+%%        - otherwise                        → halflife (12 h = 43200 s)
+%%   3. If the decayed rate drops below incremental_relay/2 → zero it out and
+%%      return CFeeRate(0) (Core line 845-848).
+%%   4. Return max(decayed_rate, incremental_relay_feerate) (Core line 850).
+%%
+%% Returns sat/vB as a float (multiply by 1000 for sat/kvB comparisons).
+-spec get_min_fee(#state{}) -> {float(), #state{}}.
+get_min_fee(#state{rolling_min_fee = R} = State) when R =:= 0 ->
+    %% Gate 1b: rolling rate is zero — return incremental relay floor.
+    IncrFee = ?DEFAULT_INCREMENTAL_RELAY_FEE / 1000.0,  %% sat/kvB → sat/vB
+    {IncrFee, State};
+get_min_fee(#state{block_since_bump = false} = State) ->
+    %% Gate 1a: no block since last bump — return raw floor without decay,
+    %% clamped to at least incremental_relay (Core line 831: early return).
+    IncrFee = ?DEFAULT_INCREMENTAL_RELAY_FEE / 1000.0,
+    Floor = max(State#state.rolling_min_fee / 1000.0, IncrFee),
+    {Floor, State};
+get_min_fee(#state{rolling_min_fee = RollingRate,
+                   last_fee_update = LastUpdate,
+                   total_bytes = TotalBytes,
+                   max_size = MaxSize} = State) ->
+    %% Gate 2: decay only if > 10 s have passed (Core line 835).
+    Now = erlang:system_time(second),
+    case Now > LastUpdate + 10 of
         false ->
-            1.0
+            %% Not enough time passed — return current floor
+            IncrFee = ?DEFAULT_INCREMENTAL_RELAY_FEE / 1000.0,
+            Floor = max(RollingRate / 1000.0, IncrFee),
+            {Floor, State};
+        true ->
+            %% Core ROLLING_FEE_HALFLIFE = 60 * 60 * 12 = 43200 seconds.
+            BaseHalflife = 43200.0,
+            Halflife = if
+                TotalBytes < MaxSize div 4 -> BaseHalflife / 4.0;
+                TotalBytes < MaxSize div 2 -> BaseHalflife / 2.0;
+                true                       -> BaseHalflife
+            end,
+            Elapsed = Now - LastUpdate,
+            Decayed = RollingRate / math:pow(2.0, Elapsed / Halflife),
+            IncrFee = ?DEFAULT_INCREMENTAL_RELAY_FEE,  %% sat/kvB
+            %% Gate 3: zero-floor — if below incremental/2, reset to 0 (Core line 845).
+            {NewRate, NewState} = case Decayed < IncrFee / 2.0 of
+                true ->
+                    {0.0, State#state{rolling_min_fee = 0.0,
+                                      last_fee_update = Now}};
+                false ->
+                    {Decayed, State#state{rolling_min_fee = Decayed,
+                                         last_fee_update = Now}}
+            end,
+            %% Gate 4: return max(decayed, incremental_relay) — Core line 850.
+            Floor = max(NewRate, float(IncrFee)) / 1000.0,  %% → sat/vB
+            {Floor, NewState}
+    end.
+
+%% @doc Update rolling minimum fee when a chunk is evicted from the pool.
+%% Mirrors Bitcoin Core CTxMemPool::trackPackageRemoved (txmempool.cpp:853-859).
+%%
+%% Called during TrimToSize: rate = feerate_of_evicted_chunk + incremental_relay.
+%% If this rate exceeds the current rolling floor, bump it and clear block_since_bump.
+-spec track_package_removed(float(), #state{}) -> #state{}.
+track_package_removed(RateSatKvB, #state{rolling_min_fee = Current} = State) ->
+    case RateSatKvB > Current of
+        true ->
+            State#state{rolling_min_fee = RateSatKvB,
+                        block_since_bump = false};
+        false ->
+            State
     end.
 
 short_hex(<<H:4/binary, _/binary>>) ->
