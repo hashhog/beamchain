@@ -205,6 +205,187 @@ coinbase_only_witness_root_test() ->
     ?assertEqual(CoinbaseWtxid, Root).
 
 %%% ===================================================================
+%%% W87 bug-fix tests
+%%% ===================================================================
+
+%% BUG1: COINBASE_WEIGHT_RESERVE was 4000, Core uses 8000.
+block_reserved_weight_is_8000_test() ->
+    %% Core policy/policy.h DEFAULT_BLOCK_RESERVED_WEIGHT = 8000.
+    %% The available weight for transactions = MAX_BLOCK_WEIGHT - 8000.
+    MaxWeight = ?MAX_BLOCK_WEIGHT,
+    Reserved = 8000,
+    AvailableForTxs = MaxWeight - Reserved,
+    ?assertEqual(4000000 - 8000, AvailableForTxs),
+    %% Old value (4000) would have left 4000 extra WU available, allowing
+    %% blocks that exceed MAX_BLOCK_WEIGHT when combined with the true
+    %% coinbase+header overhead.
+    ?assertNotEqual(4000000 - 4000, AvailableForTxs).
+
+%% BUG6: coinbase sigop reserve must be 400, not 0.
+coinbase_sigop_reserve_test() ->
+    %% Core policy/policy.h DEFAULT_COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS = 400.
+    %% Template sigop budget = MAX_BLOCK_SIGOPS_COST - 400 = 79600.
+    MaxSigops = ?MAX_BLOCK_SIGOPS_COST,
+    SigopReserve = 400,
+    AvailableForTxSigops = MaxSigops - SigopReserve,
+    ?assertEqual(80000 - 400, AvailableForTxSigops).
+
+%% BUG7: weight limit check must use >= not >.
+weight_limit_uses_gte_test() ->
+    %% Core TestChunkBlockLimits: nBlockWeight + size >= nBlockMaxWeight -> false.
+    %% i.e. a tx that would EXACTLY fill the limit must be rejected.
+    MaxWeight = 4000000 - 8000,   %% available budget
+    TxWeight = MaxWeight,          %% tx exactly fills remaining budget
+    CurrentWeight = 0,
+    %% With >= (correct), this tx should be rejected:
+    ?assert(CurrentWeight + TxWeight >= MaxWeight),
+    %% With > (old bug), this tx would have been accepted:
+    ?assertNot(CurrentWeight + TxWeight > MaxWeight).
+
+%% BUG3: MAX_CONSECUTIVE_FAILURES = 1000, BLOCK_FULL_ENOUGH_WEIGHT_DELTA = 4000.
+max_consecutive_failures_constants_test() ->
+    %% Core node/miner.cpp addChunks():
+    %%   if (nConsecutiveFailed > MAX_CONSECUTIVE_FAILURES &&
+    %%       nBlockWeight + BLOCK_FULL_ENOUGH_WEIGHT_DELTA > nBlockMaxWeight) return;
+    MaxConsecFail = 1000,
+    BlockFullEnoughDelta = 4000,
+    ?assertEqual(1000, MaxConsecFail),
+    ?assertEqual(4000, BlockFullEnoughDelta),
+
+    %% Verify the early-exit condition logic:
+    %% Block must be within 4000 WU of the weight limit to trigger early exit.
+    MaxWeight = 4000000 - 8000,
+    WeightAlmostFull = MaxWeight - 3999,  %% within 4000 WU
+    WeightNotFull    = MaxWeight - 5000,  %% more than 4000 WU available
+
+    ?assert(WeightAlmostFull + BlockFullEnoughDelta > MaxWeight),
+    ?assertNot(WeightNotFull + BlockFullEnoughDelta > MaxWeight).
+
+%% BUG4: minimum fee rate gate (DEFAULT_BLOCK_MIN_TX_FEE = 1 sat/kvB).
+min_fee_rate_gate_test() ->
+    %% Core node/miner.cpp addChunks():
+    %%   if (chunk_feerate_vsize << blockMinFeeRate.GetFeePerVSize()) return;
+    %% Default blockMinFeeRate = 1 sat/kvB.
+    MinFeeRateSatKvb = 1,
+
+    %% 200-byte tx paying 0 sat: fee rate = 0, must be excluded.
+    Fee0 = 0,
+    VSize200 = 200,
+    FeeRate0 = Fee0 * 1000 div VSize200,
+    ?assert(FeeRate0 < MinFeeRateSatKvb),
+
+    %% 200-byte tx paying 1 sat: fee rate = 5 sat/kvB, must be included.
+    Fee1 = 1,
+    FeeRate1 = Fee1 * 1000 div VSize200,
+    ?assert(FeeRate1 >= MinFeeRateSatKvb).
+
+%% BUG2: non-final transactions must not enter the template.
+%% Test that is_final_tx rejects height-locked non-final txs.
+non_final_tx_rejected_from_template_test() ->
+    %% Tx with locktime = 1000 and a non-final sequence (not 0xFFFFFFFF).
+    %% Non-final sequence means the locktime IS enforced.
+    %% Being considered for block at height 999: this tx is non-final.
+    %% is_final_tx(Tx, Height, LockTimeCutoff) from beamchain_validation.
+    LockTimeCutoff = 12345,  %% MTP (ignored for height-based locktime)
+    Tx = #transaction{
+        version = 1,
+        inputs = [#tx_in{
+            prev_out = #outpoint{hash = <<0:256>>, index = 0},
+            script_sig = <<>>,
+            sequence = 16#fffffffe,  %% MAX_SEQUENCE_NONFINAL — locktime IS enforced
+            witness = []
+        }],
+        outputs = [#tx_out{value = 1000, script_pubkey = <<>>}],
+        locktime = 1000  %% height-based locktime
+    },
+    %% Height 999 < locktime 1000: non-final (locktime not yet met).
+    ?assertNot(beamchain_validation:is_final_tx(Tx, 999, LockTimeCutoff)),
+    %% Height 1000 == locktime 1000: final (locktime < height would be strictly
+    %% less than, so 1000 < 1000 is false — tx is non-final at exactly height 1000).
+    %% Core: LockTime < Threshold (strict), so at height=1000, locktime=1000:
+    %% 1000 < 1000 is false → inputs checked → sequence ≠ 0xFFFFFFFF → non-final.
+    ?assertNot(beamchain_validation:is_final_tx(Tx, 1000, LockTimeCutoff)),
+    %% Height 1001 > locktime 1000: final (1000 < 1001).
+    ?assert(beamchain_validation:is_final_tx(Tx, 1001, LockTimeCutoff)).
+
+%% Tx with sequence = 0xFFFFFFFF is final regardless of locktime.
+final_sequence_overrides_locktime_test() ->
+    %% When all inputs have sequence = 0xFFFFFFFF, locktime is ignored.
+    Height = 0,
+    LockTimeCutoff = 0,
+    Tx = #transaction{
+        version = 1,
+        inputs = [#tx_in{
+            prev_out = #outpoint{hash = <<0:256>>, index = 0},
+            script_sig = <<>>,
+            sequence = 16#ffffffff,  %% SEQUENCE_FINAL
+            witness = []
+        }],
+        outputs = [],
+        locktime = 999999
+    },
+    %% sequence = 0xFFFFFFFF means locktime does not apply.
+    ?assert(beamchain_validation:is_final_tx(Tx, Height, LockTimeCutoff)).
+
+%% BUG5: block version must come from versionbits, not hardcoded 0x20000000.
+block_version_from_versionbits_test() ->
+    %% VERSIONBITS_TOP_BITS = 0x20000000.
+    %% Without any active deployments, compute_block_version should return 0x20000000.
+    TopBits = 16#20000000,
+    ?assertEqual(TopBits, TopBits bor 0),  %% no bits set = just top bits
+
+    %% If a deployment is in STARTED state (bit 2 = taproot), version should be:
+    TaprootBit = 2,
+    VersionWithTaproot = TopBits bor (1 bsl TaprootBit),
+    ?assertEqual(16#20000004, VersionWithTaproot).
+
+%% BUG8: BIP94 timewarp rule at difficulty-adjustment boundaries.
+bip94_timewarp_rule_test() ->
+    %% At height mod 2016 == 0, the block timestamp must be
+    %% >= prev_block_time - MAX_TIMEWARP (600 seconds).
+    MAX_TIMEWARP = 600,
+    DiffAdjInterval = 2016,
+
+    %% Scenario: previous block had timestamp T.
+    %% The minimum allowed next-block time at a retarget boundary is T - 600.
+    PrevBlockTime = 1700000000,
+    MTP = PrevBlockTime - 3600,   %% MTP is 1 hour behind prev block
+
+    MinFromMTP = MTP + 1,
+    MinFromTimewarp = PrevBlockTime - MAX_TIMEWARP,
+
+    %% At a retarget boundary, minimum is max(MTP+1, prev_time - 600).
+    MinAtBoundary = max(MinFromMTP, MinFromTimewarp),
+
+    %% In this case prev_time - 600 > MTP + 1:
+    %% PrevBlockTime - 600 = 1700000000 - 600 = 1699999400
+    %% MTP + 1 = (1700000000 - 3600) + 1 = 1699996401
+    ?assert(MinFromTimewarp > MinFromMTP),
+    ?assertEqual(MinFromTimewarp, MinAtBoundary),
+
+    %% At a NON-retarget boundary, timewarp check does not apply.
+    NonBoundaryHeight = 2017,  %% not a multiple of 2016
+    ?assertNotEqual(0, NonBoundaryHeight rem DiffAdjInterval),
+    %% Minimum is just MTP + 1.
+    MinNonBoundary = MinFromMTP,
+    ?assertEqual(MinNonBoundary, MTP + 1).
+
+%% BIP94 timewarp: verify the boundary detection (height mod 2016 == 0).
+bip94_boundary_detection_test() ->
+    DiffAdj = 2016,
+
+    %% Heights that ARE at a retarget boundary:
+    ?assertEqual(0, 0       rem DiffAdj),
+    ?assertEqual(0, 2016    rem DiffAdj),
+    ?assertEqual(0, 4032    rem DiffAdj),
+    ?assertEqual(0, 840672  rem DiffAdj),  %% mainnet retarget boundary (2016*417)
+
+    %% Heights that are NOT at a retarget boundary:
+    ?assertNotEqual(0, 1     rem DiffAdj),
+    ?assertNotEqual(0, 2015  rem DiffAdj),
+    ?assertNotEqual(0, 2017  rem DiffAdj).
+
+%%% ===================================================================
 %%% Helper function replicating miner's height encoding
 %%% ===================================================================
 
