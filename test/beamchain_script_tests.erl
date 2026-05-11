@@ -631,6 +631,27 @@ op_cltv_negative_test() ->
     {error, negative_locktime} = beamchain_script:eval_script(
         <<1, 16#81, 16#b1>>, [], Flags, SigChecker, base).
 
+%% W81: CLTV must enforce MINIMALDATA on its script-num operand when the flag is set.
+%% Bitcoin Core: CScriptNum(stacktop(-1), fRequireMinimal, 5) — interpreter.cpp:546.
+%% Non-minimal encoding of 1: <<0x01, 0x00>> encodes 1 with a redundant zero byte.
+op_cltv_minimaldata_reject_test() ->
+    SigChecker = #{check_locktime => fun(_) -> true end},
+    %% Both CLTV and MINIMALDATA active
+    Flags = ?SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY bor ?SCRIPT_VERIFY_MINIMALDATA,
+    %% Non-minimal: 1 encoded as <<0x01, 0x00>> (two bytes instead of <<0x01>>)
+    %% Push 2 bytes: <<0x02, 0x01, 0x00>>, then OP_CLTV
+    {error, non_minimal_encoding} = beamchain_script:eval_script(
+        <<16#02, 16#01, 16#00, 16#b1>>, [], Flags, SigChecker, base).
+
+%% W81: Without MINIMALDATA flag, non-minimal encoding is accepted by CLTV.
+op_cltv_minimaldata_allow_without_flag_test() ->
+    SigChecker = #{check_locktime => fun(_) -> true end},
+    %% CLTV active but MINIMALDATA NOT set
+    Flags = ?SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY,
+    %% Same non-minimal encoding of 1 should be accepted
+    {ok, [<<16#01, 16#00>>]} = beamchain_script:eval_script(
+        <<16#02, 16#01, 16#00, 16#b1>>, [], Flags, SigChecker, base).
+
 %%% -------------------------------------------------------------------
 %%% OP_CHECKSEQUENCEVERIFY test
 %%% -------------------------------------------------------------------
@@ -783,6 +804,22 @@ op_csv_input_has_disable_flag_test() ->
     {error, sequence_failed} = beamchain_script:eval_script(
         <<16#51, 16#b2>>, [], Flags, SigChecker, base),
     ok.
+
+%% W81: CSV must enforce MINIMALDATA on its script-num operand when the flag is set.
+%% Bitcoin Core: CScriptNum(stacktop(-1), fRequireMinimal, 5) — interpreter.cpp:574.
+op_csv_minimaldata_reject_test() ->
+    SigChecker = #{check_sequence => fun(_) -> true end},
+    Flags = ?SCRIPT_VERIFY_CHECKSEQUENCEVERIFY bor ?SCRIPT_VERIFY_MINIMALDATA,
+    %% Non-minimal encoding of 1: <<0x02, 0x01, 0x00>> push, then OP_CSV
+    {error, non_minimal_encoding} = beamchain_script:eval_script(
+        <<16#02, 16#01, 16#00, 16#b2>>, [], Flags, SigChecker, base).
+
+%% W81: Without MINIMALDATA flag, non-minimal encoding is accepted by CSV.
+op_csv_minimaldata_allow_without_flag_test() ->
+    SigChecker = #{check_sequence => fun(_) -> true end},
+    Flags = ?SCRIPT_VERIFY_CHECKSEQUENCEVERIFY,
+    {ok, [<<16#01, 16#00>>]} = beamchain_script:eval_script(
+        <<16#02, 16#01, 16#00, 16#b2>>, [], Flags, SigChecker, base).
 
 %%% -------------------------------------------------------------------
 %%% OP_SUCCESS in tapscript test

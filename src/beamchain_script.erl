@@ -1985,9 +1985,15 @@ execute_cltv(Rest, Pos, State) ->
                             execute(Rest, Pos, State1);
                         _ ->
                             %% peek at top (don't pop)
+                            %% Bitcoin Core: CScriptNum(stacktop(-1), fRequireMinimal, 5)
+                            %% where fRequireMinimal = (flags & SCRIPT_VERIFY_MINIMALDATA).
+                            %% We must pass the same flag so non-minimally-encoded locktimes
+                            %% are rejected when MINIMALDATA is active.
+                            %% interpreter.cpp:546.
+                            RequireMinimalCltv = (Flags band ?SCRIPT_VERIFY_MINIMALDATA) =/= 0,
                             case State1#script_state.stack of
                                 [Top | _] ->
-                                    case decode_script_num(Top, 5) of
+                                    case decode_script_num(Top, 5, RequireMinimalCltv) of
                                         {ok, N} when N < 0 ->
                                             {error, negative_locktime};
                                         {ok, N} ->
@@ -2017,9 +2023,13 @@ execute_csv(Rest, Pos, State) ->
                             %% treat as NOP
                             execute(Rest, Pos, State1);
                         _ ->
+                            %% Bitcoin Core: CScriptNum(stacktop(-1), fRequireMinimal, 5)
+                            %% where fRequireMinimal = (flags & SCRIPT_VERIFY_MINIMALDATA).
+                            %% interpreter.cpp:574.
+                            RequireMinimalCsv = (Flags band ?SCRIPT_VERIFY_MINIMALDATA) =/= 0,
                             case State1#script_state.stack of
                                 [Top | _] ->
-                                    case decode_script_num(Top, 5) of
+                                    case decode_script_num(Top, 5, RequireMinimalCsv) of
                                         {ok, N} when N < 0 ->
                                             {error, negative_sequence};
                                         {ok, N} ->
