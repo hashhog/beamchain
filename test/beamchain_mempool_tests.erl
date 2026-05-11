@@ -1247,10 +1247,14 @@ truc_descendant_limit_test_() ->
              },
              ets:insert(mempool_txs, {ParentTxid, ParentEntry}),
 
-             %% Existing child
+             %% Existing child — ancestor_count = 2 (parent + itself), as expected
+             %% for a proper TRUC direct child. Core requires ancestor_count==2 for
+             %% sibling eviction eligibility (truc_policy.cpp:249-250).
              Child1Txid = <<2:256>>,
              Child1Tx = make_v3_tx([{ParentTxid, 0}], [{4000, p2pkh_script()}]),
-             Child1Entry = make_entry_with_tx_and_version(Child1Txid, 5.0, Child1Tx, 3),
+             Child1Entry = (make_entry_with_tx_and_version(Child1Txid, 5.0, Child1Tx, 3))#mempool_entry{
+                 ancestor_count = 2
+             },
              ets:insert(mempool_txs, {Child1Txid, Child1Entry}),
              ets:insert(mempool_outpoints, {{ParentTxid, 0}, Child1Txid}),
 
@@ -1284,6 +1288,193 @@ non_truc_no_v3_parents_test_() ->
                  [ParentTxid]
              ),
              ?assertEqual(ok, Result)
+         end]
+     end}.
+
+%%% ===================================================================
+%%% W78 BIP-431 regression tests (3 bugs fixed)
+%%% ===================================================================
+
+%% Bug 1 — Gate 4 missing: parent's ancestor_count must be 1.
+%% Core truc_policy.cpp:214-221: GetAncestorCount(parent) + 1 > TRUC_ANCESTOR_LIMIT.
+%% A v3 child whose mempool parent itself has a mempool parent must be rejected;
+%% the resulting chain (grandparent→parent→child) has depth 3, violating
+%% TRUC_ANCESTOR_LIMIT=2.
+truc_parent_has_ancestor_rejected_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             %% Grandparent (confirmed, not in mempool — omitted)
+             %% Parent is in mempool and itself has ancestor_count = 2
+             %% (i.e. it already spends an unconfirmed grandparent).
+             GrandParentTxid = <<10:256>>,
+             ParentTxid = <<11:256>>,
+             ParentTx = make_v3_tx([{GrandParentTxid, 0}], [{4000, p2pkh_script()}]),
+             ParentEntry = (make_entry_with_tx_and_version(ParentTxid, 5.0, ParentTx, 3))#mempool_entry{
+                 ancestor_count = 2   %% parent itself has 1 unconfirmed ancestor
+             },
+             ets:insert(mempool_txs, {ParentTxid, ParentEntry}),
+
+             %% Grandchild v3 tries to spend parent — must be rejected
+             V3Grandchild = make_v3_tx([{ParentTxid, 0}], [{3000, p2pkh_script()}]),
+             Result = beamchain_mempool:check_truc_rules(
+                 V3Grandchild,
+                 500,
+                 [ParentTxid]
+             ),
+             ?assertMatch({error, {truc_violation, too_many_ancestors}}, Result)
+         end]
+     end}.
+
+%% Bug 1 (positive case) — v3 parent with ancestor_count=1 is accepted.
+truc_parent_no_ancestors_accepted_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             ParentTxid = <<12:256>>,
+             ParentTx = make_v3_tx([{<<100:256>>, 0}], [{5000, p2pkh_script()}]),
+             %% ancestor_count = 1 (only itself, all parents confirmed)
+             ParentEntry = (make_entry_with_tx_and_version(ParentTxid, 5.0, ParentTx, 3))#mempool_entry{
+                 ancestor_count = 1
+             },
+             ets:insert(mempool_txs, {ParentTxid, ParentEntry}),
+
+             V3Child = make_v3_tx([{ParentTxid, 0}], [{4000, p2pkh_script()}]),
+             Result = beamchain_mempool:check_truc_rules(
+                 V3Child, 500, [ParentTxid]
+             ),
+             ?assertEqual(ok, Result)
+         end]
+     end}.
+
+%% Bug 2 — Sibling eviction guard: existing sibling must have ancestor_count=2.
+%% Core truc_policy.cpp:249-250:
+%%   consider_sibling_eviction = GetDescendantCount(parent) == 2 &&
+%%                               GetAncestorCount(sibling) == 2.
+%% If the sibling has ancestor_count != 2 (e.g. due to reorg), sibling eviction
+%% must NOT be proposed — the call must return too_many_descendants.
+truc_sibling_eviction_ancestor_guard_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             ParentTxid = <<20:256>>,
+             ParentTx = make_v3_tx([{<<100:256>>, 0}], [{5000, p2pkh_script()}]),
+             %% Parent has exactly 1 child already (desc_count == 2)
+             ParentEntry = (make_entry_with_tx_and_version(ParentTxid, 5.0, ParentTx, 3))#mempool_entry{
+                 descendant_count = 2
+             },
+             ets:insert(mempool_txs, {ParentTxid, ParentEntry}),
+
+             %% Existing sibling has ancestor_count = 3 (post-reorg anomaly):
+             %% it has extra unconfirmed parents so it is NOT a simple direct child.
+             SiblingTxid = <<21:256>>,
+             SiblingTx = make_v3_tx([{ParentTxid, 0}], [{4000, p2pkh_script()}]),
+             SiblingEntry = (make_entry_with_tx_and_version(SiblingTxid, 5.0, SiblingTx, 3))#mempool_entry{
+                 ancestor_count = 3  %% NOT a direct child by Core's definition
+             },
+             ets:insert(mempool_txs, {SiblingTxid, SiblingEntry}),
+             ets:insert(mempool_outpoints, {{ParentTxid, 0}, SiblingTxid}),
+
+             %% New v3 child — must NOT get sibling_eviction, must get error
+             V3Child2 = make_v3_tx([{ParentTxid, 0}], [{3500, p2pkh_script()}]),
+             Result = beamchain_mempool:check_truc_rules(
+                 V3Child2, 500, [ParentTxid]
+             ),
+             ?assertMatch({error, {truc_violation, too_many_descendants}}, Result)
+         end]
+     end}.
+
+%% Bug 2 (positive case) — sibling with ancestor_count=2 triggers eviction.
+truc_sibling_eviction_valid_sibling_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             ParentTxid = <<22:256>>,
+             ParentTx = make_v3_tx([{<<100:256>>, 0}], [{5000, p2pkh_script()}]),
+             ParentEntry = (make_entry_with_tx_and_version(ParentTxid, 5.0, ParentTx, 3))#mempool_entry{
+                 descendant_count = 2
+             },
+             ets:insert(mempool_txs, {ParentTxid, ParentEntry}),
+
+             SiblingTxid = <<23:256>>,
+             SiblingTx = make_v3_tx([{ParentTxid, 0}], [{4000, p2pkh_script()}]),
+             SiblingEntry = (make_entry_with_tx_and_version(SiblingTxid, 5.0, SiblingTx, 3))#mempool_entry{
+                 ancestor_count = 2  %% proper direct child
+             },
+             ets:insert(mempool_txs, {SiblingTxid, SiblingEntry}),
+             ets:insert(mempool_outpoints, {{ParentTxid, 0}, SiblingTxid}),
+
+             V3Child2 = make_v3_tx([{ParentTxid, 0}], [{3500, p2pkh_script()}]),
+             Result = beamchain_mempool:check_truc_rules(
+                 V3Child2, 500, [ParentTxid]
+             ),
+             ?assertMatch({sibling_eviction, SiblingTxid}, Result)
+         end]
+     end}.
+
+%% Bug 3 — direct_conflicts bypass: if the existing TRUC child is being
+%% RBF-replaced (appears in DirectConflicts), the descendant limit gate must
+%% pass without error or sibling_eviction.
+%% Core truc_policy.cpp:240-243: skip limit when child_will_be_replaced.
+truc_descendant_limit_rbf_bypass_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             ParentTxid = <<30:256>>,
+             ParentTx = make_v3_tx([{<<100:256>>, 0}], [{5000, p2pkh_script()}]),
+             ParentEntry = (make_entry_with_tx_and_version(ParentTxid, 5.0, ParentTx, 3))#mempool_entry{
+                 descendant_count = 2   %% already has a child
+             },
+             ets:insert(mempool_txs, {ParentTxid, ParentEntry}),
+
+             %% Existing child (will be RBF-replaced)
+             ExistingChildTxid = <<31:256>>,
+             ExistingChildTx = make_v3_tx([{ParentTxid, 0}], [{4000, p2pkh_script()}]),
+             ExistingChildEntry = (make_entry_with_tx_and_version(
+                 ExistingChildTxid, 5.0, ExistingChildTx, 3))#mempool_entry{
+                 ancestor_count = 2
+             },
+             ets:insert(mempool_txs, {ExistingChildTxid, ExistingChildEntry}),
+             ets:insert(mempool_outpoints, {{ParentTxid, 0}, ExistingChildTxid}),
+
+             %% New child with ExistingChildTxid in DirectConflicts (RBF replacement)
+             V3Replacement = make_v3_tx([{ParentTxid, 0}], [{3800, p2pkh_script()}]),
+             DirectConflicts = sets:from_list([ExistingChildTxid]),
+             Result = beamchain_mempool:check_truc_rules(
+                 V3Replacement, 500, [ParentTxid], DirectConflicts
+             ),
+             %% Must pass — the child being replaced makes room for the new tx
+             ?assertEqual(ok, Result)
+         end]
+     end}.
+
+%% Bug 3 (negative case) — without DirectConflicts bypass, same scenario returns sibling_eviction.
+truc_descendant_limit_no_bypass_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             ParentTxid = <<32:256>>,
+             ParentTx = make_v3_tx([{<<100:256>>, 0}], [{5000, p2pkh_script()}]),
+             ParentEntry = (make_entry_with_tx_and_version(ParentTxid, 5.0, ParentTx, 3))#mempool_entry{
+                 descendant_count = 2
+             },
+             ets:insert(mempool_txs, {ParentTxid, ParentEntry}),
+
+             ExistingChildTxid = <<33:256>>,
+             ExistingChildTx = make_v3_tx([{ParentTxid, 0}], [{4000, p2pkh_script()}]),
+             ExistingChildEntry = (make_entry_with_tx_and_version(
+                 ExistingChildTxid, 5.0, ExistingChildTx, 3))#mempool_entry{
+                 ancestor_count = 2
+             },
+             ets:insert(mempool_txs, {ExistingChildTxid, ExistingChildEntry}),
+             ets:insert(mempool_outpoints, {{ParentTxid, 0}, ExistingChildTxid}),
+
+             %% No DirectConflicts — sibling_eviction must still be proposed
+             V3Child2 = make_v3_tx([{ParentTxid, 0}], [{3800, p2pkh_script()}]),
+             Result = beamchain_mempool:check_truc_rules(
+                 V3Child2, 500, [ParentTxid]  %% 3-arity: empty DirectConflicts
+             ),
+             ?assertMatch({sibling_eviction, ExistingChildTxid}, Result)
          end]
      end}.
 
