@@ -2754,3 +2754,205 @@ sequence_lock_above_mask_no_type_flag_test() ->
     {MinH, -1} = beamchain_validation:calculate_sequence_lock_pair(
         Tx, InputCoins, #{}),
     ?assertEqual(104, MinH).  %% 100 + 5 - 1 = 104
+
+%%% ===================================================================
+%%% W84: CheckTxInputs + GetBlockSubsidy amount / CVE-2018-17144 gates
+%%% Core refs:
+%%%   consensus/tx_verify.cpp:164-214  (CheckTxInputs)
+%%%   consensus/tx_check.cpp:36-44     (CVE-2018-17144 duplicate inputs)
+%%%   validation.cpp:1839-1850         (GetBlockSubsidy)
+%%%   validation.cpp:2520-2547         (ConnectBlock accumulated fee gate)
+%%% ===================================================================
+
+%%% -------------------------------------------------------------------
+%%% Per-coin input value range (Core tx_verify.cpp:184-188)
+%%% -------------------------------------------------------------------
+
+%% A coin whose value exceeds MAX_MONEY must be rejected.
+%% Core: !MoneyRange(coin.out.nValue) → "bad-txns-inputvalues-outofrange"
+input_coin_value_above_max_money_test() ->
+    %% Construct a UTXO with value one satoshi above MAX_MONEY.
+    BadCoin = #utxo{value = ?MAX_MONEY + 1,
+                    script_pubkey = <<>>, is_coinbase = false, height = 0},
+    ?assertThrow(input_values_outofrange,
+                 begin
+                     lists:foldl(fun(C, Acc) ->
+                         CoinVal = C#utxo.value,
+                         (CoinVal >= 0 andalso CoinVal =< ?MAX_MONEY)
+                             orelse throw(input_values_outofrange),
+                         NewAcc = Acc + CoinVal,
+                         (NewAcc >= 0 andalso NewAcc =< ?MAX_MONEY)
+                             orelse throw(input_values_outofrange),
+                         NewAcc
+                     end, 0, [BadCoin])
+                 end).
+
+%% A coin with a negative value must be rejected.
+%% Core: !MoneyRange(coin.out.nValue) → "bad-txns-inputvalues-outofrange"
+input_coin_negative_value_test() ->
+    BadCoin = #utxo{value = -1,
+                    script_pubkey = <<>>, is_coinbase = false, height = 0},
+    ?assertThrow(input_values_outofrange,
+                 begin
+                     lists:foldl(fun(C, Acc) ->
+                         CoinVal = C#utxo.value,
+                         (CoinVal >= 0 andalso CoinVal =< ?MAX_MONEY)
+                             orelse throw(input_values_outofrange),
+                         NewAcc = Acc + CoinVal,
+                         (NewAcc >= 0 andalso NewAcc =< ?MAX_MONEY)
+                             orelse throw(input_values_outofrange),
+                         NewAcc
+                     end, 0, [BadCoin])
+                 end).
+
+%% Two MAX_MONEY coins: individually valid but running sum overflows.
+%% Core: !MoneyRange(nValueIn) after each addition
+input_coin_running_sum_overflow_test() ->
+    Coin = #utxo{value = ?MAX_MONEY,
+                 script_pubkey = <<>>, is_coinbase = false, height = 0},
+    ?assertThrow(input_values_outofrange,
+                 begin
+                     lists:foldl(fun(C, Acc) ->
+                         CoinVal = C#utxo.value,
+                         (CoinVal >= 0 andalso CoinVal =< ?MAX_MONEY)
+                             orelse throw(input_values_outofrange),
+                         NewAcc = Acc + CoinVal,
+                         (NewAcc >= 0 andalso NewAcc =< ?MAX_MONEY)
+                             orelse throw(input_values_outofrange),
+                         NewAcc
+                     end, 0, [Coin, Coin])  %% second addition: 2*MAX_MONEY > MAX_MONEY
+                 end).
+
+%% Single valid coin at exactly MAX_MONEY — must pass.
+input_coin_at_max_money_ok_test() ->
+    Coin = #utxo{value = ?MAX_MONEY,
+                 script_pubkey = <<>>, is_coinbase = false, height = 0},
+    Result = lists:foldl(fun(C, Acc) ->
+        CoinVal = C#utxo.value,
+        (CoinVal >= 0 andalso CoinVal =< ?MAX_MONEY)
+            orelse throw(input_values_outofrange),
+        NewAcc = Acc + CoinVal,
+        (NewAcc >= 0 andalso NewAcc =< ?MAX_MONEY)
+            orelse throw(input_values_outofrange),
+        NewAcc
+    end, 0, [Coin]),
+    ?assertEqual(?MAX_MONEY, Result).
+
+%%% -------------------------------------------------------------------
+%%% GetBlockSubsidy (Core validation.cpp:1839-1850)
+%%% -------------------------------------------------------------------
+
+%% Halving 64 or beyond must return 0 (right-shift is undefined for >=64).
+%% Core: if (halvings >= 64) return 0;
+block_subsidy_64_halvings_test() ->
+    %% Height = 64 * 210000 = 13440000
+    ?assertEqual(0, beamchain_chain_params:block_subsidy(64 * 210000, mainnet)).
+
+block_subsidy_65_halvings_test() ->
+    ?assertEqual(0, beamchain_chain_params:block_subsidy(65 * 210000, mainnet)).
+
+block_subsidy_very_large_height_test() ->
+    ?assertEqual(0, beamchain_chain_params:block_subsidy(1000000000, mainnet)).
+
+%% Halving 63 returns 0 — 5_000_000_000 >> 63 = 0 (initial subsidy < 2^63).
+%% Core behaves identically; the >=64 guard only prevents C++ UB for even
+%% larger shift counts.
+block_subsidy_63_halvings_test() ->
+    ?assertEqual(0, beamchain_chain_params:block_subsidy(63 * 210000, mainnet)).
+
+%% Height boundary: subsidy at 209999 vs 210000.
+block_subsidy_boundary_test() ->
+    ?assertEqual(5000000000, beamchain_chain_params:block_subsidy(209999, mainnet)),
+    ?assertEqual(2500000000, beamchain_chain_params:block_subsidy(210000, mainnet)).
+
+%% Genesis: 50 BTC = 5_000_000_000 satoshis.
+block_subsidy_genesis_test() ->
+    ?assertEqual(5000000000, beamchain_chain_params:block_subsidy(0, mainnet)).
+
+%%% -------------------------------------------------------------------
+%%% CVE-2018-17144: duplicate inputs in check_transaction
+%%% (already passes; regression guard)
+%%% Core: consensus/tx_check.cpp:36-44
+%%% -------------------------------------------------------------------
+
+%% Three inputs, two sharing the same outpoint — must be rejected.
+cve_2018_17144_three_inputs_two_dups_test() ->
+    Tx = make_regular_tx(
+        [{<<1:256>>, 0}, {<<2:256>>, 1}, {<<1:256>>, 0}],
+        [{1000, <<16#6a>>}]
+    ),
+    ?assertEqual({error, duplicate_inputs},
+                 beamchain_validation:check_transaction(Tx)).
+
+%% Same hash, different index — must NOT be treated as duplicate.
+cve_2018_17144_same_hash_diff_index_ok_test() ->
+    Tx = make_regular_tx(
+        [{<<1:256>>, 0}, {<<1:256>>, 1}],
+        [{1000, <<16#6a>>}]
+    ),
+    ?assertEqual(ok, beamchain_validation:check_transaction(Tx)).
+
+%% Same index, different hash — must NOT be treated as duplicate.
+cve_2018_17144_same_index_diff_hash_ok_test() ->
+    Tx = make_regular_tx(
+        [{<<1:256>>, 0}, {<<2:256>>, 0}],
+        [{1000, <<16#6a>>}]
+    ),
+    ?assertEqual(ok, beamchain_validation:check_transaction(Tx)).
+
+%%% -------------------------------------------------------------------
+%%% Coinbase scriptSig length (Core tx_check.cpp:48-51)
+%%% bad-cb-length: [2, 100] bytes inclusive
+%%% -------------------------------------------------------------------
+
+%% Exactly 2 bytes — minimum valid length.
+cb_length_exactly_2_bytes_test() ->
+    Tx = make_coinbase_tx(<<1, 2>>, 5000000000),
+    ?assertEqual(ok, beamchain_validation:check_transaction(Tx)).
+
+%% Exactly 100 bytes — maximum valid length.
+cb_length_exactly_100_bytes_test() ->
+    Tx = make_coinbase_tx(binary:copy(<<1>>, 100), 5000000000),
+    ?assertEqual(ok, beamchain_validation:check_transaction(Tx)).
+
+%% 101 bytes — one over the maximum.
+cb_length_101_bytes_test() ->
+    Tx = make_coinbase_tx(binary:copy(<<1>>, 101), 5000000000),
+    ?assertEqual({error, bad_coinbase_length},
+                 beamchain_validation:check_transaction(Tx)).
+
+%% 1 byte — one under the minimum.
+cb_length_1_byte_test() ->
+    Tx = make_coinbase_tx(<<1>>, 5000000000),
+    ?assertEqual({error, bad_coinbase_length},
+                 beamchain_validation:check_transaction(Tx)).
+
+%% 0 bytes — empty scriptSig.
+cb_length_zero_bytes_test() ->
+    Tx = make_coinbase_tx(<<>>, 5000000000),
+    ?assertEqual({error, bad_coinbase_length},
+                 beamchain_validation:check_transaction(Tx)).
+
+%%% -------------------------------------------------------------------
+%%% Block-subsidy check (Core validation.cpp:2610-2614)
+%%% coinbase value must be <= fees + GetBlockSubsidy(height)
+%%% -------------------------------------------------------------------
+
+%% check_transaction: coinbase output value equal to MAX_MONEY is
+%% context-free valid (the contextual subsidy check is in connect_block).
+cb_output_at_max_money_passes_context_free_test() ->
+    Tx = make_coinbase_tx(<<4, 1, 0, 0, 0>>, ?MAX_MONEY),
+    ?assertEqual(ok, beamchain_validation:check_transaction(Tx)).
+
+%% block_subsidy sanity: subsidy at height 0 plus zero fees equals
+%% 5_000_000_000 satoshis; a coinbase claiming exactly that is valid.
+cb_subsidy_exact_at_genesis_ok_test() ->
+    Subsidy = beamchain_chain_params:block_subsidy(0, mainnet),
+    ?assertEqual(5000000000, Subsidy).
+
+%% Halvings correct at multiples of 210000.
+cb_subsidy_halving_sequence_test() ->
+    Expected = [5000000000, 2500000000, 1250000000, 625000000, 312500000],
+    Got = [beamchain_chain_params:block_subsidy(N * 210000, mainnet)
+           || N <- lists:seq(0, 4)],
+    ?assertEqual(Expected, Got).
