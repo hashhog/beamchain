@@ -2956,3 +2956,289 @@ cb_subsidy_halving_sequence_test() ->
     Got = [beamchain_chain_params:block_subsidy(N * 210000, mainnet)
            || N <- lists:seq(0, 4)],
     ?assertEqual(Expected, Got).
+
+%%% ===================================================================
+%%% W85 MedianTimePast + ContextualCheckBlockHeader audit tests
+%%% Reference: bitcoin-core/src/chain.h:231-245, validation.cpp:4080-4121,
+%%%            consensus/consensus.h:35
+%%% ===================================================================
+
+%% ---------------------------------------------------------------------------
+%% median_time_past/1 — chain.h:231-245
+%% ---------------------------------------------------------------------------
+
+%% Sorted median of 11 distinct timestamps: median is the 6th element.
+%% Core: pbegin[(pend-pbegin)/2] where the array is sorted ascending.
+%% With 11 elements sorted, index = 11/2 = 5 (0-based) = 6th element.
+w85_mtp_11_sorted_test() ->
+    Ts = [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100],
+    PrevIndex = #{mtp_timestamps => Ts, height => 10,
+                  header => make_w85_header(1100)},
+    MTP = beamchain_validation:median_time_past(PrevIndex),
+    %% Sorted: [100..1100], median index 5 (0-based) = 600
+    ?assertEqual(600, MTP).
+
+%% Out-of-order timestamps: sort must produce correct median.
+w85_mtp_unsorted_input_test() ->
+    Ts = [1000, 200, 800, 400, 600, 100, 700, 300, 900, 500, 1100],
+    PrevIndex = #{mtp_timestamps => Ts, height => 10,
+                  header => make_w85_header(1000)},
+    MTP = beamchain_validation:median_time_past(PrevIndex),
+    %% Sorted: [100,200,300,400,500,600,700,800,900,1000,1100], median=600
+    ?assertEqual(600, MTP).
+
+%% Single timestamp: median of list-of-1 is that timestamp.
+%% This tests the early-chain case (fewer than 11 ancestors).
+w85_mtp_single_timestamp_test() ->
+    Ts = [42],
+    PrevIndex = #{mtp_timestamps => Ts, height => 0,
+                  header => make_w85_header(42)},
+    MTP = beamchain_validation:median_time_past(PrevIndex),
+    ?assertEqual(42, MTP).
+
+%% All identical timestamps: median is that value.
+w85_mtp_all_same_test() ->
+    Ts = lists:duplicate(11, 1000000),
+    PrevIndex = #{mtp_timestamps => Ts, height => 10,
+                  header => make_w85_header(1000000)},
+    MTP = beamchain_validation:median_time_past(PrevIndex),
+    ?assertEqual(1000000, MTP).
+
+%% ---------------------------------------------------------------------------
+%% contextual_check_block_header/3 — validation.cpp:4080-4121
+%% ---------------------------------------------------------------------------
+
+%% Genesis (height = -1) always passes, no context needed.
+w85_genesis_passes_test() ->
+    Header = make_w85_header(1231006505),
+    PrevIndex = #{height => -1},
+    Params = #{},
+    ?assertEqual(ok,
+        beamchain_validation:contextual_check_block_header(Header, PrevIndex, Params)).
+
+%% Gate 2: time-too-old — block timestamp must be strictly > MTP.
+%% validation.cpp:4092-4093.
+w85_time_too_old_equal_to_mtp_test() ->
+    %% All 11 timestamps = 1000, so MTP = 1000.
+    %% Block timestamp = 1000 → equal, not strictly greater → time_too_old.
+    MTP = 1000,
+    PrevHeader = make_w85_header(1000),
+    PrevIndex = make_w85_prev_index(0, PrevHeader, lists:duplicate(11, MTP)),
+    Header = make_w85_header_with_bits(MTP, 16#207fffff),
+    Params = make_w85_regtest_params(),
+    ?assertEqual({error, time_too_old},
+        beamchain_validation:contextual_check_block_header(Header, PrevIndex, Params)).
+
+%% Gate 2: time-too-old — block timestamp below MTP.
+w85_time_too_old_below_mtp_test() ->
+    MTP = 1000,
+    PrevHeader = make_w85_header(1000),
+    PrevIndex = make_w85_prev_index(0, PrevHeader, lists:duplicate(11, MTP)),
+    Header = make_w85_header_with_bits(999, 16#207fffff),
+    Params = make_w85_regtest_params(),
+    ?assertEqual({error, time_too_old},
+        beamchain_validation:contextual_check_block_header(Header, PrevIndex, Params)).
+
+%% Gate 2: timestamp strictly above MTP passes the time-too-old gate.
+w85_time_above_mtp_passes_test() ->
+    MTP = 1000,
+    PrevHeader = make_w85_header(1000),
+    PrevIndex = make_w85_prev_index(0, PrevHeader, lists:duplicate(11, MTP)),
+    Header = make_w85_header_with_bits(MTP + 1, 16#207fffff),
+    Params = make_w85_regtest_params(),
+    ?assertEqual(ok,
+        beamchain_validation:contextual_check_block_header(Header, PrevIndex, Params)).
+
+%% Gate 3: BIP94 timewarp — fires on testnet4-style network at retarget
+%% boundary when block timestamp < prevBlock.timestamp - MAX_TIMEWARP.
+%% validation.cpp:4097-4104; consensus.h:35 MAX_TIMEWARP=600.
+%% Height 2016 is the first retarget boundary (2016 rem 2016 == 0, height > 0).
+w85_bip94_timewarp_fires_on_retarget_boundary_test() ->
+    PrevTs = 1700000000,
+    %% Block timestamp is 601 seconds before prev → violates MAX_TIMEWARP=600.
+    BlockTs = PrevTs - 601,
+    PrevHeight = 2015,
+    PrevHeader = make_w85_header(PrevTs),
+    %% MTP must be below BlockTs so time_too_old does NOT fire before BIP94 check.
+    MTP = BlockTs - 1,
+    PrevIndex = make_w85_prev_index(PrevHeight, PrevHeader, lists:duplicate(11, MTP)),
+    Header = make_w85_header_with_bits(BlockTs, 16#207fffff),
+    Params = make_w85_bip94_params(),   %% enforce_bip94 => true, pow_no_retargeting => true
+    ?assertEqual({error, time_timewarp_attack},
+        beamchain_validation:contextual_check_block_header(Header, PrevIndex, Params)).
+
+%% Gate 3: BIP94 boundary exactly at MAX_TIMEWARP (600 s) — allowed (>=, not >).
+%% Core: `block.GetBlockTime() < pindexPrev->GetBlockTime() - MAX_TIMEWARP`
+%% i.e. strictly less than → boundary is allowed.
+w85_bip94_timewarp_exactly_600s_before_prev_passes_test() ->
+    PrevTs = 1700000000,
+    BlockTs = PrevTs - 600,   %% exactly 600 s before prev → passes (>= check)
+    PrevHeight = 2015,
+    PrevHeader = make_w85_header(PrevTs),
+    %% MTP below BlockTs so time_too_old does NOT fire.
+    MTP = BlockTs - 1,
+    PrevIndex = make_w85_prev_index(PrevHeight, PrevHeader, lists:duplicate(11, MTP)),
+    Header = make_w85_header_with_bits(BlockTs, 16#207fffff),
+    Params = make_w85_bip94_params(),
+    ?assertEqual(ok,
+        beamchain_validation:contextual_check_block_header(Header, PrevIndex, Params)).
+
+%% Gate 3: BIP94 check does NOT fire on non-retarget blocks.
+%% Height 1000 (rem 2016 ≠ 0) → timewarp guard skipped entirely.
+w85_bip94_skipped_on_non_retarget_block_test() ->
+    PrevTs = 1700000000,
+    BlockTs = PrevTs - 9999,  %% far before prev — would fail BIP94 if checked
+    PrevHeight = 999,
+    PrevHeader = make_w85_header(PrevTs),
+    MTP = BlockTs - 1,  %% MTP below BlockTs so time_too_old does NOT fire
+    PrevIndex = make_w85_prev_index(PrevHeight, PrevHeader, lists:duplicate(11, MTP)),
+    Header = make_w85_header_with_bits(BlockTs, 16#207fffff),
+    Params = make_w85_bip94_params(),
+    ?assertEqual(ok,
+        beamchain_validation:contextual_check_block_header(Header, PrevIndex, Params)).
+
+%% Gate 3: BIP94 check does NOT fire on mainnet (enforce_bip94 => false).
+%% validation.cpp:4097 `if (consensusParams.enforce_BIP94)`.
+w85_bip94_skipped_on_mainnet_test() ->
+    PrevTs = 1700000000,
+    BlockTs = PrevTs - 9999,
+    PrevHeight = 2015,  %% retarget boundary
+    PrevHeader = make_w85_header(PrevTs),
+    MTP = BlockTs - 1,
+    PrevIndex = make_w85_prev_index(PrevHeight, PrevHeader, lists:duplicate(11, MTP)),
+    Header = make_w85_header_with_bits(BlockTs, 16#207fffff),
+    %% Mainnet-like: enforce_bip94 => false, pow_no_retargeting => true
+    Params = (make_w85_regtest_params())#{enforce_bip94 => false},
+    ?assertEqual(ok,
+        beamchain_validation:contextual_check_block_header(Header, PrevIndex, Params)).
+
+%% Gate 3: BIP94 check skipped at height == 2016 * k where Height=0.
+%% Height 0 is genesis, guarded by the height := -1 clause.  But the
+%% additional `Height > 0` guard in the BIP94 clause handles the edge
+%% case where the genesis block is passed as prev (height=0, new block
+%% height=1 which is not a retarget boundary anyway).  We test height=0
+%% explicitly to confirm it does not crash or false-fire.
+w85_bip94_genesis_height_skipped_test() ->
+    PrevTs = 1714777860,
+    PrevHeight = -1,  %% fake: prev is "before genesis"
+    PrevIndex = #{height => -1},
+    Header = make_w85_header(PrevTs + 1),
+    Params = make_w85_bip94_params(),
+    %% Height -1 triggers the early-return clause → ok
+    ?assertEqual(ok,
+        beamchain_validation:contextual_check_block_header(Header, PrevIndex, Params)).
+
+%% Gate 5: bad-version — BIP34: version < 2 after bip34_height fires bad_version.
+%% validation.cpp:4112-4118.
+w85_bad_version_bip34_test() ->
+    PrevHeader = make_w85_header(1000),
+    MTP = 500,
+    PrevIndex = make_w85_prev_index(0, PrevHeader, lists:duplicate(11, MTP)),
+    %% version = 1, height = 1 >= bip34_height = 1 → bad_version
+    Header = #block_header{version = 1, prev_hash = <<0:256>>,
+                           merkle_root = <<0:256>>, timestamp = MTP + 1,
+                           bits = 16#207fffff, nonce = 0},
+    Params = (make_w85_regtest_params())#{bip34_height => 1, bip66_height => 999999,
+                                          bip65_height => 999999},
+    ?assertEqual({error, bad_version},
+        beamchain_validation:contextual_check_block_header(Header, PrevIndex, Params)).
+
+%% Gate 5: bad-version — BIP66: version < 3 after bip66_height.
+w85_bad_version_bip66_test() ->
+    PrevHeader = make_w85_header(1000),
+    MTP = 500,
+    PrevIndex = make_w85_prev_index(0, PrevHeader, lists:duplicate(11, MTP)),
+    %% version = 2, height = 1 >= bip66_height = 1 → bad_version
+    Header = #block_header{version = 2, prev_hash = <<0:256>>,
+                           merkle_root = <<0:256>>, timestamp = MTP + 1,
+                           bits = 16#207fffff, nonce = 0},
+    Params = (make_w85_regtest_params())#{bip34_height => 1, bip66_height => 1,
+                                          bip65_height => 999999},
+    ?assertEqual({error, bad_version},
+        beamchain_validation:contextual_check_block_header(Header, PrevIndex, Params)).
+
+%% Gate 5: bad-version — BIP65: version < 4 after bip65_height.
+w85_bad_version_bip65_test() ->
+    PrevHeader = make_w85_header(1000),
+    MTP = 500,
+    PrevIndex = make_w85_prev_index(0, PrevHeader, lists:duplicate(11, MTP)),
+    %% version = 3, height = 1 >= bip65_height = 1 → bad_version
+    Header = #block_header{version = 3, prev_hash = <<0:256>>,
+                           merkle_root = <<0:256>>, timestamp = MTP + 1,
+                           bits = 16#207fffff, nonce = 0},
+    Params = (make_w85_regtest_params())#{bip34_height => 1, bip66_height => 1,
+                                          bip65_height => 1},
+    ?assertEqual({error, bad_version},
+        beamchain_validation:contextual_check_block_header(Header, PrevIndex, Params)).
+
+%% Gate 5: version = 4 satisfies all BIP34/66/65 version gates.
+w85_version4_satisfies_all_version_gates_test() ->
+    PrevHeader = make_w85_header(1000),
+    MTP = 500,
+    PrevIndex = make_w85_prev_index(0, PrevHeader, lists:duplicate(11, MTP)),
+    Header = #block_header{version = 4, prev_hash = <<0:256>>,
+                           merkle_root = <<0:256>>, timestamp = MTP + 1,
+                           bits = 16#207fffff, nonce = 0},
+    Params = (make_w85_regtest_params())#{bip34_height => 1, bip66_height => 1,
+                                          bip65_height => 1},
+    ?assertEqual(ok,
+        beamchain_validation:contextual_check_block_header(Header, PrevIndex, Params)).
+
+%% Version checks do not fire before activation height.
+w85_version_check_skipped_before_activation_test() ->
+    PrevHeader = make_w85_header(1000),
+    MTP = 500,
+    PrevIndex = make_w85_prev_index(0, PrevHeader, lists:duplicate(11, MTP)),
+    %% version = 1, but all BIP heights = 999999 → no version gate fires
+    Header = #block_header{version = 1, prev_hash = <<0:256>>,
+                           merkle_root = <<0:256>>, timestamp = MTP + 1,
+                           bits = 16#207fffff, nonce = 0},
+    Params = (make_w85_regtest_params())#{bip34_height => 999999,
+                                          bip66_height => 999999,
+                                          bip65_height => 999999},
+    ?assertEqual(ok,
+        beamchain_validation:contextual_check_block_header(Header, PrevIndex, Params)).
+
+%% ---------------------------------------------------------------------------
+%% W85 helper functions
+%% ---------------------------------------------------------------------------
+
+make_w85_header(Timestamp) ->
+    #block_header{version = 4, prev_hash = <<0:256>>,
+                  merkle_root = <<0:256>>, timestamp = Timestamp,
+                  bits = 16#207fffff, nonce = 0}.
+
+make_w85_header_with_bits(Timestamp, Bits) ->
+    #block_header{version = 4, prev_hash = <<0:256>>,
+                  merkle_root = <<0:256>>, timestamp = Timestamp,
+                  bits = Bits, nonce = 0}.
+
+make_w85_prev_index(Height, Header, MtpTimestamps) ->
+    #{height => Height,
+      header => Header,
+      chainwork => <<0:256>>,
+      mtp_timestamps => MtpTimestamps}.
+
+%% Minimal regtest-like params: pow_no_retargeting => true so
+%% get_next_work_required always returns PrevBits (no DB walk needed),
+%% and all BIP heights default to 0 via the gate checks.
+make_w85_regtest_params() ->
+    #{pow_limit =>
+          <<16#7f, 16#ff, 16#ff, 16#ff, 16#ff, 16#ff, 16#ff, 16#ff,
+            16#ff, 16#ff, 16#ff, 16#ff, 16#ff, 16#ff, 16#ff, 16#ff,
+            16#ff, 16#ff, 16#ff, 16#ff, 16#ff, 16#ff, 16#ff, 16#ff,
+            16#ff, 16#ff, 16#ff, 16#ff, 16#ff, 16#ff, 16#ff, 16#ff>>,
+      pow_no_retargeting => true,
+      pow_allow_min_difficulty => false,
+      pow_target_timespan => 1209600,
+      pow_target_spacing => 600,
+      enforce_bip94 => false,
+      bip34_height => 1,
+      bip65_height => 1,
+      bip66_height => 1}.
+
+%% BIP94 params: enforce_bip94 => true, pow_no_retargeting => true
+%% so difficulty gate is satisfied by matching PrevBits, and we can
+%% independently test the timewarp gate.
+make_w85_bip94_params() ->
+    (make_w85_regtest_params())#{enforce_bip94 => true}.

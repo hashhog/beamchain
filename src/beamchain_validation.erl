@@ -186,7 +186,29 @@ contextual_check_block_header(Header, PrevIndex, Params) ->
         Header#block_header.timestamp > MTP
             orelse throw(time_too_old),
 
-        %% 3. verify block version (BIP 34: version >= 2 after activation)
+        %% 3. BIP94 (testnet4 / any network with enforce_bip94 = true):
+        %% The first block of each difficulty-adjustment period must not be
+        %% more than MAX_TIMEWARP (600 s) earlier than the previous block.
+        %% Prevents the time-warp attack on the retarget boundary.
+        %% Reference: validation.cpp:4097-4104, consensus.h:35 (MAX_TIMEWARP=600).
+        %% This check must live here (connect_block + side-branch reorg paths)
+        %% in addition to beamchain_header_sync where it guards the header-only
+        %% path.  Omitting it here would let a crafted submitblock bypass the
+        %% protection even on testnet4.
+        case maps:get(enforce_bip94, Params, false) of
+            true when Height > 0, Height rem ?DIFFICULTY_ADJUSTMENT_INTERVAL =:= 0 ->
+                PrevHeader = maps:get(header, PrevIndex),
+                Header#block_header.timestamp >=
+                    PrevHeader#block_header.timestamp - 600
+                    orelse throw(time_timewarp_attack);
+            _ ->
+                ok
+        end,
+
+        %% 5. verify block version (BIP 34: version >= 2 after activation)
+        %% Reference: validation.cpp:4112-4118.
+        %% Uses buried deployment heights, same as Core's DeploymentActiveAfter
+        %% for DEPLOYMENT_HEIGHTINCB/DERSIG/CLTV.
         Bip34Height = maps:get(bip34_height, Params, 0),
         case Height >= Bip34Height of
             true ->
@@ -195,7 +217,7 @@ contextual_check_block_header(Header, PrevIndex, Params) ->
             false -> ok
         end,
 
-        %% BIP 66: version >= 3 after activation
+        %% BIP 66: version >= 3 after activation (DEPLOYMENT_DERSIG)
         Bip66Height = maps:get(bip66_height, Params, 0),
         case Height >= Bip66Height of
             true ->
@@ -204,7 +226,7 @@ contextual_check_block_header(Header, PrevIndex, Params) ->
             false -> ok
         end,
 
-        %% BIP 65: version >= 4 after activation
+        %% BIP 65: version >= 4 after activation (DEPLOYMENT_CLTV)
         Bip65Height = maps:get(bip65_height, Params, 0),
         case Height >= Bip65Height of
             true ->

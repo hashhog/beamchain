@@ -3495,6 +3495,7 @@ bip22_result(bad_cb_height)             -> <<"bad-cb-height">>;
 bip22_result(bad_txns_bip30)            -> <<"bad-txns-BIP30">>;
 bip22_result(time_too_old)              -> <<"time-too-old">>;
 bip22_result(time_too_new)              -> <<"time-too-new">>;
+bip22_result(time_timewarp_attack)      -> <<"time-timewarp-attack">>;
 bip22_result(duplicate_inputs)          -> <<"bad-txns-duplicate">>;
 %% Negative output value: check_transaction fires negative_output when value < 0.
 %% The validate_block path wraps it as {bad_tx, negative_output}.
