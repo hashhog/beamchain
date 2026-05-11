@@ -552,13 +552,11 @@ check_duplicate_inputs(Inputs) ->
     end.
 
 %% @doc Compute total block weight from transactions.
+%% Delegates to beamchain_serialize:block_weight/1 which correctly
+%% includes the varint-encoded transaction count (80-hdr*4 + varint*4 + sum-tx-weights).
+%% Bitcoin Core: consensus/validation.h GetBlockWeight.
 compute_block_weight(Txs) ->
-    %% 80-byte header * 4 (witness scale) + sum of tx weights
-    HeaderWeight = 80 * ?WITNESS_SCALE_FACTOR,
-    TxWeight = lists:foldl(fun(Tx, Acc) ->
-        Acc + beamchain_serialize:tx_weight(Tx)
-    end, 0, Txs),
-    HeaderWeight + TxWeight.
+    beamchain_serialize:block_weight(Txs).
 
 %% @doc Count legacy sigops in a transaction (context-free).
 %% Counts OP_CHECKSIG/VERIFY as 1 each, OP_CHECKMULTISIG/VERIFY as 20 each.

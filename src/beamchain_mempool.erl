@@ -490,7 +490,9 @@ do_add_transaction(Tx, State) ->
 
         %% 5. check for double-spends in mempool (+ RBF)
         %% Returns {ok, EvictedTxids, EvictedVBytes} - store for cluster cleanup later
-        {ok, RbfEvictedTxids, RbfEvictedVBytes} = check_mempool_conflicts(Tx, InputCoins),
+        %% TxSigopCost is passed so do_rbf can compute the sigop-adjusted vsize for
+        %% Rule 4 (incremental relay fee), matching Core's ws.m_vsize = GetTxSize().
+        {ok, RbfEvictedTxids, RbfEvictedVBytes} = check_mempool_conflicts(Tx, InputCoins, TxSigopCost),
 
         %% 6. compute fee
         TotalIn = lists:foldl(fun(C, A) -> A + C#utxo.value end,
@@ -501,8 +503,11 @@ do_add_transaction(Tx, State) ->
         Fee = TotalIn - TotalOut,
 
         %% 7. compute size metrics
+        %% VSize uses sigop-adjusted weight per Core policy/policy.cpp:GetVirtualTransactionSize:
+        %%   vsize = ceil(max(weight, sigop_cost * DEFAULT_BYTES_PER_SIGOP) / 4)
+        %% TxSigopCost already computed above; pass it into tx_sigop_vsize/2.
         Weight = beamchain_serialize:tx_weight(Tx),
-        VSize = beamchain_serialize:tx_vsize(Tx),
+        VSize = beamchain_serialize:tx_sigop_vsize(Tx, TxSigopCost),
         Size = byte_size(beamchain_serialize:encode_transaction(Tx)),
         FeeRate = Fee / max(1, VSize),
 
@@ -856,9 +861,9 @@ compute_package_metrics(TxPairs, PackageTxMap, _State) ->
         TotalIn >= TotalOut orelse throw(insufficient_fee),
         Fee = TotalIn - TotalOut,
 
-        %% Compute size metrics
+        %% Compute size metrics (sigop-adjusted vsize, matching single-tx path)
         Weight = beamchain_serialize:tx_weight(Tx),
-        VSize = beamchain_serialize:tx_vsize(Tx),
+        VSize = beamchain_serialize:tx_sigop_vsize(Tx, PkgSigopCost),
         Size = byte_size(beamchain_serialize:encode_transaction(Tx)),
         FeeRate = Fee / max(1, VSize),
 
@@ -1453,14 +1458,14 @@ extract_witness_version_program(_) ->
 %%% Internal: mempool conflict detection + RBF
 %%% ===================================================================
 
-check_mempool_conflicts(Tx, _InputCoins) ->
+check_mempool_conflicts(Tx, _InputCoins, SigopCost) ->
     case find_mempool_conflicts(Tx) of
         [] ->
             {ok, [], 0};
         ConflictTxids ->
             %% attempt RBF (BIP 125)
             %% Returns {ok, EvictedTxids, EvictedVBytes} or throws error
-            do_rbf(Tx, ConflictTxids)
+            do_rbf(Tx, ConflictTxids, SigopCost)
     end.
 
 find_mempool_conflicts(#transaction{inputs = Inputs}) ->
@@ -1477,7 +1482,7 @@ find_mempool_conflicts(#transaction{inputs = Inputs}) ->
 %% @doc Replace-by-fee (BIP 125 + Full RBF).
 %% Full RBF (Bitcoin Core 28.0+): allows replacement of any unconfirmed tx
 %% regardless of BIP125 opt-in signaling, when mempoolfullrbf=1.
-do_rbf(NewTx, ConflictTxids) ->
+do_rbf(NewTx, ConflictTxids, SigopCost) ->
     %% gather all conflicting entries
     ConflictEntries = lists:filtermap(fun(Cid) ->
         case ets:lookup(?MEMPOOL_TXS, Cid) of
@@ -1556,8 +1561,10 @@ do_rbf(NewTx, ConflictTxids) ->
     %% 5. additional fee must cover incremental relay fee for new tx (Rule 4)
     %% additional_fees >= relay_fee * new_tx_vsize
     %% Core: policy/rbf.cpp PaysForRBF — relay_fee.GetFee(replacement_vsize).
+    %% Use sigop-adjusted vsize (matching Core's ws.m_vsize = GetTxSize() which
+    %% calls GetVirtualTransactionSize(nTxWeight, sigOpCost, nBytesPerSigOp)).
     %% ?MIN_RELAY_TX_FEE = 1000 sat/kvB → 1 sat/vB.
-    NewVSize = beamchain_serialize:tx_vsize(NewTx),
+    NewVSize = beamchain_serialize:tx_sigop_vsize(NewTx, SigopCost),
     MinAdditionalFee = (NewVSize * ?MIN_RELAY_TX_FEE + 999) div 1000,
     (NewFee - EvictedFeeTotal) >= MinAdditionalFee
         orelse throw(rbf_insufficient_additional_fee),
