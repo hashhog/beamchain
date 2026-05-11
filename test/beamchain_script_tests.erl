@@ -2164,3 +2164,354 @@ parse_schnorr_sig_wrong_length_rejected_test() ->
     Long = binary:copy(<<16#42>>, 66),
     ?assertEqual({invalid, <<>>},
                  beamchain_script:parse_schnorr_sig(Long)).
+
+%%% -------------------------------------------------------------------
+%%% W82 BIP-66 + sig/pubkey encoding audit tests
+%%% -------------------------------------------------------------------
+
+%% Bug 1: Max-size check — oversize DER sig must be rejected under DERSIG.
+%%
+%% Core: IsValidSignatureEncoding (interpreter.cpp:122-123):
+%%   if (sig.size() > 73) return false;
+%%
+%% The full sig (SigBody + hashtype) must be <=73 bytes; equivalently
+%% SigBody must be <=72 bytes.  Build a structurally valid DER with
+%% R=34 bytes, S=1 byte (total SigBody = 2+2+34+2+1 = 41... that's fine;
+%% we need SigBody > 72).  Easiest: R=33 bytes, S=34 bytes → TotalLen=73,
+%% SigBody=75 bytes → full sig 76 bytes > 73.
+bip66_oversize_sig_rejected_test() ->
+    %% Craft a structurally valid DER sig with SigBody = 75 bytes > 72.
+    %% R = 33 bytes (0x00 sign byte + 32-byte value with high bit on first real byte)
+    %% S = 34 bytes (0x00 sign byte + 33-byte value with high bit)
+    %% This makes TotalLen = 4 + 33 + 34 = 71... still <=72.
+    %% Go bigger: R=33, S=35 → TotalLen=72, SigBody=74 > 72.
+    R33 = <<0, (binary:copy(<<16#ff>>, 32))/binary>>,          %% 33 bytes
+    S35 = <<0, (binary:copy(<<16#ff>>, 34))/binary>>,          %% 35 bytes (invalid for secp256k1 but tests size gate)
+    TotalLen = 4 + 33 + 35,                                     %% = 72 → SigBody would be 74
+    SigBody = <<16#30, TotalLen:8,
+                16#02, 33:8, R33/binary,
+                16#02, 35:8, S35/binary>>,
+    HashTypeByte = 16#01,
+    FakePK = <<16#02, 1:256>>,
+    Flags = ?SCRIPT_VERIFY_DERSIG,
+    %% SigBody is 74 bytes > 72; must fail DER check
+    ?assert(byte_size(SigBody) > 72),
+    %% check_sig_encoding must return {error, sig_der}
+    SigChecker = #{
+        check_ecdsa_sig => fun(_, _, _) -> true end,
+        compute_sighash => fun(_, _) -> <<0:256>> end
+    },
+    FullSig = <<SigBody/binary, HashTypeByte:8>>,
+    Script = <<
+        (byte_size(FullSig)), FullSig/binary,
+        (byte_size(FakePK)), FakePK/binary,
+        16#ac  %% OP_CHECKSIG
+    >>,
+    {error, sig_der} = beamchain_script:eval_script(Script, [], Flags, SigChecker, base).
+
+%% Minimum-size sig (9 bytes full = 8-byte SigBody) must be accepted under DERSIG.
+bip66_minsize_sig_accepted_test() ->
+    %% Minimal DER sig: 30 06 02 01 01 02 01 01  (8 bytes) + hashtype 01
+    SigBody = <<16#30, 16#06, 16#02, 16#01, 16#01, 16#02, 16#01, 16#01>>,
+    HashTypeByte = 16#01,
+    FakePK = <<16#02, 1:256>>,
+    Flags = ?SCRIPT_VERIFY_DERSIG,
+    ?assertEqual(8, byte_size(SigBody)),
+    SigChecker = #{
+        check_ecdsa_sig => fun(_, _, _) -> true end,
+        compute_sighash => fun(_, _) -> <<0:256>> end
+    },
+    FullSig = <<SigBody/binary, HashTypeByte:8>>,
+    Script = <<
+        (byte_size(FullSig)), FullSig/binary,
+        (byte_size(FakePK)), FakePK/binary,
+        16#ac  %% OP_CHECKSIG
+    >>,
+    {ok, [<<1>>]} = beamchain_script:eval_script(Script, [], Flags, SigChecker, base).
+
+%% Bug 2a: CONST_SCRIPTCODE + OP_CHECKSIG FindAndDelete must reject
+%% when the sig appears in the scriptCode and deletion occurs.
+%%
+%% Core: EvalChecksigPreTapscript interpreter.cpp:329-332:
+%%   if (found > 0 && (flags & SCRIPT_VERIFY_CONST_SCRIPTCODE))
+%%       return set_error(serror, SCRIPT_ERR_SIG_FINDANDDELETE);
+%%
+%% We build a script where the sig is literally embedded in the scriptCode
+%% to trigger FindAndDelete. We use OP_1 OP_CHECKSIG where the sig is
+%% pushed first; then the scriptCode contains a verbatim copy of the sig
+%% push (achieved by constructing scriptCode as a binary with the push).
+%%
+%% Simpler: use a script that IS the sig push followed by OP_CHECKSIG,
+%% executed from scriptSig=<> with State.script set to the full body.
+%% Actually, eval_script takes the script directly, so State.script = Script.
+%% We craft it so the sig data appears as a push in the script itself, and
+%% FindAndDelete on that sig removes it from State.script.
+
+bip66_const_scriptcode_checksig_test() ->
+    %% Valid minimal DER sig (SigBody + hashtype = 9 bytes)
+    SigBody = <<16#30, 16#06, 16#02, 16#01, 16#01, 16#02, 16#01, 16#01>>,
+    HashTypeByte = 16#01,
+    FullSig = <<SigBody/binary, HashTypeByte:8>>,
+    FakePK = <<16#02, 1:256>>,
+    SigChecker = #{
+        check_ecdsa_sig => fun(_, _, _) -> true end,
+        compute_sighash => fun(_, _) -> <<0:256>> end
+    },
+    %% Script: push FullSig (which gets dropped), then push FullSig again for
+    %% OP_CHECKSIG, then push FakePK, then OP_CHECKSIG.
+    %% When OP_CHECKSIG runs, FindAndDelete on State.script finds the first
+    %% SigPush occurrence and removes it; CONST_SCRIPTCODE must then reject.
+    SigPush = <<(byte_size(FullSig)):8, FullSig/binary>>,
+    PKPush  = <<(byte_size(FakePK)):8,  FakePK/binary>>,
+    %% Script layout: <SigPush> OP_DROP <SigPush> <PKPush> OP_CHECKSIG
+    %% Stack at OP_CHECKSIG: [FakePK, FullSig] (top = FakePK)
+    %% State.script contains two occurrences of SigPush; FindAndDelete finds both.
+    Script = <<SigPush/binary, 16#75, SigPush/binary, PKPush/binary, 16#ac>>,
+    %% Without CONST_SCRIPTCODE: FindAndDelete silently removes; verify succeeds.
+    {ok, [<<1>>]} = beamchain_script:eval_script(Script, [], 0, SigChecker, base),
+    %% With CONST_SCRIPTCODE: FindAndDelete finding something must fail.
+    {error, sig_findanddelete} = beamchain_script:eval_script(
+        Script, [], ?SCRIPT_VERIFY_CONST_SCRIPTCODE, SigChecker, base).
+
+%% Bug 2b: CONST_SCRIPTCODE + OP_CHECKMULTISIG FindAndDelete must reject.
+bip66_const_scriptcode_checkmultisig_test() ->
+    SigBody = <<16#30, 16#06, 16#02, 16#01, 16#01, 16#02, 16#01, 16#01>>,
+    HashTypeByte = 16#01,
+    FullSig = <<SigBody/binary, HashTypeByte:8>>,
+    FakePK = <<16#02, 1:256>>,
+    SigChecker = #{
+        check_ecdsa_sig => fun(_, _, _) -> true end,
+        compute_sighash => fun(_, _) -> <<0:256>> end
+    },
+    SigPush = <<(byte_size(FullSig)):8, FullSig/binary>>,
+    PKPush  = <<(byte_size(FakePK)):8,  FakePK/binary>>,
+    %% Script layout: <SigPush> OP_DROP  OP_0 <SigPush> OP_1 <PKPush> OP_1 OP_CHECKMULTISIG
+    %% The first SigPush+OP_DROP are executed first (to get the sig in script bytes).
+    %% When CHECKMULTISIG runs, FindAndDelete on State.script finds the first SigPush.
+    Script = <<
+        SigPush/binary,             %% sig push that will be found+deleted by FAD
+        16#75,                      %% OP_DROP (removes sig from stack, leaves script intact)
+        16#00,                      %% OP_0 (dummy for multisig)
+        SigPush/binary,             %% actual sig for multisig
+        16#51,                      %% OP_1 (m=1)
+        PKPush/binary,              %% public key
+        16#51,                      %% OP_1 (n=1)
+        16#ae                       %% OP_CHECKMULTISIG
+    >>,
+    %% Without CONST_SCRIPTCODE: FindAndDelete silently removes; verify succeeds.
+    {ok, [<<1>>]} = beamchain_script:eval_script(Script, [], 0, SigChecker, base),
+    %% With CONST_SCRIPTCODE: must fail.
+    {error, sig_findanddelete} = beamchain_script:eval_script(
+        Script, [], ?SCRIPT_VERIFY_CONST_SCRIPTCODE, SigChecker, base).
+
+%% Bug 3: OP_CODESEPARATOR in non-executing branch of base script must be
+%% rejected when CONST_SCRIPTCODE is set.
+%%
+%% Core: interpreter.cpp:474-476 — check runs BEFORE the fExec gate.
+%%
+%% Script: OP_0 OP_IF OP_CODESEPARATOR OP_ENDIF OP_1
+%% The OP_CODESEPARATOR is inside a non-executing branch (OP_0 is falsy),
+%% but CONST_SCRIPTCODE must still reject it.
+bip66_const_scriptcode_codesep_nonexecuting_test() ->
+    Script = <<
+        16#00,      %% OP_0 (false)
+        16#63,      %% OP_IF
+        16#ab,      %% OP_CODESEPARATOR (inside non-executing branch)
+        16#68,      %% OP_ENDIF
+        16#51       %% OP_1
+    >>,
+    %% Without CONST_SCRIPTCODE: the codesep is silently skipped, OP_1 succeeds.
+    {ok, [<<1>>]} = beamchain_script:eval_script(Script, [], 0, #{}, base),
+    %% With CONST_SCRIPTCODE: must fail even in non-executing branch.
+    {error, op_codeseparator_in_legacy} = beamchain_script:eval_script(
+        Script, [], ?SCRIPT_VERIFY_CONST_SCRIPTCODE, #{}, base).
+
+%% CONST_SCRIPTCODE must NOT reject OP_CODESEPARATOR in witness_v0.
+%% Core only rejects on SigVersion::BASE (interpreter.cpp:475).
+bip66_const_scriptcode_codesep_witness_v0_ok_test() ->
+    Script = <<
+        16#51,      %% OP_1
+        16#ab,      %% OP_CODESEPARATOR (in witness_v0 — allowed)
+        16#51       %% OP_1
+    >>,
+    %% Should NOT fail with CONST_SCRIPTCODE in witness_v0 context
+    {ok, [<<1>>, <<1>>]} = beamchain_script:eval_script(
+        Script, [], ?SCRIPT_VERIFY_CONST_SCRIPTCODE, #{}, witness_v0).
+
+%% CONST_SCRIPTCODE: codesep in executing branch of base also rejected.
+bip66_const_scriptcode_codesep_executing_test() ->
+    Script = <<
+        16#51,      %% OP_1
+        16#ab,      %% OP_CODESEPARATOR (executing branch, base)
+        16#51       %% OP_1
+    >>,
+    {error, op_codeseparator_in_legacy} = beamchain_script:eval_script(
+        Script, [], ?SCRIPT_VERIFY_CONST_SCRIPTCODE, #{}, base).
+
+%% Defined hash types: 0x01, 0x02, 0x03, 0x81, 0x82, 0x83 are valid under STRICTENC.
+bip66_strictenc_valid_hashtypes_test() ->
+    SigBody = <<16#30, 16#06, 16#02, 16#01, 16#01, 16#02, 16#01, 16#01>>,
+    FakePK = <<16#02, 1:256>>,
+    SigChecker = #{
+        check_ecdsa_sig => fun(_, _, _) -> true end,
+        compute_sighash => fun(_, _) -> <<0:256>> end
+    },
+    ValidHTs = [16#01, 16#02, 16#03, 16#81, 16#82, 16#83],
+    Flags = ?SCRIPT_VERIFY_STRICTENC bor ?SCRIPT_VERIFY_DERSIG,
+    [begin
+        FullSig = <<SigBody/binary, HT:8>>,
+        Script = <<
+            (byte_size(FullSig)):8, FullSig/binary,
+            (byte_size(FakePK)):8,  FakePK/binary,
+            16#ac
+        >>,
+        {ok, [<<1>>]} = beamchain_script:eval_script(Script, [], Flags, SigChecker, base)
+    end || HT <- ValidHTs].
+
+%% Undefined hash types (e.g. 0x04, 0x05, 0x00, 0xff) must be rejected under STRICTENC.
+bip66_strictenc_invalid_hashtypes_test() ->
+    SigBody = <<16#30, 16#06, 16#02, 16#01, 16#01, 16#02, 16#01, 16#01>>,
+    FakePK = <<16#02, 1:256>>,
+    SigChecker = #{
+        check_ecdsa_sig => fun(_, _, _) -> true end,
+        compute_sighash => fun(_, _) -> <<0:256>> end
+    },
+    InvalidHTs = [16#00, 16#04, 16#05, 16#7f, 16#84, 16#ff],
+    Flags = ?SCRIPT_VERIFY_STRICTENC bor ?SCRIPT_VERIFY_DERSIG,
+    [begin
+        FullSig = <<SigBody/binary, HT:8>>,
+        Script = <<
+            (byte_size(FullSig)):8, FullSig/binary,
+            (byte_size(FakePK)):8,  FakePK/binary,
+            16#ac
+        >>,
+        {error, sig_encoding} = beamchain_script:eval_script(Script, [], Flags, SigChecker, base)
+    end || HT <- InvalidHTs].
+
+%% Uncompressed pubkeys (0x04) are accepted under STRICTENC (non-witness).
+bip66_strictenc_uncompressed_pubkey_accepted_test() ->
+    SigBody = <<16#30, 16#06, 16#02, 16#01, 16#01, 16#02, 16#01, 16#01>>,
+    HashTypeByte = 16#01,
+    FullSig = <<SigBody/binary, HashTypeByte:8>>,
+    UncompPK = <<16#04, 1:256, 2:256>>,   %% 65-byte uncompressed
+    SigChecker = #{
+        check_ecdsa_sig => fun(_, _, _) -> true end,
+        compute_sighash => fun(_, _) -> <<0:256>> end
+    },
+    Script = <<
+        (byte_size(FullSig)):8, FullSig/binary,
+        (byte_size(UncompPK)):8, UncompPK/binary,
+        16#ac
+    >>,
+    %% STRICTENC allows 0x04 in non-witness context
+    Flags = ?SCRIPT_VERIFY_STRICTENC bor ?SCRIPT_VERIFY_DERSIG,
+    {ok, [<<1>>]} = beamchain_script:eval_script(Script, [], Flags, SigChecker, base).
+
+%% Invalid pubkey (wrong prefix) must be rejected under STRICTENC.
+bip66_strictenc_invalid_pubkey_rejected_test() ->
+    SigBody = <<16#30, 16#06, 16#02, 16#01, 16#01, 16#02, 16#01, 16#01>>,
+    HashTypeByte = 16#01,
+    FullSig = <<SigBody/binary, HashTypeByte:8>>,
+    BadPK = <<16#05, 1:256>>,   %% invalid prefix
+    SigChecker = #{
+        check_ecdsa_sig => fun(_, _, _) -> true end,
+        compute_sighash => fun(_, _) -> <<0:256>> end
+    },
+    Script = <<
+        (byte_size(FullSig)):8, FullSig/binary,
+        (byte_size(BadPK)):8, BadPK/binary,
+        16#ac
+    >>,
+    Flags = ?SCRIPT_VERIFY_STRICTENC bor ?SCRIPT_VERIFY_DERSIG,
+    {error, sig_encoding} = beamchain_script:eval_script(Script, [], Flags, SigChecker, base).
+
+%% DER negative R (high bit set, no padding) must be rejected under DERSIG.
+bip66_dersig_negative_r_rejected_test() ->
+    %% R starts with 0x80 (high bit set) without leading 0x00 → negative
+    NegR = <<16#80, 1:248>>,    %% 32 bytes, MSB = 0x80
+    PosS = <<16#01, 2:248>>,    %% 32 bytes, positive
+    RLen = byte_size(NegR),
+    SLen = byte_size(PosS),
+    TotalLen = 4 + RLen + SLen,
+    SigBody = <<16#30, TotalLen:8,
+                16#02, RLen:8, NegR/binary,
+                16#02, SLen:8, PosS/binary>>,
+    HashTypeByte = 16#01,
+    FullSig = <<SigBody/binary, HashTypeByte:8>>,
+    FakePK = <<16#02, 1:256>>,
+    SigChecker = #{
+        check_ecdsa_sig => fun(_, _, _) -> true end,
+        compute_sighash => fun(_, _) -> <<0:256>> end
+    },
+    Script = <<
+        (byte_size(FullSig)):8, FullSig/binary,
+        (byte_size(FakePK)):8,  FakePK/binary,
+        16#ac
+    >>,
+    {error, sig_der} = beamchain_script:eval_script(
+        Script, [], ?SCRIPT_VERIFY_DERSIG, SigChecker, base).
+
+%% DER unnecessary leading zero in R must be rejected under DERSIG.
+bip66_dersig_padded_r_rejected_test() ->
+    %% R = 0x00 followed by byte < 0x80 → unnecessary padding
+    PaddedR = <<16#00, 16#01, 1:240>>,   %% 32 bytes; 0x00 then 0x01 (no high bit)
+    PosS    = <<16#01, 2:248>>,
+    RLen = byte_size(PaddedR),
+    SLen = byte_size(PosS),
+    TotalLen = 4 + RLen + SLen,
+    SigBody = <<16#30, TotalLen:8,
+                16#02, RLen:8, PaddedR/binary,
+                16#02, SLen:8, PosS/binary>>,
+    HashTypeByte = 16#01,
+    FullSig = <<SigBody/binary, HashTypeByte:8>>,
+    FakePK = <<16#02, 1:256>>,
+    SigChecker = #{
+        check_ecdsa_sig => fun(_, _, _) -> true end,
+        compute_sighash => fun(_, _) -> <<0:256>> end
+    },
+    Script = <<
+        (byte_size(FullSig)):8, FullSig/binary,
+        (byte_size(FakePK)):8,  FakePK/binary,
+        16#ac
+    >>,
+    {error, sig_der} = beamchain_script:eval_script(
+        Script, [], ?SCRIPT_VERIFY_DERSIG, SigChecker, base).
+
+%% Zero-length R or S must be rejected under DERSIG.
+bip66_dersig_zero_r_rejected_test() ->
+    %% Build a DER sig with RLen=0 (violates "zero-length integers not allowed")
+    %% 30 04 02 00 02 01 01 = TotalLen=4, R=empty, S=1 byte
+    SigBody = <<16#30, 16#04, 16#02, 16#00, 16#02, 16#01, 16#01>>,
+    HashTypeByte = 16#01,
+    FullSig = <<SigBody/binary, HashTypeByte:8>>,
+    FakePK = <<16#02, 1:256>>,
+    SigChecker = #{
+        check_ecdsa_sig => fun(_, _, _) -> true end,
+        compute_sighash => fun(_, _) -> <<0:256>> end
+    },
+    Script = <<
+        (byte_size(FullSig)):8, FullSig/binary,
+        (byte_size(FakePK)):8,  FakePK/binary,
+        16#ac
+    >>,
+    {error, sig_der} = beamchain_script:eval_script(
+        Script, [], ?SCRIPT_VERIFY_DERSIG, SigChecker, base).
+
+%% WITNESS_PUBKEYTYPE: uncompressed pubkey (0x04) must be rejected in witness_v0.
+bip66_witness_pubkeytype_uncompressed_rejected_test() ->
+    SigBody = <<16#30, 16#06, 16#02, 16#01, 16#01, 16#02, 16#01, 16#01>>,
+    HashTypeByte = 16#01,
+    FullSig = <<SigBody/binary, HashTypeByte:8>>,
+    UncompPK = <<16#04, 1:256, 2:256>>,
+    SigChecker = #{
+        check_ecdsa_sig => fun(_, _, _) -> true end,
+        compute_sighash => fun(_, _) -> <<0:256>> end
+    },
+    Script = <<
+        (byte_size(FullSig)):8, FullSig/binary,
+        (byte_size(UncompPK)):8, UncompPK/binary,
+        16#ac
+    >>,
+    %% WITNESS_PUBKEYTYPE rejects uncompressed keys in witness_v0
+    {error, witness_pubkeytype} = beamchain_script:eval_script(
+        Script, [], ?SCRIPT_VERIFY_WITNESS_PUBKEYTYPE, SigChecker, witness_v0).
