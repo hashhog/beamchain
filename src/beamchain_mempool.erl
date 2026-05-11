@@ -50,7 +50,7 @@
          check_cluster_limits_for_test/2]).
 
 %% TRUC (v3 transaction) policy checks - exported for testing
--export([check_truc_rules/3]).
+-export([check_truc_rules/3, check_truc_rules/4]).
 
 %% Ephemeral anchor policy - exported for testing
 -export([check_dust/2, find_ephemeral_anchor/2]).
@@ -529,8 +529,12 @@ do_add_transaction(Tx, State) ->
         verify_scripts(Tx, InputCoins),
 
         %% 10b. TRUC (v3 transaction) policy checks
+        %% Pass RbfEvictedTxids as direct_conflicts so the descendant-limit gate
+        %% can skip the check when the existing child is already being RBF-replaced.
+        %% Mirrors Core SingleTRUCChecks direct_conflicts set (truc_policy.cpp:240-243).
         MempoolParentTxids = get_parent_txids(Tx),
-        {TrucEvictedTxids, TrucEvictedVBytes} = case check_truc_rules(Tx, VSize, MempoolParentTxids) of
+        DirectConflicts = sets:from_list(RbfEvictedTxids),
+        {TrucEvictedTxids, TrucEvictedVBytes} = case check_truc_rules(Tx, VSize, MempoolParentTxids, DirectConflicts) of
             ok ->
                 {[], 0};
             {sibling_eviction, SiblingTxid} ->
@@ -2435,15 +2439,25 @@ do_expire_orphans() ->
 %%% BIP 431 - Topologically Restricted Until Confirmation
 %%% ===================================================================
 
-%% @doc Check TRUC rules for a single transaction.
-%% Returns ok or {error, {truc_violation, Reason}} or {sibling_eviction, SiblingTxid}.
+%% @doc Check TRUC rules for a single transaction (no direct-conflict set).
+%% Convenience wrapper used in tests; production code calls check_truc_rules/4.
 -spec check_truc_rules(#transaction{}, non_neg_integer(), [binary()]) ->
     ok | {error, {truc_violation, term()}} | {sibling_eviction, binary()}.
 check_truc_rules(Tx, VSize, MempoolParentTxids) ->
+    check_truc_rules(Tx, VSize, MempoolParentTxids, sets:new()).
+
+%% @doc Check TRUC rules for a single transaction.
+%% DirectConflicts is the set of txids being evicted by RBF for this tx; if the
+%% existing TRUC child is among them, the descendant-count gate is bypassed.
+%% Mirrors Core SingleTRUCChecks(pool, ptx, mempool_parents, direct_conflicts, vsize)
+%% in truc_policy.cpp.
+-spec check_truc_rules(#transaction{}, non_neg_integer(), [binary()], sets:set(binary())) ->
+    ok | {error, {truc_violation, term()}} | {sibling_eviction, binary()}.
+check_truc_rules(Tx, VSize, MempoolParentTxids, DirectConflicts) ->
     TxVersion = Tx#transaction.version,
     case TxVersion of
         ?TRUC_VERSION ->
-            check_truc_v3_rules(Tx, VSize, MempoolParentTxids);
+            check_truc_v3_rules(Tx, VSize, MempoolParentTxids, DirectConflicts);
         _ ->
             %% Non-v3 tx cannot spend unconfirmed v3 outputs
             check_non_truc_parents(MempoolParentTxids)
@@ -2467,47 +2481,65 @@ check_non_truc_parents([ParentTxid | Rest]) ->
     end.
 
 %% Check TRUC rules for a v3 transaction.
-check_truc_v3_rules(Tx, VSize, MempoolParentTxids) ->
+check_truc_v3_rules(Tx, VSize, MempoolParentTxids, DirectConflicts) ->
     %% Rule 1: v3 tx must be <= TRUC_MAX_VSIZE
+    %% Core truc_policy.cpp:200-204
     case VSize > ?TRUC_MAX_VSIZE of
         true ->
             {error, {truc_violation, {tx_too_large, VSize, ?TRUC_MAX_VSIZE}}};
         false ->
-            check_truc_v3_ancestry(Tx, VSize, MempoolParentTxids)
+            check_truc_v3_ancestry(Tx, VSize, MempoolParentTxids, DirectConflicts)
     end.
 
-check_truc_v3_ancestry(_Tx, _VSize, []) ->
+check_truc_v3_ancestry(_Tx, _VSize, [], _DirectConflicts) ->
     %% No mempool parents - this is a v3 parent (no unconfirmed ancestors)
     ok;
-check_truc_v3_ancestry(Tx, VSize, MempoolParentTxids) ->
+check_truc_v3_ancestry(Tx, VSize, MempoolParentTxids, DirectConflicts) ->
     %% Has mempool parents - this is a v3 child
 
-    %% Rule 2: v3 child can have at most 1 unconfirmed parent
+    %% Rule 2a: v3 child can have at most 1 direct unconfirmed parent
+    %% Core truc_policy.cpp:207-211
     case length(MempoolParentTxids) > 1 of
         true ->
             {error, {truc_violation, too_many_ancestors}};
         false ->
             [ParentTxid] = MempoolParentTxids,
-            check_truc_v3_child_rules(Tx, VSize, ParentTxid)
+            %% Rule 2b: the parent itself must have no unconfirmed ancestors
+            %% (ancestor_count == 1 means only itself; > 1 means it has parents).
+            %% Core truc_policy.cpp:214-221: GetAncestorCount(parent) + 1 > TRUC_ANCESTOR_LIMIT
+            case ets:lookup(?MEMPOOL_TXS, ParentTxid) of
+                [{_, ParentEntry}] ->
+                    case ParentEntry#mempool_entry.ancestor_count + 1 > ?TRUC_ANCESTOR_LIMIT of
+                        true ->
+                            {error, {truc_violation, too_many_ancestors}};
+                        false ->
+                            check_truc_v3_child_rules(Tx, VSize, ParentTxid, DirectConflicts)
+                    end;
+                [] ->
+                    %% Parent not tracked (should not happen); proceed to child checks
+                    check_truc_v3_child_rules(Tx, VSize, ParentTxid, DirectConflicts)
+            end
     end.
 
-check_truc_v3_child_rules(_Tx, VSize, ParentTxid) ->
+check_truc_v3_child_rules(_Tx, VSize, ParentTxid, DirectConflicts) ->
     %% Rule 3: v3 child must be <= TRUC_CHILD_MAX_VSIZE
+    %% Core truc_policy.cpp:223-227
     case VSize > ?TRUC_CHILD_MAX_VSIZE of
         true ->
             {error, {truc_violation, {child_too_large, VSize, ?TRUC_CHILD_MAX_VSIZE}}};
         false ->
-            check_truc_parent_version(ParentTxid, VSize)
+            check_truc_parent_version(ParentTxid, VSize, DirectConflicts)
     end.
 
-check_truc_parent_version(ParentTxid, VSize) ->
+check_truc_parent_version(ParentTxid, VSize, DirectConflicts) ->
     %% Rule 4: v3 child can only spend from v3 parent
+    %% Core truc_policy.cpp:185-190 (inheritance check loop)
     case ets:lookup(?MEMPOOL_TXS, ParentTxid) of
         [{_, Entry}] ->
             ParentTx = Entry#mempool_entry.tx,
             case ParentTx#transaction.version of
                 ?TRUC_VERSION ->
-                    check_truc_parent_descendant_limit(Entry, VSize);
+                    check_truc_parent_descendant_limit(Entry, VSize, DirectConflicts);
                 _ ->
                     {error, {truc_violation, truc_spends_non_truc}}
             end;
@@ -2516,26 +2548,52 @@ check_truc_parent_version(ParentTxid, VSize) ->
             ok
     end.
 
-check_truc_parent_descendant_limit(ParentEntry, _VSize) ->
+check_truc_parent_descendant_limit(ParentEntry, _VSize, DirectConflicts) ->
     %% Rule 5: v3 parent can have at most 1 unconfirmed child
-    %% descendant_count includes the parent itself, so limit is 2
-    case ParentEntry#mempool_entry.descendant_count >= ?TRUC_DESCENDANT_LIMIT of
+    %% descendant_count includes the parent itself, so the limit is 2.
+    %% Core truc_policy.cpp:229-258.
+    DescCount = ParentEntry#mempool_entry.descendant_count,
+    case DescCount + 1 > ?TRUC_DESCENDANT_LIMIT of
+        false ->
+            ok;
         true ->
-            %% Parent already has a child - check for sibling eviction
+            %% Parent already has a child. Check whether that child is being
+            %% RBF-replaced by the new tx (direct_conflicts bypass).
+            %% Core truc_policy.cpp:240-243: skip limit if child_will_be_replaced.
             ParentTxid = ParentEntry#mempool_entry.txid,
             case find_truc_sibling(ParentTxid) of
                 {ok, SiblingTxid} ->
-                    %% Sibling eviction is possible
-                    {sibling_eviction, SiblingTxid};
+                    case sets:is_element(SiblingTxid, DirectConflicts) of
+                        true ->
+                            %% Sibling is already being evicted via RBF — no limit violation
+                            ok;
+                        false ->
+                            %% Sibling eviction possible only when:
+                            %%   parent has exactly 1 child (desc_count == 2) AND
+                            %%   that child is a direct child (ancestor_count == 2).
+                            %% Core truc_policy.cpp:249-250:
+                            %%   consider_sibling_eviction =
+                            %%     GetDescendantCount(parent) == 2 &&
+                            %%     GetAncestorCount(*descendants.begin()) == 2
+                            SiblingEligible =
+                                (DescCount =:= ?TRUC_DESCENDANT_LIMIT) andalso
+                                case ets:lookup(?MEMPOOL_TXS, SiblingTxid) of
+                                    [{_, SE}] -> SE#mempool_entry.ancestor_count =:= ?TRUC_ANCESTOR_LIMIT;
+                                    [] -> false
+                                end,
+                            case SiblingEligible of
+                                true  -> {sibling_eviction, SiblingTxid};
+                                false -> {error, {truc_violation, too_many_descendants}}
+                            end
+                    end;
                 not_found ->
-                    %% No sibling found (inconsistent state) or multiple children
+                    %% No sibling found (inconsistent state or multiple children from reorg)
                     {error, {truc_violation, too_many_descendants}}
-            end;
-        false ->
-            ok
+            end
     end.
 
 %% Find the existing child of a v3 parent for sibling eviction.
+%% Returns {ok, SiblingTxid} if exactly one child is found, not_found otherwise.
 find_truc_sibling(ParentTxid) ->
     case ets:lookup(?MEMPOOL_TXS, ParentTxid) of
         [{_, Entry}] ->
