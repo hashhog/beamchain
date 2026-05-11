@@ -3492,6 +3492,7 @@ bip22_result(bad_coinbase_length)       -> <<"bad-cb-length">>;
 %% match this before the generic {bad_tx, _} catch-all.
 bip22_result({bad_tx, bad_coinbase_length}) -> <<"bad-cb-length">>;
 bip22_result(bad_cb_height)             -> <<"bad-cb-height">>;
+bip22_result(bad_txns_bip30)            -> <<"bad-txns-BIP30">>;
 bip22_result(time_too_old)              -> <<"time-too-old">>;
 bip22_result(time_too_new)              -> <<"time-too-new">>;
 bip22_result(duplicate_inputs)          -> <<"bad-txns-duplicate">>;
