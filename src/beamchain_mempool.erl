@@ -26,7 +26,7 @@
 -export([get_ancestors/1, get_descendants/1]).
 
 %% Block interaction
--export([remove_for_block/1]).
+-export([remove_for_block/1, remove_for_block_async/1]).
 
 %% Maintenance
 -export([trim_to_size/1, expire_old/0]).
@@ -262,10 +262,21 @@ collect_by_fee_desc({_FeeRate, Txid} = Key, Acc) ->
     end,
     collect_by_fee_desc(ets:prev(?MEMPOOL_BY_FEE, Key), Acc2).
 
-%% @doc Remove confirmed transactions from the mempool.
+%% @doc Remove confirmed transactions from the mempool (synchronous).
 -spec remove_for_block([binary()]) -> ok.
 remove_for_block(Txids) ->
     gen_server:call(?SERVER, {remove_for_block, Txids}, 30000).
+
+%% @doc Asynchronous variant: cast so the caller does not block on the
+%% mempool gen_server and cannot trigger a chainstate ↔ mempool deadlock.
+%% Used from beamchain_chainstate's connect-block path (W93/B3), mirroring
+%% Bitcoin Core's ConnectTip post-step `m_mempool->removeForBlock(...)`
+%% (validation.cpp:3073-3076).  An empty list short-circuits (no message).
+-spec remove_for_block_async([binary()]) -> ok.
+remove_for_block_async([]) ->
+    ok;
+remove_for_block_async(Txids) ->
+    gen_server:cast(?SERVER, {remove_for_block, Txids}).
 
 %% @doc Trim mempool to fit within MaxBytes.
 -spec trim_to_size(non_neg_integer()) -> ok.
@@ -412,6 +423,12 @@ handle_call({get_cluster, Txid}, _From, #state{union_find = UF} = State) ->
 handle_call(_Request, _From, State) ->
     {reply, {error, not_implemented}, State}.
 
+%% Asynchronous remove_for_block (W93/B3 — invoked from chainstate's
+%% connect-block path to avoid the synchronous chainstate↔mempool
+%% deadlock).  Just reuses the existing synchronous handler logic.
+handle_cast({remove_for_block, Txids}, State) ->
+    State2 = do_remove_for_block(Txids, State),
+    {noreply, State2};
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
