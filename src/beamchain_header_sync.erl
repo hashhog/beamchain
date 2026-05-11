@@ -81,7 +81,12 @@
     peer_heights = #{}      :: #{pid() => non_neg_integer()},
     %% Anti-DoS: Per-peer state tracking
     %% #{Pid => #{unconnecting_count => N, last_header_hash => Hash}}
-    peer_header_state = #{} :: #{pid() => map()}
+    peer_header_state = #{} :: #{pid() => map()},
+    %% Anti-DoS two-phase presync/redownload state (beamchain_headerssync).
+    %% Populated when the peer's chain has not yet demonstrated sufficient
+    %% cumulative work (mirrors Bitcoin Core's HeadersSyncState per peer).
+    %% undefined = either past min_chainwork (skip pipeline) or no active sync.
+    hss_state = undefined   :: term() | undefined
 }).
 
 %%% ===================================================================
@@ -177,7 +182,8 @@ handle_cast({start_sync, _Opts}, State) ->
 
 handle_cast(stop_sync, State) ->
     State2 = cancel_timer(State),
-    {noreply, State2#state{status = idle, sync_peer = undefined}};
+    {noreply, State2#state{status = idle, sync_peer = undefined,
+                            hss_state = undefined}};
 
 handle_cast({headers, Peer, Headers}, #state{status = syncing,
                                               sync_peer = Peer} = State) ->
@@ -218,10 +224,13 @@ handle_cast({peer_disconnected, Peer}, State) ->
     State2 = remove_peer_state(Peer, State),
     case State2#state.sync_peer of
         Peer ->
-            %% Our sync peer disconnected, try another
+            %% Our sync peer disconnected, try another.
+            %% Discard HSS state — it is peer-specific and tied to the
+            %% salted hasher created for this peer's sync session.
             logger:info("header_sync: sync peer disconnected, trying another"),
             State3 = cancel_timer(State2),
-            State4 = State3#state{sync_peer = undefined, status = idle},
+            State4 = State3#state{sync_peer = undefined, status = idle,
+                                   hss_state = undefined},
             State5 = pick_sync_peer_and_start(State4),
             {noreply, State5};
         _ ->
@@ -297,7 +306,11 @@ pick_sync_peer_and_start(#state{peer_heights = PeerHeights,
                 estimated_tip = PeerHeight,
                 headers_received = 0
             },
-            send_getheaders(State2);
+            %% Initialise the PRESYNC/REDOWNLOAD anti-DoS pipeline when our
+            %% tip chainwork is below the network minimum.  This mirrors Core's
+            %% per-peer HeadersSyncState object (headerssync.cpp).
+            State3 = maybe_init_hss(Peer, State2),
+            send_getheaders(State3);
         none ->
             %% No peer ahead of us. If we have any peers, we're caught up.
             case maps:size(PeerHeights) > 0 andalso TipHeight > 0 of
@@ -327,9 +340,24 @@ select_best_peer(PeerHeights, OurHeight) ->
     end.
 
 %% Build block locator and send getheaders to the sync peer.
+%% When an HSS state is active (presync/redownload pipeline), use its locator
+%% (which may resume from m_last_header_received or m_redownload_buffer_last_hash
+%% respectively) rather than our persisted tip.
+%% Core: NextHeadersRequestLocator(), headerssync.cpp:296-317
 send_getheaders(#state{sync_peer = Peer, tip_height = TipHeight,
-                        tip_hash = TipHash} = State) ->
-    Locator = build_block_locator(TipHeight, TipHash),
+                        tip_hash = TipHash, hss_state = HssSt} = State) ->
+    Locator = case HssSt of
+        undefined ->
+            build_block_locator(TipHeight, TipHash);
+        _ ->
+            Phase = beamchain_headerssync:get_state(HssSt),
+            case Phase of
+                final ->
+                    build_block_locator(TipHeight, TipHash);
+                _ ->
+                    beamchain_headerssync:next_headers_request_locator(HssSt)
+            end
+    end,
     Msg = #{
         version => ?PROTOCOL_VERSION,
         locators => Locator,
@@ -398,6 +426,49 @@ process_headers([], _Peer, State) ->
     %% Check if we should try another peer or declare complete
     logger:info("header_sync: peer sent 0 headers, checking if in sync"),
     check_sync_complete(State);
+
+process_headers(Headers, Peer, #state{hss_state = HssSt} = State)
+  when HssSt =/= undefined ->
+    %% Route through the PRESYNC/REDOWNLOAD anti-DoS pipeline.
+    %% Core: ProcessNextHeaders(), headerssync.cpp:68-137
+    FullMsg = length(Headers) >= ?MAX_HEADERS_RESULTS,
+    case beamchain_headerssync:process_next_headers(Headers, FullMsg, HssSt) of
+        {ok, ReadyHeaders, RequestMore, HssSt2} ->
+            Phase = beamchain_headerssync:get_state(HssSt2),
+            State2 = State#state{hss_state = HssSt2},
+            %% Accept any headers released by the buffer into the block index.
+            State3 = case ReadyHeaders of
+                [] -> State2;
+                _  ->
+                    case validate_and_store_headers(ReadyHeaders, State2) of
+                        {ok, S} -> S;
+                        {error, _Reason, S} ->
+                            %% Already logged; treat as misbehaving
+                            beamchain_peer:add_misbehavior(Peer, 20),
+                            S
+                    end
+            end,
+            case Phase of
+                final ->
+                    %% Pipeline completed — clear HSS state.
+                    State4 = State3#state{hss_state = undefined},
+                    case RequestMore of
+                        true  -> send_getheaders(State4);
+                        false -> check_sync_complete(State4)
+                    end;
+                _ ->
+                    case RequestMore of
+                        true  -> send_getheaders(State3);
+                        false -> check_sync_complete(State3)
+                    end
+            end;
+        {error, _Reason, _HssSt2} ->
+            %% Bad peer — disconnect and try another
+            logger:warning("header_sync: HSS pipeline error from peer ~p: ~p",
+                           [Peer, _Reason]),
+            State2 = State#state{hss_state = undefined},
+            handle_misbehaving_peer(Peer, 100, State2)
+    end;
 
 process_headers(Headers, Peer, State) ->
     %% Check if headers connect to our chain
@@ -1072,6 +1143,57 @@ cancel_timer(#state{timer_ref = Ref} = State) ->
     %% Flush any pending timeout message
     receive getheaders_timeout -> ok after 0 -> ok end,
     State#state{timer_ref = undefined}.
+
+%%% ===================================================================
+%%% Internal: PRESYNC/REDOWNLOAD pipeline initialisation
+%%% ===================================================================
+
+%% Initialise a per-peer HeadersSyncState (beamchain_headerssync) when our
+%% persisted tip chainwork is below the network minimum.
+%%
+%% If we are already above min_chainwork, the pipeline is not needed —
+%% the peer can be trusted to be on the real chain and we process headers
+%% directly.  This matches Core's logic in net_processing.cpp where
+%% HeadersSyncState is only created when pindexBestHeader chainwork is
+%% below nMinimumChainWork.
+-spec maybe_init_hss(pid(), #state{}) -> #state{}.
+maybe_init_hss(Peer, #state{tip_chainwork = TipCW,
+                              tip_height = TipHeight,
+                              tip_hash = TipHash,
+                              params = Params} = State) ->
+    MinChainwork = maps:get(min_chainwork, Params, <<0:256>>),
+    MinCWInt = binary:decode_unsigned(MinChainwork, big),
+    TipCWInt = binary:decode_unsigned(TipCW, big),
+    case TipCWInt >= MinCWInt of
+        true ->
+            %% Already above minimum chain work — no presync pipeline needed.
+            State#state{hss_state = undefined};
+        false ->
+            %% Below minimum_required_work: create the PRESYNC state.
+            %% chain_start = current tip (fork point for this peer's headers).
+            Network = beamchain_config:network(),
+            MTPPast = compute_mtp(State#state.mtp_window),
+            ChainStart = #{
+                height   => TipHeight,
+                hash     => TipHash,
+                chainwork => TipCWInt,
+                bits     => tip_bits(State),
+                mtp_past => MTPPast
+            },
+            HssSt = beamchain_headerssync:new(
+                        Peer, Params, ChainStart, MinCWInt, Network),
+            logger:info("header_sync: peer=~p starting presync pipeline "
+                        "(tip_work=~B < min_work=~B)",
+                        [Peer, TipCWInt, MinCWInt]),
+            State#state{hss_state = HssSt}
+    end.
+
+%% Return the nBits of the current tip block (needed for HSS chain_start).
+tip_bits(#state{tip_height = H}) ->
+    case beamchain_db:get_block_index(H) of
+        {ok, #{header := Hdr}} -> Hdr#block_header.bits;
+        _                      -> 16#1d00ffff   %% genesis default
+    end.
 
 %% Encode a chainwork integer as a minimal big-endian binary,
 %% padded to at least 32 bytes.
