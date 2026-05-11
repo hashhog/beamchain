@@ -42,6 +42,12 @@
 -export([get_mining_order/0, get_all_clusters/0]).
 -export([linearize_cluster/1]).  %% Exported for testing
 -export([uf_union/3, uf_get_cluster_members/2]).  %% Union-find utilities for debugging
+%% Policy constant accessors — for tests to verify Core parity without include leakage
+-export([cluster_count_limit/0, cluster_vbytes_limit/0]).
+%% Internal functions exported for unit-testing
+-export([compute_ancestors_for_test/3,
+         check_descendant_limits_for_test/2,
+         check_cluster_limits_for_test/2]).
 
 %% TRUC (v3 transaction) policy checks - exported for testing
 -export([check_truc_rules/3]).
@@ -71,7 +77,12 @@
 -define(MAX_ORPHAN_TXS, 100).
 -define(ORPHAN_TX_EXPIRE_TIME, 1200).      % 20 minutes
 %% MAX_RBF_EVICTIONS = 100 is now in beamchain_protocol.hrl as ?MAX_RBF_EVICTIONS.
--define(MAX_CLUSTER_SIZE, 100).            % Max transactions per cluster
+%% Cluster limits — mirrors Bitcoin Core policy/policy.h:72-74 (DEFAULT_CLUSTER_LIMIT=64,
+%% DEFAULT_CLUSTER_SIZE_LIMIT_KVB=101).
+-define(MAX_CLUSTER_COUNT, 64).            % Max transactions per cluster (Core DEFAULT_CLUSTER_LIMIT)
+-define(MAX_CLUSTER_VBYTES, 101000).       % Max total vbytes per cluster (Core 101 kvB)
+%% Legacy alias kept for recompute_cluster internal use; must equal MAX_CLUSTER_COUNT.
+-define(MAX_CLUSTER_SIZE, 64).
 
 %%% -------------------------------------------------------------------
 %%% ETS table names
@@ -532,6 +543,12 @@ do_add_transaction(Tx, State) ->
         AncCount =< ?MAX_ANCESTOR_COUNT orelse throw(too_long_mempool_chain),
         AncSize =< ?MAX_ANCESTOR_SIZE orelse throw(too_long_mempool_chain),
         check_descendant_limits(Tx, VSize),
+
+        %% 11b. cluster limits (Core validation.cpp:1341-1344, policy.h:72-74)
+        %% Must check BEFORE inserting: count+vbytes of the cluster that would
+        %% form after adding this tx.  Core uses CheckMemPoolPolicyLimits() which
+        %% queries the pending changeset; we compute it eagerly from parent clusters.
+        check_cluster_limits(Tx, VSize),
 
         %% 12. check coinbase maturity for mempool spending
         %% TipHash and TipHeight were already fetched at step 3b above.
@@ -1070,6 +1087,9 @@ accept_package_txs(TxEntries, EphemeralDeps, State) ->
         AncSize =< ?MAX_ANCESTOR_SIZE orelse throw(too_long_mempool_chain),
         check_descendant_limits(Tx, VSize),
 
+        %% Cluster limits (package path)
+        check_cluster_limits(Tx, VSize),
+
         %% TRUC checks for package transactions
         MempoolParentTxids = get_parent_txids(Tx),
         case check_truc_package_rules(Tx, VSize, PackageTxMap, MempoolParentTxids) of
@@ -1132,6 +1152,28 @@ lookup_inputs(#transaction{inputs = Inputs}) ->
         true -> throw(orphan);
         false -> {lists:reverse(Coins), AnyCoinbase}
     end.
+
+%%% ===================================================================
+%%% Policy constant accessors (for test verification of Core parity)
+%%% ===================================================================
+
+%% @doc Max transactions in a cluster — Core DEFAULT_CLUSTER_LIMIT (policy.h:72)
+cluster_count_limit() -> ?MAX_CLUSTER_COUNT.
+
+%% @doc Max vbytes in a cluster — Core DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000 (policy.h:74)
+cluster_vbytes_limit() -> ?MAX_CLUSTER_VBYTES.
+
+%% @doc Test-exported wrapper for compute_ancestors/3.
+compute_ancestors_for_test(Tx, Fee, VSize) ->
+    compute_ancestors(Tx, Fee, VSize).
+
+%% @doc Test-exported wrapper for check_descendant_limits/2.
+check_descendant_limits_for_test(Tx, VSize) ->
+    check_descendant_limits(Tx, VSize).
+
+%% @doc Test-exported wrapper for check_cluster_limits/2.
+check_cluster_limits_for_test(Tx, VSize) ->
+    check_cluster_limits(Tx, VSize).
 
 %%% ===================================================================
 %%% Internal: standardness checks
@@ -1949,6 +1991,70 @@ check_desc_limits_walk([Txid | Rest], VSize, Visited) ->
                     check_desc_limits_walk(Parents ++ Rest, VSize, [Txid | Visited]);
                 [] ->
                     check_desc_limits_walk(Rest, VSize, Visited)
+            end
+    end.
+
+%% @doc Pre-acceptance cluster limit gate (Core validation.cpp:1341-1344,
+%% policy/policy.h:72-74).
+%%
+%% Computes the cluster that would result from adding Tx (by unioning the
+%% clusters of its in-mempool parents).  Throws too_large_cluster if the
+%% resulting cluster would exceed either:
+%%   - MAX_CLUSTER_COUNT (64 txs)  — Core DEFAULT_CLUSTER_LIMIT
+%%   - MAX_CLUSTER_VBYTES (101,000 vbytes) — Core DEFAULT_CLUSTER_SIZE_LIMIT_KVB*1000
+%%
+%% We read existing cluster data from the ETS table; the new tx is not yet
+%% inserted, so its VSize must be added explicitly.
+check_cluster_limits(Tx, VSize) ->
+    ParentTxids = get_parent_txids_from_inputs(Tx#transaction.inputs),
+    %% Collect the unique cluster ids that would be merged.
+    %% For each in-mempool parent, resolve its cluster root (the ETS key).
+    %% The union-find is gen_server-private, so we scan ETS cluster records.
+    ParentClusterIds = lists:usort(lists:filtermap(
+        fun(PTxid) ->
+            Root = find_cluster_for_txid(PTxid),
+            case ets:lookup(?MEMPOOL_CLUSTERS, Root) of
+                [{_, _}] -> {true, Root};
+                []       -> false
+            end
+        end, ParentTxids)),
+    %% Sum up count and vbytes across all unique clusters that will merge.
+    {CombinedCount, CombinedVBytes} = lists:foldl(
+        fun(ClusterId, {AC, AV}) ->
+            case ets:lookup(?MEMPOOL_CLUSTERS, ClusterId) of
+                [{_, CD}] ->
+                    {AC + length(CD#cluster_data.txids),
+                     AV + CD#cluster_data.total_vsize};
+                [] ->
+                    {AC, AV}
+            end
+        end,
+        {1, VSize},   %% start: the new tx itself counts as 1 tx, VSize vbytes
+        ParentClusterIds),
+    CombinedCount =< ?MAX_CLUSTER_COUNT
+        orelse throw(too_large_cluster),
+    CombinedVBytes =< ?MAX_CLUSTER_VBYTES
+        orelse throw(too_large_cluster),
+    ok.
+
+%% @doc Find the cluster root id for a txid by scanning cluster records.
+%% Falls back to the txid itself if not found (conservative: no cluster).
+find_cluster_for_txid(Txid) ->
+    %% Fast path: if the txid is itself a cluster root.
+    case ets:lookup(?MEMPOOL_CLUSTERS, Txid) of
+        [{_, _}] -> Txid;
+        [] ->
+            %% Scan all clusters for membership.
+            Found = ets:foldl(
+                fun({ClusterId, CD}, Acc) ->
+                    case lists:member(Txid, CD#cluster_data.txids) of
+                        true -> {found, ClusterId};
+                        false -> Acc
+                    end
+                end, not_found, ?MEMPOOL_CLUSTERS),
+            case Found of
+                {found, Root} -> Root;
+                not_found -> Txid  %% treat as its own singleton cluster
             end
     end.
 
@@ -3140,13 +3246,13 @@ recompute_cluster(ClusterId, UnionFind) ->
     AllTxids = [T || T <- maps:keys(UnionFind),
                      element(1, uf_find(T, UnionFind)) =:= ClusterId],
 
-    %% Check cluster size limit
+    %% Check cluster size limit — should never trigger post-acceptance because
+    %% check_cluster_limits/2 guards at admission time; defensive belt-and-suspenders.
     case length(AllTxids) > ?MAX_CLUSTER_SIZE of
         true ->
-            %% Cluster too large - this shouldn't happen with normal mempool limits
-            %% but handle gracefully by keeping existing linearization
-            logger:warning("mempool: cluster ~s exceeds size limit (~B txs)",
-                          [short_hex(ClusterId), length(AllTxids)]),
+            logger:error("mempool: BUG cluster ~s exceeds limit (~B txs > ~B) — "
+                         "check_cluster_limits/2 should have prevented this",
+                         [short_hex(ClusterId), length(AllTxids), ?MAX_CLUSTER_SIZE]),
             ok;
         false ->
             %% Recompute linearization
