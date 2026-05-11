@@ -313,23 +313,36 @@ contextual_check_block(#block{header = Header, transactions = Txs},
         (CbSigLen >= 2 andalso CbSigLen =< 100)
             orelse throw(bad_coinbase_length),
 
-        %% 4. BIP 141: witness commitment in coinbase.
-        %% Bitcoin Core CheckWitnessMalleation (validation.cpp:3870-3901) validates
-        %% the commitment whenever a commitment OP_RETURN is PRESENT in the coinbase,
-        %% regardless of whether non-coinbase transactions carry witness data.
-        %% The previous guard (HasWitnessTx on tl(Txs)) was wrong — it skipped
-        %% the recomputation when the commitment existed but no non-coinbase tx
-        %% had witness data, allowing a crafted wrong commitment to pass.
+        %% 4. BIP 141: witness commitment / malleation check.
+        %% Bitcoin Core: ContextualCheckBlock calls CheckWitnessMalleation with
+        %%   expect_witness_commitment = DeploymentActiveAfter(segwit)
+        %% (validation.cpp:4169, CheckWitnessMalleation:3870-3916).
+        %%
+        %% Two distinct sub-cases:
+        %%
+        %% Case A — segwit active (Height >= SegwitHeight):
+        %%   If commitment output present → verify nonce (exactly 1×32-byte witness
+        %%   stack item on coinbase input[0]) and merkle hash match.
+        %%   If no commitment output → reject any block where ANY tx has witness data
+        %%   ("unexpected-witness").
+        %%
+        %% Case B — segwit NOT yet active (Height < SegwitHeight):
+        %%   Reject any block where ANY tx has witness data ("unexpected-witness").
+        %%   Core: CheckWitnessMalleation called with expect_witness_commitment=false;
+        %%   it falls through to the unexpected-witness loop (validation.cpp:3905-3913).
+        %%
+        %% Bug-fix W77: case B was missing — pre-segwit blocks with witness data
+        %% were silently accepted instead of rejected.
         SegwitHeight = maps:get(segwit_height, Params, 0),
+        WitnessCommitmentPrefix = <<16#6a, 16#24, 16#aa, 16#21, 16#a9, 16#ed>>,
+        HasCommitmentOutput = lists:any(
+            fun(#tx_out{script_pubkey = SPK}) ->
+                byte_size(SPK) >= 38 andalso
+                binary:part(SPK, 0, 6) =:= WitnessCommitmentPrefix
+            end, CoinbaseTx#transaction.outputs),
         case Height >= SegwitHeight of
             true ->
-                %% Check if commitment output is present in coinbase
-                WitnessCommitmentPrefix = <<16#6a, 16#24, 16#aa, 16#21, 16#a9, 16#ed>>,
-                HasCommitmentOutput = lists:any(
-                    fun(#tx_out{script_pubkey = SPK}) ->
-                        byte_size(SPK) >= 38 andalso
-                        binary:part(SPK, 0, 6) =:= WitnessCommitmentPrefix
-                    end, CoinbaseTx#transaction.outputs),
+                %% Case A: segwit active.
                 case HasCommitmentOutput of
                     true ->
                         %% Commitment is present — always recompute and verify
@@ -339,11 +352,19 @@ contextual_check_block(#block{header = Header, transactions = Txs},
                         %% No commitment output. Reject if any tx has witness data.
                         HasWitnessTx = lists:any(fun has_witness/1, Txs),
                         case HasWitnessTx of
-                            true -> throw(missing_witness_commitment);
+                            true -> throw(unexpected_witness);
                             false -> ok
                         end
                 end;
-            false -> ok
+            false ->
+                %% Case B: segwit not yet active.
+                %% Reject if any tx (including coinbase) carries witness data.
+                %% Core validation.cpp:3905-3913.
+                HasWitnessTxPreSegwit = lists:any(fun has_witness/1, Txs),
+                case HasWitnessTxPreSegwit of
+                    true -> throw(unexpected_witness);
+                    false -> ok
+                end
         end,
 
         ok
@@ -427,10 +448,16 @@ check_witness_commitment(CoinbaseTx, AllTxs) ->
             <<_:6/binary, ExpectedCommitment:32/binary, _/binary>> = CommitSPK,
 
             %% get witness nonce from coinbase witness
+            %% Core validation.cpp:3880-3884:
+            %%   witness_stack.size() != 1 || witness_stack[0].size() != 32
+            %%   → "bad-witness-nonce-size"
+            %% The stack must have EXACTLY one 32-byte element.
+            %% Bug-fix W77: pattern [Nonce | _] accepted stacks with 2+ items;
+            %% must be [Nonce] (exactly-one-element list).
             [CbInput | _] = CoinbaseTx#transaction.inputs,
             WitnessNonce = case CbInput#tx_in.witness of
-                [Nonce | _] when byte_size(Nonce) =:= 32 -> Nonce;
-                _ -> throw(bad_witness_nonce)
+                [Nonce] when byte_size(Nonce) =:= 32 -> Nonce;
+                _ -> throw(bad_witness_nonce_size)
             end,
 
             %% compute expected commitment

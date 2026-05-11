@@ -1451,3 +1451,466 @@ tx_sigop_vsize_active_adjustment_test() ->
 %% DEFAULT_BYTES_PER_SIGOP constant must be 20 (Core policy/policy.h:50).
 default_bytes_per_sigop_constant_test() ->
     ?assertEqual(20, ?DEFAULT_BYTES_PER_SIGOP).
+
+%%% ===================================================================
+%%% W77 — BIP-141 witness commitment comprehensive audit
+%%% Reference: Bitcoin Core validation.cpp:3864-3916 (CheckWitnessMalleation),
+%%%            validation.cpp:4161-4181 (ContextualCheckBlock witness section),
+%%%            consensus/validation.h:15,18,147-165 (GetWitnessCommitmentIndex),
+%%%            consensus/merkle.cpp:76-85 (BlockWitnessMerkleRoot).
+%%%
+%%% Constants: NO_WITNESS_COMMITMENT=-1, MINIMUM_WITNESS_COMMITMENT=38.
+%%% Magic:     OP_RETURN(0x6a) 0x24 0xaa 0x21 0xa9 0xed
+%%%
+%%% 12 gates tested:
+%%%  G1  Commitment magic prefix (6 bytes) correctly identified
+%%%  G2  Minimum commitment output length = 38 bytes enforced
+%%%  G3  Last matching output is used when multiple present
+%%%  G4  Nonce stack must have exactly 1 element (BUG-FIX W77)
+%%%  G5  Nonce element must be exactly 32 bytes
+%%%  G6  Witness merkle root computed correctly (coinbase wtxid = 0)
+%%%  G7  SHA256d(witness_root || nonce) matches commitment bytes [6..38]
+%%%  G8  Bad commitment hash rejected
+%%%  G9  Valid full witness commitment accepted
+%%% G10  Segwit active + no commitment + no witness data → accepted
+%%% G11  Segwit active + no commitment + witness data → unexpected_witness
+%%% G12  Pre-segwit + witness data on non-coinbase tx → unexpected_witness (BUG-FIX W77)
+%%% ===================================================================
+
+%% --- W77 helpers ---
+
+%% OP_RETURN commitment prefix (6 bytes)
+witness_commitment_prefix() ->
+    <<16#6a, 16#24, 16#aa, 16#21, 16#a9, 16#ed>>.
+
+%% Build a 38-byte commitment scriptPubKey with the given 32-byte hash.
+commitment_spk(Hash32) ->
+    <<(witness_commitment_prefix())/binary, Hash32:32/binary>>.
+
+%% Build a regtest-like params map with segwit active at height 0.
+w77_params_segwit_active() ->
+    #{bip34_height => 0, segwit_height => 0, csv_height => 0}.
+
+%% Build a params map with segwit NOT active until height 1000.
+w77_params_segwit_inactive() ->
+    #{bip34_height => 0, segwit_height => 1000, csv_height => 0}.
+
+%% Build a PrevIndex for height H-1 (so block height = H).
+w77_prev_index(PrevHeight) ->
+    #{height => PrevHeight,
+      header => #block_header{
+          version = 1, prev_hash = <<0:256>>,
+          merkle_root = <<0:256>>,
+          timestamp = 1296688602, bits = 16#207fffff, nonce = 0
+      },
+      mtp_timestamps => lists:duplicate(11, 1296688000)}.
+
+%% Build a coinbase tx with the given witness nonce (a binary or [] or undefined)
+%% and commitment output hash.  ScriptSig is 4 bytes (valid BIP-34 at height > 0).
+w77_coinbase_with_commitment(WitnessStack, CommitHash) ->
+    #transaction{
+        version = 1,
+        inputs = [#tx_in{
+            prev_out = #outpoint{hash = <<0:256>>, index = 16#ffffffff},
+            script_sig = <<16#51, 0, 0, 0>>,   %% BIP-34: OP_1 for height=1
+            sequence = 16#ffffffff,
+            witness = WitnessStack
+        }],
+        outputs = [
+            #tx_out{value = 5000000000,
+                    script_pubkey = <<16#76, 16#a9, 16#14, 0:160, 16#88, 16#ac>>},
+            #tx_out{value = 0,
+                    script_pubkey = commitment_spk(CommitHash)}
+        ],
+        locktime = 0,
+        txid = undefined, wtxid = undefined
+    }.
+
+%% Build a coinbase with no commitment output.
+w77_coinbase_no_commitment(WitnessStack) ->
+    #transaction{
+        version = 1,
+        inputs = [#tx_in{
+            prev_out = #outpoint{hash = <<0:256>>, index = 16#ffffffff},
+            script_sig = <<16#51, 0, 0, 0>>,   %% BIP-34: OP_1 for height=1
+            sequence = 16#ffffffff,
+            witness = WitnessStack
+        }],
+        outputs = [
+            #tx_out{value = 5000000000,
+                    script_pubkey = <<16#76, 16#a9, 16#14, 0:160, 16#88, 16#ac>>}
+        ],
+        locktime = 0,
+        txid = undefined, wtxid = undefined
+    }.
+
+%% Build a non-coinbase tx with no witness data.
+w77_regular_tx_no_witness() ->
+    #transaction{
+        version = 1,
+        inputs = [#tx_in{prev_out = #outpoint{hash = <<1:256>>, index = 0},
+                         script_sig = <<>>, sequence = 16#ffffffff, witness = []}],
+        outputs = [#tx_out{value = 0, script_pubkey = <<16#6a>>}],
+        locktime = 0, txid = undefined, wtxid = undefined
+    }.
+
+%% Build a non-coinbase tx WITH witness data.
+w77_regular_tx_with_witness() ->
+    #transaction{
+        version = 1,
+        inputs = [#tx_in{prev_out = #outpoint{hash = <<2:256>>, index = 0},
+                         script_sig = <<>>, sequence = 16#ffffffff,
+                         witness = [<<1,2,3,4>>]}],
+        outputs = [#tx_out{value = 0, script_pubkey = <<16#6a>>}],
+        locktime = 0, txid = undefined, wtxid = undefined
+    }.
+
+%% Compute the correct witness commitment for a list of transactions
+%% (including coinbase as first element).
+w77_compute_correct_commitment(Txs, Nonce) ->
+    [_Cb | Rest] = Txs,
+    Wtxids = [<<0:256>> | [beamchain_serialize:wtx_hash(Tx) || Tx <- Rest]],
+    beamchain_serialize:compute_witness_commitment(Wtxids, Nonce).
+
+%% Build a minimal block from a tx list, computing the correct merkle root.
+w77_block(Txs) ->
+    Hashes = [beamchain_serialize:tx_hash(Tx) || Tx <- Txs],
+    MerkleRoot = beamchain_serialize:compute_merkle_root(Hashes),
+    Header = #block_header{
+        version = 1, prev_hash = <<0:256>>, merkle_root = MerkleRoot,
+        timestamp = 1296688700, bits = 16#207fffff, nonce = 0
+    },
+    #block{header = Header, transactions = Txs,
+           hash = undefined, height = undefined, size = undefined, weight = undefined}.
+
+%% --- G1: commitment magic prefix correctly identified ---
+%% A coinbase output that starts with the 6-byte prefix is recognised.
+w77_g1_commitment_prefix_recognised_test() ->
+    Nonce = <<0:256>>,
+    RegularTx = w77_regular_tx_no_witness(),
+    Txs0 = [w77_coinbase_no_commitment([Nonce]), RegularTx],
+    CommitHash = w77_compute_correct_commitment(Txs0, Nonce),
+    Cb = w77_coinbase_with_commitment([Nonce], CommitHash),
+    Txs = [Cb, RegularTx],
+    Block = w77_block(Txs),
+    Params = w77_params_segwit_active(),
+    PrevIdx = w77_prev_index(0),
+    ?assertEqual(ok,
+        beamchain_validation:contextual_check_block(Block, 1, PrevIdx, Params)).
+
+%% --- G2: commitment output shorter than 38 bytes not matched ---
+%% A 37-byte output starting with the prefix is not treated as a commitment
+%% → no commitment found → tx with witness data → unexpected_witness.
+w77_g2_commitment_too_short_not_matched_test() ->
+    %% Build a 37-byte "almost-commitment" output: prefix (6) + 31 bytes of hash
+    ShortSPK = <<(witness_commitment_prefix())/binary, 0:248>>,   %% 6+31=37 bytes
+    Nonce = <<0:256>>,
+    Cb = #transaction{
+        version = 1,
+        inputs = [#tx_in{
+            prev_out = #outpoint{hash = <<0:256>>, index = 16#ffffffff},
+            script_sig = <<16#51, 0, 0, 0>>,   %% BIP-34: OP_1 for height=1
+            sequence = 16#ffffffff,
+            witness = [Nonce]
+        }],
+        outputs = [
+            #tx_out{value = 5000000000,
+                    script_pubkey = <<16#76, 16#a9, 16#14, 0:160, 16#88, 16#ac>>},
+            #tx_out{value = 0, script_pubkey = ShortSPK}
+        ],
+        locktime = 0, txid = undefined, wtxid = undefined
+    },
+    RegularTx = w77_regular_tx_with_witness(),
+    Txs = [Cb, RegularTx],
+    Block = w77_block(Txs),
+    Params = w77_params_segwit_active(),
+    PrevIdx = w77_prev_index(0),
+    %% Short output not matched → no commitment → witness data present → error
+    ?assertEqual({error, unexpected_witness},
+        beamchain_validation:contextual_check_block(Block, 1, PrevIdx, Params)).
+
+%% --- G3: last matching output is used ---
+%% When two outputs match the prefix, the LAST one must be used.
+%% We set the first to a wrong hash and the second to the correct one.
+w77_g3_last_matching_output_used_test() ->
+    Nonce = <<0:256>>,
+    RegularTx = w77_regular_tx_no_witness(),
+    Txs0 = [w77_coinbase_no_commitment([Nonce]), RegularTx],
+    CorrectHash = w77_compute_correct_commitment(Txs0, Nonce),
+    WrongHash = <<1:256>>,
+    Cb = #transaction{
+        version = 1,
+        inputs = [#tx_in{
+            prev_out = #outpoint{hash = <<0:256>>, index = 16#ffffffff},
+            script_sig = <<16#51, 0, 0, 0>>,   %% BIP-34: OP_1 for height=1
+            sequence = 16#ffffffff,
+            witness = [Nonce]
+        }],
+        outputs = [
+            %% First output: wrong hash
+            #tx_out{value = 0, script_pubkey = commitment_spk(WrongHash)},
+            %% Last output: correct hash — Core uses this one
+            #tx_out{value = 0, script_pubkey = commitment_spk(CorrectHash)}
+        ],
+        locktime = 0, txid = undefined, wtxid = undefined
+    },
+    Txs = [Cb, RegularTx],
+    Block = w77_block(Txs),
+    Params = w77_params_segwit_active(),
+    PrevIdx = w77_prev_index(0),
+    ?assertEqual(ok,
+        beamchain_validation:contextual_check_block(Block, 1, PrevIdx, Params)).
+
+%% G3b: first correct, last wrong → rejected (last wins).
+w77_g3b_last_wins_first_correct_last_wrong_test() ->
+    Nonce = <<0:256>>,
+    RegularTx = w77_regular_tx_no_witness(),
+    Txs0 = [w77_coinbase_no_commitment([Nonce]), RegularTx],
+    CorrectHash = w77_compute_correct_commitment(Txs0, Nonce),
+    WrongHash = <<1:256>>,
+    Cb = #transaction{
+        version = 1,
+        inputs = [#tx_in{
+            prev_out = #outpoint{hash = <<0:256>>, index = 16#ffffffff},
+            script_sig = <<16#51, 0, 0, 0>>,   %% BIP-34: OP_1 for height=1
+            sequence = 16#ffffffff,
+            witness = [Nonce]
+        }],
+        outputs = [
+            #tx_out{value = 0, script_pubkey = commitment_spk(CorrectHash)},
+            #tx_out{value = 0, script_pubkey = commitment_spk(WrongHash)}
+        ],
+        locktime = 0, txid = undefined, wtxid = undefined
+    },
+    Txs = [Cb, RegularTx],
+    Block = w77_block(Txs),
+    Params = w77_params_segwit_active(),
+    PrevIdx = w77_prev_index(0),
+    ?assertEqual({error, bad_witness_commitment},
+        beamchain_validation:contextual_check_block(Block, 1, PrevIdx, Params)).
+
+%% --- G4: nonce stack must have exactly 1 element (BUG-FIX W77) ---
+%% Core: witness_stack.size() != 1 → "bad-witness-nonce-size"
+%% Before fix: [Nonce | _] accepted 2-element stacks.
+w77_g4_nonce_stack_two_elements_rejected_test() ->
+    Nonce = <<0:256>>,
+    RegularTx = w77_regular_tx_no_witness(),
+    Txs0 = [w77_coinbase_no_commitment([Nonce]), RegularTx],
+    CommitHash = w77_compute_correct_commitment(Txs0, Nonce),
+    %% Stack has 2 elements (nonce + extra) — Core rejects this
+    Cb = w77_coinbase_with_commitment([Nonce, <<99:256>>], CommitHash),
+    Txs = [Cb, RegularTx],
+    Block = w77_block(Txs),
+    Params = w77_params_segwit_active(),
+    PrevIdx = w77_prev_index(0),
+    ?assertEqual({error, bad_witness_nonce_size},
+        beamchain_validation:contextual_check_block(Block, 1, PrevIdx, Params)).
+
+%% G4b: empty witness stack → bad_witness_nonce_size.
+w77_g4b_empty_nonce_stack_rejected_test() ->
+    Nonce = <<0:256>>,
+    RegularTx = w77_regular_tx_no_witness(),
+    Txs0 = [w77_coinbase_no_commitment([Nonce]), RegularTx],
+    CommitHash = w77_compute_correct_commitment(Txs0, Nonce),
+    Cb = w77_coinbase_with_commitment([], CommitHash),
+    Txs = [Cb, RegularTx],
+    Block = w77_block(Txs),
+    Params = w77_params_segwit_active(),
+    PrevIdx = w77_prev_index(0),
+    ?assertEqual({error, bad_witness_nonce_size},
+        beamchain_validation:contextual_check_block(Block, 1, PrevIdx, Params)).
+
+%% G4c: undefined witness → bad_witness_nonce_size.
+w77_g4c_undefined_witness_rejected_test() ->
+    Nonce = <<0:256>>,
+    RegularTx = w77_regular_tx_no_witness(),
+    Txs0 = [w77_coinbase_no_commitment([Nonce]), RegularTx],
+    CommitHash = w77_compute_correct_commitment(Txs0, Nonce),
+    Cb = w77_coinbase_with_commitment(undefined, CommitHash),
+    Txs = [Cb, RegularTx],
+    Block = w77_block(Txs),
+    Params = w77_params_segwit_active(),
+    PrevIdx = w77_prev_index(0),
+    ?assertEqual({error, bad_witness_nonce_size},
+        beamchain_validation:contextual_check_block(Block, 1, PrevIdx, Params)).
+
+%% --- G5: nonce element must be exactly 32 bytes ---
+%% Core: witness_stack[0].size() != 32 → "bad-witness-nonce-size"
+w77_g5_nonce_too_short_rejected_test() ->
+    ShortNonce = <<0:248>>,   %% 31 bytes
+    Txs0 = [w77_coinbase_no_commitment([ShortNonce]), w77_regular_tx_no_witness()],
+    CommitHash = w77_compute_correct_commitment(Txs0, <<ShortNonce/binary, 0>>),
+    Cb = w77_coinbase_with_commitment([ShortNonce], CommitHash),
+    Txs = [Cb, w77_regular_tx_no_witness()],
+    Block = w77_block(Txs),
+    Params = w77_params_segwit_active(),
+    PrevIdx = w77_prev_index(0),
+    ?assertEqual({error, bad_witness_nonce_size},
+        beamchain_validation:contextual_check_block(Block, 1, PrevIdx, Params)).
+
+w77_g5b_nonce_too_long_rejected_test() ->
+    LongNonce = <<0:264>>,    %% 33 bytes
+    RegularTx = w77_regular_tx_no_witness(),
+    Txs0 = [w77_coinbase_no_commitment([LongNonce]), RegularTx],
+    CommitHash = w77_compute_correct_commitment(Txs0, <<0:256>>),
+    Cb = w77_coinbase_with_commitment([LongNonce], CommitHash),
+    Txs = [Cb, RegularTx],
+    Block = w77_block(Txs),
+    Params = w77_params_segwit_active(),
+    PrevIdx = w77_prev_index(0),
+    ?assertEqual({error, bad_witness_nonce_size},
+        beamchain_validation:contextual_check_block(Block, 1, PrevIdx, Params)).
+
+%% --- G6 + G7: correct commitment accepted ---
+%% Full round-trip: compute correct commitment, verify it is accepted.
+w77_g6_g7_correct_commitment_accepted_test() ->
+    Nonce = crypto:strong_rand_bytes(32),
+    RegularTx = w77_regular_tx_with_witness(),
+    Txs0 = [w77_coinbase_no_commitment([Nonce]), RegularTx],
+    CommitHash = w77_compute_correct_commitment(Txs0, Nonce),
+    Cb = w77_coinbase_with_commitment([Nonce], CommitHash),
+    Txs = [Cb, RegularTx],
+    Block = w77_block(Txs),
+    Params = w77_params_segwit_active(),
+    PrevIdx = w77_prev_index(0),
+    ?assertEqual(ok,
+        beamchain_validation:contextual_check_block(Block, 1, PrevIdx, Params)).
+
+%% Coinbase-only block (no non-coinbase txs): zero-nonce, correct commitment.
+w77_g6_coinbase_only_block_test() ->
+    Nonce = <<0:256>>,
+    Txs0 = [w77_coinbase_no_commitment([Nonce])],
+    CommitHash = w77_compute_correct_commitment(Txs0, Nonce),
+    Cb = w77_coinbase_with_commitment([Nonce], CommitHash),
+    Txs = [Cb],
+    Block = w77_block(Txs),
+    Params = w77_params_segwit_active(),
+    PrevIdx = w77_prev_index(0),
+    ?assertEqual(ok,
+        beamchain_validation:contextual_check_block(Block, 1, PrevIdx, Params)).
+
+%% --- G8: bad commitment hash rejected ---
+w77_g8_bad_commitment_hash_rejected_test() ->
+    Nonce = <<0:256>>,
+    RegularTx = w77_regular_tx_no_witness(),
+    WrongCommitHash = <<99:256>>,
+    Cb = w77_coinbase_with_commitment([Nonce], WrongCommitHash),
+    Txs = [Cb, RegularTx],
+    Block = w77_block(Txs),
+    Params = w77_params_segwit_active(),
+    PrevIdx = w77_prev_index(0),
+    ?assertEqual({error, bad_witness_commitment},
+        beamchain_validation:contextual_check_block(Block, 1, PrevIdx, Params)).
+
+%% G8b: correct hash but wrong nonce → bad_witness_commitment.
+w77_g8b_wrong_nonce_bad_commitment_test() ->
+    CorrectNonce = <<0:256>>,
+    WrongNonce = <<1:256>>,
+    RegularTx = w77_regular_tx_no_witness(),
+    Txs0 = [w77_coinbase_no_commitment([CorrectNonce]), RegularTx],
+    CommitHash = w77_compute_correct_commitment(Txs0, CorrectNonce),
+    %% Use wrong nonce in witness stack → SHA256d(root || wrong_nonce) ≠ commitment
+    Cb = w77_coinbase_with_commitment([WrongNonce], CommitHash),
+    Txs = [Cb, RegularTx],
+    Block = w77_block(Txs),
+    Params = w77_params_segwit_active(),
+    PrevIdx = w77_prev_index(0),
+    ?assertEqual({error, bad_witness_commitment},
+        beamchain_validation:contextual_check_block(Block, 1, PrevIdx, Params)).
+
+%% --- G10: segwit active + no commitment + no witness data → ok ---
+w77_g10_no_commitment_no_witness_ok_test() ->
+    Cb = w77_coinbase_no_commitment([]),
+    RegularTx = w77_regular_tx_no_witness(),
+    Txs = [Cb, RegularTx],
+    Block = w77_block(Txs),
+    Params = w77_params_segwit_active(),
+    PrevIdx = w77_prev_index(0),
+    ?assertEqual(ok,
+        beamchain_validation:contextual_check_block(Block, 1, PrevIdx, Params)).
+
+%% --- G11: segwit active + no commitment + witness data → unexpected_witness ---
+w77_g11_no_commitment_with_witness_rejected_test() ->
+    Cb = w77_coinbase_no_commitment([]),
+    RegularTxWithWitness = w77_regular_tx_with_witness(),
+    Txs = [Cb, RegularTxWithWitness],
+    Block = w77_block(Txs),
+    Params = w77_params_segwit_active(),
+    PrevIdx = w77_prev_index(0),
+    ?assertEqual({error, unexpected_witness},
+        beamchain_validation:contextual_check_block(Block, 1, PrevIdx, Params)).
+
+%% G11b: no commitment + coinbase has witness (no non-cb witness data) → unexpected_witness.
+%% A coinbase-only block where the coinbase has witness but no commitment output.
+w77_g11b_no_commitment_coinbase_witness_rejected_test() ->
+    %% Coinbase has witness but no commitment output
+    Cb = #transaction{
+        version = 1,
+        inputs = [#tx_in{
+            prev_out = #outpoint{hash = <<0:256>>, index = 16#ffffffff},
+            script_sig = <<16#51, 0, 0, 0>>,   %% BIP-34: OP_1 for height=1
+            sequence = 16#ffffffff,
+            witness = [<<0:256>>]   %% witness on coinbase, no commitment output
+        }],
+        outputs = [
+            #tx_out{value = 5000000000,
+                    script_pubkey = <<16#76, 16#a9, 16#14, 0:160, 16#88, 16#ac>>}
+        ],
+        locktime = 0, txid = undefined, wtxid = undefined
+    },
+    Txs = [Cb],
+    Block = w77_block(Txs),
+    Params = w77_params_segwit_active(),
+    PrevIdx = w77_prev_index(0),
+    ?assertEqual({error, unexpected_witness},
+        beamchain_validation:contextual_check_block(Block, 1, PrevIdx, Params)).
+
+%% --- G12: pre-segwit + witness data → unexpected_witness (BUG-FIX W77) ---
+%% Core validation.cpp:3905-3913: when expect_witness_commitment=false,
+%% ANY tx with witness data triggers "unexpected-witness".
+%% Before fix: beamchain did 'false -> ok' for Height < SegwitHeight.
+w77_g12_pre_segwit_witness_data_rejected_test() ->
+    Cb = w77_coinbase_no_commitment([]),
+    RegularTxWithWitness = w77_regular_tx_with_witness(),
+    Txs = [Cb, RegularTxWithWitness],
+    Block = w77_block(Txs),
+    %% segwit_height = 1000, block height = 1 → pre-segwit
+    Params = w77_params_segwit_inactive(),
+    PrevIdx = w77_prev_index(0),
+    ?assertEqual({error, unexpected_witness},
+        beamchain_validation:contextual_check_block(Block, 1, PrevIdx, Params)).
+
+%% G12b: pre-segwit + coinbase with witness → unexpected_witness.
+w77_g12b_pre_segwit_coinbase_witness_rejected_test() ->
+    Cb = w77_coinbase_no_commitment([<<0:256>>]),   %% coinbase has witness stack
+    Txs = [Cb],
+    Block = w77_block(Txs),
+    Params = w77_params_segwit_inactive(),
+    PrevIdx = w77_prev_index(0),
+    ?assertEqual({error, unexpected_witness},
+        beamchain_validation:contextual_check_block(Block, 1, PrevIdx, Params)).
+
+%% G12c: pre-segwit + NO witness data at all → ok.
+w77_g12c_pre_segwit_no_witness_ok_test() ->
+    Cb = w77_coinbase_no_commitment([]),
+    RegularTx = w77_regular_tx_no_witness(),
+    Txs = [Cb, RegularTx],
+    Block = w77_block(Txs),
+    Params = w77_params_segwit_inactive(),
+    PrevIdx = w77_prev_index(0),
+    ?assertEqual(ok,
+        beamchain_validation:contextual_check_block(Block, 1, PrevIdx, Params)).
+
+%% G9: valid commitment with non-zero nonce (randomised round-trip).
+w77_g9_nonzero_nonce_round_trip_test() ->
+    Nonce = <<16#deadbeef:32, 0:(256-32)>>,
+    RegularTx = w77_regular_tx_no_witness(),
+    Txs0 = [w77_coinbase_no_commitment([Nonce]), RegularTx],
+    CommitHash = w77_compute_correct_commitment(Txs0, Nonce),
+    Cb = w77_coinbase_with_commitment([Nonce], CommitHash),
+    Txs = [Cb, RegularTx],
+    Block = w77_block(Txs),
+    Params = w77_params_segwit_active(),
+    PrevIdx = w77_prev_index(0),
+    ?assertEqual(ok,
+        beamchain_validation:contextual_check_block(Block, 1, PrevIdx, Params)).
