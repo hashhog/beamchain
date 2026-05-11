@@ -10,7 +10,10 @@
 -define(MAX_BLOCK_SIGOPS_COST, 80000).
 -define(WITNESS_SCALE_FACTOR, 4).
 -define(MAX_BLOCK_SERIALIZED_SIZE, 4000000).
--define(MIN_TRANSACTION_WEIGHT, 60).
+%% Core consensus/consensus.h:23 — MIN_TRANSACTION_WEIGHT = WITNESS_SCALE_FACTOR * 60 = 240
+-define(MIN_TRANSACTION_WEIGHT, 240).
+%% Core consensus/consensus.h:24 — MIN_SERIALIZABLE_TRANSACTION_WEIGHT = WITNESS_SCALE_FACTOR * 10 = 40
+-define(MIN_SERIALIZABLE_TRANSACTION_WEIGHT, 40).
 
 %% Money
 -define(MAX_MONEY, 2100000000000000).   %% 21M BTC in satoshis
@@ -141,6 +144,8 @@
 %%% Policy constants (non-consensus)
 %%% -------------------------------------------------------------------
 
+%% Core policy/policy.h:50 — DEFAULT_BYTES_PER_SIGOP = 20
+-define(DEFAULT_BYTES_PER_SIGOP, 20).
 -define(DEFAULT_MIN_RELAY_TX_FEE, 1000).     %% sat/kvB
 -define(DEFAULT_MEMPOOL_MAX_SIZE, 300000000). %% 300 MB
 %% BIP-125 RBF constants (Core: util/rbf.h, policy/rbf.h)
