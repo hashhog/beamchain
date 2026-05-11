@@ -1884,29 +1884,43 @@ check_mempool_coinbase_maturity(InputCoins, NextHeight) ->
 
 %% @doc Check BIP 68 sequence locks for mempool acceptance.
 %% For mempool, we check if the tx would satisfy sequence locks in the next block.
+%% BIP-68/CSV must be active (csv_height reached) before enforcement.
+%% Mirrors Bitcoin Core MemPoolAccept::PreChecks → SequenceLocks only when
+%% LOCKTIME_VERIFY_SEQUENCE is set (validation.cpp:2529-2531).
 check_mempool_sequence_locks(#transaction{version = Version}, _InputCoins,
                              _TipHash, _NextHeight) when Version < 2 ->
     %% BIP 68 only applies to tx version >= 2
     ok;
 check_mempool_sequence_locks(Tx, InputCoins, TipHash, NextHeight) ->
-    %% Get the tip block index to compute MTP
-    TipIndex = case beamchain_db:get_block_index_by_hash(TipHash) of
-        {ok, TI} -> TI;
-        not_found -> throw(missing_tip_index)
-    end,
-    %% Calculate sequence lock pair for the next block
-    {MinHeight, MinTime} = beamchain_validation:calculate_sequence_lock_pair(
-        Tx, InputCoins, TipIndex),
-    %% Get the MTP of the current tip (which is pprev for the next block)
-    MTP = beamchain_validation:median_time_past(TipIndex),
-    %% Check if locks are satisfied for the next block
-    case MinHeight >= NextHeight of
-        true -> throw(sequence_lock_not_met);
-        false -> ok
-    end,
-    case MinTime >= MTP of
-        true -> throw(sequence_lock_not_met);
-        false -> ok
+    %% Gate on BIP-68 activation height.
+    Network = beamchain_config:network(),
+    ChainParams = beamchain_chain_params:params(Network),
+    CsvHeight = maps:get(csv_height, ChainParams, 419328),
+    %% For mempool, the next block is at NextHeight; BIP-68 active when
+    %% NextHeight >= CsvHeight (the next block will be the first to enforce).
+    case NextHeight >= CsvHeight of
+        false ->
+            ok;
+        true ->
+            %% Get the tip block index to compute MTP
+            TipIndex = case beamchain_db:get_block_index_by_hash(TipHash) of
+                {ok, TI} -> TI;
+                not_found -> throw(missing_tip_index)
+            end,
+            %% Calculate sequence lock pair for the next block
+            {MinHeight, MinTime} = beamchain_validation:calculate_sequence_lock_pair(
+                Tx, InputCoins, TipIndex),
+            %% Get the MTP of the current tip (which is pprev for the next block)
+            MTP = beamchain_validation:median_time_past(TipIndex),
+            %% Check if locks are satisfied for the next block
+            case MinHeight >= NextHeight of
+                true -> throw(sequence_lock_not_met);
+                false -> ok
+            end,
+            case MinTime >= MTP of
+                true -> throw(sequence_lock_not_met);
+                false -> ok
+            end
     end.
 
 %%% ===================================================================

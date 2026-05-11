@@ -645,6 +645,145 @@ op_csv_with_flag_test() ->
     {ok, [<<1>>]} = beamchain_script:eval_script(
         <<16#51, 16#b2>>, [], Flags, SigChecker, base).
 
+%% W80 BIP-112 additional gates
+
+%% Gate: OP_CSV empty stack → stack_underflow
+op_csv_empty_stack_test() ->
+    Flags = ?SCRIPT_VERIFY_CHECKSEQUENCEVERIFY,
+    SigChecker = #{check_sequence => fun(_) -> true end},
+    {error, stack_underflow} = beamchain_script:eval_script(
+        <<16#b2>>, [], Flags, SigChecker, base),
+    ok.
+
+%% Gate: OP_CSV with N < 0 → negative_sequence
+op_csv_negative_n_test() ->
+    Flags = ?SCRIPT_VERIFY_CHECKSEQUENCEVERIFY,
+    SigChecker = #{check_sequence => fun(_) -> true end},
+    %% OP_1NEGATE = 0x4f pushes -1
+    {error, negative_sequence} = beamchain_script:eval_script(
+        <<16#4f, 16#b2>>, [], Flags, SigChecker, base),
+    ok.
+
+%% Gate: OP_CSV N with DISABLE_FLAG set → NOP (even if check_sequence fails)
+op_csv_disable_flag_is_nop_test() ->
+    Flags = ?SCRIPT_VERIFY_CHECKSEQUENCEVERIFY,
+    SigChecker = #{check_sequence => fun(_) -> false end},
+    %% Encode DISABLE_FLAG = 1 bsl 31 = 2147483648 as 5-byte CScriptNum
+    DisableVal = 1 bsl 31,
+    DisableEnc = beamchain_script:encode_script_num(DisableVal),
+    PushLen = byte_size(DisableEnc),
+    Script = <<PushLen:8, DisableEnc/binary, 16#b2>>,
+    %% Should pass as NOP despite check_sequence returning false
+    {ok, _} = beamchain_script:eval_script(Script, [], Flags, SigChecker, base),
+    ok.
+
+%% Gate: OP_CSV passes when check_sequence returns true (basic)
+op_csv_check_sequence_pass_test() ->
+    Flags = ?SCRIPT_VERIFY_CHECKSEQUENCEVERIFY,
+    SigChecker = #{check_sequence => fun(_) -> true end},
+    {ok, [<<1>>]} = beamchain_script:eval_script(
+        <<16#51, 16#b2>>, [], Flags, SigChecker, base),
+    ok.
+
+%% Gate: OP_CSV fails when check_sequence returns false
+op_csv_check_sequence_fail_test() ->
+    Flags = ?SCRIPT_VERIFY_CHECKSEQUENCEVERIFY,
+    SigChecker = #{check_sequence => fun(_) -> false end},
+    {error, sequence_failed} = beamchain_script:eval_script(
+        <<16#51, 16#b2>>, [], Flags, SigChecker, base),
+    ok.
+
+%% Gate: OP_CSV with real tx sig_checker — BIP-112 v1 tx always fails
+op_csv_v1_tx_always_fails_test() ->
+    Tx = #transaction{
+        version = 1,
+        inputs = [#tx_in{prev_out = #outpoint{hash = <<1:256>>, index = 0},
+                         script_sig = <<>>, sequence = 100, witness = []}],
+        outputs = [#tx_out{value = 1000, script_pubkey = <<16#6a>>}],
+        locktime = 0
+    },
+    Flags = ?SCRIPT_VERIFY_CHECKSEQUENCEVERIFY,
+    SigChecker = {Tx, 0, 1000},
+    %% Script pushes 1, then CSV — v1 tx → check_sequence_impl returns false
+    {error, sequence_failed} = beamchain_script:eval_script(
+        <<16#51, 16#b2>>, [], Flags, SigChecker, base),
+    ok.
+
+%% Gate: OP_CSV with real tx — type mismatch (time vs height) → fail
+op_csv_type_mismatch_test() ->
+    InputSeq = 10,  %% height-based (no TYPE_FLAG)
+    Tx = #transaction{
+        version = 2,
+        inputs = [#tx_in{prev_out = #outpoint{hash = <<1:256>>, index = 0},
+                         script_sig = <<>>, sequence = InputSeq, witness = []}],
+        outputs = [#tx_out{value = 1000, script_pubkey = <<16#6a>>}],
+        locktime = 0
+    },
+    Flags = ?SCRIPT_VERIFY_CHECKSEQUENCEVERIFY,
+    SigChecker = {Tx, 0, 1000},
+    %% Script: time-based sequence (TYPE_FLAG | 5) — mismatch with height-based input
+    ScriptSeq = (1 bsl 22) bor 5,
+    ScriptSeqEnc = beamchain_script:encode_script_num(ScriptSeq),
+    PushLen = byte_size(ScriptSeqEnc),
+    Script = <<PushLen:8, ScriptSeqEnc/binary, 16#b2>>,
+    {error, sequence_failed} = beamchain_script:eval_script(
+        Script, [], Flags, SigChecker, base),
+    ok.
+
+%% Gate: OP_CSV with real tx — same type, script > tx value → fail
+op_csv_value_too_large_test() ->
+    InputSeq = 5,  %% height-based, 5 blocks
+    Tx = #transaction{
+        version = 2,
+        inputs = [#tx_in{prev_out = #outpoint{hash = <<1:256>>, index = 0},
+                         script_sig = <<>>, sequence = InputSeq, witness = []}],
+        outputs = [#tx_out{value = 1000, script_pubkey = <<16#6a>>}],
+        locktime = 0
+    },
+    Flags = ?SCRIPT_VERIFY_CHECKSEQUENCEVERIFY,
+    SigChecker = {Tx, 0, 1000},
+    ScriptSeqEnc = beamchain_script:encode_script_num(10),
+    PushLen = byte_size(ScriptSeqEnc),
+    Script = <<PushLen:8, ScriptSeqEnc/binary, 16#b2>>,
+    {error, sequence_failed} = beamchain_script:eval_script(
+        Script, [], Flags, SigChecker, base),
+    ok.
+
+%% Gate: OP_CSV with real tx — same type, script == tx value → pass
+op_csv_value_equal_test() ->
+    InputSeq = 10,
+    Tx = #transaction{
+        version = 2,
+        inputs = [#tx_in{prev_out = #outpoint{hash = <<1:256>>, index = 0},
+                         script_sig = <<>>, sequence = InputSeq, witness = []}],
+        outputs = [#tx_out{value = 1000, script_pubkey = <<16#6a>>}],
+        locktime = 0
+    },
+    Flags = ?SCRIPT_VERIFY_CHECKSEQUENCEVERIFY,
+    SigChecker = {Tx, 0, 1000},
+    ScriptSeqEnc = beamchain_script:encode_script_num(10),
+    PushLen = byte_size(ScriptSeqEnc),
+    Script = <<PushLen:8, ScriptSeqEnc/binary, 16#b2>>,
+    {ok, _} = beamchain_script:eval_script(Script, [], Flags, SigChecker, base),
+    ok.
+
+%% Gate: OP_CSV with real tx — input has disable flag → check_sequence false
+op_csv_input_has_disable_flag_test() ->
+    InputSeq = 16#80000001,  %% DISABLE_FLAG set in input sequence
+    Tx = #transaction{
+        version = 2,
+        inputs = [#tx_in{prev_out = #outpoint{hash = <<1:256>>, index = 0},
+                         script_sig = <<>>, sequence = InputSeq, witness = []}],
+        outputs = [#tx_out{value = 1000, script_pubkey = <<16#6a>>}],
+        locktime = 0
+    },
+    Flags = ?SCRIPT_VERIFY_CHECKSEQUENCEVERIFY,
+    SigChecker = {Tx, 0, 1000},
+    %% Script value=1 (height-based, no disable)
+    {error, sequence_failed} = beamchain_script:eval_script(
+        <<16#51, 16#b2>>, [], Flags, SigChecker, base),
+    ok.
+
 %%% -------------------------------------------------------------------
 %%% OP_SUCCESS in tapscript test
 %%% -------------------------------------------------------------------
