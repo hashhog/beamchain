@@ -35,6 +35,7 @@
 %% Operations
 -export([add_block/2, add_block/3, remove_block/2, remove_block/1,
          get_filter/1, get_header/1, get_block_hash_by_height/1,
+         get_height_by_hash/1,
          tip_header/0, tip_height/0]).
 
 %% BIP-157 P2P helpers
@@ -50,6 +51,13 @@
 -define(P_HEADER, $H).
 -define(P_HEIGHT, $h).
 -define(P_META,   $M).
+%% BUG-5 fix: reverse index block_hash → height for O(1) stop_hash lookup.
+%% Without this, stop_hash_to_height in peer_manager was O(tip), exposing a
+%% DoS vector (getcfcheckpt with stop_hash not in the index forces a full
+%% reverse scan).  Core resolves via m_chainman.m_blockman.LookupBlockIndex
+%% which is O(1) hash-table lookup.
+%% bitcoin-core/src/net_processing.cpp:3280.
+-define(P_HASH_TO_HEIGHT, $r).
 
 %% Meta keys
 -define(META_TIP_HEADER, <<"tip_header">>).
@@ -152,6 +160,18 @@ get_block_hash_by_height(Height) ->
         undefined -> not_found;
         _         ->
             gen_server:call(?SERVER, {get_hash_by_height, Height}, 5000)
+    end.
+
+%% @doc Return the height at which *BlockHash* was indexed, or `not_found`.
+%% O(1) lookup via the reverse hash→height index.
+%% BUG-5 fix: this supersedes the O(tip) reverse scan in stop_hash_to_height.
+%% bitcoin-core equivalent: m_chainman.m_blockman.LookupBlockIndex(stop_hash).
+-spec get_height_by_hash(binary()) -> {ok, non_neg_integer()} | not_found.
+get_height_by_hash(BlockHash) when byte_size(BlockHash) =:= 32 ->
+    case whereis(?SERVER) of
+        undefined -> not_found;
+        _         ->
+            gen_server:call(?SERVER, {get_height_by_hash, BlockHash}, 5000)
     end.
 
 %% @doc Current cfheader chain tip (32B).  Returns 32 zero bytes when
@@ -288,6 +308,8 @@ handle_call({add_block, Block, Height, PrevScripts}, _From,
             ok = put_kv(Db, fkey(BlockHash), FilterBytes),
             ok = put_kv(Db, hkey(BlockHash), Header),
             ok = put_kv(Db, height_key(Height), BlockHash),
+            %% BUG-5 fix: maintain reverse hash→height index for O(1) lookup.
+            ok = put_kv(Db, rkey(BlockHash), <<Height:32/little>>),
             ok = put_kv(Db, mkey(?META_TIP_HEADER), Header),
             ok = put_kv(Db, mkey(?META_TIP_HEIGHT),
                         <<Height:32/little>>),
@@ -328,6 +350,8 @@ handle_call({remove_block, BlockHash, Height}, _From,
                 end,
             ok = delete_kv(Db, fkey(BlockHash)),
             ok = delete_kv(Db, hkey(BlockHash)),
+            %% BUG-5 fix: also remove from the reverse hash→height index.
+            ok = delete_kv(Db, rkey(BlockHash)),
             case Height of
                 undefined -> ok;
                 _ -> ok = delete_kv(Db, height_key(Height))
@@ -360,6 +384,9 @@ handle_call({get_header, BH}, _From, #state{db = Db} = State) ->
 handle_call({get_hash_by_height, Height}, _From,
             #state{db = Db} = State) ->
     {reply, lookup_height_internal(Db, Height), State};
+handle_call({get_height_by_hash, BlockHash}, _From,
+            #state{db = Db} = State) ->
+    {reply, lookup_hash_internal(Db, BlockHash), State};
 handle_call(tip_header, _From, #state{db = Db} = State) ->
     {reply, {ok, read_tip_header(Db)}, State};
 handle_call(tip_height, _From, #state{db = Db} = State) ->
@@ -406,6 +433,8 @@ hkey(BH) -> <<?P_HEADER, BH/binary>>.
 height_key(H) when is_integer(H), H >= 0 ->
     <<?P_HEIGHT, H:32/big>>.
 mkey(MK) -> <<?P_META, MK/binary>>.
+%% BUG-5 fix: reverse hash→height index key.
+rkey(BH) -> <<?P_HASH_TO_HEIGHT, BH/binary>>.
 
 put_kv(undefined, _K, _V) -> ok;
 put_kv(Db, K, V) ->
@@ -450,6 +479,16 @@ lookup_height_internal(Db, Height) when is_integer(Height), Height >= 0 ->
         _ -> not_found
     end;
 lookup_height_internal(_, _) -> not_found.
+
+%% BUG-5 fix: O(1) reverse hash→height lookup via the 'r' index.
+%% Replaces the O(tip) scan in stop_hash_to_height.
+lookup_hash_internal(undefined, _) -> not_found;
+lookup_hash_internal(Db, BlockHash) when byte_size(BlockHash) =:= 32 ->
+    case get_kv(Db, rkey(BlockHash)) of
+        {ok, <<H:32/little>>} -> {ok, H};
+        _ -> not_found
+    end;
+lookup_hash_internal(_, _) -> not_found.
 
 %% --- BIP-157 range queries ---
 
@@ -513,16 +552,41 @@ collect_filter_hashes(Db, [H | Rest], PrevHeader, Acc) ->
     end.
 
 do_checkpoints(undefined, _, _) -> {error, index_disabled};
-do_checkpoints(Db, StopHeight, _StopHash) ->
-    case StopHeight of
-        H when is_integer(H), H >= 0 ->
-            Last = (H div 1000) * 1000,
-            Heights = case Last of
-                0 -> [];
-                _ -> lists:seq(1000, Last, 1000)
-            end,
-            collect_checkpoints(Db, Heights, [])
+do_checkpoints(Db, StopHeight, StopHash) ->
+    %% BUG-5b fix: validate that StopHash is actually in the indexed chain.
+    %% Previously _StopHash was silently ignored, allowing a peer to receive
+    %% checkpoint headers anchored to the wrong stop hash.  Core validates via
+    %% LookupBlockIndex + BlockRequestAllowed before serving checkpoints.
+    %% bitcoin-core/src/net_processing.cpp:3395-3401.
+    case verify_stop_hash(Db, StopHeight, StopHash) of
+        ok ->
+            case StopHeight of
+                H when is_integer(H), H >= 0 ->
+                    Last = (H div 1000) * 1000,
+                    Heights = case Last of
+                        0 -> [];
+                        _ -> lists:seq(1000, Last, 1000)
+                    end,
+                    collect_checkpoints(Db, Heights, [])
+            end;
+        {error, Reason} ->
+            {error, Reason}
     end.
+
+%% Verify that the block hash indexed at StopHeight equals StopHash.
+%% This ensures the stop_hash from the P2P request is on our indexed chain.
+verify_stop_hash(_Db, _StopHeight, undefined) ->
+    ok;
+verify_stop_hash(Db, StopHeight, StopHash) when is_integer(StopHeight),
+                                                 StopHeight >= 0,
+                                                 byte_size(StopHash) =:= 32 ->
+    case lookup_hash_internal(Db, StopHash) of
+        {ok, StopHeight} -> ok;
+        {ok, _OtherHeight} -> {error, stop_hash_height_mismatch};
+        not_found -> {error, stop_hash_not_indexed}
+    end;
+verify_stop_hash(_, _, _) ->
+    {error, invalid_stop_height}.
 
 collect_checkpoints(_Db, [], Acc) -> {ok, lists:reverse(Acc)};
 collect_checkpoints(Db, [H | Rest], Acc) ->
@@ -538,28 +602,16 @@ collect_checkpoints(Db, [H | Rest], Acc) ->
 
 %% Compute the inclusive height range [StartHeight, StopHeight] given
 %% the height of *StopHash*, capped at *Cap*.
+%% BUG-5 fix: use the O(1) reverse hash→height index instead of the
+%% previous O(tip - stop_height) reverse scan.
 range_heights(Db, StartHeight, StopHash, Cap) ->
-    %% Look up StopHeight by scanning the height index in reverse from
-    %% the in-memory tip.  For now we use the tip-height meta and
-    %% verify that the hash at that height matches StopHash, walking
-    %% back if necessary.  This is O(tip - stop_height) but bounded by
-    %% Cap on the actual response window.
-    Tip = read_tip_height(Db),
-    StopHeight = find_height_for_hash(Db, StopHash, Tip),
-    case StopHeight of
+    case lookup_hash_internal(Db, StopHash) of
         not_found -> {error, stop_hash_not_indexed};
-        _ when StopHeight < StartHeight ->
+        {ok, StopHeight} when StopHeight < StartHeight ->
             {error, range_inverted};
-        _ ->
+        {ok, StopHeight} ->
             Count = StopHeight - StartHeight + 1,
             Effective = min(Count, Cap),
             {ok, lists:seq(StartHeight,
                           StartHeight + Effective - 1)}
-    end.
-
-find_height_for_hash(_Db, _Hash, H) when H < 0 -> not_found;
-find_height_for_hash(Db, Hash, H) ->
-    case lookup_height_internal(Db, H) of
-        {ok, Hash} -> H;
-        _ -> find_height_for_hash(Db, Hash, H - 1)
     end.
