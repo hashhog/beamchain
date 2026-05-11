@@ -925,8 +925,25 @@ do_connect_block_inner(#block{header = Header} = Block,
                 %% in a single RocksDB write.  Prevents partial writes that
                 %% caused corruption at height 351,267 via submitblock feeder.
                 %% Uses direct write (bypasses gen_server) for IBD performance.
+                %%
+                %% Status code semantics (Core's BlockStatus enum, chain.h:54-69):
+                %%   1 = BLOCK_VALID_HEADER
+                %%   2 = BLOCK_VALID_TREE
+                %%   3 = BLOCK_VALID_TRANSACTIONS
+                %%   4 = BLOCK_VALID_CHAIN
+                %%   5 = BLOCK_VALID_SCRIPTS  <-- terminal post-ConnectBlock state
+                %%
+                %% Bug-fix W93/B2: previously beamchain wrote status=2 (TREE)
+                %% after a successful ConnectBlock.  Core (validation.cpp:2648-
+                %% 2651) raises validity to BLOCK_VALID_SCRIPTS (=5) when
+                %% ConnectBlock succeeds — i.e., all script + consensus checks
+                %% passed.  Storing 2 misclassifies a fully-validated block as
+                %% only header-tree-valid; verifychain / reconsiderblock /
+                %% IsValid(BLOCK_VALID_SCRIPTS) consumers all observe wrong
+                %% answers.  Each ConnectBlock branch passes through this code
+                %% only on the success path, so 5 is unambiguously correct here.
                 ok = beamchain_db:direct_atomic_connect_writes(
-                         Block, Height, NewCW, BlockHash, 2),
+                         Block, Height, NewCW, BlockHash, ?BLOCK_VALID_SCRIPTS),
 
                 %% Update chain tip in ETS for fast reads
                 ets:insert(?CHAIN_META, {tip, BlockHash, Height}),
@@ -957,6 +974,29 @@ do_connect_block_inner(#block{header = Header} = Block,
                 %% All post-validation work complete.  Now safe to clear
                 %% the undo tracking — terminate/2 no longer needs it.
                 erase(connect_block_undo),
+
+                %% Mempool: remove confirmed transactions
+                %% (W93/B3 — Core ConnectTip step at validation.cpp:3073-3076).
+                %% Mirrors `m_mempool->removeForBlock(block.vtx, height)`.
+                %% Uses the async cast variant to avoid a chainstate ↔ mempool
+                %% gen_server deadlock (mempool may concurrently call back into
+                %% chainstate during accept_to_memory_pool).  We skip the
+                %% coinbase txid (it can never appear in the mempool) and skip
+                %% entirely during reorg (do_reorganize_atomic batches
+                %% disconnects+connects and then refills via the
+                %% refill_mempool_after_reorg path, which is the symmetric
+                %% Core "DisconnectPool" mechanic).
+                case State4#state.reorg_in_progress of
+                    true  -> ok;
+                    false ->
+                        ConfirmedTxids = case Block#block.transactions of
+                            [] -> [];
+                            [_Coinbase | RegularTxs] ->
+                                [beamchain_serialize:tx_hash(T)
+                                 || T <- RegularTxs]
+                        end,
+                        beamchain_mempool:remove_for_block_async(ConfirmedTxids)
+                end,
 
                 %% ZMQ notification for block connect
                 beamchain_zmq:notify_block(Block, connect),
