@@ -1022,31 +1022,62 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
             {error, E2} -> throw(E2)
         end,
 
-        %% 3. BIP 30: no duplicate txids in UTXO set
-        %% Skip for known exception blocks (91842, 91880).
-        %% Also skip after BIP34 activation — unique coinbase heights make
-        %% duplicate txids impossible after height 227931. Bitcoin Core skips
-        %% the check between BIP34 activation and height 1,983,702.
+        %% 3. BIP 30: reject blocks that would overwrite unspent outputs.
+        %%
+        %% Bitcoin Core logic (validation.cpp:2402-2476):
+        %%
+        %%  a) Start with fEnforceBIP30 = !IsBIP30Repeat(pindex).
+        %%     IsBIP30Repeat returns true for exactly two blocks (91842, 91880)
+        %%     identified by BOTH height AND hash.  All other blocks enforce.
+        %%
+        %%  b) Turn off enforcement if BIP34 is active at the canonical hash:
+        %%     fEnforceBIP30 &&= !(ancestor@BIP34Height.hash == BIP34Hash).
+        %%     This optimization is safe because BIP34 coinbase uniqueness
+        %%     prevents new duplicate coinbases after activation.  But it
+        %%     requires verifying the BIP34 hash to ensure we're on the
+        %%     known canonical chain.
+        %%
+        %%  c) ALWAYS enforce if Height >= 1,983,702 regardless of (b), because
+        %%     some pre-BIP34 coinbases encode heights ≥ 1,983,702 and could
+        %%     produce duplicates at that point.
+        %%
+        %% See: validation.cpp:6189-6199 (IsBIP30Repeat / IsBIP30Unspendable),
+        %%      validation.cpp:2402, 2460-2476.
+        BlockHash = beamchain_serialize:block_hash(Header),
         Bip30Exceptions = maps:get(bip30_exceptions, Params, []),
         Bip34Height = maps:get(bip34_height, Params, 0),
-        SkipBip30 = lists:member(Height, Bip30Exceptions)
-                    orelse (Height > Bip34Height andalso Height < 1983702),
-        case SkipBip30 of
-            false ->
+        Bip34Hash = maps:get(bip34_hash, Params, <<0:256>>),
+
+        %% Gate (a): enforce unless this IS one of the two known repeat blocks.
+        IsBip30Repeat = lists:any(fun({ExH, ExHash}) ->
+            Height =:= ExH andalso BlockHash =:= ExHash
+        end, Bip30Exceptions),
+        EnforceBip30_A = not IsBip30Repeat,
+
+        %% Gate (b): turn off enforcement if BIP34 is active on canonical chain.
+        %% We use the buried bip34_height as a proxy for "ancestor at BIP34Height
+        %% has the right hash" — only safe when bip34_hash is the correct one.
+        Bip34Active = (Height >= Bip34Height) andalso
+                      (Bip34Hash =/= <<0:256>>),
+        EnforceBip30_B = EnforceBip30_A andalso (not Bip34Active),
+
+        %% Gate (c): always enforce at height >= BIP34_IMPLIES_BIP30_LIMIT.
+        EnforceBip30 = EnforceBip30_B orelse (Height >= 1983702),
+
+        case EnforceBip30 of
+            true ->
                 lists:foreach(fun(Tx) ->
                     Txid = beamchain_serialize:tx_hash(Tx),
                     NumOutputs = length(Tx#transaction.outputs),
                     check_no_existing_outputs(Txid, NumOutputs)
                 end, Txs);
-            true ->
+            false ->
                 ok
         end,
 
         %% get script flags for this height
         Network = maps:get(network, Params, mainnet),
         Flags = beamchain_script:flags_for_height(Height, Network),
-
-        BlockHash = beamchain_serialize:block_hash(Header),
 
         %% 3b. Checkpoint enforcement: verify block hash matches checkpoint
         case check_against_checkpoint(Height, BlockHash, Network) of
@@ -1285,25 +1316,26 @@ fetch_input_coins(#transaction{inputs = Inputs}) ->
         end
     end, Inputs).
 
-%% @doc Check BIP 30: no existing unspent outputs for this txid.
-%% When reconnecting blocks after a chainstate reset (tip rolled back but
-%% UTXOs not fully cleaned), duplicate outputs are expected. In that case
-%% we overwrite the existing UTXO rather than reject the block, matching
-%% Bitcoin Core's behaviour for the two historical BIP30 exception blocks
-%% and the general reconnection path.
+%% @doc Check BIP 30: reject the block if any transaction would overwrite an
+%% existing unspent output.
+%%
+%% Bitcoin Core: ConnectBlock checks view.HaveCoin(outpoint) for every output
+%% of every transaction and calls state.Invalid(BLOCK_CONSENSUS, "bad-txns-BIP30",
+%% "tried to overwrite transaction") on the first hit (validation.cpp:2468-2476).
+%%
+%% Previous implementation silently logged and spent the conflicting UTXO instead
+%% of rejecting the block — that was wrong and allowed BIP30 violations through.
 check_no_existing_outputs(Txid, NumOutputs) ->
     lists:foreach(fun(Idx) ->
         case beamchain_chainstate:has_utxo(Txid, Idx) of
             true ->
-                %% Check if we are reconnecting (chainstate tip is behind
-                %% the block that originally created this UTXO). Log a
-                %% warning but allow reconnection by spending the stale
-                %% entry so the new output can take its place.
-                logger:warning("BIP30 duplicate_txid (overwriting for reconnection): "
-                               "txid=~s vout=~B (of ~B outputs)",
+                %% Existing unspent output found — reject the block.
+                %% Core: state.Invalid(BLOCK_CONSENSUS, "bad-txns-BIP30",
+                %%        "tried to overwrite transaction")
+                logger:warning("BIP30 violation: txid=~s vout=~B already in UTXO set",
                                [binary:encode_hex(beamchain_serialize:reverse_bytes(Txid)),
-                                Idx, NumOutputs]),
-                beamchain_chainstate:spend_utxo(Txid, Idx);
+                                Idx]),
+                throw(bad_txns_bip30);
             false -> ok
         end
     end, lists:seq(0, NumOutputs - 1)).
