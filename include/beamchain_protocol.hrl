@@ -146,7 +146,11 @@
 
 %% Core policy/policy.h:50 — DEFAULT_BYTES_PER_SIGOP = 20
 -define(DEFAULT_BYTES_PER_SIGOP, 20).
--define(DEFAULT_MIN_RELAY_TX_FEE, 1000).     %% sat/kvB
+-define(DEFAULT_MIN_RELAY_TX_FEE, 1000).     %% sat/kvB (Core DEFAULT_MIN_RELAY_TX_FEE)
+%% Core policy/policy.h:48 — DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB.
+%% Distinct from DEFAULT_MIN_RELAY_TX_FEE (1000).  Used by RBF Rule 4 (PaysForRBF)
+%% and TrimToSize rolling-fee bump (trackPackageRemoved + incremental_relay_feerate).
+-define(DEFAULT_INCREMENTAL_RELAY_FEE, 100). %% sat/kvB
 -define(DEFAULT_MEMPOOL_MAX_SIZE, 300000000). %% 300 MB
 %% BIP-125 RBF constants (Core: util/rbf.h, policy/rbf.h)
 -define(MAX_BIP125_RBF_SEQUENCE, 16#fffffffd). %% nSequence =< this → signals opt-in RBF
