@@ -1125,17 +1125,27 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
                         %% a. verify all inputs exist in UTXO set
                         InputCoins = fetch_input_coins(Tx),
 
-                        %% b. verify total input value >= total output value
-                        TotalIn = lists:foldl(fun(C, A) ->
-                            A + C#utxo.value
+                        %% b. Check for negative or overflow input values.
+                        %% Core: consensus/tx_verify.cpp:184-188 — per-coin MoneyRange check
+                        %% AND running-sum MoneyRange check after each addition.
+                        %% CVE-2010-5139 class: a single coin with an out-of-range value
+                        %% or a running sum that overflows must be caught here, not just
+                        %% after the full fold completes.
+                        TotalIn = lists:foldl(fun(C, Acc) ->
+                            CoinVal = C#utxo.value,
+                            (CoinVal >= 0 andalso CoinVal =< ?MAX_MONEY)
+                                orelse throw(input_values_outofrange),
+                            NewAcc = Acc + CoinVal,
+                            (NewAcc >= 0 andalso NewAcc =< ?MAX_MONEY)
+                                orelse throw(input_values_outofrange),
+                            NewAcc
                         end, 0, InputCoins),
                         TotalOut = lists:foldl(fun(#tx_out{value = V}, A) ->
                             A + V
                         end, 0, Tx#transaction.outputs),
 
                         %% c. verify amounts
-                        TotalIn >= 0 orelse throw(negative_input),
-                        TotalIn =< ?MAX_MONEY orelse throw(input_overflow),
+                        %% (per-coin range already checked in fold above)
                         TotalIn >= TotalOut orelse throw(insufficient_input),
 
                         %% d. check coinbase maturity
@@ -1164,7 +1174,22 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
                             false -> [{Tx, InputCoins} | JobsAcc]
                         end,
 
+                        %% h. per-transaction fee must be in money range.
+                        %% Core: consensus/tx_verify.cpp:202-209 — fee = in - out;
+                        %% !MoneyRange(txfee_aux) → "bad-txns-fee-outofrange".
+                        %% (Unreachable in practice given the guards above, but
+                        %% Core checks it explicitly for defence-in-depth.)
                         Fee = TotalIn - TotalOut,
+                        (Fee >= 0 andalso Fee =< ?MAX_MONEY)
+                            orelse throw(fee_outofrange),
+
+                        %% i. accumulated block fees must stay in money range.
+                        %% Core: validation.cpp:2543-2547 — after nFees += txfee,
+                        %% !MoneyRange(nFees) → "bad-txns-accumulated-fee-outofrange".
+                        NewFeesAcc = FeesAcc + Fee,
+                        (NewFeesAcc >= 0 andalso NewFeesAcc =< ?MAX_MONEY)
+                            orelse throw(accumulated_fee_outofrange),
+
                         SpentCoins = lists:zip(
                             [#outpoint{hash = H, index = I} ||
                              #tx_in{prev_out = #outpoint{hash = H, index = I}}
@@ -1203,7 +1228,7 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
                             {lists:reverse(NewTxsAcc),
                              lists:append(lists:reverse(NewUndoAcc))}),
 
-                        {FeesAcc + Fee, NewUndoAcc, NewSigops,
+                        {NewFeesAcc, NewUndoAcc, NewSigops,
                          NewJobs, NewTxsAcc}
                 end
             end,
