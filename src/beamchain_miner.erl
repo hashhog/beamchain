@@ -26,8 +26,34 @@
 
 -define(SERVER, ?MODULE).
 
-%% Reserve some weight for the coinbase transaction
--define(COINBASE_WEIGHT_RESERVE, 4000).
+%% BUG1 FIX: Core policy/policy.h DEFAULT_BLOCK_RESERVED_WEIGHT = 8000 WU.
+%% Reserved for block header (80 B * 4 = 320 WU), tx-count varint, and
+%% coinbase tx.  The old value of 4000 allowed ~4000 extra WU of transactions,
+%% potentially producing overweight blocks.
+%% Core: node/miner.cpp resetBlock() — nBlockWeight = *block_reserved_weight.
+-define(DEFAULT_BLOCK_RESERVED_WEIGHT, 8000).
+
+%% BUG6 FIX: Core policy/policy.h DEFAULT_COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS = 400.
+%% This sigop budget is pre-reserved (subtracted from MAX_BLOCK_SIGOPS_COST before
+%% greedy selection) to account for coinbase output scriptPubKeys.
+%% Core: node/miner.cpp resetBlock() — nBlockSigOpsCost = coinbase_output_max_additional_sigops.
+-define(DEFAULT_COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS, 400).
+
+%% BUG3 FIX: Core node/miner.cpp addChunks() early-exit constants.
+%% After MAX_CONSECUTIVE_FAILURES consecutive rejections AND the block is within
+%% BLOCK_FULL_ENOUGH_WEIGHT_DELTA WU of the limit, give up (block is essentially full).
+-define(MAX_CONSECUTIVE_FAILURES, 1000).
+-define(BLOCK_FULL_ENOUGH_WEIGHT_DELTA, 4000).
+
+%% BUG4 FIX: Core policy/policy.h DEFAULT_BLOCK_MIN_TX_FEE = 1 sat/kvB.
+%% Transactions below this fee rate are skipped during block assembly.
+%% Exposed as -blockmintxfee option in Core; we use the same default.
+-define(DEFAULT_BLOCK_MIN_TX_FEE_SAT_KVBYTE, 1).
+
+%% BUG8 FIX: BIP94 timewarp rule — at difficulty-adjustment boundaries the
+%% block timestamp must be >= prev_block_time - MAX_TIMEWARP (600 seconds).
+%% Core: consensus/consensus.h MAX_TIMEWARP = 600.
+-define(MAX_TIMEWARP, 600).
 
 %% Re-define mempool_entry record (internal to beamchain_mempool)
 -record(mempool_entry, {
@@ -162,20 +188,41 @@ do_create_template(CoinbaseScriptPubKey, _Opts,
             %% Compute required difficulty for the next block
             PrevIndex = get_prev_index(TipHeight),
             Now = erlang:system_time(second),
+
+            %% BUG8 FIX: apply BIP94 timewarp rule at difficulty-adjustment
+            %% boundaries.  At height H where H mod 2016 == 0, the timestamp
+            %% must be >= prev_block_time - 600 seconds.
+            %% Core: node/miner.cpp GetMinimumTime() + UpdateTime().
+            PrevBlockTime = case PrevIndex of
+                #{header := #block_header{timestamp = T}} -> T;
+                _ -> MTP  %% fallback: no worse than MTP
+            end,
+            MinTime = compute_minimum_time(MTP, PrevBlockTime, Height),
+
             DummyHeader = #block_header{
                 version = 16#20000000,
                 prev_hash = TipHash,
                 merkle_root = <<0:256>>,
-                timestamp = Now,
+                timestamp = max(MinTime, Now),
                 bits = 0,
                 nonce = 0
             },
             Bits = beamchain_pow:get_next_work_required(
                 PrevIndex, DummyHeader, Params),
 
-            %% Select transactions from mempool
+            %% BUG8 FIX: on testnet (fPowAllowMinDifficultyBlocks), nBits may
+            %% be recalculated when timestamp advances — already done above via
+            %% DummyHeader.  For testnet the difficulty can drop to min if time
+            %% gap > 20 min, so use the updated nBits from get_next_work_required.
+
+            %% BUG5 FIX: use compute_block_version to signal BIP9 deployments.
+            %% Core: node/miner.cpp CreateNewBlock() line 140.
+            Version = beamchain_versionbits:compute_block_version(
+                TipHeight, Params),
+
+            %% Select transactions from mempool (BUG2 fix: pass lock_time_cutoff=MTP)
             {SelectedEntries, TotalFees, TotalWeight, TotalSigops} =
-                select_transactions(),
+                select_transactions(MTP, Height),
 
             %% Block subsidy + fees
             Subsidy = beamchain_chain_params:block_subsidy(Height, Network),
@@ -199,12 +246,13 @@ do_create_template(CoinbaseScriptPubKey, _Opts,
             TxHashes = [beamchain_serialize:tx_hash(Tx) || Tx <- AllTxs],
             MerkleRoot = beamchain_serialize:compute_merkle_root(TxHashes),
 
-            %% Timestamp: must be > MTP, use current time if ahead
-            Timestamp = max(MTP + 1, Now),
+            %% BUG8 FIX: timestamp is max(GetMinimumTime(), now).
+            %% GetMinimumTime = max(MTP+1, BIP94 boundary check).
+            Timestamp = max(MinTime, Now),
 
             %% Assemble block header
             Header = #block_header{
-                version = 16#20000000,
+                version = Version,
                 prev_hash = TipHash,
                 merkle_root = MerkleRoot,
                 timestamp = Timestamp,
@@ -217,7 +265,7 @@ do_create_template(CoinbaseScriptPubKey, _Opts,
             TxEntries = format_tx_entries(SelectedEntries),
 
             Template = #{
-                <<"version">> => 16#20000000,
+                <<"version">> => Version,
                 <<"previousblockhash">> => hash_to_hex(TipHash),
                 <<"transactions">> => TxEntries,
                 <<"coinbaseaux">> => #{<<"flags">> => <<>>},
@@ -252,6 +300,32 @@ get_prev_index(TipHeight) ->
     case beamchain_db:get_block_index(TipHeight) of
         {ok, PI} -> PI;
         not_found -> error({missing_block_index, TipHeight})
+    end.
+
+%% BUG8 FIX: compute_minimum_time/3 — equivalent of Core's GetMinimumTime().
+%%
+%% The minimum timestamp for the next block is:
+%%   max(MTP + 1,
+%%       [at difficulty-adjustment boundary] prev_block_time - MAX_TIMEWARP)
+%%
+%% BIP94 (timewarp fix, active on all networks since Core 28.x):
+%% At every difficulty-adjustment boundary (height mod 2016 == 0) the
+%% timestamp must be >= pindexPrev->GetBlockTime() - MAX_TIMEWARP (600s).
+%% This prevents the time-warp attack by bounding how far back a miner
+%% can retroactively set the timestamp.
+%%
+%% Core: node/miner.cpp GetMinimumTime()
+-spec compute_minimum_time(non_neg_integer(), non_neg_integer(), non_neg_integer()) ->
+    non_neg_integer().
+compute_minimum_time(MTP, PrevBlockTime, Height) ->
+    MinFromMTP = MTP + 1,
+    case Height rem ?DIFFICULTY_ADJUSTMENT_INTERVAL of
+        0 ->
+            %% At a difficulty-adjustment boundary: apply BIP94 timewarp check.
+            MinFromTimewarp = PrevBlockTime - ?MAX_TIMEWARP,
+            max(MinFromMTP, MinFromTimewarp);
+        _ ->
+            MinFromMTP
     end.
 
 has_witness(#transaction{inputs = Inputs}) ->
@@ -410,7 +484,9 @@ broadcast_new_block(Header, BlockHash) ->
 %% Sorts by ancestor fee rate (CPFP-aware), then greedily fills the
 %% block respecting weight and sigop limits. Returns a topologically
 %% ordered list of entries (parents before children).
-select_transactions() ->
+%%
+%% LockTimeCutoff = MTP of tip (for IsFinalTx), Height = next block height.
+select_transactions(LockTimeCutoff, Height) ->
     %% Get all mempool entries sorted by fee rate (highest first)
     Entries = beamchain_mempool:get_sorted_by_fee(),
 
@@ -421,14 +497,19 @@ select_transactions() ->
         ancestor_fee_rate(A) >= ancestor_fee_rate(B)
     end, Entries),
 
-    %% Available weight: max block weight (4,000,000 WU) minus coinbase reserve
-    %% Block weight is sum of all tx weights, header is NOT included
-    MaxWeight = ?MAX_BLOCK_WEIGHT - ?COINBASE_WEIGHT_RESERVE,
-    MaxSigops = ?MAX_BLOCK_SIGOPS_COST,
+    %% BUG1 FIX: nBlockWeight starts at DEFAULT_BLOCK_RESERVED_WEIGHT (8000),
+    %% not zero.  The available budget for tx data is thus MAX - 8000.
+    %% Core: node/miner.cpp resetBlock() + addChunks() TestChunkBlockLimits.
+    MaxWeight = ?MAX_BLOCK_WEIGHT - ?DEFAULT_BLOCK_RESERVED_WEIGHT,
+
+    %% BUG6 FIX: pre-reserve sigop budget for coinbase outputs.
+    %% Core: resetBlock() nBlockSigOpsCost = coinbase_output_max_additional_sigops (400).
+    MaxSigops = ?MAX_BLOCK_SIGOPS_COST - ?DEFAULT_COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS,
 
     {Selected, Fees, Weight, Sigops} =
         greedy_select(Sorted, MaxWeight, MaxSigops,
-                      sets:new([{version, 2}]), [], 0, 0, 0),
+                      LockTimeCutoff, Height,
+                      sets:new([{version, 2}]), [], 0, 0, 0, 0),
 
     %% Topological sort so parents appear before children
     Ordered = topological_sort(Selected),
@@ -454,50 +535,101 @@ ancestor_fee_rate(Entry) ->
 %%% Internal: greedy block filling
 %%% ===================================================================
 
-greedy_select([], _MaxW, _MaxS, _Seen, Acc, Fees, Weight, Sigops) ->
+%% greedy_select/11: BUG3 FIX — MAX_CONSECUTIVE_FAILURES early-exit added.
+%% After 1000 consecutive skips while the block is within 4000 WU of the
+%% limit, give up (block is essentially full, further iteration is wasteful).
+%% Core: node/miner.cpp addChunks() — nConsecutiveFailed + BLOCK_FULL_ENOUGH.
+%%
+%% BUG2 FIX — IsFinalTx check per entry.  m_lock_time_cutoff = MTP of tip.
+%% Core: node/miner.cpp TestChunkTransactions() — IsFinalTx(tx, nHeight, cutoff).
+%%
+%% BUG4 FIX — blockMinFeeRate check: entries below DEFAULT_BLOCK_MIN_TX_FEE
+%% (1 sat/kvB) are skipped; the sorted order means once we hit one below the
+%% threshold the rest will also be below (unless ancestor pulls them up), but
+%% we still check per-entry for correctness.
+%% Core: node/miner.cpp addChunks() — chunk_feerate_vsize << blockMinFeeRate.
+%%
+%% BUG7 FIX — weight limit is >= (not >).
+%% Core: TestChunkBlockLimits() — nBlockWeight + size >= nBlockMaxWeight.
+greedy_select([], _MaxW, _MaxS, _LTC, _H, _Seen, Acc, Fees, Weight, Sigops, _ConsecFail) ->
     {lists:reverse(Acc), Fees, Weight, Sigops};
-greedy_select([Entry | Rest], MaxW, MaxS, Seen, Acc,
-              Fees, Weight, Sigops) ->
+greedy_select(_Entries, _MaxW, _MaxS, _LTC, _H, _Seen, Acc, Fees, Weight, Sigops, ConsecFail)
+  when ConsecFail > ?MAX_CONSECUTIVE_FAILURES,
+       Weight + ?BLOCK_FULL_ENOUGH_WEIGHT_DELTA > ?MAX_BLOCK_WEIGHT - ?DEFAULT_BLOCK_RESERVED_WEIGHT ->
+    %% BUG3 FIX: block is full enough and we've had many failures in a row.
+    {lists:reverse(Acc), Fees, Weight, Sigops};
+greedy_select([Entry | Rest], MaxW, MaxS, LockTimeCutoff, Height, Seen, Acc,
+              Fees, Weight, Sigops, ConsecFail) ->
     Txid = Entry#mempool_entry.txid,
 
     %% Skip if already selected (pulled in as a dependency)
     case sets:is_element(Txid, Seen) of
         true ->
-            greedy_select(Rest, MaxW, MaxS, Seen, Acc,
-                          Fees, Weight, Sigops);
+            greedy_select(Rest, MaxW, MaxS, LockTimeCutoff, Height, Seen, Acc,
+                          Fees, Weight, Sigops, ConsecFail);
         false ->
-            TxWeight = Entry#mempool_entry.weight,
-            TxSigops = estimate_sigops(Entry#mempool_entry.tx),
-
-            %% Resolve parent txs that are still in mempool
-            {Parents, Seen2} = resolve_parents(
-                Entry#mempool_entry.tx, Seen),
-            ParentWeight = lists:foldl(fun(PE, W) ->
-                W + PE#mempool_entry.weight
-            end, 0, Parents),
-            ParentFees = lists:foldl(fun(PE, F) ->
-                F + PE#mempool_entry.fee
-            end, 0, Parents),
-
-            TotalNewWeight = TxWeight + ParentWeight,
-            NewWeight = Weight + TotalNewWeight,
-            NewSigops = Sigops + TxSigops,
-
-            case NewWeight > MaxW orelse NewSigops > MaxS of
+            %% BUG4 FIX: blockMinFeeRate gate — skip below-minimum-fee entries.
+            %% fee_rate in sat/kvB = fee * 1000 / vsize.
+            FeeRateSatKvb = case Entry#mempool_entry.vsize of
+                0 -> 0;
+                VS -> Entry#mempool_entry.fee * 1000 div VS
+            end,
+            case FeeRateSatKvb < ?DEFAULT_BLOCK_MIN_TX_FEE_SAT_KVBYTE of
                 true ->
-                    %% Doesn't fit, try next
-                    greedy_select(Rest, MaxW, MaxS, Seen, Acc,
-                                  Fees, Weight, Sigops);
+                    %% Below minimum fee rate, skip (sorted list: subsequent may differ
+                    %% in ancestor fee rate, so we skip rather than early-exit).
+                    greedy_select(Rest, MaxW, MaxS, LockTimeCutoff, Height, Seen, Acc,
+                                  Fees, Weight, Sigops, ConsecFail + 1);
                 false ->
-                    AllNew = Parents ++ [Entry],
-                    Seen3 = lists:foldl(fun(E, S) ->
-                        sets:add_element(E#mempool_entry.txid, S)
-                    end, Seen2, AllNew),
-                    greedy_select(
-                        Rest, MaxW, MaxS, Seen3,
-                        AllNew ++ Acc,
-                        Fees + Entry#mempool_entry.fee + ParentFees,
-                        NewWeight, NewSigops)
+                    %% BUG2 FIX: IsFinalTx check — non-final txs must not enter template.
+                    %% Core: TestChunkTransactions() IsFinalTx(tx, nHeight, m_lock_time_cutoff).
+                    TxFinal = beamchain_validation:is_final_tx(
+                        Entry#mempool_entry.tx, Height, LockTimeCutoff),
+
+                    case TxFinal of
+                        false ->
+                            %% Non-final: skip but do not count as a block-filling failure
+                            greedy_select(Rest, MaxW, MaxS, LockTimeCutoff, Height, Seen, Acc,
+                                          Fees, Weight, Sigops, ConsecFail + 1);
+                        true ->
+                            TxWeight = Entry#mempool_entry.weight,
+                            TxSigops = estimate_sigops(Entry#mempool_entry.tx),
+
+                            %% Resolve parent txs that are still in mempool
+                            {Parents, Seen2} = resolve_parents(
+                                Entry#mempool_entry.tx, Seen),
+                            ParentWeight = lists:foldl(fun(PE, W) ->
+                                W + PE#mempool_entry.weight
+                            end, 0, Parents),
+                            ParentFees = lists:foldl(fun(PE, F) ->
+                                F + PE#mempool_entry.fee
+                            end, 0, Parents),
+                            ParentSigops = lists:foldl(fun(PE, S) ->
+                                S + estimate_sigops(PE#mempool_entry.tx)
+                            end, 0, Parents),
+
+                            TotalNewWeight = TxWeight + ParentWeight,
+                            NewWeight = Weight + TotalNewWeight,
+                            %% BUG7 FIX: use >= not > (Core TestChunkBlockLimits).
+                            NewSigops = Sigops + TxSigops + ParentSigops,
+
+                            case NewWeight >= MaxW orelse NewSigops >= MaxS of
+                                true ->
+                                    %% Doesn't fit, try next — count as a failure
+                                    greedy_select(Rest, MaxW, MaxS, LockTimeCutoff, Height, Seen, Acc,
+                                                  Fees, Weight, Sigops, ConsecFail + 1);
+                                false ->
+                                    AllNew = Parents ++ [Entry],
+                                    Seen3 = lists:foldl(fun(E, S) ->
+                                        sets:add_element(E#mempool_entry.txid, S)
+                                    end, Seen2, AllNew),
+                                    greedy_select(
+                                        Rest, MaxW, MaxS, LockTimeCutoff, Height, Seen3,
+                                        AllNew ++ Acc,
+                                        Fees + Entry#mempool_entry.fee + ParentFees,
+                                        NewWeight, NewSigops, 0)
+                            end
+                    end
             end
     end.
 
@@ -771,13 +903,22 @@ do_generate_block_with_txs(CoinbaseScript, Txs, Submit,
             TxHashes = [beamchain_serialize:tx_hash(Tx) || Tx <- AllTxs],
             MerkleRoot = beamchain_serialize:compute_merkle_root(TxHashes),
 
-            %% Timestamp
+            %% BUG8 FIX: apply BIP94 timewarp rule at difficulty boundaries.
+            PrevIndex = get_prev_index(TipHeight),
+            PrevBlockTime = case PrevIndex of
+                #{header := #block_header{timestamp = T}} -> T;
+                _ -> MTP
+            end,
             Now = erlang:system_time(second),
-            Timestamp = max(MTP + 1, Now),
+            MinTime = compute_minimum_time(MTP, PrevBlockTime, Height),
+            Timestamp = max(MinTime, Now),
+
+            %% BUG5 FIX: use compute_block_version (versionbits signaling).
+            Version = beamchain_versionbits:compute_block_version(TipHeight, Params),
 
             %% Header
             Header = #block_header{
-                version = 16#20000000,
+                version = Version,
                 prev_hash = TipHash,
                 merkle_root = MerkleRoot,
                 timestamp = Timestamp,

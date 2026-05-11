@@ -24,7 +24,8 @@
     deployments/1,
     deployment_maps/1,
     signal_bit/3,
-    init_cache/0
+    init_cache/0,
+    compute_block_version/2
 ]).
 
 %% For testing
@@ -507,3 +508,33 @@ version_bits_condition(Version, Bit) ->
 -spec threshold(atom()) -> non_neg_integer().
 threshold(mainnet) -> ?MAINNET_THRESHOLD;
 threshold(_) -> ?TESTNET_THRESHOLD.
+
+%%% -------------------------------------------------------------------
+%%% compute_block_version/2
+%%% Reference: Bitcoin Core versionbits.cpp ComputeBlockVersion()
+%%%
+%%% Build the version field for the next block to mine.
+%%% Start with VERSIONBITS_TOP_BITS (0x20000000), then OR in each
+%%% deployment bit that is in STARTED or LOCKED_IN state at the
+%%% current tip height.
+%%%
+%%% This is the Erlang equivalent of:
+%%%   int32_t nVersion = VERSIONBITS_TOP_BITS;
+%%%   for each deployment:
+%%%       if state == LOCKED_IN || state == STARTED:
+%%%           nVersion |= (1 << bit)
+%%%   return nVersion;
+%%% -------------------------------------------------------------------
+
+-spec compute_block_version(non_neg_integer(), map()) -> non_neg_integer().
+compute_block_version(TipHeight, Params) ->
+    Network = maps:get(network, Params, mainnet),
+    HeightGetter = fun(H) -> beamchain_db:get_block_index(H) end,
+    Deployments = deployments(Network),
+    lists:foldl(fun(D, Version) ->
+        State = get_state_for(D, Network, TipHeight, HeightGetter),
+        case State =:= locked_in orelse State =:= started of
+            true  -> Version bor (1 bsl D#deployment.bit);
+            false -> Version
+        end
+    end, ?VERSIONBITS_TOP_BITS, Deployments).
