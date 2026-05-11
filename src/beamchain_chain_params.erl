@@ -31,6 +31,7 @@ params(mainnet) ->
         pow_target_spacing => ?POW_TARGET_SPACING,
         pow_allow_min_difficulty => false,
         pow_no_retargeting => false,
+        enforce_bip94 => false,
 
         %% subsidy
         subsidy_halving_interval => ?SUBSIDY_HALVING_INTERVAL,
@@ -112,6 +113,7 @@ params(testnet) ->
         pow_target_spacing => ?POW_TARGET_SPACING,
         pow_allow_min_difficulty => true,
         pow_no_retargeting => false,
+        enforce_bip94 => false,
 
         subsidy_halving_interval => ?SUBSIDY_HALVING_INTERVAL,
 
@@ -159,6 +161,7 @@ params(testnet4) ->
         pow_target_spacing => ?POW_TARGET_SPACING,
         pow_allow_min_difficulty => true,
         pow_no_retargeting => false,
+        enforce_bip94 => true,
 
         subsidy_halving_interval => ?SUBSIDY_HALVING_INTERVAL,
 
@@ -207,6 +210,7 @@ params(regtest) ->
         pow_target_spacing => ?POW_TARGET_SPACING,
         pow_allow_min_difficulty => true,
         pow_no_retargeting => true,
+        enforce_bip94 => false,
 
         subsidy_halving_interval => 150,
 
@@ -249,6 +253,7 @@ params(signet) ->
         pow_target_spacing => ?POW_TARGET_SPACING,
         pow_allow_min_difficulty => false,
         pow_no_retargeting => false,
+        enforce_bip94 => false,
 
         subsidy_halving_interval => ?SUBSIDY_HALVING_INTERVAL,
 

@@ -802,6 +802,15 @@ validate_one_header(Header, #state{tip_height = TipHeight,
         beamchain_pow:check_pow(BlockHash, Header#block_header.bits, PowLimit)
             orelse throw(high_hash),
 
+        %% 2b. Lightweight difficulty-transition sanity check (mirrors Core
+        %% headerssync.cpp:189 / 237) — reject headers whose bits are implausible
+        %% relative to the previous bits without needing full ancestor lookups.
+        %% Always passes on testnet/regtest (AllowMinDiff → permitted returns true).
+        PrevBits = (prev_header(State))#block_header.bits,
+        beamchain_pow:permitted_difficulty_transition(
+            Params, NewHeight, PrevBits, Header#block_header.bits)
+            orelse throw(bad_diffbits),
+
         %% 3. Timestamp must be > MTP
         MTP = compute_mtp(MTPWindow),
         Header#block_header.timestamp > MTP
@@ -971,12 +980,15 @@ get_last_checkpoint_height(Checkpoints) ->
 %%% Internal: BIP94 (testnet4 difficulty adjustment)
 %%% ===================================================================
 
-%% BIP94: On testnet4, the first block of a retarget period must have
-%% a timestamp >= the last block of the previous period.
+%% BIP94: On testnet4 (and any network with enforce_bip94 = true), the first
+%% block of a retarget period must not be more than 600 seconds before the
+%% previous block — guards against the timewarp attack on the adjustment
+%% boundary.  Core: validation.cpp:4097-4104, consensus.h:MAX_TIMEWARP=600.
+%% Use enforce_bip94 boolean, not a network-name check.
 check_bip94(Height, Header, #state{params = Params} = State) ->
-    Network = maps:get(network, Params),
-    case Network of
-        testnet4 ->
+    EnforceBIP94 = maps:get(enforce_bip94, Params, false),
+    case EnforceBIP94 of
+        true ->
             case Height rem ?DIFFICULTY_ADJUSTMENT_INTERVAL =:= 0
                  andalso Height > 0 of
                 true ->
@@ -987,7 +999,7 @@ check_bip94(Height, Header, #state{params = Params} = State) ->
                 false ->
                     ok
             end;
-        _ ->
+        false ->
             ok
     end.
 
