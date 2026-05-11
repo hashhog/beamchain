@@ -1313,7 +1313,10 @@ do_handle_cmpctblock(Peer, CmpctBlock, BlockHash, Height, State) ->
             end;
         {error, Reason} ->
             logger:warning("block_sync: invalid compact block: ~p", [Reason]),
-            beamchain_peer:add_misbehavior(Peer, 20),
+            %% BUG-9 fix: Core assigns 100 (ban) for READ_STATUS_INVALID
+            %% (net_processing.cpp ProcessMessage/cmpctblock path).
+            %% A malformed cmpctblock that fails init is READ_STATUS_INVALID.
+            beamchain_peer:add_misbehavior(Peer, 100),
             State
     end.
 
@@ -1338,6 +1341,10 @@ handle_blocktxn_received(Peer, BlockTxn, State) ->
                 {error, Reason} ->
                     logger:warning("block_sync: blocktxn fill failed: ~p",
                                    [Reason]),
+                    %% BUG-10 fix: score misbehavior for a bad blocktxn response.
+                    %% Core net_processing.cpp ProcessMessage/blocktxn assigns 10
+                    %% for READ_STATUS_FAILED (wrong tx count / merkle mismatch).
+                    beamchain_peer:add_misbehavior(Peer, 10),
                     %% Request full block instead
                     PendingCompact = maps:remove(BlockHash,
                                                   State#state.pending_compact),
