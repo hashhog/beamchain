@@ -52,6 +52,9 @@
 %% Assumevalid ancestor check (exported for testing)
 -export([skip_scripts/3, skip_scripts_eval/6]).
 
+%% W93/B1: BIP30→BIP34 canonical-chain proof (exported for testing)
+-export([bip34_canonical_chain_active/3]).
+
 %% UTXO rollback (used by chainstate terminate for crash recovery)
 -export([rollback_block_utxos/2]).
 
@@ -1036,6 +1039,24 @@ connect_block(_Block, 0, _PrevIndex, _Params) ->
 connect_block(#block{header = Header, transactions = Txs} = Block,
               Height, PrevIndex, Params) ->
     try
+        %% 0. Defense-in-depth context-free re-check (W93/B4).
+        %% Bitcoin Core (validation.cpp:2320-2329) re-runs CheckBlock at the
+        %% start of ConnectBlock — `Check it again in case a previous version
+        %% let a bad block in`.  This guards against on-disk corruption that
+        %% mutated a block after it was first validated, and against logic
+        %% changes between releases that tightened CheckBlock.  In Core a
+        %% BLOCK_MUTATED result here is treated as a fatal-error (potential
+        %% hardware failure); we mirror the consensus-rejection behavior but
+        %% surface the error as a normal connect-block failure so the chain
+        %% rollback path runs.
+        case check_block(Block, Params) of
+            ok -> ok;
+            {error, E0} ->
+                logger:warning("connect_block: context-free re-check failed "
+                               "at height ~B: ~p", [Height, E0]),
+                throw({check_block_failed, E0})
+        end,
+
         %% 1. contextual header checks
         case contextual_check_block_header(Header, PrevIndex, Params) of
             ok -> ok;
@@ -1080,11 +1101,19 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
         end, Bip30Exceptions),
         EnforceBip30_A = not IsBip30Repeat,
 
-        %% Gate (b): turn off enforcement if BIP34 is active on canonical chain.
-        %% We use the buried bip34_height as a proxy for "ancestor at BIP34Height
-        %% has the right hash" — only safe when bip34_hash is the correct one.
-        Bip34Active = (Height >= Bip34Height) andalso
-                      (Bip34Hash =/= <<0:256>>),
+        %% Gate (b): turn off enforcement if BIP34 is active on the *canonical*
+        %% chain.  Bitcoin Core (validation.cpp:2460-2462) walks
+        %% pindex->pprev->GetAncestor(BIP34Height) and checks
+        %% pindexBIP34height->GetBlockHash() == params.BIP34Hash.  This
+        %% canonical-chain proof is REQUIRED — a side-branch reorg that diverges
+        %% before BIP34Height but is now past it would have a different ancestor
+        %% hash, and Core would correctly keep BIP30 enforced for safety.
+        %%
+        %% Bug-fix W93/B1: previously beamchain only checked that
+        %% Height >= Bip34Height AND Bip34Hash is non-zero, omitting the actual
+        %% hash equality.  That bypassed Core's canonical-chain proof and could
+        %% disable BIP30 enforcement on side-branch / alternative-chain blocks.
+        Bip34Active = bip34_canonical_chain_active(Height, Bip34Height, Bip34Hash),
         EnforceBip30_B = EnforceBip30_A andalso (not Bip34Active),
 
         %% Gate (c): always enforce at height >= BIP34_IMPLIES_BIP30_LIMIT.
@@ -1368,6 +1397,60 @@ rollback_block_utxos(Txs, UndoCoins) ->
         end
     end, UndoCoins),
     ok.
+
+%% @doc Mirror Bitcoin Core's canonical-chain proof for the BIP30→BIP34
+%% transition (validation.cpp:2460-2462):
+%%
+%%   pindexBIP34height = pindex->pprev->GetAncestor(BIP34Height);
+%%   fEnforceBIP30 &&= !pindexBIP34height || !(pindexBIP34height->GetBlockHash() == BIP34Hash);
+%%
+%% In other words: BIP30 may be skipped iff (a) we are AT OR PAST the buried
+%% BIP34Height AND (b) the ancestor block at exactly BIP34Height on our active
+%% chain has hash == params.BIP34Hash.
+%%
+%% Returns true iff BIP30 enforcement may be safely skipped (i.e. BIP34 is
+%% known-active on the canonical chain).
+%%
+%% beamchain stores the active chain in beamchain_db's height-indexed
+%% block_index column family, so get_block_index(BIP34Height) returns the
+%% canonical-chain block at that height.  If the entry is missing (we have
+%% not yet downloaded that block — only possible during IBD before reaching
+%% BIP34Height) or BIP34Hash is the zero sentinel (chain has no canonical
+%% BIP34 hash, e.g. regtest), we conservatively return false to keep BIP30
+%% enabled.  This matches Core's behavior when pindexBIP34height is null.
+-spec bip34_canonical_chain_active(non_neg_integer(),
+                                    non_neg_integer(),
+                                    binary()) -> boolean().
+bip34_canonical_chain_active(_Height, _Bip34Height, <<0:256>>) ->
+    %% No canonical BIP34Hash configured — keep BIP30 enabled.
+    false;
+bip34_canonical_chain_active(Height, Bip34Height, _Bip34Hash)
+  when Height < Bip34Height ->
+    %% Below BIP34 activation — BIP34 is not yet active.
+    false;
+bip34_canonical_chain_active(_Height, Bip34Height, Bip34Hash) ->
+    %% At or past BIP34Height: walk the active chain to BIP34Height and
+    %% check the recorded hash.  The block_index table stores hashes in
+    %% internal byte order; Bip34Hash is also in internal byte order in
+    %% chain_params (see params(mainnet) → bip34_hash).
+    case beamchain_db:get_block_index(Bip34Height) of
+        {ok, #{hash := AncestorHash}} ->
+            AncestorHash =:= Bip34Hash;
+        {ok, IndexMap} when is_map(IndexMap) ->
+            %% Some get_block_index implementations don't include `hash`
+            %% directly (the key is the height); fall back to header→hash.
+            case maps:get(header, IndexMap, undefined) of
+                undefined -> false;
+                Header ->
+                    Computed = beamchain_serialize:block_hash(Header),
+                    Computed =:= Bip34Hash
+            end;
+        not_found ->
+            %% Ancestor at BIP34Height not yet known (IBD edge case):
+            %% conservatively keep BIP30 enabled.  Core's behavior under
+            %% null pindexBIP34height is to enforce BIP30 anyway.
+            false
+    end.
 
 %% @doc Fetch UTXO coins for all inputs of a transaction.
 %% Uses the chainstate ETS cache with RocksDB fallback.
