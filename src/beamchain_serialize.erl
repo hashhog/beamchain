@@ -35,7 +35,9 @@
 -export([compute_merkle_root/1, compute_witness_commitment/2]).
 
 %% Weight/vsize/size
--export([tx_weight/1, tx_vsize/1, tx_size/1]).
+-export([tx_weight/1, tx_vsize/1, tx_sigop_vsize/2, tx_size/1]).
+%% Block weight (includes header + varint tx count + transactions)
+-export([block_weight/1]).
 
 %% Utility
 -export([reverse_bytes/1, hex_encode/1, hex_decode/1]).
@@ -339,6 +341,35 @@ tx_weight(Tx) ->
 tx_vsize(Tx) ->
     Weight = tx_weight(Tx),
     (Weight + ?WITNESS_SCALE_FACTOR - 1) div ?WITNESS_SCALE_FACTOR.
+
+%% @doc Compute sigop-adjusted virtual transaction size.
+%% Mirrors Bitcoin Core policy/policy.cpp GetVirtualTransactionSize:
+%%   vsize = ceil(max(weight, sigop_cost * bytes_per_sigop) / WITNESS_SCALE_FACTOR)
+%% The bytes_per_sigop parameter corresponds to Core's DEFAULT_BYTES_PER_SIGOP (20).
+-spec tx_sigop_vsize(#transaction{}, non_neg_integer()) -> non_neg_integer().
+tx_sigop_vsize(Tx, SigopCost) ->
+    Weight = tx_weight(Tx),
+    AdjustedWeight = max(Weight, SigopCost * 20),
+    (AdjustedWeight + ?WITNESS_SCALE_FACTOR - 1) div ?WITNESS_SCALE_FACTOR.
+
+%% @doc Compute total block weight.
+%% Mirrors Bitcoin Core consensus/validation.h GetBlockWeight:
+%%   weight = stripped_size * (WITNESS_SCALE_FACTOR - 1) + total_size
+%% which equals: header(80) * 4 + varint(tx_count) * 4 + sum(tx_weight).
+%% The varint encoding of the transaction count contributes
+%% varint_size * WITNESS_SCALE_FACTOR weight units (it has no witness discount).
+-spec block_weight([#transaction{}]) -> non_neg_integer().
+block_weight(Txs) ->
+    %% 80-byte header: contributes 80 * 4 = 320 weight units
+    HeaderWeight = 80 * ?WITNESS_SCALE_FACTOR,
+    %% varint-encoded transaction count: no witness discount → * 4
+    TxCountVarintSize = byte_size(encode_varint(length(Txs))),
+    TxCountWeight = TxCountVarintSize * ?WITNESS_SCALE_FACTOR,
+    %% sum of individual transaction weights
+    TxWeight = lists:foldl(fun(Tx, Acc) ->
+        Acc + tx_weight(Tx)
+    end, 0, Txs),
+    HeaderWeight + TxCountWeight + TxWeight.
 
 %% @doc Get the serialized size of a transaction in bytes
 -spec tx_size(#transaction{}) -> non_neg_integer().
