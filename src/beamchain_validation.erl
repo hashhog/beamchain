@@ -32,6 +32,7 @@
 
 %% BIP 68 sequence locks
 -export([calculate_sequence_lock_pair/3]).
+-export([check_sequence_locks/4]).
 
 %% IsFinalTx (exported for testing)
 -export([is_final_tx/3]).
@@ -1079,6 +1080,13 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
         Network = maps:get(network, Params, mainnet),
         Flags = beamchain_script:flags_for_height(Height, Network),
 
+        %% BIP-68 / CSV activation gate.
+        %% Bitcoin Core: SequenceLocks only enforced when the LOCKTIME_VERIFY_SEQUENCE
+        %% flag is set in ConnectBlock, which happens iff CSV is active.
+        %% Core: validation.cpp:2335, 2529-2531; consensus/tx_verify.cpp:51.
+        CsvHeight = maps:get(csv_height, Params, 419328),
+        Bip68Active = Height >= CsvHeight,
+
         %% 3b. Checkpoint enforcement: verify block hash matches checkpoint
         case check_against_checkpoint(Height, BlockHash, Network) of
             ok -> ok;
@@ -1133,8 +1141,16 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
                         %% d. check coinbase maturity
                         check_coinbase_maturity(InputCoins, Height),
 
-                        %% e. BIP 68 relative locktime
-                        check_sequence_locks(Tx, InputCoins, Height, PrevIndex),
+                        %% e. BIP 68 relative locktime (gated on CSV activation)
+                        %% Core: LOCKTIME_VERIFY_SEQUENCE only set when BIP68/CSV active.
+                        %% Before activation, version≥2 txs must NOT be rejected by
+                        %% relative-locktime checks.
+                        case Bip68Active of
+                            true ->
+                                check_sequence_locks(Tx, InputCoins, Height, PrevIndex);
+                            false ->
+                                ok
+                        end,
 
                         %% f. count sigops
                         TxSigopCost = get_tx_sigop_cost(Tx, InputCoins, Flags),
@@ -1383,15 +1399,14 @@ calculate_sequence_lock_pair(#transaction{inputs = Inputs}, InputCoins, _PrevInd
                         {max(MinH, NewMinH), MinT};
                     true ->
                         %% time-based lock
-                        %% Bitcoin Core: get MTP of block prior to coin's block
-                        CoinMTP = case Coin#utxo.height of
-                            0 -> 0;
-                            H ->
-                                CoinMTPIndex = case beamchain_db:get_block_index(H - 1) of
-                                    {ok, CI} -> CI;
-                                    not_found -> error({missing_block_index, H - 1})
-                                end,
-                                median_time_past(CoinMTPIndex)
+                        %% Bitcoin Core: nCoinTime = GetAncestor(max(coinHeight-1, 0))->GetMedianTimePast()
+                        %% (consensus/tx_verify.cpp:74)
+                        %% For coinHeight=0 this is MTP of genesis (height 0), NOT 0.
+                        H_mtp = Coin#utxo.height,
+                        AncestorHeight = max(H_mtp - 1, 0),
+                        CoinMTP = case beamchain_db:get_block_index(AncestorHeight) of
+                            {ok, CI} -> median_time_past(CI);
+                            not_found -> error({missing_block_index, AncestorHeight})
                         end,
                         %% Bitcoin Core: nMinTime = max(nMinTime, coinMTP + (value << 9) - 1)
                         LockSeconds = Masked bsl ?SEQUENCE_LOCKTIME_GRANULARITY,
