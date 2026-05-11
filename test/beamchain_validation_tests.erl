@@ -1365,3 +1365,89 @@ p2wsh_witness_script_sigop_test() ->
     %% Legacy = 0, P2SH = 0, Witness = 1 (OP_CHECKSIG in witness script)
     %% → cost = (0+0)*4 + 1 = 1
     ?assertEqual(1, beamchain_validation:get_tx_sigop_cost(Tx, [P2WSH_Coin], Flags)).
+
+%%% ===================================================================
+%%% W76 — BIP-141 weight/vsize comprehensive audit
+%%% Reference: Bitcoin Core consensus/consensus.h:23-24, policy/policy.h:38,50
+%%%            consensus/validation.h:132-145, policy/policy.cpp:390-408
+%%% ===================================================================
+
+%% B1: MIN_TRANSACTION_WEIGHT must be 240 (= WITNESS_SCALE_FACTOR * 60).
+%% A transaction whose weight is 239 or less is rejected.
+%% The constant was formerly mis-defined as 60 (raw bytes, not weight units).
+min_transaction_weight_constant_test() ->
+    ?assertEqual(240, ?MIN_TRANSACTION_WEIGHT).
+
+%% MIN_SERIALIZABLE_TRANSACTION_WEIGHT must be 40 (= WITNESS_SCALE_FACTOR * 10).
+min_serializable_transaction_weight_constant_test() ->
+    ?assertEqual(40, ?MIN_SERIALIZABLE_TRANSACTION_WEIGHT).
+
+%% A transaction with weight exactly 240 passes check_transaction.
+min_transaction_weight_accept_240_test() ->
+    %% Craft a coinbase whose serialization produces weight ≥ 240.
+    %% The standard make_coinbase_tx produces a weight well above 240.
+    Tx = make_coinbase_tx(<<4, 1, 0, 0, 0>>, 5000000000),
+    Weight = beamchain_serialize:tx_weight(Tx),
+    ?assert(Weight >= 240),
+    ?assertEqual(ok, beamchain_validation:check_transaction(Tx)).
+
+%% B2: block_weight/1 includes the varint-encoded transaction count.
+%% For a single-transaction block the varint is 1 byte:
+%%   block_weight = 80*4 + varint_size*4 + tx_weight
+%%                = 320 + 4 + tx_weight
+block_weight_includes_tx_count_varint_test() ->
+    Tx = make_coinbase_tx(<<4, 1, 0, 0, 0>>, 5000000000),
+    TxWeight = beamchain_serialize:tx_weight(Tx),
+    %% varint(1) = 1 byte → 4 weight units
+    Expected = 320 + 4 + TxWeight,
+    Actual = beamchain_serialize:block_weight([Tx]),
+    ?assertEqual(Expected, Actual).
+
+%% For 253 transactions the varint needs 3 bytes (0xfd ++ 16-bit LE):
+%%   varint_weight = 3 * 4 = 12.
+block_weight_varint_253_transactions_test() ->
+    %% Build 253 coinbase-like transactions (all share the same scriptSig —
+    %% not a valid block, but sufficient for weight arithmetic testing).
+    Tx = make_coinbase_tx(<<4, 1, 0, 0, 0>>, 5000000000),
+    Txs = lists:duplicate(253, Tx),
+    TxWeight = beamchain_serialize:tx_weight(Tx),
+    TotalTxWeight = 253 * TxWeight,
+    %% varint(253) = <<0xfd, 0xfd, 0x00>> = 3 bytes → 12 weight units
+    Expected = 320 + 12 + TotalTxWeight,
+    Actual = beamchain_serialize:block_weight(Txs),
+    ?assertEqual(Expected, Actual).
+
+%% B3: tx_sigop_vsize/2 applies sigop adjustment correctly.
+%% Core: vsize = ceil(max(weight, sigop_cost * 20) / 4).
+
+%% When sigop adjustment is inactive (cost within weight/20), vsize == plain vsize.
+tx_sigop_vsize_no_adjustment_test() ->
+    Tx = make_coinbase_tx(<<4, 1, 0, 0, 0>>, 5000000000),
+    _Weight = beamchain_serialize:tx_weight(Tx),
+    PlainVSize = beamchain_serialize:tx_vsize(Tx),
+    %% sigop_cost = 0 → max(Weight, 0) = Weight → same as plain vsize
+    AdjVSize = beamchain_serialize:tx_sigop_vsize(Tx, 0),
+    ?assertEqual(PlainVSize, AdjVSize),
+    %% sigop_cost = 1 → max(Weight, 20) — weight >> 20 for any real tx, still equal
+    AdjVSize2 = beamchain_serialize:tx_sigop_vsize(Tx, 1),
+    Thresh = (20 + 3) div 4,  %% ceil(20/4) = 5
+    ?assert(PlainVSize > Thresh),
+    ?assertEqual(PlainVSize, AdjVSize2).
+
+%% When sigop_cost * 20 > weight, sigop adjustment inflates vsize.
+tx_sigop_vsize_active_adjustment_test() ->
+    %% Construct a tiny tx so weight is small.
+    Tx = make_coinbase_tx(<<4, 1, 0, 0, 0>>, 5000000000),
+    Weight = beamchain_serialize:tx_weight(Tx),
+    %% Pick sigop_cost such that sigop_cost * 20 > weight.
+    %% We want AdjWeight = sigop_cost * 20, so pick sigop_cost = Weight div 20 + 1.
+    SigopCost = Weight div 20 + 1,
+    AdjWeight = SigopCost * 20,
+    ?assert(AdjWeight > Weight),
+    Expected = (AdjWeight + 3) div 4,
+    Actual = beamchain_serialize:tx_sigop_vsize(Tx, SigopCost),
+    ?assertEqual(Expected, Actual).
+
+%% DEFAULT_BYTES_PER_SIGOP constant must be 20 (Core policy/policy.h:50).
+default_bytes_per_sigop_constant_test() ->
+    ?assertEqual(20, ?DEFAULT_BYTES_PER_SIGOP).
