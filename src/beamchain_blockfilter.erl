@@ -43,6 +43,7 @@
 
 %% GCS primitives (exported for testing and reuse)
 -export([gcs_encode/4, gcs_match/4, gcs_match_any/4,
+         gcs_match/6, gcs_match_any/6,
          hash_to_range/3, siphash_key_from_block_hash/1]).
 
 %% P2P "cfilter" payload serialization (BIP-157)
@@ -148,26 +149,44 @@ gcs_encode(Elements, K0, K1, {P, M}) ->
     NPrefix = beamchain_serialize:encode_varint(N),
     <<NPrefix/binary, BitStream/binary>>.
 
-%% @doc Match a single target byte-string against an encoded filter.
+%% @doc Match a single target byte-string against an encoded basic filter.
+%% Uses BASIC_P=19 and BASIC_M=784931.
 -spec gcs_match(binary(), binary(), non_neg_integer(),
                 non_neg_integer()) -> boolean().
 gcs_match(FilterBytes, Target, K0, K1) ->
-    gcs_match_any(FilterBytes, [Target], K0, K1).
+    gcs_match(FilterBytes, Target, K0, K1, ?BASIC_P, ?BASIC_M).
 
-%% @doc Match any of a target list against an encoded filter.  The
-%% probabilistic membership test: returns true if any target is in
-%% the set (or matches a false-positive collision).
+%% @doc Match a single target against a filter with explicit P and M.
+-spec gcs_match(binary(), binary(), non_neg_integer(), non_neg_integer(),
+                non_neg_integer(), non_neg_integer()) -> boolean().
+gcs_match(FilterBytes, Target, K0, K1, P, M) ->
+    gcs_match_any(FilterBytes, [Target], K0, K1, P, M).
+
+%% @doc Match any of a target list against an encoded basic filter.
+%% Uses BASIC_P=19 and BASIC_M=784931.
 -spec gcs_match_any(binary(), [binary()], non_neg_integer(),
                     non_neg_integer()) -> boolean().
 gcs_match_any(FilterBytes, Targets, K0, K1) ->
+    gcs_match_any(FilterBytes, Targets, K0, K1, ?BASIC_P, ?BASIC_M).
+
+%% @doc Match any target against a filter with explicit P and M.  The
+%% probabilistic membership test: returns true if any target is in
+%% the set (or matches a false-positive collision).
+%% BUG-1 fix: P and M are now explicit parameters instead of hardcoding
+%% ?BASIC_P and ?BASIC_M, which silently broke matching for non-basic
+%% filters.  Core's GCSFilter::MatchInternal uses m_params.m_P and
+%% m_F = m_N * m_params.m_M.
+-spec gcs_match_any(binary(), [binary()], non_neg_integer(), non_neg_integer(),
+                    non_neg_integer(), non_neg_integer()) -> boolean().
+gcs_match_any(FilterBytes, Targets, K0, K1, P, M) ->
     {N, Stream} = beamchain_serialize:decode_varint(FilterBytes),
     case N of
         0 -> false;
         _ ->
-            F = N * ?BASIC_M,
+            F = N * M,
             TargetHashes = lists:usort(
                 [hash_to_range(T, F, {K0, K1}) || T <- Targets]),
-            decode_and_match(Stream, N, ?BASIC_P, TargetHashes)
+            decode_and_match(Stream, N, P, TargetHashes)
     end.
 
 %%% -------------------------------------------------------------------

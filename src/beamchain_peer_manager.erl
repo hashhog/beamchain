@@ -1297,6 +1297,11 @@ handle_peer_message(_Pid, _Command, _Payload, State) ->
 %%% BIP-157 message handlers
 %%% ===================================================================
 
+%% BIP-157 protocol limits — Core disconnects for violations.
+%% bitcoin-core/src/net_processing.cpp:183-186 + PrepareBlockFilterRequest.
+-define(MAX_GETCFILTERS_SIZE,  1000).
+-define(MAX_GETCFHEADERS_SIZE, 2000).
+
 handle_getcfilters_msg(Pid, Payload) ->
     case beamchain_p2p_msg:decode_payload(getcfilters, Payload) of
         {ok, #{filter_type := FT, start_height := Start,
@@ -1304,22 +1309,51 @@ handle_getcfilters_msg(Pid, Payload) ->
             BasicFT = beamchain_blockfilter:basic_filter_type(),
             case FT of
                 BasicFT ->
-                    case beamchain_blockfilter_index:get_filter_range(
-                            Start, Stop) of
-                        {ok, Pairs} ->
-                            lists:foreach(
-                                fun({BH, FB}) ->
-                                    beamchain_peer:send_message(Pid,
-                                        {cfilter,
-                                         #{filter_type => FT,
-                                           block_hash => BH,
-                                           filter => FB}})
-                                end, Pairs);
+                    %% BUG-2/BUG-3 fix: enforce MAX_GETCFILTERS_SIZE cap.
+                    %% Core disconnects the peer when start > stop or when
+                    %% stop_height - start_height >= MAX_GETCFILTERS_SIZE.
+                    %% We resolve stop_hash → height to check; if we cannot
+                    %% resolve (not yet indexed), silently ignore.
+                    %% bitcoin-core/src/net_processing.cpp:3291-3304.
+                    case stop_hash_to_height(Stop) of
+                        {ok, StopHeight} when Start > StopHeight ->
+                            logger:debug(
+                                "peer ~p sent invalid getcfilters "
+                                "start=~p > stop=~p, disconnecting",
+                                [Pid, Start, StopHeight]),
+                            beamchain_peer:disconnect(Pid);
+                        {ok, StopHeight}
+                          when StopHeight - Start >= ?MAX_GETCFILTERS_SIZE ->
+                            logger:debug(
+                                "peer ~p requested too many cfilters: "
+                                "~p / ~p, disconnecting",
+                                [Pid, StopHeight - Start + 1,
+                                 ?MAX_GETCFILTERS_SIZE]),
+                            beamchain_peer:disconnect(Pid);
+                        {ok, _StopHeight} ->
+                            case beamchain_blockfilter_index:get_filter_range(
+                                    Start, Stop) of
+                                {ok, Pairs} ->
+                                    lists:foreach(
+                                        fun({BH, FB}) ->
+                                            beamchain_peer:send_message(Pid,
+                                                {cfilter,
+                                                 #{filter_type => FT,
+                                                   block_hash => BH,
+                                                   filter => FB}})
+                                        end, Pairs);
+                                _ -> ok
+                            end;
                         _ -> ok
                     end;
                 _ ->
-                    %% Unknown filter type — ignore per BIP-157.
-                    ok
+                    %% BUG-2 fix: unknown filter type — disconnect per Core.
+                    %% bitcoin-core/src/net_processing.cpp:3271-3276
+                    %% (PrepareBlockFilterRequest sets fDisconnect=true).
+                    logger:debug(
+                        "peer ~p requested unsupported filter type ~p "
+                        "(getcfilters), disconnecting", [Pid, FT]),
+                    beamchain_peer:disconnect(Pid)
             end;
         _ -> ok
     end.
@@ -1331,18 +1365,43 @@ handle_getcfheaders_msg(Pid, Payload) ->
             BasicFT = beamchain_blockfilter:basic_filter_type(),
             case FT of
                 BasicFT ->
-                    case beamchain_blockfilter_index:get_header_range(
-                            Start, Stop) of
-                        {ok, {PrevHeader, FilterHashes}} ->
-                            beamchain_peer:send_message(Pid,
-                                {cfheaders,
-                                 #{filter_type => FT,
-                                   stop_hash => Stop,
-                                   prev_header => PrevHeader,
-                                   filter_hashes => FilterHashes}});
+                    %% BUG-2/BUG-3 fix: enforce MAX_GETCFHEADERS_SIZE cap.
+                    %% bitcoin-core/src/net_processing.cpp:3291-3304.
+                    case stop_hash_to_height(Stop) of
+                        {ok, StopHeight} when Start > StopHeight ->
+                            logger:debug(
+                                "peer ~p sent invalid getcfheaders "
+                                "start=~p > stop=~p, disconnecting",
+                                [Pid, Start, StopHeight]),
+                            beamchain_peer:disconnect(Pid);
+                        {ok, StopHeight}
+                          when StopHeight - Start >= ?MAX_GETCFHEADERS_SIZE ->
+                            logger:debug(
+                                "peer ~p requested too many cfheaders: "
+                                "~p / ~p, disconnecting",
+                                [Pid, StopHeight - Start + 1,
+                                 ?MAX_GETCFHEADERS_SIZE]),
+                            beamchain_peer:disconnect(Pid);
+                        {ok, _StopHeight} ->
+                            case beamchain_blockfilter_index:get_header_range(
+                                    Start, Stop) of
+                                {ok, {PrevHeader, FilterHashes}} ->
+                                    beamchain_peer:send_message(Pid,
+                                        {cfheaders,
+                                         #{filter_type => FT,
+                                           stop_hash => Stop,
+                                           prev_header => PrevHeader,
+                                           filter_hashes => FilterHashes}});
+                                _ -> ok
+                            end;
                         _ -> ok
                     end;
-                _ -> ok
+                _ ->
+                    %% BUG-2 fix: unknown filter type — disconnect per Core.
+                    logger:debug(
+                        "peer ~p requested unsupported filter type ~p "
+                        "(getcfheaders), disconnecting", [Pid, FT]),
+                    beamchain_peer:disconnect(Pid)
             end;
         _ -> ok
     end.
@@ -1370,27 +1429,25 @@ handle_getcfcheckpt_msg(Pid, Payload) ->
                             end;
                         _ -> ok
                     end;
-                _ -> ok
+                _ ->
+                    %% BUG-2 fix: unknown filter type — disconnect per Core.
+                    logger:debug(
+                        "peer ~p requested unsupported filter type ~p "
+                        "(getcfcheckpt), disconnecting", [Pid, FT]),
+                    beamchain_peer:disconnect(Pid)
             end;
         _ -> ok
     end.
 
-%% Best-effort stop_hash → height resolution.  For now we walk the
-%% blockfilter_index height map (which mirrors the active chain when
-%% the index is current) until we find the entry whose hash matches.
-%% TODO(BIP157): this currently re-uses get_filter_range's internal
-%% reverse scan; for very deep stop_hash values it is O(tip).  When
-%% the index gains a hash→height secondary index we should prefer it.
+%% BUG-5 fix: O(1) stop_hash → height resolution via the reverse index.
+%% The previous implementation was O(tip) and exposed a DoS vector:
+%% a peer could send a stop_hash not in the index and force beamchain to
+%% scan the entire height→hash table.  The index now maintains a reverse
+%% hash→height entry (prefix 'r') that is kept in sync with add_block /
+%% remove_block.  This is analogous to Core's O(1) LookupBlockIndex.
+%% bitcoin-core/src/net_processing.cpp:3280.
 stop_hash_to_height(Stop) ->
-    Tip = beamchain_blockfilter_index:tip_height(),
-    stop_hash_to_height_loop(Stop, Tip).
-
-stop_hash_to_height_loop(_Stop, H) when H < 0 -> not_found;
-stop_hash_to_height_loop(Stop, H) ->
-    case beamchain_blockfilter_index:get_block_hash_by_height(H) of
-        {ok, Stop} -> {ok, H};
-        _ -> stop_hash_to_height_loop(Stop, H - 1)
-    end.
+    beamchain_blockfilter_index:get_height_by_hash(Stop).
 
 handle_addr_msg(Pid, Payload, State) ->
     case beamchain_p2p_msg:decode_payload(addr, Payload) of
