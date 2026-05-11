@@ -563,6 +563,107 @@ sequence_lock_mask_test() ->
     ?assertEqual(104, MinH).  %% 100 + 5 - 1 = 104
 
 %%% ===================================================================
+%%% W81 BIP-68 CSV sequence lock tests (Core parity)
+%%% -------------------------------------------------------------------
+%% Bug: check_sequence_locks was called unconditionally in connect_block,
+%% meaning BIP-68 relative sequence locks were enforced even before the
+%% CSV soft-fork activated (mainnet height 419328).
+%%
+%% Reference: Bitcoin Core validation.cpp:2479-2482:
+%%   int nLockTimeFlags = 0;
+%%   if (DeploymentActiveAt(*pindex, Consensus::DEPLOYMENT_CSV))
+%%       nLockTimeFlags |= LOCKTIME_VERIFY_SEQUENCE;
+%% When the flag is not set, CalculateSequenceLocks returns {-1,-1}
+%% meaning every tx passes (tx_verify.cpp:51-56).
+%%
+%% The gate is in connect_block (see source); check_sequence_locks itself
+%% is the raw enforcement function tested here for correct behavior once active.
+%%% ===================================================================
+
+%% W81: unsatisfied height lock throws sequence_lock_not_met.
+%% Tx v2, lock=10 blocks, coin at height=100, current height=100.
+%% MinHeight = 100 + 10 - 1 = 109 >= 100 → lock not met.
+bip68_unsatisfied_height_lock_fails_test() ->
+    Seq = 10,
+    Tx = make_tx_with_sequence([Seq]),
+    InputCoins = [#utxo{
+        value = 2000,
+        script_pubkey = <<>>,
+        is_coinbase = false,
+        height = 100
+    }],
+    PrevIndex = #{mtp_timestamps => [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+                  height => 99,
+                  header => #block_header{version=1, prev_hash= <<0:256>>,
+                                          merkle_root= <<0:256>>, timestamp=1,
+                                          bits=0, nonce=0}},
+    ?assertException(throw, sequence_lock_not_met,
+        beamchain_validation:check_sequence_locks(Tx, InputCoins, 100, PrevIndex)).
+
+%% W81: satisfied height lock passes.
+%% Tx v2, lock=5 blocks, coin at height=90, current height=100.
+%% MinHeight = 90 + 5 - 1 = 94 < 100 → lock satisfied.
+bip68_satisfied_height_lock_passes_test() ->
+    Seq = 5,
+    Tx = make_tx_with_sequence([Seq]),
+    InputCoins = [#utxo{
+        value = 2000,
+        script_pubkey = <<>>,
+        is_coinbase = false,
+        height = 90
+    }],
+    PrevIndex = #{mtp_timestamps => [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+                  height => 99,
+                  header => #block_header{version=1, prev_hash= <<0:256>>,
+                                          merkle_root= <<0:256>>, timestamp=1,
+                                          bits=0, nonce=0}},
+    ?assertEqual(ok, beamchain_validation:check_sequence_locks(
+        Tx, InputCoins, 100, PrevIndex)).
+
+%% W81: tx version < 2 always passes check_sequence_locks.
+%% Bitcoin Core: CalculateSequenceLocks returns {-1,-1} when version < 2
+%% (tx_verify.cpp:51, 55-56).
+bip68_version1_skips_sequence_locks_test() ->
+    Tx = #transaction{
+        version = 1,
+        inputs = [#tx_in{
+            prev_out = #outpoint{hash = <<1:256>>, index = 0},
+            script_sig = <<>>,
+            sequence = 5,   %% would be a 5-block lock if enforced
+            witness = []
+        }],
+        outputs = [#tx_out{value = 1000, script_pubkey = <<16#6a>>}],
+        locktime = 0
+    },
+    InputCoins = [#utxo{
+        value = 2000,
+        script_pubkey = <<>>,
+        is_coinbase = false,
+        height = 100
+    }],
+    PrevIndex = #{mtp_timestamps => [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+                  height => 99,
+                  header => #block_header{version=1, prev_hash= <<0:256>>,
+                                          merkle_root= <<0:256>>, timestamp=1,
+                                          bits=0, nonce=0}},
+    %% Version 1: BIP-68 does not apply, passes even though lock would fail
+    ?assertEqual(ok, beamchain_validation:check_sequence_locks(
+        Tx, InputCoins, 50, PrevIndex)).
+
+%% W81: connect_block gate — CSV deployment height gate prevents BIP-68 enforcement
+%% before activation. Verified by code review: in connect_block, the call to
+%% check_sequence_locks is gated by Height >= csv_height (Params).
+%% This test documents the expected CSV heights from chain_params.
+bip68_csv_deployment_heights_test() ->
+    MainnetParams = beamchain_chain_params:params(mainnet),
+    ?assertEqual(419328, maps:get(csv_height, MainnetParams)),
+    %% testnet4 has all BIPs active from block 1
+    Testnet4Params = beamchain_chain_params:params(testnet4),
+    ?assertEqual(1, maps:get(csv_height, Testnet4Params)),
+    RegtestParams = beamchain_chain_params:params(regtest),
+    ?assertEqual(1, maps:get(csv_height, RegtestParams)).
+
+%%% ===================================================================
 %%% Helper functions
 %%% ===================================================================
 
