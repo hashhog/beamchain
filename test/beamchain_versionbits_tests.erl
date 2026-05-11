@@ -505,3 +505,135 @@ genesis_block_test() ->
     State = beamchain_versionbits:get_deployment_state_at_height(
         mainnet, csv, 0, HeightGetter),
     ?assertEqual(defined, State).
+
+%%% ===================================================================
+%%% W91 Bug regression tests
+%%% ===================================================================
+
+%% Bug 1 (consensus): STARTED → LOCKED_IN must win over timeout.
+%% Core versionbits.cpp lines 84-98: count is checked first; only if
+%% count < threshold does it check MTP >= timeout → FAILED.
+%% A period that simultaneously meets the signalling threshold AND has
+%% MTP >= timeout must transition to LOCKED_IN, not FAILED.
+w91_regression_test_() ->
+    {foreach, fun setup/0, fun cleanup/1, [
+        {"locked_in wins over timeout when threshold met simultaneously",
+         fun locked_in_beats_timeout_test/0},
+        {"failed when below threshold and MTP >= timeout",
+         fun failed_below_threshold_and_timeout_test/0},
+        {"deployment record has period field",
+         fun deployment_record_has_period_test/0},
+        {"deployment record has threshold field",
+         fun deployment_record_has_threshold_test/0},
+        {"per-deployment threshold used not network-wide",
+         fun per_deployment_threshold_used_test/0},
+        {"testdummy deployment present on mainnet",
+         fun testdummy_present_mainnet_test/0},
+        {"testdummy present on testnet4",
+         fun testdummy_present_testnet4_test/0},
+        {"no_timeout is max int64",
+         fun no_timeout_is_max_int64_test/0},
+        {"regtest testdummy uses period 144",
+         fun regtest_testdummy_period_144_test/0},
+        {"deployment_maps includes period and threshold",
+         fun deployment_maps_include_fields_test/0}
+    ]}.
+
+locked_in_beats_timeout_test() ->
+    %% Regression test for Bug 1 (W91).
+    %% Scenario: period 1 is STARTED; the previous period (period 1)
+    %% has ALL 2016 blocks signalling (>= threshold), AND the MTP at
+    %% its end is >= timeout.  Core locks in; old beamchain code failed.
+    ets:delete_all_objects(beamchain_versionbits_cache),
+
+    StartTime = 1462060800,
+    Timeout   = 1493596800,
+
+    %% Period 0: end MTP >= start_time so period 1 enters STARTED.
+    Period0 = generate_period_blocks_end_mtp(0, non_signaling_version(), StartTime + 600),
+
+    %% Period 1: all blocks signalling (2016 >= 1916 threshold).
+    %% End MTP deliberately > timeout as well.
+    Period1 = generate_period_blocks_end_mtp(2016, signaling_version(0), Timeout + 1000),
+
+    HeightGetter = make_height_getter(Period0 ++ Period1),
+
+    %% Query a height in period 2: state should be LOCKED_IN, not FAILED.
+    State = beamchain_versionbits:get_deployment_state_at_height(
+        mainnet, csv, 4032, HeightGetter),
+    ?assertEqual(locked_in, State).
+
+failed_below_threshold_and_timeout_test() ->
+    %% When threshold is NOT met AND MTP >= timeout, result must be FAILED.
+    ets:delete_all_objects(beamchain_versionbits_cache),
+
+    StartTime = 1462060800,
+    Timeout   = 1493596800,
+
+    %% Period 0: end MTP >= start_time so period 1 enters STARTED.
+    Period0 = generate_period_blocks_end_mtp(0, non_signaling_version(), StartTime + 600),
+
+    %% Period 1: zero signalling blocks, end MTP >= timeout.
+    Period1 = generate_period_blocks_end_mtp(2016, non_signaling_version(), Timeout + 1000),
+
+    HeightGetter = make_height_getter(Period0 ++ Period1),
+
+    State = beamchain_versionbits:get_deployment_state_at_height(
+        mainnet, csv, 4032, HeightGetter),
+    ?assertEqual(failed, State).
+
+deployment_record_has_period_test() ->
+    %% Bug 2: #deployment must carry a period field.
+    %% Core BIP9Deployment has period = 2016 by default.
+    Dep = beamchain_versionbits:deployment_params(mainnet, csv),
+    %% period is field 7 (0-indexed from record name: name=2, bit=3,
+    %% start_time=4, timeout=5, min_activation_height=6, period=7, threshold=8).
+    Period = element(7, Dep),
+    ?assertEqual(2016, Period).
+
+deployment_record_has_threshold_test() ->
+    %% Bug 2: #deployment must carry a threshold field.
+    Dep = beamchain_versionbits:deployment_params(mainnet, csv),
+    Threshold = element(8, Dep),
+    ?assertEqual(1916, Threshold).
+
+per_deployment_threshold_used_test() ->
+    %% Verify that testnet deployments use 1512, not 1916.
+    Dep = beamchain_versionbits:deployment_params(testnet, csv),
+    Threshold = element(8, Dep),
+    ?assertEqual(1512, Threshold).
+
+testdummy_present_mainnet_test() ->
+    %% Bug 2: TESTDUMMY deployment must exist on mainnet
+    %% (Core chainparams.cpp CMainParams vDeployments[DEPLOYMENT_TESTDUMMY]).
+    Deps = beamchain_versionbits:deployments(mainnet),
+    Names = [element(2, D) || D <- Deps],
+    ?assert(lists:member(testdummy, Names)).
+
+testdummy_present_testnet4_test() ->
+    Deps = beamchain_versionbits:deployments(testnet4),
+    Names = [element(2, D) || D <- Deps],
+    ?assert(lists:member(testdummy, Names)).
+
+no_timeout_is_max_int64_test() ->
+    %% Bug 3: NO_TIMEOUT must be std::numeric_limits<int64_t>::max() = 9223372036854775807.
+    %% Reference: consensus/params.h BIP9Deployment::NO_TIMEOUT.
+    %% Verify that an ALWAYS_ACTIVE deployment (which uses NO_TIMEOUT) has
+    %% a timeout field with that value or is ALWAYS_ACTIVE (skip check for those).
+    %% Test a NEVER_ACTIVE deployment on mainnet (testdummy) -- timeout=NO_TIMEOUT.
+    Dep = beamchain_versionbits:deployment_params(mainnet, testdummy),
+    Timeout = element(5, Dep),
+    ?assertEqual(9223372036854775807, Timeout).
+
+regtest_testdummy_period_144_test() ->
+    %% Core CRegTestParams sets period=144 for TESTDUMMY.
+    Dep = beamchain_versionbits:deployment_params(regtest, testdummy),
+    Period = element(7, Dep),
+    ?assertEqual(144, Period).
+
+deployment_maps_include_fields_test() ->
+    %% deployment_maps/1 must expose 'period' and 'threshold' fields.
+    Maps = beamchain_versionbits:deployment_maps(mainnet),
+    CsvMap = hd([M || M <- Maps, maps:get(name_atom, M) =:= csv]),
+    ?assertEqual(2016, maps:get(period, CsvMap)),
+    ?assertEqual(1916, maps:get(threshold, CsvMap)).

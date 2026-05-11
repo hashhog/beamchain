@@ -39,26 +39,39 @@
 %%% -------------------------------------------------------------------
 
 %% Version bits top bits: binary 001 (version >= 0x20000000)
+%% Reference: versionbits.h VERSIONBITS_TOP_BITS / VERSIONBITS_TOP_MASK
 -define(VERSIONBITS_TOP_BITS, 16#20000000).
 -define(VERSIONBITS_TOP_MASK, 16#E0000000).
 
-%% Retarget period (same as difficulty adjustment interval)
--define(VERSIONBITS_PERIOD, ?DIFFICULTY_ADJUSTMENT_INTERVAL).
+%% Number of version bits available for deployments (bits 0..28)
+%% Reference: versionbits.h VERSIONBITS_NUM_BITS = 29
+-define(VERSIONBITS_NUM_BITS, 29).
 
-%% Thresholds: 95% for mainnet, 75% for testnets
--define(MAINNET_THRESHOLD, 1916).    %% 1916/2016 = 95%
+%% Default retarget period (same as difficulty adjustment interval)
+%% Individual deployments may override via #deployment.period.
+-define(DEFAULT_PERIOD, ?DIFFICULTY_ADJUSTMENT_INTERVAL).
+
+%% Default thresholds — used when constructing deployment records.
+%% Reference: consensus/params.h BIP9Deployment{period=2016, threshold=1916}
+-define(MAINNET_THRESHOLD, 1916).    %% 1916/2016 ~= 95%
 -define(TESTNET_THRESHOLD, 1512).    %% 1512/2016 = 75%
 
 %% Special time values
+%% Reference: consensus/params.h BIP9Deployment::ALWAYS_ACTIVE / NEVER_ACTIVE
 -define(ALWAYS_ACTIVE, -1).
 -define(NEVER_ACTIVE, -2).
--define(NO_TIMEOUT, 9999999999).  %% far future
+%% NO_TIMEOUT = std::numeric_limits<int64_t>::max()
+%% Reference: consensus/params.h BIP9Deployment::NO_TIMEOUT
+-define(NO_TIMEOUT, 9223372036854775807).
 
 %% ETS table for caching deployment states
 -define(VERSIONBITS_CACHE, beamchain_versionbits_cache).
 
 %%% -------------------------------------------------------------------
 %%% Deployment record
+%%%
+%%% Mirrors Consensus::BIP9Deployment (consensus/params.h):
+%%%   bit, nStartTime, nTimeout, min_activation_height, period, threshold
 %%% -------------------------------------------------------------------
 
 -record(deployment, {
@@ -66,7 +79,10 @@
     bit             :: 0..28,
     start_time      :: integer(),        %% unix timestamp or ALWAYS_ACTIVE/NEVER_ACTIVE
     timeout         :: integer(),        %% unix timestamp or NO_TIMEOUT
-    min_activation_height :: non_neg_integer()
+    min_activation_height :: non_neg_integer(),
+    %% Per-deployment period and threshold (Core: BIP9Deployment.period / .threshold)
+    period    :: pos_integer(),          %% retarget period length in blocks (default 2016)
+    threshold :: non_neg_integer()       %% signalling threshold in blocks
 }).
 
 %%% -------------------------------------------------------------------
@@ -126,17 +142,23 @@ get_deployment_state_at_height(Network, DeploymentName, Height, HeightGetter) ->
     {non_neg_integer(), non_neg_integer(), boolean()}.
 get_state_statistics(Network, DeploymentName, Height, HeightGetter) ->
     Deployment = deployment_params(Network, DeploymentName),
-    Threshold = threshold(Network),
+    %% Use per-deployment period and threshold (Core: BIP9Deployment.period/.threshold)
+    Period    = Deployment#deployment.period,
+    Threshold = Deployment#deployment.threshold,
 
     %% Find start of current period
-    PeriodStart = Height - (Height rem ?VERSIONBITS_PERIOD),
+    %% Reference: versionbits.cpp GetStateStatisticsFor line 129
+    %%   blocks_in_period = 1 + (pindex->nHeight % stats.period)
+    PeriodStart = Height - (Height rem Period),
     Elapsed = Height - PeriodStart + 1,
 
     %% Count signaling blocks in current period
     Count = count_signaling(Deployment, PeriodStart, Height, HeightGetter),
 
     %% Can threshold still be reached?
-    Remaining = ?VERSIONBITS_PERIOD - Elapsed,
+    %% Reference: versionbits.cpp line 152
+    %%   stats.possible = (stats.period - stats.threshold) >= (stats.elapsed - count)
+    Remaining = Period - Elapsed,
     Possible = (Count + Remaining) >= Threshold,
 
     {Count, Elapsed, Possible}.
@@ -153,6 +175,7 @@ deployment_params(Network, DeploymentName) ->
 %% @doc Get all deployments for a network.
 -spec deployments(atom()) -> [#deployment{}].
 deployments(mainnet) ->
+    %% Reference: chainparams.cpp CMainParams — vDeployments[]
     [
         %% CSV deployment (BIP68, BIP112, BIP113)
         #deployment{
@@ -160,7 +183,9 @@ deployments(mainnet) ->
             bit = 0,
             start_time = 1462060800,     %% May 1st, 2016
             timeout = 1493596800,        %% May 1st, 2017
-            min_activation_height = 0
+            min_activation_height = 0,
+            period = ?DEFAULT_PERIOD,
+            threshold = ?MAINNET_THRESHOLD
         },
         %% SegWit deployment (BIP141, BIP143, BIP147)
         #deployment{
@@ -168,7 +193,9 @@ deployments(mainnet) ->
             bit = 1,
             start_time = 1479168000,     %% Nov 15th, 2016
             timeout = 1510704000,        %% Nov 15th, 2017
-            min_activation_height = 0
+            min_activation_height = 0,
+            period = ?DEFAULT_PERIOD,
+            threshold = ?MAINNET_THRESHOLD
         },
         %% Taproot deployment (BIPs 340, 341, 342)
         #deployment{
@@ -176,110 +203,188 @@ deployments(mainnet) ->
             bit = 2,
             start_time = 1619222400,     %% Apr 24th, 2021
             timeout = 1628640000,        %% Aug 11th, 2021
-            min_activation_height = 709632
+            min_activation_height = 709632,
+            period = ?DEFAULT_PERIOD,
+            threshold = ?MAINNET_THRESHOLD
+        },
+        %% TESTDUMMY — not enforced on mainnet but present for completeness
+        %% Reference: chainparams.cpp CMainParams vDeployments[DEPLOYMENT_TESTDUMMY]
+        #deployment{
+            name = testdummy,
+            bit = 28,
+            start_time = ?NEVER_ACTIVE,
+            timeout = ?NO_TIMEOUT,
+            min_activation_height = 0,
+            period = ?DEFAULT_PERIOD,
+            threshold = ?MAINNET_THRESHOLD
         }
     ];
 
 deployments(testnet) ->
+    %% Reference: chainparams.cpp CTestNetParams — vDeployments[]
     [
         #deployment{
             name = csv,
             bit = 0,
             start_time = 1456790400,     %% Mar 1st, 2016
             timeout = 1493596800,        %% May 1st, 2017
-            min_activation_height = 0
+            min_activation_height = 0,
+            period = ?DEFAULT_PERIOD,
+            threshold = ?TESTNET_THRESHOLD
         },
         #deployment{
             name = segwit,
             bit = 1,
             start_time = 1462060800,     %% May 1st, 2016
             timeout = 1493596800,        %% May 1st, 2017
-            min_activation_height = 0
+            min_activation_height = 0,
+            period = ?DEFAULT_PERIOD,
+            threshold = ?TESTNET_THRESHOLD
         },
         #deployment{
             name = taproot,
             bit = 2,
             start_time = ?ALWAYS_ACTIVE,
             timeout = ?NO_TIMEOUT,
-            min_activation_height = 0
+            min_activation_height = 0,
+            period = ?DEFAULT_PERIOD,
+            threshold = ?TESTNET_THRESHOLD
+        },
+        #deployment{
+            name = testdummy,
+            bit = 28,
+            start_time = ?NEVER_ACTIVE,
+            timeout = ?NO_TIMEOUT,
+            min_activation_height = 0,
+            period = ?DEFAULT_PERIOD,
+            threshold = ?TESTNET_THRESHOLD
         }
     ];
 
 deployments(testnet4) ->
     %% All soft forks are always active on testnet4
+    %% Reference: chainparams.cpp CTestNet4Params — vDeployments[]
     [
         #deployment{
             name = csv,
             bit = 0,
             start_time = ?ALWAYS_ACTIVE,
             timeout = ?NO_TIMEOUT,
-            min_activation_height = 0
+            min_activation_height = 0,
+            period = ?DEFAULT_PERIOD,
+            threshold = ?TESTNET_THRESHOLD
         },
         #deployment{
             name = segwit,
             bit = 1,
             start_time = ?ALWAYS_ACTIVE,
             timeout = ?NO_TIMEOUT,
-            min_activation_height = 0
+            min_activation_height = 0,
+            period = ?DEFAULT_PERIOD,
+            threshold = ?TESTNET_THRESHOLD
         },
         #deployment{
             name = taproot,
             bit = 2,
             start_time = ?ALWAYS_ACTIVE,
             timeout = ?NO_TIMEOUT,
-            min_activation_height = 0
+            min_activation_height = 0,
+            period = ?DEFAULT_PERIOD,
+            threshold = ?TESTNET_THRESHOLD
+        },
+        #deployment{
+            name = testdummy,
+            bit = 28,
+            start_time = ?NEVER_ACTIVE,
+            timeout = ?NO_TIMEOUT,
+            min_activation_height = 0,
+            period = ?DEFAULT_PERIOD,
+            threshold = ?TESTNET_THRESHOLD
         }
     ];
 
 deployments(regtest) ->
     %% All soft forks are always active on regtest
+    %% Reference: chainparams.cpp CRegTestParams — vDeployments[]
+    %% Note: regtest uses period=144 for TESTDUMMY per Core; others use 2016.
     [
         #deployment{
             name = csv,
             bit = 0,
             start_time = ?ALWAYS_ACTIVE,
             timeout = ?NO_TIMEOUT,
-            min_activation_height = 0
+            min_activation_height = 0,
+            period = ?DEFAULT_PERIOD,
+            threshold = ?TESTNET_THRESHOLD
         },
         #deployment{
             name = segwit,
             bit = 1,
             start_time = ?ALWAYS_ACTIVE,
             timeout = ?NO_TIMEOUT,
-            min_activation_height = 0
+            min_activation_height = 0,
+            period = ?DEFAULT_PERIOD,
+            threshold = ?TESTNET_THRESHOLD
         },
         #deployment{
             name = taproot,
             bit = 2,
             start_time = ?ALWAYS_ACTIVE,
             timeout = ?NO_TIMEOUT,
-            min_activation_height = 0
+            min_activation_height = 0,
+            period = ?DEFAULT_PERIOD,
+            threshold = ?TESTNET_THRESHOLD
+        },
+        #deployment{
+            name = testdummy,
+            bit = 28,
+            start_time = ?NEVER_ACTIVE,
+            timeout = ?NO_TIMEOUT,
+            min_activation_height = 0,
+            period = 144,               %% Core CRegTestParams: period=144 for testdummy
+            threshold = 108             %% 75% of 144
         }
     ];
 
 deployments(signet) ->
     %% All soft forks are always active on signet
+    %% Reference: chainparams.cpp SigNetParams — vDeployments[]
     [
         #deployment{
             name = csv,
             bit = 0,
             start_time = ?ALWAYS_ACTIVE,
             timeout = ?NO_TIMEOUT,
-            min_activation_height = 0
+            min_activation_height = 0,
+            period = ?DEFAULT_PERIOD,
+            threshold = ?MAINNET_THRESHOLD
         },
         #deployment{
             name = segwit,
             bit = 1,
             start_time = ?ALWAYS_ACTIVE,
             timeout = ?NO_TIMEOUT,
-            min_activation_height = 0
+            min_activation_height = 0,
+            period = ?DEFAULT_PERIOD,
+            threshold = ?MAINNET_THRESHOLD
         },
         #deployment{
             name = taproot,
             bit = 2,
             start_time = ?ALWAYS_ACTIVE,
             timeout = ?NO_TIMEOUT,
-            min_activation_height = 0
+            min_activation_height = 0,
+            period = ?DEFAULT_PERIOD,
+            threshold = ?MAINNET_THRESHOLD
+        },
+        #deployment{
+            name = testdummy,
+            bit = 28,
+            start_time = ?NEVER_ACTIVE,
+            timeout = ?NO_TIMEOUT,
+            min_activation_height = 0,
+            period = ?DEFAULT_PERIOD,
+            threshold = ?MAINNET_THRESHOLD
         }
     ].
 
@@ -294,7 +399,9 @@ deployment_maps(Network) ->
         bit                   => D#deployment.bit,
         start_time            => D#deployment.start_time,
         timeout               => D#deployment.timeout,
-        min_activation_height => D#deployment.min_activation_height }
+        min_activation_height => D#deployment.min_activation_height,
+        period                => D#deployment.period,
+        threshold             => D#deployment.threshold }
      || D <- deployments(Network)].
 
 %% @doc Check if a block should signal for a deployment.
@@ -323,33 +430,35 @@ get_state_for(#deployment{start_time = ?ALWAYS_ACTIVE}, _Network, _Height, _Heig
 get_state_for(#deployment{start_time = ?NEVER_ACTIVE}, _Network, _Height, _HeightGetter) ->
     failed;
 get_state_for(Deployment, Network, Height, HeightGetter) ->
-    %% Find which period this height is in and compute state for that period
-    %% Period 0: blocks 0-2015, Period 1: blocks 2016-4031, etc.
-    PeriodNum = Height div ?VERSIONBITS_PERIOD,
+    %% Find which period this height is in and compute state for that period.
+    %% Use per-deployment period (Core: BIP9Deployment.period).
+    %% Period 0: blocks 0..Period-1, Period 1: blocks Period..2*Period-1, etc.
+    Period = Deployment#deployment.period,
+    PeriodNum = Height div Period,
 
     case PeriodNum =:= 0 of
         true ->
-            %% First period: check if start_time reached at genesis
-            %% Before any retarget, state is always DEFINED
+            %% First period: no retarget boundary has been crossed yet.
+            %% BIP9: "The genesis block is by definition in this state."
             defined;
         false ->
-            %% State for this period was computed at the end of previous period
-            %% Cache key is the period number
+            %% State for this period was computed at the end of previous period.
+            %% Cache key includes the period number.
             CacheKey = {Network, Deployment#deployment.name, PeriodNum},
             case ets:lookup(?VERSIONBITS_CACHE, CacheKey) of
                 [{_, CachedState}] ->
                     CachedState;
                 [] ->
                     %% Compute state by walking back to find last cached state
-                    State = compute_state_with_cache(Deployment, Network, PeriodNum, HeightGetter),
-                    State
+                    compute_state_with_cache(Deployment, Network, PeriodNum, HeightGetter)
             end
     end.
 
 %% Get the last block height of a period.
--spec period_end_height(integer()) -> integer().
-period_end_height(PeriodNum) ->
-    (PeriodNum + 1) * ?VERSIONBITS_PERIOD - 1.
+%% PeriodLen is the deployment's period length (deployment.period).
+-spec period_end_height(integer(), pos_integer()) -> integer().
+period_end_height(PeriodNum, PeriodLen) ->
+    (PeriodNum + 1) * PeriodLen - 1.
 
 %% Compute state by walking back through periods, caching as we go.
 %% TargetPeriod is the period number we want state for.
@@ -367,21 +476,24 @@ walk_back(Deployment, Network, Period, HeightGetter) ->
     walk_back(Deployment, Network, Period, HeightGetter, []).
 
 walk_back(_Deployment, _Network, Period, _HeightGetter, _ToCompute) when Period =< 0 ->
-    %% Reached period 0 or before, start from defined
+    %% Reached period 0 or before, start from defined.
+    %% BIP9: "The genesis block is by definition in this state."
     {0, defined};
 walk_back(Deployment, Network, Period, HeightGetter, ToCompute) ->
     CacheKey = {Network, Deployment#deployment.name, Period},
     case ets:lookup(?VERSIONBITS_CACHE, CacheKey) of
         [{_, CachedState}] ->
-            %% Found cached state
+            %% Found cached state — stop walking back
             {Period, CachedState};
         [] ->
-            %% Check if we're before start_time (optimization)
-            %% MTP is checked at the last block of the PREVIOUS period
-            PrevPeriodEnd = period_end_height(Period - 1),
+            PeriodLen = Deployment#deployment.period,
+            %% Optimization: if MTP at end of the PREVIOUS period is before
+            %% start_time, all earlier periods are also DEFINED.
+            %% Reference: versionbits.cpp lines 57-61
+            PrevPeriodEnd = period_end_height(Period - 1, PeriodLen),
             case get_median_time_past(PrevPeriodEnd, HeightGetter) of
                 {ok, MTP} when MTP < Deployment#deployment.start_time ->
-                    %% Before start time, cache and return defined
+                    %% Before start time; cache as defined and stop.
                     ets:insert(?VERSIONBITS_CACHE, {CacheKey, defined}),
                     {Period, defined};
                 _ ->
@@ -412,52 +524,71 @@ walk_forward(Deployment, Network, CurrentPeriod, State, TargetPeriod, HeightGett
 %% Compute next state for a period based on previous period's state.
 %% PeriodNum is the period we're computing state FOR.
 %% PrevState is the state at the start of PeriodNum (computed from PeriodNum-1).
+%%
+%% Reference: versionbits.cpp AbstractThresholdConditionChecker::GetStateFor
+%% lines 76-112 (the switch statement over state).
 -spec compute_state_for_period(#deployment{}, atom(), deployment_state(), integer(), fun()) ->
     deployment_state().
 compute_state_for_period(_Deployment, _Network, active, _PeriodNum, _HeightGetter) ->
+    %% ACTIVE is a terminal state. Reference: versionbits.cpp line 108.
     active;
 compute_state_for_period(_Deployment, _Network, failed, _PeriodNum, _HeightGetter) ->
+    %% FAILED is a terminal state. Reference: versionbits.cpp line 107.
     failed;
 compute_state_for_period(Deployment, _Network, defined, PeriodNum, HeightGetter) ->
-    %% Check MTP at end of previous period (last block before this period)
-    PrevPeriodEnd = period_end_height(PeriodNum - 1),
+    %% DEFINED → STARTED if MTP at end of previous period >= start_time.
+    %% Reference: versionbits.cpp lines 77-81.
+    PeriodLen = Deployment#deployment.period,
+    PrevPeriodEnd = period_end_height(PeriodNum - 1, PeriodLen),
     case get_median_time_past(PrevPeriodEnd, HeightGetter) of
         {ok, MTP} when MTP >= Deployment#deployment.start_time ->
             started;
         _ ->
             defined
     end;
-compute_state_for_period(Deployment, Network, started, PeriodNum, HeightGetter) ->
-    %% Check MTP at end of previous period for timeout
-    PrevPeriodEnd = period_end_height(PeriodNum - 1),
-    case get_median_time_past(PrevPeriodEnd, HeightGetter) of
-        {ok, MTP} when MTP >= Deployment#deployment.timeout ->
-            failed;
-        {ok, _MTP} ->
-            %% Count signaling blocks in the PREVIOUS period
-            %% (the period that just ended, where we were in STARTED state)
-            PrevPeriodStart = (PeriodNum - 1) * ?VERSIONBITS_PERIOD,
-            Count = count_signaling(Deployment, PrevPeriodStart, PrevPeriodEnd, HeightGetter),
-            Threshold = threshold(Network),
-            case Count >= Threshold of
-                true -> locked_in;
-                false -> started
-            end;
-        error ->
-            started
+compute_state_for_period(Deployment, _Network, started, PeriodNum, HeightGetter) ->
+    %% STARTED: count signaling in previous period FIRST; only check
+    %% timeout if the threshold was NOT met.
+    %%
+    %% IMPORTANT: Core counts BEFORE checking timeout (versionbits.cpp lines
+    %% 84-98).  A period that simultaneously meets threshold AND exceeds
+    %% timeout must transition to LOCKED_IN, not FAILED.
+    %% Previous code checked timeout first — that was a consensus bug.
+    PeriodLen = Deployment#deployment.period,
+    PrevPeriodEnd   = period_end_height(PeriodNum - 1, PeriodLen),
+    PrevPeriodStart = (PeriodNum - 1) * PeriodLen,
+    Count = count_signaling(Deployment, PrevPeriodStart, PrevPeriodEnd, HeightGetter),
+    Threshold = Deployment#deployment.threshold,
+    case Count >= Threshold of
+        true ->
+            %% Threshold met → LOCKED_IN regardless of timeout.
+            %% Reference: versionbits.cpp lines 93-94.
+            locked_in;
+        false ->
+            %% Threshold not met; check timeout.
+            %% Reference: versionbits.cpp lines 95-97.
+            case get_median_time_past(PrevPeriodEnd, HeightGetter) of
+                {ok, MTP} when MTP >= Deployment#deployment.timeout ->
+                    failed;
+                _ ->
+                    started
+            end
     end;
 compute_state_for_period(Deployment, _Network, locked_in, PeriodNum, _HeightGetter) ->
-    %% Check if we've reached min_activation_height
-    %% First block of this period is PeriodNum * 2016
-    FirstBlockHeight = PeriodNum * ?VERSIONBITS_PERIOD,
+    %% LOCKED_IN → ACTIVE once the first block of this period is at or past
+    %% min_activation_height.
+    %% Reference: versionbits.cpp lines 100-103:
+    %%   if (pindexPrev->nHeight + 1 >= min_activation_height) stateNext = ACTIVE
+    %% pindexPrev->nHeight + 1 = first block of current period = PeriodNum * PeriodLen.
+    PeriodLen = Deployment#deployment.period,
+    FirstBlockHeight = PeriodNum * PeriodLen,
     case FirstBlockHeight >= Deployment#deployment.min_activation_height of
-        true -> active;
+        true  -> active;
         false -> locked_in
     end.
 
-%% Exported for testing
+%% Exported for testing: compute one state transition for period 1.
 compute_state(Deployment, Network, PrevState, HeightGetter) ->
-    %% This is a simplified version for testing
     compute_state_for_period(Deployment, Network, PrevState, 1, HeightGetter).
 
 %% Get median time past for a block height.
@@ -504,10 +635,7 @@ version_bits_condition(Version, Bit) ->
     BitSet = (Version band (1 bsl Bit)) =/= 0,
     TopBitsOK andalso BitSet.
 
-%% Get threshold for a network.
--spec threshold(atom()) -> non_neg_integer().
-threshold(mainnet) -> ?MAINNET_THRESHOLD;
-threshold(_) -> ?TESTNET_THRESHOLD.
+%% (threshold/1 removed: threshold is now per-deployment via #deployment.threshold)
 
 %%% -------------------------------------------------------------------
 %%% compute_block_version/2

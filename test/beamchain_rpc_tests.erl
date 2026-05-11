@@ -794,11 +794,16 @@ softforks_deploymentinfo_shared_source_regtest_test_() ->
              ?assertEqual(maps:get(<<"height">>, SF), maps:get(<<"height">>, Dep))
          end, SharedKeys),
 
-         %% On regtest all deployments (buried + BIP9 ALWAYS_ACTIVE) must be
-         %% active at height 1.
+         %% On regtest all deployments except NEVER_ACTIVE ones must be
+         %% active at height 1.  The TESTDUMMY deployment is NEVER_ACTIVE
+         %% (consensus/params.h BIP9Deployment::NEVER_ACTIVE = -2) and must
+         %% NOT be active.  All others (buried or ALWAYS_ACTIVE BIP9) must
+         %% be active.
+         NeverActiveNames = [<<"testdummy">>],
          lists:foreach(fun(Name) ->
              Entry = maps:get(Name, SoftforksMap),
-             ?assertEqual(true, maps:get(<<"active">>, Entry))
+             ExpectedActive = not lists:member(Name, NeverActiveNames),
+             ?assertEqual(ExpectedActive, maps:get(<<"active">>, Entry))
          end, SharedKeys)
      end}.
 
