@@ -2080,52 +2080,126 @@ compute_mtp(Timestamps) ->
 
 %% Load a UTXO snapshot from file.
 %%
-%% After parsing the file, this routes the loaded UTXO list through
-%% beamchain_snapshot:verify_snapshot/2 which runs HASH_SERIALIZED
-%% (SHA256d via HashWriter over TxOutSer bytes) over the coin set and
-%% compares against m_assumeutxo_data.hash_serialized (mirrors
-%% validation.cpp:5901-5914 + kernel/coinstats.cpp:161). On mismatch we
-%% propagate the verbatim Core wording — wrapped in
-%% `{snapshot_content_hash_mismatch, BinMsg}` — so the loadtxoutset RPC
-%% can surface it directly without double-formatting.
+%% Implements the nine precondition + per-coin guards from Core
+%% validation.cpp:5588-5883 (ActivateSnapshot / PopulateAndValidateSnapshot):
+%%
+%%   G1  network_magic from file must match running node (validation.cpp:5605).
+%%   G2  per-coin height > base_height rejected (validation.cpp:5814-5818).
+%%   G3  per-coin vout >= UINT32_MAX rejected (validation.cpp:5815).
+%%   G4  per-coin value > MAX_MONEY rejected (validation.cpp:5820-5822).
+%%   G5  trailing bytes after all coins rejected (validation.cpp:5872-5882).
+%%   G6  double-load guard — "Can't activate more than once" (v.cpp:5600).
+%%   G7  non-empty mempool rejected (validation.cpp:5626-5628).
+%%   G8  BLOCK_FAILED_VALID on base block rejected (validation.cpp:5617-5619).
+%%   G9  snapshot chainwork must exceed active tip chainwork (v.cpp:5703-5708).
+%%
+%% After per-coin parsing, routes through verify_snapshot/2 (SHA256d
+%% strict-content-hash, mirrors validation.cpp:5901-5914 +
+%% kernel/coinstats.cpp:161). On mismatch propagates verbatim Core wording
+%% wrapped in {snapshot_content_hash_mismatch, BinMsg}.
 do_load_snapshot(Path, State) ->
     Network = beamchain_config:network(),
+    Params = beamchain_chain_params:params(Network),
+    NetworkMagic = maps:get(magic, Params),
 
-    %% Parse the snapshot file
-    case beamchain_snapshot:load_snapshot(Path) of
-        {ok, #{base_hash := BaseHash, num_coins := NumCoins, coins := Coins} = SnapshotData} ->
-            %% Verify the snapshot against known parameters (SHA256d
-            %% strict-content-hash check per validation.cpp:5901-5914).
+    %% G6: double-load guard — Core validation.cpp:5600-5601.
+    case State#state.chainstate_role of
+        snapshot ->
+            {error, snapshot_already_active};
+        _ ->
+            %% G7: non-empty mempool guard — Core validation.cpp:5626-5628.
+            MempoolInfo = beamchain_mempool:get_info(),
+            case maps:get(size, MempoolInfo, 0) of
+                MempoolSize when MempoolSize > 0 ->
+                    {error, {mempool_not_empty, MempoolSize}};
+                _ ->
+                    do_load_snapshot_inner(Path, State, Network, NetworkMagic)
+            end
+    end.
+
+do_load_snapshot_inner(Path, State, Network, NetworkMagic) ->
+    %% First pass: read metadata only to get base_hash, then look up base_height
+    %% from assumeutxo table.  We need base_height before parsing coins (G2).
+    case beamchain_snapshot:read_metadata(Path) of
+        {ok, #{base_hash := BaseHash}} ->
+            case beamchain_chain_params:get_assumeutxo_by_hash(BaseHash, Network) of
+                not_found ->
+                    {error, {unknown_snapshot_base, BaseHash}};
+                {ok, BaseHeight, _} ->
+                    do_load_snapshot_with_height(Path, State, Network,
+                                                 NetworkMagic, BaseHash,
+                                                 BaseHeight)
+            end;
+        {error, Reason} ->
+            {error, {snapshot_load_failed, Reason}}
+    end.
+
+do_load_snapshot_with_height(Path, State, Network, NetworkMagic, BaseHash, BaseHeight) ->
+    %% G8: check that the base block's block-index status does not have
+    %% BLOCK_FAILED_VALID set — Core validation.cpp:5617-5619.
+    BlockStatusOk =
+        case beamchain_db:get_block_index_by_hash(BaseHash) of
+            {ok, #{status := Status}} ->
+                (Status band ?BLOCK_FAILED_VALID) =:= 0;
+            not_found ->
+                %% Block index not yet known (node hasn't seen the header).
+                %% Allow proceeding; Core handles this via
+                %% snapshot_start_block == nullptr check, but here we permit it
+                %% for nodes still performing IBD.
+                true
+        end,
+    case BlockStatusOk of
+        false ->
+            {error, snapshot_base_block_failed_valid};
+        true ->
+            %% G9: snapshot chainwork must exceed active tip chainwork —
+            %% Core validation.cpp:5703-5708.
+            ActiveTipCWInt = active_tip_chainwork(State#state.tip_hash),
+            SnapCWInt =
+                case beamchain_db:get_block_index_by_hash(BaseHash) of
+                    {ok, #{chainwork := CW}} -> binary:decode_unsigned(CW, big);
+                    _                        -> 0
+                end,
+            case SnapCWInt =:= 0 orelse SnapCWInt > ActiveTipCWInt of
+                false ->
+                    {error, snapshot_chainwork_not_greater};
+                true ->
+                    %% Parse snapshot with all per-coin guards (G1-G5) applied.
+                    do_load_snapshot_parse(Path, State, Network,
+                                          NetworkMagic, BaseHash, BaseHeight)
+            end
+    end.
+
+do_load_snapshot_parse(Path, State, Network, NetworkMagic, BaseHash, BaseHeight) ->
+    %% G1 (network_magic), G2 (per-coin height), G3 (vout), G4 (MoneyRange),
+    %% G5 (trailing bytes) are all enforced inside load_snapshot_validated/3.
+    case beamchain_snapshot:load_snapshot_validated(Path, NetworkMagic, BaseHeight) of
+        {ok, #{num_coins := NumCoins, coins := Coins} = SnapshotData} ->
+            %% SHA256d strict-content-hash check (validation.cpp:5901-5914).
             case beamchain_snapshot:verify_snapshot(SnapshotData, Network) of
                 ok ->
-                    %% Look up the snapshot height
-                    case beamchain_chain_params:get_assumeutxo_by_hash(BaseHash, Network) of
-                        {ok, Height, _} ->
-                            logger:info("chainstate: loading ~B coins from snapshot at height ~B",
-                                        [NumCoins, Height]),
+                    logger:info("chainstate: loading ~B coins from snapshot at height ~B",
+                                [NumCoins, BaseHeight]),
 
-                            %% Populate the UTXO cache
-                            populate_utxo_cache_from_snapshot(Coins),
+                    %% Populate the UTXO cache
+                    populate_utxo_cache_from_snapshot(Coins),
 
-                            %% Update state
-                            State2 = State#state{
-                                tip_hash = BaseHash,
-                                tip_height = Height,
-                                chainstate_role = snapshot,
-                                snapshot_base_height = Height,
-                                snapshot_base_hash = BaseHash
-                            },
+                    %% Update state
+                    State2 = State#state{
+                        tip_hash = BaseHash,
+                        tip_height = BaseHeight,
+                        chainstate_role = snapshot,
+                        snapshot_base_height = BaseHeight,
+                        snapshot_base_hash = BaseHash
+                    },
 
-                            %% Update ETS chain meta
-                            ets:insert(?CHAIN_META, {tip, BaseHash, Height}),
+                    %% Update ETS chain meta
+                    ets:insert(?CHAIN_META, {tip, BaseHash, BaseHeight}),
 
-                            %% Start background validation
-                            spawn(fun() -> start_background_validation() end),
+                    %% Start background validation
+                    spawn(fun() -> start_background_validation() end),
 
-                            {ok, State2, Height};
-                        not_found ->
-                            {error, {unknown_snapshot_base, BaseHash}}
-                    end;
+                    {ok, State2, BaseHeight};
                 {error, BinMsg} when is_binary(BinMsg) ->
                     %% Verbatim Core "Bad snapshot content hash: ..." text.
                     {error, {snapshot_content_hash_mismatch, BinMsg}};
