@@ -18,7 +18,8 @@
 -export([flags_for_height/2]).
 %% Exported for testing the BIP-342 tapscript validation-weight budget
 %% gate. Not part of the stable API.
--export([eval_tapscript/5, compact_size_len/1, serialized_witness_stack_size/1]).
+-export([eval_tapscript/5, eval_tapscript/6, compact_size_len/1,
+         serialized_witness_stack_size/1]).
 
 %% Sighash computation
 -export([sighash_legacy/4, sighash_witness_v0/5, sighash_taproot/7]).
@@ -52,7 +53,16 @@
     sig_version = base :: base | witness_v0 | tapscript,
     script = <<>>     :: binary(),      %% full script (for codesep)
     sigops_budget = 0 :: integer(),     %% tapscript sigops budget
-    success = false   :: boolean()      %% tapscript OP_SUCCESS
+    success = false   :: boolean(),     %% tapscript OP_SUCCESS
+    %% BIP-341 annex hash for tapscript/taproot sighash.
+    %% Core (interpreter.cpp:1954): execdata.m_annex_hash =
+    %%   (HashWriter{} << annex).GetSHA256()
+    %% which is SHA256(compact_size(annex.size) || annex_bytes). undefined
+    %% when no annex was present in the witness stack. Threaded into
+    %% sighash_taproot/7 so the sigmsg's spend_type byte commits to the
+    %% annex correctly. W94: missing thread-through was a consensus bug
+    %% for any TAPROOT spend that included an annex.
+    annex_hash = undefined :: binary() | undefined
 }).
 
 %%% -------------------------------------------------------------------
@@ -1569,59 +1579,96 @@ do_checksig_tapscript(Rest, Pos, State) ->
     %% pop2 returns {ok, deeper, top, State} — deeper=Sig, top=PubKey
     case pop2(State) of
         {ok, Sig, PubKey, State1} ->
-            case PubKey of
-                <<>> ->
-                    {error, tapscript_empty_pubkey};
-                _ when byte_size(PubKey) =:= 32 ->
-                    %% x-only pubkey: Schnorr verify
-                    do_schnorr_checksig(Rest, Pos, PubKey, Sig, State1);
-                _ ->
-                    %% unknown pubkey type
-                    Flags = State1#script_state.flags,
-                    case Flags band ?SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE of
-                        0 ->
-                            %% unknown pubkey type succeeds
-                            execute(Rest, Pos, push(script_true(), State1));
+            %% Core (interpreter.cpp:357-382) gate order:
+            %%   1. success = !sig.empty()
+            %%   2. if (success) decrement budget; bail with VALIDATION_WEIGHT
+            %%      if it goes negative.  ALWAYS, regardless of pubkey type.
+            %%   3. if (pubkey.size()==0) -> TAPSCRIPT_EMPTY_PUBKEY
+            %%   4. else if (pubkey.size()==32) -> Schnorr-verify
+            %%   5. else -> DISCOURAGE_UPGRADABLE_PUBKEYTYPE (success=true)
+            %% W94 fix: previously the budget decrement was skipped for
+            %% non-32-byte pubkey types, so signatures with a future
+            %% pubkey-version softfork prefix were under-charged.  Also,
+            %% empty-pubkey was raised before the budget check, so the
+            %% error code drifted from Core when the budget was also
+            %% over-run on the same input.
+            SigNonEmpty = Sig =/= <<>>,
+            case apply_tapscript_sigops_budget(SigNonEmpty, State1) of
+                {error, _} = E -> E;
+                {ok, State2} ->
+                    case PubKey of
+                        <<>> ->
+                            {error, tapscript_empty_pubkey};
+                        _ when byte_size(PubKey) =:= 32 ->
+                            %% x-only pubkey: Schnorr verify.  Budget
+                            %% already decremented; skip the second
+                            %% decrement inside do_schnorr_checksig by
+                            %% using a budget-free helper.
+                            do_schnorr_checksig_post_budget(
+                              Rest, Pos, PubKey, Sig, State2);
                         _ ->
-                            {error, discourage_upgradable_pubkeytype}
+                            %% unknown pubkey type
+                            Flags = State2#script_state.flags,
+                            case Flags band ?SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE of
+                                0 ->
+                                    %% unknown pubkey type succeeds.
+                                    %% NB: per Core, "success" is not
+                                    %% modified by upgradable types, so
+                                    %% the truthy value pushed onto the
+                                    %% stack is the same as a successful
+                                    %% sig verification.
+                                    execute(Rest, Pos, push(script_true(), State2));
+                                _ ->
+                                    {error, discourage_upgradable_pubkeytype}
+                            end
                     end
             end;
         Error -> Error
     end.
 
-do_schnorr_checksig(Rest, Pos, _PubKey, <<>>, State) ->
-    %% empty sig = push false, don't consume sigops budget
+%% Apply the BIP-342 validation-weight cost (50 wu per executed sigop
+%% with non-empty signature).  Called from tapscript CHECKSIG /
+%% CHECKSIGVERIFY / CHECKSIGADD before the per-opcode branching, so the
+%% budget bookkeeping matches Core's EvalChecksigTapscript exactly.
+apply_tapscript_sigops_budget(false, State) ->
+    %% Empty signature: no decrement (Core: `if (success) ...`).
+    {ok, State};
+apply_tapscript_sigops_budget(true, State) ->
+    Budget = State#script_state.sigops_budget - 50,
+    case Budget < 0 of
+        true -> {error, tapscript_sigops_exceeded};
+        false -> {ok, State#script_state{sigops_budget = Budget}}
+    end.
+
+%% Variant of do_schnorr_checksig that assumes the budget has already
+%% been decremented by the caller.  Used by do_checksig_tapscript to
+%% avoid double-decrement.
+do_schnorr_checksig_post_budget(Rest, Pos, _PubKey, <<>>, State) ->
+    %% Empty sig: push false (caller already skipped budget).
     execute(Rest, Pos, push(script_false(), State));
-do_schnorr_checksig(Rest, Pos, PubKey, Sig, State) ->
-    {HashType, SigBytes} = case Sig of
-        <<S:64/binary>> ->
-            {?SIGHASH_DEFAULT, S};
-        <<S:64/binary, HT:8>> when HT =/= 0 ->
-            {HT, S};
-        _ ->
-            {invalid, <<>>}
-    end,
-    case HashType of
-        invalid ->
+do_schnorr_checksig_post_budget(Rest, Pos, PubKey, Sig, State) ->
+    case parse_schnorr_sig(Sig) of
+        {invalid, _} ->
             {error, invalid_schnorr_sig_size};
-        _ ->
-            %% consume sigops budget
-            Budget = State#script_state.sigops_budget - 50,
-            case Budget < 0 of
-                true -> {error, tapscript_sigops_exceeded};
-                false ->
-                    State1 = State#script_state{sigops_budget = Budget},
-                    SigChecker = State1#script_state.sig_checker,
-                    SigHash = compute_taproot_sig_hash(State1, HashType, Pos),
+        {HashType, SigBytes} ->
+            SigChecker = State#script_state.sig_checker,
+            case compute_taproot_sig_hash(State, HashType, Pos) of
+                {error, _} = E -> E;
+                {ok, SigHash} ->
                     Valid = check_schnorr_sig(SigChecker, SigBytes, PubKey, SigHash),
                     case Valid of
                         true ->
-                            execute(Rest, Pos, push(script_true(), State1));
+                            execute(Rest, Pos, push(script_true(), State));
                         false ->
                             {error, schnorr_sig_failed}
                     end
             end
     end.
+
+%% do_schnorr_checksig/5 retired in W94 — replaced by
+%% do_schnorr_checksig_post_budget/5 inside do_checksig_tapscript so
+%% the BIP-342 sigops-budget decrement runs ONCE per CHECKSIG and in
+%% the same gate position as Core's EvalChecksigTapscript.
 
 %%% -------------------------------------------------------------------
 %%% OP_CHECKSIGVERIFY
@@ -1648,35 +1695,51 @@ do_checksig_result(#script_state{sig_version = tapscript} = State, Pos) ->
     %% pop2 returns {ok, deeper, top, State} — deeper=Sig, top=PubKey
     case pop2(State) of
         {ok, Sig, PubKey, State1} ->
-            case PubKey of
-                <<>> ->
-                    {error, tapscript_empty_pubkey};
-                _ when byte_size(PubKey) =:= 32 ->
-                    case Sig of
-                        <<>> -> {ok, false, State1};
-                        _ ->
-                            {HashType, SigBytes} = parse_schnorr_sig(Sig),
-                            case HashType of
-                                invalid -> {error, invalid_schnorr_sig_size};
+            %% Match Core's gate order (EvalChecksigTapscript): decrement
+            %% budget when sig is non-empty *before* branching on pubkey
+            %% type.  Same fix as do_checksig_tapscript / do_checksigadd.
+            SigNonEmpty = Sig =/= <<>>,
+            case apply_tapscript_sigops_budget(SigNonEmpty, State1) of
+                {error, _} = E -> E;
+                {ok, State2} ->
+                    case PubKey of
+                        <<>> ->
+                            {error, tapscript_empty_pubkey};
+                        _ when byte_size(PubKey) =:= 32 ->
+                            case Sig of
+                                <<>> ->
+                                    {ok, false, State2};
                                 _ ->
-                                    Budget = State1#script_state.sigops_budget - 50,
-                                    case Budget < 0 of
-                                        true -> {error, tapscript_sigops_exceeded};
-                                        false ->
-                                            State2 = State1#script_state{sigops_budget = Budget},
-                                            SigHash = compute_taproot_sig_hash(State2, HashType, Pos),
-                                            Valid = check_schnorr_sig(
-                                                State2#script_state.sig_checker,
-                                                SigBytes, PubKey, SigHash),
-                                            {ok, Valid, State2}
+                                    case parse_schnorr_sig(Sig) of
+                                        {invalid, _} ->
+                                            {error, invalid_schnorr_sig_size};
+                                        {HashType, SigBytes} ->
+                                            case compute_taproot_sig_hash(State2, HashType, Pos) of
+                                                {error, _} = E2 -> E2;
+                                                {ok, SigHash} ->
+                                                    Valid = check_schnorr_sig(
+                                                        State2#script_state.sig_checker,
+                                                        SigBytes, PubKey, SigHash),
+                                                    {ok, Valid, State2}
+                                            end
                                     end
+                            end;
+                        _ ->
+                            Flags = State2#script_state.flags,
+                            case Flags band ?SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE of
+                                0 ->
+                                    %% Upgradable pubkey type: "success"
+                                    %% is unchanged (Core comments at
+                                    %% interpreter.cpp:373-381).  For
+                                    %% CHECKSIGVERIFY the caller treats
+                                    %% the boolean here as the verify
+                                    %% gate, so propagate SigNonEmpty
+                                    %% (which Core also uses as initial
+                                    %% `success`).
+                                    {ok, SigNonEmpty, State2};
+                                _ ->
+                                    {error, discourage_upgradable_pubkeytype}
                             end
-                    end;
-                _ ->
-                    Flags = State1#script_state.flags,
-                    case Flags band ?SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE of
-                        0 -> {ok, true, State1};
-                        _ -> {error, discourage_upgradable_pubkeytype}
                     end
             end;
         Error -> Error
@@ -1957,55 +2020,74 @@ do_checksigadd(Rest, Pos, State) ->
                 {ok, N, State2} ->
                     case pop(State2) of
                         {ok, Sig, State3} ->
-                            case PubKey of
-                                <<>> ->
-                                    {error, tapscript_empty_pubkey};
-                                _ when byte_size(PubKey) =:= 32 ->
-                                    case Sig of
-                                        <<>> ->
-                                            %% empty sig = no contribution
-                                            execute(Rest, Pos, push_num(N, State3));
-                                        _ ->
-                                            {HashType, SigBytes} = parse_schnorr_sig(Sig),
-                                            case HashType of
-                                                invalid ->
-                                                    {error, invalid_schnorr_sig_size};
-                                                _ ->
-                                                    Budget = State3#script_state.sigops_budget - 50,
-                                                    case Budget < 0 of
-                                                        true -> {error, tapscript_sigops_exceeded};
-                                                        false ->
-                                                            State4 = State3#script_state{sigops_budget = Budget},
-                                                            SigHash = compute_taproot_sig_hash(State4, HashType, Pos),
-                                                            Valid = check_schnorr_sig(
-                                                                State4#script_state.sig_checker,
-                                                                SigBytes, PubKey, SigHash),
-                                                            case Valid of
-                                                                true ->
-                                                                    execute(Rest, Pos, push_num(N + 1, State4));
-                                                                false ->
-                                                                    {error, schnorr_sig_failed}
-                                                            end
-                                                    end
-                                            end
-                                    end;
-                                _ ->
-                                    Flags = State3#script_state.flags,
-                                    case Flags band ?SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE of
-                                        0 ->
-                                            case Sig of
-                                                <<>> -> execute(Rest, Pos, push_num(N, State3));
-                                                _ -> execute(Rest, Pos, push_num(N + 1, State3))
-                                            end;
-                                        _ ->
-                                            {error, discourage_upgradable_pubkeytype}
-                                    end
-                            end;
+                            do_checksigadd_eval(Rest, Pos, PubKey, N, Sig, State3);
                         Error -> Error
                     end;
                 Error -> Error
             end;
         Error -> Error
+    end.
+
+%% BIP-342 OP_CHECKSIGADD evaluation core, factored out so the gate
+%% order matches Core's EvalChecksig / EvalChecksigTapscript exactly:
+%%   1. budget decrement when sig non-empty (Core: l.357-365)
+%%   2. empty-pubkey -> TAPSCRIPT_EMPTY_PUBKEY
+%%   3. 32-byte pubkey: Schnorr-verify
+%%   4. other pubkey size: DISCOURAGE or success
+%% W94 fix: budget was skipped on the unknown-pubkey-type branch when
+%% sig was non-empty, and the pubkey-empty error pre-empted budget
+%% exhaustion checks.  Both diverged from Core.
+do_checksigadd_eval(Rest, Pos, PubKey, N, Sig, State) ->
+    SigNonEmpty = Sig =/= <<>>,
+    case apply_tapscript_sigops_budget(SigNonEmpty, State) of
+        {error, _} = E -> E;
+        {ok, State1} ->
+            case PubKey of
+                <<>> ->
+                    {error, tapscript_empty_pubkey};
+                _ when byte_size(PubKey) =:= 32 ->
+                    do_checksigadd_xonly(Rest, Pos, PubKey, N, Sig, State1);
+                _ ->
+                    %% Unknown pubkey type.
+                    Flags = State1#script_state.flags,
+                    case Flags band ?SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE of
+                        0 ->
+                            %% Per Core EvalChecksigTapscript, `success`
+                            %% is not modified for upgradable pubkey
+                            %% types.  For CHECKSIGADD, that means the
+                            %% accumulator is incremented IF the sig was
+                            %% non-empty, and left unchanged otherwise.
+                            case SigNonEmpty of
+                                true  -> execute(Rest, Pos, push_num(N + 1, State1));
+                                false -> execute(Rest, Pos, push_num(N, State1))
+                            end;
+                        _ ->
+                            {error, discourage_upgradable_pubkeytype}
+                    end
+            end
+    end.
+
+do_checksigadd_xonly(Rest, Pos, _PubKey, N, <<>>, State) ->
+    %% Empty sig with x-only pubkey: no Schnorr check; accumulator unchanged.
+    execute(Rest, Pos, push_num(N, State));
+do_checksigadd_xonly(Rest, Pos, PubKey, N, Sig, State) ->
+    case parse_schnorr_sig(Sig) of
+        {invalid, _} ->
+            {error, invalid_schnorr_sig_size};
+        {HashType, SigBytes} ->
+            case compute_taproot_sig_hash(State, HashType, Pos) of
+                {error, _} = E -> E;
+                {ok, SigHash} ->
+                    Valid = check_schnorr_sig(
+                              State#script_state.sig_checker,
+                              SigBytes, PubKey, SigHash),
+                    case Valid of
+                        true ->
+                            execute(Rest, Pos, push_num(N + 1, State));
+                        false ->
+                            {error, schnorr_sig_failed}
+                    end
+            end
     end.
 
 %%% -------------------------------------------------------------------
@@ -2258,18 +2340,33 @@ compute_sig_hash(_, _, _) ->
 
 compute_taproot_sig_hash(#script_state{sig_checker = #{compute_taproot_sighash := Fun}},
                          HashType, CodeSepPos) ->
-    Fun(HashType, CodeSepPos);
+    {ok, Fun(HashType, CodeSepPos)};
 compute_taproot_sig_hash(#script_state{sig_checker = {Tx, InputIndex, _Amount, PrevOuts},
                                        script = Script,
-                                       codesep_pos = CodesepPos},
+                                       codesep_pos = CodesepPos,
+                                       annex_hash = AnnexHash},
                          HashType, _Pos) ->
-    %% For tapscript, compute leaf hash from the executing script
-    LeafHash = beamchain_crypto:tagged_hash(
-        <<"TapLeaf">>,
-        <<16#c0, (encode_compact_size(byte_size(Script)))/binary, Script/binary>>),
-    sighash_taproot(Tx, InputIndex, PrevOuts, HashType, undefined, LeafHash, CodesepPos);
+    %% For tapscript, compute leaf hash from the executing script.
+    %% AnnexHash is threaded from script_state (set at verify_taproot
+    %% entry), so spend_type bit 0 commits to any witness annex per
+    %% BIP-341.  W94 fix: was hardcoded to `undefined`.
+    %%
+    %% Core (interpreter.cpp:1549-1556) returns false from
+    %% SignatureHashSchnorr when output_type == SIGHASH_SINGLE and
+    %% in_pos >= tx_to.vout.size().  Callers map that to
+    %% SCHNORR_SIG_HASHTYPE.  W94 fix: was silently producing a wrong
+    %% hash before.
+    case sighash_single_in_range(Tx, InputIndex, HashType) of
+        false -> {error, schnorr_sig_hashtype};
+        true ->
+            LeafHash = beamchain_crypto:tagged_hash(
+                <<"TapLeaf">>,
+                <<16#c0, (encode_compact_size(byte_size(Script)))/binary, Script/binary>>),
+            {ok, sighash_taproot(Tx, InputIndex, PrevOuts, HashType, AnnexHash,
+                                  LeafHash, CodesepPos)}
+    end;
 compute_taproot_sig_hash(_, _, _) ->
-    <<0:256>>.
+    {ok, <<0:256>>}.
 
 check_hash_type(HT) ->
     Base = HT band (bnot ?SIGHASH_ANYONECANPAY),
@@ -2447,7 +2544,28 @@ do_verify_script(ScriptSig, ScriptPubKey, Witness, Flags, SigChecker) ->
 %%% Witness program verification
 %%% -------------------------------------------------------------------
 
-verify_witness_program(0, Program, Witness, Flags, SigChecker)
+%% 5-arity entry point: native-segwit (NOT P2SH-wrapped).
+verify_witness_program(Version, Program, Witness, Flags, SigChecker) ->
+    verify_witness_program(Version, Program, Witness, Flags, SigChecker, false).
+
+%% 6-arity entry point with explicit IsP2SH flag.
+%% Per BIP-341 / Core (interpreter.cpp:1947): Taproot is DISABLED inside
+%% a P2SH wrapper.  A witness v1+32 program reached via P2SH must fall
+%% through to the upgradable-witness branch (i.e. succeed unconditionally
+%% unless DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM is set).
+%% W94 fix: 5-arity path always treated v1+32 as Taproot, regardless of
+%% the surrounding scriptPubKey, which is a spec violation.
+
+%% v1 + 32 + P2SH-wrapped: per BIP-341, NOT Taproot. Falls through to
+%% the upgradable-witness branch (succeed-or-discourage).
+verify_witness_program(1, Program, _Witness, Flags, _SigChecker, true)
+  when byte_size(Program) =:= 32 ->
+    case (Flags band ?SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM) =/= 0 of
+        true  -> {error, discourage_upgradable_witness_program};
+        false -> {ok, [script_true()]}
+    end;
+
+verify_witness_program(0, Program, Witness, Flags, SigChecker, _IsP2SH)
   when byte_size(Program) =:= 20 ->
     %% P2WPKH
     case Witness of
@@ -2483,7 +2601,7 @@ verify_witness_program(0, Program, Witness, Flags, SigChecker)
             {error, witness_program_mismatch}
     end;
 
-verify_witness_program(0, Program, Witness, Flags, SigChecker)
+verify_witness_program(0, Program, Witness, Flags, SigChecker, _IsP2SH)
   when byte_size(Program) =:= 32 ->
     %% P2WSH
     case Witness of
@@ -2515,13 +2633,14 @@ verify_witness_program(0, Program, Witness, Flags, SigChecker)
             end
     end;
 
-verify_witness_program(1, Program, Witness, Flags, SigChecker)
+verify_witness_program(1, Program, Witness, Flags, SigChecker, false)
   when byte_size(Program) =:= 32,
        (Flags band ?SCRIPT_VERIFY_TAPROOT) =/= 0 ->
-    %% P2TR (Taproot)
+    %% P2TR (Taproot).  IsP2SH must be false here — the P2SH-wrapped
+    %% case is handled by the dedicated v1+32+IsP2SH=true clause above.
     verify_taproot(Program, Witness, Flags, SigChecker);
 
-verify_witness_program(Version, _Program, _Witness, Flags, _SigChecker)
+verify_witness_program(Version, _Program, _Witness, Flags, _SigChecker, _IsP2SH)
   when Version >= 2, Version =< 16 ->
     %% Future witness versions 2–16 are reserved for future softforks.
     %% Per BIP-141 forward-compatibility (Bitcoin Core interpreter.cpp
@@ -2533,30 +2652,33 @@ verify_witness_program(Version, _Program, _Witness, Flags, _SigChecker)
         false -> {ok, [script_true()]}
     end;
 
-verify_witness_program(1, Program, _Witness, Flags, _SigChecker)
+verify_witness_program(1, Program, _Witness, _Flags, _SigChecker, _IsP2SH)
   when byte_size(Program) =:= 32,
-       (Flags band ?SCRIPT_VERIFY_TAPROOT) =:= 0 ->
+       (_Flags band ?SCRIPT_VERIFY_TAPROOT) =:= 0 ->
     %% taproot not active yet, succeed
     {ok, [script_true()]};
 
-verify_witness_program(1, <<16#4e, 16#73>>, _Witness, _Flags, _SigChecker) ->
+verify_witness_program(1, <<16#4e, 16#73>>, _Witness, _Flags, _SigChecker, _IsP2SH) ->
     %% Pay-to-Anchor (P2A): witness v1 with 2-byte program 0x4e73.
     %% P2A outputs are anyone-can-spend and succeed unconditionally.
     %% This is NOT gated by DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM per BIP (policy exception).
     {ok, [script_true()]};
 
-verify_witness_program(1, Program, _Witness, Flags, _SigChecker)
-  when byte_size(Program) =/= 32,
-       (Flags band ?SCRIPT_VERIFY_TAPROOT) =/= 0 ->
-    %% BIP 341: v1 witness programs that are NOT 32 bytes are reserved
-    %% for future extensions and succeed unconditionally (unencumbered).
-    %% Note: P2A (0x4e73) is handled above and bypasses DISCOURAGE flag.
+verify_witness_program(1, Program, _Witness, Flags, _SigChecker, _IsP2SH)
+  when byte_size(Program) =/= 32 ->
+    %% BIP 341 / Core (interpreter.cpp:1990-1997): v1 witness programs
+    %% that are NOT 32 bytes are reserved for future softforks and
+    %% succeed unconditionally (anyone-can-spend at consensus) EVEN
+    %% before SCRIPT_VERIFY_TAPROOT activates.  W94 fix: was previously
+    %% gated on TAPROOT=set, which falsely rejected non-32-byte v1
+    %% programs pre-activation.  Note: P2A (0x4e73) is handled above
+    %% and bypasses DISCOURAGE flag.
     case (Flags band ?SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM) =/= 0 of
         true -> {error, discourage_upgradable_witness_program};
         false -> {ok, [script_true()]}
     end;
 
-verify_witness_program(_, _, _, _, _) ->
+verify_witness_program(_, _, _, _, _, _) ->
     {error, witness_program_wrong_length}.
 
 %%% -------------------------------------------------------------------
@@ -2564,14 +2686,23 @@ verify_witness_program(_, _, _, _, _) ->
 %%% -------------------------------------------------------------------
 
 verify_taproot(OutputKey, Witness, Flags, SigChecker) ->
-    %% Check for annex (last witness item starting with 0x50)
-    {CleanWitness, _Annex} = strip_annex(Witness),
+    %% Check for annex (last witness item starting with 0x50 when there
+    %% are at least 2 items, per BIP-341 / Core interpreter.cpp:1951).
+    {CleanWitness, AnnexBytes} = strip_annex(Witness),
+    %% Pre-compute annex hash so we can thread it into the BIP-341
+    %% sighash regardless of which spend path we take.  Core (line 1954):
+    %%   m_annex_hash = (HashWriter{} << annex).GetSHA256()
+    %% which is SHA256(compact_size(annex.size) || annex_bytes).
+    AnnexHash = case AnnexBytes of
+        undefined -> undefined;
+        _ -> annex_sha256(AnnexBytes)
+    end,
     case CleanWitness of
         [] ->
             {error, witness_program_empty};
         [Sig] ->
             %% Key path spend
-            verify_taproot_key_path(OutputKey, Sig, Flags, SigChecker);
+            verify_taproot_key_path(OutputKey, Sig, AnnexHash, Flags, SigChecker);
         _ ->
             %% Script path spend
             %% Last two items: script and control block
@@ -2585,8 +2716,15 @@ verify_taproot(OutputKey, Witness, Flags, SigChecker) ->
             %% stripped; we need the pre-strip stack here.
             verify_taproot_script_path(
                 OutputKey, Script, ControlBlock, ScriptArgs, Witness,
-                Flags, SigChecker)
+                AnnexHash, Flags, SigChecker)
     end.
+
+%% Core interpreter.cpp:1953-1955: annex hash is SHA256 over
+%%   compact_size(annex.size) || annex_bytes
+%% NOT a tagged hash (untagged SHA256).
+annex_sha256(Annex) ->
+    Sz = byte_size(Annex),
+    beamchain_crypto:sha256(<<(encode_compact_size(Sz))/binary, Annex/binary>>).
 
 strip_annex(Witness) when length(Witness) >= 2 ->
     Last = lists:last(Witness),
@@ -2599,30 +2737,54 @@ strip_annex(Witness) when length(Witness) >= 2 ->
 strip_annex(Witness) ->
     {Witness, undefined}.
 
-verify_taproot_key_path(OutputKey, Sig, _Flags, SigChecker) ->
+verify_taproot_key_path(OutputKey, Sig, AnnexHash, _Flags, SigChecker) ->
     {HashType, SigBytes} = parse_schnorr_sig(Sig),
     case HashType of
         invalid ->
             {error, invalid_schnorr_sig_size};
         _ ->
-            SigHash = case SigChecker of
-                #{compute_taproot_sighash := Fun} ->
-                    Fun(HashType, 16#ffffffff);
-                {Tx, InputIndex, _Amt, PrevOuts} ->
-                    %% Key path: no leaf hash, no annex
-                    sighash_taproot(Tx, InputIndex, PrevOuts, HashType,
-                                    undefined, undefined, 16#ffffffff);
-                _ ->
-                    <<0:256>>
-            end,
-            case check_schnorr_sig(SigChecker, SigBytes, OutputKey, SigHash) of
-                true -> {ok, [script_true()]};
-                false -> {error, taproot_sig_failed}
+            %% Key-path SIGHASH_SINGLE with InputIndex >= len(outputs)
+            %% must fail (Core interpreter.cpp:1550: returns false when
+            %% in_pos >= tx_to.vout.size()).
+            case sighash_taproot_for_key_path(SigChecker, HashType, AnnexHash) of
+                {error, _} = E -> E;
+                {ok, SigHash} ->
+                    case check_schnorr_sig(SigChecker, SigBytes, OutputKey, SigHash) of
+                        true -> {ok, [script_true()]};
+                        false -> {error, taproot_sig_failed}
+                    end
             end
     end.
 
+%% Helper: build the BIP-341 key-path sighash, propagating SIGHASH_SINGLE
+%% out-of-range as an error (Core: SignatureHashSchnorr returns false →
+%% caller maps to SCHNORR_SIG_HASHTYPE).
+sighash_taproot_for_key_path(#{compute_taproot_sighash := Fun}, HashType, _AnnexHash) ->
+    %% External sighash hook (used by some test fixtures). It is expected
+    %% to handle SIGHASH_SINGLE bounds checking itself.
+    {ok, Fun(HashType, 16#ffffffff)};
+sighash_taproot_for_key_path({Tx, InputIndex, _Amt, PrevOuts}, HashType, AnnexHash) ->
+    case sighash_single_in_range(Tx, InputIndex, HashType) of
+        false -> {error, schnorr_sig_hashtype};
+        true ->
+            {ok, sighash_taproot(Tx, InputIndex, PrevOuts, HashType,
+                                  AnnexHash, undefined, 16#ffffffff)}
+    end;
+sighash_taproot_for_key_path(_, _, _) ->
+    {ok, <<0:256>>}.
+
+%% SIGHASH_SINGLE / SIGHASH_SINGLE|ANYONECANPAY require InputIndex to be
+%% a valid output index (Core interpreter.cpp:1549-1556).  For other
+%% sighash types, always in range.
+sighash_single_in_range(Tx, InputIndex, HashType) ->
+    BaseType = HashType band 16#03,
+    case BaseType =:= ?SIGHASH_SINGLE of
+        false -> true;
+        true -> InputIndex < length(Tx#transaction.outputs)
+    end.
+
 verify_taproot_script_path(OutputKey, Script, ControlBlock,
-                           ScriptArgs, FullWitness, Flags, SigChecker) ->
+                           ScriptArgs, FullWitness, AnnexHash, Flags, SigChecker) ->
     %% Validate control block
     %% Core (interpreter.cpp:1970, interpreter.h:245-246):
     %%   TAPROOT_CONTROL_BASE_SIZE = 33
@@ -2674,8 +2836,35 @@ verify_taproot_script_path(OutputKey, Script, ControlBlock,
                                         + 50,
                                     %% Reverse: wire order is bottom-to-top,
                                     %% our list HEAD = top of stack
-                                    eval_tapscript(Script, lists:reverse(ScriptArgs),
-                                                  Budget, Flags, SigChecker);
+                                    InitialStack = lists:reverse(ScriptArgs),
+                                    %% Core (interpreter.cpp:1854-1856) gate:
+                                    %% tapscript enforces MAX_STACK_SIZE on the
+                                    %% initial stack BEFORE EvalScript.  Altstack
+                                    %% is empty here so the comparison is just
+                                    %% the initial stack length.
+                                    case length(InitialStack) > ?MAX_STACK_SIZE of
+                                        true ->
+                                            {error, stack_size};
+                                        false ->
+                                            %% Core (interpreter.cpp:1858-1861)
+                                            %% gate: every initial-stack element
+                                            %% must be <= MAX_SCRIPT_ELEMENT_SIZE
+                                            %% (520 bytes).  W94: was missing —
+                                            %% witness-supplied 521+ byte stack
+                                            %% elements bypassed the gate via
+                                            %% the script_path entry point.
+                                            case lists:any(
+                                                   fun(E) ->
+                                                       byte_size(E) > ?MAX_SCRIPT_ELEMENT_SIZE
+                                                   end, InitialStack) of
+                                                true ->
+                                                    {error, push_size_exceeded};
+                                                false ->
+                                                    eval_tapscript(
+                                                      Script, InitialStack, Budget,
+                                                      AnnexHash, Flags, SigChecker)
+                                            end
+                                    end;
                                 _ ->
                                     case (Flags band ?SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION) =/= 0 of
                                         true ->
@@ -2692,14 +2881,21 @@ verify_taproot_script_path(OutputKey, Script, ControlBlock,
             end
     end.
 
+%% 5-arity entry point preserved for callers / tests that don't have an
+%% annex hash (e.g. pre-W94 unit tests).  Annex defaults to undefined,
+%% which is exactly what the pre-W94 code path was implicitly using.
 eval_tapscript(Script, Stack, SigopsBudget, Flags, SigChecker) ->
+    eval_tapscript(Script, Stack, SigopsBudget, undefined, Flags, SigChecker).
+
+eval_tapscript(Script, Stack, SigopsBudget, AnnexHash, Flags, SigChecker) ->
     State0 = #script_state{
         stack = Stack,
         flags = Flags,
         sig_checker = SigChecker,
         sig_version = tapscript,
         script = Script,
-        sigops_budget = SigopsBudget
+        sigops_budget = SigopsBudget,
+        annex_hash = AnnexHash
     },
     %% check for OP_SUCCESS first
     case check_op_success(Script, Flags) of
@@ -2791,7 +2987,9 @@ is_p2sh(_) -> false.
 check_p2sh_witness(true, [RS | _], Witness, Flags, SigChecker, _Stack3) ->
     case extract_witness_program(RS) of
         {ok, WV, WP} when (Flags band ?SCRIPT_VERIFY_WITNESS) =/= 0 ->
-            verify_witness_program(WV, WP, Witness, Flags, SigChecker);
+            %% IsP2SH = true: gates the Taproot path off (BIP-341 forbids
+            %% v1+32 inside P2SH; it must succeed as upgradable-witness).
+            verify_witness_program(WV, WP, Witness, Flags, SigChecker, true);
         _ ->
             {ok, _Stack3}
     end;
