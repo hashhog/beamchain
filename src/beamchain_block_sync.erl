@@ -861,9 +861,17 @@ handle_unsolicited_block(Peer, Block, State) ->
                                                 [hash_hex(BlockHash), Height, Peer]),
                                     State;
                                 {error, Reason} ->
-                                    logger:debug("block_sync: unsolicited block ~s "
-                                                 "failed connect: ~p",
-                                                 [hash_hex(BlockHash), Reason]),
+                                    %% G16/G17 fix: connect_block failures include
+                                    %% BLOCK_MUTATED (defense-in-depth re-check at
+                                    %% connect time) and BLOCK_INVALID_HEADER
+                                    %% (contextual header check).  Bitcoin Core
+                                    %% calls Misbehaving(pfrom, 100, …) for both
+                                    %% (validation.cpp ProcessNewBlock).  Log at
+                                    %% warning so the event is visible, then penalise.
+                                    logger:warning("block_sync: unsolicited block ~s "
+                                                   "failed connect: ~p — penalising peer ~p",
+                                                   [hash_hex(BlockHash), Reason, Peer]),
+                                    beamchain_peer:add_misbehavior(Peer, 100),
                                     State
                             end;
                         {error, Reason} ->
