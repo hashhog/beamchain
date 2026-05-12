@@ -35,7 +35,8 @@
          handle_peer_disconnected/1,
          handle_cmpctblock/2,
          handle_blocktxn/2,
-         get_status/0]).
+         get_status/0,
+         is_too_far_ahead/2]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -816,33 +817,62 @@ handle_unsolicited_block(Peer, Block, State) ->
             State;
         false ->
             Params = State#state.params,
-            %% 1. Context-free validation
-            case beamchain_validation:check_block(Block, Params) of
-                ok ->
-                    %% 2. Connect via chainstate — this does contextual
-                    %%    validation, UTXO updates, block storage, block
-                    %%    index, and tip update all in one call.
-                    case beamchain_chainstate:connect_block(Block) of
+            %% G19c (Core validation.cpp:4325): drop unrequested blocks that are
+            %% more than MIN_BLOCKS_TO_KEEP heights ahead of the active tip.
+            %% This protects the pruning window and prevents CPU-DoS via a
+            %% large burst of valid-but-far-future blocks.
+            %% Derive the candidate block height from its parent's index entry.
+            %% If the parent is not yet in the index, BlockHeight is unknown and
+            %% we skip the gate (connect_block will reject with bad_prevblk).
+            PrevHash = (Block#block.header)#block_header.prev_hash,
+            {TipHeight, BlockHeightKnown, BlockHeight} =
+                case beamchain_chainstate:get_tip_height() of
+                    {ok, TH} ->
+                        case beamchain_db:get_block_index_by_hash(PrevHash) of
+                            {ok, #{height := PH}} ->
+                                {TH, true, PH + 1};
+                            not_found ->
+                                {TH, false, 0}
+                        end;
+                    not_found ->
+                        {-1, false, 0}
+                end,
+            case BlockHeightKnown andalso is_too_far_ahead(BlockHeight, TipHeight) of
+                true ->
+                    logger:debug("block_sync: dropping unrequested block ~s — "
+                                 "too far ahead (height ~B > tip ~B + ~B)",
+                                 [hash_hex(BlockHash), BlockHeight,
+                                  TipHeight, ?MIN_BLOCKS_TO_KEEP]),
+                    State;
+                false ->
+                    %% 1. Context-free validation
+                    case beamchain_validation:check_block(Block, Params) of
                         ok ->
-                            {ok, {_, Height}} = beamchain_chainstate:get_tip(),
-                            %% 3. Store tx index entries (not done by chainstate)
-                            store_tx_index(Block, Height),
-                            logger:info("block_sync: connected unsolicited "
-                                        "block ~s at height ~B from ~p",
-                                        [hash_hex(BlockHash), Height, Peer]),
-                            State;
+                            %% 2. Connect via chainstate — this does contextual
+                            %%    validation, UTXO updates, block storage, block
+                            %%    index, and tip update all in one call.
+                            case beamchain_chainstate:connect_block(Block) of
+                                ok ->
+                                    {ok, {_, Height}} = beamchain_chainstate:get_tip(),
+                                    %% 3. Store tx index entries (not done by chainstate)
+                                    store_tx_index(Block, Height),
+                                    logger:info("block_sync: connected unsolicited "
+                                                "block ~s at height ~B from ~p",
+                                                [hash_hex(BlockHash), Height, Peer]),
+                                    State;
+                                {error, Reason} ->
+                                    logger:debug("block_sync: unsolicited block ~s "
+                                                 "failed connect: ~p",
+                                                 [hash_hex(BlockHash), Reason]),
+                                    State
+                            end;
                         {error, Reason} ->
-                            logger:debug("block_sync: unsolicited block ~s "
-                                         "failed connect: ~p",
-                                         [hash_hex(BlockHash), Reason]),
+                            logger:warning("block_sync: unsolicited block ~s "
+                                           "failed validation: ~p",
+                                           [hash_hex(BlockHash), Reason]),
+                            beamchain_peer:add_misbehavior(Peer, 20),
                             State
-                    end;
-                {error, Reason} ->
-                    logger:warning("block_sync: unsolicited block ~s "
-                                   "failed validation: ~p",
-                                   [hash_hex(BlockHash), Reason]),
-                    beamchain_peer:add_misbehavior(Peer, 20),
-                    State
+                    end
             end
     end.
 
@@ -1047,6 +1077,15 @@ validate_and_connect(Height, Block,
                          [Height, Reason, Stack]),
             {error, Reason}
     end.
+
+%% Pure predicate: true when an unrequested block is too far ahead of the
+%% active tip to bother with. Mirrors Core validation.cpp:4325:
+%%   fTooFarAhead = pindex->nHeight > ActiveHeight() + MIN_BLOCKS_TO_KEEP
+%% BlockHeight is the candidate's height; TipHeight is the active chain tip.
+%% Both are non-negative integers (genesis = 0).
+-spec is_too_far_ahead(non_neg_integer(), integer()) -> boolean().
+is_too_far_ahead(BlockHeight, TipHeight) ->
+    BlockHeight > TipHeight + ?MIN_BLOCKS_TO_KEEP.
 
 %% Look up the height of the assumevalid block at startup.
 lookup_assume_valid_height(<<0:256>>) ->

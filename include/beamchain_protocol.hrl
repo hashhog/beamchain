@@ -14,6 +14,10 @@
 -define(MIN_TRANSACTION_WEIGHT, 240).
 %% Core consensus/consensus.h:24 — MIN_SERIALIZABLE_TRANSACTION_WEIGHT = WITNESS_SCALE_FACTOR * 10 = 40
 -define(MIN_SERIALIZABLE_TRANSACTION_WEIGHT, 40).
+%% Core validation.cpp — minimum blocks to keep for pruning; also the fTooFarAhead threshold.
+%% An unrequested block whose height exceeds ActiveHeight + MIN_BLOCKS_TO_KEEP is
+%% dropped without validation (Core validation.cpp:4325).
+-define(MIN_BLOCKS_TO_KEEP, 288).
 
 %% Money
 -define(MAX_MONEY, 2100000000000000).   %% 21M BTC in satoshis

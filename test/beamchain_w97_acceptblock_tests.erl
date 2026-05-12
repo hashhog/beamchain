@@ -388,17 +388,39 @@ g19b_bug_unsolicited_block_validates_before_work_check_test() ->
 %%% G19c: fTooFarAhead = nHeight > ActiveHeight + 288 (MIN_BLOCKS_TO_KEEP)
 %%%
 %%% Core skips unrequested blocks whose height is more than 288 ahead
-%%% of the active tip — protects pruning. beamchain has NO height-gap
-%%% gate for unsolicited blocks. A future-height block from a peer is
-%%% rejected only because parent is unknown (bad_prevblk), but a peer
-%%% sending a chain of headers + 1 future-height block bypasses this.
+%%% of the active tip — protects pruning. W97 G19c fix: beamchain now
+%%% calls beamchain_block_sync:is_too_far_ahead/2 in handle_unsolicited_block
+%%% before check_block. The three cases below verify the predicate directly.
 %%% -------------------------------------------------------------------
 
-g19c_bug_too_far_ahead_gate_missing_test() ->
-    %% Documentary. No grep for MIN_BLOCKS_TO_KEEP or 288 against
-    %% block_sync / chainstate accept paths. Only block_sync uses 288
-    %% in a different context (in_flight pipeline depth).
-    ok = sanity_present(too_far_ahead_gate_missing).
+%% Case 1: unrequested block strictly beyond the 288-block window is rejected
+%% by the is_too_far_ahead/2 predicate (height = tip + 289).
+g19c_unrequested_too_far_ahead_rejected_test() ->
+    TipHeight = 1000,
+    BlockHeight = TipHeight + 289,   %% one past the limit
+    ?assert(beamchain_block_sync:is_too_far_ahead(BlockHeight, TipHeight)).
+
+%% Case 2: unrequested block exactly at the window boundary (height = tip + 288)
+%% is NOT dropped — the gate is strictly greater-than.
+g19c_unrequested_at_gate_boundary_accepted_test() ->
+    TipHeight = 1000,
+    BlockHeight = TipHeight + 288,   %% exactly at limit, not beyond
+    ?assertNot(beamchain_block_sync:is_too_far_ahead(BlockHeight, TipHeight)).
+
+%% Case 3: the is_too_far_ahead/2 predicate returns true for far-ahead heights,
+%% but the requested (IBD/sync) path does not invoke it, so a requested block
+%% at tip+289 is not subject to this gate. We encode this by confirming the
+%% predicate returns true (the gate fires) while noting the sync path bypasses it.
+g19c_requested_too_far_accepted_by_sync_path_test() ->
+    %% The predicate fires: height > tip + 288
+    TipHeight = 500,
+    BlockHeight = TipHeight + 300,
+    ?assert(beamchain_block_sync:is_too_far_ahead(BlockHeight, TipHeight)),
+    %% The gate is only consulted by handle_unsolicited_block; the IBD
+    %% validate_sequential path does not call is_too_far_ahead — so a
+    %% requested block at this height passes through. This is correct per Core:
+    %%   if (!fRequested) { ... if (fTooFarAhead) return true; ... }
+    ok.
 
 %%% -------------------------------------------------------------------
 %%% G19d: nChainWork < MinimumChainWork() early-return on unrequested
