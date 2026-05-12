@@ -158,7 +158,15 @@
     %% `headers` message rather than `inv`. Mirrors Core
     %% net_processing.cpp::CNodeState::fPreferHeaders. Updated by the
     %% {peer_sendheaders, Pid} message dispatched from beamchain_peer.
-    wants_headers = false :: boolean()
+    wants_headers = false :: boolean(),
+    %% W99 G2: ban-exemption flags mirroring Bitcoin Core
+    %% net_processing.cpp:5083-5088.
+    %%   noban  — peer was granted NoBan permission (whitelist/config);
+    %%            never ban, never discourage.
+    %%   manual — peer was added via addnode / connect_to API;
+    %%            never ban, never discourage.
+    noban  = false :: boolean(),
+    manual = false :: boolean()
 }).
 
 -record(state, {
@@ -484,7 +492,7 @@ handle_call({connect_to, IP, Port}, _From, State) ->
                 {ok, _Pid} ->
                     {reply, {error, already_connected}, State};
                 error ->
-                    case do_connect(Address, full_relay, State) of
+                    case do_connect(Address, full_relay, true, State) of
                         {ok, Pid, State2} ->
                             {reply, {ok, Pid}, State2};
                         {error, Reason} ->
@@ -1002,7 +1010,10 @@ count_outbound_by_type(Type) ->
             C
     end, 0, ?PEER_TABLE).
 
-do_connect({IP, _Port} = Address, ConnType, State) ->
+do_connect(Address, ConnType, State) ->
+    do_connect(Address, ConnType, false, State).
+
+do_connect({IP, _Port} = Address, ConnType, IsManual, State) ->
     case beamchain_peer:connect(Address, self(), #{}) of
         {ok, Pid} ->
             MonRef = erlang:monitor(process, Pid),
@@ -1016,7 +1027,8 @@ do_connect({IP, _Port} = Address, ConnType, State) ->
                 connected = false,
                 connect_time = Now,
                 keyed_netgroup = calculate_keyed_netgroup(Address, State),
-                network_type = get_network_type(IP)
+                network_type = get_network_type(IP),
+                manual = IsManual
             },
             ets:insert(?PEER_TABLE, Entry),
             %% Track netgroup for diversity (before connection completes)
@@ -1816,32 +1828,57 @@ disconnect_peers_by_ip(IP) ->
 %% Handle misbehavior report
 handle_misbehaving(Pid, Score, Reason, State) ->
     case ets:lookup(?PEER_TABLE, Pid) of
-        [#peer_entry{address = {IP, Port}, misbehavior_score = OldScore} = Entry] ->
-            NewScore = OldScore + Score,
-            ReasonStr = if
-                is_binary(Reason) -> Reason;
-                is_list(Reason) -> list_to_binary(Reason);
-                true -> <<"unknown">>
-            end,
-            logger:warning("peer manager: misbehaving peer ~p:~B (+~B -> ~B): ~s",
-                           [IP, Port, Score, NewScore, ReasonStr]),
-            case NewScore >= ?BAN_THRESHOLD of
+        [#peer_entry{address = {IP, Port},
+                     misbehavior_score = OldScore,
+                     noban  = NoBan,
+                     manual = IsManual} = Entry] ->
+            %% W99 G2 — mirror Bitcoin Core net_processing.cpp:5083-5088:
+            %%   HasPermission(NoBan) → return false (no action)
+            %%   IsManualConn()       → return false (no action)
+            %%   addr.IsLocal()       → disconnect only, never ban/discourage
+            case NoBan orelse IsManual of
                 true ->
-                    %% Ban the peer
-                    BanExpiry = erlang:system_time(second) + ?DEFAULT_BAN_DURATION,
-                    ets:insert(?BANNED_PEERS_TABLE, {IP, BanExpiry}),
-                    logger:info("peer manager: banning ~p:~B for ~B seconds (score ~B)",
-                                [IP, Port, ?DEFAULT_BAN_DURATION, NewScore]),
-                    %% Persist bans to disk
-                    save_bans(State#state.datadir),
-                    %% Disconnect the peer
-                    beamchain_peer:disconnect(Pid),
+                    %% Exempt peer: log and take no action.
+                    logger:info("peer manager: misbehaving peer ~p:~B (+~B) ignored "
+                                "(noban=~p manual=~p)",
+                                [IP, Port, Score, NoBan, IsManual]),
                     {noreply, State};
                 false ->
-                    %% Update the score
-                    Entry2 = Entry#peer_entry{misbehavior_score = NewScore},
-                    ets:insert(?PEER_TABLE, Entry2),
-                    {noreply, State}
+                    NewScore = OldScore + Score,
+                    ReasonStr = if
+                        is_binary(Reason) -> Reason;
+                        is_list(Reason) -> list_to_binary(Reason);
+                        true -> <<"unknown">>
+                    end,
+                    logger:warning("peer manager: misbehaving peer ~p:~B (+~B -> ~B): ~s",
+                                   [IP, Port, Score, NewScore, ReasonStr]),
+                    case NewScore >= ?BAN_THRESHOLD of
+                        true ->
+                            case is_local_addr(IP) of
+                                true ->
+                                    %% Local peer: disconnect only, do not ban.
+                                    %% Mirrors Core: addr.IsLocal() → fDisconnect=true, no Discourage.
+                                    logger:info("peer manager: disconnecting local peer ~p:~B "
+                                                "(score ~B, no ban)", [IP, Port, NewScore]),
+                                    beamchain_peer:disconnect(Pid),
+                                    {noreply, State};
+                                false ->
+                                    %% Regular inbound: ban + disconnect.
+                                    BanExpiry = erlang:system_time(second) + ?DEFAULT_BAN_DURATION,
+                                    ets:insert(?BANNED_PEERS_TABLE, {IP, BanExpiry}),
+                                    logger:info("peer manager: banning ~p:~B for ~B seconds "
+                                                "(score ~B)",
+                                                [IP, Port, ?DEFAULT_BAN_DURATION, NewScore]),
+                                    save_bans(State#state.datadir),
+                                    beamchain_peer:disconnect(Pid),
+                                    {noreply, State}
+                            end;
+                        false ->
+                            %% Update the score
+                            Entry2 = Entry#peer_entry{misbehavior_score = NewScore},
+                            ets:insert(?PEER_TABLE, Entry2),
+                            {noreply, State}
+                    end
             end;
         [] ->
             %% Unknown peer, ignore
@@ -2339,3 +2376,15 @@ get_network_type({16#FC00, _, _, _, _, _, _, _}) ->
     cjdns;
 get_network_type({_, _, _, _, _, _, _, _}) ->
     ipv6.
+
+%% @doc True for loopback addresses.
+%% Mirrors Bitcoin Core CNetAddr::IsLocal() — these addresses are never
+%% discouraged/banned, only disconnected (W99 G2).
+-spec is_local_addr(inet:ip_address()) -> boolean().
+is_local_addr({127, _, _, _}) -> true;
+is_local_addr({0, 0, 0, 0}) -> true;
+%% IPv6 loopback (::1)
+is_local_addr({0, 0, 0, 0, 0, 0, 0, 1}) -> true;
+%% IPv4-mapped loopback ::ffff:127.x.x.x  — second-to-last group is 0x7Fxx
+is_local_addr({0, 0, 0, 0, 0, 16#FFFF, H6, _}) when H6 band 16#FF00 =:= 16#7F00 -> true;
+is_local_addr(_) -> false.
