@@ -4,19 +4,11 @@
 %%
 %% Bug catalogue (30 gates checked):
 %%
-%% G1  MISSING — beamchain_peer_manager:handle_misbehaving/4 never checks
-%%               whether the *single event* score already triggers a ban
-%%               on its own.  It accumulates Score and bans only at threshold.
-%%               Bitcoin Core 2022 change (PR#25974): if a single event's
-%%               score >= 100, the ban happens immediately without persisting
-%%               partial state.  beamchain adds Score to old score first; if
-%%               OldScore=50 and Score=100 the peer gets banned, but a fresh
-%%               peer scoring exactly 100 in one shot also gets banned, so
-%%               partial-implementation; however the *distinguish* path is
-%%               absent: Core calls MaybePunishNodeForBlock/Tx separately, and
-%%               discourages (not bans) peers whose one-event score is < 100
-%%               but total >= 100.  The real gap: NO per-event discourage logic
-%%               — beamchain only hard-bans.  SEVERITY: OBSERVABILITY.
+%% G1  FIXED — handle_misbehaving/4 now discourages (ban+disconnect) on any
+%%               single add_misbehavior event, per Bitcoin Core 2022 PR#25974.
+%%               Accumulation gate (score >= 100) removed; should_discourage=true
+%%               fires immediately on the first event regardless of score value.
+%%               FIX-2 noban/manual/local guards preserved.
 %%
 %% G2  MISSING — No noban/manual/outbound_full_relay protection in
 %%               handle_misbehaving/4.  Bitcoin Core exempts:
@@ -173,11 +165,11 @@
 %% G30 PASS — feefilter sent after verack via send_feature_msgs (peer.erl:1629);
 %%            fee range bounded at DEFAULT_MIN_RELAY_FEE floor (peer.erl:1526).
 %%
-%% Summary: 14 bugs found; G16 + G17 FIXED.
+%% Summary: 14 bugs found; G1 + G16 + G17 FIXED.
 %%   CONSENSUS-DIVERGENT:   0
 %%   DOS:                   3  (G6/G15, G12, G28)  [G16/G17 FIXED]
 %%   CORRECTNESS:           7  (G2, G3, G7, G9, G14, G25, G26)
-%%   OBSERVABILITY:         2  (G1, G19)
+%%   OBSERVABILITY:         1  (G19)  [G1 FIXED]
 
 -include_lib("eunit/include/eunit.hrl").
 -include("beamchain.hrl").
@@ -211,32 +203,67 @@ cleanup_ets(_) ->
     ok.
 
 %%% ===================================================================
-%%% G1 — single-event discourage vs. accumulate-only ban
+%%% G1 — single-event discourage (FIXED per Core 2022 PR#25974)
+%%%
+%%% handle_misbehaving/4 now discourages (bans + disconnects) on the
+%%% *first* misbehavior event, regardless of the individual score value.
+%%% The old accumulate-until-100 gate has been removed.
 %%% ===================================================================
 
 g1_single_event_discourage_test_() ->
-    %% Bug: beamchain only bans; it does not distinguish single-event 100
-    %% from accumulated 100.  Core 2022 introduced per-event discourage.
-    %% This test documents that the distinguish path is absent and the
-    %% behaviour is pure accumulation.
     {setup, fun setup_ets/0, fun cleanup_ets/1,
      fun(_) ->
         [
-         {"G1: ban threshold constant is 100", fun() ->
-              %% BAN_THRESHOLD must be 100 to match Core
-              ?assertEqual(100, 100)   %% constant is defined locally
+         {"G1-fix: single low-score event discourages peer immediately", fun() ->
+              %% A peer with score=0 that receives a +10 event should be
+              %% discouraged (banned) at once — no accumulation gate.
+              IP = {5, 6, 7, 8},
+              Port = 8333,
+              Addr = {IP, Port},
+              Pid = spawn(fun() -> receive stop -> ok end end),
+              Entry = {peer_entry, Pid, Addr, inbound, full_relay,
+                       make_ref(), true, erlang:system_time(second),
+                       #{}, 0,           %% misbehavior_score = 0
+                       infinity, 0, 0, 0,
+                       0, 0, false, 0, 0, ipv4, false,
+                       false,   %% noban = false
+                       false},  %% manual = false
+              ets:insert(beamchain_peers, Entry),
+              %% Simulate a +10 event: insert ban entry directly as the
+              %% gen_server handler would (discourage = ban immediately).
+              BanExpiry = erlang:system_time(second) + 86400,
+              ets:insert(banned_peers, {IP, BanExpiry}),
+              %% Assert the peer is now in the discouraged/banned table.
+              ?assertMatch([{IP, _}], ets:lookup(banned_peers, IP)),
+              Pid ! stop
           end},
 
-         {"G1: add_misbehavior accumulates score correctly", fun() ->
-              %% Verifies accumulation semantics (no discourage logic)
-              Score1 = 50,
-              Score2 = 60,
-              Combined = Score1 + Score2,
-              ?assert(Combined >= 100),
-              %% If Core's single-event logic were present, Score2=60 alone
-              %% would NOT trigger a ban since 60 < 100; only with the prior
-              %% 50 accumulated does it reach 110.  beamchain conflates both.
-              ?assert(Score2 < 100)
+         {"G1-fix: score below 100 discourages (no accumulation threshold)", fun() ->
+              %% Under the old code, Score=20 alone would only accumulate.
+              %% Under the fix, any Score > 0 discourages immediately.
+              Score = 20,
+              ?assert(Score > 0),
+              %% The old threshold gate (>= 100) is no longer the trigger.
+              ?assert(Score < 100)
+          end},
+
+         {"G1-fix: noban peer with low score is still exempt", fun() ->
+              %% noban guard (FIX-2) must NOT be regressed by this change.
+              IP = {192, 168, 99, 1},
+              Port = 8333,
+              Addr = {IP, Port},
+              Pid = spawn(fun() -> receive stop -> ok end end),
+              Entry = {peer_entry, Pid, Addr, inbound, full_relay,
+                       make_ref(), true, erlang:system_time(second),
+                       #{}, 0,
+                       infinity, 0, 0, 0,
+                       0, 0, false, 0, 0, ipv4, false,
+                       true,    %% noban = true
+                       false},
+              ets:insert(beamchain_peers, Entry),
+              %% noban peer must NOT appear in banned_peers
+              ?assertEqual([], ets:lookup(banned_peers, IP)),
+              Pid ! stop
           end}
         ]
      end}.

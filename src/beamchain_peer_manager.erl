@@ -1826,12 +1826,24 @@ disconnect_peers_by_ip(IP) ->
     end, ok, ?PEER_TABLE).
 
 %% Handle misbehavior report
+%%
+%% W99 G1 fix — single-event discourage per Bitcoin Core 2022 PR#25974.
+%%
+%% Core changed MaybePunishNodeForBlock/Tx so that any single add_misbehavior
+%% call sets should_discourage=true and the ban fires in the next network
+%% loop, rather than waiting for the accumulated score to reach 100.  The
+%% old accumulate-only model required multiple events before acting; the new
+%% model discourages (ban+disconnect) on the *first* event regardless of the
+%% individual score value.
+%%
+%% Preserved from FIX-2 (W99 G2):
+%%   noban/manual flags → skip all action.
+%%   addr.IsLocal()     → disconnect only, never ban.
 handle_misbehaving(Pid, Score, Reason, State) ->
     case ets:lookup(?PEER_TABLE, Pid) of
         [#peer_entry{address = {IP, Port},
-                     misbehavior_score = OldScore,
                      noban  = NoBan,
-                     manual = IsManual} = Entry] ->
+                     manual = IsManual}] ->
             %% W99 G2 — mirror Bitcoin Core net_processing.cpp:5083-5088:
             %%   HasPermission(NoBan) → return false (no action)
             %%   IsManualConn()       → return false (no action)
@@ -1844,39 +1856,33 @@ handle_misbehaving(Pid, Score, Reason, State) ->
                                 [IP, Port, Score, NoBan, IsManual]),
                     {noreply, State};
                 false ->
-                    NewScore = OldScore + Score,
                     ReasonStr = if
                         is_binary(Reason) -> Reason;
                         is_list(Reason) -> list_to_binary(Reason);
                         true -> <<"unknown">>
                     end,
-                    logger:warning("peer manager: misbehaving peer ~p:~B (+~B -> ~B): ~s",
-                                   [IP, Port, Score, NewScore, ReasonStr]),
-                    case NewScore >= ?BAN_THRESHOLD of
+                    logger:warning("peer manager: misbehaving peer ~p:~B (+~B): ~s — "
+                                   "discouraging (single-event, PR#25974)",
+                                   [IP, Port, Score, ReasonStr]),
+                    %% W99 G1: single-event discourage — any misbehavior triggers
+                    %% should_discourage=true immediately (no accumulation gate).
+                    case is_local_addr(IP) of
                         true ->
-                            case is_local_addr(IP) of
-                                true ->
-                                    %% Local peer: disconnect only, do not ban.
-                                    %% Mirrors Core: addr.IsLocal() → fDisconnect=true, no Discourage.
-                                    logger:info("peer manager: disconnecting local peer ~p:~B "
-                                                "(score ~B, no ban)", [IP, Port, NewScore]),
-                                    beamchain_peer:disconnect(Pid),
-                                    {noreply, State};
-                                false ->
-                                    %% Regular inbound: ban + disconnect.
-                                    BanExpiry = erlang:system_time(second) + ?DEFAULT_BAN_DURATION,
-                                    ets:insert(?BANNED_PEERS_TABLE, {IP, BanExpiry}),
-                                    logger:info("peer manager: banning ~p:~B for ~B seconds "
-                                                "(score ~B)",
-                                                [IP, Port, ?DEFAULT_BAN_DURATION, NewScore]),
-                                    save_bans(State#state.datadir),
-                                    beamchain_peer:disconnect(Pid),
-                                    {noreply, State}
-                            end;
+                            %% Local peer: disconnect only, do not ban.
+                            %% Mirrors Core: addr.IsLocal() → fDisconnect=true, no Discourage.
+                            logger:info("peer manager: disconnecting local peer ~p:~B "
+                                        "(score ~B, no ban)", [IP, Port, Score]),
+                            beamchain_peer:disconnect(Pid),
+                            {noreply, State};
                         false ->
-                            %% Update the score
-                            Entry2 = Entry#peer_entry{misbehavior_score = NewScore},
-                            ets:insert(?PEER_TABLE, Entry2),
+                            %% Regular peer: discourage (ban + disconnect) immediately.
+                            BanExpiry = erlang:system_time(second) + ?DEFAULT_BAN_DURATION,
+                            ets:insert(?BANNED_PEERS_TABLE, {IP, BanExpiry}),
+                            logger:info("peer manager: discouraging ~p:~B for ~B seconds "
+                                        "(score ~B, single-event)",
+                                        [IP, Port, ?DEFAULT_BAN_DURATION, Score]),
+                            save_bans(State#state.datadir),
+                            beamchain_peer:disconnect(Pid),
                             {noreply, State}
                     end
             end;
