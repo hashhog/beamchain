@@ -113,6 +113,10 @@
 -define(MSG_BLOCK, 2).
 -define(MSG_FILTERED_BLOCK, 3).
 -define(MSG_CMPCT_BLOCK, 4).
+%% BIP-339: MSG_WTX = 5 is the inv type for wtxid announcements.
+%% Distinct from MSG_WITNESS_TX (0x40000001) which is a BIP-144 getdata
+%% flag used to request witness-serialised tx data — NOT a valid inv type.
+-define(MSG_WTX, 5).
 -define(MSG_WITNESS_TX, 16#40000001).
 -define(MSG_WITNESS_BLOCK, 16#40000002).
 -define(MSG_WITNESS_FLAG, 16#40000000).
