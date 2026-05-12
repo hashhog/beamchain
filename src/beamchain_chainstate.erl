@@ -51,6 +51,12 @@
 %% point closes both gaps.
 -export([submit_block/1, refill_mempool_after_reorg/1]).
 
+%% G8 (W97): exported for EUnit white-box testing only.
+%% check_min_pow_work_int/3 is the pure inner predicate of the per-submit
+%% min_chainwork gate (Core validation.cpp:4229-4232).
+%% Args: ParentCWInt (integer), Bits (nBits word), MinCWInt (integer).
+-export([check_min_pow_work_int/3]).
+
 %% Block invalidation / reconsideration
 -export([invalidate_block/1, reconsider_block/1]).
 
@@ -1122,28 +1128,95 @@ maybe_check_ibd(State) ->
 %%% ===================================================================
 
 do_submit_block(#block{header = Header} = Block,
-                #state{tip_hash = TipHash, tip_height = TipHeight} = State) ->
+                #state{tip_hash = TipHash, tip_height = TipHeight,
+                       params = Params} = State) ->
     PrevHash = Header#block_header.prev_hash,
-    %% If parent IS the active tip, take the happy path: validate+
-    %% connect (UTXO update, atomic write).
-    PrevIsTip = case TipHeight >= 0 of
-        true  -> PrevHash =:= TipHash;
-        false -> true   %% Genesis or empty chain
-    end,
-    case PrevIsTip of
-        true ->
-            case do_connect_block(Block, State) of
-                {ok, State2} ->
-                    %% Active-chain extension always wins; no reorg
-                    %% evaluation needed.
-                    {ok, active, State2};
-                {error, Reason} ->
-                    {error, Reason}
+    %% G8 (W97): min_pow_checked gate.
+    %% submit_block is the untrusted path (RPC submitblock + unsolicited peer
+    %% blocks).  It is NOT preceded by the PRESYNC anti-DoS pipeline that
+    %% guarantees the header chain reaches min_chainwork before AddToBlockIndex.
+    %% Mirror Core validation.cpp:4229-4232: if !min_pow_checked, reject with
+    %% too-little-chainwork unless the new block's cumulative work meets the
+    %% embedded minimum.  The PRESYNC-verified path uses connect_block/1 directly
+    %% and never goes through do_submit_block, so min_pow_checked is always false
+    %% here.
+    case check_min_pow_chainwork(Header, PrevHash, Params) of
+        ok ->
+            %% If parent IS the active tip, take the happy path: validate+
+            %% connect (UTXO update, atomic write).
+            PrevIsTip = case TipHeight >= 0 of
+                true  -> PrevHash =:= TipHash;
+                false -> true   %% Genesis or empty chain
+            end,
+            case PrevIsTip of
+                true ->
+                    case do_connect_block(Block, State) of
+                        {ok, State2} ->
+                            %% Active-chain extension always wins; no reorg
+                            %% evaluation needed.
+                            {ok, active, State2};
+                        {error, Reason} ->
+                            {error, Reason}
+                    end;
+                false ->
+                    %% Side-branch arrival.  Find the parent in either index;
+                    %% if not present, the block is a true orphan and we reject.
+                    do_side_branch_accept(Block, State)
             end;
+        {error, _} = Err ->
+            Err
+    end.
+
+%% G8 outer wrapper: look up the parent chainwork from the DB and delegate
+%% to the pure inner predicate.
+%%
+%% If the parent is not yet in the index (true orphan), we skip the check and
+%% let the subsequent bad_prevblk rejection handle it — there is nothing to
+%% accumulate work against.
+check_min_pow_chainwork(Header, PrevHash, Params) ->
+    MinChainwork = maps:get(min_chainwork, Params, <<0:256>>),
+    MinCWInt = binary:decode_unsigned(MinChainwork, big),
+    case MinCWInt of
+        0 ->
+            %% No minimum configured (regtest / fresh testnet) — always passes.
+            ok;
+        _ ->
+            ParentCWInt = case lookup_block_index_anywhere(PrevHash) of
+                {ok, PE} ->
+                    binary:decode_unsigned(
+                        maps:get(chainwork, PE, <<0:256>>), big);
+                not_found ->
+                    %% True orphan — skip the check; bad_prevblk fires later.
+                    undefined
+            end,
+            case ParentCWInt of
+                undefined -> ok;
+                _         -> check_min_pow_work_int(
+                                 ParentCWInt,
+                                 Header#block_header.bits,
+                                 MinCWInt)
+            end
+    end.
+
+%% G8 pure inner predicate (exported for EUnit).
+%%
+%% Given the parent's accumulated chainwork (ParentCWInt), the new block's
+%% nBits, and the network-minimum chainwork (MinCWInt), returns ok when the
+%% new block's cumulative work meets the minimum, or {error, too_little_chainwork}
+%% otherwise.
+%%
+%% Mirrors Core validation.cpp:4229-4232 ("too-little-chainwork").
+-spec check_min_pow_work_int(non_neg_integer(), non_neg_integer(), non_neg_integer()) ->
+    ok | {error, too_little_chainwork}.
+check_min_pow_work_int(ParentCWInt, Bits, MinCWInt) ->
+    BlockWork = beamchain_pow:compute_work(Bits),
+    NewCWInt = ParentCWInt + BlockWork,
+    case NewCWInt >= MinCWInt of
+        true  -> ok;
         false ->
-            %% Side-branch arrival.  Find the parent in either index;
-            %% if not present, the block is a true orphan and we reject.
-            do_side_branch_accept(Block, State)
+            logger:debug("chainstate: reject header — too-little-chainwork "
+                         "(work=~B min=~B)", [NewCWInt, MinCWInt]),
+            {error, too_little_chainwork}
     end.
 
 %% Accept a block whose parent is in the block index but is NOT the
