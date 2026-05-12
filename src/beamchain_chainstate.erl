@@ -2285,8 +2285,10 @@ start_background_validation() ->
 %% Disconnects the block from the active chain if present, marks it invalid,
 %% and switches to the best valid alternative chain.
 do_invalidate_block(Hash, State) ->
-    %% Look up the block
-    case beamchain_db:get_block_index_by_hash(Hash) of
+    %% Look up the block — check both active-chain and side-branch indexes
+    %% (BUG-8 fix: use lookup_block_index_anywhere instead of
+    %% get_block_index_by_hash so side-branch blocks are reachable).
+    case lookup_block_index_anywhere(Hash) of
         {ok, #{height := BlockHeight, status := Status}} ->
             %% Genesis block cannot be invalidated
             case BlockHeight of
@@ -2307,13 +2309,18 @@ do_invalidate_block(Hash, State) ->
     end.
 
 do_invalidate_block_impl(Hash, BlockHeight, #state{tip_height = TipHeight} = State) ->
-    %% Step 1: Disconnect blocks from tip back to block's parent if needed
-    State2 = case TipHeight >= BlockHeight of
+    %% Step 1: Disconnect blocks from tip back to block's parent if needed.
+    %% BUG-2 fix: guard with is_on_active_chain(Hash) before disconnecting.
+    %% Without this check, a side-branch block at height H would cause the
+    %% active chain to be unnecessarily unwound to H-1 even though the active
+    %% block at height H is a completely different block.  Core guards with
+    %% m_chain.Contains(pindex) before calling DisconnectTip.
+    State2 = case TipHeight >= BlockHeight andalso is_on_active_chain(Hash) of
         true ->
-            %% Block might be on the active chain; disconnect to just before it
+            %% Block is on the active chain; disconnect to just before it
             disconnect_to_height(BlockHeight - 1, State);
         false ->
-            %% Block is not on the active chain (or ahead of tip)
+            %% Block is not on the active chain (side branch or ahead of tip)
             State
     end,
 
@@ -2347,14 +2354,29 @@ disconnect_to_height(TargetHeight, State) ->
             State
     end.
 
-%% Mark a block and all its descendants as invalid in the block index
+%% Mark a block and all its descendants as invalid in the block index.
+%% Handles both active-chain (height-indexed) and side-branch (hash-keyed)
+%% block index entries.
 mark_block_invalid(Hash, BlockHeight) ->
-    %% Get the block's current status and mark it invalid
-    case beamchain_db:get_block_index_by_hash(Hash) of
+    case lookup_block_index_anywhere(Hash) of
         {ok, #{status := Status}} ->
             NewStatus = Status bor ?BLOCK_FAILED_VALID,
-            ok = beamchain_db:update_block_status(Hash, NewStatus),
-            logger:info("chainstate: marked block at height ~B as invalid", [BlockHeight]),
+            %% Try the height-indexed path first; fall back to side-branch update.
+            case beamchain_db:update_block_status(Hash, NewStatus) of
+                ok ->
+                    ok;
+                {error, _} ->
+                    %% Block is a side-branch entry — re-store with updated status.
+                    case beamchain_db:get_side_branch_index(Hash) of
+                        {ok, SideEntry} ->
+                            beamchain_db:store_side_branch_index(
+                                Hash, SideEntry#{status => NewStatus});
+                        _ ->
+                            ok
+                    end
+            end,
+            logger:info("chainstate: marked block at height ~B as invalid",
+                        [BlockHeight]),
 
             %% Mark all descendants as invalid
             mark_descendants_invalid(Hash, BlockHeight);
@@ -2406,9 +2428,18 @@ is_descendant_of(#block_header{prev_hash = PrevHash}, AncestorHash, AllBlocks) -
 find_best_valid_chain(#state{tip_hash = TipHash}) ->
     case beamchain_db:get_all_block_indexes() of
         {ok, AllBlocks} ->
-            %% Filter to valid blocks only
+            %% Filter to valid blocks that also have block data on disk.
+            %% BUG-1 + BUG-9 fix: require BLOCK_HAVE_DATA (bit 8) in addition
+            %% to the BLOCK_FAILED_VALID check.  Core's FindMostWorkChain skips
+            %% any candidate where !(pindexTest->nStatus & BLOCK_HAVE_DATA),
+            %% adding those entries to m_blocks_unlinked and erasing them from
+            %% setBlockIndexCandidates.  Without this guard a VALID_TREE entry
+            %% (status=2, no body) with high chainwork would be selected here,
+            %% causing collect_chain_blocks to silently drop it and
+            %% connect_blocks to receive an incomplete chain.
             ValidBlocks = [B || B = #{status := S} <- AllBlocks,
-                               (S band ?BLOCK_FAILED_VALID) =:= 0],
+                               (S band ?BLOCK_FAILED_VALID) =:= 0,
+                               (S band ?BLOCK_HAVE_DATA)    =/= 0],
             %% Find the block with most cumulative work
             case ValidBlocks of
                 [] ->
