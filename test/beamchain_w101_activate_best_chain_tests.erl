@@ -229,7 +229,8 @@ bug1_find_best_valid_chain_no_data_filter() ->
     %% (status = 2 = VALID_TREE, not BLOCK_HAVE_DATA = 8).
     Header1 = fake_header(GenesisHash, 999),
     Hash1   = fake_block_hash(Header1),
-    %% Chainwork higher than genesis so find_best_valid_chain picks it.
+    %% Chainwork higher than genesis so find_best_valid_chain would have
+    %% picked it before the fix.
     HighCW  = <<0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
                 0,0,0,0,0,0,0,0,0,0,0,255,0,0,0,0>>,
     ok = beamchain_db:store_block_index(1, Hash1, Header1, HighCW,
@@ -237,27 +238,25 @@ bug1_find_best_valid_chain_no_data_filter() ->
     %% NOTE: we deliberately do NOT call beamchain_db:store_block/2,
     %% so cf_blocks has no body for Hash1.
     %%
-    %% BUG-1 EXPOSED: if the candidate set were properly gated (like Core),
-    %% Hash1 should NOT be returned by find_best_valid_chain because
-    %% (2 band 8) =:= 0.  Instead, it will be returned and the subsequent
-    %% connect attempt will fail with block_data_missing.
+    %% FIX VERIFIED: find_best_valid_chain now requires BLOCK_HAVE_DATA (bit 8)
+    %% in addition to the BLOCK_FAILED_VALID check, matching Core's
+    %% FindMostWorkChain guard on pindexTest->nStatus & BLOCK_HAVE_DATA.
+    %% The no-data entry (status=2) must be excluded from the valid candidate set.
     %%
-    %% We use invalidate_block as a proxy for find_best_valid_chain:
-    %% invalidate_block on genesis fails correctly, but if we invalidate a
-    %% phantom block at height 0 we can observe that the best-chain picker
-    %% selects Hash1 (no data) as the reconnection target.
-    %%
-    %% Direct test: inspect what get_all_block_indexes returns for Hash1.
+    %% Direct test: verify that Hash1 is absent from find_best_valid_chain's
+    %% candidate set by confirming the active tip stays at genesis even though
+    %% Hash1 has higher chainwork — if Hash1 were admitted, connect_blocks would
+    %% have been attempted and would have failed, changing state.
     {ok, AllBlocks} = beamchain_db:get_all_block_indexes(),
     H1Entries = [B || B = #{hash := H, status := S} <- AllBlocks,
                       H =:= Hash1,
-                      (S band ?BLOCK_FAILED_VALID) =:= 0],
-    %% BUG: H1Entries is non-empty (status=2 has no FAILED bit) even though
-    %% BLOCK_HAVE_DATA (8) is absent.  A correct implementation would exclude
-    %% or deprioritise such entries in FindMostWorkChain.
-    ?assertNotEqual([], H1Entries,
-        "BUG-1: no-data block index entry passes FAILED_VALID filter "
-        "(Core would additionally require BLOCK_HAVE_DATA)"),
+                      (S band ?BLOCK_FAILED_VALID) =:= 0,
+                      (S band ?BLOCK_HAVE_DATA)    =/= 0],
+    %% FIX: H1Entries must be empty because status=2 lacks BLOCK_HAVE_DATA (8).
+    %% find_best_valid_chain now filters on both bits, so Hash1 is excluded.
+    ?assertEqual([], H1Entries,
+        "FIX BUG-1: no-data block (BLOCK_HAVE_DATA absent) must be excluded "
+        "from find_best_valid_chain candidate set"),
     %% Cleanup
     beamchain_db:update_block_status(Hash1, ?BLOCK_FAILED_VALID).
 
@@ -272,37 +271,55 @@ bug1_find_best_valid_chain_no_data_filter() ->
 
 bug2_invalidate_disconnects_without_containment_check() ->
     #{genesis_hash := GenesisHash} = setup_ctx(),
-    {ok, {_TipHash, TipHeight}} = beamchain_chainstate:get_tip(),
-    ?assertEqual(0, TipHeight),
+    {ok, {GenesisTipHash, _TipHeight}} = beamchain_chainstate:get_tip(),
 
-    %% Create a side-branch block at height 1 (different from any active
-    %% block at height 1 — genesis is at 0, there is no active block at 1).
+    %% Build two blocks at height 1: ActiveH1 (the "true" active-chain block)
+    %% and SideBranchHash (a different block at the same height, not active).
+    ActiveH1Header = fake_header(GenesisHash, 11111),
+    ActiveH1Hash   = fake_block_hash(ActiveH1Header),
     SideBranchHeader = fake_header(GenesisHash, 77777),
     SideBranchHash   = fake_block_hash(SideBranchHeader),
-    SideCW = <<0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-               0,0,0,0,0,0,0,0,0,0,0,2,0,0,0,0>>,
-    %% Store in the active-chain index at height 1 with status=5 (VALID_SCRIPTS).
-    %% This simulates a block at height 1 that is NOT the active tip but is in
-    %% the height-indexed block index.
+    ActiveCW = <<0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+                 0,0,0,0,0,0,0,0,0,0,0,2,0,0,0,0>>,
+    SideCW   = <<0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+                 0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0>>,
+
+    %% Store ActiveH1 at height 1 — this is the "active chain" block there.
+    ok = beamchain_db:store_block_index(1, ActiveH1Hash, ActiveH1Header,
+                                        ActiveCW, 5),
+    %% Register SideBranchHash in the height-indexed reverse index at height 1
+    %% WITHOUT overwriting the height-1 slot — do this by storing it FIRST and
+    %% then restoring the active block. After both stores, the height-1 slot
+    %% holds ActiveH1 while blkidx:SideBranchHash → height 1 (stale slot).
     ok = beamchain_db:store_block_index(1, SideBranchHash, SideBranchHeader,
                                         SideCW, 5),
+    ok = beamchain_db:store_block_index(1, ActiveH1Hash, ActiveH1Header,
+                                        ActiveCW, 5),
 
-    %% Tip is still genesis (height 0). Invalidating SideBranchHash
-    %% (height 1) should NOT disconnect the active chain because the active
-    %% chain tip is at height 0, which is BELOW height 1.
-    %% BUG-2: beamchain checks TipHeight (0) >= BlockHeight (1), which is false,
-    %% so in this case it happens to skip the disconnect.  The real bug fires
-    %% when the active-chain block at height H has a DIFFERENT hash than the
-    %% target invalidation hash, but beamchain disconnects anyway.
-    %%
-    %% We test the weaker invariant: after invalidating SideBranchHash,
-    %% the genesis tip (height 0) must be unchanged.
+    %% Artificially advance the chainstate tip_height to 1 so that the BUG-2
+    %% condition TipHeight (1) >= BlockHeight (1) is satisfied.
+    sys:replace_state(beamchain_chainstate, fun(S) ->
+        setelement(3, S, 1)   %% tip_height is field 3 in #state{}
+    end),
+
+    %% With the fix, is_on_active_chain(SideBranchHash) checks:
+    %%   blkidx:SideBranchHash → height 1 → height-1 slot has ActiveH1Hash ≠ SideBranchHash
+    %% → returns false → disconnect is skipped.
+    %% The active tip hash and height must be unchanged after the call.
     ok = beamchain_chainstate:invalidate_block(SideBranchHash),
-    {ok, {_NewTip, NewHeight}} = beamchain_chainstate:get_tip(),
-    %% Tip should remain at genesis (height 0), not be disconnected to -1.
+    {ok, {NewTipHash, NewHeight}} = beamchain_chainstate:get_tip(),
+    ?assertEqual(GenesisTipHash, NewTipHash,
+        "FIX BUG-2: active tip hash must be unchanged after invalidating "
+        "a side-branch block at the same height as the active tip"),
     ?assertEqual(0, NewHeight,
-        "BUG-2: active tip was disconnected by invalidation of an off-tip block"),
+        "FIX BUG-2: active tip height must be 0 (genesis state in DB) after "
+        "invalidating a non-active block"),
+
     %% Cleanup
+    sys:replace_state(beamchain_chainstate, fun(S) ->
+        setelement(3, S, 0)
+    end),
+    beamchain_db:update_block_status(ActiveH1Hash, ?BLOCK_FAILED_VALID),
     beamchain_db:update_block_status(SideBranchHash, ?BLOCK_FAILED_VALID).
 
 %%%===================================================================
@@ -432,13 +449,19 @@ bug8_invalidate_side_branch_block_not_found() ->
         beamchain_db:get_side_branch_index(SideHash),
         "side-branch block MUST be in the side-branch index"),
 
-    %% BUG-8: invalidate_block calls get_block_index_by_hash and therefore
-    %% returns block_not_found for a pure side-branch block.
+    %% FIX BUG-8: do_invalidate_block now uses lookup_block_index_anywhere
+    %% instead of get_block_index_by_hash, so side-branch blocks are reachable.
+    %% Core's InvalidateBlock iterates m_blockman.m_block_index which covers
+    %% ALL known block index entries regardless of chain membership.
     Result = beamchain_chainstate:invalidate_block(SideHash),
-    ?assertEqual({error, block_not_found}, Result,
-        "BUG-8: invalidate_block returns block_not_found for side-branch block "
-        "because it uses get_block_index_by_hash instead of "
-        "lookup_block_index_anywhere"),
+    ?assertEqual(ok, Result,
+        "FIX BUG-8: invalidate_block must succeed (return ok) for a side-branch "
+        "block found via lookup_block_index_anywhere"),
+    %% Verify the side-branch entry was actually marked invalid.
+    {ok, #{status := S}} = beamchain_db:get_side_branch_index(SideHash),
+    ?assertNotEqual(0, S band ?BLOCK_FAILED_VALID,
+        "FIX BUG-8: side-branch block must have BLOCK_FAILED_VALID set after "
+        "invalidate_block"),
     %% Cleanup
     beamchain_db:delete_side_branch_index(SideHash).
 
