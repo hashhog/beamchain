@@ -34,7 +34,7 @@
 -include("beamchain.hrl").
 -include("beamchain_protocol.hrl").
 
--export([load_snapshot/1, verify_snapshot/2]).
+-export([load_snapshot/1, load_snapshot_validated/3, verify_snapshot/2]).
 -export([compute_utxo_hash/0, serialize_snapshot/2]).
 -export([read_metadata/1]).
 -export([compute_utxo_hash_from_list/1]).
@@ -85,6 +85,22 @@ load_snapshot(Path) ->
     case file:read_file(Path) of
         {ok, Data} ->
             parse_snapshot(Data);
+        {error, Reason} ->
+            {error, {file_read_failed, Reason}}
+    end.
+
+%% @doc Load a UTXO snapshot with per-coin validation gates (G2-G5).
+%% ExpectedMagic is the running network's pchMessageStart (G1).
+%% BaseHeight is the snapshot base block height for the per-coin height check (G2).
+-spec load_snapshot_validated(string(), binary(), non_neg_integer()) ->
+    {ok, #{base_hash => binary(), num_coins => non_neg_integer(),
+           network_magic => binary(),
+           coins => [{binary(), non_neg_integer(), #utxo{}}]}} |
+    {error, term()}.
+load_snapshot_validated(Path, ExpectedMagic, BaseHeight) ->
+    case file:read_file(Path) of
+        {ok, Data} ->
+            parse_snapshot_validated(Data, ExpectedMagic, BaseHeight);
         {error, Reason} ->
             {error, {file_read_failed, Reason}}
     end.
@@ -313,6 +329,128 @@ parse_snapshot(Data) ->
                            coins => Coins}};
                 {error, Reason} ->
                     {error, Reason}
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% parse_snapshot_validated/3 — adds G1 network-magic check + G2-G5 per-coin
+%% guards, mirroring Core validation.cpp:5600-5883 ActivateSnapshot/
+%% PopulateAndValidateSnapshot.
+%%
+%% G1: verify metadata network_magic == ExpectedMagic (pchMessageStart).
+%% G2: per-coin height > BaseHeight → {error, bad_coin_height}.
+%% G3: per-coin vout >= 16#ffffffff → {error, bad_coin_vout}.
+%% G4: per-coin value > MAX_MONEY → {error, bad_tx_out_value}.
+%% G5: leftover bytes after all coins consumed → {error, coins_left_over}.
+parse_snapshot_validated(Data, ExpectedMagic, BaseHeight) ->
+    case parse_metadata(Data) of
+        {ok, #{base_hash := BaseHash, num_coins := NumCoins,
+               network_magic := FileMagic} = _Meta, Rest} ->
+            %% G1: network magic must match the running node's pchMessageStart.
+            case FileMagic =:= ExpectedMagic of
+                false ->
+                    {error, {wrong_network_magic, FileMagic}};
+                true ->
+                    case parse_coins_validated(Rest, NumCoins, BaseHeight, []) of
+                        {ok, Coins, Remainder} ->
+                            %% G5: no bytes may follow the last declared coin.
+                            case Remainder of
+                                <<>> ->
+                                    {ok, #{base_hash => BaseHash,
+                                           num_coins => NumCoins,
+                                           network_magic => FileMagic,
+                                           coins => Coins}};
+                                _ ->
+                                    {error, coins_left_over}
+                            end;
+                        {error, Reason} ->
+                            {error, Reason}
+                    end
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% parse_coins_validated/4 — like parse_coins/3 but returns the leftover binary
+%% and applies per-coin guards (G2-G4) via parse_txid_coins_validated/2.
+parse_coins_validated(Data, 0, _BaseHeight, Acc) ->
+    {ok, lists:reverse(Acc), Data};
+parse_coins_validated(Data, Remaining, BaseHeight, Acc) when Remaining > 0 ->
+    case parse_txid_coins_validated(Data, BaseHeight) of
+        {ok, TxidCoins, Rest, CoinsRead} ->
+            parse_coins_validated(Rest, Remaining - CoinsRead, BaseHeight, TxidCoins ++ Acc);
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+parse_txid_coins_validated(<<Txid:32/binary, Rest/binary>>, BaseHeight) ->
+    case decode_compact_size(Rest) of
+        {ok, CoinsPerTxid, Rest2} ->
+            parse_txid_coin_entries_validated(Rest2, Txid, CoinsPerTxid, BaseHeight, []);
+        {error, Reason} ->
+            {error, Reason}
+    end;
+parse_txid_coins_validated(_, _BaseHeight) ->
+    {error, truncated_txid}.
+
+%% G3 guard: vout must be < UINT32_MAX (Core validation.cpp:5815).
+-define(MAX_VOUT, 16#fffffffe).   %% = UINT32_MAX - 1; largest valid vout index
+
+parse_txid_coin_entries_validated(Data, _Txid, 0, _BaseHeight, Acc) ->
+    {ok, lists:reverse(Acc), Data, length(Acc)};
+parse_txid_coin_entries_validated(Data, Txid, Remaining, BaseHeight, Acc) when Remaining > 0 ->
+    case decode_compact_size(Data) of
+        {ok, Vout, _Rest} when Vout >= 16#ffffffff ->
+            %% G3: vout >= UINT32_MAX would wrap around in ApplyHash.
+            {error, {bad_coin_vout, Vout}};
+        {ok, Vout, Rest} ->
+            case parse_coin_validated(Rest, BaseHeight) of
+                {ok, Utxo, Rest2} ->
+                    Entry = {Txid, Vout, Utxo},
+                    parse_txid_coin_entries_validated(Rest2, Txid, Remaining - 1, BaseHeight, [Entry | Acc]);
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% parse_coin_validated/2 — parse_coin/1 plus G2 (height) and G4 (MoneyRange).
+parse_coin_validated(Data, BaseHeight) ->
+    case decode_varint(Data) of
+        {ok, HeightCode, Rest} ->
+            Height = HeightCode bsr 1,
+            IsCoinbase = (HeightCode band 1) =:= 1,
+            %% G2: coin height must not exceed snapshot base height.
+            case Height > BaseHeight of
+                true ->
+                    {error, {bad_coin_height, Height, BaseHeight}};
+                false ->
+                    case decode_varint(Rest) of
+                        {ok, CompressedValue, Rest2} ->
+                            Value = decompress_amount(CompressedValue),
+                            %% G4: value must satisfy MoneyRange.
+                            case Value > ?MAX_MONEY of
+                                true ->
+                                    {error, {bad_tx_out_value, Value}};
+                                false ->
+                                    case decode_script(Rest2) of
+                                        {ok, Script, Rest3} ->
+                                            Utxo = #utxo{
+                                                value = Value,
+                                                script_pubkey = Script,
+                                                is_coinbase = IsCoinbase,
+                                                height = Height
+                                            },
+                                            {ok, Utxo, Rest3};
+                                        {error, Reason} ->
+                                            {error, Reason}
+                                    end
+                            end;
+                        {error, Reason} ->
+                            {error, Reason}
+                    end
             end;
         {error, Reason} ->
             {error, Reason}
