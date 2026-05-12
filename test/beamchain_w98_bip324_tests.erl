@@ -405,25 +405,54 @@ g23_unknown_short_id_returns_error_test() ->
         [29, 30, 31, 32, 100, 200, 255]).
 
 %%% ===================================================================
-%%% G24 BUG — Max plaintext 4 MiB check ABSENT from v2 decrypt path
+%%% G24 — Max plaintext 4 MB cap enforced in extract_v2_packet
 %%% ===================================================================
 
-%% Documents the missing gate.  If ContentsLen were >= 4 MB beamchain
-%% would attempt to allocate the buffer without a guard.  We cannot safely
-%% send 4 MB in a unit test, so we document the absence via a comment and
-%% verify only the cipher-layer constants.
-g24_bug_max_plaintext_check_absent_test() ->
-    %% Cipher constants are correct — the BUG is in beamchain_peer.erl's
-    %% extract_v2_packet, which does not guard ContentsLen against
-    %% MAX_PROTOCOL_MESSAGE_LENGTH (4 000 000 bytes) before allocating.
-    %% Bitcoin Core rejects packets with ContentsLen > MAX_CONTENTS_LEN
-    %% (≈4 000 013 bytes) in ProcessReceivedPacketBytes.
-    %%
-    %% This test documents the issue as KNOWN-MISSING so CI catches any
-    %% future regression where the constant is set to a wrong value.
+%% FIX-5 / W98 G24: extract_v2_packet must return {stop, oversize_message}
+%% when the decrypted ContentsLen exceeds MAX_PROTOCOL_MESSAGE_LENGTH
+%% (4 000 000 bytes, matching Bitcoin Core).  Previously the guard was
+%% absent — a peer could force a 16 MiB buffer allocation pre-AEAD.
+%%
+%% Strategy: set up a real initiator/responder cipher pair, encrypt a
+%% packet whose plaintext length is MAX_PROTOCOL_MESSAGE_LENGTH + 1 (we
+%% do NOT allocate the payload — only the 3-byte encrypted length field is
+%% needed), then feed only the EncLen bytes into extract_v2_packet and
+%% assert it returns {stop, oversize_message}.
+g24_oversize_message_rejected_test() ->
+    %% Sanity: cipher constants are correct.
     ?assertEqual(4095, beamchain_transport_v2:max_garbage_len()),
-    %% Tag size correct (used in body length calculation)
-    ?assertEqual(16, beamchain_transport_v2:tag_len()).
+    ?assertEqual(16,   beamchain_transport_v2:tag_len()),
+    %% Oversize threshold is 4 000 000 (Core MAX_PROTOCOL_MESSAGE_LENGTH).
+    MaxLen = 4000000,
+
+    %% Build a paired initiator/responder cipher.
+    {ok, A0} = beamchain_transport_v2:new_cipher(),
+    {ok, B0} = beamchain_transport_v2:new_cipher(),
+    PA = beamchain_transport_v2:get_pubkey(A0),
+    PB = beamchain_transport_v2:get_pubkey(B0),
+    {ok, A1} = beamchain_transport_v2:initialize(A0, PB, true,  false, ?TEST_MAGIC),
+    {ok, B1} = beamchain_transport_v2:initialize(B0, PA, false, false, ?TEST_MAGIC),
+
+    %% Encrypt a payload of exactly MaxLen+1 bytes on the initiator side.
+    %% We only need the 3-byte encrypted length prefix — not the full body.
+    OversizePayload = binary:copy(<<0>>, MaxLen + 1),
+    {ok, CT, _} = beamchain_transport_v2:encrypt(A1, OversizePayload, <<>>, false),
+    <<EncLen:3/binary, _Rest/binary>> = CT,
+
+    %% Feed just the EncLen into extract_v2_packet via the responder cipher.
+    %% The buffer contains exactly 3 bytes — length field only.
+    Peer = beamchain_peer:make_test_v2_peer(B1, EncLen),
+    ?assertEqual({stop, oversize_message},
+                 beamchain_peer:extract_v2_packet(Peer)),
+
+    %% Boundary: exactly MaxLen is allowed.
+    MaxPayload = binary:copy(<<0>>, MaxLen),
+    {ok, CT2, _} = beamchain_transport_v2:encrypt(A1, MaxPayload, <<>>, false),
+    <<EncLen2:3/binary, _/binary>> = CT2,
+    Peer2 = beamchain_peer:make_test_v2_peer(B1, EncLen2),
+    %% Must NOT return oversize_message for the boundary-exact case.
+    ?assertNotEqual({stop, oversize_message},
+                    beamchain_peer:extract_v2_packet(Peer2)).
 
 %%% ===================================================================
 %%% G25 BUG — Garbage range [0,32] instead of BIP-324's [0,4095]
