@@ -76,6 +76,10 @@
          check_tx_already_known/1,
          consensus_script_checks/2]).
 
+%% Gate 2a/2b: BIP-339 wtxid/txid duplicate detection — exported for unit testing.
+%% Tests seed the ETS table directly (it is public) and call this helper.
+-export([lookup_entry_by_wtxid/1]).
+
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2]).
