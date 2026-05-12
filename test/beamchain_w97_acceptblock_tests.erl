@@ -222,30 +222,52 @@ g5_g6_bug_bad_prevblk_does_not_distinguish_missing_vs_invalid_test() ->
     ok = sanity_present(do_side_branch_accept_missing_vs_invalid_conflated).
 
 %%% -------------------------------------------------------------------
-%%% G8: min_pow_checked / too-little-chainwork
+%%% G8: min_pow_checked / too-little-chainwork (ACTIVE — W97 G8 fix)
 %%%
-%%% Core (4229-4232) gates AddToBlockIndex on min_pow_checked. beamchain
-%%% places this gate in beamchain_header_sync:maybe_init_hss/2
-%%% (header_sync.erl:1160-1189), which spins up the PRESYNC pipeline
-%%% only when tip work < min_chainwork. The active-chain submit_block
-%%% path never consults min_chainwork — a peer can submit any header chain
-%%% as long as the parent is in the index and the PoW math is internally
-%%% consistent.
+%%% Core (4229-4232) gates AddToBlockIndex on min_pow_checked.
+%%% beamchain's fix: do_submit_block now calls check_min_pow_work_int/3
+%%% (chainstate.erl) before admitting any block via the untrusted
+%%% submit_block path.  The PRESYNC-verified connect_block path is exempt.
 %%%
-%%% Symptom: post-IBD, a peer can stuff the index with low-work headers
-%%% that fork below min_chainwork. The header is added to the index even
-%%% though Core would reject with BLOCK_HEADER_LOW_WORK. side-branch
-%%% storage costs unbounded RocksDB writes until the deep-fork-depth gate
-%%% in handle_unconnecting_headers catches it.
+%%% Three cases exercise the pure inner predicate directly so the test
+%%% does not require a running gen_server or RocksDB instance.
 %%% -------------------------------------------------------------------
 
-g8_bug_submit_block_does_not_check_min_chainwork_test() ->
-    %% Documentary. do_submit_block/2 (chainstate.erl:1124-1147) and
-    %% do_side_branch_accept_with_parent (1166-1207) never read
-    %% min_chainwork from Params. Only the header_sync gen_server's
-    %% maybe_init_hss does, and that path is bypassed by direct
-    %% submitblock callers.
-    ok = sanity_present(submit_block_missing_min_chainwork_gate).
+%% Case 1: cumulative chainwork below min_chainwork → too-little-chainwork.
+%% Parent chainwork = 0, block nBits = 0x1d00ffff (mainnet genesis bits).
+%% beamchain_pow:compute_work(0x1d00ffff) ≈ 4295032833.
+%% min_chainwork is set to a very large value so any single block fails.
+g8_rejects_below_min_chainwork_test() ->
+    ParentCWInt = 0,
+    %% mainnet genesis nBits; compute_work gives a small value (~4e9)
+    Bits        = 16#1d00ffff,
+    %% min_chainwork > any single-block work → must reject
+    MinCWInt    = 16#ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff,
+    ?assertEqual({error, too_little_chainwork},
+                 beamchain_chainstate:check_min_pow_work_int(
+                     ParentCWInt, Bits, MinCWInt)).
+
+%% Case 2: cumulative chainwork meets or exceeds min_chainwork → ok.
+%% Set min_chainwork = 1 and parent = 0; any real block work ≥ 1.
+g8_accepts_at_min_chainwork_test() ->
+    ParentCWInt = 0,
+    Bits        = 16#1d00ffff,   %% compute_work >> 1
+    MinCWInt    = 1,
+    ?assertEqual(ok,
+                 beamchain_chainstate:check_min_pow_work_int(
+                     ParentCWInt, Bits, MinCWInt)).
+
+%% Case 3: min_chainwork = 0 (regtest / no minimum) → always ok.
+%% The outer wrapper short-circuits at MinCWInt=0 before calling this
+%% function, but the inner predicate also handles it correctly (0 >= 0).
+g8_zero_min_chainwork_always_passes_test() ->
+    %% Even with zero parent work and the minimum nBits, MinCWInt=0 passes.
+    ParentCWInt = 0,
+    Bits        = 16#207fffff,   %% regtest difficulty, very small work
+    MinCWInt    = 0,
+    ?assertEqual(ok,
+                 beamchain_chainstate:check_min_pow_work_int(
+                     ParentCWInt, Bits, MinCWInt)).
 
 %%% -------------------------------------------------------------------
 %%% G9: AddToBlockIndex updates best_header
