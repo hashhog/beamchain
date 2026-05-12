@@ -32,7 +32,9 @@
 -ifdef(TEST).
 -export([is_v1_version_header/2,
          build_v2_initiator_handshake/2,
-         scan_terminator/5]).
+         scan_terminator/5,
+         extract_v2_packet/1,
+         make_test_v2_peer/2]).
 -endif.
 
 %%% -------------------------------------------------------------------
@@ -1034,12 +1036,18 @@ extract_v2_packet(#peer_data{buffer = Buffer,
                 <<EncLen:LenLen/binary, BufferRest/binary>> ->
                     {ok, ContentsLen, Cipher1} =
                         beamchain_transport_v2:decrypt_length(Cipher, EncLen),
+                    %% W98 G24: reject oversize messages before allocating the
+                    %% receive buffer.  Core: MAX_PROTOCOL_MESSAGE_LENGTH = 4 MB.
+                    if ContentsLen > ?MAX_PROTOCOL_MESSAGE_LENGTH ->
+                        {stop, oversize_message};
+                    true ->
                     Data1 = Data#peer_data{
                         v2_cipher = Cipher1,
                         v2_pending_len = ContentsLen,
                         buffer = BufferRest
                     },
-                    extract_v2_body(Data1, ContentsLen, HdrLen, TagLen, AAD);
+                    extract_v2_body(Data1, ContentsLen, HdrLen, TagLen, AAD)
+                    end;
                 _ ->
                     incomplete
             end;
@@ -1135,6 +1143,22 @@ build_v2_initiator_handshake(random, _) ->
 build_v2_initiator_handshake_cont({ok, Cipher0}) ->
     Pubkey = beamchain_transport_v2:get_pubkey(Cipher0),
     {ok, Pubkey, Cipher0}.
+
+%% Build a minimal #peer_data{} suitable for passing to extract_v2_packet/1
+%% in unit tests.  Only the fields consumed by that function are set.
+make_test_v2_peer(Cipher, Buffer) ->
+    #peer_data{
+        socket          = undefined,
+        address         = {{127,0,0,1}, 0},
+        direction       = inbound,
+        buffer          = Buffer,
+        v2_cipher       = Cipher,
+        v2_pending_len  = undefined,
+        v2_next_aad     = <<>>,
+        our_nonce       = 0,
+        magic           = <<>>,
+        handler         = self()
+    }.
 -endif.
 
 %% Open the BIP-324 outbound handshake.  Called from start_handshake/1
