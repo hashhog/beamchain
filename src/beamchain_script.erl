@@ -26,6 +26,7 @@
 -export([find_and_delete/2]).  %% Exported for testing
 -export([verify_taproot/4]).   %% Exported for testing
 -export([parse_schnorr_sig/1]). %% Exported for testing
+-export([sighash_single_in_range/3, valid_taproot_hash_type/1]). %% W95: exported for testing
 
 %% Pay-to-Anchor (P2A) detection
 -export([is_pay_to_anchor/1]).
@@ -2372,6 +2373,19 @@ check_hash_type(HT) ->
     Base = HT band (bnot ?SIGHASH_ANYONECANPAY),
     Base >= ?SIGHASH_ALL andalso Base =< ?SIGHASH_SINGLE.
 
+%% W95: BIP-341 hash_type whitelist for Schnorr / Taproot. Mirrors
+%% Core's `SignatureHashSchnorr` gate (interpreter.cpp:1516):
+%%   `hash_type <= 0x03 || (hash_type >= 0x81 && hash_type <= 0x83)`
+%% i.e. one of {0x00, 0x01, 0x02, 0x03, 0x81, 0x82, 0x83}.
+%% Used by `sighash_taproot/7` as a belt-and-suspenders check on top
+%% of `parse_schnorr_sig` so out-of-spec hash_type bytes can never
+%% silently produce a bogus sighash.
+-spec valid_taproot_hash_type(non_neg_integer()) -> boolean().
+valid_taproot_hash_type(HT) when is_integer(HT), HT >= 0, HT =< 16#ff ->
+    HT =< 16#03 orelse (HT >= 16#81 andalso HT =< 16#83);
+valid_taproot_hash_type(_) ->
+    false.
+
 %% @doc Check signature encoding (DER, LOW_S, STRICTENC) - returns ok or {error, Reason}.
 %% This consolidates all encoding checks done before signature verification.
 %%
@@ -3371,6 +3385,19 @@ sighash_witness_v0(Tx, InputIndex, ScriptCode, Amount, HashType) ->
                       non_neg_integer()) -> binary().
 sighash_taproot(Tx, InputIndex, PrevOuts, HashType, AnnexHash,
                 LeafHash, CodeSepPos) ->
+    %% W95: defense-in-depth hash_type gate matching Core's
+    %% SignatureHashSchnorr (interpreter.cpp:1516):
+    %%   if (!(hash_type <= 0x03 || (hash_type >= 0x81 && hash_type <= 0x83)))
+    %%       return false;
+    %% Spec callers go through parse_schnorr_sig + sighash_single_in_range
+    %% which already filter the hash_type. This inner guard catches
+    %% bugs in future callers and direct test entry points by throwing
+    %% schnorr_sig_hashtype — the top-level verify_script try/catch
+    %% then maps to script-fails, matching Core's behaviour.
+    case valid_taproot_hash_type(HashType) of
+        true -> ok;
+        false -> throw(schnorr_sig_hashtype)
+    end,
     BaseType = HashType band 16#1f,
     AnyoneCanPay = (HashType band ?SIGHASH_ANYONECANPAY) =/= 0,
     Inputs = Tx#transaction.inputs,

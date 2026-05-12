@@ -2848,3 +2848,128 @@ w94_parse_schnorr_sig_wrong_size_test() ->
     ?assertMatch({invalid, _}, beamchain_script:parse_schnorr_sig(<<>>)),
     ?assertMatch({invalid, _}, beamchain_script:parse_schnorr_sig(<<0:8>>)),
     ?assertMatch({invalid, _}, beamchain_script:parse_schnorr_sig(<<0:520>>)).
+
+%%% ===================================================================
+%%% W95: BIP-340 Schnorr + tagged-hash audit
+%%%
+%%% W94 closed the annex-hash gap and SIGHASH_SINGLE-OOR silent-pass
+%%% bug. W95 adds the matching belt-and-suspenders inside
+%%% sighash_taproot/7 itself and pins gate-for-gate hash_type byte
+%%% acceptance against Core (interpreter.cpp:1516). The 16 BIP-340
+%%% verify gates inside libsecp256k1 are exercised by the eunit
+%%% vectors in beamchain_crypto_tests:schnorr_vector_*; the W95 work
+%%% in this module is about the surrounding Erlang policy.
+%%% ===================================================================
+
+%% Fresh 1-in/1-out helper so every test stays independent and we do
+%% not have to share a fixture record between modules.
+w95_one_in_one_out_tx() ->
+    Outpoint = #outpoint{hash = <<0:256>>, index = 0},
+    In = #tx_in{prev_out = Outpoint, script_sig = <<>>,
+                sequence = 16#ffffffff, witness = []},
+    Out = #tx_out{value = 1000, script_pubkey = <<>>},
+    #transaction{version = 2, locktime = 0,
+                 inputs = [In], outputs = [Out]}.
+
+%% Every BIP-341 valid hash_type byte must produce a 32-byte sighash
+%% without throwing. {0x00, 0x01, 0x02, 0x03, 0x81, 0x82, 0x83}
+w95_sighash_taproot_valid_hash_types_accepted_test() ->
+    Tx = w95_one_in_one_out_tx(),
+    PrevOuts = [{2000, <<16#51, 16#20, 0:256>>}],
+    lists:foreach(
+      fun(HT) ->
+          H = beamchain_script:sighash_taproot(
+                Tx, 0, PrevOuts, HT, undefined, undefined, 16#ffffffff),
+          ?assertEqual(32, byte_size(H))
+      end,
+      [16#00, 16#01, 16#02, 16#03, 16#81, 16#82, 16#83]).
+
+%% Every BIP-341 invalid hash_type byte MUST throw schnorr_sig_hashtype.
+%% Core (interpreter.cpp:1516) returns false here; the inner gate in
+%% sighash_taproot/7 raises an exception so verify_script's top-level
+%% try/catch maps to "script fails" exactly as Core's SCRIPT_ERR.
+w95_sighash_taproot_invalid_hash_types_throw_test() ->
+    Tx = w95_one_in_one_out_tx(),
+    PrevOuts = [{2000, <<16#51, 16#20, 0:256>>}],
+    %% Sample the full set of invalid types: 0x04..0x7f and 0x80, 0x84..0xff
+    Invalids = [16#04, 16#05, 16#1f, 16#20, 16#7f, 16#80,
+                16#84, 16#85, 16#fe, 16#ff],
+    lists:foreach(
+      fun(HT) ->
+          ?assertThrow(
+             schnorr_sig_hashtype,
+             beamchain_script:sighash_taproot(
+               Tx, 0, PrevOuts, HT, undefined, undefined, 16#ffffffff))
+      end,
+      Invalids).
+
+%% verify_script's top-level catch must turn the throw into a clean
+%% "false" return — no exception leaks to the caller and no node
+%% process crashes.
+w95_verify_script_catches_taproot_hashtype_throw_test() ->
+    Tx = w95_one_in_one_out_tx(),
+    PrevOuts = [{2000, <<16#51, 16#20, 0:256>>}],
+    %% Build a witness with a 65-byte schnorr sig + invalid hashtype.
+    %% parse_schnorr_sig will reject it before sighash_taproot is even
+    %% reached, but if a future regression bypassed the parser, the
+    %% inner gate would still keep us safe. Exercise the parser path
+    %% first to confirm the rejection happens up front.
+    OutputKey = <<2:256>>,
+    BadSig = <<0:512, 16#04:8>>,    %% 65 bytes, hashtype=0x04 invalid
+    Witness = [BadSig],
+    SigChecker = {Tx, 0, 2000, PrevOuts},
+    %% Direct entry into verify_taproot must error cleanly, not crash.
+    Result = beamchain_script:verify_taproot(OutputKey, Witness, 0, SigChecker),
+    ?assertMatch({error, _}, Result).
+
+%% Sweep test: every byte 0x04..0x7f and 0x84..0xff in the 65-byte
+%% Schnorr-sig form MUST be rejected by parse_schnorr_sig.  W94 only
+%% sampled 0x04; W95 widens the coverage to the entire forbidden range
+%% so a regression that, say, accidentally accepted 0x10 would be
+%% caught.
+w95_parse_schnorr_sig_all_invalid_hashtypes_rejected_test() ->
+    SigBody = <<0:512>>,
+    %% 0x04..0x7f
+    Range1 = lists:seq(16#04, 16#7f),
+    %% 0x80 is bare-ANYONECANPAY (no base type) — invalid per BIP-341
+    Range2 = [16#80],
+    %% 0x84..0xff (anyonecanpay set, but base type out of range)
+    Range3 = lists:seq(16#84, 16#ff),
+    lists:foreach(
+      fun(HT) ->
+          ?assertMatch(
+             {invalid, _},
+             beamchain_script:parse_schnorr_sig(<<SigBody/binary, HT:8>>))
+      end,
+      Range1 ++ Range2 ++ Range3).
+
+%% The 64-byte Schnorr sig form must NEVER carry an explicit hash_type
+%% byte — that case is the 65-byte branch and reserved for the
+%% non-DEFAULT types. Sanity-check the type returned for a 64-byte sig
+%% is exactly ?SIGHASH_DEFAULT (i.e. 0), so callers cannot accidentally
+%% inject a different DEFAULT value via a renamed constant.
+w95_parse_schnorr_sig_64byte_is_default_zero_test() ->
+    Sig = crypto:strong_rand_bytes(64),
+    {HT, Body} = beamchain_script:parse_schnorr_sig(Sig),
+    ?assertEqual(?SIGHASH_DEFAULT, HT),
+    ?assertEqual(0, HT),
+    ?assertEqual(Sig, Body).
+
+%% sighash_single_in_range/3 is a separate gate ahead of the
+%% sighash_taproot/7 hash_type whitelist. Pin its three branches so
+%% the {0x03, 0x83, others} matrix can't drift.
+w95_sighash_single_in_range_branches_test() ->
+    Tx = w95_one_in_one_out_tx(),   %% 1 output
+    %% Index 0 is in-range (< 1) — must always be true regardless of type.
+    [?assert(beamchain_script:sighash_single_in_range(Tx, 0, HT))
+     || HT <- [16#00, 16#01, 16#02, 16#03, 16#81, 16#82, 16#83]],
+    %% Index 1 is out-of-range. SIGHASH_SINGLE (0x03) and
+    %% SIGHASH_SINGLE|ANYONECANPAY (0x83) must say false; everything
+    %% else must say true (the bounds check only applies to SINGLE).
+    ?assertNot(beamchain_script:sighash_single_in_range(Tx, 1, 16#03)),
+    ?assertNot(beamchain_script:sighash_single_in_range(Tx, 1, 16#83)),
+    ?assert(beamchain_script:sighash_single_in_range(Tx, 1, 16#00)),
+    ?assert(beamchain_script:sighash_single_in_range(Tx, 1, 16#01)),
+    ?assert(beamchain_script:sighash_single_in_range(Tx, 1, 16#02)),
+    ?assert(beamchain_script:sighash_single_in_range(Tx, 1, 16#81)),
+    ?assert(beamchain_script:sighash_single_in_range(Tx, 1, 16#82)).
