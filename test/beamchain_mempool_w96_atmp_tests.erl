@@ -21,6 +21,18 @@
 -include("beamchain.hrl").
 -include("beamchain_protocol.hrl").
 
+%%% -------------------------------------------------------------------
+%%% Re-define mempool_entry for test-side ETS seeding (it is internal to
+%%% beamchain_mempool; the ETS tables are public so tests can insert rows).
+%%% -------------------------------------------------------------------
+-record(mempool_entry, {
+    txid, wtxid, tx, fee, size, vsize, weight, fee_rate,
+    time_added, height_added,
+    ancestor_count, ancestor_size, ancestor_fee,
+    descendant_count, descendant_size, descendant_fee,
+    spends_coinbase, rbf_signaling
+}).
+
 %%% ===================================================================
 %%% Helpers
 %%% ===================================================================
@@ -275,6 +287,98 @@ consensus_subset_of_standard_test() ->
     ?assertEqual(Consensus, Consensus band StandardFlags).
 
 %%% ===================================================================
+%%% ===================================================================
+%%% Gate 2a/2b (BIP-339): wtxid vs txid duplicate detection
+%%% ===================================================================
+%%
+%% Core validation.cpp:823-829:
+%%   if (m_pool.exists(GenTxid::Wtxid(wtxid))) → "txn-already-in-mempool"
+%%   else if (m_pool.exists(GenTxid::Txid(txid))) → "txn-same-nonwitness-data-in-mempool"
+%%
+%% The two checks MUST return distinct error atoms.  Collapsing them into a
+%% single "already in mempool" check (the W96 universal bug) causes nodes to
+%% silence the second case, which is required for correct relay behaviour.
+%%
+%% Strategy: seed the ?MEMPOOL_TXS ETS table directly (it is public), then
+%% call beamchain_mempool:lookup_entry_by_wtxid/1 to validate the separation.
+
+setup_ets() ->
+    Tables = [mempool_txs, mempool_by_fee, mempool_outpoints,
+              mempool_orphans, mempool_clusters, mempool_ephemeral],
+    lists:foreach(fun(T) ->
+        case ets:info(T) of
+            undefined -> ok;
+            _         -> ets:delete(T)
+        end
+    end, Tables),
+    ets:new(mempool_txs,       [set, public, named_table, {read_concurrency, true}]),
+    ets:new(mempool_by_fee,    [ordered_set, public, named_table]),
+    ets:new(mempool_outpoints, [set, public, named_table]),
+    ets:new(mempool_orphans,   [set, public, named_table]),
+    ets:new(mempool_clusters,  [set, public, named_table, {read_concurrency, true}]),
+    ets:new(mempool_ephemeral, [set, public, named_table]),
+    ok.
+
+cleanup_ets(_) ->
+    lists:foreach(fun(T) ->
+        case ets:info(T) of
+            undefined -> ok;
+            _         -> ets:delete(T)
+        end
+    end, [mempool_txs, mempool_by_fee, mempool_outpoints,
+          mempool_orphans, mempool_clusters, mempool_ephemeral]).
+
+make_dummy_entry(Txid, Wtxid) ->
+    #mempool_entry{
+        txid = Txid, wtxid = Wtxid, tx = undefined,
+        fee = 1000, size = 200, vsize = 200, weight = 800,
+        fee_rate = 5.0, time_added = 0, height_added = 0,
+        ancestor_count = 1, ancestor_size = 200, ancestor_fee = 1000,
+        descendant_count = 1, descendant_size = 200, descendant_fee = 1000,
+        spends_coinbase = false, rbf_signaling = true
+    }.
+
+%% Gate 2a: exact wtxid already in mempool → found by lookup_entry_by_wtxid.
+%% This is the precondition that causes do_add_transaction to throw
+%% 'txn-already-in-mempool' per Core validation.cpp:823-826.
+gate2a_wtxid_match_found_test_() ->
+    {setup, fun setup_ets/0, fun cleanup_ets/1,
+     fun(_) ->
+         Txid  = <<1:256>>,
+         Wtxid = <<2:256>>,
+         Entry = make_dummy_entry(Txid, Wtxid),
+         ets:insert(mempool_txs, {Txid, Entry}),
+         [
+          %% Searching by the same wtxid must find the entry.
+          ?_assertMatch({ok, _},
+                        beamchain_mempool:lookup_entry_by_wtxid(Wtxid)),
+          %% Searching by a different wtxid must return not_found.
+          ?_assertEqual(not_found,
+                        beamchain_mempool:lookup_entry_by_wtxid(<<3:256>>))
+         ]
+     end}.
+
+%% Gate 2b: same txid but different wtxid (mutated witness) → txid lookup
+%% hits but wtxid lookup misses.  This must NOT collapse to the gate-2a
+%% error: the path for "same nonwitness data" is triggered by ets:lookup on
+%% ?MEMPOOL_TXS (keyed by txid) after the wtxid miss.
+gate2b_txid_match_wtxid_miss_test_() ->
+    {setup, fun setup_ets/0, fun cleanup_ets/1,
+     fun(_) ->
+         Txid       = <<10:256>>,
+         OrigWtxid  = <<20:256>>,
+         MutWtxid   = <<21:256>>,   %% different wtxid — witness was mutated
+         Entry = make_dummy_entry(Txid, OrigWtxid),
+         ets:insert(mempool_txs, {Txid, Entry}),
+         [
+          %% wtxid lookup with the MUTATED wtxid must miss (gate 2a would not fire).
+          ?_assertEqual(not_found,
+                        beamchain_mempool:lookup_entry_by_wtxid(MutWtxid)),
+          %% txid lookup must still hit (gate 2b fires → txn-same-nonwitness-data).
+          ?_assertMatch([{Txid, _}], ets:lookup(mempool_txs, Txid))
+         ]
+     end}.
+
 %%% Gate 5b/Bug 3: txn-already-known
 %%% ===================================================================
 
