@@ -71,8 +71,8 @@
          update_ping_latency/2,
          notify_tip_updated/0]).
 
-%% Exposed for testing (BIP35 mempool inv chunking)
--export([chunk_inv_items/2]).
+%% Exposed for testing (BIP35 mempool inv chunking; BIP-339 inv type selection)
+-export([chunk_inv_items/2, inv_items_from_pairs/2]).
 
 %% Exposed for testing (BIP-130 announce branching)
 -export([pick_announce_msg/3]).
@@ -1685,8 +1685,11 @@ peer_uses_wtxid(Pid) ->
     end.
 
 inv_items_from_pairs(Pairs, UseWtxid) ->
+    %% BIP-339: MSG_WTX (5) is the correct inv type for wtxid announcements.
+    %% MSG_WITNESS_TX (0x40000001) is a BIP-144 getdata flag — NOT a valid
+    %% inv type; Core peers receiving it silently discard the inv.
     Type = case UseWtxid of
-        true  -> ?MSG_WITNESS_TX;  %% BIP339: MSG_WTX is encoded as MSG_WITNESS_TX
+        true  -> ?MSG_WTX;
         false -> ?MSG_TX
     end,
     [#{type => Type, hash => select_inv_hash(P, UseWtxid)} || P <- Pairs].

@@ -19,7 +19,7 @@
 -export([accept_to_memory_pool/1, add_transaction/1, accept_package/1]).
 
 %% Queries
--export([has_tx/1, get_tx/1, get_entry/1]).
+-export([has_tx/1, get_tx/1, get_entry/1, get_wtxid/1]).
 -export([get_all_txids/0, get_all_entries/0, get_all_id_pairs/0, get_info/0]).
 -export([get_sorted_by_fee/0]).
 -export([get_tx_fee_rate/1]).
@@ -222,6 +222,14 @@ get_tx(Txid) ->
 get_entry(Txid) ->
     case ets:lookup(?MEMPOOL_TXS, Txid) of
         [{Txid, Entry}] -> {ok, Entry};
+        [] -> not_found
+    end.
+
+%% @doc Get the wtxid for a txid (BIP-339: used when building MSG_WTX inv items).
+-spec get_wtxid(binary()) -> {ok, binary()} | not_found.
+get_wtxid(Txid) ->
+    case ets:lookup(?MEMPOOL_TXS, Txid) of
+        [{Txid, Entry}] -> {ok, Entry#mempool_entry.wtxid};
         [] -> not_found
     end.
 

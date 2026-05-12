@@ -260,54 +260,50 @@ bug1_tx_inv_dropped_no_getdata_test() ->
     ?assertEqual(false, erlang:function_exported(beamchain_tx_request, get_requestable, 2)).
 
 %%% ===================================================================
-%%% BUG-2: send_tx_inv always sends MSG_TX (type=1) for wtxid peers
+%%% BUG-2: send_tx_inv always sends MSG_TX (type=1) for wtxid peers — FIXED
 %%% ===================================================================
 
 %% Core: net_processing.cpp:6008 — uses MSG_WTX for wtxidrelay peers.
-%% beamchain_peer.erl:1840 hardcodes type => 1 (MSG_TX) for all peers.
+%% Fix: send_tx_inv now selects MSG_WTX(5)+wtxid when peer has wtxidrelay=true.
 bug2_send_tx_inv_always_msg_tx_test() ->
-    %% The correct type for a wtxid-relay peer is MSG_WTX = 5 (BIP-339)
-    MsgWtx = 5,
-    MsgTx  = ?MSG_TX,    %% = 1
-    %% Verify the constants are distinct
-    ?assertNotEqual(MsgWtx, MsgTx),
-    %% Verify MSG_WTX is NOT defined in beamchain_protocol.hrl.
-    %% Core protocol.h:481 defines MSG_WTX = 5; beamchain_protocol.hrl
-    %% has no MSG_WTX macro — the peer module would need to hardcode 5
-    %% or the hrl would need updating.
-    MsgWtxFromHrl =
-        case erlang:function_exported(beamchain_protocol, msg_wtx, 0) of
-            true  -> beamchain_protocol:msg_wtx();
-            false -> undefined
-        end,
-    %% If MSG_WTX is not exported, beamchain cannot send the correct type
-    ?assertEqual(undefined, MsgWtxFromHrl),
-    %% Verify that type => 1 is what the outbound trickle sends
-    %% (asserts the bug: type 1 should be type 5 for wtxid peers)
-    ExpectedBuggyType = 1,
-    CorrectTypeForWtxidPeer = 5,
-    ?assertNotEqual(ExpectedBuggyType, CorrectTypeForWtxidPeer).
+    %% MSG_WTX must be defined as 5 in beamchain_protocol.hrl (BIP-339)
+    ?assertEqual(5, ?MSG_WTX),
+    %% MSG_TX (1) and MSG_WTX (5) are distinct constants
+    ?assert(1 =/= 5),
+    %% BIP-339 inv_items_from_pairs uses MSG_WTX for wtxid peers:
+    %% two synthetic id pairs; UseWtxid=true → type must be MSG_WTX
+    Txid1  = crypto:strong_rand_bytes(32),
+    Wtxid1 = crypto:strong_rand_bytes(32),
+    Pairs  = [{Txid1, Wtxid1}],
+    WtxItems = beamchain_peer_manager:inv_items_from_pairs(Pairs, true),
+    TxItems  = beamchain_peer_manager:inv_items_from_pairs(Pairs, false),
+    ?assertMatch([#{type := 5}],           WtxItems),  %% MSG_WTX
+    ?assertMatch([#{type := ?MSG_TX}],     TxItems),   %% MSG_TX
+    %% Hash selection: wtxid peer gets wtxid, txid peer gets txid
+    ?assertMatch([#{hash := Wtxid1}],      WtxItems),
+    ?assertMatch([#{hash := Txid1}],       TxItems).
 
 %%% ===================================================================
-%%% BUG-3: MSG_WITNESS_TX (0x40000001) != MSG_WTX (5) for BIP-339 inv
+%%% BUG-3: MSG_WITNESS_TX (0x40000001) != MSG_WTX (5) for BIP-339 inv — FIXED
 %%% ===================================================================
 
 %% Core protocol.h:481 — MSG_WTX = 5 (BIP-339 tx inv)
 %% Core protocol.h:486 — MSG_WITNESS_TX = MSG_TX | MSG_WITNESS_FLAG = 0x40000001
 %%                        (for getdata of witness-serialised tx, BIP-144)
-%% beamchain_protocol.hrl defines only MSG_WITNESS_TX = 0x40000001 and
-%% uses it for BIP-339 wtxid inv announcements — wrong wire type.
+%% Fix: inv_items_from_pairs now uses ?MSG_WTX (5), not ?MSG_WITNESS_TX.
 bug3_wrong_wtxid_inv_type_test() ->
-    %% Verify the protocol constants
-    CoreMsgWtx = 5,
+    %% MSG_WITNESS_TX remains 0x40000001 (BIP-144 getdata flag, not an inv type)
     ?assertEqual(16#40000001, ?MSG_WITNESS_TX),
-    ?assert(CoreMsgWtx =/= ?MSG_WITNESS_TX),
-    %% BIP-339 specifies that the inv type for wtxid announcements MUST be
-    %% MSG_WTX = 5, not MSG_WITNESS_TX = 0x40000001.
-    %% The beamchain_peer_manager:inv_items_from_pairs/2 uses ?MSG_WITNESS_TX
-    %% for wtxid relay, which is the wrong constant.
-    BuggyWtxidInvType = ?MSG_WITNESS_TX,
-    ?assert(CoreMsgWtx =/= BuggyWtxidInvType).
+    %% MSG_WTX is now defined as 5 (BIP-339 inv type)
+    ?assertEqual(5, ?MSG_WTX),
+    %% The two constants must be distinct
+    ?assert(?MSG_WTX =/= ?MSG_WITNESS_TX),
+    %% inv_items_from_pairs with UseWtxid=true must use MSG_WTX (5), not MSG_WITNESS_TX
+    Txid  = crypto:strong_rand_bytes(32),
+    Wtxid = crypto:strong_rand_bytes(32),
+    [Item] = beamchain_peer_manager:inv_items_from_pairs([{Txid, Wtxid}], true),
+    ?assertEqual(?MSG_WTX, maps:get(type, Item)),
+    ?assertNotEqual(?MSG_WITNESS_TX, maps:get(type, Item)).
 
 %%% ===================================================================
 %%% BUG-4: Inbound inv size not validated (no Misbehave on > MAX_INV_SZ)
@@ -571,25 +567,31 @@ bug19_block_relay_sends_relay_true_test() ->
     ok.
 
 %%% ===================================================================
-%%% BUG-20: wtxidrelay status ignored in outgoing trickle tx inv type
+%%% BUG-20: wtxidrelay status ignored in outgoing trickle tx inv type — FIXED
 %%% ===================================================================
 
-%% Even the trickle path (do_trickle_inv) ignores wtxidrelay when
-%% deciding inv item type — always sends MSG_TX with txid hash.
+%% Fix: send_tx_inv (called by do_trickle_inv) now checks peer_data.wtxidrelay
+%% and selects MSG_WTX (5) + wtxid for wtxidrelay peers.
 bug20_trickle_ignores_wtxid_relay_test() ->
-    %% Verify MSG_WTX = 5 is NOT defined in beamchain_protocol.hrl
-    %% (it would need to be for correct BIP-339 relay)
-    ?assert(not is_msg_wtx_defined()),
-    %% MSG_TX and MSG_WTX are different constants
+    %% MSG_WTX is now defined as 5 in beamchain_protocol.hrl
+    ?assertEqual(5, ?MSG_WTX),
+    %% MSG_TX remains 1 and is distinct from MSG_WTX (5)
     ?assertEqual(1, ?MSG_TX),
-    CorrectMsgWtx = 5,
-    ?assert(?MSG_TX =/= CorrectMsgWtx).
+    ?assert(1 =/= 5),
+    %% inv_items_from_pairs encodes the correct per-peer type choice:
+    %%   wtxid peer → MSG_WTX (5)
+    %%   txid peer  → MSG_TX  (1)
+    Txid  = crypto:strong_rand_bytes(32),
+    Wtxid = crypto:strong_rand_bytes(32),
+    Pairs = [{Txid, Wtxid}],
+    [WtxItem] = beamchain_peer_manager:inv_items_from_pairs(Pairs, true),
+    [TxItem]  = beamchain_peer_manager:inv_items_from_pairs(Pairs, false),
+    ?assertEqual(?MSG_WTX, maps:get(type, WtxItem)),
+    ?assertEqual(?MSG_TX,  maps:get(type, TxItem)),
+    %% Hash correctness: wtxid peer gets the wtxid, txid peer gets txid
+    ?assertEqual(Wtxid, maps:get(hash, WtxItem)),
+    ?assertEqual(Txid,  maps:get(hash, TxItem)).
 
-is_msg_wtx_defined() ->
-    %% Macro existence check: try to reference MSG_WTX via module attribute trick.
-    %% Since we can't check macros at runtime, we check if any function uses the value 5
-    %% for inv type. The absence of MSG_WTX in beamchain_protocol.hrl is the bug indicator.
-    false.  %% MSG_WTX is not defined in beamchain_protocol.hrl
 
 %%% ===================================================================
 %%% G21-G30: PASS gates (documented correctness for audit completeness)

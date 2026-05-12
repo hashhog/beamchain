@@ -1835,9 +1835,25 @@ tx_passes_feefilter(Txid, PeerFeeFilter) ->
             false
     end.
 
-%% Send inv message for a list of txids
-send_tx_inv(Txids, Data) ->
-    Items = [#{type => 1, hash => Txid} || Txid <- Txids],  %% 1 = MSG_TX
+%% Send inv message for a list of txids.
+%% BIP-339: when peer has negotiated wtxidrelay=true, use MSG_WTX (5) +
+%% wtxid.  Otherwise use MSG_TX (1) + txid.
+send_tx_inv(Txids, #peer_data{wtxidrelay = UseWtxid} = Data) ->
+    Items = case UseWtxid of
+        true ->
+            %% Look up the wtxid for each txid from the mempool.
+            %% If the tx has left the mempool, fall back to txid with MSG_TX
+            %% (the peer will issue a getdata that returns notfound, which is
+            %% harmless and matches Core behaviour).
+            lists:filtermap(fun(Txid) ->
+                case beamchain_mempool:get_wtxid(Txid) of
+                    {ok, Wtxid} -> {true, #{type => ?MSG_WTX, hash => Wtxid}};
+                    not_found   -> {true, #{type => ?MSG_TX,  hash => Txid}}
+                end
+            end, Txids);
+        false ->
+            [#{type => ?MSG_TX, hash => Txid} || Txid <- Txids]
+    end,
     do_send_msg(inv, #{items => Items}, Data).
 
 %% Fisher-Yates shuffle for randomizing inv order
