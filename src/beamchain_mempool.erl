@@ -110,7 +110,8 @@
 -define(MEMPOOL_TXS, mempool_txs).           %% txid -> mempool_entry
 -define(MEMPOOL_BY_FEE, mempool_by_fee).     %% ordered {fee_rate, txid}
 -define(MEMPOOL_OUTPOINTS, mempool_outpoints). %% {txid, vout} -> spending_txid
--define(MEMPOOL_ORPHANS, mempool_orphans).   %% txid -> {tx, expiry}
+-define(MEMPOOL_ORPHANS, mempool_orphans).         %% wtxid -> {tx, expiry}  (BIP-339 primary key)
+-define(MEMPOOL_ORPHAN_BY_TXID, mempool_orphan_by_txid). %% txid -> wtxid  (secondary index)
 -define(MEMPOOL_CLUSTERS, mempool_clusters). %% cluster_id -> cluster_data
 -define(MEMPOOL_EPHEMERAL, mempool_ephemeral). %% {parent_txid, anchor_index} -> child_txid
 
@@ -360,6 +361,7 @@ init([]) ->
     ets:new(?MEMPOOL_OUTPOINTS, [set, public, named_table,
                                   {write_concurrency, true}]),
     ets:new(?MEMPOOL_ORPHANS, [set, public, named_table]),
+    ets:new(?MEMPOOL_ORPHAN_BY_TXID, [set, public, named_table]),
     ets:new(?MEMPOOL_CLUSTERS, [set, public, named_table,
                                  {read_concurrency, true}]),
     ets:new(?MEMPOOL_EPHEMERAL, [set, public, named_table]),
@@ -772,7 +774,7 @@ do_add_transaction(Tx, State) ->
         throw:{validation, Reason} ->
             {error, Reason};
         throw:orphan ->
-            add_orphan(Tx, Txid),
+            add_orphan(Tx, Wtxid, Txid),
             {error, orphan};
         throw:Reason ->
             {error, Reason}
@@ -2301,29 +2303,46 @@ get_ancestors_loop([Txid | Rest], Visited, Acc) ->
 %%% Internal: orphan pool
 %%% ===================================================================
 
-add_orphan(Tx, Txid) ->
+%% add_orphan/3 — primary key is Wtxid (BIP-339); secondary txid→wtxid index
+%% kept so reprocess_orphans/1 can resolve children by their input prev_out hash
+%% (which is the parent's txid, not wtxid).
+add_orphan(Tx, Wtxid, Txid) ->
     OrphanCount = ets:info(?MEMPOOL_ORPHANS, size),
     case OrphanCount < ?MAX_ORPHAN_TXS of
         true ->
             Expiry = erlang:system_time(second) + ?ORPHAN_TX_EXPIRE_TIME,
-            ets:insert(?MEMPOOL_ORPHANS, {Txid, Tx, Expiry}),
-            logger:debug("mempool: added orphan ~s (~B total)",
-                         [short_hex(Txid), OrphanCount + 1]);
+            ets:insert(?MEMPOOL_ORPHANS, {Wtxid, Tx, Expiry}),
+            ets:insert(?MEMPOOL_ORPHAN_BY_TXID, {Txid, Wtxid}),
+            logger:debug("mempool: added orphan wtxid=~s (~B total)",
+                         [short_hex(Wtxid), OrphanCount + 1]);
         false ->
             %% evict a random orphan to make room
             case ets:first(?MEMPOOL_ORPHANS) of
                 '$end_of_table' -> ok;
-                OldTxid ->
-                    ets:delete(?MEMPOOL_ORPHANS, OldTxid)
+                OldWtxid ->
+                    %% Remove secondary index entry for the evicted orphan
+                    case ets:lookup(?MEMPOOL_ORPHANS, OldWtxid) of
+                        [{OldWtxid, OldTx, _}] ->
+                            OldTxid = beamchain_serialize:tx_hash(OldTx),
+                            ets:delete(?MEMPOOL_ORPHAN_BY_TXID, OldTxid);
+                        [] -> ok
+                    end,
+                    ets:delete(?MEMPOOL_ORPHANS, OldWtxid)
             end,
             Expiry = erlang:system_time(second) + ?ORPHAN_TX_EXPIRE_TIME,
-            ets:insert(?MEMPOOL_ORPHANS, {Txid, Tx, Expiry})
+            ets:insert(?MEMPOOL_ORPHANS, {Wtxid, Tx, Expiry}),
+            ets:insert(?MEMPOOL_ORPHAN_BY_TXID, {Txid, Wtxid})
     end.
 
 %% Attempt to re-process orphans whose missing parent might now exist.
+%% NewTxid is the txid (non-witness hash) of the newly accepted parent.
+%% We scan all orphans by iterating the primary (wtxid-keyed) table and
+%% checking whether any input's prev_out hash matches NewTxid.
+%% The secondary ?MEMPOOL_ORPHAN_BY_TXID index is not used here because the
+%% children reference their parent by txid in prev_out, not by wtxid.
 reprocess_orphans(NewTxid) ->
     Orphans = ets:tab2list(?MEMPOOL_ORPHANS),
-    lists:foreach(fun({OrphanTxid, OrphanTx, _Expiry}) ->
+    lists:foreach(fun({OrphanWtxid, OrphanTx, _Expiry}) ->
         HasParent = lists:any(
             fun(#tx_in{prev_out = #outpoint{hash = H}}) ->
                 H =:= NewTxid
@@ -2331,11 +2350,14 @@ reprocess_orphans(NewTxid) ->
             OrphanTx#transaction.inputs),
         case HasParent of
             true ->
-                ets:delete(?MEMPOOL_ORPHANS, OrphanTxid),
+                %% Remove from both tables before re-submission
+                OrphanTxid = beamchain_serialize:tx_hash(OrphanTx),
+                ets:delete(?MEMPOOL_ORPHANS, OrphanWtxid),
+                ets:delete(?MEMPOOL_ORPHAN_BY_TXID, OrphanTxid),
                 case add_transaction(OrphanTx) of
                     {ok, _} ->
-                        logger:debug("mempool: promoted orphan ~s",
-                                     [short_hex(OrphanTxid)]);
+                        logger:debug("mempool: promoted orphan wtxid=~s",
+                                     [short_hex(OrphanWtxid)]);
                     {error, _} ->
                         ok
                 end;
@@ -2681,10 +2703,12 @@ do_expire_old(State) ->
 do_expire_orphans() ->
     Now = erlang:system_time(second),
     Orphans = ets:tab2list(?MEMPOOL_ORPHANS),
-    Expired = lists:foldl(fun({Txid, _Tx, Expiry}, Count) ->
+    Expired = lists:foldl(fun({Wtxid, Tx, Expiry}, Count) ->
         case Now >= Expiry of
             true ->
-                ets:delete(?MEMPOOL_ORPHANS, Txid),
+                Txid = beamchain_serialize:tx_hash(Tx),
+                ets:delete(?MEMPOOL_ORPHANS, Wtxid),
+                ets:delete(?MEMPOOL_ORPHAN_BY_TXID, Txid),
                 Count + 1;
             false ->
                 Count
