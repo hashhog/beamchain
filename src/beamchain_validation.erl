@@ -22,6 +22,8 @@
 %% Sigops counting
 -export([count_legacy_sigops/1, count_sigops_accurate/1]).
 -export([count_p2sh_sigops/2, count_witness_sigops/2]).
+%% W96: per-redeem-script sigops cap requires the redeem-script extractor.
+-export([get_p2sh_redeem_script/1]).
 -export([get_tx_sigop_cost/3]).
 
 %% Utility

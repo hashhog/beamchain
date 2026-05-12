@@ -67,6 +67,15 @@
 %% Witness standardness (IsWitnessStandard) - exported for testing
 -export([is_witness_standard/2]).
 
+%% W96 ATMP gates - exported for unit testing
+-export([validate_inputs_standardness/2,
+         check_tx_inputs_money_range/2,
+         is_dust_output/1,
+         pre_check_ephemeral_tx/2,
+         consensus_script_flags/0,
+         check_tx_already_known/1,
+         consensus_script_checks/2]).
+
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2]).
@@ -483,19 +492,37 @@ do_add_transaction(Tx, State) ->
     Wtxid = beamchain_serialize:wtx_hash(Tx),
 
     try
-        %% 1. basic structure check
+        %% W96 GATE 1: basic structure check (Core CheckTransaction).
         case beamchain_validation:check_transaction(Tx) of
             ok -> ok;
             {error, E} -> throw({validation, E})
         end,
 
-        %% 2. not already in mempool
-        ets:member(?MEMPOOL_TXS, Txid) andalso throw(already_in_mempool),
+        %% W96 GATE 1b: coinbase rejected — coinbase is only valid in a block.
+        %% Core validation.cpp:803-804: TX_CONSENSUS "coinbase".
+        is_coinbase_tx(Tx#transaction.inputs)
+            andalso throw('bad-txns-coinbase'),
 
-        %% 3. check standardness (weight, version)
+        %% W96 GATE 2a: exists(wtxid) — exact tx already in mempool.
+        %% Core validation.cpp:823-826: TX_CONFLICT "txn-already-in-mempool".
+        case lookup_entry_by_wtxid(Wtxid) of
+            {ok, _Existing} -> throw('txn-already-in-mempool');
+            not_found -> ok
+        end,
+        %% W96 GATE 2b: exists(txid) but wtxid differs — same-txid-different-witness.
+        %% Core validation.cpp:826-829: TX_CONFLICT "txn-same-nonwitness-data-in-mempool".
+        case ets:lookup(?MEMPOOL_TXS, Txid) of
+            [{_, _OtherEntry}] ->
+                %% A tx with the same txid but a different wtxid is already in
+                %% the mempool (witness was mutated).  Distinct error class.
+                throw('txn-same-nonwitness-data-in-mempool');
+            [] -> ok
+        end,
+
+        %% W96 GATE 3: check standardness (weight, version, scriptSig, OP_RETURN budget).
         check_standard(Tx),
 
-        %% 3b. IsFinalTx (BIP-113): reject non-final transactions at mempool admit.
+        %% W96 GATE 4: IsFinalTx (BIP-113) — reject non-final transactions.
         %% Mempool holds txs for the *next* block, so we check against height+1 and
         %% the current chain MTP (MEDIAN_TIME_PAST of the last 11 blocks) per BIP-113.
         %% Mirrors Bitcoin Core MemPoolAccept::PreChecks → CheckFinalTxAtTip.
@@ -504,15 +531,36 @@ do_add_transaction(Tx, State) ->
         beamchain_validation:is_final_tx(Tx, TipHeight + 1, Mtp)
             orelse throw(non_final),
 
-        %% 4. look up all inputs (UTXO set + mempool)
+        %% W96 GATE 5: look up all inputs (UTXO set + mempool).
+        %% If any prevout is missing, look for already-confirmed (txn-already-known)
+        %% before returning bad-txns-inputs-missingorspent.
         {InputCoins, SpendsCoinbase} = lookup_inputs(Tx),
 
-        %% 4b. witness standardness (IsWitnessStandard) — requires prevout coins
-        %% Mirrors Bitcoin Core policy/policy.cpp:265-351.
-        is_witness_standard(Tx, InputCoins) orelse throw(bad_witness_nonstandard),
+        %% W96 GATE 6: per-coin + accumulated MoneyRange check (Core CheckTxInputs).
+        %% Core consensus/tx_verify.cpp:175-200: each coin's value must satisfy
+        %% MoneyRange and the running sum must not exceed MAX_MONEY.  Without this,
+        %% inputs summing to >MAX_MONEY can be hidden by a TotalIn>=TotalOut gate
+        %% if the outputs also overflow silently.  We do this BEFORE expensive
+        %% checks so a malicious peer can't burn CPU.
+        check_tx_inputs_money_range(InputCoins, Txid),
 
-        %% 4c. sigops limit: reject transactions whose sigop cost exceeds
-        %% MAX_STANDARD_TX_SIGOPS_COST (16000 = 80000 / 5).
+        %% W96 GATE 7: witness standardness (IsWitnessStandard) — requires prevout coins.
+        %% Mirrors Bitcoin Core policy/policy.cpp:265-351.
+        is_witness_standard(Tx, InputCoins) orelse throw('bad-witness-nonstandard'),
+
+        %% W96 GATE 8: ValidateInputsStandardness — Core validation.cpp:896-901.
+        %% (a) nonstandard input scriptPubKey → bad-txns-nonstandard-inputs.
+        %% (b) WITNESS_UNKNOWN witness version → bad-txns-nonstandard-inputs.
+        %% (c) per-redeem-script P2SH sigops cap (MAX_P2SH_SIGOPS = 15) → reject.
+        %% This is distinct from the global MAX_STANDARD_TX_SIGOPS_COST gate; it
+        %% caps the sigops density of a *single* P2SH redeem script.
+        case validate_inputs_standardness(Tx, InputCoins) of
+            ok -> ok;
+            {error, ISReason} -> throw(ISReason)
+        end,
+
+        %% W96 GATE 9: sigops limit — reject transactions whose total sigop cost
+        %% exceeds MAX_STANDARD_TX_SIGOPS_COST (16000 = 80000 / 5).
         %% Mirrors Bitcoin Core validation.cpp:908+941-943:
         %%   nSigOpsCost = GetTransactionSigOpCost(tx, view, STANDARD_SCRIPT_VERIFY_FLAGS);
         %%   if (nSigOpsCost > MAX_STANDARD_TX_SIGOPS_COST) return Invalid(...);
@@ -521,49 +569,77 @@ do_add_transaction(Tx, State) ->
         MempoolSigopFlags = all_standard_flags(),
         TxSigopCost = beamchain_validation:get_tx_sigop_cost(Tx, InputCoins, MempoolSigopFlags),
         TxSigopCost =< ?MAX_STANDARD_TX_SIGOPS_COST
-            orelse throw({too_many_sigops, TxSigopCost}),
+            orelse throw({'bad-txns-too-many-sigops', TxSigopCost}),
 
-        %% 5. check for double-spends in mempool (+ RBF)
-        %% Returns {ok, EvictedTxids, EvictedVBytes} - store for cluster cleanup later
+        %% W96 GATE 10: check for double-spends in mempool (+ RBF).
+        %% Returns {ok, EvictedTxids, EvictedVBytes} - store for cluster cleanup later.
         %% TxSigopCost is passed so do_rbf can compute the sigop-adjusted vsize for
         %% Rule 4 (incremental relay fee), matching Core's ws.m_vsize = GetTxSize().
         {ok, RbfEvictedTxids, RbfEvictedVBytes} = check_mempool_conflicts(Tx, InputCoins, TxSigopCost),
 
-        %% 6. compute fee
+        %% W96 GATE 11: compute fee.
         TotalIn = lists:foldl(fun(C, A) -> A + C#utxo.value end,
                               0, InputCoins),
         TotalOut = lists:foldl(fun(#tx_out{value = V}, A) -> A + V end,
                                0, Tx#transaction.outputs),
-        TotalIn >= TotalOut orelse throw(insufficient_fee),
+        TotalIn >= TotalOut orelse throw('bad-txns-in-belowout'),
         Fee = TotalIn - TotalOut,
+        %% Per-coin and accumulated check_tx_inputs_money_range above already
+        %% asserts MoneyRange for inputs; outputs were checked in CheckTransaction.
+        Fee =< ?MAX_MONEY orelse throw('bad-txns-fee-outofrange'),
 
-        %% 7. compute size metrics
+        %% W96 GATE 12: compute size metrics.
         %% VSize uses sigop-adjusted weight per Core policy/policy.cpp:GetVirtualTransactionSize:
         %%   vsize = ceil(max(weight, sigop_cost * DEFAULT_BYTES_PER_SIGOP) / 4)
-        %% TxSigopCost already computed above; pass it into tx_sigop_vsize/2.
         Weight = beamchain_serialize:tx_weight(Tx),
         VSize = beamchain_serialize:tx_sigop_vsize(Tx, TxSigopCost),
         Size = byte_size(beamchain_serialize:encode_transaction(Tx)),
         FeeRate = Fee / max(1, VSize),
 
-        %% 8. check dust outputs (with ephemeral anchor support)
-        %% This returns {has_ephemeral, Index} if tx is an ephemeral anchor parent
+        %% W96 GATE 13: PreCheckEphemeralTx — generalized (Core ephemeral_policy.cpp:23-31).
+        %% Reject any tx with a dust output unless fee == 0 (no incentive to mine alone).
+        %% Beamchain previously only special-cased P2A here; Core 28+ treats ANY
+        %% dust output the same way (the receiver must be spent ephemerally).
+        case pre_check_ephemeral_tx(Tx, Fee) of
+            ok -> ok;
+            {error, EphReason} -> throw(EphReason)
+        end,
+        %% W96 GATE 13b: per-output dust gate for non-zero-fee txs (legacy dust check
+        %% scoped to non-ephemeral path).  Ephemeral anchor P2A outputs already
+        %% exempted by check_dust when EphemeralInfo = {has_ephemeral, _}.
         EphemeralInfo = check_dust(Tx, Fee),
 
-        %% 9. check minimum relay fee (1 sat/vB)
-        %% Ephemeral anchor parents are allowed to have 0 fee, but need package
-        case EphemeralInfo of
+        %% W96 GATE 14: minimum relay fee — must use rolling mempool min-fee.
+        %% Core validation.cpp:948: CheckFeeRate(ws.m_vsize, ws.m_modified_fees, state).
+        %% CheckFeeRate compares against GetMinFee() (rolling decay) and the static
+        %% incremental_relay_feerate floor — NOT a hardcoded 1 sat/vB.
+        %% Without this, when the mempool is full and rolling_min_fee has been
+        %% bumped above 1 sat/vB by trim_to_size, low-fee txs are still admitted
+        %% — the DoS-prevention rolling-fee machinery is bypassed.
+        %% Ephemeral anchor parents bypass the fee gate (they're 0-fee by design
+        %% and rely on a child to bump them via CPFP).
+        State1 = case EphemeralInfo of
             {has_ephemeral, _} ->
-                %% Zero-fee tx with ephemeral anchor - must be spent in package
+                %% Zero-fee ephemeral parent — defer for package evaluation.
                 throw(ephemeral_anchor_needs_spending);
             none ->
-                FeeRate >= 1.0 orelse throw(mempool_min_fee_not_met)
+                %% Core CheckFeeRate composition:
+                %%   mempool_reject_fee = GetMinFee().GetFee(vsize)   (rolling)
+                %%   min_relay_fee      = min_relay_feerate.GetFee(vsize) (static)
+                %%   reject if package_fee < max(mempool_reject_fee, min_relay_fee)
+                %% In sat/vB:
+                %%   effective_min = max(rolling_min_fee_sat_per_vb,
+                %%                       DEFAULT_MIN_RELAY_TX_FEE / 1000)
+                %% DEFAULT_MIN_RELAY_TX_FEE = 1000 sat/kvB = 1.0 sat/vB.
+                {RollingMin, St1} = get_min_fee(State),
+                StaticMinRelay = ?DEFAULT_MIN_RELAY_TX_FEE / 1000.0,
+                EffectiveMin = max(RollingMin, StaticMinRelay),
+                FeeRate >= EffectiveMin orelse throw('mempool min fee not met'),
+                St1
         end,
+        %% Use the post-decay State1 going forward.
 
-        %% 10. verify scripts
-        verify_scripts(Tx, InputCoins),
-
-        %% 10b. TRUC (v3 transaction) policy checks
+        %% W96 GATE 15: TRUC (v3 transaction) policy checks.
         %% Pass RbfEvictedTxids as direct_conflicts so the descendant-limit gate
         %% can skip the check when the existing child is already being RBF-replaced.
         %% Mirrors Core SingleTRUCChecks direct_conflicts set (truc_policy.cpp:240-243).
@@ -582,25 +658,39 @@ do_add_transaction(Tx, State) ->
                 throw(TrucErr)
         end,
 
-        %% 11. ancestor/descendant limits
+        %% W96 GATE 16: ancestor/descendant limits.
         {AncCount, AncSize, AncFee} = compute_ancestors(Tx, Fee, VSize),
-        AncCount =< ?MAX_ANCESTOR_COUNT orelse throw(too_long_mempool_chain),
-        AncSize =< ?MAX_ANCESTOR_SIZE orelse throw(too_long_mempool_chain),
+        AncCount =< ?MAX_ANCESTOR_COUNT orelse throw('too-long-mempool-chain'),
+        AncSize =< ?MAX_ANCESTOR_SIZE orelse throw('too-long-mempool-chain'),
         check_descendant_limits(Tx, VSize),
 
-        %% 11b. cluster limits (Core validation.cpp:1341-1344, policy.h:72-74)
+        %% W96 GATE 17: cluster limits (Core validation.cpp:1341-1344, policy.h:72-74).
         %% Must check BEFORE inserting: count+vbytes of the cluster that would
         %% form after adding this tx.  Core uses CheckMemPoolPolicyLimits() which
         %% queries the pending changeset; we compute it eagerly from parent clusters.
         check_cluster_limits(Tx, VSize),
 
-        %% 12. check coinbase maturity for mempool spending
-        %% TipHash and TipHeight were already fetched at step 3b above.
+        %% W96 GATE 18: coinbase maturity for mempool spending.
+        %% TipHash and TipHeight were already fetched at GATE 4 above.
         check_mempool_coinbase_maturity(InputCoins, TipHeight + 1),
 
-        %% 12b. BIP 68 sequence lock check
-        %% For mempool, check if tx would satisfy locks in the next block
+        %% W96 GATE 19: BIP-68 sequence lock check.
+        %% For mempool, check if tx would satisfy locks in the next block.
         check_mempool_sequence_locks(Tx, InputCoins, TipHash, TipHeight + 1),
+
+        %% W96 GATE 20: PolicyScriptChecks — verify scripts with standard flags.
+        %% Core validation.cpp:1146: CheckInputScripts(STANDARD_SCRIPT_VERIFY_FLAGS).
+        %% Ordered LAST among per-tx gates (after all cheap checks) to mitigate
+        %% CPU-exhaustion DoS — see Core comment validation.cpp:1380-1381.
+        verify_scripts(Tx, InputCoins),
+
+        %% W96 GATE 21: ConsensusScriptChecks — re-verify with consensus flags.
+        %% Core validation.cpp:1181-1185: CheckInputsFromMempoolAndCache(currentBlockScriptVerifyFlags).
+        %% If standard-flags PASSED but consensus-flags FAIL, this is a beamchain
+        %% interpreter bug — Core logs "BUG! PLEASE REPORT THIS!" and refuses to
+        %% admit.  A tx that fails consensus flags must never reach a mined block,
+        %% else miners produce orphan-prone invalid blocks.
+        ok = consensus_script_checks(Tx, InputCoins),
 
         %% 13. build entry
         Now = erlang:system_time(second),
@@ -646,12 +736,13 @@ do_add_transaction(Tx, State) ->
         %% 15. update ancestor descendant stats
         update_ancestors_for_new_tx(Tx, VSize, Fee),
 
-        %% 16. clean up clusters for evicted transactions (RBF + TRUC sibling)
+        %% 16. clean up clusters for evicted transactions (RBF + TRUC sibling).
+        %% Thread State1 (post GetMinFee decay update) through cluster mutations.
         AllEvictedTxids = RbfEvictedTxids ++ TrucEvictedTxids,
         AllEvictedVBytes = RbfEvictedVBytes + TrucEvictedVBytes,
         State2 = lists:foldl(fun(EvictedTxid, St) ->
             cluster_remove_tx(EvictedTxid, St)
-        end, State, AllEvictedTxids),
+        end, State1, AllEvictedTxids),
 
         %% 17. update cluster membership for new tx
         State3 = cluster_add_tx(Txid, Tx, Fee, VSize, State2),
@@ -822,8 +913,9 @@ try_individual_accept([{Txid, Tx} | Rest], State, AcceptedAcc, DeferredAcc) ->
             case do_add_transaction(Tx, State) of
                 {ok, Txid, State2} ->
                     try_individual_accept(Rest, State2, [Txid | AcceptedAcc], DeferredAcc);
-                {error, mempool_min_fee_not_met} ->
-                    %% Defer for package evaluation (CPFP)
+                {error, 'mempool min fee not met'} ->
+                    %% Defer for package evaluation (CPFP). Canonical Core string
+                    %% per validation.cpp:948 + policy/feerate.cpp.
                     try_individual_accept(Rest, State, AcceptedAcc,
                                           [{Txid, Tx} | DeferredAcc]);
                 {error, orphan} ->
@@ -1173,7 +1265,10 @@ accept_package_txs(TxEntries, EphemeralDeps, State) ->
 
 %% Look up all inputs. For each input, first check the UTXO set
 %% (confirmed outputs), then fall back to mempool outputs.
-lookup_inputs(#transaction{inputs = Inputs}) ->
+lookup_inputs(Tx) ->
+    lookup_inputs_for_tx(Tx).
+
+lookup_inputs_for_tx(#transaction{inputs = Inputs} = Tx) ->
     {Coins, AnyMissing, AnyCoinbase} = lists:foldl(
         fun(#tx_in{prev_out = #outpoint{hash = H, index = I}},
             {Acc, Missing, Cb}) ->
@@ -1194,8 +1289,24 @@ lookup_inputs(#transaction{inputs = Inputs}) ->
         {[], false, false},
         Inputs),
     case AnyMissing of
-        true -> throw(orphan);
-        false -> {lists:reverse(Coins), AnyCoinbase}
+        true ->
+            %% W96 GATE 5b: 'txn-already-known' — before declaring an orphan,
+            %% check whether ANY of this tx's outputs is already in the UTXO
+            %% cache.  If so, the tx is already mined (or replays a mined one);
+            %% treat as TX_CONFLICT, not as an orphan.  Without this, an
+            %% attacker can replay a confirmed tx as an "orphan" and burn peer
+            %% orphan-pool resources indefinitely.
+            %% Core validation.cpp:858-867:
+            %%   for each output: if coins_cache.HaveCoinInCache(COutPoint(hash, out))
+            %%       return Invalid(TX_CONFLICT, "txn-already-known")
+            case check_tx_already_known(Tx) of
+                already_known ->
+                    throw('txn-already-known');
+                not_known ->
+                    throw(orphan)
+            end;
+        false ->
+            {lists:reverse(Coins), AnyCoinbase}
     end.
 
 %%% ===================================================================
@@ -3620,6 +3731,282 @@ split_cluster(OldClusterId, Components, #state{union_find = UF, cluster_count = 
     NewCC = CC - 1 + NewClusterCount,
 
     State#state{union_find = UF2, cluster_count = NewCC}.
+
+%%% ===================================================================
+%%% W96: AcceptToMemoryPool gates — Core MemPoolAccept PreChecks +
+%%% PolicyScriptChecks + ConsensusScriptChecks (validation.cpp:782-1190).
+%%% ===================================================================
+
+%% @doc ValidateInputsStandardness — Core policy/policy.cpp:214-263.
+%% Per-input gates applied AFTER witness standardness and BEFORE the global
+%% sigops cap.  Three failure modes, all returning the canonical Core token
+%% 'bad-txns-nonstandard-inputs' (TX_INPUTS_NOT_STANDARD):
+%%
+%%   (a) Input scriptPubKey is NONSTANDARD (doesn't match any standard template).
+%%   (b) Input scriptPubKey is WITNESS_UNKNOWN (a future-witness program).
+%%   (c) For P2SH inputs: redeem-script sigop count > MAX_P2SH_SIGOPS (15).
+%%       This is a per-redeem cap distinct from the global 16k sigop budget.
+%%
+%% Coinbase txs are exempt (they cannot reach the mempool but we guard anyway).
+-spec validate_inputs_standardness(#transaction{}, [#utxo{}]) ->
+    ok | {error, atom()}.
+validate_inputs_standardness(Tx, _InputCoins)
+  when is_record(Tx, transaction), Tx#transaction.inputs =:= [] ->
+    ok;
+validate_inputs_standardness(#transaction{inputs = Inputs} = Tx, InputCoins) ->
+    case is_coinbase_tx(Inputs) of
+        true ->
+            ok;
+        false ->
+            validate_inputs_standardness_loop(
+                lists:zip(Inputs, InputCoins), 0, Tx)
+    end.
+
+validate_inputs_standardness_loop([], _Idx, _Tx) ->
+    ok;
+validate_inputs_standardness_loop([{#tx_in{script_sig = SS}, Coin} | Rest],
+                                  Idx, Tx) ->
+    SPK = Coin#utxo.script_pubkey,
+    case classify_input_template(SPK) of
+        nonstandard ->
+            {error, 'bad-txns-nonstandard-inputs'};
+        witness_unknown ->
+            %% Future witness version 2-16 with a 2-40-byte program is
+            %% standard at OUTPUT side (relayable forward-compat) but is
+            %% NONSTANDARD on the INPUT side: spending it locally requires
+            %% known semantics.  Core returns the same canonical token.
+            {error, 'bad-txns-nonstandard-inputs'};
+        scripthash ->
+            %% P2SH: cap redeem-script sigops at MAX_P2SH_SIGOPS (=15).
+            %% Extract the redeem script (last data push in scriptSig) and run
+            %% accurate sigop counting on it.  A non-push-only scriptSig yields
+            %% the same null redeem script Core sees (sigops = 0).
+            case beamchain_validation:get_p2sh_redeem_script(SS) of
+                {ok, RedeemScript} ->
+                    N = beamchain_validation:count_sigops_accurate(RedeemScript),
+                    if
+                        N > ?MAX_P2SH_SIGOPS ->
+                            {error, 'bad-txns-nonstandard-inputs'};
+                        true ->
+                            validate_inputs_standardness_loop(Rest, Idx + 1, Tx)
+                    end;
+                _NoRedeem ->
+                    %% No identifiable redeem script — Core treats as 0 sigops.
+                    validate_inputs_standardness_loop(Rest, Idx + 1, Tx)
+            end;
+        _Standard ->
+            validate_inputs_standardness_loop(Rest, Idx + 1, Tx)
+    end.
+
+%% @doc Classify a scriptPubKey from the INPUT side (Core's Solver applied to
+%% prevouts).  Returns atoms matching Core's TxoutType enum surface where it
+%% diverges from the output-side classifier:
+%%   - 'witness_unknown' for witness v2-v16 with a 2-40 byte program.
+%%   - 'witness_unknown' for witness v0 with neither 20 nor 32 bytes.
+%%   - 'scripthash' for P2SH (so the redeem-script sigop cap fires).
+%% Standard types (p2pkh, p2wpkh, p2wsh, p2tr, p2a, multisig, pubkey, op_return)
+%% return their canonical atom.
+classify_input_template(<<16#a9, 16#14, _:20/binary, 16#87>>) ->
+    scripthash;
+classify_input_template(<<16#76, 16#a9, 16#14, _:20/binary, 16#88, 16#ac>>) ->
+    p2pkh;
+classify_input_template(<<16#00, 16#14, _:20/binary>>) ->
+    p2wpkh;
+classify_input_template(<<16#00, 16#20, _:32/binary>>) ->
+    p2wsh;
+classify_input_template(<<16#51, 16#20, _:32/binary>>) ->
+    p2tr;
+classify_input_template(<<16#51, 16#02, 16#4e, 16#73>>) ->
+    p2a;
+%% v0 program with wrong length: witness-unknown on the input side
+classify_input_template(<<16#00, Len:8, _:Len/binary>>)
+  when Len =/= 20, Len =/= 32, Len >= 2, Len =< 40 ->
+    witness_unknown;
+%% v1 program with wrong length (not 32): witness-unknown
+classify_input_template(<<16#51, Len:8, _:Len/binary>>)
+  when Len =/= 32, Len >= 2, Len =< 40 ->
+    witness_unknown;
+%% Future witness versions (v2..v16, programs 2..40 bytes)
+classify_input_template(<<WitVer:8, Len:8, _:Len/binary>>)
+  when WitVer >= 16#52 andalso WitVer =< 16#60,
+       Len >= 2 andalso Len =< 40 ->
+    witness_unknown;
+%% Bare multisig OP_M <pk1>..<pkN> OP_N OP_CHECKMULTISIG — accept up to 3-of-3
+classify_input_template(<<M, Rest/binary>>) when M >= 16#51, M =< 16#60 ->
+    case classify_multisig_tail(Rest, M - 16#50) of
+        true -> multisig;
+        false -> classify_remainder(<<M, Rest/binary>>)
+    end;
+classify_input_template(Other) ->
+    classify_remainder(Other).
+
+%% Fallback: bare-pubkey (compressed 33-byte or uncompressed 65-byte) OP_CHECKSIG,
+%% OP_RETURN, or nonstandard.
+classify_remainder(<<16#21, _:33/binary, 16#ac>>) -> pubkey;
+classify_remainder(<<16#41, _:65/binary, 16#ac>>) -> pubkey;
+classify_remainder(<<16#6a, _/binary>>)            -> op_return;
+classify_remainder(_)                              -> nonstandard.
+
+%% Crude bare-multisig tail check.  M was already extracted; expect:
+%%   N * 33-byte (or 65-byte) pubkey pushes, OP_N (16#50+N), OP_CHECKMULTISIG (16#ae)
+%% with N >= M and N =< 3.
+classify_multisig_tail(Bin, M) ->
+    classify_multisig_tail(Bin, M, 0).
+
+classify_multisig_tail(<<16#21, _:33/binary, Rest/binary>>, M, Acc) ->
+    classify_multisig_tail(Rest, M, Acc + 1);
+classify_multisig_tail(<<16#41, _:65/binary, Rest/binary>>, M, Acc) ->
+    classify_multisig_tail(Rest, M, Acc + 1);
+classify_multisig_tail(<<N, 16#ae>>, M, Acc)
+  when N >= 16#51, N =< 16#60 ->
+    Nn = N - 16#50,
+    Nn =:= Acc andalso Acc >= M andalso Acc =< 3;
+classify_multisig_tail(_, _, _) ->
+    false.
+
+%% @doc Per-coin + accumulated MoneyRange — Core consensus/tx_verify.cpp:175-200.
+%% Each coin's value must satisfy MoneyRange (0..MAX_MONEY) and the running sum
+%% must not exceed MAX_MONEY.  Without this, inputs summing to >MAX_MONEY can
+%% be passed through if some downstream gate fails to check.
+-spec check_tx_inputs_money_range([#utxo{}], binary()) -> ok | no_return().
+check_tx_inputs_money_range(InputCoins, _Txid) ->
+    lists:foldl(fun(Coin, Acc) ->
+        V = Coin#utxo.value,
+        (V >= 0 andalso V =< ?MAX_MONEY)
+            orelse throw('bad-txns-inputvalues-outofrange'),
+        NewAcc = Acc + V,
+        NewAcc =< ?MAX_MONEY
+            orelse throw('bad-txns-inputvalues-outofrange'),
+        NewAcc
+    end, 0, InputCoins),
+    ok.
+
+%% @doc IsDust — Core policy/policy.cpp:24-43 (single-output variant).
+%% An output is dust if its value is less than the threshold computed from
+%% the scriptPubKey size and the dust_relay_feerate.  OP_RETURN outputs are
+%% NEVER dust (Core: GetDustThreshold returns 0).
+-spec is_dust_output(#tx_out{}) -> boolean().
+is_dust_output(#tx_out{value = V, script_pubkey = <<16#6a, _/binary>>}) ->
+    %% OP_RETURN: never dust regardless of value.
+    _ = V,
+    false;
+is_dust_output(#tx_out{value = V, script_pubkey = SPK}) ->
+    V < dust_threshold(SPK).
+
+%% @doc PreCheckEphemeralTx — Core policy/ephemeral_policy.cpp:23-31.
+%% Reject any tx that has at least one dust output AND a non-zero fee.
+%% Rationale: an ephemeral dust output (e.g. anchor) must rely on a child to
+%% pay for it via CPFP; if the parent itself pays fees, a miner has an
+%% incentive to mine the parent alone, stranding the dust permanently.
+%%
+%% Note: beamchain previously only applied this to P2A outputs.  Core 28+
+%% generalizes it to any IsDust(output) — including v0/v1 witness outputs
+%% with very small value.
+-spec pre_check_ephemeral_tx(#transaction{}, integer() | undefined) ->
+    ok | {error, atom()}.
+pre_check_ephemeral_tx(_Tx, 0) ->
+    %% Fee == 0: dust is permitted (will be enforced by CheckEphemeralSpends in
+    %% the package path).
+    ok;
+pre_check_ephemeral_tx(_Tx, undefined) ->
+    ok;
+pre_check_ephemeral_tx(#transaction{outputs = Outputs}, Fee) when Fee > 0 ->
+    case lists:any(fun(O) -> is_dust_output(O) end, Outputs) of
+        true ->
+            {error, dust};
+        false ->
+            ok
+    end.
+
+%% @doc Consensus-script flags for the second-pass check.
+%% Core's ConsensusScriptChecks computes GetBlockScriptFlags(tip) which returns
+%% the MANDATORY_SCRIPT_VERIFY_FLAGS plus any soft-fork flags currently active.
+%% On a post-Taproot chain (mainnet block 709632, testnet earlier) the active
+%% set is: P2SH | DERSIG | NULLDUMMY | CLTV | CSV | WITNESS | TAPROOT.
+%% (NULLFAIL was made mandatory in 0.18.0; LOW_S is policy-only.)
+-spec consensus_script_flags() -> integer().
+consensus_script_flags() ->
+    ?SCRIPT_VERIFY_P2SH bor
+    ?SCRIPT_VERIFY_DERSIG bor
+    ?SCRIPT_VERIFY_NULLDUMMY bor
+    ?SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY bor
+    ?SCRIPT_VERIFY_CHECKSEQUENCEVERIFY bor
+    ?SCRIPT_VERIFY_WITNESS bor
+    ?SCRIPT_VERIFY_NULLFAIL bor
+    ?SCRIPT_VERIFY_TAPROOT.
+
+%% @doc ConsensusScriptChecks — Core validation.cpp:1158-1189.
+%% Re-runs script verification with current-tip consensus flags AFTER the
+%% policy-flags pass succeeded.  If this fails the standard pass succeeded but
+%% the consensus pass failed, indicating a bug in the script interpreter.
+%% Core logs "BUG! PLEASE REPORT THIS!" and refuses to admit; we do the same.
+-spec consensus_script_checks(#transaction{}, [#utxo{}]) -> ok | no_return().
+consensus_script_checks(Tx, InputCoins) ->
+    Flags = consensus_script_flags(),
+    Inputs = Tx#transaction.inputs,
+    AllPrevOuts = [{C#utxo.value, C#utxo.script_pubkey} || C <- InputCoins],
+    try
+        lists:foldl(fun({Input, Coin}, Idx) ->
+            ScriptSig = Input#tx_in.script_sig,
+            ScriptPubKey = Coin#utxo.script_pubkey,
+            Witness = Input#tx_in.witness,
+            Amount = Coin#utxo.value,
+            SigChecker = {Tx, Idx, Amount, AllPrevOuts},
+            case beamchain_script:verify_script(
+                    ScriptSig, ScriptPubKey, Witness, Flags, SigChecker) of
+                true -> Idx + 1;
+                false ->
+                    %% BUG: PolicyScriptChecks passed (called immediately
+                    %% before) but ConsensusScriptChecks failed.  Bail.
+                    logger:error("BUG! PLEASE REPORT THIS! "
+                                 "ConsensusScriptChecks failed against latest-"
+                                 "block flags but PolicyScriptChecks passed: "
+                                 "txid=~p input=~B",
+                                 [beamchain_serialize:tx_hash(Tx), Idx]),
+                    throw({consensus_script_bug, Idx})
+            end
+        end, 0, lists:zip(Inputs, InputCoins)),
+        ok
+    catch
+        throw:{consensus_script_bug, _} = E ->
+            throw(E)
+    end.
+
+%% @doc 'txn-already-known' detection — Core validation.cpp:858-864.
+%% When all this tx's inputs are missing from the UTXO set + mempool, the
+%% normal interpretation is "orphan, wait for parents".  But if ANY of this
+%% tx's outputs is already in the UTXO cache, the tx (or a same-txid tx) has
+%% already been mined.  In that case it's NOT an orphan — it's a confirmed
+%% replay and we return TX_CONFLICT, not TX_MISSING_INPUTS, so we don't waste
+%% orphan-pool slots on replays.
+-spec check_tx_already_known(#transaction{}) -> already_known | not_known.
+check_tx_already_known(#transaction{outputs = Outputs} = Tx) ->
+    Txid = beamchain_serialize:tx_hash(Tx),
+    NumOutputs = length(Outputs),
+    Indexes = lists:seq(0, max(0, NumOutputs - 1)),
+    case lists:any(fun(I) ->
+            case beamchain_chainstate:get_utxo(Txid, I) of
+                {ok, _} -> true;
+                not_found -> false
+            end
+        end, Indexes) of
+        true -> already_known;
+        false -> not_known
+    end.
+
+%% @doc Look up a mempool entry by wtxid (witness hash).
+%% Beamchain stores entries keyed by txid in ?MEMPOOL_TXS but also stamps each
+%% entry with its wtxid.  Core has two separate indices (mapTx + mapTxByWtxid);
+%% we emulate the wtxid index with a linear scan.  Mempool sizes are bounded
+%% so the cost is acceptable; if it becomes a hotspot a secondary ets index
+%% on wtxid → txid would be the right fix.
+lookup_entry_by_wtxid(Wtxid) ->
+    case ets:match_object(?MEMPOOL_TXS,
+                          {'_', #mempool_entry{wtxid = Wtxid, _ = '_'}}) of
+        [{_, Entry}] -> {ok, Entry};
+        []           -> not_found;
+        _Many        -> not_found  %% defensive; wtxid must be unique
+    end.
 
 %%% ===================================================================
 %%% Internal: helpers

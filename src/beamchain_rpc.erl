@@ -2603,11 +2603,39 @@ relay_transaction(Txid) ->
 %% Format mempool rejection errors with appropriate RPC error codes.
 format_mempool_error(orphan, _Txid) ->
     {error, ?RPC_VERIFY_ERROR, <<"Missing inputs">>};
+format_mempool_error('bad-txns-inputs-missingorspent', _Txid) ->
+    {error, ?RPC_VERIFY_ERROR, <<"Missing inputs">>};
 format_mempool_error(already_in_mempool, _Txid) ->
     {error, ?RPC_VERIFY_ALREADY_IN_CHAIN, <<"Transaction already in mempool">>};
+format_mempool_error('txn-already-in-mempool', _Txid) ->
+    {error, ?RPC_VERIFY_ALREADY_IN_CHAIN, <<"Transaction already in mempool">>};
+format_mempool_error('txn-same-nonwitness-data-in-mempool', _Txid) ->
+    {error, ?RPC_VERIFY_ALREADY_IN_CHAIN, <<"txn-same-nonwitness-data-in-mempool">>};
+format_mempool_error('txn-already-known', _Txid) ->
+    {error, ?RPC_VERIFY_ALREADY_IN_CHAIN, <<"Transaction already known">>};
+format_mempool_error('bad-txns-coinbase', _Txid) ->
+    {error, ?RPC_VERIFY_REJECTED, <<"coinbase">>};
+format_mempool_error('bad-witness-nonstandard', _Txid) ->
+    {error, ?RPC_VERIFY_REJECTED, <<"bad-witness-nonstandard">>};
+format_mempool_error('bad-txns-nonstandard-inputs', _Txid) ->
+    {error, ?RPC_VERIFY_REJECTED, <<"bad-txns-nonstandard-inputs">>};
+format_mempool_error({'bad-txns-nonstandard-inputs', _}, _Txid) ->
+    {error, ?RPC_VERIFY_REJECTED, <<"bad-txns-nonstandard-inputs">>};
+format_mempool_error({'bad-txns-too-many-sigops', _N}, _Txid) ->
+    {error, ?RPC_VERIFY_REJECTED, <<"bad-txns-too-many-sigops">>};
+format_mempool_error('bad-txns-in-belowout', _Txid) ->
+    {error, ?RPC_VERIFY_REJECTED, <<"bad-txns-in-belowout">>};
+format_mempool_error('bad-txns-fee-outofrange', _Txid) ->
+    {error, ?RPC_VERIFY_REJECTED, <<"bad-txns-fee-outofrange">>};
+format_mempool_error('bad-txns-inputvalues-outofrange', _Txid) ->
+    {error, ?RPC_VERIFY_REJECTED, <<"bad-txns-inputvalues-outofrange">>};
+format_mempool_error('too-long-mempool-chain', _Txid) ->
+    {error, ?RPC_VERIFY_REJECTED, <<"too-long-mempool-chain">>};
 format_mempool_error(insufficient_fee, _Txid) ->
     {error, ?RPC_VERIFY_REJECTED, <<"Insufficient fee">>};
 format_mempool_error(mempool_min_fee_not_met, _Txid) ->
+    {error, ?RPC_VERIFY_REJECTED, <<"mempool min fee not met">>};
+format_mempool_error('mempool min fee not met', _Txid) ->
     {error, ?RPC_VERIFY_REJECTED, <<"mempool min fee not met">>};
 format_mempool_error(dust, _Txid) ->
     {error, ?RPC_VERIFY_REJECTED, <<"dust">>};
