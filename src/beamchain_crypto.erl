@@ -170,10 +170,15 @@ batch_schnorr_verify_nif(_Items) ->
 -spec ecdsa_verify(Msg :: binary(), Sig :: binary(),
                    PubKey :: binary()) -> boolean().
 ecdsa_verify(Msg, Sig, PubKey) when byte_size(Msg) =:= 32 ->
-    case ecdsa_verify_nif(Msg, Sig, PubKey) of
+    %% W95: catch nif_not_loaded for parity with schnorr_verify; a
+    %% missing NIF must not crash the script evaluator. Returning
+    %% false means "signature does not verify" — the safe default.
+    try ecdsa_verify_nif(Msg, Sig, PubKey) of
         true  -> true;
         false -> false;
         {error, _} -> false
+    catch
+        error:nif_not_loaded -> false
     end.
 
 %% @doc ECDSA verify with lax DER parsing.
@@ -199,10 +204,17 @@ ecdsa_verify_lax(Msg, Sig, PubKey) when byte_size(Msg) =:= 32 ->
 schnorr_verify(Msg, Sig, PubKey) when byte_size(Msg) =:= 32,
                                        byte_size(Sig) =:= 64,
                                        byte_size(PubKey) =:= 32 ->
-    case schnorr_verify_nif(Msg, Sig, PubKey) of
+    %% W95: catch nif_not_loaded so a missing/broken NIF degrades to
+    %% "signature does not verify" instead of crashing the calling
+    %% script evaluator. Bitcoin consensus never relies on Erlang-side
+    %% Schnorr verification, so the fallback is "always reject" — the
+    %% same semantics ecdsa_verify uses on NIF failure.
+    try schnorr_verify_nif(Msg, Sig, PubKey) of
         true  -> true;
         false -> false;
         {error, _} -> false
+    catch
+        error:nif_not_loaded -> false
     end.
 
 %%% -------------------------------------------------------------------
