@@ -219,15 +219,21 @@ route_message(Peer, inv, Payload, State) ->
                     State;
                 _ ->
                     %% Directly request the announced blocks via getdata
-                    %% so we don't depend on a getheaders round-trip
+                    %% so we don't depend on a getheaders round-trip.
+                    %% Core protocol.h:482 — MAX_GETDATA_SZ=1000: an outgoing
+                    %% getdata must not exceed 1000 items; chunk larger requests.
                     GetDataItems = [#{type => ?MSG_WITNESS_BLOCK,
                                       hash => Hash}
                                     || #{hash := Hash} <- BlockItems],
-                    beamchain_peer:send_message(Peer,
-                        {getdata, #{items => GetDataItems}}),
+                    Chunks = beamchain_peer_manager:chunk_inv_items(
+                                 GetDataItems, ?MAX_GETDATA_SZ),
+                    lists:foreach(fun(Chunk) ->
+                        beamchain_peer:send_message(Peer,
+                            {getdata, #{items => Chunk}})
+                    end, Chunks),
                     logger:info("sync: received block inv from ~p, "
-                                "requesting ~B blocks via getdata",
-                                [Peer, length(GetDataItems)]),
+                                "requesting ~B blocks via getdata (~B msg(s))",
+                                [Peer, length(GetDataItems), length(Chunks)]),
                     %% Also kick off header sync if we think we're done,
                     %% so the header chain catches up too
                     case State#state.phase =:= complete of

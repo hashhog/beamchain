@@ -65,6 +65,10 @@
 -define(MAX_PROTOCOL_MESSAGE_LENGTH, 4000000).
 -define(MAX_HEADERS_RESULTS, 2000).
 -define(MAX_INV_SIZE, 50000).
+%% Core protocol.h:482 — MAX_GETDATA_SZ = 1000.  An outgoing getdata must not
+%% exceed this count; split larger requests into multiple messages.
+%% (Distinct from MAX_INV_SIZE=50000 which governs inbound inv messages.)
+-define(MAX_GETDATA_SZ, 1000).
 -define(MAX_LOCATOR_SZ, 101).
 -define(MAX_ADDR_TO_SEND, 1000).
 -define(MAX_SUBVERSION_LENGTH, 256).
