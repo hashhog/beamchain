@@ -580,12 +580,30 @@ special_script_payload_size(5) -> 32.
 %%% Internal: Compact size encoding/decoding (Bitcoin's WriteCompactSize)
 %%% ===================================================================
 
+%% MAX_SIZE mirrors bitcoin-core/src/serialize.h line 34:
+%%   MAX_SIZE = 0x02000000 (= 33,554,432 bytes)
+%% ReadCompactSize throws "ReadCompactSize(): size too large" when the
+%% decoded value exceeds MAX_SIZE (range_check=true, the default).
+-define(MAX_COMPACT_SIZE, 16#02000000).
+
 decode_compact_size(<<N:8, Rest/binary>>) when N < 253 ->
     {ok, N, Rest};
+decode_compact_size(<<253, N:16/little, _Rest/binary>>) when N < 253 ->
+    {error, non_canonical_compact_size};
+decode_compact_size(<<253, N:16/little, _Rest/binary>>) when N > ?MAX_COMPACT_SIZE ->
+    {error, oversized_compact_size};
 decode_compact_size(<<253, N:16/little, Rest/binary>>) ->
     {ok, N, Rest};
+decode_compact_size(<<254, N:32/little, _Rest/binary>>) when N < 16#10000 ->
+    {error, non_canonical_compact_size};
+decode_compact_size(<<254, N:32/little, _Rest/binary>>) when N > ?MAX_COMPACT_SIZE ->
+    {error, oversized_compact_size};
 decode_compact_size(<<254, N:32/little, Rest/binary>>) ->
     {ok, N, Rest};
+decode_compact_size(<<255, N:64/little, _Rest/binary>>) when N < 16#100000000 ->
+    {error, non_canonical_compact_size};
+decode_compact_size(<<255, N:64/little, _Rest/binary>>) when N > ?MAX_COMPACT_SIZE ->
+    {error, oversized_compact_size};
 decode_compact_size(<<255, N:64/little, Rest/binary>>) ->
     {ok, N, Rest};
 decode_compact_size(_) ->

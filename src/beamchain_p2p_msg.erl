@@ -662,13 +662,20 @@ decode_inv_items(N, Bin, Acc) ->
 %% allocating, so an adversarial peer can't trigger multi-GB allocation by
 %% sending a ~5-byte payload with varint count = 0xFEFFFFFFFF.  Mirrors
 %% Bitcoin Core net_processing.cpp:4042 / :4133 (rejects + Misbehaving).
+%% Note: decode_varint itself rejects values > MAX_COMPACT_SIZE
+%% (0x02000000); adversarial counts beyond that threshold are already
+%% blocked before this function's MAX_INV_SIZE check fires.
 decode_inv_payload(MsgKind, Bin) ->
-    {Count, Rest} = beamchain_serialize:decode_varint(Bin),
-    case Count > ?MAX_INV_SIZE of
-        true ->
-            {error, {oversized, MsgKind, Count, ?MAX_INV_SIZE}};
-        false ->
-            {ok, #{items => decode_inv_items(Count, Rest, [])}}
+    case beamchain_serialize:decode_varint(Bin) of
+        {error, Reason} ->
+            {error, {bad_compact_size, MsgKind, Reason}};
+        {Count, Rest} ->
+            case Count > ?MAX_INV_SIZE of
+                true ->
+                    {error, {oversized, MsgKind, Count, ?MAX_INV_SIZE}};
+                false ->
+                    {ok, #{items => decode_inv_items(Count, Rest, [])}}
+            end
     end.
 
 %%% ===================================================================
@@ -881,9 +888,11 @@ encode_addrv2_address(#{address := Addr}) when byte_size(Addr) =:= 32 ->
     {?BIP155_TORV3, Addr}.
 
 %% @doc Decode an ADDRv2 address entry.
+%% The services field uses range_check=false (BIP-155 / bitcoin-core
+%% src/net_processing.cpp DeserializeAddr: ReadCompactSize(is, false)).
 -spec decode_addrv2_entry(binary()) -> {map(), binary()}.
 decode_addrv2_entry(<<T:32/little, Rest/binary>>) ->
-    {Svc, Rest2} = beamchain_serialize:decode_varint(Rest),
+    {Svc, Rest2} = beamchain_serialize:decode_varint_no_range(Rest),
     <<NetId:8, Rest3/binary>> = Rest2,
     {AddrLen, Rest4} = beamchain_serialize:decode_varint(Rest3),
     <<AddrBytes:AddrLen/binary, Port:16/big, Rest5/binary>> = Rest4,
