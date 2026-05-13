@@ -20,6 +20,7 @@
 -export([submit_block/1]).
 -export([generate_blocks/3, generate_block_with_txs/3]).
 -export([encode_coinbase_height/1]).
+-export([build_gbt_rules_and_vbavailable/2]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -265,12 +266,48 @@ do_create_template(CoinbaseScriptPubKey, _Opts,
             Target = beamchain_pow:bits_to_target(Bits),
             TxEntries = format_tx_entries(SelectedEntries),
 
-            Template = #{
+            %% BUG-3 FIX: BIP-22/23/141 required response fields.
+            %% Core: rpc/mining.cpp ~line 895-1031.
+            %%
+            %% capabilities: BIP-23 §3 requires "proposal" in every GBT response.
+            Capabilities = [<<"proposal">>],
+
+            %% rules + vbavailable: compute from deployment states.
+            %% Core: rpc/mining.cpp ~line 950-991.
+            {Rules, VbAvailable} = build_gbt_rules_and_vbavailable(
+                Network, TipHeight),
+
+            %% vbrequired: bitmask of version bits the server requires.
+            %% Core always emits 0 for standard templates.
+            VbRequired = 0,
+
+            %% longpollid: tip hash hex + mempool tx count.
+            %% Core: tip.GetHex() ++ ToString(nTransactionsUpdatedLast).
+            %% We use the current mempool size as a proxy for "transactions
+            %% updated" — it changes whenever a tx is added/removed,
+            %% which satisfies the BIP-22 long-poll invalidation contract.
+            MempoolInfo = beamchain_mempool:get_info(),
+            MempoolCount = maps:get(size, MempoolInfo, 0),
+            LongPollId = <<(hash_to_hex(TipHash))/binary,
+                           (integer_to_binary(MempoolCount))/binary>>,
+
+            %% default_witness_commitment: hex of the OP_RETURN commitment
+            %% script when the block contains witness transactions.
+            %% Core: rpc/mining.cpp ~line 1028-1031.
+            %% We already built CoinbaseTx which contains the commitment
+            %% output at index 1 (when HasWitnessTx).  Extract its scriptPubKey
+            %% as the hex string for the "default_witness_commitment" field.
+            TemplateBase = #{
+                <<"capabilities">> => Capabilities,
                 <<"version">> => Version,
+                <<"rules">> => Rules,
+                <<"vbavailable">> => VbAvailable,
+                <<"vbrequired">> => VbRequired,
                 <<"previousblockhash">> => hash_to_hex(TipHash),
                 <<"transactions">> => TxEntries,
                 <<"coinbaseaux">> => #{<<"flags">> => <<>>},
                 <<"coinbasevalue">> => CoinbaseValue,
+                <<"longpollid">> => LongPollId,
                 <<"target">> => target_to_hex(Target),
                 <<"mintime">> => MTP + 1,
                 <<"mutable">> => [<<"time">>, <<"transactions">>,
@@ -289,6 +326,23 @@ do_create_template(CoinbaseScriptPubKey, _Opts,
                 <<"_total_weight">> => TotalWeight,
                 <<"_total_sigops">> => TotalSigops
             },
+            Template = case HasWitnessTx of
+                true ->
+                    %% Extract the witness commitment script from coinbase output[1]
+                    CommitOutputs = CoinbaseTx#transaction.outputs,
+                    CommitScript = case CommitOutputs of
+                        [_, #tx_out{script_pubkey = S} | _] -> S;
+                        _ -> undefined
+                    end,
+                    case CommitScript of
+                        undefined -> TemplateBase;
+                        CS -> maps:put(<<"default_witness_commitment">>,
+                                       beamchain_serialize:hex_encode(CS),
+                                       TemplateBase)
+                    end;
+                false ->
+                    TemplateBase
+            end,
 
             State2 = State#state{template = Template, tip_hash = TipHash},
             {ok, Template, State2};
@@ -302,6 +356,63 @@ get_prev_index(TipHeight) ->
         {ok, PI} -> PI;
         not_found -> error({missing_block_index, TipHeight})
     end.
+
+%% BUG-3 FIX: build_gbt_rules_and_vbavailable/2
+%%
+%% Returns {Rules, VbAvailable} for the GBT response.
+%%
+%% Rules (BIP-22/23/9): list of strings naming active/mandatory softforks.
+%%   "csv"     — CSV is always active on all networks (no ! prefix = optional).
+%%   "!segwit" — SegWit changes block structure → required flag (!).
+%%   "taproot" — Taproot (no ! per Core default).
+%% Only deployments in 'active' state are listed in "rules"; deployments in
+%% 'started' or 'locked_in' state go into "vbavailable" instead.
+%%
+%% VbAvailable (BIP-9): JSON object {deployment_name: bit_number} for
+%% deployments in STARTED or LOCKED_IN state.  Miners use this to signal.
+%%
+%% Core reference: rpc/mining.cpp ~line 950-991.
+-spec build_gbt_rules_and_vbavailable(atom(), non_neg_integer()) ->
+    {[binary()], map()}.
+build_gbt_rules_and_vbavailable(Network, TipHeight) ->
+    HeightGetter = fun(H) -> beamchain_db:get_block_index(H) end,
+    Deployments = beamchain_versionbits:deployment_maps(Network),
+
+    %% "csv" is always listed in rules once active (Core hardcodes it).
+    %% We build rules dynamically for all deployments to handle any network.
+    lists:foldl(fun(Dep, {Rules, VbAvail}) ->
+        NameAtom = maps:get(name_atom, Dep),
+        NameBin  = maps:get(name, Dep),        %% binary, e.g. <<"segwit">>
+        Bit      = maps:get(bit, Dep),
+
+        State = beamchain_versionbits:get_deployment_state_at_height(
+            Network, NameAtom, TipHeight, HeightGetter),
+
+        case State of
+            active ->
+                %% Active: add to rules with ! prefix for structure-changing
+                %% deployments.  Core uses ! for segwit; csv and taproot are
+                %% listed without ! per Core src/rpc/mining.cpp.
+                RuleName = case NameAtom of
+                    segwit -> <<"!segwit">>;
+                    _      -> NameBin
+                end,
+                {[RuleName | Rules], VbAvail};
+            locked_in ->
+                %% Locked-in: add to vbavailable so miners can signal.
+                RuleKey = case NameAtom of
+                    segwit -> <<"!segwit">>;
+                    _      -> NameBin
+                end,
+                {Rules, maps:put(RuleKey, Bit, VbAvail)};
+            started ->
+                %% Started: add to vbavailable.
+                {Rules, maps:put(NameBin, Bit, VbAvail)};
+            _ ->
+                %% defined / failed: not reported.
+                {Rules, VbAvail}
+        end
+    end, {[], #{}}, Deployments).
 
 %% BUG8 FIX: compute_minimum_time/3 — equivalent of Core's GetMinimumTime().
 %%
