@@ -423,20 +423,21 @@ bug9_no_recent_rejects_bloom_filter_test() ->
     ?assertEqual(false, erlang:function_exported(beamchain_mempool, is_recently_rejected, 1)).
 
 %%% ===================================================================
-%%% BUG-10: Orphan pool not cleaned on block connect (no EraseForBlock)
+%%% BUG-10: Orphan pool not cleaned on block connect (no EraseForBlock) — FIXED
 %%% ===================================================================
 
 %% Core: ConnectTip → removeForBlock also calls EraseForBlock on orphanage.
-%% beamchain do_remove_for_block/2 does not clean the orphan ETS tables.
+%% Fix: erase_orphans_for_block/1 now exported and called from do_remove_for_block/2.
+%%   (a) Orphans whose inputs double-spend confirmed outpoints are removed.
+%%   (b) Orphans whose parents are now confirmed are re-promoted via reprocess_orphans/1.
+%% Core ref: net_processing.cpp:2089 + TxOrphanage::EraseForBlock
 bug10_orphan_not_cleaned_on_block_connect_test() ->
-    %% do_remove_for_block/2 is internal — check exported API
+    %% remove_for_block/1 must still be exported
     {module, _} = code:ensure_loaded(beamchain_mempool),
     ?assertEqual(true, erlang:function_exported(beamchain_mempool, remove_for_block, 1)),
-    %% BUG: remove_for_block does NOT iterate ?MEMPOOL_ORPHANS to remove
-    %% orphans whose inputs are now confirmed.  Verified by reading
-    %% do_remove_for_block/2 which only operates on ?MEMPOOL_TXS.
-    %% No erase_orphans_for_block function exists:
-    ?assertEqual(false, erlang:function_exported(beamchain_mempool, erase_orphans_for_block, 1)),
+    %% FIX: erase_orphans_for_block/1 must now be exported and is called from
+    %% do_remove_for_block/2 on every ConnectTip.
+    ?assertEqual(true, erlang:function_exported(beamchain_mempool, erase_orphans_for_block, 1)),
     ok.
 
 %%% ===================================================================
@@ -468,14 +469,20 @@ get_max_orphan_txs() ->
     100.
 
 %%% ===================================================================
-%%% BUG-13: No per-peer orphan cleanup on peer disconnect (no EraseForPeer)
+%%% BUG-13: No per-peer orphan cleanup on peer disconnect (no EraseForPeer) — FIXED
 %%% ===================================================================
 
 %% Core: TxOrphanage::EraseForPeer removes all orphans announced only by
-%% the disconnecting peer.  beamchain does nothing with orphans on disconnect.
+%% the disconnecting peer.
+%% Fix: erase_orphans_for_peer/1 is now exported and called from
+%% beamchain_peer_manager handle_info/{peer_disconnected,...} on every disconnect.
+%% NOTE: full per-peer attribution requires BUG-14 schema fix (PeerId field in
+%% orphan records).  The hook is wired; the orphan schema upgrade is a follow-up.
+%% Core ref: TxOrphanage::EraseForPeer + net_processing.cpp peer disconnect path.
 bug13_orphan_not_cleaned_on_peer_disconnect_test() ->
-    %% Check that no orphan-cleanup API is called on disconnect
-    ?assertEqual(false, erlang:function_exported(beamchain_mempool, erase_orphans_for_peer, 1)),
+    %% FIX: erase_orphans_for_peer/1 must now be exported and is called on disconnect.
+    ?assertEqual(true, erlang:function_exported(beamchain_mempool, erase_orphans_for_peer, 1)),
+    %% remove_orphans_for_peer/1 is not the chosen name — erase_orphans_for_peer is canonical.
     ?assertEqual(false, erlang:function_exported(beamchain_mempool, remove_orphans_for_peer, 1)).
 
 %%% ===================================================================
