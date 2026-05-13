@@ -385,12 +385,16 @@ bug2_no_script_execution_cache() ->
     ?assert(lists:member(beamchain_sig_cache_tab, AllTables)).
 
 %%% ===================================================================
-%%% BUG-3 (G3): Sig-cache key has no nonce
+%%% BUG-3 (G3): Sig-cache key has no nonce — FIXED
 %%%
-%%% make_key/3 = SHA256(sighash || pubkey || sig).
-%%% Core: key = SHA256(nonce || 'E'/'S' || 31-zero-bytes || sighash || pubkey || sig)
-%%% where nonce is a 32-byte random value generated at startup.
-%%% A deterministic key allows pre-computation of cache entries.
+%%% FIX: make_key/4 = SHA256(Nonce || sighash || pubkey || sig)
+%%% where Nonce is a 32-byte random value generated at startup and
+%%% published via persistent_term.  This matches Bitcoin Core:
+%%%   sigcache.h:42-44 — CSHA256 m_salted_hasher seeded with GetRandHash()
+%%%
+%%% An adversary who knows sighash/pubkey/sig cannot predict the ETS key
+%%% without knowing the nonce, preventing false-positive cache
+%%% pre-population across restarts.
 %%% ===================================================================
 
 bug3_sig_cache_key_no_nonce() ->
@@ -400,17 +404,24 @@ bug3_sig_cache_key_no_nonce() ->
     %% Insert the entry (async cast — wait for gen_server to process it)
     beamchain_sig_cache:insert(SigHash, PubKey, Sig),
     timer:sleep(20),
-    %% The key in the ETS table is beamchain_crypto:sha256(SigHash||PubKey||Sig)
-    %% — fully deterministic, no nonce.
-    ExpectedKey = beamchain_crypto:sha256(
+    %% FIX: The old deterministic key (no nonce) must NOT be in the table.
+    OldDeterministicKey = beamchain_crypto:sha256(
         <<SigHash/binary, PubKey/binary, Sig/binary>>),
-    %% Confirm the deterministic key is exactly what is stored.
-    ?assert(ets:member(beamchain_sig_cache_tab, ExpectedKey)),
-    %% If there were a nonce the key would NOT match this deterministic value
-    %% (it would depend on random state seeded at gen_server start).
-    %% BUG: the key is the same on every restart for the same inputs.
-    beamchain_sig_cache:insert(SigHash, PubKey, Sig), % idempotent
-    ?assert(ets:member(beamchain_sig_cache_tab, ExpectedKey)).
+    ?assertNot(ets:member(beamchain_sig_cache_tab, OldDeterministicKey)),
+    %% FIX: The nonce is stored in persistent_term at gen_server startup.
+    Nonce = persistent_term:get(beamchain_sig_cache_nonce),
+    ?assert(is_binary(Nonce)),
+    ?assertEqual(32, byte_size(Nonce)),
+    %% FIX: The actual key in ETS includes the nonce.
+    NonceKey = beamchain_crypto:sha256(
+        <<Nonce/binary, SigHash/binary, PubKey/binary, Sig/binary>>),
+    ?assert(ets:member(beamchain_sig_cache_tab, NonceKey)),
+    %% FIX: lookup/3 also uses the nonce — must return true for a hit.
+    ?assert(beamchain_sig_cache:lookup(SigHash, PubKey, Sig)),
+    %% FIX: nonce differs across gen_server restarts — confirm the nonce
+    %% is non-zero (a zero nonce would be astronomically unlikely but
+    %% is also the only "same as no-nonce" degenerate case).
+    ?assertNotEqual(<<0:256>>, Nonce).
 
 %%% ===================================================================
 %%% BUG-4 (G4): collect_script_results FIFO ordering — no early abort
@@ -869,7 +880,9 @@ g26_schnorr_cache_key_sig_length() ->
     P32 = crypto:strong_rand_bytes(32),
     beamchain_sig_cache:insert(H32, P32, S64),
     timer:sleep(5),
-    Key = beamchain_crypto:sha256(<<H32/binary, P32/binary, S64/binary>>),
+    %% Key now includes the startup nonce: SHA256(Nonce||H32||P32||S64).
+    Nonce = persistent_term:get(beamchain_sig_cache_nonce),
+    Key = beamchain_crypto:sha256(<<Nonce/binary, H32/binary, P32/binary, S64/binary>>),
     ?assert(ets:member(beamchain_sig_cache_tab, Key)).
 
 %%% ===================================================================
