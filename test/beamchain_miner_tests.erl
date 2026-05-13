@@ -82,15 +82,19 @@ bip34_height_encoding_test() ->
     ?assertEqual(<<1, 1>>, encode_coinbase_height(1)),
     ?assertEqual(<<1, 16>>, encode_coinbase_height(16)),
 
-    %% Heights 17-255 are encoded as: 0x01 HEIGHT (single byte)
+    %% Heights 17-127: single byte, high bit clear — no sign-byte padding needed.
     ?assertEqual(<<1, 17>>, encode_coinbase_height(17)),
     ?assertEqual(<<1, 127>>, encode_coinbase_height(127)),
-    ?assertEqual(<<1, 128>>, encode_coinbase_height(128)),
-    ?assertEqual(<<1, 255>>, encode_coinbase_height(255)),
+    %% Heights 128-255: high bit set — CScriptNum requires 0x00 sign-byte padding.
+    %% Core: script.h CScriptNum::serialize appends 0x00 when vch.back() & 0x80.
+    ?assertEqual(<<2, 128, 0>>, encode_coinbase_height(128)),
+    ?assertEqual(<<2, 255, 0>>, encode_coinbase_height(255)),
 
-    %% Heights 256-65535 need 2 bytes
+    %% Heights 256-32767: 2 LE bytes, last byte bit 7 clear — no sign padding.
     ?assertEqual(<<2, 0, 1>>, encode_coinbase_height(256)),
-    ?assertEqual(<<2, 255, 255>>, encode_coinbase_height(65535)),
+    %% Height 32768-65535: last LE byte has bit 7 set → 0x00 sign byte appended.
+    %% 65535 = 0xFFFF: LE <<0xFF, 0xFF>>; last byte 0xFF → <<3, 0xFF, 0xFF, 0x00>>.
+    ?assertEqual(<<3, 255, 255, 0>>, encode_coinbase_height(65535)),
 
     %% Heights 65536+ need 3 bytes
     ?assertEqual(<<3, 0, 0, 1>>, encode_coinbase_height(65536)).
@@ -399,7 +403,12 @@ encode_coinbase_height(Height) ->
     <<Len:8, Bytes/binary>>.
 
 le_minimal(N) ->
-    le_minimal_acc(N, <<>>).
+    Bytes = le_minimal_acc(N, <<>>),
+    LastByte = binary:last(Bytes),
+    case LastByte band 16#80 of
+        0 -> Bytes;
+        _ -> <<Bytes/binary, 0>>
+    end.
 
 le_minimal_acc(0, Acc) -> Acc;
 le_minimal_acc(N, Acc) ->
