@@ -696,4 +696,44 @@ msg_wtx_bip339_value_test() ->
 max_inv_size_test() ->
     ?assertEqual(50000, ?MAX_INV_SIZE).
 
+%%% ===================================================================
+%%% G5 (W103): Outgoing getdata capped at MAX_GETDATA_SZ=1000 — FIXED
+%%% ===================================================================
+
+%% Core protocol.h:482 — MAX_GETDATA_SZ=1000.
+%% Previously beamchain_sync route_message/inv sent ALL filtered block items in
+%% a single getdata regardless of count.  A peer advertising 50000 block inv
+%% items could force beamchain to emit a 50000-item getdata, which Core (and
+%% any protocol-conforming peer) treats as a protocol violation.
+%% Fix: beamchain_sync now uses chunk_inv_items(?MAX_GETDATA_SZ) so each
+%% outgoing getdata carries at most 1000 items.
+g5_outgoing_getdata_capped_at_max_getdata_sz_test() ->
+    %% 1. The macro must be defined with the correct Core value.
+    ?assertEqual(1000, ?MAX_GETDATA_SZ),
+    %% 2. MAX_GETDATA_SZ is strictly less than MAX_INV_SIZE (an inbound inv
+    %%    with 50000 items must produce many small getdata messages, not one).
+    ?assert(?MAX_GETDATA_SZ < ?MAX_INV_SIZE),
+    %% 3. Chunking 1001 items at MAX_GETDATA_SZ yields 2 batches.
+    Items1001 = [#{type => ?MSG_WITNESS_BLOCK,
+                   hash => crypto:strong_rand_bytes(32)}
+                 || _ <- lists:seq(1, 1001)],
+    Chunks = beamchain_peer_manager:chunk_inv_items(Items1001, ?MAX_GETDATA_SZ),
+    ?assertEqual(2, length(Chunks)),
+    [First | [Second]] = Chunks,
+    ?assertEqual(1000, length(First)),
+    ?assertEqual(1,    length(Second)),
+    %% 4. Chunking exactly 1000 items yields exactly 1 batch.
+    Items1000 = [#{type => ?MSG_WITNESS_BLOCK,
+                   hash => crypto:strong_rand_bytes(32)}
+                 || _ <- lists:seq(1, 1000)],
+    [SingleChunk] = beamchain_peer_manager:chunk_inv_items(Items1000, ?MAX_GETDATA_SZ),
+    ?assertEqual(1000, length(SingleChunk)),
+    %% 5. Chunking 50000 items (full-size inv) yields 50 batches of 1000.
+    Items50000 = [#{type => ?MSG_WITNESS_BLOCK,
+                    hash => crypto:strong_rand_bytes(32)}
+                  || _ <- lists:seq(1, 50000)],
+    BigChunks = beamchain_peer_manager:chunk_inv_items(Items50000, ?MAX_GETDATA_SZ),
+    ?assertEqual(50, length(BigChunks)),
+    lists:foreach(fun(C) -> ?assertEqual(1000, length(C)) end, BigChunks).
+
 -endif.
