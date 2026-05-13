@@ -870,9 +870,13 @@ inv_oversized_rejected_test() ->
                  beamchain_p2p_msg:decode_payload(inv, Bin)).
 
 inv_attack_count_rejected_test() ->
-    %% Worst case: 1.0e9 items advertised in 5 wire bytes. Cap must fire.
+    %% 1.0e9 > MAX_COMPACT_SIZE (0x02000000 = 33,554,432): decode_varint now
+    %% rejects the count before the MAX_INV_SIZE check fires.  The inv handler
+    %% propagates the parse error via {error, {bad_compact_size, inv, _}}.
+    %% Any count > MAX_COMPACT_SIZE encoded in 5 wire bytes is now rejected
+    %% at the CompactSize layer, not the inv-size layer.
     Bin = oversized_count_payload(1_000_000_000),
-    ?assertMatch({error, {oversized, inv, 1_000_000_000, ?MAX_INV_SIZE}},
+    ?assertMatch({error, {bad_compact_size, inv, oversized_compact_size}},
                  beamchain_p2p_msg:decode_payload(inv, Bin)).
 
 getdata_oversized_rejected_test() ->
