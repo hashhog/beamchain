@@ -629,6 +629,12 @@ handle_info({peer_disconnected, Pid, Reason}, State) ->
     logger:debug("peer manager: ~p disconnected: ~p",
                  [Pid, Reason]),
     beamchain_sync:notify_peer_disconnected(Pid),
+    %% W103 BUG-13 fix: clean orphans announced by this peer.
+    %% Mirrors Bitcoin Core TxOrphanage::EraseForPeer(nodeid) on disconnect.
+    %% NOTE: full per-peer orphan pruning requires BUG-14 schema fix (PeerId
+    %% field in orphan records); erase_orphans_for_peer/1 is a no-op stub
+    %% until that is done.
+    beamchain_mempool:erase_orphans_for_peer(Pid),
     State2 = remove_peer_and_update(Pid, State),
     {noreply, State2};
 
