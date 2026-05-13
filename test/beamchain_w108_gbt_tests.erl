@@ -358,52 +358,45 @@ gbt_estimate_sigops_excludes_witness_script_test() ->
     ?assert(ScaledWitnessSigops > 0).
 
 %%%===================================================================
-%%% BUG-6: encode_coinbase_height sign-bit bug for heights 128-255
+%%% BUG-6 (FIXED): encode_coinbase_height sign-bit padding for heights 128-255
 %%%===================================================================
 
 %% Bitcoin CScriptNum uses minimal little-endian encoding with a sign bit.
-%% For values 128..255 the byte has its high bit (0x80) set, so Bitcoin
-%% appends 0x00 as a sign byte: <<2, Value, 0x00>>.
-%% beamchain's encode_coinbase_height emits <<1, Height>> for ALL heights
-%% in the 1..255 range (via the le_minimal path), but for 128..255 this
-%% is a negative scriptnum (sign bit set in last byte → negative).
-gbt_coinbase_height_128_sign_bit_bug_test() ->
-    %% Height 128: correct BIP34 encoding is <<2, 0x80, 0x00>> (2-byte minimal).
-    CorrectEncoding128 = <<2, 128, 0>>,
-    %% beamchain emits <<1, 128>> (one byte 0x80 = sign bit set = negative -0).
-    %% Demonstrate they differ by checking sizes:
-    ?assertEqual(3, byte_size(CorrectEncoding128)),  %% correct: len_prefix + 2 bytes
-    %% Verify the bug: le_minimal(128) = <<128>> (1 byte, but sign bit set).
-    ?assertEqual(<<128>>, le_minimal_for_test(128)),
-    ?assertEqual(1, byte_size(le_minimal_for_test(128))),
-    %% Encoding the bug produces <<1, 128>> = 2 bytes, not 3.
-    BuggyLen = 1 + 1,   %% len_prefix (1) + le_minimal(128) (1 byte)
-    CorrectLen = byte_size(CorrectEncoding128),
-    ?assertNot(CorrectLen =:= BuggyLen).
+%% For values 128..255 the high bit (0x80) of the single byte is set, so
+%% Bitcoin appends a 0x00 sign byte: <<2, Value, 0x00>>.
+%% Core: script.h CScriptNum::serialize ~line 366-367:
+%%   if (vch.back() & 0x80) vch.push_back(neg ? 0x80 : 0);
+%%
+%% Previously le_minimal/1 emitted <<128>> for height 128 — sign bit set,
+%% interpreted as negative scriptnum → BIP-34 check_coinbase_height failure.
+%% Fixed: le_minimal/1 now appends 0x00 when the last byte has bit 7 set.
 
-gbt_coinbase_height_255_sign_bit_bug_test() ->
-    %% Height 255: correct is <<2, 255, 0>> (3 bytes).
-    %% beamchain emits <<1, 255>> (2 bytes) — sign bit set, wrong encoding.
-    CorrectLen = byte_size(<<2, 255, 0>>),
-    BuggyLen   = byte_size(<<1, 255>>),
-    ?assertNot(CorrectLen =:= BuggyLen).
+gbt_coinbase_height_128_sign_bit_fixed_test() ->
+    %% Height 128: correct CScriptNum encoding is <<2, 0x80, 0x00>>
+    %% (length prefix 2, then the 2-byte signed value 0x80 0x00 = +128).
+    ?assertEqual(<<2, 128, 0>>, beamchain_miner:encode_coinbase_height(128)).
 
-gbt_coinbase_height_127_ok_test() ->
-    %% Height 127: the encoding <<1, 127>> is correct (no sign bit issue).
-    Encoding127 = <<1, 127>>,
-    ?assertEqual(1, byte_size(binary:part(Encoding127, 0, 1))).  %% prefix byte
+gbt_coinbase_height_255_sign_bit_fixed_test() ->
+    %% Height 255: correct encoding is <<2, 0xFF, 0x00>>.
+    ?assertEqual(<<2, 255, 0>>, beamchain_miner:encode_coinbase_height(255)).
 
-gbt_coinbase_height_256_ok_test() ->
-    %% Height 256: 2-byte little-endian = <<0, 1>>, no sign bit.
-    Encoding = <<2, 0, 1>>,
-    ?assertEqual(<<2, 0, 1>>, Encoding).
+gbt_coinbase_height_32768_sign_bit_fixed_test() ->
+    %% Height 32768 (0x8000): LE bytes = <<0x00, 0x80>>; last byte 0x80 has bit 7
+    %% set → append 0x00 sign byte → 3 bytes → <<3, 0x00, 0x80, 0x00>>.
+    ?assertEqual(<<3, 0, 128, 0>>, beamchain_miner:encode_coinbase_height(32768)).
 
-%% Replicate beamchain's current (buggy) le_minimal to demonstrate the issue.
-le_minimal_for_test(N) -> le_minimal_acc_for_test(N, <<>>).
-le_minimal_acc_for_test(0, Acc) -> Acc;
-le_minimal_acc_for_test(N, Acc) ->
-    Byte = N band 16#ff,
-    le_minimal_acc_for_test(N bsr 8, <<Acc/binary, Byte:8>>).
+gbt_coinbase_height_65535_sign_bit_fixed_test() ->
+    %% Height 65535: LE bytes = <<0xFF, 0xFF>>; last byte 0xFF has bit 7 set
+    %% → append 0x00 → 3 bytes → <<3, 0xFF, 0xFF, 0x00>>.
+    ?assertEqual(<<3, 255, 255, 0>>, beamchain_miner:encode_coinbase_height(65535)).
+
+gbt_coinbase_height_127_no_padding_test() ->
+    %% Height 127: LE byte = <<0x7F>>; bit 7 clear — no sign byte needed.
+    ?assertEqual(<<1, 127>>, beamchain_miner:encode_coinbase_height(127)).
+
+gbt_coinbase_height_256_no_padding_test() ->
+    %% Height 256: LE bytes = <<0x00, 0x01>>; last byte 0x01 has bit 7 clear.
+    ?assertEqual(<<2, 0, 1>>, beamchain_miner:encode_coinbase_height(256)).
 
 %%%===================================================================
 %%% BUG-7: submitblock no duplicate-block pre-check
@@ -772,8 +765,10 @@ gbt_coinbase_height_encoding_small_test() ->
 
 %% Coinbase height encoding for multi-byte heights.
 gbt_coinbase_height_encoding_256_test() ->
-    ?assertEqual(<<2, 0, 1>>,   encode_cb_height_test(256)),
-    ?assertEqual(<<2, 255, 255>>, encode_cb_height_test(65535)).
+    ?assertEqual(<<2, 0, 1>>,     encode_cb_height_test(256)),
+    %% 65535 = 0xFFFF: LE bytes <<0xFF, 0xFF>>; last byte 0xFF has bit 7 set
+    %% → append 0x00 sign byte → <<3, 0xFF, 0xFF, 0x00>>.
+    ?assertEqual(<<3, 255, 255, 0>>, encode_cb_height_test(65535)).
 
 %% Witness merkle root: coinbase wtxid is always 32 zero bytes.
 gbt_witness_merkle_coinbase_zero_test() ->
@@ -804,10 +799,25 @@ gbt_witness_scale_factor_test() ->
 %%% Helpers used within this test module only
 %%% -------------------------------------------------------------------
 
-%% Local replica of beamchain_miner:encode_coinbase_height.
+%% Local replica of beamchain_miner:encode_coinbase_height (post-fix).
 encode_cb_height_test(0) -> <<0>>;
 encode_cb_height_test(H) when H >= 1, H =< 16 -> <<1, H:8>>;
 encode_cb_height_test(H) ->
-    Bytes = le_minimal_for_test(H),
+    Bytes = le_minimal_test(H),
     Len = byte_size(Bytes),
     <<Len:8, Bytes/binary>>.
+
+%% Local replica of the fixed beamchain_miner:le_minimal.
+%% Appends a 0x00 sign byte when the last LE byte has bit 7 set.
+le_minimal_test(N) ->
+    Bytes = le_minimal_acc_test(N, <<>>),
+    LastByte = binary:last(Bytes),
+    case LastByte band 16#80 of
+        0 -> Bytes;
+        _ -> <<Bytes/binary, 0>>
+    end.
+
+le_minimal_acc_test(0, Acc) -> Acc;
+le_minimal_acc_test(N, Acc) ->
+    Byte = N band 16#ff,
+    le_minimal_acc_test(N bsr 8, <<Acc/binary, Byte:8>>).
