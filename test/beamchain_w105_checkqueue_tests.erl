@@ -283,78 +283,80 @@ make_utxo(Value) ->
     }.
 
 %%% ===================================================================
-%%% BUG-1 (G1): ECDSA sig-cache bypass
+%%% BUG-1 (G1): ECDSA sig-cache bypass — FIXED
 %%%
-%%% check_ecdsa_sig/4 in beamchain_script.erl:2234-2237 dispatches to
-%%% beamchain_crypto:ecdsa_verify_lax/3, which has no cache path.  The
-%%% cached variant beamchain_crypto:ecdsa_verify_cached/3 exists but is
-%%% never called from the block-validation script checker.
-%%%
-%%% We verify the structural property: ecdsa_verify_lax is called directly
-%%% and does not go through the sig-cache ETS table.
+%%% check_ecdsa_sig/4 now calls beamchain_crypto:ecdsa_verify_lax_cached/3
+%%% instead of ecdsa_verify_lax/3.  ecdsa_verify_lax_cached normalises the
+%%% sig to canonical DER then routes through the sig-cache (lookup + insert
+%%% on success), matching Core's CachingTransactionSignatureChecker.
 %%% ===================================================================
 
 bug1_ecdsa_bypasses_sig_cache() ->
-    %% Prime the sig cache with a known key so we can detect a hit.
+    %% FIX: ecdsa_verify_lax_cached/3 must be exported.
+    ?assert(erlang:function_exported(beamchain_crypto, ecdsa_verify_lax_cached, 3)),
+    %% FIX: ecdsa_verify_cached/3 also exists (used internally by lax_cached).
+    ?assert(erlang:function_exported(beamchain_crypto, ecdsa_verify_cached, 3)),
+    %% Demonstrate cache hit path: manually insert a canonical sig, confirm
+    %% ecdsa_verify_lax_cached returns true on a cache hit without hitting NIF.
+    %%
+    %% Build a minimal valid-DER sig with low-S so lax decode normalises to
+    %% the same bytes we insert as the cache key.
+    %% Sig = DER(R=1, S=1): 30 06 02 01 01 02 01 01
+    RawSig = <<16#30, 16#06, 16#02, 16#01, 16#01, 16#02, 16#01, 16#01>>,
+    %% ecdsa_verify_lax_cached normalises to canonical DER before the lookup.
+    %% Compute what the canonical form will be:
+    {ok, {R, S}} = beamchain_crypto:decode_der_lax(RawSig),
+    S2 = beamchain_crypto:normalize_s(S),
+    CanonicalSig = beamchain_crypto:encode_der_signature(R, S2),
     SigHash = crypto:strong_rand_bytes(32),
     PubKey  = crypto:strong_rand_bytes(33),
-    Sig     = crypto:strong_rand_bytes(71),
-    beamchain_sig_cache:insert(SigHash, PubKey, Sig),
-    %% insert is an async cast; allow the gen_server to process it.
+    %% Insert canonical sig into cache manually.
+    beamchain_sig_cache:insert(SigHash, PubKey, CanonicalSig),
     timer:sleep(20),
-    %% Confirm the key is in the cache.
-    ?assert(beamchain_sig_cache:lookup(SigHash, PubKey, Sig)),
-    %% ecdsa_verify_lax ignores the cache: even if the result is cached the
-    %% lax path does NOT skip the NIF — it always attempts full DER decode.
-    %% Structural check: ecdsa_verify_lax is exported and does NOT call
-    %% beamchain_sig_cache:lookup internally (inspect the function body).
-    %% We verify this by confirming ecdsa_verify_cached exists as the cached
-    %% variant but is NOT the one called by check_ecdsa_sig on the block path.
-    %% check_ecdsa_sig({Tx,Idx,Amt,PrevOuts}, ...) → ecdsa_verify_lax (BUG-1)
-    %% check_ecdsa_sig({Tx,Idx,Amt}, ...) → ecdsa_verify_lax (BUG-1)
-    ?assert(erlang:function_exported(beamchain_crypto, ecdsa_verify_lax, 3)),
-    ?assert(erlang:function_exported(beamchain_crypto, ecdsa_verify_cached, 3)),
-    %% Document that ecdsa_verify_lax does NOT consult the ETS table:
-    %% a fresh sig hash not in cache; lax_verify returns false (bad DER),
-    %% which is fine — the key point is it never called sig_cache:lookup.
-    FreshHash = crypto:strong_rand_bytes(32),
-    FreshPub  = crypto:strong_rand_bytes(33),
-    FreshSig  = <<16#30, 16#06, 16#02, 16#01, 16#01, 16#02, 16#01, 16#01>>,
-    %% Even though this key is not in the cache, lax_verify will attempt NIF:
-    Result = beamchain_crypto:ecdsa_verify_lax(FreshHash, FreshSig, FreshPub),
-    ?assert(Result =:= true orelse Result =:= false), % no crash
-    %% Key is still not in cache (lax_verify doesn't insert on miss)
-    ?assertNot(beamchain_sig_cache:lookup(FreshHash, FreshPub, FreshSig)).
+    ?assert(beamchain_sig_cache:lookup(SigHash, PubKey, CanonicalSig)),
+    %% FIX: ecdsa_verify_lax_cached hits the cache and returns true.
+    Result = beamchain_crypto:ecdsa_verify_lax_cached(SigHash, RawSig, PubKey),
+    ?assertEqual(true, Result),
+    %% FIX: bad DER → lax decode fails → false (no crash).
+    BadSig = <<16#FF, 16#FF>>,
+    ?assertEqual(false, beamchain_crypto:ecdsa_verify_lax_cached(SigHash, BadSig, PubKey)).
 
 %%% ===================================================================
-%%% BUG-9 (G9): Schnorr cached, ECDSA uncached — asymmetric
+%%% BUG-9 (G9): Schnorr cached, ECDSA uncached — asymmetric — FIXED
+%%%
+%%% Both Schnorr and ECDSA paths now use cached variants.
+%%% schnorr_verify_cached and ecdsa_verify_lax_cached both consult and
+%%% populate the sig-cache ETS table, matching Core's symmetric treatment
+%%% in CachingTransactionSignatureChecker (script/sigcache.h:64-74).
 %%% ===================================================================
 
 bug9_schnorr_cached_ecdsa_not() ->
-    %% Schnorr path: schnorr_verify_cached is exported and calls lookup+insert
+    %% FIX: both Schnorr and ECDSA cached variants are exported.
     ?assert(erlang:function_exported(beamchain_crypto, schnorr_verify_cached, 3)),
-    %% ECDSA path: ecdsa_verify_lax is used on block path — no lookup+insert
-    ?assert(erlang:function_exported(beamchain_crypto, ecdsa_verify_lax, 3)),
-    %% The ONLY cached ECDSA function is ecdsa_verify_cached (not on block path).
-    %% Demonstrate the asymmetry: Schnorr cache populates ETS; ECDSA lax does not.
+    ?assert(erlang:function_exported(beamchain_crypto, ecdsa_verify_lax_cached, 3)),
+    %% Schnorr path: cache hit returns true.
     SH32  = crypto:strong_rand_bytes(32),
     Sig64 = crypto:strong_rand_bytes(64),
     Pk32  = crypto:strong_rand_bytes(32),
-    %% schnorr_verify_cached: on crypto-fail it returns false but still checks cache
-    %% (false results are NOT inserted, but the function did call lookup).
-    %% We manually insert to prove cache path is exercised:
     beamchain_sig_cache:insert(SH32, Pk32, Sig64),
     timer:sleep(20),
     ?assert(beamchain_sig_cache:lookup(SH32, Pk32, Sig64)),
-    Hit = beamchain_crypto:schnorr_verify_cached(SH32, Sig64, Pk32),
-    %% Cache hit → true (short-circuits NIF call)
-    ?assertEqual(true, Hit),
-    %% ECDSA lax: never inserts into cache regardless of result
+    SchnorrHit = beamchain_crypto:schnorr_verify_cached(SH32, Sig64, Pk32),
+    ?assertEqual(true, SchnorrHit),
+    %% FIX: ECDSA lax_cached path: cache hit also returns true.
+    %% Normalise a minimal DER sig to get the canonical cache key form.
+    RawSig2 = <<16#30, 16#06, 16#02, 16#01, 16#01, 16#02, 16#01, 16#01>>,
+    {ok, {R2, S2Raw}} = beamchain_crypto:decode_der_lax(RawSig2),
+    S2Norm = beamchain_crypto:normalize_s(S2Raw),
+    CanonSig2 = beamchain_crypto:encode_der_signature(R2, S2Norm),
     SH2 = crypto:strong_rand_bytes(32),
     Pk2 = crypto:strong_rand_bytes(33),
-    Sg2 = <<16#30, 16#06, 16#02, 16#01, 16#01, 16#02, 16#01, 16#01>>,
-    _R = beamchain_crypto:ecdsa_verify_lax(SH2, Sg2, Pk2),
-    ?assertNot(beamchain_sig_cache:lookup(SH2, Pk2, Sg2)).
+    beamchain_sig_cache:insert(SH2, Pk2, CanonSig2),
+    timer:sleep(20),
+    ?assert(beamchain_sig_cache:lookup(SH2, Pk2, CanonSig2)),
+    EcdsaHit = beamchain_crypto:ecdsa_verify_lax_cached(SH2, RawSig2, Pk2),
+    %% FIX: cache hit → true (ECDSA is now symmetric with Schnorr).
+    ?assertEqual(true, EcdsaHit).
 
 %%% ===================================================================
 %%% BUG-2 (G2): No script execution cache
