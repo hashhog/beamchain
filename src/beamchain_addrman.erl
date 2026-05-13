@@ -339,26 +339,94 @@ get_bucket_position(Address, IsNew, Bucket, Secret) ->
     Hash rem ?BUCKET_SIZE.
 
 %%% ===================================================================
+%%% Internal: routability filter (mirrors CNetAddr::IsRoutable in Core)
+%%% ===================================================================
+
+%% @doc Return true iff Address is publicly routable.
+%%
+%% For non-IP networks (NetworkId >= 4: TorV3, I2P, CJDNS) we always allow
+%% the address through — those are inherently overlay/onion networks and Core
+%% treats them as routable when valid.
+%%
+%% For IPv4 (NetworkId 1) and IPv6 (NetworkId 2) we reject:
+%%   - Loopback    127.0.0.0/8  or  the unspecified 0.0.0.0/8
+%%   - RFC 1918    10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+%%   - RFC 6598    100.64.0.0/10  (carrier-grade NAT)
+%%   - RFC 2544    198.18.0.0/15  (benchmarking)
+%%   - RFC 5737    192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24 (documentation)
+%%   - RFC 3927    169.254.0.0/16 (link-local)
+%%   - IPv6 link-local  fe80::/10
+%%   - IPv6 ULA         fc00::/7
+%%
+%% Reference: Bitcoin Core netaddress.cpp CNetAddr::IsRoutable()
+%%            addrman.cpp:534  AddSingle() early-return on !addr.IsRoutable()
+-spec is_routable({inet:ip_address() | binary(), inet:port_number()}, non_neg_integer()) -> boolean().
+is_routable({_Addr, _Port}, NetworkId) when NetworkId >= 4 ->
+    %% TorV3 / I2P / CJDNS — always considered routable when well-formed
+    true;
+is_routable({{A, _B, _C, _D} = IP4, _Port}, _NetworkId) ->
+    not (
+        %% Loopback 127.0.0.0/8 or unspecified 0.0.0.0/8
+        A =:= 127 orelse A =:= 0 orelse
+        %% RFC 1918
+        A =:= 10 orelse
+        (A =:= 172 andalso element(2, IP4) >= 16 andalso element(2, IP4) =< 31) orelse
+        (A =:= 192 andalso element(2, IP4) =:= 168) orelse
+        %% RFC 6598 carrier-grade NAT  100.64.0.0/10
+        (A =:= 100 andalso element(2, IP4) >= 64 andalso element(2, IP4) =< 127) orelse
+        %% RFC 2544 benchmarking  198.18.0.0/15
+        (A =:= 198 andalso (element(2, IP4) =:= 18 orelse element(2, IP4) =:= 19)) orelse
+        %% RFC 5737 documentation
+        (A =:= 192 andalso element(2, IP4) =:= 0 andalso element(3, IP4) =:= 2) orelse
+        (A =:= 198 andalso element(2, IP4) =:= 51 andalso element(3, IP4) =:= 100) orelse
+        (A =:= 203 andalso element(2, IP4) =:= 0 andalso element(3, IP4) =:= 113) orelse
+        %% RFC 3927 link-local  169.254.0.0/16
+        (A =:= 169 andalso element(2, IP4) =:= 254)
+    );
+is_routable({{A, B, C, D, E, F, G, H} = IP6, _Port}, _NetworkId) ->
+    _ = {C, D, E, F, G, H},  %% suppress unused-variable warnings
+    not (
+        %% Loopback ::1
+        IP6 =:= {0,0,0,0,0,0,0,1} orelse
+        %% Link-local fe80::/10  (first 10 bits are 1111111010)
+        (A band 16#ffc0) =:= 16#fe80 orelse
+        %% ULA fc00::/7  (fc00::/8 | fd00::/8)
+        (A band 16#fe00) =:= 16#fc00 orelse
+        %% IPv4-mapped ::ffff:0:0/96
+        (A =:= 0 andalso B =:= 16#ffff)
+    );
+is_routable(_Address, _NetworkId) ->
+    %% Unknown/binary address type — allow through (TorV3 bytes handled above)
+    true.
+
+%%% ===================================================================
 %%% Internal: address management
 %%% ===================================================================
 
 do_add_address(Address, Services, Source, NetworkId, #state{addr_table = AddrTab,
                                                             secret = Secret} = State) ->
-    Now = erlang:system_time(second),
-    SourceNG = source_netgroup(Source),
-
-    case ets:lookup(AddrTab, Address) of
-        [#addr_info{in_tried = true} = Existing] ->
-            %% Already in tried, just update timestamp
-            ets:insert(AddrTab, Existing#addr_info{timestamp = Now}),
+    %% BUG-2 fix: reject non-routable addresses before touching the table.
+    %% Mirrors Bitcoin Core addrman.cpp AddSingle() line 534:
+    %%   if (!addr.IsRoutable()) return false;
+    case is_routable(Address, NetworkId) of
+        false ->
             State;
-        [#addr_info{in_tried = false} = Existing] ->
-            %% Already in new, update timestamp and maybe add to more buckets
-            ets:insert(AddrTab, Existing#addr_info{timestamp = Now}),
-            State;
-        [] ->
-            %% New address - add to new table
-            add_to_new(Address, Services, Now, Source, SourceNG, NetworkId, Secret, State)
+        true ->
+            Now = erlang:system_time(second),
+            SourceNG = source_netgroup(Source),
+            case ets:lookup(AddrTab, Address) of
+                [#addr_info{in_tried = true} = Existing] ->
+                    %% Already in tried, just update timestamp
+                    ets:insert(AddrTab, Existing#addr_info{timestamp = Now}),
+                    State;
+                [#addr_info{in_tried = false} = Existing] ->
+                    %% Already in new, update timestamp and maybe add to more buckets
+                    ets:insert(AddrTab, Existing#addr_info{timestamp = Now}),
+                    State;
+                [] ->
+                    %% New address - add to new table
+                    add_to_new(Address, Services, Now, Source, SourceNG, NetworkId, Secret, State)
+            end
     end.
 
 %% @doc Add an addrv2 entry (handles all network types).

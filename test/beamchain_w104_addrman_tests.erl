@@ -390,34 +390,55 @@ bug1_hash_function_test_() ->
 
 %%% ===================================================================
 %%% BUG-2: No IsRoutable check — private/loopback addresses accepted
+%%% FIXED: is_routable/2 added; do_add_address returns State unchanged
+%%%        when the address is not publicly routable.
 %%% ===================================================================
 
 bug2_no_routability_check_test_() ->
-    {"BUG-2: do_add_address accepts unroutable addresses (loopback, RFC1918, unspecified)",
+    {"BUG-2 FIXED: do_add_address rejects unroutable addresses (loopback, RFC1918, unspecified)",
      {setup, fun setup/0, fun cleanup/1,
       fun(_) ->
           [
-           {"Loopback 127.0.0.1 accepted — should be rejected", fun() ->
+           {"Loopback 127.0.0.1 is rejected — count stays 0", fun() ->
                Loopback = {{127, 0, 0, 1}, 8333},
                beamchain_addrman:add_address(Loopback, 0, dns),
                timer:sleep(50),
                {New, _Tried} = beamchain_addrman:count(),
-               %% BUG: Core rejects this; beamchain accepts it
-               %% When fixed, New should be 0
-               ?assert(New >= 0),  %% permissive assertion documents current (buggy) state
-               %% The defect: New =:= 1 after this (loopback stored)
-               %% Fixed behaviour: New =:= 0
-               true
+               %% Fixed: is_routable/2 returns false for 127.x; address is not stored.
+               %% Core ref: addrman.cpp:534 AddSingle() early return on !addr.IsRoutable()
+               ?assertEqual(0, New)
            end},
-           {"RFC1918 10.0.0.1 accepted — should be rejected", fun() ->
+           {"RFC1918 10.0.0.1 is rejected — count stays 0", fun() ->
                Private = {{10, 0, 0, 1}, 8333},
                beamchain_addrman:add_address(Private, 0, dns),
                timer:sleep(50),
-               %% Bitcoin Core's AddSingle: if (!addr.IsRoutable()) return false;
-               %% Beamchain does not have this check.
                {New, _} = beamchain_addrman:count(),
-               ?assert(New >= 0)
-               %% Defect: private address was stored; fix should return early
+               %% Fixed: RFC1918 (10.0.0.0/8) is not routable; address is not stored.
+               ?assertEqual(0, New)
+           end},
+           {"Unspecified 0.0.0.0 is rejected — count stays 0", fun() ->
+               Unspec = {{0, 0, 0, 0}, 8333},
+               beamchain_addrman:add_address(Unspec, 0, dns),
+               timer:sleep(50),
+               {New, _} = beamchain_addrman:count(),
+               %% Fixed: 0.0.0.0/8 treated as unroutable (same as 127.x check in is_routable/2).
+               ?assertEqual(0, New)
+           end},
+           {"RFC1918 192.168.1.1 is rejected — count stays 0", fun() ->
+               Private2 = {{192, 168, 1, 1}, 8333},
+               beamchain_addrman:add_address(Private2, 0, dns),
+               timer:sleep(50),
+               {New, _} = beamchain_addrman:count(),
+               ?assertEqual(0, New)
+           end},
+           {"Public 203.0.114.1 is accepted — count becomes 1", fun() ->
+               Public = {{203, 0, 114, 1}, 8333},
+               beamchain_addrman:add_address(Public, 0, dns),
+               timer:sleep(50),
+               {New, _} = beamchain_addrman:count(),
+               %% 203.0.114.0/24 is NOT in RFC5737 (only .113), so this is a valid
+               %% public address and must be accepted.
+               ?assertEqual(1, New)
            end}
           ]
       end}}.
@@ -432,7 +453,7 @@ bug3_no_stochastic_multi_bucket_test_() ->
       fun(_) ->
           [
            {"Repeated add of same address never raises ref_count above 1", fun() ->
-               Addr = {{203, 0, 113, 1}, 8333},
+               Addr = {{1, 2, 3, 4}, 8333},
                %% Add same address 20 times from same source
                lists:foreach(fun(_) ->
                    beamchain_addrman:add_address(Addr, 0, dns)
@@ -513,7 +534,7 @@ bug6_no_is_terrible_test_() ->
       fun(_) ->
           [
            {"Marking failed 3+ times never evicts address (RETRIES=3 not enforced)", fun() ->
-               Addr = {{198, 51, 100, 1}, 8333},
+               Addr = {{5, 6, 7, 8}, 8333},
                beamchain_addrman:add_address(Addr, 0, dns),
                timer:sleep(50),
                %% Mark failed 5 times (> ADDRMAN_RETRIES=3)
@@ -629,8 +650,8 @@ bug9_no_test_before_evict_test_() ->
                ?assertNot(lists:member({select_tried_collision, 0}, Exports))
            end},
            {"Two addresses colliding in tried causes immediate eviction", fun() ->
-               A1 = {{172, 16, 1, 1}, 8333},
-               A2 = {{172, 16, 1, 2}, 8333},
+               A1 = {{9, 10, 11, 12}, 8333},
+               A2 = {{9, 10, 11, 13}, 8333},
                beamchain_addrman:add_address(A1, 0, dns),
                beamchain_addrman:add_address(A2, 0, dns),
                timer:sleep(50),
@@ -680,7 +701,7 @@ bug11_no_set_services_test_() ->
                ?assertNot(lists:member({set_services, 3}, Exports))
            end},
            {"Adding known address with new services does not update services field", fun() ->
-               Addr = {{192, 0, 2, 1}, 8333},
+               Addr = {{13, 14, 15, 16}, 8333},
                %% Add with NODE_NETWORK (1)
                beamchain_addrman:add_address(Addr, 1, dns),
                timer:sleep(50),
@@ -892,7 +913,7 @@ bug18_attempts_not_reset_on_tried_test_() ->
       fun(_) ->
           [
            {"Attempts counter persists after mark_tried — no reset to 0", fun() ->
-               Addr = {{203, 0, 113, 2}, 8333},
+               Addr = {{17, 18, 19, 20}, 8333},
                beamchain_addrman:add_address(Addr, 0, dns),
                timer:sleep(50),
                %% Accumulate some failures
