@@ -900,6 +900,14 @@ w95_schnorr_verify_guard_rejects_bad_size_test() ->
 %% crash inside `ets:member` when the gen_server isn't running.
 %% Mirrors `ensure_sig_cache/0` in script_vectors_tests.erl.
 w95_ensure_sig_cache() ->
+    %% Seed the startup nonce in persistent_term if not already present.
+    %% In production this is done by beamchain_sig_cache:init/1.
+    case persistent_term:get(beamchain_sig_cache_nonce, undefined) of
+        undefined ->
+            persistent_term:put(beamchain_sig_cache_nonce,
+                                crypto:strong_rand_bytes(32));
+        _ -> ok
+    end,
     try ets:info(beamchain_sig_cache_tab, size) of
         undefined ->
             ets:new(beamchain_sig_cache_tab, [set, public, named_table,

@@ -296,6 +296,14 @@ make_sig_checker(SpendingTx, Amount) ->
 %% Ensure the sig_cache ETS tables exist so ecdsa_verify_cached doesn't crash.
 %% In production these are created by the beamchain_sig_cache gen_server.
 ensure_sig_cache() ->
+    %% Seed the startup nonce in persistent_term if not already present.
+    %% In production this is done by beamchain_sig_cache:init/1.
+    case persistent_term:get(beamchain_sig_cache_nonce, undefined) of
+        undefined ->
+            persistent_term:put(beamchain_sig_cache_nonce,
+                                crypto:strong_rand_bytes(32));
+        _ -> ok
+    end,
     try ets:info(beamchain_sig_cache_tab, size) of
         undefined ->
             ets:new(beamchain_sig_cache_tab, [set, public, named_table,
