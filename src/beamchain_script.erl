@@ -2232,11 +2232,14 @@ pop_n(N, State) when N > 0 ->
 check_ecdsa_sig(#{check_ecdsa_sig := Fun}, Sig, PubKey, SigHash) ->
     Fun(Sig, PubKey, SigHash);
 check_ecdsa_sig({_Tx, _Idx, _Amt, _PrevOuts}, Sig, PubKey, SigHash) ->
-    %% Use lax DER parsing: strict checks already done by check_sig_encoding.
-    %% Lax parsing handles pre-BIP66 non-canonical DER signatures.
-    beamchain_crypto:ecdsa_verify_lax(SigHash, Sig, PubKey);
+    %% Use lax DER parsing + sig-cache: strict checks already done by
+    %% check_sig_encoding.  Routes through ecdsa_verify_lax_cached so the
+    %% cache is consulted (and populated on success) for both ECDSA and
+    %% Schnorr paths — matching Core's CachingTransactionSignatureChecker
+    %% (script/sigcache.h:64-74).
+    beamchain_crypto:ecdsa_verify_lax_cached(SigHash, Sig, PubKey);
 check_ecdsa_sig({_Tx, _Idx, _Amt}, Sig, PubKey, SigHash) ->
-    beamchain_crypto:ecdsa_verify_lax(SigHash, Sig, PubKey);
+    beamchain_crypto:ecdsa_verify_lax_cached(SigHash, Sig, PubKey);
 check_ecdsa_sig(_, _Sig, _PubKey, _SigHash) ->
     false.
 

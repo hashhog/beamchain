@@ -4,7 +4,7 @@
 -export([ecdsa_verify/3, ecdsa_verify_lax/3, schnorr_verify/3]).
 
 %% Cached verification (checks sig cache before calling NIF)
--export([ecdsa_verify_cached/3, schnorr_verify_cached/3]).
+-export([ecdsa_verify_cached/3, ecdsa_verify_lax_cached/3, schnorr_verify_cached/3]).
 
 %% Signing (NIF-backed)
 -export([ecdsa_sign/2, schnorr_sign/3, seckey_tweak_add/2]).
@@ -238,6 +238,24 @@ ecdsa_verify_cached(Msg, Sig, PubKey) when byte_size(Msg) =:= 32 ->
                 false ->
                     false
             end
+    end.
+
+%% @doc ECDSA verify with lax DER parsing + sig-cache lookup.
+%% Normalises the signature to canonical DER (lax decode + low-S), then
+%% routes through ecdsa_verify_cached so the cache is consulted and
+%% populated on a successful verify.  This matches Core's
+%% CachingTransactionSignatureChecker which wraps both ECDSA and Schnorr
+%% paths uniformly (script/sigcache.h:64-74).
+-spec ecdsa_verify_lax_cached(Msg :: binary(), Sig :: binary(),
+                               PubKey :: binary()) -> boolean().
+ecdsa_verify_lax_cached(Msg, Sig, PubKey) when byte_size(Msg) =:= 32 ->
+    case decode_der_lax(Sig) of
+        {ok, {R, S}} ->
+            S2 = normalize_s(S),
+            CanonicalSig = encode_der_signature(R, S2),
+            ecdsa_verify_cached(Msg, CanonicalSig, PubKey);
+        {error, _} ->
+            false
     end.
 
 -spec schnorr_verify_cached(Msg :: binary(), Sig :: binary(),
