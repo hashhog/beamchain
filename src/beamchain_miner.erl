@@ -19,6 +19,7 @@
 -export([create_block_template/1, create_block_template/2]).
 -export([submit_block/1]).
 -export([generate_blocks/3, generate_block_with_txs/3]).
+-export([encode_coinbase_height/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -813,7 +814,17 @@ encode_coinbase_height(Height) ->
     <<Len:8, Bytes/binary>>.
 
 le_minimal(N) ->
-    le_minimal_acc(N, <<>>).
+    Bytes = le_minimal_acc(N, <<>>),
+    %% CScriptNum::serialize: if the MSB of the last encoded byte has bit 7
+    %% set and the value is positive, append a 0x00 sign byte so the encoding
+    %% is not interpreted as a negative number in Bitcoin Script.
+    %% Core: script.h CScriptNum::serialize ~line 366-367:
+    %%   if (vch.back() & 0x80) vch.push_back(neg ? 0x80 : 0);
+    LastByte = binary:last(Bytes),
+    case LastByte band 16#80 of
+        0 -> Bytes;
+        _ -> <<Bytes/binary, 0>>
+    end.
 
 le_minimal_acc(0, Acc) -> Acc;
 le_minimal_acc(N, Acc) ->
