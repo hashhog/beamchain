@@ -312,30 +312,68 @@ terminate(_Reason, State) ->
 %%% Internal: bucket assignment (Bitcoin Core parity)
 %%% ===================================================================
 
+%% @doc Cryptographic keyed hash for bucket assignment.
+%%
+%% Mirrors Bitcoin Core's GetCheapHash(): double-SHA256 of (NKey || serialized
+%% terms), returning the first 32 bits as a non-negative integer.
+%%
+%% erlang:phash2 has a 27-bit output range and is NOT keyed — a replacement
+%% must use a cryptographic hash with the 256-bit secret so that an adversary
+%% cannot predict or influence bucket placement (eclipse-attack resistance).
+%%
+%% Each term is converted to a binary via term_to_binary/1 before concatenation
+%% so that the input to SHA256 is a well-defined byte sequence.
+%%
+%% Reference: Bitcoin Core hash.h GetCheapHash() + addrman.cpp GetNewBucket /
+%%            GetTriedBucket / GetBucketPosition (SHA256d, first 64 bits LE).
+-spec bucket_hash(binary(), [term()]) -> non_neg_integer().
+bucket_hash(NKey, Terms) ->
+    %% Serialize each term to binary and concatenate with the 32-byte secret.
+    TermBin = iolist_to_binary([term_to_binary(T) || T <- Terms]),
+    Input = <<NKey/binary, TermBin/binary>>,
+    %% Double-SHA256 (SHA256d) — same as Bitcoin Core's HashWriter::GetHash().
+    Round1 = crypto:hash(sha256, Input),
+    Round2 = crypto:hash(sha256, Round1),
+    %% Take the first 32 bits (little-endian) as the cheap hash value.
+    <<Hash:32/little-unsigned-integer, _/binary>> = Round2,
+    Hash.
+
 %% @doc Compute bucket for new table entry.
 %% Uses address netgroup and source netgroup to determine bucket.
-%% Formula: hash2(key, source_group, hash1(key, group) % BUCKETS_PER_SOURCE_GROUP)
+%%
+%% Mirrors Bitcoin Core addrman.cpp AddrInfo::GetNewBucket():
+%%   hash1 = CheapHash(nKey || addrGroup || srcGroup)
+%%   hash2 = CheapHash(nKey || srcGroup || (hash1 % NEW_BUCKETS_PER_SOURCE_GROUP))
+%%   bucket = hash2 % NEW_BUCKET_COUNT
 get_new_bucket(Address, SourceNetgroup, Secret) ->
     AddrGroup = netgroup(Address),
-    Hash1 = erlang:phash2({Secret, AddrGroup, SourceNetgroup}),
+    Hash1 = bucket_hash(Secret, [AddrGroup, SourceNetgroup]),
     Slot1 = Hash1 rem ?NEW_BUCKETS_PER_SOURCE_GROUP,
-    Hash2 = erlang:phash2({Secret, SourceNetgroup, Slot1}),
+    Hash2 = bucket_hash(Secret, [SourceNetgroup, Slot1]),
     Hash2 rem ?NEW_BUCKET_COUNT.
 
 %% @doc Compute bucket for tried table entry.
 %% Uses address itself and netgroup.
-%% Formula: hash2(key, group, hash1(key, addr) % BUCKETS_PER_GROUP)
+%%
+%% Mirrors Bitcoin Core addrman.cpp AddrInfo::GetTriedBucket():
+%%   hash1 = CheapHash(nKey || address)
+%%   hash2 = CheapHash(nKey || addrGroup || (hash1 % TRIED_BUCKETS_PER_GROUP))
+%%   bucket = hash2 % TRIED_BUCKET_COUNT
 get_tried_bucket(Address, Secret) ->
     AddrGroup = netgroup(Address),
-    Hash1 = erlang:phash2({Secret, Address}),
+    Hash1 = bucket_hash(Secret, [Address]),
     Slot1 = Hash1 rem ?TRIED_BUCKETS_PER_GROUP,
-    Hash2 = erlang:phash2({Secret, AddrGroup, Slot1}),
+    Hash2 = bucket_hash(Secret, [AddrGroup, Slot1]),
     Hash2 rem ?TRIED_BUCKET_COUNT.
 
 %% @doc Compute position within a bucket.
+%%
+%% Mirrors Bitcoin Core addrman.cpp AddrInfo::GetBucketPosition():
+%%   hash1 = CheapHash(nKey || type_byte || bucket || address)
+%%   position = hash1 % BUCKET_SIZE
 get_bucket_position(Address, IsNew, Bucket, Secret) ->
     Type = case IsNew of true -> new; false -> tried end,
-    Hash = erlang:phash2({Secret, Type, Bucket, Address}),
+    Hash = bucket_hash(Secret, [Type, Bucket, Address]),
     Hash rem ?BUCKET_SIZE.
 
 %%% ===================================================================
