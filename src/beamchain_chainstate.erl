@@ -938,6 +938,8 @@ do_connect_block_inner(#block{header = Header} = Block,
                 %%   3 = BLOCK_VALID_TRANSACTIONS
                 %%   4 = BLOCK_VALID_CHAIN
                 %%   5 = BLOCK_VALID_SCRIPTS  <-- terminal post-ConnectBlock state
+                %%   8 = BLOCK_HAVE_DATA      <-- block body written to blk*.dat
+                %%  16 = BLOCK_HAVE_UNDO      <-- undo data written to rev*.dat
                 %%
                 %% Bug-fix W93/B2: previously beamchain wrote status=2 (TREE)
                 %% after a successful ConnectBlock.  Core (validation.cpp:2648-
@@ -948,8 +950,21 @@ do_connect_block_inner(#block{header = Header} = Block,
                 %% IsValid(BLOCK_VALID_SCRIPTS) consumers all observe wrong
                 %% answers.  Each ConnectBlock branch passes through this code
                 %% only on the success path, so 5 is unambiguously correct here.
+                %%
+                %% Bug-fix W109/BUG-1 (FIX-33): OR in BLOCK_HAVE_DATA (8) and
+                %% BLOCK_HAVE_UNDO (16) so that the persisted status reflects
+                %% that block data was written to the blocks CF (analogous to
+                %% Core validation.cpp:3784 `pindexNew->nStatus |= BLOCK_HAVE_DATA`
+                %% after WriteBlockToDisk) and that undo data was written by
+                %% beamchain_validation:connect_block via direct_store_undo
+                %% (analogous to Core blockstorage.cpp:1029
+                %% `block.nStatus |= BLOCK_HAVE_UNDO` after WriteUndoDataForBlock).
+                %% Without these bits, FindMostWorkChain's BLOCK_HAVE_DATA filter
+                %% (beamchain_chainstate.erl:find_best_valid_chain) rejects every
+                %% connected block as a candidate, and prune eligibility is broken.
+                ConnectStatus = ?BLOCK_VALID_SCRIPTS bor ?BLOCK_HAVE_DATA bor ?BLOCK_HAVE_UNDO,
                 ok = beamchain_db:direct_atomic_connect_writes(
-                         Block, Height, NewCW, BlockHash, ?BLOCK_VALID_SCRIPTS),
+                         Block, Height, NewCW, BlockHash, ConnectStatus),
 
                 %% Update chain tip in ETS for fast reads
                 ets:insert(?CHAIN_META, {tip, BlockHash, Height}),

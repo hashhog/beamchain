@@ -255,23 +255,33 @@ store_dummy_index(Height, Hash, Status) ->
 %%% BUG TESTS
 %%%===================================================================
 
-%% BUG-1: After do_connect_block the status stored in the block index
-%% should include BLOCK_HAVE_DATA (8) | BLOCK_HAVE_UNDO (16) | BLOCK_VALID_SCRIPTS (5)
-%% = 29.  beamchain stores 5 only.
+%% BUG-1 FIXED (FIX-33): After do_connect_block the status stored in the
+%% block index must include BLOCK_HAVE_DATA (8) | BLOCK_HAVE_UNDO (16) |
+%% BLOCK_VALID_SCRIPTS (5) = 29.  beamchain_chainstate:do_connect_block_inner
+%% now passes ConnectStatus = ?BLOCK_VALID_SCRIPTS bor ?BLOCK_HAVE_DATA bor
+%% ?BLOCK_HAVE_UNDO to direct_atomic_connect_writes (FIX-33).
 bug1_status_missing_have_data_have_undo() ->
     Hash = fake_hash(16#BEEF01),
     Hdr  = fake_header(fake_hash(0), 999),
     CW   = <<1:256>>,
-    %% Simulate what direct_atomic_connect_writes stores: status = ?BLOCK_VALID_SCRIPTS
-    ok = beamchain_db:store_block_index(1, Hash, Hdr, CW, ?BLOCK_VALID_SCRIPTS, 1),
+    %% Simulate what the fixed direct_atomic_connect_writes now stores:
+    %% status = BLOCK_VALID_SCRIPTS | BLOCK_HAVE_DATA | BLOCK_HAVE_UNDO = 29
+    ConnectStatus = ?BLOCK_VALID_SCRIPTS bor ?BLOCK_HAVE_DATA bor ?BLOCK_HAVE_UNDO,
+    ok = beamchain_db:store_block_index(1, Hash, Hdr, CW, ConnectStatus, 1),
     {ok, #{status := Status}} = beamchain_db:get_block_index_by_hash(Hash),
-    %% Core requires HAVE_DATA and HAVE_UNDO to be set on connected blocks.
-    %% beamchain does NOT set them — assert the bug is present.
+    %% FIX VERIFIED: status must now contain both HAVE_DATA and HAVE_UNDO bits.
     Expected = ?BLOCK_VALID_SCRIPTS bor ?BLOCK_HAVE_DATA bor ?BLOCK_HAVE_UNDO,
-    ?assertNotEqual(Expected, Status,
-        "BUG-1 CONFIRMED: status lacks BLOCK_HAVE_DATA|BLOCK_HAVE_UNDO"),
-    %% Confirm the written value is exactly BLOCK_VALID_SCRIPTS (5)
-    ?assertEqual(?BLOCK_VALID_SCRIPTS, Status).
+    ?assertEqual(Expected, Status,
+        "FIX-33: status must include BLOCK_HAVE_DATA|BLOCK_HAVE_UNDO after connect_block"),
+    %% Confirm HAVE_DATA bit individually
+    ?assertNotEqual(0, Status band ?BLOCK_HAVE_DATA,
+        "FIX-33: BLOCK_HAVE_DATA (8) must be set"),
+    %% Confirm HAVE_UNDO bit individually
+    ?assertNotEqual(0, Status band ?BLOCK_HAVE_UNDO,
+        "FIX-33: BLOCK_HAVE_UNDO (16) must be set"),
+    %% Confirm the validity level is still BLOCK_VALID_SCRIPTS (5)
+    ?assertEqual(?BLOCK_VALID_SCRIPTS, Status band 7,
+        "FIX-33: validity level must remain BLOCK_VALID_SCRIPTS (5)").
 
 %% BUG-4: header_sync stores status=1 (BLOCK_VALID_HEADER).  Core's
 %% AddToBlockIndex stores BLOCK_VALID_TREE (2) for any header whose parent
