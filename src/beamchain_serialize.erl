@@ -4,7 +4,7 @@
 -include("beamchain_protocol.hrl").
 
 %% Varint
--export([encode_varint/1, decode_varint/1]).
+-export([encode_varint/1, decode_varint/1, decode_varint_no_range/1]).
 
 %% Little-endian helpers
 -export([encode_le32/1, decode_le32/1,
@@ -56,14 +56,52 @@ encode_varint(N) when N =< 16#FFFFFFFF ->
 encode_varint(N) when N =< 16#FFFFFFFFFFFFFFFF ->
     <<16#FF:8, N:64/little>>.
 
--spec decode_varint(binary()) -> {non_neg_integer(), binary()}.
+%% MAX_SIZE mirrors bitcoin-core/src/serialize.h line 34:
+%%   MAX_SIZE = 0x02000000 (= 33,554,432 bytes)
+%% ReadCompactSize throws "ReadCompactSize(): size too large" when the
+%% decoded value exceeds MAX_SIZE (range_check=true, the default).
+-define(MAX_COMPACT_SIZE, 16#02000000).
+
+-spec decode_varint(binary()) -> {non_neg_integer(), binary()} | {error, atom()}.
+decode_varint(<<16#FD:8, N:16/little, _Rest/binary>>) when N < 253 ->
+    {error, non_canonical_compact_size};
+decode_varint(<<16#FD:8, N:16/little, _Rest/binary>>) when N > ?MAX_COMPACT_SIZE ->
+    {error, oversized_compact_size};
 decode_varint(<<16#FD:8, N:16/little, Rest/binary>>) ->
     {N, Rest};
+decode_varint(<<16#FE:8, N:32/little, _Rest/binary>>) when N < 16#10000 ->
+    {error, non_canonical_compact_size};
+decode_varint(<<16#FE:8, N:32/little, _Rest/binary>>) when N > ?MAX_COMPACT_SIZE ->
+    {error, oversized_compact_size};
 decode_varint(<<16#FE:8, N:32/little, Rest/binary>>) ->
     {N, Rest};
+decode_varint(<<16#FF:8, N:64/little, _Rest/binary>>) when N < 16#100000000 ->
+    {error, non_canonical_compact_size};
+decode_varint(<<16#FF:8, N:64/little, _Rest/binary>>) when N > ?MAX_COMPACT_SIZE ->
+    {error, oversized_compact_size};
 decode_varint(<<16#FF:8, N:64/little, Rest/binary>>) ->
     {N, Rest};
 decode_varint(<<N:8, Rest/binary>>) ->
+    {N, Rest}.
+
+%% @doc Decode CompactSize without the MAX_SIZE range check.
+%% Mirrors bitcoin-core's ReadCompactSize(stream, range_check=false).
+%% Use for fields that are bitmasks / arbitrary uint64 values rather than
+%% allocation sizes — e.g. the services field in addrv2 (BIP-155).
+-spec decode_varint_no_range(binary()) -> {non_neg_integer(), binary()} | {error, atom()}.
+decode_varint_no_range(<<16#FD:8, N:16/little, _Rest/binary>>) when N < 253 ->
+    {error, non_canonical_compact_size};
+decode_varint_no_range(<<16#FD:8, N:16/little, Rest/binary>>) ->
+    {N, Rest};
+decode_varint_no_range(<<16#FE:8, N:32/little, _Rest/binary>>) when N < 16#10000 ->
+    {error, non_canonical_compact_size};
+decode_varint_no_range(<<16#FE:8, N:32/little, Rest/binary>>) ->
+    {N, Rest};
+decode_varint_no_range(<<16#FF:8, N:64/little, _Rest/binary>>) when N < 16#100000000 ->
+    {error, non_canonical_compact_size};
+decode_varint_no_range(<<16#FF:8, N:64/little, Rest/binary>>) ->
+    {N, Rest};
+decode_varint_no_range(<<N:8, Rest/binary>>) ->
     {N, Rest}.
 
 %%% -------------------------------------------------------------------

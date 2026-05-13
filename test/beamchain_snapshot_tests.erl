@@ -85,14 +85,13 @@ test_compact_size() ->
     test_compact_size_roundtrip(1000),
     test_compact_size_roundtrip(65535),
 
-    %% Test 4-byte encoding (65536-4294967295)
+    %% Test 4-byte encoding (65536 - MAX_COMPACT_SIZE)
+    %% decode_compact_size enforces range_check=true (Core default):
+    %% values above MAX_COMPACT_SIZE (0x02000000 = 33,554,432) are rejected.
     test_compact_size_roundtrip(65536),
     test_compact_size_roundtrip(1000000),
-    test_compact_size_roundtrip(4294967295),
-
-    %% Test 8-byte encoding (> 4294967295)
-    test_compact_size_roundtrip(4294967296),
-    test_compact_size_roundtrip(10000000000).
+    test_compact_size_roundtrip(16#01FFFFFF),
+    test_compact_size_roundtrip(16#02000000).  %% MAX_COMPACT_SIZE: last valid value
 
 test_compact_size_roundtrip(N) ->
     Encoded = beamchain_snapshot:encode_compact_size(N),

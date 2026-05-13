@@ -80,11 +80,14 @@ obfuscation_bytewise_xor_test() ->
 %%% -------------------------------------------------------------------
 
 compact_size_roundtrip_test() ->
+    %% Roundtrip values must not exceed MAX_COMPACT_SIZE (0x02000000 = 33,554,432).
+    %% decode_compact_size uses range_check=true (Core default); larger values
+    %% return {error, oversized_compact_size}.
     lists:foreach(fun(N) ->
         Bin = beamchain_mempool_persist:encode_compact_size(N),
         ?assertEqual({N, <<>>},
                      beamchain_mempool_persist:decode_compact_size(Bin))
-    end, [0, 1, 252, 253, 65535, 65536, 16#FFFFFFFF, 16#FFFFFFFF + 1]).
+    end, [0, 1, 252, 253, 65535, 65536, 16#01FFFFFF, 16#02000000]).
 
 %%% -------------------------------------------------------------------
 %%% Payload round-trip (no file IO)

@@ -161,24 +161,25 @@ g5_compact_size_decode_rest_9byte_test() ->
 
 %% BUG-1a: 0xFD followed by value < 253 (should be rejected by Core)
 g6_non_canonical_fd_below_253_accepted_bug_test() ->
-    %% Core would throw "non-canonical ReadCompactSize()"
-    %% beamchain accepts it (BUG) — documents current wrong behaviour
+    %% Core throws "non-canonical ReadCompactSize()"; beamchain must now also
+    %% reject. FIX: returns {error, non_canonical_compact_size}.
     Result = beamchain_serialize:decode_varint(<<16#FD, 0, 0>>),
-    %% Currently succeeds: {0, <<>>} — WRONG per Core
-    ?assertMatch({0, <<>>}, Result).
+    ?assertEqual({error, non_canonical_compact_size}, Result).
 
 %% BUG-1b: 0xFE followed by value < 65536 (should be rejected by Core)
 g6_non_canonical_fe_below_65536_accepted_bug_test() ->
-    %% Core would throw "non-canonical ReadCompactSize()" for FE+0x00FF
+    %% Core throws "non-canonical ReadCompactSize()"; beamchain must now also
+    %% reject. FIX: returns {error, non_canonical_compact_size}.
     Result = beamchain_serialize:decode_varint(<<16#FE, 255, 0, 0, 0>>),
-    ?assertMatch({255, <<>>}, Result).
+    ?assertEqual({error, non_canonical_compact_size}, Result).
 
 %% BUG-1c: 0xFF followed by value < 2^32 (should be rejected by Core)
 g6_non_canonical_ff_below_2_32_accepted_bug_test() ->
-    %% 0xFF 0x00 0x00 0x01 0x00 0x00 0x00 0x00 0x00 = 65536 via 9-byte form
-    %% Core would reject: "non-canonical ReadCompactSize()"
+    %% 0xFF 0x00 0x00 0x01 0x00 0x00 0x00 0x00 0x00 = 65536 via 9-byte form.
+    %% Core rejects "non-canonical ReadCompactSize()"; beamchain must also
+    %% reject. FIX: returns {error, non_canonical_compact_size}.
     Result = beamchain_serialize:decode_varint(<<16#FF, 0, 0, 1, 0, 0, 0, 0, 0>>),
-    ?assertMatch({65536, <<>>}, Result).
+    ?assertEqual({error, non_canonical_compact_size}, Result).
 
 %%% -------------------------------------------------------------------
 %%% G7: CompactSize snapshot module — encode_compact_size / decode_compact_size
@@ -219,14 +220,16 @@ g7_snapshot_compact_size_decode_error_truncated_test() ->
 %%% -------------------------------------------------------------------
 
 g8_snapshot_non_canonical_fd_bug_test() ->
-    %% 0xFD 0x00 0x00 = 0 via 3-byte form — Core rejects, beamchain accepts
+    %% 0xFD 0x00 0x00 = 0 via 3-byte form — Core rejects; beamchain must also
+    %% reject. FIX: returns {error, non_canonical_compact_size}.
     Result = beamchain_snapshot:decode_compact_size(<<16#FD, 0, 0>>),
-    ?assertMatch({ok, 0, <<>>}, Result).
+    ?assertEqual({error, non_canonical_compact_size}, Result).
 
 g8_snapshot_non_canonical_fe_bug_test() ->
-    %% 0xFE 0x00 0x01 0x00 0x00 = 256 via 5-byte form — Core rejects
+    %% 0xFE 0x00 0x01 0x00 0x00 = 256 via 5-byte form — Core rejects; beamchain
+    %% must also reject. FIX: returns {error, non_canonical_compact_size}.
     Result = beamchain_snapshot:decode_compact_size(<<16#FE, 0, 1, 0, 0>>),
-    ?assertMatch({ok, 256, <<>>}, Result).
+    ?assertEqual({error, non_canonical_compact_size}, Result).
 
 %%% -------------------------------------------------------------------
 %%% G9: CompactSize mempool_persist delegates to beamchain_serialize
@@ -261,19 +264,20 @@ g10_max_size_value_is_33554432_test() ->
     ?assertEqual(MaxSize, Decoded).
 
 g10_above_max_size_accepted_bug_test() ->
-    %% Core throws "ReadCompactSize(): size too large" for N > MAX_SIZE
-    %% beamchain silently returns the value — documents the BUG
+    %% Core throws "ReadCompactSize(): size too large" for N > MAX_SIZE.
+    %% FIX: beamchain now returns {error, oversized_compact_size}.
     AboveMax = 16#02000001,
     Enc = beamchain_serialize:encode_varint(AboveMax),
-    {Decoded, <<>>} = beamchain_serialize:decode_varint(Enc),
-    ?assertEqual(AboveMax, Decoded).
+    ?assertEqual({error, oversized_compact_size},
+                 beamchain_serialize:decode_varint(Enc)).
 
 g10_large_value_no_range_check_test() ->
-    %% Values much larger than MAX_SIZE are returned without error
+    %% Values much larger than MAX_SIZE must now be rejected.
+    %% FIX: beamchain returns {error, oversized_compact_size}.
     LargeVal = 16#0FFFFFFF,
     Enc = beamchain_serialize:encode_varint(LargeVal),
-    {Decoded, <<>>} = beamchain_serialize:decode_varint(Enc),
-    ?assertEqual(LargeVal, Decoded).
+    ?assertEqual({error, oversized_compact_size},
+                 beamchain_serialize:decode_varint(Enc)).
 
 %%% -------------------------------------------------------------------
 %%% G11: Snapshot decode_compact_size also lacks MAX_SIZE check
@@ -281,11 +285,12 @@ g10_large_value_no_range_check_test() ->
 %%% -------------------------------------------------------------------
 
 g11_snapshot_no_max_size_check_bug_test() ->
-    %% 0x03000000 > MAX_SIZE but snapshot accepts silently
+    %% 0x03000000 > MAX_SIZE — snapshot must now reject.
+    %% FIX: beamchain returns {error, oversized_compact_size}.
     TooLarge = 16#03000000,
     Enc = beamchain_snapshot:encode_compact_size(TooLarge),
-    {ok, Decoded, <<>>} = beamchain_snapshot:decode_compact_size(Enc),
-    ?assertEqual(TooLarge, Decoded).
+    ?assertEqual({error, oversized_compact_size},
+                 beamchain_snapshot:decode_compact_size(Enc)).
 
 %%% -------------------------------------------------------------------
 %%% G12: GetSizeOfCompactSize equivalent — no function in beamchain

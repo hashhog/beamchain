@@ -29,7 +29,10 @@ varint_encode_eight_byte_test() ->
                  beamchain_serialize:encode_varint(4294967296)).
 
 varint_roundtrip_test_() ->
-    Values = [0, 1, 252, 253, 254, 255, 65535, 65536, 4294967295, 4294967296],
+    %% Roundtrip test is bounded by MAX_COMPACT_SIZE (0x02000000 = 33,554,432).
+    %% Values above MAX_COMPACT_SIZE are still encodable but decode_varint/1
+    %% rejects them (range_check=true, mirroring Core's ReadCompactSize default).
+    Values = [0, 1, 252, 253, 254, 255, 65535, 65536, 16#01FFFFFF, 16#02000000],
     [?_assertEqual({V, <<>>}, beamchain_serialize:decode_varint(
         beamchain_serialize:encode_varint(V)))
      || V <- Values].
