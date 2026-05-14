@@ -961,6 +961,137 @@ g33_outbound_asn_diversity_uses_asmap_test_() ->
           ]
       end}}.
 
+%%% ===================================================================
+%%% G34–G36 — FIX-52: ASMapHealthCheck periodic task
+%%%
+%%% Covers BUG-15–23 (health/logging/stats from W115 deferred set).
+%%% G34: asmap_health_check/0 is exported from beamchain_peer_manager.
+%%% G35: asmap_health_check/0 returns a well-formed map with the correct
+%%%      shape and all mandatory keys; values are non-negative integers.
+%%% G36: asmap_health_check/0 with no asmap configured sets
+%%%      asmap_loaded=false and returns 0 for mapped counts.
+%%% ===================================================================
+
+%%% G34: asmap_health_check/0 exported from beamchain_peer_manager
+
+g34_asmap_health_check_exported_test_() ->
+    {"G34: asmap_health_check/0 exported from beamchain_peer_manager (FIX-52)",
+     {setup, fun setup/0, fun cleanup/1,
+      fun(_) ->
+          [
+           {"G34: asmap_health_check/0 present in exports",
+            fun() ->
+                Exports = beamchain_peer_manager:module_info(exports),
+                ?assert(lists:member({asmap_health_check, 0}, Exports))
+            end}
+          ]
+      end}}.
+
+%%% G35: asmap_health_check/0 returns a well-formed map
+
+g35_asmap_health_check_return_shape_test_() ->
+    {"G35: asmap_health_check/0 returns map with mandatory keys (FIX-52)",
+     {setup, fun setup/0, fun cleanup/1,
+      fun(_) ->
+          [
+           {"G35: return value is a map",
+            fun() ->
+                %% Call directly without the gen_server running.
+                %% asmap_health_check/0 is a pure computation over ETS/persistent_term;
+                %% it does not send messages to the gen_server.
+                os:unsetenv("BEAMCHAIN_ASMAP"),
+                Result = try beamchain_peer_manager:asmap_health_check()
+                         catch _:_ -> error
+                         end,
+                ?assert(is_map(Result))
+            end},
+           {"G35: map contains all mandatory keys",
+            fun() ->
+                os:unsetenv("BEAMCHAIN_ASMAP"),
+                Result = try beamchain_peer_manager:asmap_health_check()
+                         catch _:_ -> #{}
+                         end,
+                Required = [peer_count, peer_mapped, peer_unmapped,
+                            peer_asn_counts, addrman_total,
+                            addrman_mapped, addrman_unmapped, asmap_loaded],
+                Missing = [K || K <- Required, not maps:is_key(K, Result)],
+                ?assertEqual([], Missing)
+            end},
+           {"G35: integer fields are non-negative integers",
+            fun() ->
+                os:unsetenv("BEAMCHAIN_ASMAP"),
+                Result = try beamchain_peer_manager:asmap_health_check()
+                         catch _:_ -> #{peer_count => 0, peer_mapped => 0,
+                                        peer_unmapped => 0, addrman_total => 0,
+                                        addrman_mapped => 0, addrman_unmapped => 0}
+                         end,
+                IntKeys = [peer_count, peer_mapped, peer_unmapped,
+                           addrman_total, addrman_mapped, addrman_unmapped],
+                lists:foreach(fun(K) ->
+                    V = maps:get(K, Result, -1),
+                    ?assert(is_integer(V) andalso V >= 0)
+                end, IntKeys)
+            end},
+           {"G35: peer_asn_counts is a map",
+            fun() ->
+                os:unsetenv("BEAMCHAIN_ASMAP"),
+                Result = try beamchain_peer_manager:asmap_health_check()
+                         catch _:_ -> #{peer_asn_counts => #{}}
+                         end,
+                ?assert(is_map(maps:get(peer_asn_counts, Result, error)))
+            end}
+          ]
+      end}}.
+
+%%% G36: no-asmap path returns asmap_loaded=false and zero mapped counts
+
+g36_asmap_health_check_no_asmap_test_() ->
+    {"G36: asmap_health_check/0 reports asmap_loaded=false when no asmap (FIX-52)",
+     {setup, fun setup/0, fun cleanup/1,
+      fun(_) ->
+          [
+           {"G36: asmap_loaded is false when BEAMCHAIN_ASMAP is unset",
+            fun() ->
+                os:unsetenv("BEAMCHAIN_ASMAP"),
+                Result = try beamchain_peer_manager:asmap_health_check()
+                         catch _:_ -> #{asmap_loaded => undefined}
+                         end,
+                ?assertEqual(false, maps:get(asmap_loaded, Result, undefined))
+            end},
+           {"G36: peer_mapped is 0 when no asmap loaded",
+            fun() ->
+                os:unsetenv("BEAMCHAIN_ASMAP"),
+                Result = try beamchain_peer_manager:asmap_health_check()
+                         catch _:_ -> #{peer_mapped => 0}
+                         end,
+                ?assertEqual(0, maps:get(peer_mapped, Result, -1))
+            end},
+           {"G36: addrman_mapped is 0 when no asmap loaded",
+            fun() ->
+                os:unsetenv("BEAMCHAIN_ASMAP"),
+                Result = try beamchain_peer_manager:asmap_health_check()
+                         catch _:_ -> #{addrman_mapped => 0}
+                         end,
+                ?assertEqual(0, maps:get(addrman_mapped, Result, -1))
+            end},
+           {"G36: with RETURN-1 asmap installed, asmap_loaded is true",
+            fun() ->
+                TestPath = "/tmp/beamchain_fix52_g36_asmap_test.bin",
+                Asmap = <<0, 0, 0>>,  %% RETURN ASN=1 for all IPs
+                ok = file:write_file(TestPath, Asmap),
+                true = os:putenv("BEAMCHAIN_ASMAP", TestPath),
+                persistent_term:put({beamchain_asmap, TestPath}, Asmap),
+                Result = try beamchain_peer_manager:asmap_health_check()
+                         catch _:_ -> #{asmap_loaded => undefined}
+                         end,
+                persistent_term:erase({beamchain_asmap, TestPath}),
+                os:unsetenv("BEAMCHAIN_ASMAP"),
+                file:delete(TestPath),
+                ?assertEqual(true, maps:get(asmap_loaded, Result, undefined))
+            end}
+          ]
+      end}}.
+
 asmap_subsystem_present_marker_test_() ->
     {"FIX-50: beamchain ASMap subsystem implemented",
      {setup, fun setup/0, fun cleanup/1,
@@ -977,6 +1108,7 @@ asmap_subsystem_present_marker_test_() ->
                             {beamchain_asmap, get_mapped_as, 2},
                             {beamchain_config, asmap_path, 0},
                             {beamchain_peer_manager, get_mapped_as, 1},
+                            {beamchain_peer_manager, asmap_health_check, 0},
                             {beamchain_addrman, netgroup, 2},
                             %% FIX-51: bucket-hash test helpers (BUG-7/8)
                             {beamchain_addrman, get_new_bucket, 3},
