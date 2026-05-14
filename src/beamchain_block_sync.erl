@@ -36,7 +36,8 @@
          handle_cmpctblock/2,
          handle_blocktxn/2,
          get_status/0,
-         is_too_far_ahead/2]).
+         is_too_far_ahead/2,
+         is_cmpctblock_too_deep/2]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -70,6 +71,15 @@
 
 %% Progress reporting interval
 -define(PROGRESS_INTERVAL, 1000).
+
+%% BIP152 compact block depth limits (Core net_processing.cpp:138-140).
+%% Cmpctblocks for blocks more than MAX_CMPCTBLOCK_DEPTH below the tip
+%% are rejected — the peer's mempool is unlikely to help reconstruct old
+%% blocks, and accepting them would allow unbounded pending_compact state.
+-define(MAX_CMPCTBLOCK_DEPTH, 5).
+%% Parallel constant for getblocktxn: blocks deeper than MAX_BLOCKTXN_DEPTH
+%% below the tip are served as full blocks to bound expensive disk reads.
+-define(MAX_BLOCKTXN_DEPTH, 10).
 
 %% Per-peer tracking
 -record(peer_stats, {
@@ -1095,6 +1105,18 @@ validate_and_connect(Height, Block,
 is_too_far_ahead(BlockHeight, TipHeight) ->
     BlockHeight > TipHeight + ?MIN_BLOCKS_TO_KEEP.
 
+%% Pure predicate: true when a cmpctblock's height is more than
+%% MAX_CMPCTBLOCK_DEPTH blocks below the active tip.
+%% Mirrors Core net_processing.cpp:2466 depth guard:
+%%   if (pindex->nHeight >= tip->nHeight - MAX_CMPCTBLOCK_DEPTH) → send cmpctblock
+%%   else → send full block
+%% On the receiving side we reject cmpctblocks that are too deep to avoid
+%% storing unbounded pending_compact state for blocks whose mempool overlap
+%% with the sender is negligible.
+-spec is_cmpctblock_too_deep(non_neg_integer(), integer()) -> boolean().
+is_cmpctblock_too_deep(BlockHeight, TipHeight) ->
+    BlockHeight < TipHeight - ?MAX_CMPCTBLOCK_DEPTH.
+
 %% Look up the height of the assumevalid block at startup.
 lookup_assume_valid_height(<<0:256>>) ->
     -1;
@@ -1325,6 +1347,22 @@ do_handle_unsolicited_cmpctblock(Peer, CmpctBlock, BlockHash, State) ->
     end.
 
 do_handle_cmpctblock(Peer, CmpctBlock, BlockHash, Height, State) ->
+    %% MAX_CMPCTBLOCK_DEPTH guard (Core net_processing.cpp:2466).
+    %% If the cmpctblock is more than MAX_CMPCTBLOCK_DEPTH blocks below the
+    %% current tip the peer's mempool is unlikely to assist reconstruction,
+    %% and we must not store unbounded pending_compact state for old blocks.
+    %% Fall back to requesting the full block instead.
+    TipHeight = case beamchain_chainstate:get_tip_height() of
+        {ok, H} -> H;
+        not_found -> 0
+    end,
+    case is_cmpctblock_too_deep(Height, TipHeight) of
+        true ->
+            logger:debug("block_sync: cmpctblock at height ~B is too deep "
+                         "(tip=~B, max_depth=~B); requesting full block",
+                         [Height, TipHeight, ?MAX_CMPCTBLOCK_DEPTH]),
+            request_full_block(Peer, BlockHash, State);
+        false ->
     case beamchain_compact_block:init_compact_block(CmpctBlock) of
         {ok, CompactState} ->
             %% Try to reconstruct using mempool + recent transactions
@@ -1365,6 +1403,7 @@ do_handle_cmpctblock(Peer, CmpctBlock, BlockHash, Height, State) ->
             %% A malformed cmpctblock that fails init is READ_STATUS_INVALID.
             beamchain_peer:add_misbehavior(Peer, 100),
             State
+    end
     end.
 
 %% Handle blocktxn response (missing transactions for a compact block)

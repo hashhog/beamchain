@@ -30,6 +30,11 @@
 %% How often to poll header sync status when waiting for completion
 -define(HEADER_CHECK_INTERVAL, 2000).
 
+%% BIP152 getblocktxn depth limit (Core net_processing.cpp:140/4276).
+%% When a peer sends getblocktxn for a block deeper than this below the tip
+%% we respond with a full block (cheaper to send than unbounded disk reads).
+-define(MAX_BLOCKTXN_DEPTH, 10).
+
 -record(state, {
     %% Current sync phase: idle | headers | blocks | complete
     phase = idle :: idle | headers | blocks | complete,
@@ -277,8 +282,28 @@ route_message(Peer, getblocktxn, Payload, State) ->
             logger:debug("sync: getblocktxn from ~p for ~s (~B indexes)",
                          [Peer, beamchain_serialize:hex_encode(BlockHash),
                           length(Indexes)]),
-            %% Look up the full block and respond with requested transactions
+            %% MAX_BLOCKTXN_DEPTH guard (Core net_processing.cpp:4276).
+            %% If the requested block is more than MAX_BLOCKTXN_DEPTH below the
+            %% tip, respond with the full block instead of a blocktxn message.
+            %% This bounds expensive disk reads from malicious getblocktxn floods.
+            TipH = case beamchain_chainstate:get_tip_height() of
+                {ok, H} -> H;
+                not_found -> 0
+            end,
+            BlockHeight = case beamchain_db:get_block_index_by_hash(BlockHash) of
+                {ok, #{height := BH}} -> BH;
+                _ -> TipH  %% unknown block: treat as shallow (will fail get_block)
+            end,
+            TooDeep = BlockHeight < TipH - ?MAX_BLOCKTXN_DEPTH,
+            %% Look up the full block and respond accordingly
             case beamchain_db:get_block(BlockHash) of
+                {ok, Block} when TooDeep ->
+                    %% Block is too old: send full block per Core fallback path.
+                    logger:debug("sync: getblocktxn for ~s is ~B deep (max ~B), "
+                                 "sending full block",
+                                 [beamchain_serialize:hex_encode(BlockHash),
+                                  TipH - BlockHeight, ?MAX_BLOCKTXN_DEPTH]),
+                    beamchain_peer:send_message(Peer, {block, Block});
                 {ok, Block} ->
                     Txs = Block#block.transactions,
                     TxArray = list_to_tuple(Txs),
