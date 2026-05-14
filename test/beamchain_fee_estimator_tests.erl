@@ -42,23 +42,29 @@ cleanup(_) ->
 %%% ===================================================================
 
 bucket_generation_test() ->
-    %% Test that buckets are generated and logarithmically spaced
+    %% Test that buckets are generated and logarithmically spaced.
+    %% Core layout: min=0.1 sat/vB, spacing=1.05, max=10000 sat/vB → ~237 buckets.
     Buckets = generate_test_buckets(),
-    ?assertEqual(40, length(Buckets)),
-    %% First bucket should be 1.0 sat/vB
-    ?assert(abs(hd(Buckets) - 1.0) < 0.001),
-    %% Last bucket should be ~10000 sat/vB
-    ?assert(abs(lists:last(Buckets) - 10000.0) < 1.0),
+    ?assert(length(Buckets) >= 200),
+    %% First bucket should be 0.1 sat/vB (Core MIN_BUCKET_FEERATE = 100 sat/kvB)
+    ?assert(abs(hd(Buckets) - 0.1) < 0.001),
+    %% Last bucket should be <= 10000 sat/vB
+    ?assert(lists:last(Buckets) =< 10000.0),
     %% Buckets should be strictly increasing
     ?assert(is_strictly_increasing(Buckets)).
 
 bucket_spacing_test() ->
     %% Verify logarithmic spacing: ratio between consecutive buckets
-    %% should be approximately constant
+    %% should be approximately constant and equal to FEE_SPACING=1.05.
+    %% The last bucket is an explicit MAX_BUCKET_FEERATE endpoint (10000 sat/vB)
+    %% so its ratio may be slightly irregular — we exclude it from the check.
     Buckets = generate_test_buckets(),
     Ratios = compute_ratios(Buckets),
-    %% All ratios should be approximately equal
-    [First | Rest] = Ratios,
+    %% Drop the last ratio (appended endpoint may not be exactly 1.05 spacing)
+    RegularRatios = lists:sublist(Ratios, length(Ratios) - 1),
+    [First | Rest] = RegularRatios,
+    %% All regular ratios should be approximately equal to 1.05
+    ?assert(abs(First - 1.05) < 0.01),
     lists:foreach(fun(R) ->
         ?assert(abs(R - First) < 0.001)
     end, Rest).
@@ -69,12 +75,13 @@ bucket_spacing_test() ->
 
 find_bucket_test() ->
     Buckets = generate_test_buckets(),
-    %% Fee rate of 1.0 should be in bucket 0
-    ?assertEqual(0, find_bucket(1.0, Buckets)),
+    NumBuckets = length(Buckets),
+    %% Fee rate of 0.1 (min) should be in bucket 0
+    ?assertEqual(0, find_bucket(0.1, Buckets)),
     %% Fee rate at last bucket should be in last bucket
-    ?assertEqual(39, find_bucket(10000.0, Buckets)),
+    ?assertEqual(NumBuckets - 1, find_bucket(lists:last(Buckets), Buckets)),
     %% Fee rate above max should also be in last bucket
-    ?assertEqual(39, find_bucket(50000.0, Buckets)),
+    ?assertEqual(NumBuckets - 1, find_bucket(50000.0, Buckets)),
     %% Fee rate between two buckets should be in the lower one
     B2 = lists:nth(2, Buckets),
     ?assertEqual(0, find_bucket(B2 - 0.001, Buckets)),
@@ -275,11 +282,11 @@ success_rate_none_confirmed_test() ->
 
 find_bucket_at_boundaries_test() ->
     Buckets = generate_test_buckets(),
-    %% Fee rate below minimum should be in bucket 0
-    ?assertEqual(0, find_bucket(0.5, Buckets)),
+    %% Fee rate below minimum (0.1) should be in bucket 0
+    ?assertEqual(0, find_bucket(0.05, Buckets)),
     ?assertEqual(0, find_bucket(0.001, Buckets)),
-    %% Fee rate exactly at 1.0 (first bucket) should be bucket 0
-    ?assertEqual(0, find_bucket(1.0, Buckets)).
+    %% Fee rate exactly at 0.1 (first bucket) should be bucket 0
+    ?assertEqual(0, find_bucket(0.1, Buckets)).
 
 %%% ===================================================================
 %%% Decay preserves relative proportions
@@ -301,14 +308,19 @@ decay_preserves_ratio_test() ->
 %%% Test helpers — reimplementations of internal functions
 %%% ===================================================================
 
+%% Mirror the production generate_buckets/0 logic.
+%% MIN=0.1 sat/vB, spacing=1.05, stop when Rate > 10000.0, append max boundary.
 generate_test_buckets() ->
-    Factor = math:pow(10000.0 / 1.0, 1.0 / 39),
-    generate_test_buckets(1.0, Factor, 40, []).
+    Bs = generate_test_buckets_inner(0.1, []),
+    case lists:last(Bs) < 10000.0 of
+        true  -> Bs ++ [10000.0];
+        false -> Bs
+    end.
 
-generate_test_buckets(_Rate, _Factor, 0, Acc) ->
+generate_test_buckets_inner(Rate, Acc) when Rate > 10000.0 ->
     lists:reverse(Acc);
-generate_test_buckets(Rate, Factor, N, Acc) ->
-    generate_test_buckets(Rate * Factor, Factor, N - 1, [Rate | Acc]).
+generate_test_buckets_inner(Rate, Acc) ->
+    generate_test_buckets_inner(Rate * 1.05, [Rate | Acc]).
 
 find_bucket(FeeRate, Buckets) ->
     find_bucket(FeeRate, Buckets, 0).
