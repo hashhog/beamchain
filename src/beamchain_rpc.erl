@@ -2714,7 +2714,18 @@ rpc_submitpackage([RawTxs]) when is_list(RawTxs) ->
     rpc_submitpackage([RawTxs, ?DEFAULT_MAX_RAW_TX_FEE_RATE / 100000000.0, 0]);
 rpc_submitpackage([RawTxs, MaxFeeRate]) when is_list(RawTxs) ->
     rpc_submitpackage([RawTxs, MaxFeeRate, 0]);
-rpc_submitpackage([RawTxs, _MaxFeeRate, _MaxBurnAmount]) when is_list(RawTxs) ->
+rpc_submitpackage([RawTxs, MaxFeeRate, MaxBurnAmount]) when is_list(RawTxs) ->
+    %% Convert MaxFeeRate from BTC/kvB to sat/vB (same convention as
+    %% sendrawtransaction). 0.0 means "no limit".
+    MaxFeeRateSatVB = case MaxFeeRate of
+        N when is_number(N) -> N * 100000000.0 / 1000.0;
+        _ -> 0.0
+    end,
+    %% Convert MaxBurnAmount from BTC to satoshis. 0 means "no limit".
+    MaxBurnSat = case MaxBurnAmount of
+        B when is_number(B) -> round(B * 100000000.0);
+        _ -> 0
+    end,
     %% 1. Up-front bounds check (matches Core's RPC_INVALID_PARAMETER path).
     Count = length(RawTxs),
     case Count >= 1 andalso Count =< ?MAX_PACKAGE_COUNT of
@@ -2731,7 +2742,40 @@ rpc_submitpackage([RawTxs, _MaxFeeRate, _MaxBurnAmount]) when is_list(RawTxs) ->
                 Wtxids = [beamchain_serialize:wtx_hash(Tx) || Tx <- Txs],
                 Txids = [beamchain_serialize:tx_hash(Tx) || Tx <- Txs],
 
-                %% 3. Hand off to the package validator. accept_package/1
+                %% 3. Per-tx fee-rate check (mirrors Core's client_maxfeerate
+                %%    gate in submitpackage, rpc/mempool.cpp:1367).
+                %%    Reuses check_max_fee_rate/2 from sendrawtransaction.
+                case MaxFeeRateSatVB > 0 of
+                    true ->
+                        lists:foreach(fun(Tx) ->
+                            check_max_fee_rate(Tx, MaxFeeRateSatVB)
+                        end, Txs);
+                    false ->
+                        ok
+                end,
+
+                %% 4. Per-output burn-amount check (mirrors Core's
+                %%    maxburnamount gate, rpc/mempool.cpp:1375-1390).
+                %%    Any unspendable output (OP_RETURN prefix) whose value
+                %%    exceeds MaxBurnSat causes rejection.
+                case MaxBurnSat > 0 of
+                    true ->
+                        lists:foreach(fun(Tx) ->
+                            lists:foreach(fun(#tx_out{value = V,
+                                                      script_pubkey = SPK}) ->
+                                case ds_is_unspendable(SPK) andalso V > MaxBurnSat of
+                                    true ->
+                                        throw({burn_amount_exceeded, V, MaxBurnSat});
+                                    false ->
+                                        ok
+                                end
+                            end, Tx#transaction.outputs)
+                        end, Txs);
+                    false ->
+                        ok
+                end,
+
+                %% 5. Hand off to the package validator. accept_package/1
                 %%    enforces topology + atomicity in beamchain_mempool.
                 {PackageMsg, AcceptedSet} =
                     case beamchain_mempool:accept_package(Txs) of
@@ -2743,7 +2787,7 @@ rpc_submitpackage([RawTxs, _MaxFeeRate, _MaxBurnAmount]) when is_list(RawTxs) ->
                             {ReasonBin, sets:new()}
                         end,
 
-                %% 4. Per-tx result map keyed by wtxid (Core shape).
+                %% 6. Per-tx result map keyed by wtxid (Core shape).
                 TxResultMap = lists:foldl(
                     fun({Tx, Wtxid, Txid}, Acc) ->
                         WtxidHex = hash_to_hex(Wtxid),
@@ -2754,7 +2798,7 @@ rpc_submitpackage([RawTxs, _MaxFeeRate, _MaxBurnAmount]) when is_list(RawTxs) ->
                     #{},
                     lists:zip3(Txs, Wtxids, Txids)),
 
-                %% 5. Relay every accepted tx (matches Core's broadcast pass).
+                %% 7. Relay every accepted tx (matches Core's broadcast pass).
                 lists:foreach(fun(Txid) ->
                     case sets:is_element(Txid, AcceptedSet) of
                         true -> relay_transaction(Txid);
@@ -2771,6 +2815,16 @@ rpc_submitpackage([RawTxs, _MaxFeeRate, _MaxBurnAmount]) when is_list(RawTxs) ->
                     <<"replaced-transactions">> => []
                 }}
             catch
+                throw:{max_fee_exceeded, FeeRate} ->
+                    {error, ?RPC_VERIFY_REJECTED,
+                     iolist_to_binary(io_lib:format(
+                         "Fee rate (~.2f sat/vB) exceeds maximum (~.2f sat/vB)",
+                         [FeeRate, MaxFeeRateSatVB]))};
+                throw:{burn_amount_exceeded, ActualSat, LimitSat} ->
+                    {error, ?RPC_VERIFY_REJECTED,
+                     iolist_to_binary(io_lib:format(
+                         "Unspendable output value (~B sat) exceeds maxburnamount (~B sat)",
+                         [ActualSat, LimitSat]))};
                 throw:{decode_failed, BadHex} ->
                     {error, ?RPC_DESERIALIZATION_ERROR,
                      iolist_to_binary(io_lib:format(
