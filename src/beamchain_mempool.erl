@@ -778,6 +778,12 @@ do_add_transaction(Tx, State) ->
         beamchain_zmq:notify_transaction(Tx, mempool_add, ZmqSeq),
         State5 = State4#state{zmq_seq = ZmqSeq + 1},
 
+        %% 21. Fee estimator: record this tx so that when it is confirmed
+        %% in a block, process_block/2 can compute its confirmation latency.
+        %% FeeRate is in sat/vB (float); TipHeight is the mempool admission height.
+        %% Uses the gen_server cast (non-blocking) to avoid delaying admission.
+        beamchain_fee_estimator:track_tx(Txid, FeeRate, TipHeight),
+
         logger:debug("mempool: accepted ~s (fee_rate=~.1f sat/vB, ~B vB)",
                      [short_hex(Txid), FeeRate, VSize]),
         {ok, Txid, State5}

@@ -1016,7 +1016,11 @@ do_connect_block_inner(#block{header = Header} = Block,
                                 [beamchain_serialize:tx_hash(T)
                                  || T <- RegularTxs]
                         end,
-                        beamchain_mempool:remove_for_block_async(ConfirmedTxids)
+                        beamchain_mempool:remove_for_block_async(ConfirmedTxids),
+                        %% Fee estimator: update confirmation latency stats for
+                        %% every non-coinbase tx in this block.  Cast is
+                        %% non-blocking so it cannot delay the connect path.
+                        beamchain_fee_estimator:process_block(Height, ConfirmedTxids)
                 end,
 
                 %% ZMQ notification for block connect
