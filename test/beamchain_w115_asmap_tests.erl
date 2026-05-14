@@ -778,9 +778,188 @@ g30_asmap_module_complete_test_() ->
 %%% BUG-3 (netgroup/2 with ASN), BUG-4 (MAX_ASMAP_FILE_SIZE),
 %%% BUG-5 (SanityCheckAsmap), BUG-6 (AsmapVersion), BUG-11 (using_asmap
 %%% equivalent via asmap_path()), BUG-12 (mapped_as in getpeerinfo).
-%%% Deferred to FIX-51: BUG-7/8/9 (bucket hash with ASN group),
-%%% BUG-10 (peers.dat asmap_version), BUG-13 (source_mapped_as),
+%%% FIX-51 closes: BUG-7 (get_new_bucket uses ASN group), BUG-8 (get_tried_bucket
+%%% uses ASN group), BUG-9 (outbound diversity uses ASN group).
+%%% Deferred: BUG-10 (peers.dat asmap_version), BUG-13 (source_mapped_as),
 %%% BUG-14 (getnetworkinfo asmap), BUG-15–23 (health/logging/stats).
+
+%%% ===================================================================
+%%% G31 — BUG-7 fix: get_new_bucket uses ASN-derived group when asmap loaded
+%%%
+%%% Without fix: two IPs from different /16s get different AddrGroup keys,
+%%% so they hash to different buckets even if they're in the same AS.
+%%% With fix: both get group {asn, 1} (RETURN-1 asmap), so they hash to the
+%%% SAME new bucket — an AS now gets a single bucket pool, not N /16 pools.
+%%%
+%%% Core: addrman.cpp GetNewBucket() calls AddrInfo::GetGroup() which calls
+%%% NetGroupManager::GetGroup() → GetMappedAS() when m_asmap.size() > 0.
+%%% ===================================================================
+
+g31_get_new_bucket_uses_asn_group_test_() ->
+    {"G31: get_new_bucket uses ASN-derived group when asmap loaded (BUG-7)",
+     {setup, fun setup/0, fun cleanup/1,
+      fun(_) ->
+          [
+           {"G31: get_new_bucket/3 exported from beamchain_addrman",
+            fun() ->
+                Exports = beamchain_addrman:module_info(exports),
+                ?assert(lists:member({get_new_bucket, 3}, Exports))
+            end},
+           {"G31: without asmap, different /16s → different new buckets",
+            fun() ->
+                os:unsetenv("BEAMCHAIN_ASMAP"),
+                Secret = crypto:strong_rand_bytes(32),
+                %% Two IPs from different /16s
+                B1 = beamchain_addrman:get_new_bucket({{1,2,3,4},8333}, other, Secret),
+                B2 = beamchain_addrman:get_new_bucket({{5,6,7,8},8333}, other, Secret),
+                %% Without asmap: netgroup({1,2,3,4,8333}) = {ipv4,1,2}
+                %%                netgroup({5,6,7,8,8333}) = {ipv4,5,6}
+                %% → different AddrGroup → almost certainly different buckets
+                ?assertNotEqual(B1, B2)
+            end},
+           {"G31: with RETURN-1 asmap, different /16s → same new bucket",
+            fun() ->
+                %% Install RETURN-1 asmap in persistent_term so get_new_bucket
+                %% picks it up via get_asmap_binary()
+                TestPath = "/tmp/beamchain_fix51_g31_asmap_test.bin",
+                true = os:putenv("BEAMCHAIN_ASMAP", TestPath),
+                Asmap = <<0, 0, 0>>,  %% RETURN ASN=1 for every IP
+                persistent_term:put({beamchain_asmap, TestPath}, Asmap),
+                Secret = crypto:strong_rand_bytes(32),
+                %% Both IPs map to ASN 1 → same AddrGroup = {asn, 1}
+                B1 = beamchain_addrman:get_new_bucket({{1,2,3,4},8333}, other, Secret),
+                B2 = beamchain_addrman:get_new_bucket({{5,6,7,8},8333}, other, Secret),
+                persistent_term:erase({beamchain_asmap, TestPath}),
+                os:unsetenv("BEAMCHAIN_ASMAP"),
+                %% Both get AddrGroup {asn,1} → same bucket
+                ?assertEqual(B1, B2)
+            end}
+          ]
+      end}}.
+
+%%% ===================================================================
+%%% G32 — BUG-8 fix: get_tried_bucket uses ASN-derived group when asmap loaded
+%%%
+%%% Same principle as G31 but for the tried table.
+%%% Core: addrman.cpp GetTriedBucket() calls GetGroup() which calls GetMappedAS().
+%%% ===================================================================
+
+g32_get_tried_bucket_uses_asn_group_test_() ->
+    {"G32: get_tried_bucket uses ASN-derived group when asmap loaded (BUG-8)",
+     {setup, fun setup/0, fun cleanup/1,
+      fun(_) ->
+          [
+           {"G32: get_tried_bucket/2 exported from beamchain_addrman",
+            fun() ->
+                Exports = beamchain_addrman:module_info(exports),
+                ?assert(lists:member({get_tried_bucket, 2}, Exports))
+            end},
+           {"G32: with asmap, tried-bucket addrGroup uses ASN key (not /16)",
+            fun() ->
+                %% Core: GetTriedBucket() calls GetGroup() which uses GetMappedAS().
+                %% We verify the group key used in bucket hashing is ASN-derived
+                %% by checking that netgroup/2 returns {asn, N} for both IPs —
+                %% because get_tried_bucket internally calls netgroup(Address, Asmap).
+                Asmap = <<0, 0, 0>>,  %% RETURN ASN=1 for every IP
+                NG1 = beamchain_addrman:netgroup({{1,2,3,4},8333}, Asmap),
+                NG2 = beamchain_addrman:netgroup({{5,6,7,8},8333}, Asmap),
+                %% Both should resolve to {asn, 1} — the ASN group, not /16
+                ?assertEqual({asn, 1}, NG1),
+                ?assertEqual({asn, 1}, NG2),
+                ?assertEqual(NG1, NG2)
+            end},
+           {"G32: with asmap, same IP uses ASN group in tried bucket (different from no-asmap)",
+            fun() ->
+                %% The tried bucket for the same address should differ when the
+                %% AddrGroup key changes from {ipv4,1,2} to {asn,1} because
+                %% hash2 = CheapHash(nKey || addrGroup || slot1) depends on addrGroup.
+                TestPath = "/tmp/beamchain_fix51_g32_asmap_test.bin",
+                true = os:putenv("BEAMCHAIN_ASMAP", TestPath),
+                Asmap = <<0, 0, 0>>,
+                persistent_term:put({beamchain_asmap, TestPath}, Asmap),
+                Secret = crypto:strong_rand_bytes(32),
+                Addr = {{1,2,3,4},8333},
+                BucketWithAsmap = beamchain_addrman:get_tried_bucket(Addr, Secret),
+                persistent_term:erase({beamchain_asmap, TestPath}),
+                os:unsetenv("BEAMCHAIN_ASMAP"),
+                BucketNoAsmap = beamchain_addrman:get_tried_bucket(Addr, Secret),
+                %% The ASN group {asn,1} =/= /16 group {ipv4,1,2} →
+                %% hash2 differs → bucket value changes (eclipse-resistance activated)
+                ?assertNotEqual(BucketWithAsmap, BucketNoAsmap)
+            end}
+          ]
+      end}}.
+
+%%% ===================================================================
+%%% G33 — BUG-9 fix: outbound ASN-diversity uses netgroup/2 when asmap loaded
+%%%
+%%% has_netgroup_diversity/2 in beamchain_peer_manager used netgroup/1 (plain
+%%% /16) even when an ASMap was loaded.  With the fix it uses netgroup/2 so
+%%% that two peers in the same /16 but different ASNs are permitted (different
+%%% netgroup keys), while two peers in different /16s but the same ASN are
+%%% rejected (same netgroup key = {asn, N}).
+%%%
+%%% We test the observable change via beamchain_addrman:netgroup/2 directly
+%%% (which is the same function that has_netgroup_diversity now calls), and
+%%% verify that a simulated diversity set enforces ASN-level uniqueness.
+%%%
+%%% Core: net.cpp CConnman::AttemptToEvictConnection() + OpenNetworkConnection()
+%%% both call CAddress::GetGroup() which honours m_asmap.
+%%% ===================================================================
+
+g33_outbound_asn_diversity_uses_asmap_test_() ->
+    {"G33: outbound diversity enforces ASN-level uniqueness when asmap loaded (BUG-9)",
+     {setup, fun setup/0, fun cleanup/1,
+      fun(_) ->
+          [
+           {"G33: with asmap, two IPs in same /16 → same netgroup when same ASN",
+            fun() ->
+                %% RETURN-1 asmap: every IP → ASN 1 → group {asn, 1}
+                Asmap = <<0, 0, 0>>,
+                NG1 = beamchain_addrman:netgroup({{1,2,3,4},8333}, Asmap),
+                %% Same /16, same ASN (both → ASN 1)
+                NG2 = beamchain_addrman:netgroup({{1,2,5,6},8333}, Asmap),
+                ?assertEqual({asn, 1}, NG1),
+                ?assertEqual(NG1, NG2)
+            end},
+           {"G33: with asmap, two IPs in different /16s → same netgroup when same ASN",
+            fun() ->
+                %% RETURN-1 asmap: every IP → ASN 1
+                Asmap = <<0, 0, 0>>,
+                NG1 = beamchain_addrman:netgroup({{1,2,3,4},8333}, Asmap),
+                NG2 = beamchain_addrman:netgroup({{9,10,11,12},8333}, Asmap),
+                %% Different /16 but both in ASN 1 → same group
+                ?assertEqual({asn, 1}, NG1),
+                ?assertEqual(NG1, NG2)
+            end},
+           {"G33: without asmap, two IPs in different /16s → different netgroups",
+            fun() ->
+                NG1 = beamchain_addrman:netgroup({{1,2,3,4},8333}),
+                NG2 = beamchain_addrman:netgroup({{9,10,11,12},8333}),
+                ?assertNotEqual(NG1, NG2)
+            end},
+           {"G33: simulated diversity set: with asmap, second peer in same ASN rejected",
+            fun() ->
+                Asmap = <<0, 0, 0>>,
+                %% Simulate the outbound_netgroups set after connecting to 1.2.3.4
+                NG1 = beamchain_addrman:netgroup({{1,2,3,4},8333}, Asmap),
+                NGs = sets:add_element(NG1, sets:new([{version, 2}])),
+                %% Now try 5.6.7.8 — different /16 but same ASN 1 → rejected
+                NG2 = beamchain_addrman:netgroup({{5,6,7,8},8333}, Asmap),
+                AlreadyConnected = sets:is_element(NG2, NGs),
+                ?assert(AlreadyConnected)
+            end},
+           {"G33: simulated diversity set: without asmap, different /16 is allowed",
+            fun() ->
+                %% Without asmap: groups are /16 based, so 1.2.x.x and 5.6.x.x differ
+                NG1 = beamchain_addrman:netgroup({{1,2,3,4},8333}),
+                NGs = sets:add_element(NG1, sets:new([{version, 2}])),
+                NG2 = beamchain_addrman:netgroup({{5,6,7,8},8333}),
+                AlreadyConnected = sets:is_element(NG2, NGs),
+                ?assertNot(AlreadyConnected)
+            end}
+          ]
+      end}}.
 
 asmap_subsystem_present_marker_test_() ->
     {"FIX-50: beamchain ASMap subsystem implemented",
@@ -798,7 +977,10 @@ asmap_subsystem_present_marker_test_() ->
                             {beamchain_asmap, get_mapped_as, 2},
                             {beamchain_config, asmap_path, 0},
                             {beamchain_peer_manager, get_mapped_as, 1},
-                            {beamchain_addrman, netgroup, 2}],
+                            {beamchain_addrman, netgroup, 2},
+                            %% FIX-51: bucket-hash test helpers (BUG-7/8)
+                            {beamchain_addrman, get_new_bucket, 3},
+                            {beamchain_addrman, get_tried_bucket, 2}],
                 _ = AllMods,
                 Missing = [{M, F, A} || {M, F, A} <- AsmapFns,
                                         not lists:member({F, A},
