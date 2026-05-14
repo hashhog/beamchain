@@ -71,7 +71,8 @@
          update_ping_latency/2,
          notify_tip_updated/0,
          %% ASMap
-         get_mapped_as/1]).
+         get_mapped_as/1,
+         asmap_health_check/0]).
 
 %% Exposed for testing (BIP35 mempool inv chunking; BIP-339 inv type selection)
 -export([chunk_inv_items/2, inv_items_from_pairs/2]).
@@ -126,6 +127,13 @@
 -define(STALE_TIP_CHECK_INTERVAL, 600000).   %% 10 minutes in milliseconds
 -define(STALE_TIP_AGE_THRESHOLD, 1800).      %% 30 minutes: 3 * nPowTargetSpacing
 -define(PERIODIC_HEADER_INTERVAL, 300000).   %% 5 minutes: periodic getheaders
+
+%% ASMap health-check interval: 3600 s (Bitcoin Core does not have a
+%% strict equivalent; this mirrors the once-per-hour cadence used by
+%% the Core diagnostic log line "Loaded asmap with N unique ASNs").
+-define(ASMAP_HEALTH_CHECK_INTERVAL, 3600000). %% 1 hour in milliseconds
+%% Top-N ASNs reported in the health log.
+-define(ASMAP_HEALTH_TOP_N, 10).
 
 %% Cold-start DNS warm-up: hold the connect_tick loop for up to this long on
 %% startup so that DNS seed resolution has a chance to populate addrman /
@@ -209,7 +217,9 @@
     %% completed, or the warm-up deadline has elapsed. While false,
     %% connect_tick is not scheduled — anchors and inbound accepts still
     %% operate normally.
-    dns_warmup_done = false :: boolean()
+    dns_warmup_done = false :: boolean(),
+    %% Timer for periodic ASMap health check (every 3600 s)
+    asmap_health_timer :: reference() | undefined
 }).
 
 %%% ===================================================================
@@ -457,6 +467,98 @@ get_mapped_as(IP) ->
             end
     end.
 
+%% @doc Run an ASMap health-check snapshot and log the results.
+%%
+%% Counts unique ASNs across all currently connected peers and all
+%% addresses in AddrMan, split into mapped (ASN > 0) and unmapped
+%% (ASN = 0). Logs a summary line and the top-N ASNs by peer count.
+%%
+%% Called at startup (once) and then every ASMAP_HEALTH_CHECK_INTERVAL
+%% seconds via the asmap_health_check timer.
+%%
+%% Returns the health map for introspection / testing:
+%%   #{peer_count       => N,
+%%     peer_mapped      => M,
+%%     peer_unmapped    => U,
+%%     peer_asn_counts  => #{ASN => Count},
+%%     addrman_total    => T,
+%%     addrman_mapped   => AM,
+%%     addrman_unmapped => AU,
+%%     asmap_loaded     => boolean()}
+-spec asmap_health_check() -> map().
+asmap_health_check() ->
+    Asmap = get_asmap_binary(),
+    AsmapLoaded = Asmap =/= undefined,
+
+    %% ── 1. Connected peers ─────────────────────────────────────────────
+    %% Guard with try/catch: PEER_TABLE may not exist in unit-test mode
+    %% (gen_server not started), so degrade gracefully to zero counts.
+    {PeerCount, PeerMapped, PeerUnmapped, PeerAsnCounts} =
+        try
+            ets:foldl(fun
+                (#peer_entry{connected = true, address = {IP, _Port}}, Acc)
+                  when is_tuple(IP) ->
+                    asmap_acc_ip(IP, Asmap, Acc);
+                (_, Acc) ->
+                    Acc
+            end, {0, 0, 0, #{}}, ?PEER_TABLE)
+        catch
+            _:_ -> {0, 0, 0, #{}}
+        end,
+
+    %% ── 2. AddrMan addresses ───────────────────────────────────────────
+    {AddrTotal, AddrMapped, AddrUnmapped} =
+        try
+            {New, Tried} = beamchain_addrman:count(),
+            Total = New + Tried,
+            case AsmapLoaded of
+                false ->
+                    {Total, 0, Total};
+                true ->
+                    %% Walk all addresses via get_addresses/1; use a large N
+                    %% to get everything (addrman caps at MAX_NEW + MAX_TRIED).
+                    Addrs = beamchain_addrman:get_addresses(65536),
+                    lists:foldl(fun
+                        ({IP, _Port}, {T, M, U}) when is_tuple(IP) ->
+                            case beamchain_asmap:get_mapped_as(Asmap, IP) of
+                                0 -> {T + 1, M, U + 1};
+                                _ -> {T + 1, M + 1, U}
+                            end;
+                        (_, {T, M, U}) ->
+                            {T + 1, M, U + 1}
+                    end, {0, 0, 0}, Addrs)
+            end
+        catch
+            _:_ -> {0, 0, 0}
+        end,
+
+    %% ── 3. Top-N ASNs ──────────────────────────────────────────────────
+    TopN = top_n_asns(PeerAsnCounts, ?ASMAP_HEALTH_TOP_N),
+
+    %% ── 4. Log ─────────────────────────────────────────────────────────
+    case AsmapLoaded of
+        false ->
+            logger:info("asmap health: no asmap loaded — "
+                        "peers=~B addrman=~B (all unmapped)",
+                        [PeerCount, AddrTotal]);
+        true ->
+            logger:info("asmap health: peers=~B mapped=~B unmapped=~B | "
+                        "addrman=~B mapped=~B unmapped=~B | "
+                        "unique_peer_asns=~B top~B=~p",
+                        [PeerCount, PeerMapped, PeerUnmapped,
+                         AddrTotal, AddrMapped, AddrUnmapped,
+                         map_size(PeerAsnCounts), ?ASMAP_HEALTH_TOP_N, TopN])
+    end,
+
+    #{peer_count       => PeerCount,
+      peer_mapped      => PeerMapped,
+      peer_unmapped    => PeerUnmapped,
+      peer_asn_counts  => PeerAsnCounts,
+      addrman_total    => AddrTotal,
+      addrman_mapped   => AddrMapped,
+      addrman_unmapped => AddrUnmapped,
+      asmap_loaded     => AsmapLoaded}.
+
 %%% ===================================================================
 %%% gen_server callbacks
 %%% ===================================================================
@@ -503,6 +605,11 @@ init([]) ->
     StaleTipTimer = erlang:send_after(?STALE_TIP_CHECK_INTERVAL, self(), check_stale_tip),
     %% Schedule periodic getheaders to random peer
     PeriodicHdrTimer = erlang:send_after(?PERIODIC_HEADER_INTERVAL, self(), periodic_getheaders),
+    %% Run initial ASMap health check at startup, then schedule periodic runs.
+    %% Mirrors the once-per-hour diagnostic log in Bitcoin Core init.cpp.
+    self() ! asmap_health_check,
+    AsmapHealthTimer = erlang:send_after(?ASMAP_HEALTH_CHECK_INTERVAL, self(),
+                                         asmap_health_check),
     Now = erlang:system_time(second),
     MaxInbound = beamchain_config:get(max_inbound, ?MAX_INBOUND_DEFAULT),
     {ok, #state{our_nonce = Nonce, connect_timer = Timer,
@@ -512,7 +619,8 @@ init([]) ->
                 stale_check_timer = StaleTimer,
                 last_tip_update = Now,
                 stale_tip_timer = StaleTipTimer,
-                periodic_header_timer = PeriodicHdrTimer}}.
+                periodic_header_timer = PeriodicHdrTimer,
+                asmap_health_timer = AsmapHealthTimer}}.
 
 handle_call({connect_to, IP, Port}, _From, State) ->
     Address = {IP, Port},
@@ -866,6 +974,13 @@ handle_info(periodic_getheaders, State) ->
     send_periodic_getheaders(),
     Timer = erlang:send_after(?PERIODIC_HEADER_INTERVAL, self(), periodic_getheaders),
     {noreply, State#state{periodic_header_timer = Timer}};
+
+%% ASMap health check — runs at startup and then every 3600 s.
+%% Logs unique-ASN diversity across connected peers + addrman.
+handle_info(asmap_health_check, State) ->
+    catch asmap_health_check(),
+    Timer = erlang:send_after(?ASMAP_HEALTH_CHECK_INTERVAL, self(), asmap_health_check),
+    {noreply, State#state{asmap_health_timer = Timer}};
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -2465,6 +2580,41 @@ get_network_type({16#FC00, _, _, _, _, _, _, _}) ->
     cjdns;
 get_network_type({_, _, _, _, _, _, _, _}) ->
     ipv6.
+
+%%% ===================================================================
+%%% Internal: ASMap health-check helpers
+%%% ===================================================================
+
+%% @doc Accumulate ASN stats for a single IP address.
+%%
+%% Updates the {PeerCount, Mapped, Unmapped, AsnCounts} accumulator:
+%%   - If AsmapLoaded is false (Asmap = undefined), the IP is unmapped.
+%%   - If the lookup returns ASN > 0, increment mapped + AsnCounts[ASN].
+%%   - If the lookup returns 0, increment unmapped.
+-spec asmap_acc_ip(inet:ip_address(), binary() | undefined,
+                   {non_neg_integer(), non_neg_integer(),
+                    non_neg_integer(), #{non_neg_integer() => non_neg_integer()}})
+    -> {non_neg_integer(), non_neg_integer(),
+        non_neg_integer(), #{non_neg_integer() => non_neg_integer()}}.
+asmap_acc_ip(IP, undefined, {Count, Mapped, Unmapped, Counts}) ->
+    _ = IP,
+    {Count + 1, Mapped, Unmapped + 1, Counts};
+asmap_acc_ip(IP, Asmap, {Count, Mapped, Unmapped, Counts}) ->
+    case beamchain_asmap:get_mapped_as(Asmap, IP) of
+        0 ->
+            {Count + 1, Mapped, Unmapped + 1, Counts};
+        ASN ->
+            NewCounts = maps:update_with(ASN, fun(N) -> N + 1 end, 1, Counts),
+            {Count + 1, Mapped + 1, Unmapped, NewCounts}
+    end.
+
+%% @doc Return the top-N ASNs by peer count as a sorted list of {ASN, Count}.
+-spec top_n_asns(#{non_neg_integer() => non_neg_integer()}, non_neg_integer())
+    -> [{non_neg_integer(), non_neg_integer()}].
+top_n_asns(AsnCounts, N) ->
+    Sorted = lists:sort(fun({_, A}, {_, B}) -> A >= B end,
+                        maps:to_list(AsnCounts)),
+    lists:sublist(Sorted, N).
 
 %% @doc True for loopback addresses.
 %% Mirrors Bitcoin Core CNetAddr::IsLocal() — these addresses are never
