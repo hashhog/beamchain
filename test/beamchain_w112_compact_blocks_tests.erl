@@ -155,20 +155,35 @@ g2_new_cap_enforced_test() ->
                  beamchain_compact_block:init_compact_block(Msg)).
 
 %%% ===================================================================
-%%% G3  MAX_CMPCT_BLOCK_DEPTH = 5 (BUG-A: guard ABSENT)
+%%% G3  MAX_CMPCT_BLOCK_DEPTH = 5 (BUG-A: guard now present)
 %%% ===================================================================
 
-%% Verify the depth constant is not defined in the codebase (documents the gap).
-g3_depth_guard_absent_test() ->
-    %% beamchain_block_sync has no MAX_CMPCT_BLOCK_DEPTH constant and
-    %% no depth check in do_handle_cmpctblock. This test documents the gap.
-    %% The correct behavior: cmpctblock for a height > tip+5 must be rejected.
-    %% We cannot easily exercise the full gen_server path in a unit test,
-    %% so we assert the property at the library level: there is no public
-    %% API in beamchain_compact_block or beamchain_block_sync that takes
-    %% a tip_height and rejects deep blocks.
-    %% ACTION NEEDED: add depth guard in do_handle_cmpctblock/4.
-    true = true. %% placeholder — gap is in wiring, not in compact_block.erl
+%% Verify is_cmpctblock_too_deep/2 correctly implements the
+%% MAX_CMPCTBLOCK_DEPTH=5 guard from Core net_processing.cpp:2466.
+%% Core condition for sending cmpctblock: pindex->nHeight >= tip->nHeight - 5
+%% i.e. reject if: BlockHeight < TipHeight - 5
+
+g3_depth_guard_at_boundary_test() ->
+    %% tip=100, block=95 → depth=5 → NOT too deep (exactly at limit).
+    ?assertEqual(false, beamchain_block_sync:is_cmpctblock_too_deep(95, 100)).
+
+g3_depth_guard_one_over_test() ->
+    %% tip=100, block=94 → depth=6 → TOO deep.
+    ?assertEqual(true, beamchain_block_sync:is_cmpctblock_too_deep(94, 100)).
+
+g3_depth_guard_shallow_test() ->
+    %% tip=100, block=100 → depth=0 → NOT too deep.
+    ?assertEqual(false, beamchain_block_sync:is_cmpctblock_too_deep(100, 100)).
+
+g3_depth_guard_future_block_test() ->
+    %% Future block (height > tip) → NOT too deep.
+    ?assertEqual(false, beamchain_block_sync:is_cmpctblock_too_deep(101, 100)).
+
+g3_depth_guard_low_tip_test() ->
+    %% Near genesis: tip=3, block=0 → depth=3 → NOT too deep.
+    ?assertEqual(false, beamchain_block_sync:is_cmpctblock_too_deep(0, 3)),
+    %% tip=6, block=0 → depth=6 → TOO deep.
+    ?assertEqual(true, beamchain_block_sync:is_cmpctblock_too_deep(0, 6)).
 
 %%% ===================================================================
 %%% G4  SipHash-2-4 constants
