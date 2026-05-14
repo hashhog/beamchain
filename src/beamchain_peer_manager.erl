@@ -630,10 +630,13 @@ handle_info({peer_connected, Pid, Info}, State) ->
             ets:insert(?PEER_TABLE, Entry2),
             %% Mark as tried in addrman
             beamchain_addrman:mark_tried(Addr),
-            %% Track outbound netgroup
+            %% Track outbound netgroup.
+            %% Use asmap-aware netgroup for consistency with
+            %% has_netgroup_diversity/2 (BUG-9 fix).
             State2 = case Dir of
                 outbound ->
-                    NG = beamchain_addrman:netgroup(Addr),
+                    Asmap = get_asmap_binary(),
+                    NG = beamchain_addrman:netgroup(Addr, Asmap),
                     NGs = sets:add_element(NG, State#state.outbound_netgroups),
                     State#state{outbound_netgroups = NGs};
                 inbound ->
@@ -1034,10 +1037,45 @@ can_connect(Address, State) ->
         andalso find_peer_by_address(Address) =:= error
         andalso has_netgroup_diversity(Address, State).
 
-%% Ensure we don't connect to more than 1 outbound peer per netgroup
-%% (strict diversity for eclipse protection)
+%% @doc Retrieve the loaded ASMap binary from persistent_term, or undefined.
+%%
+%% Used by netgroup-diversity checks so that, when an ASMap is configured,
+%% two peers in the same /16 but different ASNs are treated as distinct
+%% netgroups for outbound eclipse-protection purposes (BUG-9 fix).
+%% Mirrors the same caching pattern as get_mapped_as/1.
+-spec get_asmap_binary() -> binary() | undefined.
+get_asmap_binary() ->
+    Path = try beamchain_config:asmap_path()
+           catch _:_ -> undefined
+           end,
+    case Path of
+        undefined ->
+            undefined;
+        _ ->
+            case persistent_term:get({beamchain_asmap, Path}, undefined) of
+                undefined ->
+                    case beamchain_asmap:load_asmap(Path) of
+                        {ok, Asmap} ->
+                            persistent_term:put({beamchain_asmap, Path}, Asmap),
+                            Asmap;
+                        {error, _} ->
+                            undefined
+                    end;
+                Asmap ->
+                    Asmap
+            end
+    end.
+
+%% Ensure we don't connect to more than 1 outbound peer per netgroup.
+%% When an ASMap is loaded, uses ASN-derived group for eclipse-protection
+%% (BUG-9 fix): peers in different ASNs but same /16 are now treated as
+%% distinct netgroups, preventing a single AS from filling all outbound slots.
+%% Mirrors Bitcoin Core net.cpp CConnman::AttemptToEvictConnection() and
+%% OpenNetworkConnection() which both use CAddress::GetGroup() →
+%% NetGroupManager::GetGroup() honouring m_asmap when non-empty.
 has_netgroup_diversity(Address, #state{outbound_netgroups = NGs}) ->
-    NG = beamchain_addrman:netgroup(Address),
+    Asmap = get_asmap_binary(),
+    NG = beamchain_addrman:netgroup(Address, Asmap),
     not sets:is_element(NG, NGs).
 
 count_outbound_by_type(Type) ->
@@ -1069,8 +1107,12 @@ do_connect({IP, _Port} = Address, ConnType, IsManual, State) ->
                 manual = IsManual
             },
             ets:insert(?PEER_TABLE, Entry),
-            %% Track netgroup for diversity (before connection completes)
-            NG = beamchain_addrman:netgroup(Address),
+            %% Track netgroup for diversity (before connection completes).
+            %% Use asmap-aware netgroup so ASN-diversity is enforced when
+            %% an ASMap is loaded (BUG-9 fix: must be consistent with
+            %% has_netgroup_diversity/2 which also uses get_asmap_binary()).
+            Asmap = get_asmap_binary(),
+            NG = beamchain_addrman:netgroup(Address, Asmap),
             NGs = sets:add_element(NG, State#state.outbound_netgroups),
             {ok, Pid, State#state{outbound_netgroups = NGs}};
         {error, Reason} ->

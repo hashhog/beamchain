@@ -32,7 +32,10 @@
          count/0,
          netgroup/1,
          netgroup/2,
-         get_secret/0]).
+         get_secret/0,
+         %% Exported for testing: bucket assignment helpers (pure, deterministic)
+         get_new_bucket/3,
+         get_tried_bucket/2]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -387,15 +390,54 @@ bucket_hash(NKey, Terms) ->
     <<Hash:32/little-unsigned-integer, _/binary>> = Round2,
     Hash.
 
+%% @doc Retrieve the loaded ASMap binary from persistent_term, or undefined.
+%%
+%% Mirrors the pattern in beamchain_peer_manager:get_mapped_as/1.
+%% Called by get_new_bucket/3 and get_tried_bucket/2 to resolve the
+%% ASN-derived group when an asmap has been configured (BUG-7/BUG-8 fix).
+%%
+%% Wraps beamchain_config:asmap_path() in a try/catch so that unit tests
+%% that call get_new_bucket/3 or get_tried_bucket/2 directly (without
+%% starting the config ETS table) still work — the function gracefully
+%% returns undefined rather than crashing.
+-spec get_asmap_binary() -> binary() | undefined.
+get_asmap_binary() ->
+    Path = try beamchain_config:asmap_path()
+           catch _:_ -> undefined
+           end,
+    case Path of
+        undefined ->
+            undefined;
+        _ ->
+            case persistent_term:get({beamchain_asmap, Path}, undefined) of
+                undefined ->
+                    %% Try to load and cache on-demand (same as peer_manager)
+                    case beamchain_asmap:load_asmap(Path) of
+                        {ok, Asmap} ->
+                            persistent_term:put({beamchain_asmap, Path}, Asmap),
+                            Asmap;
+                        {error, _} ->
+                            undefined
+                    end;
+                Asmap ->
+                    Asmap
+            end
+    end.
+
 %% @doc Compute bucket for new table entry.
 %% Uses address netgroup and source netgroup to determine bucket.
+%%
+%% When an ASMap is configured, uses ASN-derived group for the address
+%% (BUG-7 fix: Core's GetNewBucket calls GetGroup() which uses GetMappedAS()
+%% when m_asmap is non-empty, giving each AS its own bucket pool).
 %%
 %% Mirrors Bitcoin Core addrman.cpp AddrInfo::GetNewBucket():
 %%   hash1 = CheapHash(nKey || addrGroup || srcGroup)
 %%   hash2 = CheapHash(nKey || srcGroup || (hash1 % NEW_BUCKETS_PER_SOURCE_GROUP))
 %%   bucket = hash2 % NEW_BUCKET_COUNT
 get_new_bucket(Address, SourceNetgroup, Secret) ->
-    AddrGroup = netgroup(Address),
+    Asmap = get_asmap_binary(),
+    AddrGroup = netgroup(Address, Asmap),
     Hash1 = bucket_hash(Secret, [AddrGroup, SourceNetgroup]),
     Slot1 = Hash1 rem ?NEW_BUCKETS_PER_SOURCE_GROUP,
     Hash2 = bucket_hash(Secret, [SourceNetgroup, Slot1]),
@@ -404,12 +446,17 @@ get_new_bucket(Address, SourceNetgroup, Secret) ->
 %% @doc Compute bucket for tried table entry.
 %% Uses address itself and netgroup.
 %%
+%% When an ASMap is configured, uses ASN-derived group for the address
+%% (BUG-8 fix: same principle as get_new_bucket — Core's GetTriedBucket
+%% calls GetGroup() which honours the asmap).
+%%
 %% Mirrors Bitcoin Core addrman.cpp AddrInfo::GetTriedBucket():
 %%   hash1 = CheapHash(nKey || address)
 %%   hash2 = CheapHash(nKey || addrGroup || (hash1 % TRIED_BUCKETS_PER_GROUP))
 %%   bucket = hash2 % TRIED_BUCKET_COUNT
 get_tried_bucket(Address, Secret) ->
-    AddrGroup = netgroup(Address),
+    Asmap = get_asmap_binary(),
+    AddrGroup = netgroup(Address, Asmap),
     Hash1 = bucket_hash(Secret, [Address]),
     Slot1 = Hash1 rem ?TRIED_BUCKETS_PER_GROUP,
     Hash2 = bucket_hash(Secret, [AddrGroup, Slot1]),
