@@ -3267,7 +3267,10 @@ rpc_getpeerinfo() ->
                 inbound -> <<"inbound">>
             end,
             <<"transport_protocol_type">> => <<"v1">>,
-            <<"session_id">> => <<>>
+            <<"session_id">> => <<>>,
+            %% ASMap: mapped_as field (BUG-12 fix, W115 FIX-50)
+            %% Core: rpc/net.cpp:236 obj.pushKV("mapped_as", stats.m_mapped_as)
+            <<"mapped_as">> => beamchain_peer_manager:get_mapped_as(IP)
         }
     end, Peers),
     {ok, PeerInfoList}.

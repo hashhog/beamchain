@@ -23,6 +23,8 @@
          node_bloom_enabled/0,
          blockfilterindex_enabled/0,
          rest_enabled/0,
+         %% ASMap
+         asmap_path/0,
          %% Proxy configuration
          proxy/0,
          onion_proxy/0,
@@ -345,6 +347,49 @@ listen_onion() ->
                 _ -> false
             end;
         _ -> false
+    end.
+
+%% @doc Get the path to the ASMap file, or undefined if not configured.
+%% Set via -asmap=<path> in the config file or BEAMCHAIN_ASMAP env var.
+%% A relative path is resolved relative to the datadir.
+%% Returns the path as a string, or undefined if no asmap is configured.
+%%
+%% Bitcoin Core reference: init.cpp "-asmap=<file>" AddArg.
+-spec asmap_path() -> string() | undefined.
+asmap_path() ->
+    RawPath = case os:getenv("BEAMCHAIN_ASMAP") of
+        false -> get(asmap, undefined);
+        Val   -> Val
+    end,
+    case RawPath of
+        undefined -> undefined;
+        "" -> undefined;
+        P when is_list(P) ->
+            %% Resolve relative paths against the datadir
+            case filename:pathtype(P) of
+                relative ->
+                    DataDir = case get(datadir) of
+                        undefined -> ".";
+                        D -> D
+                    end,
+                    filename:join(DataDir, P);
+                _ ->
+                    P
+            end;
+        P when is_binary(P) ->
+            asmap_path_helper(binary_to_list(P))
+    end.
+
+asmap_path_helper(P) ->
+    case filename:pathtype(P) of
+        relative ->
+            DataDir = case get(datadir) of
+                undefined -> ".";
+                D -> D
+            end,
+            filename:join(DataDir, P);
+        _ ->
+            P
     end.
 
 %% Parse proxy address string into map.
