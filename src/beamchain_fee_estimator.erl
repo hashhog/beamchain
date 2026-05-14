@@ -3,6 +3,14 @@
 
 %% Block-based fee rate estimation using exponential decay buckets.
 %% Modeled after Bitcoin Core's CBlockPolicyEstimator.
+%%
+%% Three independent horizons matching Core exactly:
+%%   SHORT  decay=0.962,   scale=1,  periods=12  blocks
+%%   MED    decay=0.9952,  scale=2,  periods=24  blocks
+%%   LONG   decay=0.99931, scale=24, periods=42  blocks
+%%
+%% Bucket layout matches Core:
+%%   MIN=100 sat/kvB = 0.1 sat/vB, spacing=1.05, ~237 buckets up to 10000 sat/vB.
 
 -include("beamchain.hrl").
 
@@ -19,14 +27,35 @@
 -define(SERVER, ?MODULE).
 
 %%% -------------------------------------------------------------------
-%%% Fee estimation parameters
+%%% Fee estimation parameters — match Bitcoin Core exactly
 %%% -------------------------------------------------------------------
 
--define(NUM_BUCKETS, 40).
--define(MIN_FEE_RATE, 1.0).       %% sat/vB
--define(MAX_FEE_RATE, 10000.0).   %% sat/vB
--define(DECAY_FACTOR, 0.998).     %% per-block exponential decay
--define(SUCCESS_THRESHOLD, 0.85). %% 85% confirmation success rate
+%% Bucket layout (Core FEE_SPACING / MIN_BUCKET_FEERATE / MAX_BUCKET_FEERATE)
+-define(MIN_BUCKET_FEERATE, 0.1).     %% sat/vB  (Core: 100 sat/kvB)
+-define(MAX_BUCKET_FEERATE, 10000.0). %% sat/vB  (Core: 1e7 sat/kvB)
+-define(FEE_SPACING, 1.05).           %% Core FEE_SPACING
+
+%% Three horizons (Core CBlockPolicyEstimator SHORT/MED/LONG)
+-define(SHORT_DECAY,  0.962).
+-define(MED_DECAY,    0.9952).
+-define(LONG_DECAY,   0.99931).
+-define(SHORT_SCALE,  1).
+-define(MED_SCALE,    2).
+-define(LONG_SCALE,   24).
+%% Number of periods per horizon
+-define(SHORT_PERIODS, 12).
+-define(MED_PERIODS,   24).
+-define(LONG_PERIODS,  42).
+
+%% Derived conf-target windows for horizon dispatch.
+%% Core: short handles  1..SHORT_SCALE*SHORT_PERIODS = 12
+%%       medium handles 1..MED_SCALE*MED_PERIODS     = 48
+%%       long handles   1..LONG_SCALE*LONG_PERIODS   = 1008
+-define(SHORT_MAX_TARGET, (?SHORT_SCALE * ?SHORT_PERIODS)).   %% 12
+-define(MED_MAX_TARGET,   (?MED_SCALE   * ?MED_PERIODS)).     %% 48
+-define(LONG_MAX_TARGET,  (?LONG_SCALE  * ?LONG_PERIODS)).    %% 1008
+
+-define(SUCCESS_THRESHOLD, 0.85). %% 85 % confirmation success rate
 -define(MIN_TRACKED_TXS, 100).    %% minimum data before using buckets
 -define(MAX_CONF_TARGET, 1008).   %% max target (~1 week of blocks)
 -define(PERSIST_INTERVAL, 300_000). %% persist every 5 minutes
@@ -39,17 +68,27 @@
 %%% Records
 %%% -------------------------------------------------------------------
 
-%% Per-bucket tracking data
+%% Per-bucket tracking data (shared layout across all three horizons)
 -record(bucket_data, {
     total      = 0.0  :: float(),  %% weighted count of all tracked txs
     in_mempool = 0.0  :: float(),  %% currently unconfirmed
     confirmed  = #{}  :: #{integer() => float()}  %% blocks_waited => count
 }).
 
+%% Per-horizon state
+-record(horizon, {
+    decay   :: float(),
+    scale   :: integer(),
+    max_target :: integer(),
+    data    :: #{integer() => #bucket_data{}}
+}).
+
 -record(state, {
     buckets       :: [float()],          %% sorted bucket boundaries (sat/vB)
     num_buckets   :: integer(),
-    data          :: #{integer() => #bucket_data{}},
+    short         :: #horizon{},
+    med           :: #horizon{},
+    long          :: #horizon{},
     total_tracked :: integer(),          %% total txs tracked since start
     block_height  :: integer()
 }).
@@ -68,31 +107,26 @@ track_tx(Txid, FeeRate, Height) ->
     gen_server:cast(?SERVER, {track_tx, Txid, FeeRate, Height}).
 
 %% @doc Process a newly connected block. Updates confirmation stats
-%% for tracked transactions and applies exponential decay.
+%% for tracked transactions and applies exponential decay to all horizons.
 -spec process_block(integer(), [binary()]) -> ok.
 process_block(Height, Txids) ->
     gen_server:cast(?SERVER, {process_block, Height, Txids}).
 
 %% @doc Estimate the fee rate (sat/vB) needed for confirmation within
-%% ConfTarget blocks (1-1008).
+%% ConfTarget blocks (2-1008).  Core rejects target=1.
 -spec estimate_fee(integer()) -> {ok, float()} | {error, term()}.
 estimate_fee(ConfTarget) when is_integer(ConfTarget),
-                              ConfTarget >= 1,
+                              ConfTarget >= 2,
                               ConfTarget =< ?MAX_CONF_TARGET ->
     gen_server:call(?SERVER, {estimate_fee, ConfTarget});
 estimate_fee(_) ->
     {error, invalid_target}.
 
 %% @doc Raw, per-horizon fee estimate. Returns a map keyed by horizon
-%% atom (`short' / `medium' / `long') with `feerate', `decay', `scale',
-%% `pass' and `fail' bucket info — matching the Bitcoin Core
-%% estimaterawfee RPC. Threshold is the proportion (0..1) of confirmed
+%% atom (<<"short">> / <<"medium">> / <<"long">>) with `feerate', `decay',
+%% `scale', `pass' and `fail' bucket info — matching the Bitcoin Core
+%% estimaterawfee RPC.  Threshold is the proportion (0..1) of confirmed
 %% txs required for a bucket to "pass".
-%%
-%% beamchain only tracks a single horizon (CBlockPolicyEstimator's
-%% short / medium / long are merged in our exponential-decay model),
-%% so we report `medium' as the canonical horizon and skip the others
-%% when conf_target exceeds what we have data for.
 -spec estimate_raw_fee(integer(), float()) -> map().
 estimate_raw_fee(ConfTarget, Threshold)
   when is_integer(ConfTarget),
@@ -129,24 +163,35 @@ init([]) ->
         _ -> 0
     end,
 
-    %% Try to load persisted state
-    {Data, TotalTracked} = case load_persisted_state(NumBuckets) of
-        {ok, PData, PTotal} ->
-            logger:info("fee_estimator: loaded persisted state (~B tracked txs)",
-                        [PTotal]),
-            {PData, PTotal};
-        {error, _} ->
-            {EmptyData, 0}
-    end,
+    ShortH = #horizon{decay = ?SHORT_DECAY, scale = ?SHORT_SCALE,
+                      max_target = ?SHORT_MAX_TARGET, data = EmptyData},
+    MedH   = #horizon{decay = ?MED_DECAY,   scale = ?MED_SCALE,
+                      max_target = ?MED_MAX_TARGET,   data = EmptyData},
+    LongH  = #horizon{decay = ?LONG_DECAY,  scale = ?LONG_SCALE,
+                      max_target = ?LONG_MAX_TARGET,  data = EmptyData},
+
+    %% Try to load persisted state (v2 format with 3 horizons).
+    {Short2, Med2, Long2, TotalTracked} =
+        case load_persisted_state(NumBuckets, ShortH, MedH, LongH) of
+            {ok, PS, PM, PL, PTotal} ->
+                logger:info("fee_estimator: loaded persisted state "
+                            "(~B tracked txs)", [PTotal]),
+                {PS, PM, PL, PTotal};
+            {error, _} ->
+                {ShortH, MedH, LongH, 0}
+        end,
 
     %% Schedule periodic persistence
     erlang:send_after(?PERSIST_INTERVAL, self(), persist),
 
-    logger:info("fee_estimator: initialized with ~B buckets", [NumBuckets]),
+    logger:info("fee_estimator: initialized with ~B buckets, 3 horizons",
+                [NumBuckets]),
     {ok, #state{
         buckets = Buckets,
         num_buckets = NumBuckets,
-        data = Data,
+        short = Short2,
+        med   = Med2,
+        long  = Long2,
         total_tracked = TotalTracked,
         block_height = Height
     }}.
@@ -191,17 +236,23 @@ terminate(_Reason, State) ->
 %%% Internal: bucket generation
 %%% ===================================================================
 
-%% Generate NUM_BUCKETS logarithmically-spaced fee rate boundaries
-%% spanning MIN_FEE_RATE to MAX_FEE_RATE.
+%% Generate logarithmically-spaced fee rate boundaries matching Core.
+%% Core: MIN=100 sat/kvB, MAX=1e7 sat/kvB, spacing=1.05 → ~237 buckets.
+%% We work in sat/vB (÷1000): min=0.1, max=10000.
+%% We append MAX_BUCKET_FEERATE as the explicit final boundary (matching
+%% Core's INF sentinel approach) so the last bucket covers up to 10000.
 generate_buckets() ->
-    Factor = math:pow(?MAX_FEE_RATE / ?MIN_FEE_RATE,
-                      1.0 / (?NUM_BUCKETS - 1)),
-    generate_buckets(?MIN_FEE_RATE, Factor, ?NUM_BUCKETS, []).
+    Bs = generate_buckets(?MIN_BUCKET_FEERATE, []),
+    %% Ensure the maximum boundary is included
+    case lists:last(Bs) < ?MAX_BUCKET_FEERATE of
+        true  -> Bs ++ [?MAX_BUCKET_FEERATE];
+        false -> Bs
+    end.
 
-generate_buckets(_Rate, _Factor, 0, Acc) ->
+generate_buckets(Rate, Acc) when Rate > ?MAX_BUCKET_FEERATE ->
     lists:reverse(Acc);
-generate_buckets(Rate, Factor, N, Acc) ->
-    generate_buckets(Rate * Factor, Factor, N - 1, [Rate | Acc]).
+generate_buckets(Rate, Acc) ->
+    generate_buckets(Rate * ?FEE_SPACING, [Rate | Acc]).
 
 %% Find which bucket index a fee rate belongs to.
 %% Returns the index of the highest bucket boundary <= FeeRate.
@@ -220,123 +271,177 @@ find_bucket(FeeRate, [_ | Rest], Idx) ->
 %%% ===================================================================
 
 do_track_tx(Txid, FeeRate, Height,
-            #state{buckets = Buckets, data = Data,
+            #state{buckets = Buckets,
+                   short = Short, med = Med, long = Long,
                    total_tracked = Total} = State) ->
     BucketIdx = find_bucket(FeeRate, Buckets),
 
     %% Store in ETS for lookup when a block confirms this tx
     ets:insert(?FEE_EST_TRACKED, {Txid, BucketIdx, Height}),
 
-    %% Update bucket counters
+    %% Update all three horizon data sets
+    Short2 = horizon_add_tx(BucketIdx, Short),
+    Med2   = horizon_add_tx(BucketIdx, Med),
+    Long2  = horizon_add_tx(BucketIdx, Long),
+
+    State#state{
+        short = Short2,
+        med   = Med2,
+        long  = Long2,
+        total_tracked = Total + 1
+    }.
+
+horizon_add_tx(BucketIdx, #horizon{data = Data} = H) ->
     BD = maps:get(BucketIdx, Data, #bucket_data{}),
     BD2 = BD#bucket_data{
         total = BD#bucket_data.total + 1.0,
         in_mempool = BD#bucket_data.in_mempool + 1.0
     },
-    State#state{
-        data = maps:put(BucketIdx, BD2, Data),
-        total_tracked = Total + 1
-    }.
+    H#horizon{data = maps:put(BucketIdx, BD2, Data)}.
 
 %%% ===================================================================
 %%% Internal: process block
 %%% ===================================================================
 
+do_process_block(Height, _Txids, #state{block_height = BestHeight} = State)
+  when Height =< BestHeight ->
+    %% Reorg guard: ignore blocks at or below best-seen height (Core guard).
+    State;
 do_process_block(Height, Txids, State) ->
-    %% 1. Update confirmed counts for each tracked tx that got confirmed
+    %% 1. Update confirmed counts for each tracked tx that got confirmed.
+    %%    We record into all three horizons, each with its own scale.
     State2 = lists:foldl(fun(Txid, S) ->
         case ets:lookup(?FEE_EST_TRACKED, Txid) of
             [{Txid, BucketIdx, EntryHeight}] ->
-                BlocksWaited = max(1, Height - EntryHeight + 1),
+                BlocksWaited = max(1, Height - EntryHeight),
                 ets:delete(?FEE_EST_TRACKED, Txid),
-                record_confirmation(BucketIdx, BlocksWaited, S);
+                S2 = record_confirmation_horizon(
+                         BucketIdx, BlocksWaited, short, S),
+                S3 = record_confirmation_horizon(
+                         BucketIdx, BlocksWaited, med, S2),
+                record_confirmation_horizon(
+                         BucketIdx, BlocksWaited, long, S3);
             [] ->
-                %% Not tracked (entered before estimator, or already gone)
                 S
         end
     end, State, Txids),
 
-    %% 2. Apply exponential decay to all bucket data
-    State3 = apply_decay(State2),
+    %% 2. Apply per-horizon exponential decay once per block.
+    State3 = apply_decay_all(State2),
     State3#state{block_height = Height}.
 
-%% Record that a tx in BucketIdx was confirmed after BlocksWaited blocks.
-record_confirmation(BucketIdx, BlocksWaited,
-                    #state{data = Data} = State) ->
+record_confirmation_horizon(BucketIdx, BlocksWaited, HorizonName, State) ->
+    H = get_horizon(HorizonName, State),
+    #horizon{scale = Scale, data = Data} = H,
+    %% Core records into period index: blocksWaited / scale (integer div).
+    PeriodIdx = BlocksWaited div Scale,
     BD = maps:get(BucketIdx, Data, #bucket_data{}),
     Confirmed = BD#bucket_data.confirmed,
-    OldCount = maps:get(BlocksWaited, Confirmed, 0.0),
+    OldCount = maps:get(PeriodIdx, Confirmed, 0.0),
     BD2 = BD#bucket_data{
-        confirmed = maps:put(BlocksWaited, OldCount + 1.0, Confirmed),
+        confirmed = maps:put(PeriodIdx, OldCount + 1.0, Confirmed),
         in_mempool = max(0.0, BD#bucket_data.in_mempool - 1.0)
     },
-    State#state{data = maps:put(BucketIdx, BD2, Data)}.
+    H2 = H#horizon{data = maps:put(BucketIdx, BD2, Data)},
+    set_horizon(HorizonName, H2, State).
+
+get_horizon(short, #state{short = H}) -> H;
+get_horizon(med,   #state{med   = H}) -> H;
+get_horizon(long,  #state{long  = H}) -> H.
+
+set_horizon(short, H, State) -> State#state{short = H};
+set_horizon(med,   H, State) -> State#state{med   = H};
+set_horizon(long,  H, State) -> State#state{long  = H}.
 
 %%% ===================================================================
 %%% Internal: exponential decay
 %%% ===================================================================
 
-%% Apply decay factor to all bucket counters. Called once per block.
-apply_decay(#state{data = Data} = State) ->
-    Data2 = maps:map(fun(_Idx, BD) -> decay_bucket(BD) end, Data),
-    State#state{data = Data2}.
+%% Apply each horizon's own decay factor once per block.
+apply_decay_all(#state{short = Short, med = Med, long = Long} = State) ->
+    State#state{
+        short = decay_horizon(Short),
+        med   = decay_horizon(Med),
+        long  = decay_horizon(Long)
+    }.
 
-decay_bucket(#bucket_data{total = T, in_mempool = M, confirmed = C}) ->
+decay_horizon(#horizon{decay = D, data = Data} = H) ->
+    H#horizon{data = maps:map(fun(_Idx, BD) -> decay_bucket(BD, D) end, Data)}.
+
+decay_bucket(#bucket_data{total = T, in_mempool = M, confirmed = C}, D) ->
     #bucket_data{
-        total = T * ?DECAY_FACTOR,
-        in_mempool = M * ?DECAY_FACTOR,
-        confirmed = maps:map(fun(_K, V) -> V * ?DECAY_FACTOR end, C)
+        total = T * D,
+        in_mempool = M * D,
+        confirmed = maps:map(fun(_K, V) -> V * D end, C)
     }.
 
 %%% ===================================================================
-%%% Internal: fee estimation
+%%% Internal: fee estimation (estimatesmartfee)
 %%% ===================================================================
 
 do_estimate_fee(ConfTarget, #state{total_tracked = Total} = State)
   when Total < ?MIN_TRACKED_TXS ->
-    %% Not enough historical data — fall back to mempool percentile
     estimate_from_mempool(ConfTarget, State);
-do_estimate_fee(ConfTarget, #state{buckets = Buckets, data = Data,
+do_estimate_fee(ConfTarget, #state{buckets = Buckets,
                                     num_buckets = NumBuckets} = State) ->
-    case find_passing_bucket(0, NumBuckets, ConfTarget, Buckets, Data) of
+    %% Select the most-appropriate horizon: shortest that covers the target.
+    Horizons = applicable_horizons(ConfTarget, State),
+    case find_passing_any_horizon(Horizons, ConfTarget, Buckets, NumBuckets) of
         {ok, FeeRate} ->
             {ok, FeeRate};
         not_found ->
-            %% Bucket model couldn't find a passing bucket, try mempool
             estimate_from_mempool(ConfTarget, State)
+    end.
+
+%% Return horizons applicable for this conf_target, shortest first.
+applicable_horizons(ConfTarget, #state{short = S, med = M, long = L}) ->
+    All = [{short, S}, {med, M}, {long, L}],
+    [{Name, H} || {Name, H} <- All,
+                  ConfTarget =< H#horizon.max_target].
+
+find_passing_any_horizon([], _Target, _Buckets, _NumBuckets) ->
+    not_found;
+find_passing_any_horizon([{_Name, H} | Rest], Target, Buckets, NumBuckets) ->
+    case find_passing_bucket(0, NumBuckets, Target, H#horizon.scale,
+                             Buckets, H#horizon.data) of
+        {ok, FeeRate} -> {ok, FeeRate};
+        not_found     -> find_passing_any_horizon(Rest, Target, Buckets,
+                                                  NumBuckets)
     end.
 
 %% Scan buckets from lowest fee rate upward. Return the fee rate of
 %% the first bucket where the confirmation success rate meets threshold.
-find_passing_bucket(Idx, NumBuckets, _Target, _Buckets, _Data)
+%% Scale is used to convert blocks_waited periods back to blocks.
+find_passing_bucket(Idx, NumBuckets, _Target, _Scale, _Buckets, _Data)
   when Idx >= NumBuckets ->
     not_found;
-find_passing_bucket(Idx, NumBuckets, Target, Buckets, Data) ->
+find_passing_bucket(Idx, NumBuckets, Target, Scale, Buckets, Data) ->
     BD = maps:get(Idx, Data, #bucket_data{}),
-    %% Only consider txs that have resolved (confirmed or dropped),
-    %% not ones still sitting in the mempool
+    %% Only consider resolved txs (confirmed or dropped, not still in mempool)
     Resolved = BD#bucket_data.total - BD#bucket_data.in_mempool,
     case Resolved >= 1.0 of
         true ->
-            ConfWithin = sum_confirmed_within(Target,
+            %% Target in periods for this horizon
+            TargetPeriods = (Target + Scale - 1) div Scale,
+            ConfWithin = sum_confirmed_within(TargetPeriods,
                                               BD#bucket_data.confirmed),
             SuccessRate = ConfWithin / Resolved,
             case SuccessRate >= ?SUCCESS_THRESHOLD of
                 true ->
                     {ok, lists:nth(Idx + 1, Buckets)};
                 false ->
-                    find_passing_bucket(Idx + 1, NumBuckets, Target,
+                    find_passing_bucket(Idx + 1, NumBuckets, Target, Scale,
                                         Buckets, Data)
             end;
         false ->
-            %% Not enough resolved data in this bucket
-            find_passing_bucket(Idx + 1, NumBuckets, Target, Buckets, Data)
+            find_passing_bucket(Idx + 1, NumBuckets, Target, Scale,
+                                Buckets, Data)
     end.
 
-%% Sum the weighted confirmed count for all delays <= MaxBlocks.
-sum_confirmed_within(MaxBlocks, Confirmed) ->
-    maps:fold(fun(BlocksWaited, Count, Acc) ->
-        case BlocksWaited =< MaxBlocks of
+%% Sum the weighted confirmed count for all period-delays <= MaxPeriods.
+sum_confirmed_within(MaxPeriods, Confirmed) ->
+    maps:fold(fun(PeriodIdx, Count, Acc) ->
+        case PeriodIdx =< MaxPeriods of
             true -> Acc + Count;
             false -> Acc
         end
@@ -350,71 +455,74 @@ sum_confirmed_total(Confirmed) ->
 %%% Internal: raw fee estimation (estimaterawfee)
 %%% ===================================================================
 
-%% Build a bucket-info map for one horizon. Returns the canonical
-%% `medium' horizon report (we only track one). If conf_target
-%% exceeds what we have data for, returns an `errors' map only.
+%% Build a full per-horizon map. Returns entries for each applicable
+%% horizon keyed by <<"short">>, <<"medium">>, <<"long">>.
 do_estimate_raw_fee(ConfTarget, Threshold,
-                    #state{buckets = Buckets, data = Data,
-                           num_buckets = NumBuckets,
-                           total_tracked = Total}) ->
-    Decay = ?DECAY_FACTOR,
-    Scale = 1,
-    case Total < ?MIN_TRACKED_TXS of
+                    #state{buckets = Buckets, num_buckets = NumBuckets,
+                           total_tracked = Total,
+                           short = Short, med = Med, long = Long}) ->
+    Insufficient = Total < ?MIN_TRACKED_TXS,
+    HorizonDefs = [
+        {<<"short">>,  Short,  ConfTarget =< Short#horizon.max_target},
+        {<<"medium">>, Med,    ConfTarget =< Med#horizon.max_target},
+        {<<"long">>,   Long,   ConfTarget =< Long#horizon.max_target}
+    ],
+    maps:from_list(
+        [{Key, build_horizon_result(H, ConfTarget, Threshold,
+                                   Buckets, NumBuckets, Insufficient)}
+         || {Key, H, Applicable} <- HorizonDefs,
+            Applicable]).
+
+build_horizon_result(#horizon{decay = Decay, scale = Scale, data = Data},
+                     ConfTarget, Threshold, Buckets, NumBuckets,
+                     Insufficient) ->
+    case Insufficient of
         true ->
-            FailBucket = empty_bucket_info(),
-            Horizon = #{
-                <<"decay">> => Decay,
-                <<"scale">> => Scale,
-                <<"fail">>  => FailBucket,
-                <<"errors">> =>
-                    [<<"Insufficient data or no feerate found "
-                       "which meets threshold">>]
-            },
-            #{<<"medium">> => Horizon};
+            #{<<"decay">>  => Decay,
+              <<"scale">>  => Scale,
+              <<"fail">>   => empty_bucket_info(),
+              <<"errors">> => [<<"Insufficient data or no feerate found "
+                                "which meets threshold">>]};
         false ->
-            case scan_buckets_for_pass(0, NumBuckets, ConfTarget, Threshold,
-                                        Buckets, Data) of
+            TargetPeriods = (ConfTarget + Scale - 1) div Scale,
+            case scan_buckets_for_pass(0, NumBuckets, TargetPeriods,
+                                       Threshold, Buckets, Data) of
                 {pass, FeeRate, Pass, Fail} ->
-                    Horizon0 = #{
-                        <<"feerate">> => fee_rate_to_btc_per_kvb(FeeRate),
-                        <<"decay">>   => Decay,
-                        <<"scale">>   => Scale,
-                        <<"pass">>    => Pass
-                    },
-                    Horizon = case Fail of
-                        none -> Horizon0;
-                        _    -> Horizon0#{<<"fail">> => Fail}
-                    end,
-                    #{<<"medium">> => Horizon};
+                    Base = #{<<"feerate">> => fee_rate_to_btc_per_kvb(FeeRate),
+                             <<"decay">>   => Decay,
+                             <<"scale">>   => Scale,
+                             <<"pass">>    => Pass},
+                    case Fail of
+                        none -> Base;
+                        _    -> Base#{<<"fail">> => Fail}
+                    end;
                 {fail, Fail} ->
-                    #{<<"medium">> => #{
-                        <<"decay">>  => Decay,
-                        <<"scale">>  => Scale,
-                        <<"fail">>   => Fail,
-                        <<"errors">> =>
-                            [<<"Insufficient data or no feerate found "
-                               "which meets threshold">>]
-                      }}
+                    #{<<"decay">>  => Decay,
+                      <<"scale">>  => Scale,
+                      <<"fail">>   => Fail,
+                      <<"errors">> => [<<"Insufficient data or no feerate found "
+                                        "which meets threshold">>]}
             end
     end.
 
-%% Scan buckets ascending. Track the highest-failing bucket along the
-%% way; return the first passing bucket plus the most-recent fail bucket.
-scan_buckets_for_pass(Idx, NumBuckets, _Target, _Thr, _B, _D)
+%% Scan buckets ascending. Track the highest-failing bucket along the way;
+%% return the first passing bucket plus the most-recent fail bucket.
+scan_buckets_for_pass(Idx, NumBuckets, _TargetP, _Thr, _B, _D)
   when Idx >= NumBuckets ->
     {fail, empty_bucket_info()};
-scan_buckets_for_pass(Idx, NumBuckets, Target, Threshold, Buckets, Data) ->
-    scan_buckets_for_pass(Idx, NumBuckets, Target, Threshold, Buckets,
-                          Data, none).
+scan_buckets_for_pass(Idx, NumBuckets, TargetPeriods, Threshold,
+                      Buckets, Data) ->
+    scan_buckets_for_pass(Idx, NumBuckets, TargetPeriods, Threshold,
+                          Buckets, Data, none).
 
-scan_buckets_for_pass(Idx, NumBuckets, _Target, _Thr, _B, _D, LastFail)
+scan_buckets_for_pass(Idx, NumBuckets, _TargetP, _Thr, _B, _D, LastFail)
   when Idx >= NumBuckets ->
     case LastFail of
         none -> {fail, empty_bucket_info()};
         _    -> {fail, LastFail}
     end;
-scan_buckets_for_pass(Idx, NumBuckets, Target, Threshold, Buckets, Data,
-                      LastFail) ->
+scan_buckets_for_pass(Idx, NumBuckets, TargetPeriods, Threshold, Buckets,
+                      Data, LastFail) ->
     BD = maps:get(Idx, Data, #bucket_data{}),
     StartRange = lists:nth(Idx + 1, Buckets),
     EndRange = case Idx + 2 =< length(Buckets) of
@@ -422,30 +530,30 @@ scan_buckets_for_pass(Idx, NumBuckets, Target, Threshold, Buckets, Data,
         false -> StartRange * 2.0
     end,
     Resolved = BD#bucket_data.total - BD#bucket_data.in_mempool,
-    Info = bucket_info(StartRange, EndRange, Target, BD),
+    Info = bucket_info(StartRange, EndRange, TargetPeriods, BD),
     case Resolved >= 1.0 of
         true ->
-            ConfWithin = sum_confirmed_within(Target,
+            ConfWithin = sum_confirmed_within(TargetPeriods,
                                               BD#bucket_data.confirmed),
             SuccessRate = ConfWithin / Resolved,
             case SuccessRate >= Threshold of
                 true ->
                     {pass, StartRange, Info, LastFail};
                 false ->
-                    scan_buckets_for_pass(Idx + 1, NumBuckets, Target,
+                    scan_buckets_for_pass(Idx + 1, NumBuckets, TargetPeriods,
                                           Threshold, Buckets, Data, Info)
             end;
         false ->
-            scan_buckets_for_pass(Idx + 1, NumBuckets, Target, Threshold,
-                                  Buckets, Data, LastFail)
+            scan_buckets_for_pass(Idx + 1, NumBuckets, TargetPeriods,
+                                  Threshold, Buckets, Data, LastFail)
     end.
 
-bucket_info(Start, End, Target, BD) ->
+bucket_info(Start, End, TargetPeriods, BD) ->
     #{
         <<"startrange">>     => Start,
         <<"endrange">>       => End,
         <<"withintarget">>   =>
-            round_centi(sum_confirmed_within(Target,
+            round_centi(sum_confirmed_within(TargetPeriods,
                                               BD#bucket_data.confirmed)),
         <<"totalconfirmed">> =>
             round_centi(sum_confirmed_total(BD#bucket_data.confirmed)),
@@ -492,7 +600,7 @@ estimate_from_mempool(ConfTarget, _State) ->
             _ ->
                 N = length(FeeRates),
                 %% Map confirmation target to percentile via log scale.
-                %% Target 1 → ~95th percentile, target 144 → ~5th
+                %% Target 2 → ~95th percentile, target 144 → ~5th
                 Pct = max(0.05, min(0.95,
                     1.0 - math:log(max(1, ConfTarget)) * 0.2)),
                 Idx = max(1, min(N, ceil(N * Pct))),
@@ -519,7 +627,7 @@ collect_rates_asc({FeeRate, _Txid} = Key, Acc) ->
     collect_rates_asc(ets:next(mempool_by_fee, Key), [FeeRate | Acc]).
 
 %%% ===================================================================
-%%% Internal: persistence
+%%% Internal: persistence (version 2 — 3 horizons)
 %%% ===================================================================
 
 %% Return the path to the fee estimation data file.
@@ -529,19 +637,23 @@ persist_path() ->
               end,
     filename:join(DataDir, ?FEE_EST_FILE).
 
-%% Save the current estimator state to disk as an Erlang term file.
-do_save_state(#state{data = Data, total_tracked = Total,
-                     block_height = Height}) ->
+%% Save current estimator state to disk as an Erlang term file.
+do_save_state(#state{short = Short, med = Med, long = Long,
+                     total_tracked = Total, block_height = Height}) ->
     Path = persist_path(),
-    %% Convert bucket data to a serializable form (maps with atoms stripped)
-    SerData = maps:map(fun(_Idx, #bucket_data{total = T, in_mempool = M,
-                                               confirmed = C}) ->
-        #{total => T, in_mempool => M, confirmed => C}
-    end, Data),
-    Term = #{version => 1,
-             data => SerData,
+    Ser = fun(#horizon{decay = D, scale = Sc, max_target = MT, data = Data}) ->
+        SerData = maps:map(fun(_I, #bucket_data{total = T, in_mempool = M,
+                                                 confirmed = C}) ->
+            #{total => T, in_mempool => M, confirmed => C}
+        end, Data),
+        #{decay => D, scale => Sc, max_target => MT, data => SerData}
+    end,
+    Term = #{version => 2,
+             short => Ser(Short),
+             med   => Ser(Med),
+             long  => Ser(Long),
              total_tracked => Total,
-             block_height => Height},
+             block_height  => Height},
     TmpPath = Path ++ ".tmp",
     case file:write_file(TmpPath, term_to_binary(Term)) of
         ok ->
@@ -560,29 +672,47 @@ do_save_state(#state{data = Data, total_tracked = Total,
             {error, Reason}
     end.
 
-%% Load persisted state from disk.
-load_persisted_state(NumBuckets) ->
+%% Deserialise one horizon from the v2 on-disk map.
+deser_horizon(#{decay := D, scale := Sc, max_target := MT,
+                data := SerData}, NumBuckets, Default) ->
+    Data = maps:map(fun(_I, #{total := T, in_mempool := M, confirmed := C}) ->
+        #bucket_data{total = T, in_mempool = M, confirmed = C}
+    end, SerData),
+    case maps:size(Data) =:= NumBuckets of
+        true ->
+            {ok, Default#horizon{decay = D, scale = Sc, max_target = MT,
+                                 data = Data}};
+        false ->
+            {error, bucket_mismatch}
+    end.
+
+%% Load persisted state from disk (v2 format; v1 is discarded).
+load_persisted_state(NumBuckets, ShortDefault, MedDefault, LongDefault) ->
     Path = persist_path(),
     case file:read_file(Path) of
         {ok, Bin} ->
             try
-                #{version := 1,
-                  data := SerData,
-                  total_tracked := Total,
-                  block_height := _Height} = binary_to_term(Bin),
-                %% Reconstruct bucket_data records
-                Data = maps:map(fun(_Idx, #{total := T, in_mempool := M,
-                                            confirmed := C}) ->
-                    #bucket_data{total = T, in_mempool = M, confirmed = C}
-                end, SerData),
-                %% Validate bucket count matches
-                case maps:size(Data) of
-                    NumBuckets -> {ok, Data, Total};
-                    Other ->
-                        logger:warning("fee_estimator: bucket count mismatch "
-                                       "(file=~B, expected=~B), starting fresh",
-                                       [Other, NumBuckets]),
-                        {error, bucket_mismatch}
+                case binary_to_term(Bin) of
+                    #{version := 2,
+                      short := SS, med := SM, long := SL,
+                      total_tracked := Total} ->
+                        case {deser_horizon(SS, NumBuckets, ShortDefault),
+                              deser_horizon(SM, NumBuckets, MedDefault),
+                              deser_horizon(SL, NumBuckets, LongDefault)} of
+                            {{ok, S}, {ok, M}, {ok, L}} ->
+                                {ok, S, M, L, Total};
+                            _ ->
+                                logger:warning("fee_estimator: horizon "
+                                               "bucket-count mismatch, "
+                                               "starting fresh"),
+                                {error, bucket_mismatch}
+                        end;
+                    #{version := V} ->
+                        logger:info("fee_estimator: discarding v~B state "
+                                    "(upgrading to v2)", [V]),
+                        {error, version_mismatch};
+                    _ ->
+                        {error, corrupt}
                 end
             catch
                 _:Reason ->
