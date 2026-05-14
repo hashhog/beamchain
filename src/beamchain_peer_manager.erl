@@ -69,7 +69,9 @@
          mark_getheaders_sent/1,
          mark_headers_received/1,
          update_ping_latency/2,
-         notify_tip_updated/0]).
+         notify_tip_updated/0,
+         %% ASMap
+         get_mapped_as/1]).
 
 %% Exposed for testing (BIP35 mempool inv chunking; BIP-339 inv type selection)
 -export([chunk_inv_items/2, inv_items_from_pairs/2]).
@@ -424,6 +426,36 @@ update_ping_latency(Pid, LatencyMs) ->
 -spec notify_tip_updated() -> ok.
 notify_tip_updated() ->
     gen_server:cast(?SERVER, tip_updated).
+
+%% @doc Look up the ASN for an IP address using the loaded asmap.
+%% Returns the ASN as a non-negative integer, or 0 if:
+%%   - no asmap is configured / loaded,
+%%   - the address is not in the trie (unmapped),
+%%   - the address is a non-IP type (Tor, I2P, CJDNS).
+%%
+%% IP may be an IPv4 tuple {A,B,C,D}, IPv6 tuple, or raw binary.
+%% Mirrors Bitcoin Core NetGroupManager::GetMappedAS() called from
+%% CAddress::GetMappedAS() in net.h and net_processing.cpp.
+-spec get_mapped_as(term()) -> non_neg_integer().
+get_mapped_as(IP) ->
+    case beamchain_config:asmap_path() of
+        undefined ->
+            0;
+        Path ->
+            case persistent_term:get({beamchain_asmap, Path}, undefined) of
+                undefined ->
+                    %% Try to load the asmap on-demand (cached in persistent_term)
+                    case beamchain_asmap:load_asmap(Path) of
+                        {ok, Asmap} ->
+                            persistent_term:put({beamchain_asmap, Path}, Asmap),
+                            beamchain_asmap:get_mapped_as(Asmap, IP);
+                        {error, _} ->
+                            0
+                    end;
+                Asmap ->
+                    beamchain_asmap:get_mapped_as(Asmap, IP)
+            end
+    end.
 
 %%% ===================================================================
 %%% gen_server callbacks

@@ -31,6 +31,7 @@
          get_addrv2_addresses/1,
          count/0,
          netgroup/1,
+         netgroup/2,
          get_secret/0]).
 
 %% gen_server callbacks
@@ -190,6 +191,54 @@ netgroup({Addr, _Port}) when is_binary(Addr) ->
         _ -> {binary, 0, 0, 0, 0}
     end;
 netgroup(_) -> other.
+
+%% @doc Get the netgroup for an address with optional ASMap-derived grouping.
+%%
+%% When Asmap is a non-empty binary, IPv4 and IPv6 addresses are looked up
+%% in the ASMap trie and the resulting ASN is used as the netgroup key.
+%% This provides eclipse-attack-resistant bucketing: two addresses in the
+%% same /16 prefix but different autonomous systems will land in different
+%% AddrMan buckets, preventing a single AS from filling all buckets.
+%%
+%% Non-IP networks (Tor/I2P/CJDNS) always use the first-4-bytes netgroup
+%% regardless of asmap (Core returns ASN=0 for these).
+%%
+%% When Asmap is undefined or empty, falls back to netgroup/1 behaviour.
+%% Mirrors Bitcoin Core netgroup.cpp NetGroupManager::GetGroup() which
+%% calls GetMappedAS() when m_asmap.size() > 0.
+-spec netgroup(term(), binary() | undefined) -> term().
+netgroup(Addr, undefined) ->
+    netgroup(Addr);
+netgroup(Addr, <<>>) ->
+    netgroup(Addr);
+netgroup(#{network_id := NetId} = AddrMap, _Asmap) when NetId >= 4 ->
+    %% Non-IP: use first-bytes netgroup (same as netgroup/1)
+    netgroup(AddrMap);
+netgroup({{A, B, C, D}, _Port}, Asmap) ->
+    %% IPv4: look up ASN
+    case beamchain_asmap:get_mapped_as(Asmap, {A, B, C, D}) of
+        0 -> {ipv4, A, B};              %% No mapping — fall back to /16
+        ASN -> {asn, ASN}
+    end;
+netgroup({A, B, C, D}, Asmap) ->
+    case beamchain_asmap:get_mapped_as(Asmap, {A, B, C, D}) of
+        0 -> {ipv4, A, B};
+        ASN -> {asn, ASN}
+    end;
+netgroup({{A, B, C, D, E, F, G, H}, _Port}, Asmap) ->
+    %% IPv6: look up ASN
+    case beamchain_asmap:get_mapped_as(Asmap, {A, B, C, D, E, F, G, H}) of
+        0 -> {ipv6, A, B, C, D};       %% No mapping — fall back to /32
+        ASN -> {asn, ASN}
+    end;
+netgroup({A, B, C, D, E, F, G, H}, Asmap) ->
+    case beamchain_asmap:get_mapped_as(Asmap, {A, B, C, D, E, F, G, H}) of
+        0 -> {ipv6, A, B, C, D};
+        ASN -> {asn, ASN}
+    end;
+netgroup(Addr, _Asmap) ->
+    %% Anything else: fall back to plain netgroup/1
+    netgroup(Addr).
 
 %% @doc Get the secret key (for testing).
 -spec get_secret() -> binary().
