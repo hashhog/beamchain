@@ -167,6 +167,22 @@ parse_args(["--p2p-port", Value | Rest], Cmd, Opts) ->
 parse_args(["--p2p-port=" ++ Value | Rest], Cmd, Opts) ->
     parse_args(Rest, Cmd, Opts#{p2p_port => list_to_integer(Value)});
 
+%% --rpc-tls-cert=<path>: PEM-encoded server certificate (chain) for the
+%% RPC HTTPS listener. Pair with --rpc-tls-key. Both unset = plaintext
+%% (backward compatible). One set without the other = startup error.
+%% Mirrors bitcoin-core/src/httpserver.cpp -rpcsslcertificatechainfile.
+parse_args(["--rpc-tls-cert", Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{rpc_tls_cert => Value});
+parse_args(["--rpc-tls-cert=" ++ Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{rpc_tls_cert => Value});
+
+%% --rpc-tls-key=<path>: PEM-encoded private key for the RPC HTTPS
+%% listener. Mirrors bitcoin-core -rpcsslprivatekeyfile.
+parse_args(["--rpc-tls-key", Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{rpc_tls_key => Value});
+parse_args(["--rpc-tls-key=" ++ Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{rpc_tls_key => Value});
+
 %% --torcontrol=host:port: Tor control-port address. Default 127.0.0.1:9051.
 %% Only meaningful when combined with -listenonion=1 (or BEAMCHAIN_LISTENONION=1)
 %% in beamchain.conf -- the gen_server is otherwise never started.
@@ -300,6 +316,9 @@ print_usage() ->
         "  --torcontrol=h:p  Tor control-port address~n"
         "                    (default 127.0.0.1:9051; mirrors Core -torcontrol)~n"
         "  --torpassword=<p> HASHEDPASSWORD auth for the Tor control port~n"
+        "  --rpc-tls-cert=<f> PEM cert file for the RPC HTTPS listener~n"
+        "                    (pair with --rpc-tls-key; both unset = plaintext)~n"
+        "  --rpc-tls-key=<f> PEM private key for the RPC HTTPS listener~n"
         "  -h, --help        show this help~n"
         "  -v, --version     show version~n",
         [header("beamchain " ++ ?VERSION ++ " - bitcoin full node in erlang/otp"),
@@ -684,6 +703,21 @@ apply_opts(Opts) ->
     case maps:get(p2p_port, Opts, undefined) of
         undefined -> ok;
         P2pPort -> application:set_env(beamchain, p2pport, P2pPort, [{persistent, true}])
+    end,
+    %% W119 FIX-64: TLS termination paths. Promoted to application env
+    %% so beamchain_config:init/1 can mirror them into the ETS table
+    %% (same path the rpcport / p2pport overrides take).
+    case maps:get(rpc_tls_cert, Opts, undefined) of
+        undefined -> ok;
+        CertPath ->
+            application:set_env(beamchain, rpc_tls_cert, CertPath,
+                                [{persistent, true}])
+    end,
+    case maps:get(rpc_tls_key, Opts, undefined) of
+        undefined -> ok;
+        KeyPath ->
+            application:set_env(beamchain, rpc_tls_key, KeyPath,
+                                [{persistent, true}])
     end,
     %% --conf=<file>: explicit beamchain.conf path override. Promoted from
     %% the legacy fixed path at <datadir>/beamchain.conf so operators can
