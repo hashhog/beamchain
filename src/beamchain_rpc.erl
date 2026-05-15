@@ -61,6 +61,13 @@
 -export([rpc_analyzepsbt/1, rpc_lockunspent/2, rpc_listlockunspent/1,
          rpc_walletcreatefundedpsbt/2,
          analyze_psbt/1]).
+%% Test-only exports — bumpfee / psbtbumpfee (W118 BUG-2/BUG-3, FIX-61).
+%% bumpfee_ceil_num/1 + bumpfee_replace_change/3 are pure helpers a unit
+%% test can exercise without needing a running mempool / wallet.
+%% rpc_bumpfee/2 + rpc_psbtbumpfee/2 are exported so eunit can drive the
+%% RPC dispatcher path directly.
+-export([rpc_bumpfee/2, rpc_psbtbumpfee/2,
+         bumpfee_ceil_num/1, bumpfee_replace_change/3]).
 -endif.
 
 %% Cowboy handler
@@ -82,6 +89,7 @@
 -define(RPC_PARSE_ERROR, -32700).
 -define(RPC_MISC_ERROR, -1).
 -define(RPC_TYPE_ERROR, -3).
+-define(RPC_WALLET_ERROR, -4).
 -define(RPC_INVALID_ADDRESS_OR_KEY, -5).
 -define(RPC_INVALID_PARAMETER, -8).
 -define(RPC_DATABASE_ERROR, -20).
@@ -643,6 +651,9 @@ handle_method(<<"walletlock">>, _, W) -> rpc_walletlock(W);
 handle_method(<<"signrawtransactionwithwallet">>, P, W) -> rpc_signrawtransactionwithwallet(P, W);
 handle_method(<<"importdescriptors">>, P, W) -> rpc_importdescriptors(P, W);
 handle_method(<<"walletcreatefundedpsbt">>, P, W) -> rpc_walletcreatefundedpsbt(P, W);
+%% W118 BUG-2 / BUG-3 closure: BIP-125 RBF fee bumping.
+handle_method(<<"bumpfee">>, P, W) -> rpc_bumpfee(P, W);
+handle_method(<<"psbtbumpfee">>, P, W) -> rpc_psbtbumpfee(P, W);
 
 %% -- PSBT --
 handle_method(<<"createpsbt">>, P, _W) -> rpc_createpsbt(P);
@@ -5383,6 +5394,363 @@ lookup_privkeys_for_inputs(Pid, Selected, Network) ->
             {error, wallet_locked};
         throw:{key_not_found, Idx, Info} ->
             {error, {key_not_found, Idx, Info}}
+    end.
+
+%%% ===================================================================
+%%% bumpfee / psbtbumpfee (W118 BUG-2 / BUG-3 closure)
+%%%
+%%% Implements BIP-125 RBF fee bumping for wallet-owned transactions sat
+%%% in the mempool. Mirrors bitcoin-core/src/wallet/rpc/spend.cpp
+%%% bumpfee_helper + wallet/feebumper.cpp::CreateRateBumpTransaction.
+%%%
+%%% Single-pipeline reuse: the re-sign path uses lookup_privkeys_for_inputs/3
+%%% (FIX-59) — the same keystore-walk that rpc_sendtoaddress uses. We do NOT
+%%% introduce a second per-input keystore lookup pipeline.
+%%%
+%%% Minimal-viable scope (matches Core's "rate bump" subset):
+%%%   - The original tx must be in the local mempool.
+%%%   - All inputs must signal BIP-125 (sequence ≤ 0xFFFFFFFD).
+%%%   - All inputs' prevouts must be owned by this wallet (privkey present).
+%%%   - The original tx must have at least one change output (we detect by
+%%%     matching against listaddresses' "change"=true entries).
+%%%   - The bumped fee = orig_fee + ceil(vsize * fee_delta_satvb), where
+%%%     fee_delta_satvb defaults to incrementalRelayFee (1 sat/vB) or the
+%%%     caller-supplied fee_rate.
+%%%   - Change output is reduced by the fee delta; if it would go below the
+%%%     dust threshold (546 sat) we reject.
+%%%   - For bumpfee we re-sign + broadcast; for psbtbumpfee we package an
+%%%     unsigned PSBT and return base64.
+%%%
+%%% Out of scope (deferred): adding new inputs, multiple change outputs,
+%%% original_change_index, custom outputs array, conf_target / estimate_mode,
+%%% wallet-tx tracking (descendants-in-wallet check uses mempool only),
+%%% calculateCombinedBumpFee.
+%%%-------------------------------------------------------------------
+
+%% Core's WALLET_INCREMENTAL_RELAY_FEE = 5000 sat/kvB = 5 sat/vB
+%% (wallet/wallet.h). Both this and the node's incrementalRelayFee are
+%% considered when computing the minimum fee delta — Core takes the max.
+-define(WALLET_INCREMENTAL_RELAY_FEE_SATVB, 5).
+-define(DUST_THRESHOLD_SAT, 546).
+
+rpc_bumpfee([TxidHex], WalletName) when is_binary(TxidHex) ->
+    rpc_bumpfee([TxidHex, #{}], WalletName);
+rpc_bumpfee([TxidHex, Options], WalletName)
+        when is_binary(TxidHex), is_map(Options) ->
+    do_bumpfee_rpc(TxidHex, Options, WalletName, txid);
+rpc_bumpfee(_, _) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"bumpfee \"txid\" ( options )">>}.
+
+rpc_psbtbumpfee([TxidHex], WalletName) when is_binary(TxidHex) ->
+    rpc_psbtbumpfee([TxidHex, #{}], WalletName);
+rpc_psbtbumpfee([TxidHex, Options], WalletName)
+        when is_binary(TxidHex), is_map(Options) ->
+    do_bumpfee_rpc(TxidHex, Options, WalletName, psbt);
+rpc_psbtbumpfee(_, _) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"psbtbumpfee \"txid\" ( options )">>}.
+
+%% Shared driver — Mode is `txid` (bumpfee: re-sign + submit) or `psbt`
+%% (psbtbumpfee: return base64 PSBT).
+do_bumpfee_rpc(TxidHex, Options, WalletName, Mode) ->
+    case resolve_wallet(WalletName) of
+        {ok, Pid} ->
+            try
+                bumpfee_run(Pid, TxidHex, Options, Mode)
+            catch
+                throw:{bumpfee_error, Code, Msg} ->
+                    {error, Code, Msg};
+                _:Err ->
+                    {error, ?RPC_MISC_ERROR,
+                     iolist_to_binary(io_lib:format("bumpfee error: ~p",
+                                                    [Err]))}
+            end;
+        {error, _} ->
+            wallet_not_found_error(WalletName)
+    end.
+
+bumpfee_run(Pid, TxidHex, Options, Mode) ->
+    Txid = hex_to_internal_hash(TxidHex),
+    %% --- precondition 1: original tx must be in the mempool ---
+    {OldTx, OldEntryFee, OldEntryVSize} =
+        case beamchain_mempool:get_entry(Txid) of
+            {ok, Entry} ->
+                bumpfee_extract_entry(Entry);
+            not_found ->
+                throw({bumpfee_error, ?RPC_INVALID_ADDRESS_OR_KEY,
+                       <<"Transaction not in mempool (cannot bump confirmed "
+                         "or unknown transactions)">>})
+        end,
+    %% --- precondition 2: descendants in mempool? ---
+    case beamchain_mempool:get_descendants(Txid) of
+        Descs when is_list(Descs) ->
+            %% get_descendants includes self; require length =< 1.
+            case [D || D <- Descs, D =/= Txid] of
+                [] -> ok;
+                _NonSelf ->
+                    throw({bumpfee_error, ?RPC_INVALID_PARAMETER,
+                           <<"Transaction has descendants in the mempool">>})
+            end;
+        _ -> ok
+    end,
+    %% --- precondition 3: all inputs signal BIP-125 (replaceable) ---
+    lists:foreach(fun(#tx_in{sequence = Seq}) ->
+        case Seq =< ?MAX_BIP125_RBF_SEQUENCE of
+            true -> ok;
+            false ->
+                throw({bumpfee_error, ?RPC_WALLET_ERROR,
+                       <<"Transaction is not BIP-125 replaceable">>})
+        end
+    end, OldTx#transaction.inputs),
+    %% --- precondition 4: replaceable option ---
+    NewSequence = case maps:get(<<"replaceable">>, Options, true) of
+        true  -> ?MAX_BIP125_RBF_SEQUENCE;            %% 0xfffffffd
+        false -> ?MAX_BIP125_RBF_SEQUENCE + 1;        %% 0xfffffffe
+        _ ->
+            throw({bumpfee_error, ?RPC_INVALID_PARAMETER,
+                   <<"replaceable must be a boolean">>})
+    end,
+    %% --- look up each input's prevout UTXO (single pipeline: chainstate) ---
+    Network = beamchain_config:network(),
+    InputUtxos = bumpfee_lookup_input_utxos(OldTx#transaction.inputs),
+    %% --- precondition 5: all input prevouts must be wallet-owned ---
+    %% Borrow the FIX-59 helper which throws not_found if any prevout
+    %% scriptPubKey doesn't resolve to a wallet keystore key, AND short-
+    %% circuits to wallet_locked when the wallet is locked. Refusal here
+    %% mirrors Core's AllInputsMine() precondition.
+    Selected = bumpfee_make_selected(OldTx#transaction.inputs, InputUtxos),
+    case lookup_privkeys_for_inputs(Pid, Selected, Network) of
+        {ok, PrivKeys} ->
+            bumpfee_build_and_finalize(
+                Pid, Txid, OldTx, OldEntryFee, OldEntryVSize,
+                InputUtxos, PrivKeys, NewSequence,
+                Options, Network, Mode);
+        {error, wallet_locked} ->
+            throw({bumpfee_error, -13,
+                   <<"Error: Please enter the wallet passphrase with "
+                     "walletpassphrase first.">>});
+        {error, {key_not_found, _Idx, _Info}} ->
+            %% Core: feebumper::Result::WALLET_ERROR / "Transaction contains
+            %% inputs that don't belong to this wallet".
+            throw({bumpfee_error, ?RPC_WALLET_ERROR,
+                   <<"Transaction contains inputs that don't belong to "
+                     "this wallet">>})
+    end.
+
+bumpfee_extract_entry(Entry) ->
+    %% mempool_entry is private; reach in via record_info field index. We
+    %% defensively check the tag.
+    case Entry of
+        {mempool_entry, _Txid, _Wtxid, Tx, Fee, _Size, VSize, _Weight,
+         _FeeRate, _TimeAdded, _HeightAdded, _AC, _AS, _AF, _DC, _DS, _DF,
+         _SC, _RBF} ->
+            {Tx, Fee, VSize};
+        _ ->
+            throw({bumpfee_error, ?RPC_MISC_ERROR,
+                   <<"Unexpected mempool_entry shape">>})
+    end.
+
+bumpfee_lookup_input_utxos(Inputs) ->
+    lists:map(fun(#tx_in{prev_out = #outpoint{hash = H, index = I}}) ->
+        case beamchain_chainstate:get_utxo(H, I) of
+            {ok, Utxo} -> Utxo;
+            not_found ->
+                %% Fall back to the mempool (parent could be unconfirmed).
+                case beamchain_mempool:get_mempool_utxo(H, I) of
+                    {ok, Utxo} -> Utxo;
+                    not_found ->
+                        throw({bumpfee_error, ?RPC_WALLET_ERROR,
+                               <<"Could not locate prevout UTXO for "
+                                 "transaction input (missing from "
+                                 "chainstate and mempool)">>})
+                end
+        end
+    end, Inputs).
+
+%% Build the {Txid, Vout, Utxo} triples lookup_privkeys_for_inputs expects.
+bumpfee_make_selected(Inputs, Utxos) ->
+    lists:zipwith(fun(#tx_in{prev_out = #outpoint{hash = H, index = V}},
+                      Utxo) ->
+        {H, V, Utxo}
+    end, Inputs, Utxos).
+
+bumpfee_build_and_finalize(Pid, OldTxid, OldTx, OldFee, OldVSize,
+                           InputUtxos, PrivKeys, NewSequence,
+                           Options, Network, Mode) ->
+    %% --- identify change output(s) ---
+    ChangeOutputs = bumpfee_change_outputs(Pid, OldTx, Network),
+    case ChangeOutputs of
+        [] ->
+            throw({bumpfee_error, ?RPC_WALLET_ERROR,
+                   <<"Transaction has no change output to absorb the fee "
+                     "increase; add inputs or specify outputs (not yet "
+                     "supported by beamchain bumpfee)">>});
+        [_ | _] ->
+            ok
+    end,
+    %% --- compute target fee delta ---
+    %% IncrFee_satvB = max(WALLET_INCREMENTAL_RELAY_FEE, node incremental).
+    %% Node value is 100 sat/kvB = ceil(100/1000) = 1 sat/vB.
+    NodeIncrSatVB = (beamchain_mempool:incremental_relay_fee_constant()
+                     + 999) div 1000,
+    IncrSatVB = max(?WALLET_INCREMENTAL_RELAY_FEE_SATVB, NodeIncrSatVB),
+    %% MinNewFee = OldFee + ceil(VSize * IncrSatVB).  This guarantees the
+    %% PaysForRBF rule (Rule 4) and the new tx pays the incremental relay
+    %% fee for its bandwidth.
+    MinNewFee = OldFee + OldVSize * IncrSatVB,
+    NewFee =
+        case maps:get(<<"fee_rate">>, Options, undefined) of
+            undefined ->
+                %% Default: pay the minimum bump (Core's PaysForRBF + Rule 3).
+                MinNewFee;
+            FR when is_number(FR), FR > 0 ->
+                %% fee_rate is sat/vB; total fee = ceil(VSize * fee_rate).
+                Candidate = bumpfee_ceil_num(FR * OldVSize),
+                case Candidate >= MinNewFee of
+                    true  -> Candidate;
+                    false ->
+                        throw({bumpfee_error, ?RPC_INVALID_PARAMETER,
+                            iolist_to_binary(io_lib:format(
+                                "fee_rate ~p sat/vB produces fee ~B which "
+                                "is below the minimum bump ~B (oldFee ~B + "
+                                "incrementalFee ~B sat/vB * ~B vbytes)",
+                                [FR, Candidate, MinNewFee, OldFee, IncrSatVB,
+                                 OldVSize]))})
+                end;
+            _ ->
+                throw({bumpfee_error, ?RPC_INVALID_PARAMETER,
+                       <<"fee_rate must be a positive number (sat/vB)">>})
+        end,
+    FeeDelta = NewFee - OldFee,
+    %% --- reduce change ---
+    {ChangeIdx, ChangeValue} = hd(ChangeOutputs),
+    NewChangeValue = ChangeValue - FeeDelta,
+    case NewChangeValue >= ?DUST_THRESHOLD_SAT of
+        true -> ok;
+        false ->
+            throw({bumpfee_error, ?RPC_WALLET_ERROR,
+                   iolist_to_binary(io_lib:format(
+                       "Insufficient change to absorb fee delta of ~B sat "
+                       "(change ~B sat would fall below dust ~B sat)",
+                       [FeeDelta, NewChangeValue, ?DUST_THRESHOLD_SAT]))})
+    end,
+    %% --- build new tx (same inputs, same outputs except change) ---
+    NewInputs = [In#tx_in{
+                    script_sig = <<>>,
+                    sequence   = NewSequence,
+                    witness    = []
+                 } || In <- OldTx#transaction.inputs],
+    NewOutputs = bumpfee_replace_change(OldTx#transaction.outputs,
+                                        ChangeIdx, NewChangeValue),
+    NewTx = OldTx#transaction{
+        inputs   = NewInputs,
+        outputs  = NewOutputs,
+        txid     = undefined,
+        wtxid    = undefined
+    },
+    case Mode of
+        txid ->
+            bumpfee_sign_and_submit(NewTx, InputUtxos, PrivKeys, OldFee,
+                                    NewFee, OldTxid);
+        psbt ->
+            bumpfee_emit_psbt(NewTx, InputUtxos, OldFee, NewFee)
+    end.
+
+%% Replace the change-output value at OutputIdx; preserve all other outputs.
+bumpfee_replace_change(Outputs, OutputIdx, NewValue) ->
+    {Pre, [Change | Post]} = lists:split(OutputIdx, Outputs),
+    Pre ++ [Change#tx_out{value = NewValue} | Post].
+
+%% Identify the wallet's change outputs in OldTx by matching script→addr
+%% against listaddresses. Returns [{OutputIndex, Value}] sorted by index.
+bumpfee_change_outputs(Pid, OldTx, Network) ->
+    {ok, AddrEntries} = beamchain_wallet:list_addresses(Pid),
+    ChangeAddrSet = lists:foldl(fun(M, Acc) ->
+        case maps:get(<<"change">>, M, false) of
+            true ->
+                sets:add_element(maps:get(<<"address">>, M), Acc);
+            false ->
+                Acc
+        end
+    end, sets:new(), AddrEntries),
+    %% Walk outputs in order; collect those whose decoded address is a
+    %% wallet change address.
+    {_, Hits} = lists:foldl(
+        fun(#tx_out{value = V, script_pubkey = S}, {Idx, Acc}) ->
+            AddrStr = beamchain_address:script_to_address(S, Network),
+            AddrBin = case AddrStr of
+                unknown -> <<>>;
+                A when is_list(A) -> list_to_binary(A);
+                A when is_binary(A) -> A
+            end,
+            case AddrBin =/= <<>> andalso
+                 sets:is_element(AddrBin, ChangeAddrSet) of
+                true  -> {Idx + 1, [{Idx, V} | Acc]};
+                false -> {Idx + 1, Acc}
+            end
+        end, {0, []}, OldTx#transaction.outputs),
+    lists:reverse(Hits).
+
+bumpfee_sign_and_submit(NewTx, InputUtxos, PrivKeys, OldFee, NewFee, OldTxid) ->
+    case beamchain_wallet:sign_transaction(NewTx, InputUtxos, PrivKeys) of
+        {ok, SignedTx} ->
+            case beamchain_mempool:accept_to_memory_pool(SignedTx) of
+                {ok, NewTxid} ->
+                    {ok_raw_json, replace_btc_sentinels(jsx:encode(#{
+                        <<"txid">>    => beamchain_serialize:hex_encode(NewTxid),
+                        <<"origfee">> => format_amount_sentinel(OldFee),
+                        <<"fee">>     => format_amount_sentinel(NewFee),
+                        <<"errors">>  => []
+                    }))};
+                {error, Reason} ->
+                    %% Bubble up the mempool reason but include the old
+                    %% txid so the operator can correlate.
+                    Msg = iolist_to_binary(io_lib:format(
+                        "Replacement tx rejected by mempool "
+                        "(old=~s reason=~p)",
+                        [beamchain_serialize:hex_encode(OldTxid), Reason])),
+                    throw({bumpfee_error, ?RPC_VERIFY_REJECTED, Msg})
+            end;
+        {error, Reason} ->
+            throw({bumpfee_error, ?RPC_WALLET_ERROR,
+                   iolist_to_binary(io_lib:format(
+                       "Failed to sign replacement transaction: ~p",
+                       [Reason]))})
+    end.
+
+bumpfee_emit_psbt(NewTx, InputUtxos, OldFee, NewFee) ->
+    case beamchain_psbt:create(NewTx) of
+        {ok, Psbt0} ->
+            %% Attach witness UTXOs so an offline signer (or psbtbumpfee
+            %% follow-up via walletprocesspsbt) has everything to compute
+            %% sighashes — same pattern as walletcreatefundedpsbt.
+            Psbt = lists:foldl(
+                fun({Idx, U}, Acc) ->
+                    beamchain_wallet:add_witness_utxo(Acc, Idx, U)
+                end, Psbt0,
+                lists:zip(lists:seq(0, length(InputUtxos) - 1), InputUtxos)),
+            PsbtBin = beamchain_psbt:encode(Psbt),
+            PsbtB64 = base64:encode(PsbtBin),
+            {ok_raw_json, replace_btc_sentinels(jsx:encode(#{
+                <<"psbt">>    => PsbtB64,
+                <<"origfee">> => format_amount_sentinel(OldFee),
+                <<"fee">>     => format_amount_sentinel(NewFee),
+                <<"errors">>  => []
+            }))};
+        {error, Reason} ->
+            throw({bumpfee_error, ?RPC_MISC_ERROR,
+                   iolist_to_binary(io_lib:format(
+                       "PSBT creation failed: ~p", [Reason]))})
+    end.
+
+%% Ceiling of a possibly-float product: float values round up, ints stay.
+bumpfee_ceil_num(X) when is_integer(X) -> X;
+bumpfee_ceil_num(X) when is_float(X) ->
+    T = trunc(X),
+    case X > T of
+        true  -> T + 1;
+        false -> T
     end.
 
 %% @doc List unspent outputs (multi-wallet aware).

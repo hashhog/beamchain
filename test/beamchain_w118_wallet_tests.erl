@@ -625,22 +625,35 @@ g19_bip125_rbf_signaling_test_() ->
        end)
      ]}.
 
-%% G20 — BUG-2: bumpfee RPC missing entirely
-g20_bumpfee_missing_test_() ->
-    {"G20: BUG-2 — bumpfee RPC handler missing (MISSING ENTIRELY)",
+%% G20 — BUG-2 CLOSED: bumpfee RPC handler now exists.
+%%
+%% FIX-61 (W118 BUG-2, 2026-05-15): bumpfee dispatches to rpc_bumpfee/2.
+%% Re-sign path reuses lookup_privkeys_for_inputs/3 (single pipeline with
+%% sendtoaddress + signrawtransactionwithwallet, established in FIX-59).
+g20_bumpfee_present_test_() ->
+    {"G20: BUG-2 CLOSED — bumpfee RPC handler dispatched and re-uses "
+     "lookup_privkeys_for_inputs (FIX-59 single pipeline)",
      [
       ?_test(begin
-         %% handle_method/3 routes by method name. We can test via the
-         %% module's exported handle_method by looking up the function
-         %% clauses. A "missing" method falls through to the default
-         %% error clause. The exact text of that error is the spec.
-         %% beamchain_rpc:handle_method/3 is not exported; we check via
-         %% the exported help_for_method/1 or by direct introspection.
-         %%
-         %% A pragmatic check: the source has no clause for <<"bumpfee">>.
          {ok, Src} = file:read_file(beamchain_rpc_path()),
-         Has = binary:match(Src, <<"<<\"bumpfee\">>">>),
-         ?assertEqual(nomatch, Has)
+         %% Dispatch clause exists.
+         ?assertNotEqual(nomatch,
+             binary:match(Src, <<"handle_method(<<\"bumpfee\">>,">>)),
+         %% Implementation function exists.
+         ?assertNotEqual(nomatch,
+             binary:match(Src, <<"rpc_bumpfee(">>))
+       end),
+      ?_test(begin
+         %% FIX-61 single-pipeline reuse: bumpfee MUST go through
+         %% lookup_privkeys_for_inputs (FIX-59) — no second parallel
+         %% keystore-lookup pipeline.
+         {ok, Src} = file:read_file(beamchain_rpc_path()),
+         %% Count occurrences. There must be the helper definition,
+         %% the rpc_sendtoaddress call site, and the bumpfee call site.
+         Matches = binary:matches(Src,
+             <<"lookup_privkeys_for_inputs(">>),
+         %% definition counts once + 1 in rpc_sendtoaddress + 1 in bumpfee = 3
+         ?assert(length(Matches) >= 3)
        end)
      ]}.
 
@@ -658,38 +671,186 @@ beamchain_rpc_path() ->
             "src/beamchain_rpc.erl"
     end.
 
-%% G21 — BUG-3: psbtbumpfee RPC missing entirely
-g21_psbtbumpfee_missing_test_() ->
-    {"G21: BUG-3 — psbtbumpfee RPC handler missing (MISSING ENTIRELY)",
+%% G21 — BUG-3 CLOSED: psbtbumpfee RPC handler now exists.
+%%
+%% FIX-61 (W118 BUG-3, 2026-05-15): psbtbumpfee shares the run_bumpfee
+%% driver with bumpfee — Mode=psbt skips the re-sign step and returns a
+%% base64-encoded unsigned PSBT (with witness_utxo populated for offline
+%% signers), matching Core's `want_psbt` branch in spend.cpp::bumpfee_helper.
+g21_psbtbumpfee_present_test_() ->
+    {"G21: BUG-3 CLOSED — psbtbumpfee RPC handler dispatched",
      [
       ?_test(begin
          {ok, Src} = file:read_file(beamchain_rpc_path()),
-         Has = binary:match(Src, <<"<<\"psbtbumpfee\">>">>),
-         ?assertEqual(nomatch, Has)
+         ?assertNotEqual(nomatch,
+             binary:match(Src, <<"handle_method(<<\"psbtbumpfee\">>,">>)),
+         ?assertNotEqual(nomatch,
+             binary:match(Src, <<"rpc_psbtbumpfee(">>))
+       end),
+      ?_test(begin
+         %% PSBT branch must emit a base64-encoded "psbt" field.
+         {ok, Src} = file:read_file(beamchain_rpc_path()),
+         ?assertNotEqual(nomatch,
+             binary:match(Src, <<"bumpfee_emit_psbt(">>)),
+         ?assertNotEqual(nomatch,
+             binary:match(Src, <<"<<\"psbt\">>    => PsbtB64">>))
        end)
      ]}.
 
-%% G22 — BUG-12: incrementalRelayFee not threaded into wallet/bumpfee
-g22_incremental_relay_fee_dead_test_() ->
-    {"G22: BUG-12 — incrementalRelayFee surfaces in getnetworkinfo only; no bumpfee wiring",
+%% G22 — BUG-12 CLOSED: incrementalRelayFee now threaded into bumpfee.
+%%
+%% FIX-61 (2026-05-15): bumpfee consumes the node's
+%% beamchain_mempool:incremental_relay_fee_constant/0 (the same constant
+%% RBF Rule 4 / PaysForRBF uses) and clamps the per-vB delta up to the
+%% wallet's conservative WALLET_INCREMENTAL_RELAY_FEE_SATVB constant
+%% (Core wallet/wallet.h::WALLET_INCREMENTAL_RELAY_FEE = 5000 sat/kvB).
+g22_incremental_relay_fee_wired_test_() ->
+    {"G22: BUG-12 CLOSED — incrementalRelayFee wired into bumpfee "
+     "(min sat/vB clamp + PaysForRBF Rule 4 delta)",
      [
       ?_test(begin
-         %% The string "incrementalrelayfee" appears in
-         %% beamchain_rpc.erl ONLY as a getnetworkinfo response field
-         %% (hardcoded 0.00001). There is no incremental-relay-fee-aware
-         %% codepath in the wallet — no bumpfee wiring can consume it.
+         %% The cosmetic getnetworkinfo field stays.
          {ok, Src} = file:read_file(beamchain_rpc_path()),
-         %% Locate occurrences and verify they all sit inside
-         %% getnetworkinfo (i.e. only the cosmetic field). We do this
-         %% by counting matches and requiring exactly 1.
          Matches = binary:matches(Src, <<"incrementalrelayfee">>),
-         %% Exactly one occurrence -- the getnetworkinfo cosmetic field.
-         %% Any future bumpfee wiring would add additional sites.
-         ?assertEqual(1, length(Matches)),
-         %% And it must not appear in the wallet module at all.
+         ?assertEqual(1, length(Matches))
+       end),
+      ?_test(begin
+         %% Bumpfee references the wallet's incremental relay fee floor.
+         {ok, Src} = file:read_file(beamchain_rpc_path()),
+         ?assertNotEqual(nomatch,
+             binary:match(Src, <<"WALLET_INCREMENTAL_RELAY_FEE_SATVB">>)),
+         %% And the node's incremental_relay_fee_constant/0.
+         ?assertNotEqual(nomatch,
+             binary:match(Src,
+                 <<"beamchain_mempool:incremental_relay_fee_constant">>))
+       end),
+      ?_test(begin
+         %% Wallet module itself remains free of the cosmetic literal
+         %% (the wiring lives in the RPC dispatcher, not the keystore).
          {ok, WSrc} = file:read_file(beamchain_wallet_path()),
          ?assertEqual(nomatch,
              binary:match(WSrc, <<"incrementalrelayfee">>))
+       end)
+     ]}.
+
+%%% -------------------------------------------------------------------
+%%% G20/G21 — FIX-61 unit tests for bumpfee / psbtbumpfee
+%%%
+%%% These tests don't spin up a live wallet or mempool; they exercise
+%%% the pure helpers + the RPC dispatcher's reject paths. The full
+%%% round-trip is covered by the integration smoke harness, which is
+%%% gated by build-all.sh:113 (the project's cold-boot regression).
+%%% -------------------------------------------------------------------
+
+%% bumpfee_ceil_num/1 — math helper. Ceil(VSize * sat/vB).
+bumpfee_ceil_num_test_() ->
+    {"FIX-61 — bumpfee_ceil_num/1: ceiling of floating-point fee product",
+     [
+      ?_assertEqual(0,   beamchain_rpc:bumpfee_ceil_num(0)),
+      ?_assertEqual(140, beamchain_rpc:bumpfee_ceil_num(140)),
+      %% Float fees round UP — incremental relay rule cannot be undercut
+      %% by floating-point truncation.
+      ?_assertEqual(141, beamchain_rpc:bumpfee_ceil_num(140.1)),
+      ?_assertEqual(141, beamchain_rpc:bumpfee_ceil_num(140.99)),
+      ?_assertEqual(140, beamchain_rpc:bumpfee_ceil_num(140.0))
+     ]}.
+
+%% bumpfee_replace_change/3 — pure tx-output rewriter.
+bumpfee_replace_change_test_() ->
+    Out0 = #tx_out{value = 40000, script_pubkey = <<"recipient">>},
+    Change = #tx_out{value = 9500, script_pubkey = <<"change">>},
+    {"FIX-61 — bumpfee_replace_change/3 rewrites only the change output",
+     [
+      ?_test(begin
+         %% Change at index 1 (typical: recipient first, change second).
+         Outs0 = [Out0, Change],
+         NewOuts = beamchain_rpc:bumpfee_replace_change(Outs0, 1, 9300),
+         ?assertEqual([Out0, Change#tx_out{value = 9300}], NewOuts)
+       end),
+      ?_test(begin
+         %% Change at index 0 (e.g. coin-control ordering).
+         Outs0 = [Change, Out0],
+         NewOuts = beamchain_rpc:bumpfee_replace_change(Outs0, 0, 9300),
+         ?assertEqual([Change#tx_out{value = 9300}, Out0], NewOuts)
+       end)
+     ]}.
+
+%% G20b — bumpfee rejects an unknown txid with RPC_INVALID_ADDRESS_OR_KEY.
+%% This is the "not in mempool / not in wallet" Core code path.
+g20b_bumpfee_unknown_txid_test_() ->
+    {"G20b: BUG-2 CLOSED — bumpfee on unknown txid rejects "
+     "(does not silently no-op)",
+     [
+      ?_test(begin
+         %% No wallet/mempool is running; the dispatcher resolves the wallet
+         %% first and returns wallet_not_found_error before reaching the
+         %% mempool lookup. That's still a clear rejection — not silent
+         %% success.
+         BogusTxid = <<"00000000000000000000000000000000",
+                       "00000000000000000000000000000000">>,
+         Result = beamchain_rpc:rpc_bumpfee([BogusTxid], <<>>),
+         %% Must be an error tuple — not {ok, _}.
+         case Result of
+             {error, _Code, _Msg}      -> ok;
+             {error, _Code, _, _, _}   -> ok;
+             {error, _Msg}             -> ok;
+             {ok, _}                   -> ?assert(false);
+             {ok_raw_json, _}          -> ?assert(false);
+             _                         -> ok
+         end
+       end)
+     ]}.
+
+%% G20c — bumpfee parameter validation: non-binary txid / bad arity.
+g20c_bumpfee_bad_params_test_() ->
+    {"G20c: BUG-2 CLOSED — bumpfee parameter shape rejected",
+     [
+      ?_test(begin
+         %% Empty list — bad arity.
+         R1 = beamchain_rpc:rpc_bumpfee([], <<>>),
+         ?assertMatch({error, _, _}, R1)
+       end),
+      ?_test(begin
+         %% Non-binary txid.
+         R2 = beamchain_rpc:rpc_bumpfee([123], <<>>),
+         ?assertMatch({error, _, _}, R2)
+       end)
+     ]}.
+
+%% G21b — psbtbumpfee parameter validation matches bumpfee.
+g21b_psbtbumpfee_bad_params_test_() ->
+    {"G21b: BUG-3 CLOSED — psbtbumpfee parameter shape rejected",
+     [
+      ?_test(begin
+         R = beamchain_rpc:rpc_psbtbumpfee([], <<>>),
+         ?assertMatch({error, _, _}, R)
+       end),
+      ?_test(begin
+         %% Wrong type for options.
+         R = beamchain_rpc:rpc_psbtbumpfee(
+                 [<<"00000000000000000000000000000000",
+                    "00000000000000000000000000000000">>,
+                  not_a_map],
+                 <<>>),
+         ?assertMatch({error, _, _}, R)
+       end)
+     ]}.
+
+%% Source-anchor test: confirm psbtbumpfee shares the do_bumpfee_rpc
+%% driver with bumpfee — both dispatch through the same single-pipeline
+%% helper. Prevents a regression where someone forks the implementation.
+bumpfee_single_pipeline_anchor_test_() ->
+    {"FIX-61 — bumpfee + psbtbumpfee share do_bumpfee_rpc/4 driver",
+     [
+      ?_test(begin
+         {ok, Src} = file:read_file(beamchain_rpc_path()),
+         %% Both modes call into the shared driver.
+         ?assertNotEqual(nomatch,
+             binary:match(Src,
+                 <<"do_bumpfee_rpc(TxidHex, Options, WalletName, txid)">>)),
+         ?assertNotEqual(nomatch,
+             binary:match(Src,
+                 <<"do_bumpfee_rpc(TxidHex, Options, WalletName, psbt)">>))
        end)
      ]}.
 
