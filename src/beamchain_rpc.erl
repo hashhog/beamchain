@@ -78,6 +78,11 @@
 %% `handle_method(<<"walletprocesspsbt">>, ...)` calls this same fun.
 -export([rpc_walletprocesspsbt/2, parse_sighash_string/1]).
 
+%% W119 FIX-64: TLS termination config resolver. Exported so eunit can
+%% probe half-config / missing-file failure modes without spinning up
+%% the gen_server.
+-export([resolve_tls_config/0]).
+
 %% Cowboy handler
 -export([init/2]).
 
@@ -204,12 +209,56 @@ init([]) ->
             {"/health", beamchain_rpc, [health]}
         ]}
     ]),
-    TransportOpts = #{socket_opts => [{port, Port}, {reuseaddr, true}]},
     ProtoOpts = #{env => #{dispatch => Dispatch}},
-    case beamchain_listener:start_clear_with_retry(
-            beamchain_rpc_listener, TransportOpts, ProtoOpts, "rpc") of
+    %% W119 FIX-64: optional HTTPS/TLS termination. When BOTH
+    %% rpc_tls_cert and rpc_tls_key are set (via --rpc-tls-cert /
+    %% --rpc-tls-key or rpctlscert= / rpctlskey= in beamchain.conf),
+    %% wire cowboy:start_tls/3 with the cert+key files. When NEITHER
+    %% is set, fall back to plaintext cowboy:start_clear/3 (backward
+    %% compatible). When exactly one is set, refuse to start: mirrors
+    %% Core's "BIP-78 §Protocol" requirement that PayJoin requests
+    %% always travel under TLS in production, and prevents the silent
+    %% half-config foot-gun where an operator typoed one key.
+    %%
+    %% Reference: bitcoin-core/src/httpserver.cpp HTTPServerInit() ->
+    %%   InitHTTPServer wires evhttp_set_bevcb when -rpcsslcertificatechainfile
+    %%   and -rpcsslprivatekeyfile are both set, else errors.
+    %%
+    %% Note on reuseaddr: only valid for ranch_tcp (plaintext). ranch_ssl
+    %% does not accept it and logs a "Transport option unknown or invalid"
+    %% warning. Keep it on the clear path (where it covers the SIGTERM ->
+    %% restart TIME_WAIT race documented in beamchain_listener) and omit
+    %% on the TLS path.
+    TlsResult = resolve_tls_config(),
+    {ListenerLaunch, LogScheme} = case TlsResult of
+        {ok, none} ->
+            TransportOpts0 = #{socket_opts =>
+                                 [{port, Port}, {reuseaddr, true}]},
+            LaunchFun0 = fun() ->
+                beamchain_listener:start_clear_with_retry(
+                    beamchain_rpc_listener, TransportOpts0, ProtoOpts, "rpc")
+            end,
+            {LaunchFun0, "http"};
+        {ok, {tls, CertFile, KeyFile}} ->
+            TransportOpts1 = #{socket_opts =>
+                                 [{port, Port},
+                                  {certfile, CertFile},
+                                  {keyfile, KeyFile}]},
+            LaunchFun1 = fun() ->
+                beamchain_listener:start_tls_with_retry(
+                    beamchain_rpc_listener, TransportOpts1, ProtoOpts, "rpc")
+            end,
+            logger:info("rpc: HTTPS enabled (cert=~s key=~s)",
+                        [CertFile, KeyFile]),
+            {LaunchFun1, "https"};
+        {error, TlsErr} ->
+            logger:error("rpc: TLS misconfigured: ~p", [TlsErr]),
+            exit({rpc_tls_misconfigured, TlsErr})
+    end,
+    case ListenerLaunch() of
         {ok, _} ->
-            logger:info("rpc: listening on port ~B", [Port]);
+            logger:info("rpc: listening on ~s://0.0.0.0:~B",
+                        [LogScheme, Port]);
         {error, Reason} ->
             logger:error("rpc: failed to bind port ~B after retries: ~p",
                          [Port, Reason]),
@@ -4294,6 +4343,54 @@ rpc_port(Params) ->
         undefined -> Params#network_params.rpc_port;
         P when is_integer(P) -> P;
         P when is_list(P) -> list_to_integer(P)
+    end.
+
+%% W119 FIX-64: resolve RPC TLS termination config.
+%% Returns:
+%%   {ok, none}                       -- plaintext (default, backward compat)
+%%   {ok, {tls, CertFile, KeyFile}}   -- HTTPS termination
+%%   {error, Reason}                  -- half-config / file missing
+%%
+%% Sources (priority high -> low): env var > application env > config file.
+%% Keys: rpc_tls_cert / rpc_tls_key (atoms in ETS, populated via CLI
+%% --rpc-tls-cert / --rpc-tls-key OR rpctlscert= / rpctlskey= lines in
+%% beamchain.conf). Matches the {rpcuser, rpcpassword} resolution shape
+%% in setup_auth/0.
+resolve_tls_config() ->
+    Cert = tls_path_from_config(rpc_tls_cert, rpctlscert,
+                                "BEAMCHAIN_RPC_TLS_CERT"),
+    Key  = tls_path_from_config(rpc_tls_key, rpctlskey,
+                                "BEAMCHAIN_RPC_TLS_KEY"),
+    case {Cert, Key} of
+        {undefined, undefined} ->
+            {ok, none};
+        {undefined, _} ->
+            {error, {rpc_tls_cert_missing, key_set_without_cert}};
+        {_, undefined} ->
+            {error, {rpc_tls_key_missing, cert_set_without_key}};
+        {CertPath, KeyPath} ->
+            case {filelib:is_regular(CertPath),
+                  filelib:is_regular(KeyPath)} of
+                {true, true} -> {ok, {tls, CertPath, KeyPath}};
+                {false, _}   -> {error, {cert_file_not_found, CertPath}};
+                {_, false}   -> {error, {key_file_not_found, KeyPath}}
+            end
+    end.
+
+tls_path_from_config(EtsKey, ConfKey, EnvVar) ->
+    case os:getenv(EnvVar) of
+        false  -> tls_path_first_set([EtsKey, ConfKey]);
+        ""     -> tls_path_first_set([EtsKey, ConfKey]);
+        EnvVal -> EnvVal
+    end.
+
+tls_path_first_set([]) -> undefined;
+tls_path_first_set([K | Rest]) ->
+    case beamchain_config:get(K) of
+        undefined -> tls_path_first_set(Rest);
+        V when is_binary(V) -> binary_to_list(V);
+        V when is_list(V), V =/= "" -> V;
+        _ -> tls_path_first_set(Rest)
     end.
 
 to_bin(V) when is_binary(V) -> V;

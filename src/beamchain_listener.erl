@@ -20,7 +20,8 @@
 %% worst-case wait. Matches the spec in
 %% overnight-2026-04-13/BEAMCHAIN-RPC-RETRY-FIX.md.
 
--export([start_clear_with_retry/4]).
+-export([start_clear_with_retry/4,
+         start_tls_with_retry/4]).
 
 -define(MAX_ATTEMPTS, 6).
 -define(BASE_BACKOFF_MS, 1000).
@@ -29,10 +30,28 @@
                              iodata()) ->
     {ok, pid()} | {error, term()}.
 start_clear_with_retry(Ref, TransportOpts, ProtoOpts, LogTag) ->
-    start_clear_with_retry(Ref, TransportOpts, ProtoOpts, LogTag, 1).
+    start_with_retry(clear, Ref, TransportOpts, ProtoOpts, LogTag, 1).
 
-start_clear_with_retry(Ref, TransportOpts, ProtoOpts, LogTag, Attempt) ->
-    case cowboy:start_clear(Ref, TransportOpts, ProtoOpts) of
+%% Mirrors start_clear_with_retry/4 but dispatches cowboy:start_tls/3.
+%% TransportOpts MUST include {certfile, Path} and {keyfile, Path} in
+%% socket_opts (see FIX-64 + W119; matches Bitcoin Core
+%% src/httpserver.cpp's evhttp_set_bevcb wiring for libevent + OpenSSL).
+%%
+%% TLS handshake-level failures (bad cert chain, key permission denied,
+%% wrong PEM tag) surface as {error, Reason} from cowboy:start_tls and
+%% are NOT retried -- only port-busy races are.
+-spec start_tls_with_retry(ranch:ref(), ranch:opts(), cowboy:opts(),
+                           iodata()) ->
+    {ok, pid()} | {error, term()}.
+start_tls_with_retry(Ref, TransportOpts, ProtoOpts, LogTag) ->
+    start_with_retry(tls, Ref, TransportOpts, ProtoOpts, LogTag, 1).
+
+start_with_retry(Kind, Ref, TransportOpts, ProtoOpts, LogTag, Attempt) ->
+    Result = case Kind of
+        clear -> cowboy:start_clear(Ref, TransportOpts, ProtoOpts);
+        tls   -> cowboy:start_tls(Ref, TransportOpts, ProtoOpts)
+    end,
+    case Result of
         {ok, Pid} ->
             {ok, Pid};
         {error, {already_started, Pid}} ->
@@ -42,8 +61,8 @@ start_clear_with_retry(Ref, TransportOpts, ProtoOpts, LogTag, Attempt) ->
             logger:warning("~s: port busy (attempt ~B/~B, retry in ~Bms): ~p",
                            [LogTag, Attempt, ?MAX_ATTEMPTS, Backoff, Reason]),
             timer:sleep(Backoff),
-            start_clear_with_retry(Ref, TransportOpts, ProtoOpts, LogTag,
-                                   Attempt + 1);
+            start_with_retry(Kind, Ref, TransportOpts, ProtoOpts, LogTag,
+                             Attempt + 1);
         {error, {listen_error, _, eaddrinuse}} when Attempt < ?MAX_ATTEMPTS ->
             %% Older / differently-wrapped ranch error shape. Belt and
             %% suspenders: match both.
@@ -51,8 +70,8 @@ start_clear_with_retry(Ref, TransportOpts, ProtoOpts, LogTag, Attempt) ->
             logger:warning("~s: port busy (attempt ~B/~B, retry in ~Bms)",
                            [LogTag, Attempt, ?MAX_ATTEMPTS, Backoff]),
             timer:sleep(Backoff),
-            start_clear_with_retry(Ref, TransportOpts, ProtoOpts, LogTag,
-                                   Attempt + 1);
+            start_with_retry(Kind, Ref, TransportOpts, ProtoOpts, LogTag,
+                             Attempt + 1);
         {error, Reason} ->
             {error, Reason}
     end.
