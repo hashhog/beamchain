@@ -70,6 +70,14 @@
          bumpfee_ceil_num/1, bumpfee_replace_change/3]).
 -endif.
 
+%% walletprocesspsbt (W118 BUG-5, FIX-63) — exported unconditionally so
+%% the W119 audit gate `expect_rpc_method_missing(<<"walletprocesspsbt">>)`
+%% (which inspects `beamchain_rpc:module_info(exports)`) sees the symbol
+%% appear and trips when the closure lands. Also exposes the entry point
+%% for eunit harnesses driving the handler directly. The dispatcher
+%% `handle_method(<<"walletprocesspsbt">>, ...)` calls this same fun.
+-export([rpc_walletprocesspsbt/2, parse_sighash_string/1]).
+
 %% Cowboy handler
 -export([init/2]).
 
@@ -654,6 +662,8 @@ handle_method(<<"walletcreatefundedpsbt">>, P, W) -> rpc_walletcreatefundedpsbt(
 %% W118 BUG-2 / BUG-3 closure: BIP-125 RBF fee bumping.
 handle_method(<<"bumpfee">>, P, W) -> rpc_bumpfee(P, W);
 handle_method(<<"psbtbumpfee">>, P, W) -> rpc_psbtbumpfee(P, W);
+%% W118 BUG-5 closure (FIX-63): wallet PSBT signer envelope.
+handle_method(<<"walletprocesspsbt">>, P, W) -> rpc_walletprocesspsbt(P, W);
 
 %% -- PSBT --
 handle_method(<<"createpsbt">>, P, _W) -> rpc_createpsbt(P);
@@ -795,6 +805,7 @@ rpc_help_list() ->
         <<"walletcreatefundedpsbt [{\"txid\":\"hex\",\"vout\":n},...] [{\"address\":amount},...] ( locktime options bip32derivs )">>,
         <<"walletlock">>,
         <<"walletpassphrase \"passphrase\" timeout">>,
+        <<"walletprocesspsbt \"psbt\" ( sign \"sighashtype\" bip32derivs finalize )">>,
         <<"">>,
         <<"== assumeUTXO ==">>,
         <<"loadtxoutset \"path\"">>,
@@ -5751,6 +5762,369 @@ bumpfee_ceil_num(X) when is_float(X) ->
     case X > T of
         true  -> T + 1;
         false -> T
+    end.
+
+%%% ===================================================================
+%%% walletprocesspsbt (W118 BUG-5 closure, FIX-63)
+%%%
+%%% Mirrors bitcoin-core/src/wallet/rpc/spend.cpp::walletprocesspsbt +
+%%% CWallet::FillPSBT (src/wallet/scriptpubkeyman.cpp).
+%%%
+%%% RPC contract (Core-compatible):
+%%%   walletprocesspsbt "psbt" ( sign "sighashtype" bip32derivs finalize )
+%%%   defaults: sign=true, sighashtype="DEFAULT"/"ALL", bip32derivs=true,
+%%%             finalize=true
+%%%   returns:  { psbt: <base64>, complete: <bool>, hex?: <hex> }
+%%%             hex is present iff complete=true AND finalize=true
+%%%
+%%% Pre-fix this RPC was MISSING (W118 audit BUG-5 / W119 G5 carry-
+%%% forward): the wallet had sign_psbt + finalize_psbt internal helpers
+%%% but no JSON-RPC envelope path that consumed a base64 PSBT. Classic
+%%% dead-helper-at-RPC-boundary. Now wires the existing signer through
+%%% the dispatcher and produces the Core RPC shape.
+%%%
+%%% Reuses (single-pipeline):
+%%%   - beamchain_psbt:decode/1                 (BIP-174 deserialize)
+%%%   - beamchain_wallet:get_private_key/2      (FIX-61 keystore lookup,
+%%%                                              same path as
+%%%                                              lookup_privkeys_for_inputs)
+%%%   - beamchain_wallet:sign_transaction/3+/4  (per-script-type signer)
+%%%   - beamchain_psbt:finalize/1 + :extract/1  (assemble final tx)
+%%%
+%%% Does NOT add a second keystore-walk pipeline (FIX-61's
+%%% lookup_privkeys_for_inputs/3 is the canonical wallet→privkey path).
+%%% bip32derivs is honored as a flag but attachment is skipped here —
+%%% beamchain's address record does not currently expose the derivation
+%%% path through a public API. Future work: add wallet:get_address_path/2
+%%% and populate bip32_derivation when bip32derivs=true.
+%%%-------------------------------------------------------------------
+
+%% sighashtype string → byte (mirrors Bitcoin Core's SighashFromStr,
+%% src/core_io.cpp:266). Returns {ok, Byte} | {error, Msg}.
+%%
+%% Two-stage match: the explicit clauses below accept the canonical
+%% upper-case spellings; `parse_sighash_string/1` itself
+%% upper-cases the binary first via `parse_sighash_string/2`. The split
+%% prevents infinite recursion when a non-matching binary is already
+%% upper-case (e.g. `<<"JUNK">>`).
+parse_sighash_string(Str) when is_binary(Str) ->
+    Upper = string:uppercase(Str),
+    parse_sighash_string_canonical(Upper, Str);
+parse_sighash_string(Str) when is_list(Str) ->
+    parse_sighash_string(list_to_binary(Str));
+parse_sighash_string(_) ->
+    {error, <<"sighashtype must be a string">>}.
+
+parse_sighash_string_canonical(<<"DEFAULT">>,             _) -> {ok, 16#00};
+parse_sighash_string_canonical(<<"ALL">>,                 _) -> {ok, 16#01};
+parse_sighash_string_canonical(<<"NONE">>,                _) -> {ok, 16#02};
+parse_sighash_string_canonical(<<"SINGLE">>,              _) -> {ok, 16#03};
+parse_sighash_string_canonical(<<"ALL|ANYONECANPAY">>,    _) -> {ok, 16#81};
+parse_sighash_string_canonical(<<"NONE|ANYONECANPAY">>,   _) -> {ok, 16#82};
+parse_sighash_string_canonical(<<"SINGLE|ANYONECANPAY">>, _) -> {ok, 16#83};
+parse_sighash_string_canonical(_, Orig) ->
+    {error, iolist_to_binary(io_lib:format(
+        "'~s' is not a valid sighash parameter.", [Orig]))}.
+
+%% RPC entry — handle_method dispatches `walletprocesspsbt` here.
+rpc_walletprocesspsbt([PsbtB64], W) ->
+    rpc_walletprocesspsbt([PsbtB64, true], W);
+rpc_walletprocesspsbt([PsbtB64, Sign], W) ->
+    rpc_walletprocesspsbt([PsbtB64, Sign, <<"ALL">>], W);
+rpc_walletprocesspsbt([PsbtB64, Sign, SH], W) ->
+    rpc_walletprocesspsbt([PsbtB64, Sign, SH, true], W);
+rpc_walletprocesspsbt([PsbtB64, Sign, SH, Bip32], W) ->
+    rpc_walletprocesspsbt([PsbtB64, Sign, SH, Bip32, true], W);
+rpc_walletprocesspsbt([PsbtB64, Sign, SH, Bip32, Finalize], WalletName)
+        when is_binary(PsbtB64), is_boolean(Sign),
+             is_boolean(Bip32), is_boolean(Finalize) ->
+    case resolve_wallet(WalletName) of
+        {ok, Pid} ->
+            try
+                do_walletprocesspsbt(Pid, PsbtB64, Sign, SH, Bip32, Finalize)
+            catch
+                throw:{wpp_error, Code, Msg} ->
+                    {error, Code, Msg};
+                _:Err ->
+                    {error, ?RPC_MISC_ERROR,
+                     iolist_to_binary(io_lib:format("Error: ~p", [Err]))}
+            end;
+        {error, _} ->
+            wallet_not_found_error(WalletName)
+    end;
+rpc_walletprocesspsbt(_, _) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"walletprocesspsbt \"psbt\" ( sign \"sighashtype\" bip32derivs "
+       "finalize )">>}.
+
+do_walletprocesspsbt(Pid, PsbtB64, Sign, SighashStr, _Bip32Derivs, Finalize) ->
+    %% Sighash resolution (string → byte).
+    Sighash = case parse_sighash_string(SighashStr) of
+        {ok, B} -> B;
+        {error, M} ->
+            throw({wpp_error, ?RPC_INVALID_PARAMETER, M})
+    end,
+    %% Locked-wallet check: only mandatory when sign=true (Core's
+    %% EnsureWalletIsUnlocked is gated on whether keys would actually be
+    %% accessed — spend.cpp:1627).
+    case Sign andalso beamchain_wallet:is_locked(Pid) of
+        true ->
+            throw({wpp_error, -13,
+                   <<"Error: Please enter the wallet passphrase with "
+                     "walletpassphrase first.">>});
+        _ ->
+            ok
+    end,
+    %% Base64 decode.
+    PsbtBin = try base64:decode(PsbtB64) of
+        Bin -> Bin
+    catch
+        error:_ ->
+            throw({wpp_error, ?RPC_DESERIALIZATION_ERROR,
+                   <<"Invalid base64 encoding">>})
+    end,
+    %% BIP-174 deserialize.
+    Psbt0 = case beamchain_psbt:decode(PsbtBin) of
+        {ok, P} -> P;
+        {error, R} ->
+            throw({wpp_error, ?RPC_DESERIALIZATION_ERROR,
+                   iolist_to_binary(io_lib:format(
+                       "TX decode failed: ~p", [R]))})
+    end,
+    %% Updater + Signer roles per BIP-174.
+    Network = try beamchain_config:network()
+              catch error:badarg -> mainnet  %% eunit fallback (no ETS)
+              end,
+    Tx = beamchain_psbt:get_unsigned_tx(Psbt0),
+    Inputs0 = inputs_field(Psbt0),
+    NumInputs = length(Tx#transaction.inputs),
+    NumInputs = length(Inputs0),
+    %% Per-input processing.  Returns {NewInputMap, Signed?} tuples.
+    Indexed = lists:zip(lists:seq(0, NumInputs - 1),
+                        lists:zip(Tx#transaction.inputs, Inputs0)),
+    Processed = lists:map(fun({Idx, {TxIn, InputMap}}) ->
+        wpp_process_input(Pid, Tx, TxIn, InputMap, Idx, Sighash, Sign,
+                          Inputs0, Network)
+    end, Indexed),
+    NewInputs = [M || {M, _} <- Processed],
+    AllSigned = lists:all(fun({_, S}) -> S end, Processed),
+    Psbt1 = set_inputs_field(Psbt0, NewInputs),
+    %% Finalize (optional).
+    {PsbtFinal, Complete, MaybeHex} = case Finalize andalso AllSigned of
+        true ->
+            case wpp_try_finalize_and_extract(Psbt1) of
+                {ok, FPsbt, Hex} -> {FPsbt, true, Hex};
+                {error_keep, FPsbt} -> {FPsbt, false, undefined}
+            end;
+        false ->
+            {Psbt1, AllSigned andalso Finalize, undefined}
+    end,
+    PsbtOutBin = beamchain_psbt:encode(PsbtFinal),
+    Base = #{<<"psbt">>     => base64:encode(PsbtOutBin),
+             <<"complete">> => Complete},
+    Result = case MaybeHex of
+        undefined -> Base;
+        H         -> Base#{<<"hex">> => H}
+    end,
+    {ok, Result}.
+
+%% Field accessors — defensively go through getters/setters that work on
+%% the canonical record. `inputs_field/1` exists because there is no
+%% public getter for `psbt#psbt.inputs`; we hand-walk the index 6.
+%% (W118 TP-2: now safe because both modules share the include header.)
+inputs_field(Psbt) ->
+    %% #psbt{} fields: {psbt, unsigned_tx, xpubs, version,
+    %%                  global_unknown, inputs, outputs}
+    element(6, Psbt).
+
+set_inputs_field(Psbt, NewInputs) ->
+    setelement(6, Psbt, NewInputs).
+
+%% Resolve prevout {Value, ScriptPubKey} from input map: prefer
+%% witness_utxo, fall back to non_witness_utxo[vout].
+wpp_prevout(InputMap, TxIn) ->
+    case maps:get(witness_utxo, InputMap, undefined) of
+        {V, SPK} when is_integer(V), is_binary(SPK) ->
+            {ok, V, SPK};
+        _ ->
+            case maps:get(non_witness_utxo, InputMap, undefined) of
+                #transaction{outputs = Outs} ->
+                    Vout = (TxIn#tx_in.prev_out)#outpoint.index,
+                    case Vout < length(Outs) of
+                        true ->
+                            #tx_out{value = V, script_pubkey = SPK} =
+                                lists:nth(Vout + 1, Outs),
+                            {ok, V, SPK};
+                        false ->
+                            error
+                    end;
+                _ ->
+                    error
+            end
+    end.
+
+%% Per-input processing.  Returns {NewInputMap, Signed?}.
+wpp_process_input(Pid, Tx, TxIn, InputMap, Idx, Sighash, Sign, AllInputMaps,
+                  Network) ->
+    %% If already finalized, leave alone.
+    case wpp_is_finalized(InputMap) of
+        true -> {InputMap, true};
+        false ->
+            case wpp_prevout(InputMap, TxIn) of
+                {ok, Value, ScriptPubKey} ->
+                    Utxo = #utxo{value = Value,
+                                 script_pubkey = ScriptPubKey,
+                                 is_coinbase = false,
+                                 height = 0},
+                    %% Ensure witness_utxo is attached (Updater role).
+                    InputMap1 = maps:put(witness_utxo,
+                                         {Value, ScriptPubKey},
+                                         InputMap),
+                    case Sign of
+                        false ->
+                            {InputMap1, false};
+                        true ->
+                            wpp_try_sign(Pid, Tx, TxIn, InputMap1, Idx, Utxo,
+                                          Sighash, AllInputMaps, Network)
+                    end;
+                error ->
+                    %% No UTXO info — cannot sign, cannot finalize.
+                    {InputMap, false}
+            end
+    end.
+
+wpp_is_finalized(InputMap) ->
+    maps:is_key(final_script_sig, InputMap)
+        orelse maps:is_key(final_script_witness, InputMap).
+
+%% Attempt to sign one input.  Looks up the wallet privkey via the
+%% scriptPubKey → address path (same as FIX-61
+%% lookup_privkeys_for_inputs/3), then dispatches to the appropriate
+%% per-script-type signer.
+wpp_try_sign(Pid, Tx, _TxIn, InputMap, Idx, Utxo, Sighash, AllInputMaps,
+              Network) ->
+    ScriptPubKey = Utxo#utxo.script_pubkey,
+    case beamchain_address:script_to_address(ScriptPubKey, Network) of
+        unknown ->
+            {InputMap, false};
+        AddrStr ->
+            case beamchain_wallet:get_private_key(Pid, AddrStr) of
+                {ok, PrivKey} when is_binary(PrivKey),
+                                   byte_size(PrivKey) =:= 32,
+                                   PrivKey =/= <<0:256>> ->
+                    wpp_sign_with(InputMap, Tx, Idx, Utxo, PrivKey, Sighash,
+                                   AllInputMaps);
+                {error, wallet_locked} ->
+                    throw({wpp_error, -13,
+                           <<"Error: Please enter the wallet passphrase "
+                             "with walletpassphrase first.">>});
+                _ ->
+                    %% Not a wallet input.  Updater path already attached
+                    %% witness_utxo.
+                    {InputMap, false}
+            end
+    end.
+
+%% Effective sighash for taproot (per BIP-341 default 0x00 / DEFAULT)
+%% unless the input or caller explicitly overrode it.
+wpp_effective_sighash(p2tr, _CallerSighash, InputMap) ->
+    case maps:get(sighash_type, InputMap, undefined) of
+        undefined -> 16#00;
+        S -> S
+    end;
+wpp_effective_sighash(_Other, CallerSighash, InputMap) ->
+    case maps:get(sighash_type, InputMap, undefined) of
+        undefined -> CallerSighash;
+        S -> S
+    end.
+
+wpp_sign_with(InputMap, Tx, Idx, Utxo, PrivKey, CallerSighash, AllInputMaps) ->
+    ScriptPubKey = Utxo#utxo.script_pubkey,
+    PubKey = beamchain_wallet:privkey_to_pubkey(PrivKey),
+    case beamchain_address:classify_script(ScriptPubKey) of
+        p2wpkh ->
+            HT = wpp_effective_sighash(p2wpkh, CallerSighash, InputMap),
+            PkHash = beamchain_crypto:hash160(PubKey),
+            ScriptCode = <<16#76, 16#a9, 20, PkHash/binary, 16#88, 16#ac>>,
+            SigHash = beamchain_script:sighash_witness_v0(
+                        Tx, Idx, ScriptCode, Utxo#utxo.value, HT),
+            {ok, DerSig} = beamchain_crypto:ecdsa_sign(SigHash, PrivKey),
+            SigWithType = <<DerSig/binary, HT>>,
+            Sigs0 = maps:get(partial_sigs, InputMap, #{}),
+            Sigs1 = Sigs0#{PubKey => SigWithType},
+            {InputMap#{partial_sigs => Sigs1}, true};
+        p2pkh ->
+            HT = wpp_effective_sighash(p2pkh, CallerSighash, InputMap),
+            PkHash = beamchain_crypto:hash160(PubKey),
+            ScriptCode = <<16#76, 16#a9, 20, PkHash/binary, 16#88, 16#ac>>,
+            SigHash = beamchain_script:sighash_legacy(
+                        Tx, Idx, ScriptCode, HT),
+            {ok, DerSig} = beamchain_crypto:ecdsa_sign(SigHash, PrivKey),
+            SigWithType = <<DerSig/binary, HT>>,
+            Sigs0 = maps:get(partial_sigs, InputMap, #{}),
+            Sigs1 = Sigs0#{PubKey => SigWithType},
+            {InputMap#{partial_sigs => Sigs1}, true};
+        p2tr ->
+            HT = wpp_effective_sighash(p2tr, CallerSighash, InputMap),
+            %% Build prevouts for taproot sighash — covers ALL inputs.
+            %% Bail if any other input has no prevout info available.
+            Prevouts = wpp_collect_prevouts(Tx, AllInputMaps),
+            case lists:any(fun(P) -> P =:= undefined end, Prevouts) of
+                true ->
+                    {InputMap, false};
+                false ->
+                    SigHash = beamchain_script:sighash_taproot(
+                                Tx, Idx, Prevouts,
+                                case HT of
+                                    16#00 -> ?SIGHASH_DEFAULT;
+                                    _ -> HT
+                                end,
+                                undefined, undefined, 16#ffffffff),
+                    Tweaked =
+                        beamchain_crypto:taproot_tweak_seckey(PrivKey),
+                    AuxRand = crypto:strong_rand_bytes(32),
+                    {ok, SchnorrSig} = beamchain_crypto:schnorr_sign(
+                                          SigHash, Tweaked, AuxRand),
+                    %% BIP-341: SIGHASH_DEFAULT → bare 64-byte sig;
+                    %% otherwise appended hashtype byte = 65 bytes.
+                    SigBytes = case HT of
+                        16#00 -> SchnorrSig;
+                        _ -> <<SchnorrSig/binary, HT>>
+                    end,
+                    {InputMap#{tap_key_sig => SigBytes}, true}
+            end;
+        _Other ->
+            %% Unsupported script type for the wallet signer — leave the
+            %% input untouched.
+            {InputMap, false}
+    end.
+
+%% Collect per-input {Value, ScriptPubKey} for taproot sighash. Any
+%% input without resolvable prevout yields `undefined` (caller checks).
+wpp_collect_prevouts(Tx, InputMaps) ->
+    lists:zipwith(fun(TI, M) ->
+        case wpp_prevout(M, TI) of
+            {ok, V, SPK} -> {V, SPK};
+            _ -> undefined
+        end
+    end, Tx#transaction.inputs, InputMaps).
+
+%% Try beamchain_psbt:finalize/1 then :extract/1.  On either failure,
+%% return the not-yet-finalized PSBT so the caller can still emit the
+%% partially-signed base64 PSBT.
+wpp_try_finalize_and_extract(Psbt) ->
+    case beamchain_psbt:finalize(Psbt) of
+        {ok, FPsbt} ->
+            case beamchain_psbt:extract(FPsbt) of
+                {ok, FinalTx} ->
+                    Hex = beamchain_serialize:hex_encode(
+                            beamchain_serialize:encode_transaction(FinalTx)),
+                    {ok, FPsbt, Hex};
+                {error, _} ->
+                    {error_keep, FPsbt}
+            end;
+        {error, _} ->
+            {error_keep, Psbt}
     end.
 
 %% @doc List unspent outputs (multi-wallet aware).

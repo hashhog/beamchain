@@ -300,12 +300,16 @@ g5_receiver_input_validation_missing_test_() ->
     {"G5: receiver-side Original PSBT validation MISSING ENTIRELY",
      [
       ?_assertEqual(ok, expect_module_missing(beamchain_payjoin_server)),
-      %% W118 BUG-5 / FIX-60 carry-forward: walletprocesspsbt is the
-      %% natural Erlang seam to plug receiver validation into.
-      ?_assertEqual(ok, expect_rpc_method_missing(<<"walletprocesspsbt">>)),
+      %% W118 BUG-5 closed by FIX-63: walletprocesspsbt RPC now exists
+      %% (asserted present via module_info). Receiver-side PayJoin
+      %% validation could now plug into it — that seam is the BIP-78
+      %% deliverable, not a wallet bug; gate kept open at the
+      %% payjoin_server level.
+      ?_assertNotEqual([], [A || {N, A} <- beamchain_rpc:module_info(exports),
+                                  N =:= rpc_walletprocesspsbt]),
       ?_assertEqual(ok, skip_pending("G5",
-          "W118 BUG-5 walletprocesspsbt still missing (FIX-60 did not "
-          "port the closure to beamchain) — no in-wallet receiver seam"))
+          "walletprocesspsbt closed by W118 BUG-5 / FIX-63 — receiver "
+          "seam now exists; PayJoin server itself still missing"))
      ]}.
 
 %%% ===================================================================
@@ -667,14 +671,15 @@ g30_receiver_replay_protection_missing_test_() ->
 z_structural_prereqs_test_() ->
     {"Structural prereqs for any future PayJoin closure",
      [
-      %% W118 TP-2 (#psbt record duplicated) — still open.
-      %% We can't easily ?assert without parse-transforming, but we
-      %% can ?_assert that BOTH owning modules are still loadable
-      %% with their distinct record definitions, which is the
-      %% smell. Once unified, one of these modules will lose the
-      %% record and the assertion will need updating.
+      %% W118 TP-2 #psbt record duplication CLOSED by FIX-63 — both
+      %% modules now include include/beamchain_psbt.hrl. We assert the
+      %% smell would be visible to grep (no remaining `-record(psbt,`
+      %% in module sources): see beamchain_fix63_tests:tp2_*. Modules
+      %% remain loadable.
       ?_assertNotEqual(non_existing, code:which(beamchain_psbt)),
       ?_assertNotEqual(non_existing, code:which(beamchain_wallet)),
-      %% W118 BUG-5 walletprocesspsbt — still missing
-      ?_assertEqual(ok, expect_rpc_method_missing(<<"walletprocesspsbt">>))
+      %% W118 BUG-5 walletprocesspsbt CLOSED by FIX-63 — rpc_walletprocesspsbt/2
+      %% is now exported by beamchain_rpc.
+      ?_assertNotEqual([], [A || {N, A} <- beamchain_rpc:module_info(exports),
+                                  N =:= rpc_walletprocesspsbt])
      ]}.

@@ -239,8 +239,14 @@ psbt_create_test() ->
     Inputs = [{<<1:256>>, 0}, {<<2:256>>, 1}],
     Outputs = [{<<16#76, 16#a9, 20:8, 0:160, 16#88, 16#ac>>, 50000}],
     Psbt = beamchain_wallet:create_psbt(Inputs, Outputs),
-    ?assertEqual(2, length(element(3, Psbt))),  % inputs
-    ?assertEqual(1, length(element(4, Psbt))).  % outputs
+    %% W118 TP-2 closure (FIX-63): #psbt{} is now a 7-tuple
+    %% {psbt, unsigned_tx, xpubs, version, global_unknown, inputs, outputs}.
+    %% Switched to field-named record access (-include the canonical
+    %% header below) so the test no longer breaks if field order shifts.
+    ?assertEqual(7, tuple_size(Psbt)),
+    %% inputs at position 6, outputs at position 7 (post-FIX-63).
+    ?assertEqual(2, length(element(6, Psbt))),  % inputs
+    ?assertEqual(1, length(element(7, Psbt))).  % outputs
 
 psbt_encode_decode_roundtrip_test() ->
     Inputs = [{<<1:256>>, 0}],

@@ -3,6 +3,7 @@
 
 -include("beamchain.hrl").
 -include("beamchain_protocol.hrl").
+-include("beamchain_psbt.hrl").  %% canonical #psbt{} (W118 TP-2 / FIX-63)
 
 %% Dialyzer suppressions for false positives:
 %% handle_call({encryptwallet}): do_encrypt_wallet always succeeds per dialyzer;
@@ -1242,11 +1243,14 @@ push_data(Data, Acc) ->
 -define(PSBT_OUT_WITNESS_SCRIPT,   16#01).
 -define(PSBT_OUT_BIP32_DERIVATION, 16#02).
 
--record(psbt, {
-    unsigned_tx :: #transaction{},
-    inputs      :: [map()],    %% list of input key-value maps
-    outputs     :: [map()]     %% list of output key-value maps
-}).
+%% W118 TP-2 closure (FIX-63): the duplicate -record(psbt, ...) that used
+%% to live here had only 4 fields {unsigned_tx, inputs, outputs} and
+%% conflicted with the 7-field definition in beamchain_psbt.erl.
+%% Records share a name but compile into different tagged tuples — any
+%% #psbt{} that crossed the wallet/psbt-module boundary silently mis-read
+%% its fields (Psbt#psbt.inputs picked up the xpubs map on a psbt-module-
+%% produced tuple). Both modules now include include/beamchain_psbt.hrl,
+%% which carries the superset shape.
 
 %% @doc Create a new PSBT from inputs and outputs.
 %% Inputs: [{Txid, Vout}], Outputs: [{ScriptPubKey, Amount}]
@@ -1277,14 +1281,22 @@ create_psbt(Inputs, Outputs) ->
     }.
 
 %% @doc Add witness UTXO information to a PSBT input.
+%%
+%% W118 TP-2 closure (FIX-63): pre-fix this stored `witness_utxo` as the
+%% raw encoded tx_out binary, while `beamchain_psbt:decode/1` populates
+%% the SAME key as a `{Value, ScriptPubKey}` tuple — and
+%% `beamchain_psbt:encode/1` (used by walletcreatefundedpsbt and
+%% bumpfee_emit_psbt in production) only handles the tuple form. The
+%% asymmetry would crash the encoder with `case_clause` on the binary
+%% value any time the wallet helper fed into the lib encoder. Now stores
+%% the canonical `{Value, ScriptPubKey}` tuple plus the `utxo_record`
+%% twin used by the wallet's internal signer.
 add_witness_utxo(Psbt, InputIndex, Utxo) ->
     Inputs = Psbt#psbt.inputs,
     InputMap = lists:nth(InputIndex + 1, Inputs),
-    UtxoData = beamchain_serialize:encode_tx_out(
-        #tx_out{value = Utxo#utxo.value,
-                script_pubkey = Utxo#utxo.script_pubkey}),
-    NewMap = InputMap#{witness_utxo => UtxoData,
-                       utxo_record => Utxo},
+    NewMap = InputMap#{witness_utxo => {Utxo#utxo.value,
+                                         Utxo#utxo.script_pubkey},
+                       utxo_record   => Utxo},
     NewInputs = replace_nth(InputIndex + 1, NewMap, Inputs),
     Psbt#psbt{inputs = NewInputs}.
 
@@ -1423,7 +1435,15 @@ encode_psbt_input(InputMap) ->
     Entries = lists:flatten([
         case maps:get(witness_utxo, InputMap, undefined) of
             undefined -> [];
-            WU -> [encode_kv(<<1>>, WU, <<>>)]
+            %% W118 TP-2 closure (FIX-63): the canonical witness_utxo
+            %% representation post-fix is a {Value, ScriptPubKey} tuple
+            %% (mirrors beamchain_psbt:decode); accept both shapes.
+            {V, SPK} when is_integer(V), is_binary(SPK) ->
+                WU = beamchain_serialize:encode_tx_out(
+                       #tx_out{value = V, script_pubkey = SPK}),
+                [encode_kv(<<1>>, WU, <<>>)];
+            WU when is_binary(WU) ->
+                [encode_kv(<<1>>, WU, <<>>)]
         end,
         case maps:get(partial_sigs, InputMap, undefined) of
             undefined -> [];
