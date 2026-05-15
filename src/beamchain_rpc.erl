@@ -2663,32 +2663,98 @@ format_mempool_error(Reason, _Txid) ->
     {error, ?RPC_VERIFY_REJECTED,
      iolist_to_binary(io_lib:format("~p", [Reason]))}.
 
+%% @doc testmempoolaccept — dry-run validation without mutating the mempool.
+%%
+%% FIX-54 / W116 BUG-1: the previous implementation called
+%% accept_to_memory_pool/1 (real accept) followed by remove_for_block/1
+%% (real remove), which caused observable state changes: bloom filters,
+%% ZMQ notifications, fee-estimator entries, cluster-mempool state, and
+%% the orphan-reprocess cycle all fired for a "test" call.  The correct
+%% behaviour — mirroring Bitcoin Core rpc/mempool.cpp testmempoolaccept —
+%% is to run all consensus/policy validation gates but skip every ETS
+%% write.
+%%
+%% Single tx  → accept_to_memory_pool_dry_run/1 (all 21 gates, no insert)
+%% Multiple tx → accept_package_dry_run/1       (package path, no insert)
+%%
+%% Reference: bitcoin-core/src/rpc/mempool.cpp::testmempoolaccept (≈ line
+%% 277). Core uses ProcessNewPackage(test_accept=true) for both single and
+%% multi-tx cases; we dispatch to the same dry-run helpers.
 rpc_testmempoolaccept([RawTxs]) when is_list(RawTxs) ->
-    Results = lists:map(fun(HexStr) ->
-        try
+    try
+        Decoded = lists:map(fun(HexStr) ->
             Bin = beamchain_serialize:hex_decode(HexStr),
             {Tx, _} = beamchain_serialize:decode_transaction(Bin),
-            Txid = beamchain_serialize:tx_hash(Tx),
-            case beamchain_mempool:accept_to_memory_pool(Tx) of
-                {ok, _} ->
-                    %% Remove it right away (this was just a test)
-                    beamchain_mempool:remove_for_block([Txid]),
-                    #{<<"txid">> => hash_to_hex(Txid),
-                      <<"allowed">> => true};
-                {error, Reason} ->
-                    #{<<"txid">> => hash_to_hex(Txid),
-                      <<"allowed">> => false,
-                      <<"reject-reason">> =>
-                          iolist_to_binary(io_lib:format("~p", [Reason]))}
-            end
-        catch
-            _:_ ->
-                #{<<"txid">> => <<>>,
-                  <<"allowed">> => false,
-                  <<"reject-reason">> => <<"TX decode failed">>}
-        end
-    end, RawTxs),
-    {ok, Results};
+            Tx
+        end, RawTxs),
+        Results = case length(Decoded) of
+            1 ->
+                %% Single-tx path — dry-run via accept_to_memory_pool_dry_run/1
+                [Tx] = Decoded,
+                Txid  = beamchain_serialize:tx_hash(Tx),
+                Wtxid = beamchain_serialize:wtx_hash(Tx),
+                case beamchain_mempool:accept_to_memory_pool_dry_run(Tx) of
+                    {ok, Txid, _Wtxid, Fee, VSize, FeeRate} ->
+                        [#{<<"txid">>    => hash_to_hex(Txid),
+                           <<"wtxid">>   => hash_to_hex(_Wtxid),
+                           <<"allowed">> => true,
+                           <<"vsize">>   => VSize,
+                           <<"fees">>    => #{
+                               <<"base">> => Fee / 100000000.0,
+                               <<"effective-feerate">> =>
+                                   FeeRate * 1000.0 / 100000000.0
+                           }}];
+                    {error, Reason} ->
+                        [#{<<"txid">>          => hash_to_hex(Txid),
+                           <<"wtxid">>         => hash_to_hex(Wtxid),
+                           <<"allowed">>       => false,
+                           <<"reject-reason">> =>
+                               iolist_to_binary(io_lib:format("~p", [Reason]))}]
+                end;
+            _ ->
+                %% Multi-tx path — dry-run via accept_package_dry_run/1.
+                %% Each entry may succeed or fail independently.
+                case beamchain_mempool:accept_package_dry_run(Decoded) of
+                    {ok, EntryList} ->
+                        lists:map(fun
+                            ({ok, Txid, Wtxid, Fee, VSize}) ->
+                                FeeRate = Fee / max(1, VSize),
+                                #{<<"txid">>    => hash_to_hex(Txid),
+                                  <<"wtxid">>   => hash_to_hex(Wtxid),
+                                  <<"allowed">> => true,
+                                  <<"vsize">>   => VSize,
+                                  <<"fees">>    => #{
+                                      <<"base">> => Fee / 100000000.0,
+                                      <<"effective-feerate">> =>
+                                          FeeRate * 1000.0 / 100000000.0
+                                  }};
+                            ({error, Txid, Wtxid, Reason}) ->
+                                #{<<"txid">>          => hash_to_hex(Txid),
+                                  <<"wtxid">>         => hash_to_hex(Wtxid),
+                                  <<"allowed">>       => false,
+                                  <<"reject-reason">> =>
+                                      iolist_to_binary(io_lib:format("~p", [Reason]))}
+                        end, EntryList);
+                    {error, Reason} ->
+                        %% Structural package error — report for every tx
+                        lists:map(fun(Tx) ->
+                            Txid  = beamchain_serialize:tx_hash(Tx),
+                            Wtxid = beamchain_serialize:wtx_hash(Tx),
+                            #{<<"txid">>    => hash_to_hex(Txid),
+                              <<"wtxid">>   => hash_to_hex(Wtxid),
+                              <<"allowed">> => false,
+                              <<"package-error">> =>
+                                  iolist_to_binary(io_lib:format("~p", [Reason]))}
+                        end, Decoded)
+                end
+        end,
+        {ok, Results}
+    catch
+        _:_ ->
+            {ok, [#{<<"txid">>          => <<>>,
+                    <<"allowed">>       => false,
+                    <<"reject-reason">> => <<"TX decode failed">>}]}
+    end;
 rpc_testmempoolaccept(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"Usage: testmempoolaccept [\"rawtx\"]">>}.

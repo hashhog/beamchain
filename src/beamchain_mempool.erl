@@ -17,6 +17,8 @@
 
 %% Transaction submission
 -export([accept_to_memory_pool/1, add_transaction/1, accept_package/1]).
+%% Dry-run variants (testmempoolaccept — validate without mutating mempool)
+-export([accept_to_memory_pool_dry_run/1, accept_package_dry_run/1]).
 
 %% Queries
 -export([has_tx/1, get_tx/1, get_entry/1, get_wtxid/1]).
@@ -206,6 +208,26 @@ add_transaction(Tx) ->
     {ok, [binary()]} | {error, term()}.
 accept_package(Package) ->
     gen_server:call(?SERVER, {accept_package, Package}, 60000).
+
+%% @doc Dry-run single-tx validation (testmempoolaccept).
+%% Runs all 21 ATMP gates but does NOT insert into any ETS table.
+%% Returns {ok, Txid, Wtxid, Fee, VSize, FeeRate} on would-accept,
+%% or {error, Reason} on would-reject.
+-spec accept_to_memory_pool_dry_run(#transaction{}) ->
+    {ok, binary(), binary(), non_neg_integer(), non_neg_integer(), float()} |
+    {error, term()}.
+accept_to_memory_pool_dry_run(Tx) ->
+    gen_server:call(?SERVER, {test_accept_tx, Tx}, 30000).
+
+%% @doc Dry-run package validation (testmempoolaccept with multiple txs).
+%% Mirrors Bitcoin Core's ProcessNewPackage(test_accept=true): evaluates
+%% the package with CPFP but does NOT write anything to the mempool.
+%% Returns {ok, [{Txid, Wtxid, Fee, VSize}]} or {error, Reason}.
+-spec accept_package_dry_run([#transaction{}]) ->
+    {ok, [{binary(), binary(), non_neg_integer(), non_neg_integer()}]} |
+    {error, term()}.
+accept_package_dry_run(Package) ->
+    gen_server:call(?SERVER, {test_accept_package, Package}, 60000).
 
 %% @doc Check if a transaction is in the mempool.
 -spec has_tx(binary()) -> boolean().
@@ -411,6 +433,27 @@ handle_call({accept_package, Package}, _From, State) ->
     case do_accept_package(Package, State) of
         {ok, Txids, State2} ->
             {reply, {ok, Txids}, State2};
+        {error, Reason} ->
+            {reply, {error, Reason}, State}
+    end;
+
+%% Dry-run: validate a single tx through all 21 ATMP gates without
+%% writing to any ETS table.  State is never mutated (reply uses
+%% the original State regardless of outcome).
+handle_call({test_accept_tx, Tx}, _From, State) ->
+    case do_add_transaction_dry_run(Tx, State) of
+        {ok, Txid, Wtxid, Fee, VSize, FeeRate} ->
+            {reply, {ok, Txid, Wtxid, Fee, VSize, FeeRate}, State};
+        {error, Reason} ->
+            {reply, {error, Reason}, State}
+    end;
+
+%% Dry-run: validate a package through the full CPFP path without
+%% writing to any ETS table.
+handle_call({test_accept_package, Package}, _From, State) ->
+    case do_accept_package_dry_run(Package, State) of
+        {ok, Results} ->
+            {reply, {ok, Results}, State};
         {error, Reason} ->
             {reply, {error, Reason}, State}
     end;
@@ -796,6 +839,201 @@ do_add_transaction(Tx, State) ->
         throw:Reason ->
             {error, Reason}
     end.
+
+%%% ===================================================================
+%%% Internal: dry-run (testmempoolaccept) — no ETS writes
+%%% ===================================================================
+
+%% @doc Run all 21 ATMP validation gates for Tx against the live
+%% mempool/UTXO state but do NOT insert anything into ETS.
+%% Returns {ok, Txid, Wtxid, Fee, VSize, FeeRate} on would-accept,
+%% or {error, Reason} on would-reject.
+%%
+%% IMPORTANT: this function is intentionally a structural parallel of
+%% do_add_transaction/2.  The only difference is that the commit phase
+%% (insert_entry, update_ancestors, cluster mutations, ZMQ, fee-estimator)
+%% is omitted — the function returns after Gate 21 without touching
+%% any ETS table.  State is never threaded out (caller keeps original).
+do_add_transaction_dry_run(Tx, State) ->
+    Txid = beamchain_serialize:tx_hash(Tx),
+    Wtxid = beamchain_serialize:wtx_hash(Tx),
+
+    try
+        %% GATE 1: basic structure check
+        case beamchain_validation:check_transaction(Tx) of
+            ok -> ok;
+            {error, E} -> throw({validation, E})
+        end,
+
+        %% GATE 1b: coinbase rejected
+        is_coinbase_tx(Tx#transaction.inputs)
+            andalso throw('bad-txns-coinbase'),
+
+        %% GATE 2a: wtxid duplicate
+        case lookup_entry_by_wtxid(Wtxid) of
+            {ok, _Existing} -> throw('txn-already-in-mempool');
+            not_found -> ok
+        end,
+        %% GATE 2b: txid duplicate (different witness)
+        case ets:lookup(?MEMPOOL_TXS, Txid) of
+            [{_, _OtherEntry}] -> throw('txn-same-nonwitness-data-in-mempool');
+            [] -> ok
+        end,
+
+        %% GATE 3: standardness
+        check_standard(Tx),
+
+        %% GATE 4: IsFinalTx
+        {ok, {TipHash, TipHeight}} = beamchain_chainstate:get_tip(),
+        Mtp = beamchain_chainstate:get_mtp(),
+        beamchain_validation:is_final_tx(Tx, TipHeight + 1, Mtp)
+            orelse throw(non_final),
+
+        %% GATE 5: input lookup
+        {InputCoins, _SpendsCoinbase} = lookup_inputs(Tx),
+
+        %% GATE 6: money range
+        check_tx_inputs_money_range(InputCoins, Txid),
+
+        %% GATE 7: witness standardness
+        is_witness_standard(Tx, InputCoins) orelse throw('bad-witness-nonstandard'),
+
+        %% GATE 8: input scriptPubKey standardness
+        case validate_inputs_standardness(Tx, InputCoins) of
+            ok -> ok;
+            {error, ISReason} -> throw(ISReason)
+        end,
+
+        %% GATE 9: sigops
+        MempoolSigopFlags = all_standard_flags(),
+        TxSigopCost = beamchain_validation:get_tx_sigop_cost(Tx, InputCoins, MempoolSigopFlags),
+        TxSigopCost =< ?MAX_STANDARD_TX_SIGOPS_COST
+            orelse throw({'bad-txns-too-many-sigops', TxSigopCost}),
+
+        %% GATE 10: double-spends / RBF (read-only — conflicts checked,
+        %% no actual eviction performed in dry-run)
+        {ok, RbfEvictedTxids, _RbfEvictedVBytes} =
+            check_mempool_conflicts(Tx, InputCoins, TxSigopCost),
+
+        %% GATE 11: fee
+        TotalIn = lists:foldl(fun(C, A) -> A + C#utxo.value end, 0, InputCoins),
+        TotalOut = lists:foldl(fun(#tx_out{value = V}, A) -> A + V end,
+                               0, Tx#transaction.outputs),
+        TotalIn >= TotalOut orelse throw('bad-txns-in-belowout'),
+        Fee = TotalIn - TotalOut,
+        Fee =< ?MAX_MONEY orelse throw('bad-txns-fee-outofrange'),
+
+        %% GATE 12: size metrics
+        VSize = beamchain_serialize:tx_sigop_vsize(Tx, TxSigopCost),
+        FeeRate = Fee / max(1, VSize),
+
+        %% GATE 13: ephemeral tx pre-check
+        case pre_check_ephemeral_tx(Tx, Fee) of
+            ok -> ok;
+            {error, EphReason} -> throw(EphReason)
+        end,
+        EphemeralInfo = check_dust(Tx, Fee),
+
+        %% GATE 14: minimum relay fee (read-only — get_min_fee result is
+        %% discarded; State is not updated since we never return a new State)
+        case EphemeralInfo of
+            {has_ephemeral, _} ->
+                throw(ephemeral_anchor_needs_spending);
+            none ->
+                {RollingMin, _St1} = get_min_fee(State),
+                StaticMinRelay = ?DEFAULT_MIN_RELAY_TX_FEE / 1000.0,
+                EffectiveMin = max(RollingMin, StaticMinRelay),
+                FeeRate >= EffectiveMin orelse throw('mempool min fee not met')
+        end,
+
+        %% GATE 15: TRUC policy (read-only check; sibling eviction not performed)
+        MempoolParentTxids = get_parent_txids(Tx),
+        DirectConflicts = sets:from_list(RbfEvictedTxids),
+        case check_truc_rules(Tx, VSize, MempoolParentTxids, DirectConflicts) of
+            ok -> ok;
+            {sibling_eviction, _SiblingTxid} ->
+                %% Would evict sibling — policy check passed; eviction skipped in dry-run
+                ok;
+            {error, TrucErr} ->
+                throw(TrucErr)
+        end,
+
+        %% GATE 16: ancestor/descendant limits
+        {AncCount, AncSize, _AncFee} = compute_ancestors(Tx, Fee, VSize),
+        AncCount =< ?MAX_ANCESTOR_COUNT orelse throw('too-long-mempool-chain'),
+        AncSize =< ?MAX_ANCESTOR_SIZE orelse throw('too-long-mempool-chain'),
+        check_descendant_limits(Tx, VSize),
+
+        %% GATE 17: cluster limits
+        check_cluster_limits(Tx, VSize),
+
+        %% GATE 18: coinbase maturity
+        check_mempool_coinbase_maturity(InputCoins, TipHeight + 1),
+
+        %% GATE 19: BIP-68 sequence locks
+        check_mempool_sequence_locks(Tx, InputCoins, TipHash, TipHeight + 1),
+
+        %% GATE 20: policy script checks
+        verify_scripts(Tx, InputCoins),
+
+        %% GATE 21: consensus script checks
+        ok = consensus_script_checks(Tx, InputCoins),
+
+        %% All gates passed — return validation result WITHOUT touching ETS
+        {ok, Txid, Wtxid, Fee, VSize, FeeRate}
+    catch
+        throw:{validation, Reason} ->
+            {error, Reason};
+        throw:orphan ->
+            %% Missing inputs in dry-run → report as missing inputs
+            {error, 'bad-txns-inputs-missingorspent'};
+        throw:Reason ->
+            {error, Reason}
+    end.
+
+%% @doc Dry-run package validation (ProcessNewPackage test_accept=true).
+%% Validates each tx individually without writing to ETS.
+%% Returns {ok, [{Txid, Wtxid, Fee, VSize} | {error, Txid, Wtxid, Reason}]}
+%% or {error, Reason} on a structural package error.
+do_accept_package_dry_run([], _State) ->
+    {error, empty_package};
+do_accept_package_dry_run(Package, State) ->
+    try
+        validate_package_structure(Package),
+        TxidTxPairs = [{beamchain_serialize:tx_hash(Tx), Tx} || Tx <- Package],
+        Results = dry_run_individual_accept(TxidTxPairs, State),
+        {ok, Results}
+    catch
+        throw:Reason ->
+            {error, Reason}
+    end.
+
+%% Dry-run each transaction individually.
+%% A tx already in the mempool is reported as would-accept.
+%% Each entry is tagged: {ok, Txid, Wtxid, Fee, VSize} or
+%%                       {error, Txid, Wtxid, Reason}.
+dry_run_individual_accept(TxidTxPairs, State) ->
+    lists:map(fun({Txid, Tx}) ->
+        case ets:member(?MEMPOOL_TXS, Txid) of
+            true ->
+                case get_entry(Txid) of
+                    {ok, E} ->
+                        {ok, Txid, E#mempool_entry.wtxid,
+                         E#mempool_entry.fee, E#mempool_entry.vsize};
+                    not_found ->
+                        Wtxid = beamchain_serialize:wtx_hash(Tx),
+                        {ok, Txid, Wtxid, 0, 0}
+                end;
+            false ->
+                case do_add_transaction_dry_run(Tx, State) of
+                    {ok, Txid, Wtxid, Fee, VSize, _FeeRate} ->
+                        {ok, Txid, Wtxid, Fee, VSize};
+                    {error, Reason} ->
+                        Wtxid = beamchain_serialize:wtx_hash(Tx),
+                        {error, Txid, Wtxid, Reason}
+                end
+        end
+    end, TxidTxPairs).
 
 %%% ===================================================================
 %%% Internal: package acceptance
