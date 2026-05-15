@@ -5266,7 +5266,7 @@ rpc_sendtoaddress([Address, AmountBtc], WalletName) when is_binary(Address) ->
     rpc_sendtoaddress([Address, AmountBtc, <<>>], WalletName);
 rpc_sendtoaddress([Address, AmountBtc, _Comment], WalletName) when is_binary(Address) ->
     case resolve_wallet(WalletName) of
-        {ok, _Pid} ->
+        {ok, Pid} ->
             Amount = btc_to_satoshi(AmountBtc),
             %% Get wallet UTXOs for coin selection
             Utxos = beamchain_wallet:get_wallet_utxos(),
@@ -5287,26 +5287,48 @@ rpc_sendtoaddress([Address, AmountBtc, _Comment], WalletName) when is_binary(Add
                     end,
                     case beamchain_wallet:build_transaction(Selected, FinalOutputs, Network) of
                         {ok, Tx} ->
-                            %% Get private keys for inputs
-                            PrivKeys = lists:map(fun({_Txid, _Vout, _Utxo}) ->
-                                %% TODO: Look up privkey from address
-                                %% For now, this is a placeholder
-                                <<0:256>>
-                            end, Selected),
-                            InputUtxos = [U || {_, _, U} <- Selected],
-                            case beamchain_wallet:sign_transaction(Tx, InputUtxos, PrivKeys) of
-                                {ok, SignedTx} ->
-                                    %% Broadcast transaction
-                                    case beamchain_mempool:accept_to_memory_pool(SignedTx) of
-                                        {ok, Txid} ->
-                                            {ok, beamchain_serialize:hex_encode(Txid)};
+                            %% W118 BUG-1 closure: real per-input keystore
+                            %% lookup. Mirrors CWallet::SignTransaction in
+                            %% bitcoin-core/src/wallet/wallet.cpp:2166 — for
+                            %% each input, identify the address from the
+                            %% prevout scriptPubKey, then fetch the privkey
+                            %% from the wallet keystore (same path used by
+                            %% rpc_signrawtransactionwithwallet — single
+                            %% pipeline). Errors out on first failure rather
+                            %% than signing with <<0:256>> placeholders that
+                            %% would produce invalid signatures rejected by
+                            %% the network.
+                            case lookup_privkeys_for_inputs(Pid, Selected, Network) of
+                                {ok, PrivKeys} ->
+                                    InputUtxos = [U || {_, _, U} <- Selected],
+                                    case beamchain_wallet:sign_transaction(
+                                           Tx, InputUtxos, PrivKeys) of
+                                        {ok, SignedTx} ->
+                                            %% Broadcast transaction
+                                            case beamchain_mempool:accept_to_memory_pool(SignedTx) of
+                                                {ok, Txid} ->
+                                                    {ok, beamchain_serialize:hex_encode(Txid)};
+                                                {error, Reason} ->
+                                                    {error, ?RPC_VERIFY_REJECTED, iolist_to_binary(
+                                                        io_lib:format("TX rejected: ~p", [Reason]))}
+                                            end;
                                         {error, Reason} ->
-                                            {error, ?RPC_VERIFY_REJECTED, iolist_to_binary(
-                                                io_lib:format("TX rejected: ~p", [Reason]))}
+                                            {error, ?RPC_MISC_ERROR, iolist_to_binary(
+                                                io_lib:format("Signing failed: ~p", [Reason]))}
                                     end;
-                                {error, Reason} ->
-                                    {error, ?RPC_MISC_ERROR, iolist_to_binary(
-                                        io_lib:format("Signing failed: ~p", [Reason]))}
+                                {error, wallet_locked} ->
+                                    %% Core's RPC_WALLET_UNLOCK_NEEDED (-13).
+                                    {error, -13, <<"Error: Please enter the wallet "
+                                                   "passphrase with walletpassphrase first.">>};
+                                {error, {key_not_found, InputIdx, AddrInfo}} ->
+                                    %% Core's RPC_WALLET_ERROR (-4). Mirrors
+                                    %% "Input not found or already spent" / "Key not
+                                    %% found" failure modes — refuse to sign rather
+                                    %% than emit garbage signatures.
+                                    {error, -4, iolist_to_binary(
+                                        io_lib:format(
+                                            "Input ~B scriptPubKey not in this "
+                                            "wallet (~s)", [InputIdx, AddrInfo]))}
                             end;
                         {error, Reason} ->
                             {error, ?RPC_MISC_ERROR, iolist_to_binary(
@@ -5321,6 +5343,47 @@ rpc_sendtoaddress([Address, AmountBtc, _Comment], WalletName) when is_binary(Add
 rpc_sendtoaddress(_, _WalletName) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"sendtoaddress \"address\" amount ( \"comment\" )">>}.
+
+%% W118 BUG-1: real privkey lookup for each input. Walks the selected-coin
+%% list in order and resolves each prevout scriptPubKey → address → wallet
+%% keystore privkey. Returns `{ok, [PrivKey]}` aligned with the input order,
+%% or one of `{error, wallet_locked}` / `{error, {key_not_found, Idx, _}}`.
+%%
+%% This is the same keystore path that `rpc_signrawtransactionwithwallet`
+%% uses (lines ~5645) — we now route sendtoaddress through it too, closing
+%% the "wallet sendtoaddress signs with <<0:256>> placeholder" P0 from
+%% the W118 audit and avoiding a second parallel keystore-lookup pipeline.
+lookup_privkeys_for_inputs(Pid, Selected, Network) ->
+    %% Use indexed lookup so we can name the offending input on error.
+    Indexed = lists:zip(lists:seq(0, length(Selected) - 1), Selected),
+    try
+        Keys = lists:map(fun({Idx, {_Txid, _Vout, Utxo}}) ->
+            Script = Utxo#utxo.script_pubkey,
+            AddrStr = case beamchain_address:script_to_address(Script, Network) of
+                unknown ->
+                    AddrHex = beamchain_serialize:hex_encode(Script),
+                    throw({key_not_found, Idx,
+                           <<"unrecognized scriptPubKey ", AddrHex/binary>>});
+                A -> A
+            end,
+            case beamchain_wallet:get_private_key(Pid, AddrStr) of
+                {ok, K} when is_binary(K), byte_size(K) =:= 32,
+                             K =/= <<0:256>> ->
+                    K;
+                {error, wallet_locked} ->
+                    throw(wallet_locked);
+                _Other ->
+                    AddrBin = iolist_to_binary(AddrStr),
+                    throw({key_not_found, Idx, AddrBin})
+            end
+        end, Indexed),
+        {ok, Keys}
+    catch
+        throw:wallet_locked ->
+            {error, wallet_locked};
+        throw:{key_not_found, Idx, Info} ->
+            {error, {key_not_found, Idx, Info}}
+    end.
 
 %% @doc List unspent outputs (multi-wallet aware).
 rpc_listunspent(Params, WalletName) ->
