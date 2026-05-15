@@ -3288,6 +3288,7 @@ rpc_loadmempool() ->
 
 rpc_getnetworkinfo() ->
     Connections = beamchain_peer_manager:peer_count(),
+    LocalAddrs = local_addresses_for_getnetworkinfo(),
     {ok, #{
         <<"version">> => 260000,
         <<"subversion">> => <<"/beamchain:0.1.0/">>,
@@ -3309,9 +3310,27 @@ rpc_getnetworkinfo() ->
         }],
         <<"relayfee">> => ?DEFAULT_MIN_RELAY_TX_FEE / 100000.0,
         <<"incrementalfee">> => 0.00001,
-        <<"localaddresses">> => [],
+        <<"localaddresses">> => LocalAddrs,
         <<"warnings">> => <<>>
     }}.
+
+%% Collect locally-bound P2P addresses for getnetworkinfo. Currently
+%% only the v3 .onion advertised by beamchain_torcontrol (when
+%% listenonion is enabled) makes it in; future wiring can add bound
+%% IPv4/IPv6 interfaces from the listener.
+local_addresses_for_getnetworkinfo() ->
+    OnionEntries =
+        case catch beamchain_torcontrol:get_onion_address() of
+            Addr when is_list(Addr), Addr =/= [] ->
+                Port = try beamchain_config:network_params() of
+                    NP -> NP#network_params.default_port
+                catch _:_ -> 8333 end,
+                [#{<<"address">> => list_to_binary(Addr),
+                   <<"port">>    => Port,
+                   <<"score">>   => 4}];
+            _ -> []
+        end,
+    OnionEntries.
 
 rpc_getpeerinfo() ->
     Peers = beamchain_peer_manager:get_peers(),
