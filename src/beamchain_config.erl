@@ -29,7 +29,9 @@
          proxy/0,
          onion_proxy/0,
          i2p_sam/0,
-         listen_onion/0]).
+         listen_onion/0,
+         torcontrol_addr/0,
+         torcontrol_password/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -347,6 +349,43 @@ listen_onion() ->
                 _ -> false
             end;
         _ -> false
+    end.
+
+%% @doc Get the Tor control port address.
+%% Format: "host:port" (default 127.0.0.1:9051).
+%% Set via BEAMCHAIN_TORCONTROL env var or torcontrol= config option.
+%% Returns undefined if listen_onion is disabled.
+%%
+%% Bitcoin Core reference: torcontrol.cpp DEFAULT_TOR_CONTROL.
+-spec torcontrol_addr() -> undefined | #{host := string(), port := inet:port_number()}.
+torcontrol_addr() ->
+    case os:getenv("BEAMCHAIN_TORCONTROL") of
+        false ->
+            case get(torcontrol) of
+                undefined -> #{host => "127.0.0.1", port => 9051};
+                Addr -> parse_proxy_addr(Addr, 9051)
+            end;
+        Addr ->
+            parse_proxy_addr(Addr, 9051)
+    end.
+
+%% @doc Get the Tor control password for HASHEDPASSWORD authentication.
+%% Set via BEAMCHAIN_TORPASSWORD env var or torpassword= config option.
+%% Returns undefined if no password is configured (NULL/SAFECOOKIE used instead).
+%%
+%% Bitcoin Core reference: torcontrol.cpp gArgs.GetArg("-torpassword").
+-spec torcontrol_password() -> undefined | string().
+torcontrol_password() ->
+    case os:getenv("BEAMCHAIN_TORPASSWORD") of
+        false ->
+            case get(torpassword) of
+                undefined -> undefined;
+                "" -> undefined;
+                P when is_list(P) -> P;
+                P when is_binary(P) -> binary_to_list(P)
+            end;
+        "" -> undefined;
+        P -> P
     end.
 
 %% @doc Get the path to the ASMap file, or undefined if not configured.

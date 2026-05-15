@@ -56,7 +56,21 @@ init([]) ->
             true -> [child_spec(beamchain_blockfilter_index, worker)];
             false -> []
         end,
-    Children = CoreChildren ++ RestChildren ++ ZmqChildren ++ BlockFilterChildren,
+    %% Optional Tor control-port client for v3 hidden-service inbound.
+    %% Only started when listenonion=1 in beamchain.conf or
+    %% BEAMCHAIN_LISTENONION=1 in the environment.  The client connects
+    %% to the Tor control port (default 127.0.0.1:9051), runs the
+    %% PROTOCOLINFO -> AUTHENTICATE -> ADD_ONION sequence, persists the
+    %% returned ED25519-V3 private key under <datadir>/tor_v3_secret_key
+    %% and advertises the resulting .onion via getnetworkinfo.
+    %% Mirrors bitcoin-core/src/torcontrol.cpp StartTorControl.
+    TorControlChildren =
+        case beamchain_config:listen_onion() of
+            true  -> [child_spec(beamchain_torcontrol, worker)];
+            false -> []
+        end,
+    Children = CoreChildren ++ RestChildren ++ ZmqChildren
+               ++ BlockFilterChildren ++ TorControlChildren,
     {ok, {SupFlags, Children}}.
 
 child_spec(Module, Type) ->

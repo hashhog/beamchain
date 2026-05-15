@@ -167,6 +167,28 @@ parse_args(["--p2p-port", Value | Rest], Cmd, Opts) ->
 parse_args(["--p2p-port=" ++ Value | Rest], Cmd, Opts) ->
     parse_args(Rest, Cmd, Opts#{p2p_port => list_to_integer(Value)});
 
+%% --torcontrol=host:port: Tor control-port address. Default 127.0.0.1:9051.
+%% Only meaningful when combined with -listenonion=1 (or BEAMCHAIN_LISTENONION=1)
+%% in beamchain.conf -- the gen_server is otherwise never started.
+parse_args(["--torcontrol", Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{torcontrol => Value});
+parse_args(["--torcontrol=" ++ Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{torcontrol => Value});
+
+%% --torpassword=<password>: HASHEDPASSWORD for the Tor control port.
+parse_args(["--torpassword", Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{torpassword => Value});
+parse_args(["--torpassword=" ++ Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{torpassword => Value});
+
+%% --listenonion=<0|1>: Enable v3 hidden-service registration via the
+%% Tor control port. Equivalent to setting BEAMCHAIN_LISTENONION=1 or
+%% listenonion=1 in beamchain.conf.
+parse_args(["--listenonion", Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{listenonion => parse_bool(Value)});
+parse_args(["--listenonion=" ++ Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{listenonion => parse_bool(Value)});
+
 parse_args(["--reset" | Rest], Cmd, Opts) ->
     parse_args(Rest, Cmd, Opts#{reset => true});
 
@@ -273,6 +295,11 @@ print_usage() ->
         "                    Bitcoin Core's `dumptxoutset`); alias --load-snapshot~n"
         "  --cfilter=<n>     BIP-157/158 compact block filter index~n"
         "                    (0=off, 1=basic; mirrors Core -blockfilterindex)~n"
+        "  --listenonion=<n> 1 = register v3 hidden service via Tor control~n"
+        "                    port (default 0; mirrors Core -listenonion)~n"
+        "  --torcontrol=h:p  Tor control-port address~n"
+        "                    (default 127.0.0.1:9051; mirrors Core -torcontrol)~n"
+        "  --torpassword=<p> HASHEDPASSWORD auth for the Tor control port~n"
         "  -h, --help        show this help~n"
         "  -v, --version     show version~n",
         [header("beamchain " ++ ?VERSION ++ " - bitcoin full node in erlang/otp"),
@@ -707,6 +734,22 @@ apply_opts(Opts) ->
             io:format(standard_error,
                       "warning: --cfilter=~p ignored (only 0 or 1 supported)~n",
                       [Other])
+    end,
+    %% --listenonion / --torcontrol / --torpassword: route through the
+    %% same BEAMCHAIN_* env vars that beamchain_config consults so the
+    %% config gate functions pick them up before init_table/0.
+    case maps:get(listenonion, Opts, undefined) of
+        undefined -> ok;
+        true -> os:putenv("BEAMCHAIN_LISTENONION", "1");
+        false -> os:putenv("BEAMCHAIN_LISTENONION", "0")
+    end,
+    case maps:get(torcontrol, Opts, undefined) of
+        undefined -> ok;
+        TCAddr when is_list(TCAddr) -> os:putenv("BEAMCHAIN_TORCONTROL", TCAddr)
+    end,
+    case maps:get(torpassword, Opts, undefined) of
+        undefined -> ok;
+        TP when is_list(TP) -> os:putenv("BEAMCHAIN_TORPASSWORD", TP)
     end,
     ok.
 
