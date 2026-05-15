@@ -18,7 +18,9 @@
 %%%     - SOCKS5 proxy support: YES  (beamchain_proxy)
 %%%     - Stream isolation:     YES
 %%%     - v3 address generation:YES
-%%%     - Inbound hidden service:MISSING (no torcontrol / Tor control-port integration)
+%%%     - Inbound hidden service:YES (FIX-58: beamchain_torcontrol —
+%%%       PROTOCOLINFO/AUTHENTICATE/ADD_ONION; supports NULL,
+%%%       HASHEDPASSWORD, SAFECOOKIE auth; persists ED25519-V3 key)
 %%%     - proxy_randomize_credentials in getnetworkinfo: NO (hardcoded false)
 %%%
 %%%   I2P:
@@ -289,13 +291,14 @@ g9_torv2_deprecated_test_() ->
     ].
 
 %%% ===================================================================
-%%% G10 – Inbound Tor hidden service (MISSING ENTIRELY)
+%%% G10 – Inbound Tor hidden service
 %%%
-%%% BUG-1 (HIGH): beamchain has no torcontrol.cpp equivalent.
-%%% The node cannot create or manage a Tor v3 hidden service for
-%%% inbound .onion reachability.  beamchain_config:listen_onion/0
-%%% exists and returns the config flag, but nothing reads it to
-%%% actually register with Tor's control port.
+%%% W117 BUG-1 (HIGH): historically beamchain had no torcontrol.cpp
+%%% equivalent. FIX-58 added beamchain_torcontrol, which now consumes
+%%% listen_onion/0 and runs the Tor control-port command sequence
+%%% (PROTOCOLINFO -> AUTHENTICATE -> ADD_ONION).  The asserts below
+%%% pivot to confirming the module is present and exports the
+%%% expected API surface.
 %%% ===================================================================
 
 g10_inbound_tor_hidden_service_missing_test_() ->
@@ -305,11 +308,23 @@ g10_inbound_tor_hidden_service_missing_test_() ->
              Exports = beamchain_config:module_info(exports),
              ?assert(lists:member({listen_onion, 0}, Exports))
          end},
-        {"G10: [BUG-1] no torcontrol module exists (hidden service MISSING ENTIRELY)",
+        {"G10: torcontrol module exists (FIX-58 closure)",
          fun() ->
-             %% beamchain_torcontrol does not exist — the feature is absent
-             Exists = code:which(beamchain_torcontrol),
-             ?assertEqual(non_existing, Exists)
+             ?assertNotEqual(non_existing,
+                              code:which(beamchain_torcontrol))
+         end},
+        {"G10: torcontrol exposes add_onion/3 and del_onion/1",
+         fun() ->
+             Exports = beamchain_torcontrol:module_info(exports),
+             ?assert(lists:member({add_onion, 3}, Exports)),
+             ?assert(lists:member({del_onion, 1}, Exports)),
+             ?assert(lists:member({get_onion_address, 0}, Exports))
+         end},
+        {"G10: torcontrol config helpers are exported",
+         fun() ->
+             Exports = beamchain_config:module_info(exports),
+             ?assert(lists:member({torcontrol_addr, 0}, Exports)),
+             ?assert(lists:member({torcontrol_password, 0}, Exports))
          end}
     ].
 
