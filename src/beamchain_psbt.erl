@@ -7,6 +7,7 @@
 
 -include("beamchain.hrl").
 -include("beamchain_protocol.hrl").
+-include("beamchain_psbt.hrl").
 
 %% Public API
 -export([create/1,
@@ -74,22 +75,14 @@
 
 %%% -------------------------------------------------------------------
 %%% PSBT record
+%%%
+%%% Canonical -record(psbt, ...) lives in include/beamchain_psbt.hrl.
+%%% W118 TP-2 closure (FIX-63): the wallet used to redefine the same
+%%% record with a 4-field tuple shape, which silently mis-decoded any
+%%% #psbt{} produced by this module when handed to wallet helpers
+%%% (`Psbt#psbt.inputs` resolved to the `xpubs` map). Both modules now
+%%% include the shared header.
 %%% -------------------------------------------------------------------
-
--record(psbt, {
-    %% The unsigned transaction (inputs have empty scriptSigs, no witness)
-    unsigned_tx :: #transaction{},
-    %% Global xpubs: #{xpub_binary => {fingerprint, path}}
-    xpubs = #{} :: map(),
-    %% Global version (default 0)
-    version = 0 :: non_neg_integer(),
-    %% Global unknown/proprietary key-value pairs
-    global_unknown = #{} :: map(),
-    %% Per-input data: list of maps
-    inputs = [] :: [map()],
-    %% Per-output data: list of maps
-    outputs = [] :: [map()]
-}).
 
 -export_type([psbt/0]).
 -type psbt() :: #psbt{}.
