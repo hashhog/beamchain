@@ -602,27 +602,48 @@ g27_rpc_sendpayjoinrequest_missing_test_() ->
 
 %%% ===================================================================
 %%% G28 — BIP-21 URI parameter pj= parsed
+%%%
+%%% CLOSED by FIX-62 — beamchain_bip21 module now exists and parses
+%%% pj= per BIP-21 extension. The original "module missing" absence
+%%% assertion is replaced with a positive parse assertion. Module
+%%% presence is also asserted so that the symmetric "module present"
+%%% smell shows up if a future refactor removes it.
 %%% ===================================================================
 
-g28_bip21_pj_param_missing_test_() ->
-    {"G28: BIP-21 URI pj= parameter parsing MISSING ENTIRELY",
+g28_bip21_pj_param_parsed_test_() ->
+    {"G28: BIP-21 URI pj= parameter parses to PayJoin endpoint",
      [
-      ?_assertEqual(ok, expect_module_missing(beamchain_bip21)),
-      ?_assertEqual(ok, skip_pending("G28",
-          "no BIP-21 'bitcoin:' URI parser anywhere in src/ — "
-          "prerequisite gap (BUG-3) blocks both G28 and G29"))
+      ?_assertNotEqual(non_existing, code:which(beamchain_bip21)),
+      ?_assertMatch({ok, _},
+                    beamchain_bip21:parse(
+                      <<"bitcoin:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa?"
+                        "pj=https%3A%2F%2Fexample.com%2Fpj">>,
+                      mainnet))
      ]}.
 
 %%% ===================================================================
 %%% G29 — BIP-21 URI parameter pjos= parsed
+%%%
+%%% CLOSED by FIX-62 — beamchain_bip21 module now parses pjos= as a
+%%% strict 0/1 integer (rejects "yes" / "true" / unknown).
 %%% ===================================================================
 
-g29_bip21_pjos_param_missing_test_() ->
-    {"G29: BIP-21 URI pjos= parameter parsing MISSING ENTIRELY",
+g29_bip21_pjos_param_parsed_test_() ->
+    {"G29: BIP-21 URI pjos= parameter parses to disableoutputsubstitution",
      [
-      ?_assertEqual(ok, expect_module_missing(beamchain_bip21)),
-      ?_assertEqual(ok, skip_pending("G29",
-          "pjos=1 means disableoutputsubstitution; no parser, no consumer"))
+      ?_assertNotEqual(non_existing, code:which(beamchain_bip21)),
+      ?_assertMatch({ok, _},
+                    beamchain_bip21:parse(
+                      <<"bitcoin:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa?"
+                        "pjos=1">>,
+                      mainnet)),
+      %% Reject non-{0,1} values — defensive policy that prevents a
+      %% misencoded "yes" / "true" from being silently accepted as 1.
+      ?_assertMatch({error, {bad_pjos, _}},
+                    beamchain_bip21:parse(
+                      <<"bitcoin:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa?"
+                        "pjos=yes">>,
+                      mainnet))
      ]}.
 
 %%% ===================================================================
