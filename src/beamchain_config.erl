@@ -516,6 +516,19 @@ init([]) ->
             end
     end,
 
+    %% W119 FIX-64: RPC HTTPS termination cert+key paths.
+    %% CLI (apply_opts via application:set_env) overrides config file.
+    case application:get_env(beamchain, rpc_tls_cert) of
+        {ok, CertPath} when is_list(CertPath), CertPath =/= "" ->
+            ets:insert(?CONFIG_TABLE, {rpc_tls_cert, CertPath});
+        _ -> ok
+    end,
+    case application:get_env(beamchain, rpc_tls_key) of
+        {ok, KeyPath} when is_list(KeyPath), KeyPath =/= "" ->
+            ets:insert(?CONFIG_TABLE, {rpc_tls_key, KeyPath});
+        _ -> ok
+    end,
+
     State = #state{
         network = Network,
         datadir = DataDir,
