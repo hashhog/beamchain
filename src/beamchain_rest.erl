@@ -74,9 +74,18 @@ init([]) ->
     %% Start Cowboy listener for REST API
     Params = beamchain_config:network_params(),
     Port = rest_port(Params),
+    %% W119 FIX-65: /payjoin is a sibling route on the REST listener for
+    %% BIP-78 PayJoin receiver POSTs. The dispatch target is the
+    %% standalone beamchain_payjoin_server handler so the REST router
+    %% body (which is GET-only) stays unchanged. BIP-78 §"Protocol"
+    %% mandates TLS in production; FIX-64 handles HTTPS on the RPC port,
+    %% and operators that need TLS on the REST/PayJoin port should front
+    %% with nginx/haproxy until the REST listener grows the same
+    %% rpc_tls_cert/key plumbing.
     Dispatch = cowboy_router:compile([
         {'_', [
-            {"/rest/[...]", ?MODULE, []}
+            {"/rest/[...]", ?MODULE, []},
+            {"/payjoin", beamchain_payjoin_server, []}
         ]}
     ]),
     TransportOpts = #{socket_opts => [{port, Port}, {reuseaddr, true}]},
