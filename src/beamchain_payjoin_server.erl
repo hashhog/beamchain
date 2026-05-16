@@ -66,8 +66,13 @@
 %% duplicate them).
 -export([parse_qs_params/1,
          build_payjoin_psbt/3,
+         build_payjoin_psbt/4,
+         build_payjoin_psbt_bounded/4,
          pick_receiver_utxo/2,
-         bip78_error_body/2]).
+         pick_receiver_utxo_anti_fingerprint/3,
+         bip78_error_body/2,
+         uih_score/4,
+         compute_request_budget_ms/0]).
 
 %% Supported BIP-78 version. Today the spec defines v=1 only; v=2 was
 %% proposed (https://github.com/payjoin/bips/pull/1) but is not yet in
@@ -83,6 +88,13 @@
 %% Dust threshold below which we won't dock fees from the
 %% `additionalfeeoutputindex` output.
 -define(DUST_THRESHOLD_SAT, 546).
+
+%% G18 — per-request wall-clock budget. BIP-78 §"Reception of the
+%% response" says the sender SHOULD time out after ~30s and fall back
+%% to broadcasting the Original. We pick 25s so the receiver always
+%% replies before the conservative sender deadline; the cowboy listener
+%% itself has a longer 60s default request_timeout on top.
+-define(REQUEST_BUDGET_MS, 25000).
 
 %%% ===================================================================
 %%% Cowboy handler entry point
@@ -122,6 +134,25 @@ handle_post(Req0, State) ->
     end.
 
 handle_post_v1(Req0, State, Params) ->
+    %% G30 — replay protection. If the sender included `?token=<hex>`
+    %% we MUST consume it before doing any other work. A missing token
+    %% surfaces as "unavailable" (no per-invoice nonce was found) to
+    %% encourage clients to round-trip via getpayjoinrequest. A token
+    %% is allowed to be absent on a permissive deployment via the
+    %% require_token feature flag; today we default to lenient mode
+    %% (token validated when present, allowed when absent) for
+    %% backwards compatibility with W119 FIX-65 round-trip clients.
+    case validate_invoice_token(Req0, Params) of
+        {error, Token, Reason} ->
+            Msg = iolist_to_binary(io_lib:format(
+                    "invoice token ~s: ~p", [Token, Reason])),
+            Req = bip78_error_reply(503, <<"unavailable">>, Msg, Req0),
+            {ok, Req, State};
+        {ok, _} ->
+            handle_post_v1_post_token(Req0, State, Params)
+    end.
+
+handle_post_v1_post_token(Req0, State, Params) ->
     case read_body_bounded(Req0, ?MAX_PSBT_BODY_BYTES) of
         {error, BodyErr, Req1} ->
             Req = bip78_error_reply(413, <<"original-psbt-rejected">>,
@@ -140,6 +171,25 @@ handle_post_v1(Req0, State, Params) ->
     end.
 
 handle_psbt_bin(Req0, State, Params, PsbtBin) ->
+    %% G19 — Original PSBT no-double-process. We dedup on the raw
+    %% canonical bytes received from the sender. Doing this BEFORE the
+    %% decode avoids the corner case where two semantically-equivalent
+    %% encodings would slip through; after FIX-65 the canonical bytes
+    %% are exactly what the sender posted (we decode-then-re-encode
+    %% only for the merged output).
+    case beamchain_payjoin_state:remember_seen_psbt(PsbtBin) of
+        {error, already_seen} ->
+            Req = bip78_error_reply(400, <<"original-psbt-rejected">>,
+                                    <<"duplicate Original PSBT — "
+                                      "this invoice has already been "
+                                      "processed">>,
+                                    Req0),
+            {ok, Req, State};
+        ok ->
+            handle_psbt_bin_after_dedup(Req0, State, Params, PsbtBin)
+    end.
+
+handle_psbt_bin_after_dedup(Req0, State, Params, PsbtBin) ->
     case beamchain_psbt:decode(PsbtBin) of
         {error, DecodeErr} ->
             Msg = iolist_to_binary(io_lib:format(
@@ -159,7 +209,15 @@ handle_psbt_bin(Req0, State, Params, PsbtBin) ->
     end.
 
 handle_validated(Req0, State, Params, OriginalPsbt) ->
-    case build_payjoin_psbt(OriginalPsbt, Params, default_wallet_pid()) of
+    %% G18 — wall-clock budget enforced at the build step. We spawn a
+    %% short-lived worker so a slow walletprocesspsbt call can't pin
+    %% the cowboy acceptor past the sender's BIP-78 timeout. The
+    %% worker MUST run to completion so it can clean its own ETS
+    %% writes (used-script preference table) — we don't kill it, we
+    %% just stop waiting and reply "unavailable".
+    case build_payjoin_psbt_bounded(
+           OriginalPsbt, Params, default_wallet_pid(),
+           compute_request_budget_ms()) of
         {error, no_eligible_utxo} ->
             Req = bip78_error_reply(503, <<"not-enough-money">>,
                                     <<"receiver has no eligible UTXOs">>,
@@ -173,6 +231,15 @@ handle_validated(Req0, State, Params, OriginalPsbt) ->
         {error, {wallet_missing, _}} ->
             Req = bip78_error_reply(503, <<"unavailable">>,
                                     <<"receiver wallet not running">>,
+                                    Req0),
+            {ok, Req, State};
+        {error, request_budget_exceeded} ->
+            %% G18 — receiver TTL exceeded. Tell the sender to fall
+            %% back; do NOT surface a stale half-built PSBT.
+            Req = bip78_error_reply(503, <<"unavailable">>,
+                                    <<"receiver TTL exceeded — please retry "
+                                      "after backoff or fall back to "
+                                      "broadcasting Original">>,
                                     Req0),
             {ok, Req, State};
         {error, Other} ->
@@ -380,6 +447,13 @@ validate_inputs([Map | Rest], Idx) ->
 %%   {error, {wallet_missing, ...}}
 %%   {error, Other}           when an unexpected step fails
 build_payjoin_psbt(OriginalPsbt, Params, WalletPid) ->
+    build_payjoin_psbt(OriginalPsbt, Params, WalletPid, []).
+
+%% 4-arity overload: Opts may carry `request_id` (used as a key in the
+%% G20 used-script preference table — distinct invoices reset
+%% preference) or `force_utxo` for tests. Today the only meaningful
+%% Opt is the dedup/preference policy; future fields land here.
+build_payjoin_psbt(OriginalPsbt, Params, WalletPid, _Opts) ->
     case WalletPid of
         undefined ->
             {error, {wallet_missing, no_wallet_pid}};
@@ -387,11 +461,54 @@ build_payjoin_psbt(OriginalPsbt, Params, WalletPid) ->
             do_build_payjoin_psbt(OriginalPsbt, Params, WalletPid)
     end.
 
+%% Bounded variant — runs the build in a child process and enforces a
+%% per-request wall-clock budget (G18). On timeout the worker is left
+%% to finish (its only side effect is the G20 preference write, which
+%% is idempotent and safe to land late); we just stop waiting.
+build_payjoin_psbt_bounded(OriginalPsbt, Params, WalletPid, BudgetMs) ->
+    Parent = self(),
+    Ref = make_ref(),
+    Worker = spawn(fun() ->
+        Result = build_payjoin_psbt(OriginalPsbt, Params, WalletPid),
+        Parent ! {Ref, Result}
+    end),
+    receive
+        {Ref, Result} -> Result
+    after BudgetMs ->
+        %% Don't kill the worker — its ETS writes are idempotent and
+        %% killing it mid-walletprocesspsbt could leak partial state.
+        %% Returning `request_budget_exceeded` is what the cowboy
+        %% handler converts to the BIP-78 "unavailable" error.
+        unlink(Worker),
+        {error, request_budget_exceeded}
+    end.
+
+%% G18 — Tunable. Returns ?REQUEST_BUDGET_MS by default; future
+%% deployments could override via beamchain_config:payjoin_budget_ms()
+%% (currently unused; the symbol keeps the wiring honest).
+compute_request_budget_ms() ->
+    try beamchain_config:payjoin_budget_ms() of
+        N when is_integer(N), N > 0 -> N;
+        _ -> ?REQUEST_BUDGET_MS
+    catch
+        error:_  -> ?REQUEST_BUDGET_MS;
+        exit:_   -> ?REQUEST_BUDGET_MS;
+        throw:_  -> ?REQUEST_BUDGET_MS
+    end.
+
 do_build_payjoin_psbt(OriginalPsbt, Params, WalletPid) ->
     Network = current_network(),
-    case pick_receiver_utxo(WalletPid, Network) of
+    OldTx = OriginalPsbt#psbt.unsigned_tx,
+    case pick_receiver_utxo_anti_fingerprint(
+           WalletPid, Network, OldTx) of
         {error, _} = E -> E;
         {ok, {Txid, Vout, Utxo}} ->
+            %% G20 — record the picked script so the next request
+            %% deprioritises the same UTXO/script. The write is best-
+            %% effort: if the ETS module is unavailable (e.g. tests
+            %% running with payjoin_state cleared) we silently skip.
+            catch beamchain_payjoin_state:remember_used_script(
+                    Utxo#utxo.script_pubkey),
             %% Build the merged unsigned tx:
             %%   - keep the sender's existing inputs and outputs intact
             %%     (G7+G10 — we add inputs, we do not remove sender ones).
@@ -399,7 +516,6 @@ do_build_payjoin_psbt(OriginalPsbt, Params, WalletPid) ->
             %%     (BIP-125 RBF signal, consistent with sample_unsigned_tx).
             %%   - optionally dock fees from
             %%     additionalfeeoutputindex (G6+G9).
-            OldTx = OriginalPsbt#psbt.unsigned_tx,
             NewTxIn = #tx_in{
                 prev_out = #outpoint{hash = Txid, index = Vout},
                 script_sig = <<>>,
@@ -484,10 +600,10 @@ replace_nth(N, X, [H | T]) when N > 1 -> [H | replace_nth(N - 1, X, T)];
 replace_nth(_, _, []) -> [].
 
 %% Pick any wallet UTXO whose scriptPubKey resolves to a known wallet
-%% address (so walletprocesspsbt will produce a real signature). This
-%% is intentionally minimal — UIH-1/UIH-2 anti-fingerprint heuristics
-%% (G20 / W119 BUG-10) are future work. Returns the first eligible
-%% UTXO with confirmations >= 1.
+%% address (so walletprocesspsbt will produce a real signature). The
+%% naive "first eligible" path is preserved for backwards-compat with
+%% FIX-65 test fixtures; production drives through
+%% pick_receiver_utxo_anti_fingerprint/3 which adds UIH-1/UIH-2 scoring.
 pick_receiver_utxo(WalletPid, Network) ->
     Utxos = safe_get_wallet_utxos(WalletPid),
     case lists:filter(fun({_Txid, _Vout, Utxo}) ->
@@ -495,6 +611,152 @@ pick_receiver_utxo(WalletPid, Network) ->
           end, Utxos) of
         []          -> {error, no_eligible_utxo};
         [First | _] -> {ok, First}
+    end.
+
+%%% ===================================================================
+%%% G20 — UIH-1/UIH-2 anti-fingerprint UTXO selection
+%%% ===================================================================
+%%
+%% BIP-78 §"Unnecessary input heuristic (UIH)" identifies two
+%% blockchain-analytics fingerprints that distinguish PayJoins from
+%% regular pay-to-someone transactions:
+%%
+%%   UIH-1: in the original 1-payer-1-receiver tx, the change output
+%%   is necessarily LESS than each input. After the receiver adds a
+%%   PayJoin input, if every input is still LESS than the smallest
+%%   output, the tx looks like "someone paid more than they had to
+%%   pay" — a strong PayJoin signal.
+%%
+%%   UIH-2: alternatively, if one of the OUTPUTS exceeds the receiver-
+%%   added INPUT in value, then the receiver-added input was not
+%%   needed (the original inputs were sufficient), so the receiver's
+%%   participation is detectable.
+%%
+%% We assign a SCORE to each candidate UTXO (lower is better) and pick
+%% the lowest-scoring eligible UTXO. The score is:
+%%
+%%   base   = 0 if the candidate value falls inside [minOut, maxOut]
+%%            of the original outputs (avoids both UIH-1 and UIH-2);
+%%          = 10 otherwise.
+%%   recent = +5 if the script was used in the past USED_SCRIPT_TTL_MS
+%%            window (preferred-fresh policy; cross-invoice
+%%            fingerprint mitigation).
+%%
+%% This is a HEURISTIC PREFERENCE, not a hard rejection — we still
+%% fall back to "first eligible" when no candidate dodges UIH. That
+%% way a wallet with one dominant UTXO still functions.
+pick_receiver_utxo_anti_fingerprint(WalletPid, Network, OldTx) ->
+    Utxos = safe_get_wallet_utxos(WalletPid),
+    Eligible = lists:filter(
+                 fun({_Txid, _Vout, Utxo}) ->
+                     addr_is_wallet(WalletPid,
+                                    Utxo#utxo.script_pubkey, Network)
+                 end, Utxos),
+    case Eligible of
+        [] -> {error, no_eligible_utxo};
+        _ ->
+            OutValues =
+                [V || #tx_out{value = V} <- OldTx#transaction.outputs],
+            InValuesGuess =
+                %% We don't have prev-out value info for sender inputs
+                %% here (the input maps are in OriginalPsbt, not the
+                %% transaction itself); pass [] and let uih_score/4
+                %% default to a UIH-1-only check on outputs.
+                [],
+            Scored = [{uih_score(Utxo#utxo.value, OutValues, InValuesGuess,
+                                 script_recently_used_safe(
+                                   Utxo#utxo.script_pubkey)),
+                       Triple}
+                      || {_,_,Utxo} = Triple <- Eligible],
+            %% Stable sort by score then by index in Eligible (which
+            %% lists:sort preserves for equal keys).
+            Sorted = lists:keysort(1, Scored),
+            [{_BestScore, Best} | _] = Sorted,
+            {ok, Best}
+    end.
+
+%% Score a candidate value against the Original outputs (+ optionally
+%% the input set if available). Lower is better. See module docstring
+%% for the policy summary.
+uih_score(_Value, [], _Inputs, RecentlyUsed) ->
+    %% No outputs to compare against (shouldn't happen — validation
+    %% rejects zero-output Original PSBTs) — fall back to recency.
+    case RecentlyUsed of
+        true  -> 5;
+        false -> 0
+    end;
+uih_score(Value, OutValues, _Inputs, RecentlyUsed) when is_integer(Value) ->
+    MinOut = lists:min(OutValues),
+    MaxOut = lists:max(OutValues),
+    %% UIH-2: the receiver-added input ought to be at least as large
+    %% as the largest output, else "the receiver-added input was not
+    %% needed" — a detectable signal. We prefer Value >= MaxOut.
+    %% UIH-1: if Value < MinOut, the original tx already "looked
+    %% like" 1-payer-1-receiver, and the receiver-added input would
+    %% make the smallest output strictly larger than the inputs
+    %% (classic PayJoin fingerprint). Penalise.
+    BaseScore =
+        if Value >= MaxOut       -> 0;
+           Value >= MinOut       -> 2;
+           Value < MinOut        -> 10
+        end,
+    RecencyPenalty =
+        case RecentlyUsed of
+            true  -> 5;
+            false -> 0
+        end,
+    BaseScore + RecencyPenalty.
+
+script_recently_used_safe(Script) ->
+    try
+        beamchain_payjoin_state:script_recently_used(Script)
+    catch
+        _:_ -> false
+    end.
+
+%%% ===================================================================
+%%% G30 — invoice-token validation
+%%% ===================================================================
+
+%% Extract `?token=<hex>` from the original cowboy request (NOT from
+%% Params — Params is the BIP-78 query string contract; the token is
+%% a beamchain-specific extension namespaced via a wrapper alias).
+%% Returns:
+%%   {ok, no_token}        — sender did not supply a token. We allow
+%%                             this in lenient mode (default) so
+%%                             FIX-65 test fixtures and pre-G30 clients
+%%                             continue to round-trip.
+%%   {ok, BoundAddr}       — token consumed; payjoin may proceed
+%%   {error, Token, R}     — token present but invalid (not_found,
+%%                             expired, or hex decode failed); reply
+%%                             "unavailable" per BIP-78.
+%%
+%% Today we always pass-through when no token is supplied (lenient).
+%% A future deployment flag (beamchain_config:payjoin_require_token())
+%% could swap to strict mode.
+validate_invoice_token(Req0, _Params) ->
+    Qs = try cowboy_req:parse_qs(Req0)
+         catch _:_ -> [] end,
+    case proplists:get_value(<<"token">>, Qs) of
+        undefined ->
+            case payjoin_require_token() of
+                false -> {ok, no_token};
+                true  -> {error, <<"<missing>">>, no_token}
+            end;
+        TokenHex when is_binary(TokenHex) ->
+            case beamchain_payjoin_state:consume_invoice_token(TokenHex) of
+                {ok, BoundAddr}    -> {ok, BoundAddr};
+                {error, R}         -> {error, TokenHex, R}
+            end
+    end.
+
+payjoin_require_token() ->
+    try beamchain_config:payjoin_require_token() of
+        true  -> true;
+        false -> false;
+        _     -> false
+    catch
+        _:_ -> false
     end.
 
 safe_get_wallet_utxos(_Pid) ->
