@@ -31,7 +31,10 @@
          i2p_sam/0,
          listen_onion/0,
          torcontrol_addr/0,
-         torcontrol_password/0]).
+         torcontrol_password/0,
+         %% PayJoin (W119 FIX-67)
+         payjoin_budget_ms/0,
+         payjoin_require_token/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -454,6 +457,34 @@ parse_proxy_addr(Addr, DefaultPort) when is_binary(Addr) ->
     parse_proxy_addr(binary_to_list(Addr), DefaultPort);
 parse_proxy_addr(_, _) ->
     undefined.
+
+%%% ===================================================================
+%%% PayJoin (W119 FIX-67)
+%%% ===================================================================
+
+%% G18 — per-request wall-clock budget in milliseconds. Default 25_000
+%% (set inside beamchain_payjoin_server; the config hook here lets
+%% deployments override without code changes). Returns undefined to
+%% leave the server module's default in force.
+-spec payjoin_budget_ms() -> pos_integer() | undefined.
+payjoin_budget_ms() ->
+    case get(payjoin_budget_ms, undefined) of
+        undefined -> undefined;
+        N when is_integer(N), N > 0 -> N;
+        _ -> undefined
+    end.
+
+%% G30 — when true, the receiver REQUIRES a `?token=<hex>` query
+%% parameter on every POST /payjoin and rejects requests without one.
+%% Defaults to false (lenient mode) for backwards compatibility with
+%% FIX-65 round-trip clients that pre-date the token scheme.
+-spec payjoin_require_token() -> boolean().
+payjoin_require_token() ->
+    case get(payjoin_require_token, false) of
+        true  -> true;
+        false -> false;
+        _     -> false
+    end.
 
 %%% ===================================================================
 %%% gen_server callbacks

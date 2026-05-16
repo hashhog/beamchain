@@ -2,10 +2,10 @@
 -include_lib("eunit/include/eunit.hrl").
 
 %% `expect_module_missing/1` and `expect_rpc_method_missing/1` are
-%% retained as audit-style absence helpers even after FIX-66 flipped
-%% all of their call sites to positive assertions. A future audit
-%% wave touching G18 / G19 / G20 / G30 (still SKIP-PENDING) may
-%% re-use them as the canonical absence shape.
+%% retained as audit-style absence helpers even after FIX-67 flipped
+%% all of their call sites to positive assertions (G18/G19/G20/G30
+%% closed). A future audit wave landing a new MISSING-ENTIRELY gate
+%% may re-use them as the canonical absence shape.
 -compile({nowarn_unused_function, [expect_module_missing/1,
                                    expect_rpc_method_missing/1]}).
 
@@ -580,13 +580,19 @@ g17_error_taxonomy_missing_test_() ->
 %%% ===================================================================
 
 g18_receiver_ttl_missing_test_() ->
-    {"G18: receiver response TTL / sender wait window STILL MISSING "
-     "(post-FIX-65)",
+    {"G18: receiver response TTL / sender wait window — CLOSED by FIX-67",
      [
       ?_assertNotEqual(non_existing, code:which(beamchain_payjoin_server)),
-      ?_assertEqual(ok, skip_pending("G18",
-          "module present; no per-request timeout / TTL policy yet — "
-          "receiver hangs would still block sender fallback indefinitely"))
+      ?_assert(lists:member({build_payjoin_psbt_bounded, 4},
+                            beamchain_payjoin_server:module_info(exports))),
+      ?_assert(lists:member({compute_request_budget_ms, 0},
+                            beamchain_payjoin_server:module_info(exports))),
+      %% Budget defaults to a positive integer ms value.
+      ?_test(begin
+         B = beamchain_payjoin_server:compute_request_budget_ms(),
+         ?assert(is_integer(B)),
+         ?assert(B > 0)
+       end)
      ]}.
 
 %%% ===================================================================
@@ -594,14 +600,18 @@ g18_receiver_ttl_missing_test_() ->
 %%% ===================================================================
 
 g19_receiver_no_double_processing_missing_test_() ->
-    {"G19: receiver-side Original PSBT replay protection STILL MISSING "
-     "(post-FIX-65)",
+    {"G19: receiver-side Original PSBT replay protection — CLOSED by FIX-67",
      [
-      ?_assertNotEqual(non_existing, code:which(beamchain_payjoin_server)),
-      ?_assertEqual(ok, skip_pending("G19",
-          "module present; no PSBT-hash dedup ETS table — a network "
-          "reorder could still trigger the receiver to add inputs twice "
-          "to the same invoice"))
+      ?_assertNotEqual(non_existing, code:which(beamchain_payjoin_state)),
+      ?_assert(lists:member({remember_seen_psbt, 1},
+                            beamchain_payjoin_state:module_info(exports))),
+      ?_test(begin
+         beamchain_payjoin_state:clear_all(),
+         ?assertEqual(ok,
+             beamchain_payjoin_state:remember_seen_psbt(<<"abc">>)),
+         ?assertEqual({error, already_seen},
+             beamchain_payjoin_state:remember_seen_psbt(<<"abc">>))
+       end)
      ]}.
 
 %%% ===================================================================
@@ -609,13 +619,22 @@ g19_receiver_no_double_processing_missing_test_() ->
 %%% ===================================================================
 
 g20_receiver_uih_heuristic_missing_test_() ->
-    {"G20: receiver-side UIH-1/UIH-2 anti-fingerprint heuristic STILL "
-     "MISSING (post-FIX-65)",
+    {"G20: receiver-side UIH-1/UIH-2 anti-fingerprint heuristic — "
+     "CLOSED by FIX-67",
      [
       ?_assertNotEqual(non_existing, code:which(beamchain_payjoin_server)),
-      ?_assertEqual(ok, skip_pending("G20",
-          "module present, UTXO selection picks first eligible — no "
-          "UIH-1/UIH-2 anti-fingerprint heuristic yet (W119 BUG-10)"))
+      ?_assert(lists:member({uih_score, 4},
+                            beamchain_payjoin_server:module_info(exports))),
+      ?_assert(lists:member({pick_receiver_utxo_anti_fingerprint, 3},
+                            beamchain_payjoin_server:module_info(exports))),
+      %% UIH-2: candidate value ≥ MaxOut → score 0 (preferred).
+      ?_assertEqual(0,
+          beamchain_payjoin_server:uih_score(
+            150000, [100000, 49000], [], false)),
+      %% UIH-1: candidate value < MinOut → score 10 (worst).
+      ?_assertEqual(10,
+          beamchain_payjoin_server:uih_score(
+            10000, [100000, 49000], [], false))
      ]}.
 
 %%% ===================================================================
@@ -810,13 +829,24 @@ g29_bip21_pjos_param_parsed_test_() ->
 %%% ===================================================================
 
 g30_receiver_replay_protection_missing_test_() ->
-    {"G30: receiver replay protection (once-only nonce in pj= URL) "
-     "STILL MISSING (post-FIX-65)",
+    {"G30: receiver replay protection (once-only nonce in pj= URL) — "
+     "CLOSED by FIX-67",
      [
-      ?_assertNotEqual(non_existing, code:which(beamchain_payjoin_server)),
-      ?_assertEqual(ok, skip_pending("G30",
-          "module present; no per-invoice nonce store yet — the same "
-          "invoice can still be PayJoined multiple times"))
+      ?_assertNotEqual(non_existing, code:which(beamchain_payjoin_state)),
+      ?_assert(lists:member({mint_invoice_token, 1},
+                            beamchain_payjoin_state:module_info(exports))),
+      ?_assert(lists:member({consume_invoice_token, 1},
+                            beamchain_payjoin_state:module_info(exports))),
+      ?_test(begin
+         beamchain_payjoin_state:clear_all(),
+         Hex = beamchain_payjoin_state:mint_invoice_token(<<"bc1qx">>),
+         %% First consume returns the bound address.
+         ?assertEqual({ok, <<"bc1qx">>},
+             beamchain_payjoin_state:consume_invoice_token(Hex)),
+         %% Second consume returns not_found (one-shot).
+         ?assertEqual({error, not_found},
+             beamchain_payjoin_state:consume_invoice_token(Hex))
+       end)
      ]}.
 
 %%% ===================================================================
