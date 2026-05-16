@@ -6333,13 +6333,44 @@ do_getpayjoinrequest([AmountBtc, BaseUrl, Label, Message, AddrType], Pid) ->
     end,
     {ok, AddrStr} = beamchain_wallet:get_new_address(Pid, AddrTypeAtom),
     BaseUrlBin = pj_resolve_base_url(BaseUrl),
+    %% G30 (W119 FIX-67) — mint a one-shot invoice token. The token is
+    %% appended to the pj= endpoint as a query parameter; the receiver
+    %% atomically consumes it on the matching POST /payjoin so the
+    %% same invoice URI cannot be PayJoined twice. Token mint is
+    %% always attempted; if the state module fails (extremely rare —
+    %% would indicate ETS subsystem failure) we fall back to a
+    %% tokenless URL so the API remains usable in lenient mode.
+    Token = try
+        beamchain_payjoin_state:mint_invoice_token(
+          iolist_to_binary(AddrStr))
+    catch
+        _:_ -> <<>>
+    end,
+    BaseUrlWithToken = pj_append_token(BaseUrlBin, Token),
     %% Encode the BIP-21 URI manually — beamchain_bip21:parse/2 is the
     %% inverse direction (URI → record); a small encoder lives here.
-    Uri = pj_build_bip21(AddrStr, AmountBtc, Label, Message, BaseUrlBin),
+    Uri = pj_build_bip21(AddrStr, AmountBtc, Label, Message,
+                         BaseUrlWithToken),
     {ok, #{<<"uri">>           => Uri,
            <<"address">>       => iolist_to_binary(AddrStr),
-           <<"endpoint">>      => BaseUrlBin,
+           <<"endpoint">>      => BaseUrlWithToken,
+           <<"token">>         => Token,
            <<"amount_btc">>    => AmountBtc}}.
+
+%% Append ?token=<hex> or &token=<hex> to the pj= endpoint URL. We do
+%% a byte-level inspection of the URL to decide which separator to
+%% use; a more clever approach would parse the URL but the cost would
+%% not pay back for our use case (the endpoint is either provided by
+%% the operator or is the placeholder pj_resolve_base_url/1 fallback).
+pj_append_token(BaseUrl, <<>>) ->
+    BaseUrl;
+pj_append_token(BaseUrl, TokenHex) when is_binary(BaseUrl),
+                                         is_binary(TokenHex) ->
+    Sep = case binary:match(BaseUrl, <<"?">>) of
+        nomatch -> <<"?">>;
+        _       -> <<"&">>
+    end,
+    <<BaseUrl/binary, Sep/binary, "token=", TokenHex/binary>>.
 
 pj_resolve_base_url(<<>>) ->
     %% Default placeholder — production deployments SHOULD override
