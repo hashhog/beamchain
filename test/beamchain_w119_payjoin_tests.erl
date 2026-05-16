@@ -1,6 +1,14 @@
 -module(beamchain_w119_payjoin_tests).
 -include_lib("eunit/include/eunit.hrl").
 
+%% `expect_module_missing/1` and `expect_rpc_method_missing/1` are
+%% retained as audit-style absence helpers even after FIX-66 flipped
+%% all of their call sites to positive assertions. A future audit
+%% wave touching G18 / G19 / G20 / G30 (still SKIP-PENDING) may
+%% re-use them as the canonical absence shape.
+-compile({nowarn_unused_function, [expect_module_missing/1,
+                                   expect_rpc_method_missing/1]}).
+
 %%% ===================================================================
 %%% W119 BIP-78 PayJoin (P2EP) audit — beamchain (Erlang/OTP)
 %%%
@@ -271,27 +279,38 @@ g1_receiver_http_endpoint_missing_test_() ->
 
 %%% ===================================================================
 %%% G2 — Sender-side HTTP client POSTing Original PSBT
+%%%
+%%% CLOSED by FIX-66 — beamchain_payjoin_client now exists and POSTs
+%%% Original PSBTs via httpc + ssl + optional Tor proxy. Old absence
+%%% assertion flipped to positive "module present" assertion.
 %%% ===================================================================
 
 g2_sender_http_client_missing_test_() ->
-    {"G2: BIP-78 sender HTTP client MISSING ENTIRELY",
+    {"G2: BIP-78 sender HTTP client — CLOSED by FIX-66",
      [
-      ?_assertEqual(ok, expect_module_missing(beamchain_payjoin_client)),
-      %% Sanity: inets/httpc not even started (no PayJoin client could function)
-      ?_assertEqual(ok, skip_pending("G2",
-          "no payjoin sender; inets not started in beamchain_app"))
+      ?_assertNotEqual(non_existing, code:which(beamchain_payjoin_client)),
+      %% send_payjoin_request/3 is the canonical entry point.
+      ?_assert(lists:member({send_payjoin_request, 3},
+                            beamchain_payjoin_client:module_info(exports)))
      ]}.
 
 %%% ===================================================================
 %%% G3 — TLS / .onion endpoint (sender connects only via TLS or onion)
+%%%
+%%% CLOSED by FIX-66 — classify_endpoint/1 enforces the TLS-or-onion
+%%% policy: http://clearnet → {error, plaintext_to_clearnet}.
 %%% ===================================================================
 
 g3_sender_tls_or_onion_only_missing_test_() ->
-    {"G3: BIP-78 sender TLS/.onion-only transport policy MISSING ENTIRELY",
+    {"G3: BIP-78 sender TLS/.onion-only transport policy — CLOSED by FIX-66",
      [
-      ?_assertEqual(ok, expect_module_missing(beamchain_payjoin_client)),
-      ?_assertEqual(ok, skip_pending("G3",
-          "sender MUST refuse plain http:// unless .onion; no policy module"))
+      ?_assertNotEqual(non_existing, code:which(beamchain_payjoin_client)),
+      ?_assertEqual({error, plaintext_to_clearnet},
+                    beamchain_payjoin_client:classify_endpoint(
+                      <<"http://example.com/pj">>)),
+      ?_assertMatch({ok, https},
+                    beamchain_payjoin_client:classify_endpoint(
+                      <<"https://example.com/pj">>))
      ]}.
 
 %%% ===================================================================
@@ -418,80 +437,87 @@ g9_receiver_fee_adjustment_missing_test_() ->
 
 %%% ===================================================================
 %%% G10 — Sender anti-snoop: outputs preserved
+%%%
+%%% CLOSED by FIX-66 — beamchain_payjoin:g10_outputs_preserved/3.
 %%% ===================================================================
 
 g10_sender_anti_snoop_outputs_missing_test_() ->
-    {"G10: sender anti-snoop output-preservation check MISSING ENTIRELY",
+    {"G10: sender anti-snoop output-preservation check — CLOSED by FIX-66",
      [
-      ?_assertEqual(ok, expect_module_missing(beamchain_payjoin_client)),
-      ?_assertEqual(ok, skip_pending("G10",
-          "sender MUST verify all original outputs (except substituted "
-          "receiver output) survive in the Payjoin PSBT"))
+      ?_assertNotEqual(non_existing, code:which(beamchain_payjoin)),
+      ?_assert(lists:member({g10_outputs_preserved, 3},
+                            beamchain_payjoin:module_info(exports)))
      ]}.
 
 %%% ===================================================================
 %%% G11 — Sender anti-snoop: scriptSig types preserved
+%%%
+%%% CLOSED by FIX-66 — beamchain_payjoin:g11_scriptsig_types_preserved/2.
 %%% ===================================================================
 
 g11_sender_anti_snoop_scriptsig_missing_test_() ->
-    {"G11: sender anti-snoop scriptSig-type check MISSING ENTIRELY",
+    {"G11: sender anti-snoop scriptSig-type check — CLOSED by FIX-66",
      [
-      ?_assertEqual(ok, expect_module_missing(beamchain_payjoin_client)),
-      ?_assertEqual(ok, skip_pending("G11",
-          "mixing P2WPKH-original with P2SH-receiver inputs is a known "
-          "PayJoin fingerprint — sender MUST reject"))
+      ?_assertNotEqual(non_existing, code:which(beamchain_payjoin)),
+      ?_assert(lists:member({g11_scriptsig_types_preserved, 2},
+                            beamchain_payjoin:module_info(exports)))
      ]}.
 
 %%% ===================================================================
 %%% G12 — Sender anti-snoop: no new sender inputs introduced
+%%%
+%%% CLOSED by FIX-66 — beamchain_payjoin:g12_no_new_sender_inputs/3.
 %%% ===================================================================
 
 g12_sender_anti_snoop_no_new_inputs_missing_test_() ->
-    {"G12: sender anti-snoop no-new-sender-inputs check MISSING ENTIRELY",
+    {"G12: sender anti-snoop no-new-sender-inputs check — CLOSED by FIX-66",
      [
-      ?_assertEqual(ok, expect_module_missing(beamchain_payjoin_client)),
-      ?_assertEqual(ok, skip_pending("G12",
-          "receiver MAY only add receiver-owned inputs; sender MUST "
-          "verify every input not in Original PSBT is new (not theirs)"))
+      ?_assertNotEqual(non_existing, code:which(beamchain_payjoin)),
+      ?_assert(lists:member({g12_no_new_sender_inputs, 3},
+                            beamchain_payjoin:module_info(exports)))
      ]}.
 
 %%% ===================================================================
 %%% G13 — Sender anti-snoop: fee within max_additional_fee_contribution
+%%%
+%%% CLOSED by FIX-66 — beamchain_payjoin:g13_fee_within_cap/4.
 %%% ===================================================================
 
 g13_sender_anti_snoop_max_fee_missing_test_() ->
-    {"G13: sender anti-snoop fee-cap check MISSING ENTIRELY",
+    {"G13: sender anti-snoop fee-cap check — CLOSED by FIX-66",
      [
-      ?_assertEqual(ok, expect_module_missing(beamchain_payjoin_client)),
-      ?_assertEqual(ok, skip_pending("G13",
-          "without enforcement a malicious receiver could pump fee "
-          "arbitrarily and drain the sender's change"))
+      ?_assertNotEqual(non_existing, code:which(beamchain_payjoin)),
+      ?_assert(lists:member({g13_fee_within_cap, 4},
+                            beamchain_payjoin:module_info(exports)))
      ]}.
 
 %%% ===================================================================
 %%% G14 — Sender disableoutputsubstitution=true honoured
+%%%
+%%% CLOSED by FIX-66 — beamchain_payjoin:g14_disable_output_substitution/4.
 %%% ===================================================================
 
 g14_sender_disableos_missing_test_() ->
-    {"G14: sender disableoutputsubstitution=true enforcement MISSING",
+    {"G14: sender disableoutputsubstitution=true enforcement — "
+     "CLOSED by FIX-66",
      [
-      ?_assertEqual(ok, expect_module_missing(beamchain_payjoin_client)),
-      ?_assertEqual(ok, skip_pending("G14",
-          "when pjos=1 sender MUST reject any returned PSBT whose "
-          "receiver output amount or scriptPubKey differs from Original"))
+      ?_assertNotEqual(non_existing, code:which(beamchain_payjoin)),
+      ?_assert(lists:member({g14_disable_output_substitution, 4},
+                            beamchain_payjoin:module_info(exports)))
      ]}.
 
 %%% ===================================================================
 %%% G15 — Sender minfeerate enforced on returned Payjoin PSBT
+%%%
+%%% CLOSED by FIX-66 — beamchain_payjoin:g15_min_fee_rate/3.
 %%% ===================================================================
 
 g15_sender_min_fee_rate_missing_test_() ->
-    {"G15: sender minfeerate-floor enforcement MISSING ENTIRELY",
+    {"G15: sender minfeerate-floor enforcement — CLOSED by FIX-66",
      [
-      ?_assertEqual(ok, expect_module_missing(beamchain_payjoin_client)),
-      ?_assertEqual(ok, skip_pending("G15",
-          "sender MUST reject Payjoin PSBT whose effective fee rate "
-          "drops below the minfeerate it sent in the query string"))
+      ?_assertNotEqual(non_existing, code:which(beamchain_payjoin)),
+      ?_assert(lists:member({g15_min_fee_rate, 3},
+                            beamchain_payjoin:module_info(exports)))
      ]}.
 
 %%% ===================================================================
@@ -530,12 +556,13 @@ g16_query_params_missing_test_() ->
 
 g17_error_taxonomy_missing_test_() ->
     {"G17: BIP-78 4 error tokens — receiver CLOSED by FIX-65, "
-     "sender-side classifier MISSING",
+     "sender-side wrapper CLOSED by FIX-66",
      [
       ?_assertNotEqual(non_existing, code:which(beamchain_payjoin_server)),
-      %% Sender (beamchain_payjoin_client) is still missing — gate
-      %% remains structurally open on the sender side.
-      ?_assertEqual(ok, expect_module_missing(beamchain_payjoin_client)),
+      %% Sender (beamchain_payjoin_client) now present — gate flips
+      %% positive. Sender wraps receiver-emitted tokens via the
+      %% G22 fallback path (any error → fallback broadcast).
+      ?_assertNotEqual(non_existing, code:which(beamchain_payjoin_client)),
       %% Receiver emits all four tokens as JSON.
       ?_test(begin
          Tokens = [<<"unavailable">>, <<"not-enough-money">>,
@@ -617,16 +644,18 @@ g21_version_v1_handled_missing_test_() ->
 
 %%% ===================================================================
 %%% G22 — Sender fallback: on receiver error, broadcast Original PSBT
+%%%
+%%% CLOSED by FIX-66 — beamchain_payjoin_client:broadcast_original_fallback/1
+%%% is invoked on any HTTP error / anti-snoop violation / parse failure.
 %%% ===================================================================
 
 g22_sender_fallback_broadcast_missing_test_() ->
     {"G22: sender fallback (broadcast Original PSBT on receiver error/"
-     "timeout) MISSING ENTIRELY",
+     "timeout) — CLOSED by FIX-66",
      [
-      ?_assertEqual(ok, expect_module_missing(beamchain_payjoin_client)),
-      ?_assertEqual(ok, skip_pending("G22",
-          "rpc_sendtoaddress signs+broadcasts in one shot; there is no "
-          "'build PSBT, hold pending response, decide later' state machine"))
+      ?_assertNotEqual(non_existing, code:which(beamchain_payjoin_client)),
+      ?_assert(lists:member({broadcast_original_fallback, 1},
+                            beamchain_payjoin_client:module_info(exports)))
      ]}.
 
 %%% ===================================================================
@@ -659,55 +688,75 @@ g23_receiver_content_type_missing_test_() ->
 
 %%% ===================================================================
 %%% G24 — HTTPS cert validation
+%%%
+%%% CLOSED by FIX-66 — tls_options_for(https) sets verify_peer +
+%%% cacerts from system store. Self-signed certs rejected.
 %%% ===================================================================
 
 g24_https_cert_validation_missing_test_() ->
-    {"G24: sender HTTPS cert validation MISSING ENTIRELY",
+    {"G24: sender HTTPS cert validation — CLOSED by FIX-66",
      [
-      ?_assertEqual(ok, expect_module_missing(beamchain_payjoin_client)),
-      ?_assertEqual(ok, skip_pending("G24",
-          "no SSL/TLS client policy; httpc/ssl options would need "
-          "verify_peer + cacerts loaded from system store"))
+      ?_assertNotEqual(non_existing, code:which(beamchain_payjoin_client)),
+      ?_test(begin
+         Opts = beamchain_payjoin_client:tls_options_for(https),
+         ?assertEqual(verify_peer, proplists:get_value(verify, Opts)),
+         %% Cipher / version policy must restrict to TLS 1.2+.
+         Versions = proplists:get_value(versions, Opts),
+         ?assert(is_list(Versions)),
+         ?assert(lists:member('tlsv1.2', Versions))
+       end)
      ]}.
 
 %%% ===================================================================
 %%% G25 — Tor onion endpoint support
+%%%
+%%% CLOSED by FIX-66 — classify_endpoint/1 recognises .onion hosts
+%%% (HTTP or HTTPS) as routable via the local Tor proxy. tls_options_for/1
+%%% relaxes cert verification for .onion since the address itself
+%%% authenticates the endpoint.
 %%% ===================================================================
 
 g25_tor_onion_dial_missing_test_() ->
-    {"G25: sender dial of .onion PayJoin endpoint MISSING ENTIRELY",
+    {"G25: sender dial of .onion PayJoin endpoint — CLOSED by FIX-66",
      [
-      %% Note: FIX-58 added beamchain_torcontrol (794 LOC) — verify it
-      %% loads. The module exists but is server-publishing (ADD_ONION
-      %% for OUR hidden service), NOT a SOCKS5 client for dialling a
-      %% peer-supplied .onion. So the prerequisite for G25 (Tor SOCKS5
-      %% client) is in beamchain_proxy not torcontrol.
       ?_assertNotEqual(non_existing, code:which(beamchain_torcontrol)),
-      ?_assertEqual(ok, expect_module_missing(beamchain_payjoin_client)),
-      ?_assertEqual(ok, skip_pending("G25",
-          "FIX-58 beamchain_torcontrol is server-side (ADD_ONION); the "
-          "PayJoin sender needs beamchain_proxy SOCKS5 to reach a peer's "
-          ".onion BIP-78 endpoint — different code path"))
+      ?_assertNotEqual(non_existing, code:which(beamchain_payjoin_client)),
+      ?_assertMatch({ok, onion_http},
+                    beamchain_payjoin_client:classify_endpoint(
+                      <<"http://xxxabcdefghijklmnopqrstuvwxyz234567abcdefghi"
+                        "jklmnopqrstuvwxyz23456yzd.onion/pj">>)),
+      ?_assertMatch({ok, onion_https},
+                    beamchain_payjoin_client:classify_endpoint(
+                      <<"https://xxxabcdefghijklmnopqrstuvwxyz234567abcdefgh"
+                        "ijklmnopqrstuvwxyz23456yzd.onion/pj">>))
      ]}.
 
 %%% ===================================================================
 %%% G26 — RPC getpayjoinrequest
+%%%
+%%% CLOSED by FIX-66 — rpc_getpayjoinrequest/2 exported and wired
+%%% into the dispatcher.
 %%% ===================================================================
 
 g26_rpc_getpayjoinrequest_missing_test_() ->
-    {"G26: RPC getpayjoinrequest MISSING ENTIRELY",
+    {"G26: RPC getpayjoinrequest — CLOSED by FIX-66",
      [
-      ?_assertEqual(ok, expect_rpc_method_missing(<<"getpayjoinrequest">>))
+      ?_assertNotEqual([], [A || {N, A} <- beamchain_rpc:module_info(exports),
+                                  N =:= rpc_getpayjoinrequest])
      ]}.
 
 %%% ===================================================================
 %%% G27 — RPC sendpayjoinrequest
+%%%
+%%% CLOSED by FIX-66 — rpc_sendpayjoinrequest/2 exported and wired
+%%% into the dispatcher.
 %%% ===================================================================
 
 g27_rpc_sendpayjoinrequest_missing_test_() ->
-    {"G27: RPC sendpayjoinrequest MISSING ENTIRELY",
+    {"G27: RPC sendpayjoinrequest — CLOSED by FIX-66",
      [
-      ?_assertEqual(ok, expect_rpc_method_missing(<<"sendpayjoinrequest">>))
+      ?_assertNotEqual([], [A || {N, A} <- beamchain_rpc:module_info(exports),
+                                  N =:= rpc_sendpayjoinrequest])
      ]}.
 
 %%% ===================================================================
