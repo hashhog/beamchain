@@ -10,12 +10,21 @@
 
 #include <string.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <errno.h>
 #include <erl_nif.h>
 #include <secp256k1.h>
 #include <secp256k1_schnorrsig.h>
 #include <secp256k1_extrakeys.h>
 #include <secp256k1_recovery.h>
 #include <secp256k1_ellswift.h>
+
+/* Entropy source for secp256k1_context_randomize.
+ * Mirrors Core's ECC_Start (src/key.cpp:572-587) which seeds the context
+ * with 32 strong-random bytes to enable side-channel blinding. */
+#if defined(__linux__)
+  #include <sys/random.h>  /* getrandom(2) */
+#endif
 
 /* ------------------------------------------------------------------ */
 /* SHA-256 implementation with hardware acceleration                    */
@@ -633,11 +642,51 @@ static secp256k1_context *ctx = NULL;
 /* NIF lifecycle                                                       */
 /* ------------------------------------------------------------------ */
 
+/* Fill `out` with 32 bytes of strong entropy. Returns 1 on success,
+ * 0 on failure. Mirrors what Core's GetStrongRandBytes ultimately wraps:
+ * getrandom(2) on Linux with a /dev/urandom fallback for portability. */
+static int get_entropy_32(unsigned char out[32])
+{
+#if defined(__linux__)
+    ssize_t n = getrandom(out, 32, 0);
+    if (n == 32) return 1;
+    /* Fall through to /dev/urandom on EINTR / older kernels */
+#endif
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (!f) return 0;
+    size_t got = fread(out, 1, 32, f);
+    fclose(f);
+    return got == 32;
+}
+
 static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info)
 {
     ctx = secp256k1_context_create(
         SECP256K1_CONTEXT_VERIFY | SECP256K1_CONTEXT_SIGN);
     if (!ctx) return -1;
+
+    /* Side-channel blinding seed — see Core src/key.cpp:572-587 and
+     * secp256k1.h:286-290 ("highly recommended to call this function
+     * on contexts returned from secp256k1_context_create"). Protects
+     * scalar multiplications in signing paths from cache-timing / EM /
+     * power side-channels. If we can't get entropy, refuse to load
+     * rather than running unblinded. */
+    {
+        unsigned char seed[32];
+        if (!get_entropy_32(seed)) {
+            secp256k1_context_destroy(ctx);
+            ctx = NULL;
+            return -1;
+        }
+        int ok = secp256k1_context_randomize(ctx, seed);
+        /* Wipe the seed from the stack ASAP. */
+        memset(seed, 0, sizeof(seed));
+        if (!ok) {
+            secp256k1_context_destroy(ctx);
+            ctx = NULL;
+            return -1;
+        }
+    }
 
     /* Detect best SHA-256 implementation at load time */
     detect_sha256_implementation();
