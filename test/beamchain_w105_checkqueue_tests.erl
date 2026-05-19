@@ -311,9 +311,9 @@ bug1_ecdsa_bypasses_sig_cache() ->
     SigHash = crypto:strong_rand_bytes(32),
     PubKey  = crypto:strong_rand_bytes(33),
     %% Insert canonical sig into cache manually.
-    beamchain_sig_cache:insert(SigHash, PubKey, CanonicalSig),
+    beamchain_sig_cache:insert(ecdsa, SigHash, PubKey, CanonicalSig),
     timer:sleep(20),
-    ?assert(beamchain_sig_cache:lookup(SigHash, PubKey, CanonicalSig)),
+    ?assert(beamchain_sig_cache:lookup(ecdsa, SigHash, PubKey, CanonicalSig)),
     %% FIX: ecdsa_verify_lax_cached hits the cache and returns true.
     Result = beamchain_crypto:ecdsa_verify_lax_cached(SigHash, RawSig, PubKey),
     ?assertEqual(true, Result),
@@ -334,13 +334,16 @@ bug9_schnorr_cached_ecdsa_not() ->
     %% FIX: both Schnorr and ECDSA cached variants are exported.
     ?assert(erlang:function_exported(beamchain_crypto, schnorr_verify_cached, 3)),
     ?assert(erlang:function_exported(beamchain_crypto, ecdsa_verify_lax_cached, 3)),
-    %% Schnorr path: cache hit returns true.
+    %% Schnorr path: cache hit returns true.  Insert under `schnorr'
+    %% so the lookup inside `schnorr_verify_cached/3' hits the
+    %% Schnorr-domain key (W160 BUG-16 — ECDSA and Schnorr namespaces
+    %% are now disjoint).
     SH32  = crypto:strong_rand_bytes(32),
     Sig64 = crypto:strong_rand_bytes(64),
     Pk32  = crypto:strong_rand_bytes(32),
-    beamchain_sig_cache:insert(SH32, Pk32, Sig64),
+    beamchain_sig_cache:insert(schnorr, SH32, Pk32, Sig64),
     timer:sleep(20),
-    ?assert(beamchain_sig_cache:lookup(SH32, Pk32, Sig64)),
+    ?assert(beamchain_sig_cache:lookup(schnorr, SH32, Pk32, Sig64)),
     SchnorrHit = beamchain_crypto:schnorr_verify_cached(SH32, Sig64, Pk32),
     ?assertEqual(true, SchnorrHit),
     %% FIX: ECDSA lax_cached path: cache hit also returns true.
@@ -351,9 +354,9 @@ bug9_schnorr_cached_ecdsa_not() ->
     CanonSig2 = beamchain_crypto:encode_der_signature(R2, S2Norm),
     SH2 = crypto:strong_rand_bytes(32),
     Pk2 = crypto:strong_rand_bytes(33),
-    beamchain_sig_cache:insert(SH2, Pk2, CanonSig2),
+    beamchain_sig_cache:insert(ecdsa, SH2, Pk2, CanonSig2),
     timer:sleep(20),
-    ?assert(beamchain_sig_cache:lookup(SH2, Pk2, CanonSig2)),
+    ?assert(beamchain_sig_cache:lookup(ecdsa, SH2, Pk2, CanonSig2)),
     EcdsaHit = beamchain_crypto:ecdsa_verify_lax_cached(SH2, RawSig2, Pk2),
     %% FIX: cache hit → true (ECDSA is now symmetric with Schnorr).
     ?assertEqual(true, EcdsaHit).
@@ -402,7 +405,7 @@ bug3_sig_cache_key_no_nonce() ->
     PubKey  = crypto:strong_rand_bytes(33),
     Sig     = crypto:strong_rand_bytes(71),
     %% Insert the entry (async cast — wait for gen_server to process it)
-    beamchain_sig_cache:insert(SigHash, PubKey, Sig),
+    beamchain_sig_cache:insert(ecdsa, SigHash, PubKey, Sig),
     timer:sleep(20),
     %% FIX: The old deterministic key (no nonce) must NOT be in the table.
     OldDeterministicKey = beamchain_crypto:sha256(
@@ -412,12 +415,16 @@ bug3_sig_cache_key_no_nonce() ->
     Nonce = persistent_term:get(beamchain_sig_cache_nonce),
     ?assert(is_binary(Nonce)),
     ?assertEqual(32, byte_size(Nonce)),
-    %% FIX: The actual key in ETS includes the nonce.
+    %% FIX: The actual key in ETS includes the nonce AND a 32-byte
+    %% ECDSA / Schnorr domain-separator padding (W160 BUG-16).
+    %% Core sigcache.cpp:27-32 — PADDING_ECDSA[32] = {'E'}.
+    PaddingEcdsa = <<$E, 0:248>>,
     NonceKey = beamchain_crypto:sha256(
-        <<Nonce/binary, SigHash/binary, PubKey/binary, Sig/binary>>),
+        <<Nonce/binary, PaddingEcdsa/binary,
+          SigHash/binary, PubKey/binary, Sig/binary>>),
     ?assert(ets:member(beamchain_sig_cache_tab, NonceKey)),
-    %% FIX: lookup/3 also uses the nonce — must return true for a hit.
-    ?assert(beamchain_sig_cache:lookup(SigHash, PubKey, Sig)),
+    %% FIX: lookup/4 also uses the nonce — must return true for a hit.
+    ?assert(beamchain_sig_cache:lookup(ecdsa, SigHash, PubKey, Sig)),
     %% FIX: nonce differs across gen_server restarts — confirm the nonce
     %% is non-zero (a zero nonce would be astronomically unlikely but
     %% is also the only "same as no-nonce" degenerate case).
@@ -580,7 +587,7 @@ bug8_sig_cache_count_not_bytes() ->
         H = crypto:strong_rand_bytes(32),
         P = crypto:strong_rand_bytes(33),
         S = crypto:strong_rand_bytes(71),
-        beamchain_sig_cache:insert(H, P, S)
+        beamchain_sig_cache:insert(ecdsa, H, P, S)
     end, lists:seq(1, 10)),
     %% ETS table exists and has entries (count-based, not byte-based)
     TableSize = ets:info(beamchain_sig_cache_tab, size),
@@ -670,15 +677,15 @@ bug12_spawn_no_opts() ->
 %%% ===================================================================
 
 g13_sig_cache_lookup_direct_ets() ->
-    %% beamchain_sig_cache:lookup/3 calls ets:member/2 directly.
+    %% beamchain_sig_cache:lookup/4 calls ets:member/2 directly.
     %% This is correct: hot-path lookup must not serialize through a gen_server.
     H = crypto:strong_rand_bytes(32),
     P = crypto:strong_rand_bytes(33),
     S = crypto:strong_rand_bytes(71),
-    ?assertNot(beamchain_sig_cache:lookup(H, P, S)), % miss
-    beamchain_sig_cache:insert(H, P, S),
+    ?assertNot(beamchain_sig_cache:lookup(ecdsa, H, P, S)), % miss
+    beamchain_sig_cache:insert(ecdsa, H, P, S),
     timer:sleep(5), % allow async cast to process
-    ?assert(beamchain_sig_cache:lookup(H, P, S)).    % hit
+    ?assert(beamchain_sig_cache:lookup(ecdsa, H, P, S)).    % hit
 
 %%% ===================================================================
 %%% G14: sig-cache insert is async gen_server cast (non-blocking)
@@ -689,9 +696,9 @@ g14_sig_cache_insert_async() ->
     H = crypto:strong_rand_bytes(32),
     P = crypto:strong_rand_bytes(33),
     S = crypto:strong_rand_bytes(71),
-    ok = beamchain_sig_cache:insert(H, P, S),
+    ok = beamchain_sig_cache:insert(ecdsa, H, P, S),
     %% Return value is always ok (cast never waits for reply)
-    ?assertEqual(ok, beamchain_sig_cache:insert(H, P, S)).
+    ?assertEqual(ok, beamchain_sig_cache:insert(ecdsa, H, P, S)).
 
 %%% ===================================================================
 %%% G15: sig-cache eviction preserves oldest-first order
@@ -707,9 +714,9 @@ g15_sig_cache_eviction_order() ->
     H = crypto:strong_rand_bytes(32),
     P = crypto:strong_rand_bytes(33),
     S = crypto:strong_rand_bytes(71),
-    beamchain_sig_cache:insert(H, P, S),
+    beamchain_sig_cache:insert(ecdsa, H, P, S),
     timer:sleep(5),
-    ?assert(beamchain_sig_cache:lookup(H, P, S)).
+    ?assert(beamchain_sig_cache:lookup(ecdsa, H, P, S)).
 
 %%% ===================================================================
 %%% G16: coinbase excluded from ScriptJobs
@@ -865,9 +872,9 @@ g25_schnorr_cache_key_pubkey_length() ->
     H32 = crypto:strong_rand_bytes(32),
     S64 = crypto:strong_rand_bytes(64),
     P32 = crypto:strong_rand_bytes(32),
-    beamchain_sig_cache:insert(H32, P32, S64),
+    beamchain_sig_cache:insert(ecdsa, H32, P32, S64),
     timer:sleep(5),
-    ?assert(beamchain_sig_cache:lookup(H32, P32, S64)).
+    ?assert(beamchain_sig_cache:lookup(ecdsa, H32, P32, S64)).
 
 %%% ===================================================================
 %%% G26: Schnorr cache key uses 64-byte signature
@@ -878,11 +885,16 @@ g26_schnorr_cache_key_sig_length() ->
     H32 = crypto:strong_rand_bytes(32),
     S64 = crypto:strong_rand_bytes(64),
     P32 = crypto:strong_rand_bytes(32),
-    beamchain_sig_cache:insert(H32, P32, S64),
+    beamchain_sig_cache:insert(ecdsa, H32, P32, S64),
     timer:sleep(5),
-    %% Key now includes the startup nonce: SHA256(Nonce||H32||P32||S64).
+    %% Key now includes the startup nonce AND a 32-byte ECDSA / Schnorr
+    %% domain-separator padding (W160 BUG-16; Core sigcache.cpp:27-32):
+    %%   SHA256(Nonce || Padding || H32 || P32 || S64).
     Nonce = persistent_term:get(beamchain_sig_cache_nonce),
-    Key = beamchain_crypto:sha256(<<Nonce/binary, H32/binary, P32/binary, S64/binary>>),
+    PaddingEcdsa = <<$E, 0:248>>,
+    Key = beamchain_crypto:sha256(
+            <<Nonce/binary, PaddingEcdsa/binary,
+              H32/binary, P32/binary, S64/binary>>),
     ?assert(ets:member(beamchain_sig_cache_tab, Key)).
 
 %%% ===================================================================
@@ -893,7 +905,7 @@ g27_sig_cache_miss() ->
     H = crypto:strong_rand_bytes(32),
     P = crypto:strong_rand_bytes(33),
     S = crypto:strong_rand_bytes(71),
-    ?assertNot(beamchain_sig_cache:lookup(H, P, S)).
+    ?assertNot(beamchain_sig_cache:lookup(ecdsa, H, P, S)).
 
 %%% ===================================================================
 %%% G28: sig-cache hit returns true after insert
@@ -903,9 +915,9 @@ g28_sig_cache_hit() ->
     H = crypto:strong_rand_bytes(32),
     P = crypto:strong_rand_bytes(33),
     S = crypto:strong_rand_bytes(71),
-    ok = beamchain_sig_cache:insert(H, P, S),
+    ok = beamchain_sig_cache:insert(ecdsa, H, P, S),
     timer:sleep(10),
-    ?assert(beamchain_sig_cache:lookup(H, P, S)).
+    ?assert(beamchain_sig_cache:lookup(ecdsa, H, P, S)).
 
 %%% ===================================================================
 %%% G29: eviction reduces count to MAX_ENTRIES - EVICT_BATCH
@@ -920,7 +932,7 @@ g29_eviction_count() ->
     H = crypto:strong_rand_bytes(32),
     P = crypto:strong_rand_bytes(33),
     S = crypto:strong_rand_bytes(71),
-    beamchain_sig_cache:insert(H, P, S),
+    beamchain_sig_cache:insert(ecdsa, H, P, S),
     timer:sleep(5),
     %% Order table has at least one entry with an ascending seq key
     OrderSize = ets:info(beamchain_sig_cache_order, size),
