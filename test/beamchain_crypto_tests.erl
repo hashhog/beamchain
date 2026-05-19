@@ -949,6 +949,66 @@ w95_schnorr_verify_cached_negative_not_cached_test() ->
     ?assertNot(beamchain_crypto:schnorr_verify_cached(Msg, Sig, WrongPubKey)),
     ?assertNot(beamchain_crypto:schnorr_verify_cached(Msg, Sig, WrongPubKey)).
 
+%% --- W160 BUG-16: ECDSA and Schnorr cache namespaces must be disjoint.
+%%
+%% Insert the *same* (SigHash, PubKey, Sig) byte-triple under each
+%% algorithm and assert that a lookup for the opposite algorithm
+%% returns false.  Before the fix the cache used one shared key so an
+%% `insert(ecdsa, ...)' would falsely return true for a
+%% `lookup(schnorr, ...)' over the identical bytes — Core's
+%% `PADDING_ECDSA[32] = {'E'}' / `PADDING_SCHNORR[32] = {'S'}'
+%% domain-separator design (sigcache.cpp:27-32) prevents this.
+w160_bug16_sig_cache_domain_separation_test() ->
+    w95_ensure_sig_cache(),
+    %% Deterministic bytes — content doesn't matter, only that ECDSA
+    %% and Schnorr see the *same* (SigHash, PubKey, Sig).  Schnorr
+    %% sizes (32-byte xonly pubkey, 64-byte sig) are the tighter
+    %% constraint, so use those widths.
+    SigHash = <<16#aa, 0:248>>,
+    PubKey  = <<16#bb, 0:248>>,
+    Sig     = <<16#cc, 0:504>>,
+    %% Insert under ECDSA only.
+    ok = beamchain_sig_cache:insert(ecdsa, SigHash, PubKey, Sig),
+    %% Wait for the async cast to land (gen_server isn't running in
+    %% eunit; ensure_sig_cache only seeds the ETS tables).  We poll
+    %% the ECDSA side until it shows up — at most 100 iterations of
+    %% 10 ms = 1 s.  In CI without the gen_server the cast is dropped,
+    %% so we bypass the gen_server by populating ETS directly under
+    %% the correct ECDSA-domain key.
+    case wait_for_lookup(ecdsa, SigHash, PubKey, Sig, 10) of
+        true  -> ok;
+        false ->
+            %% No gen_server: write directly via a second insert path
+            %% that does NOT round-trip through `cast` — re-use the
+            %% module's own make_key by calling lookup once after a
+            %% manual ets:insert.  We do this by directly populating
+            %% both namespaces and asserting they hash differently.
+            Nonce = persistent_term:get(beamchain_sig_cache_nonce),
+            PadE  = <<$E, 0:248>>,
+            PadS  = <<$S, 0:248>>,
+            KeyE = beamchain_crypto:sha256(
+                     <<Nonce/binary, PadE/binary, SigHash/binary,
+                       PubKey/binary, Sig/binary>>),
+            KeyS = beamchain_crypto:sha256(
+                     <<Nonce/binary, PadS/binary, SigHash/binary,
+                       PubKey/binary, Sig/binary>>),
+            ?assertNotEqual(KeyE, KeyS),
+            ets:insert(beamchain_sig_cache_tab, {KeyE, 0})
+    end,
+    %% ECDSA must see it; Schnorr must NOT — proves namespaces are
+    %% disjoint.  This is the regression test for W160 BUG-16.
+    ?assert(beamchain_sig_cache:lookup(ecdsa, SigHash, PubKey, Sig)),
+    ?assertNot(beamchain_sig_cache:lookup(schnorr, SigHash, PubKey, Sig)).
+
+wait_for_lookup(_Algo, _H, _P, _S, 0) -> false;
+wait_for_lookup(Algo, H, P, S, N) ->
+    case beamchain_sig_cache:lookup(Algo, H, P, S) of
+        true  -> true;
+        false ->
+            timer:sleep(10),
+            wait_for_lookup(Algo, H, P, S, N - 1)
+    end.
+
 %% --- Batch verify: idempotent with single-call verify; empty list
 %% returns empty list (not a crash).
 w95_batch_schnorr_verify_empty_test() ->

@@ -228,12 +228,12 @@ schnorr_verify(Msg, Sig, PubKey) when byte_size(Msg) =:= 32,
 -spec ecdsa_verify_cached(Msg :: binary(), Sig :: binary(),
                           PubKey :: binary()) -> boolean().
 ecdsa_verify_cached(Msg, Sig, PubKey) when byte_size(Msg) =:= 32 ->
-    case beamchain_sig_cache:lookup(Msg, PubKey, Sig) of
+    case beamchain_sig_cache:lookup(ecdsa, Msg, PubKey, Sig) of
         true -> true;
         false ->
             case ecdsa_verify(Msg, Sig, PubKey) of
                 true ->
-                    beamchain_sig_cache:insert(Msg, PubKey, Sig),
+                    beamchain_sig_cache:insert(ecdsa, Msg, PubKey, Sig),
                     true;
                 false ->
                     false
@@ -263,12 +263,12 @@ ecdsa_verify_lax_cached(Msg, Sig, PubKey) when byte_size(Msg) =:= 32 ->
 schnorr_verify_cached(Msg, Sig, PubKey) when byte_size(Msg) =:= 32,
                                               byte_size(Sig) =:= 64,
                                               byte_size(PubKey) =:= 32 ->
-    case beamchain_sig_cache:lookup(Msg, PubKey, Sig) of
+    case beamchain_sig_cache:lookup(schnorr, Msg, PubKey, Sig) of
         true -> true;
         false ->
             case schnorr_verify(Msg, Sig, PubKey) of
                 true ->
-                    beamchain_sig_cache:insert(Msg, PubKey, Sig),
+                    beamchain_sig_cache:insert(schnorr, Msg, PubKey, Sig),
                     true;
                 false ->
                     false
