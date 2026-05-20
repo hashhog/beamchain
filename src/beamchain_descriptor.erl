@@ -904,10 +904,9 @@ derive_bip32_path(#bip32_key{extkey = {Type, KeyData, ChainCode}}, Path) ->
 derive_bip32_pubkey_path(PubKey, ChainCode, []) ->
     {PubKey, ChainCode, undefined};
 derive_bip32_pubkey_path(PubKey, ChainCode, [Index | Rest]) when Index < ?HARDENED ->
-    %% Unhardened derivation with public key
-    Data = <<PubKey/binary, Index:32/big>>,
-    <<IL:32/binary, IR:32/binary>> = beamchain_crypto:hmac_sha512(ChainCode, Data),
-    {ok, ChildPub} = beamchain_crypto:pubkey_tweak_add(PubKey, IL),
+    %% Unhardened derivation with public key (BIP-32 retry on IL>=n /
+    %% child-point-at-infinity per spec — see W161 BUG-2/BUG-4).
+    {ChildPub, IR} = derive_pub_step(PubKey, ChainCode, Index, Index),
     derive_bip32_pubkey_path(ChildPub, IR, Rest);
 derive_bip32_pubkey_path(_PubKey, _ChainCode, [Index | _]) when Index >= ?HARDENED ->
     %% Cannot do hardened derivation without private key
@@ -917,14 +916,50 @@ derive_bip32_pubkey_path(_PubKey, _ChainCode, [Index | _]) when Index >= ?HARDEN
 derive_bip32_privkey_path(PrivKey, ChainCode, []) ->
     {PrivKey, ChainCode, PrivKey};
 derive_bip32_privkey_path(PrivKey, ChainCode, [Index | Rest]) ->
+    %% BIP-32 retry on IL>=n / (PrivKey+IL) mod n == 0 per spec — see
+    %% W161 BUG-2/BUG-4.
+    {ChildPriv, IR} = derive_priv_step(PrivKey, ChainCode, Index, Index),
+    derive_bip32_privkey_path(ChildPriv, IR, Rest).
+
+%% derive_priv_step/4: retry helper for private CKD. StartIndex used to
+%% enforce hardened/unhardened range boundary on retry; CurIndex advances.
+%% Mirrors `bitcoin-core/src/key.cpp::CKey::Derive` retry-on-fail semantics.
+derive_priv_step(_PrivKey, _ChainCode, StartIndex, CurIndex)
+  when StartIndex <  ?HARDENED, CurIndex >= ?HARDENED ->
+    throw({extkey_exhausted, StartIndex, CurIndex});
+derive_priv_step(_PrivKey, _ChainCode, StartIndex, CurIndex)
+  when StartIndex >= ?HARDENED, CurIndex >= (?HARDENED bsl 1) ->
+    throw({extkey_exhausted, StartIndex, CurIndex});
+derive_priv_step(PrivKey, ChainCode, StartIndex, CurIndex) ->
     {ok, PubKey} = beamchain_crypto:pubkey_from_privkey(PrivKey),
-    Data = case Index >= ?HARDENED of
-        true -> <<0, PrivKey/binary, Index:32/big>>;
-        false -> <<PubKey/binary, Index:32/big>>
+    Data = case CurIndex >= ?HARDENED of
+        true -> <<0, PrivKey/binary, CurIndex:32/big>>;
+        false -> <<PubKey/binary, CurIndex:32/big>>
     end,
     <<IL:32/binary, IR:32/binary>> = beamchain_crypto:hmac_sha512(ChainCode, Data),
-    {ok, ChildPriv} = beamchain_crypto:seckey_tweak_add(PrivKey, IL),
-    derive_bip32_privkey_path(ChildPriv, IR, Rest).
+    case beamchain_crypto:seckey_tweak_add(PrivKey, IL) of
+        {ok, ChildPriv} ->
+            {ChildPriv, IR};
+        {error, _} ->
+            derive_priv_step(PrivKey, ChainCode, StartIndex, CurIndex + 1)
+    end.
+
+%% derive_pub_step/4: retry helper for public CKD. Mirrors
+%% `bitcoin-core/src/pubkey.cpp::CPubKey::Derive` retry-on-fail semantics.
+derive_pub_step(_PubKey, _ChainCode, StartIndex, CurIndex)
+  when StartIndex < ?HARDENED, CurIndex >= ?HARDENED ->
+    %% Pub-only path can never derive hardened; if retry walks past 2^31
+    %% (because StartIndex was 2^31-1), bail out.
+    throw({extkey_exhausted, StartIndex, CurIndex});
+derive_pub_step(PubKey, ChainCode, StartIndex, CurIndex) ->
+    Data = <<PubKey/binary, CurIndex:32/big>>,
+    <<IL:32/binary, IR:32/binary>> = beamchain_crypto:hmac_sha512(ChainCode, Data),
+    case beamchain_crypto:pubkey_tweak_add(PubKey, IL) of
+        {ok, ChildPub} ->
+            {ChildPub, IR};
+        {error, _} ->
+            derive_pub_step(PubKey, ChainCode, StartIndex, CurIndex + 1)
+    end.
 
 bip32_to_const(#bip32_key{extkey = {Type, KeyData, _ChainCode}}) ->
     case Type of

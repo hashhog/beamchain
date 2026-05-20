@@ -1899,47 +1899,89 @@ master_from_seed(Seed) when byte_size(Seed) >= 16,
 %%% BIP 32: Child key derivation
 %%% ===================================================================
 
+%% BIP-32 §"Private parent key → private child key" / §"Public parent key →
+%% private child key" mandate: *"In case parse256(IL) >= n or k_i = 0, the
+%% resulting key is invalid, and one should proceed with the next value for
+%% i."* Mirrors Bitcoin Core's `CKey::Derive` (`key.cpp:293-310`) which
+%% returns the libsecp256k1 success flag so the caller (e.g.
+%% `scriptpubkeyman.cpp::TopUpInactiveHDChain`) can advance the keypool
+%% index and retry.
+%%
+%% Historical note: prior to W161 BUG-2/BUG-4 fix, `derive_child/2` hard-
+%% matched `{ok, _} = seckey_tweak_add(...)` and crashed the gen_server on
+%% the rare-but-spec-required `{error, _}` return. This was a 6-WAVE
+%% carry-forward W156->W161. The refactor below loops on the next child
+%% index in the same hardened/unhardened range, raising `extkey_exhausted`
+%% only when retry would cross the 2^31 hardened boundary (matches Core's
+%% behavior at `key.cpp:482-489`).
 -spec derive_child(Parent :: #hd_key{}, Index :: non_neg_integer()) -> #hd_key{}.
-derive_child(#hd_key{private_key = PrivKey, chain_code = ChainCode,
-                      public_key = PubKey} = Parent, Index)
+derive_child(Parent, Index) ->
+    derive_child_retry(Parent, Index, Index).
+
+%% derive_child_retry/3: StartIndex is the originally-requested index used
+%% to enforce the hardened/unhardened range boundary; CurIndex advances on
+%% retry. Crossing 2^31 boundary in either direction raises. The upper
+%% bound 2^32 is also enforced (BIP-32 child indices are u32).
+derive_child_retry(_Parent, StartIndex, CurIndex)
+  when StartIndex <  ?HARDENED, CurIndex >= ?HARDENED ->
+    %% Unhardened range exhausted (would cross into hardened); raise.
+    error({extkey_exhausted, StartIndex, CurIndex});
+derive_child_retry(_Parent, StartIndex, CurIndex)
+  when StartIndex >= ?HARDENED, CurIndex >= (?HARDENED bsl 1) ->
+    %% Hardened range exhausted at u32 max; raise.
+    error({extkey_exhausted, StartIndex, CurIndex});
+derive_child_retry(#hd_key{private_key = undefined}, _StartIndex, CurIndex)
+  when CurIndex >= ?HARDENED ->
+    error(hardened_derivation_requires_private_key);
+derive_child_retry(#hd_key{private_key = PrivKey, chain_code = ChainCode,
+                            public_key = PubKey} = Parent, StartIndex, CurIndex)
   when PrivKey =/= undefined ->
-    Data = case Index >= ?HARDENED of
+    Data = case CurIndex >= ?HARDENED of
         true ->
-            <<0, PrivKey/binary, Index:32/big>>;
+            <<0, PrivKey/binary, CurIndex:32/big>>;
         false ->
-            <<PubKey/binary, Index:32/big>>
+            <<PubKey/binary, CurIndex:32/big>>
     end,
     <<IL:32/binary, IR:32/binary>> =
         beamchain_crypto:hmac_sha512(ChainCode, Data),
-    {ok, ChildPriv} = beamchain_crypto:seckey_tweak_add(PrivKey, IL),
-    {ok, ChildPub} = beamchain_crypto:pubkey_from_privkey(ChildPriv),
-    <<Fingerprint:4/binary, _/binary>> = beamchain_crypto:hash160(PubKey),
-    #hd_key{
-        private_key  = ChildPriv,
-        public_key   = ChildPub,
-        chain_code   = IR,
-        depth        = Parent#hd_key.depth + 1,
-        fingerprint  = Fingerprint,
-        child_index  = Index
-    };
-derive_child(#hd_key{private_key = undefined}, Index)
-  when Index >= ?HARDENED ->
-    error(hardened_derivation_requires_private_key);
-derive_child(#hd_key{private_key = undefined, chain_code = ChainCode,
-                      public_key = PubKey} = Parent, Index) ->
-    Data = <<PubKey/binary, Index:32/big>>,
+    case beamchain_crypto:seckey_tweak_add(PrivKey, IL) of
+        {ok, ChildPriv} ->
+            {ok, ChildPub} = beamchain_crypto:pubkey_from_privkey(ChildPriv),
+            <<Fingerprint:4/binary, _/binary>> = beamchain_crypto:hash160(PubKey),
+            #hd_key{
+                private_key  = ChildPriv,
+                public_key   = ChildPub,
+                chain_code   = IR,
+                depth        = Parent#hd_key.depth + 1,
+                fingerprint  = Fingerprint,
+                child_index  = CurIndex
+            };
+        {error, _} ->
+            %% IL >= n  OR  (PrivKey + IL) mod n == 0. Per BIP-32 spec,
+            %% advance to next i and retry.
+            derive_child_retry(Parent, StartIndex, CurIndex + 1)
+    end;
+derive_child_retry(#hd_key{private_key = undefined, chain_code = ChainCode,
+                            public_key = PubKey} = Parent, StartIndex, CurIndex) ->
+    Data = <<PubKey/binary, CurIndex:32/big>>,
     <<IL:32/binary, IR:32/binary>> =
         beamchain_crypto:hmac_sha512(ChainCode, Data),
-    {ok, ChildPub} = beamchain_crypto:pubkey_tweak_add(PubKey, IL),
-    <<Fingerprint:4/binary, _/binary>> = beamchain_crypto:hash160(PubKey),
-    #hd_key{
-        private_key  = undefined,
-        public_key   = ChildPub,
-        chain_code   = IR,
-        depth        = Parent#hd_key.depth + 1,
-        fingerprint  = Fingerprint,
-        child_index  = Index
-    }.
+    case beamchain_crypto:pubkey_tweak_add(PubKey, IL) of
+        {ok, ChildPub} ->
+            <<Fingerprint:4/binary, _/binary>> = beamchain_crypto:hash160(PubKey),
+            #hd_key{
+                private_key  = undefined,
+                public_key   = ChildPub,
+                chain_code   = IR,
+                depth        = Parent#hd_key.depth + 1,
+                fingerprint  = Fingerprint,
+                child_index  = CurIndex
+            };
+        {error, _} ->
+            %% IL >= n  OR  child point at infinity. Per BIP-32 spec,
+            %% advance to next i and retry.
+            derive_child_retry(Parent, StartIndex, CurIndex + 1)
+    end.
 
 %%% ===================================================================
 %%% BIP 32: Path derivation
