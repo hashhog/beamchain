@@ -509,19 +509,38 @@ reply_json_batch(Responses, Req0, CowboyState) ->
 %%% ===================================================================
 
 setup_auth() ->
-    %% Generate random cookie and write to .cookie file
-    Cookie = beamchain_serialize:hex_encode(crypto:strong_rand_bytes(32)),
+    %% Preserve cookie across gen_server restarts. beamchain_node_sup uses
+    %% rest_for_one, so any crash in an earlier sibling (e.g. the
+    %% beamchain_mempool calling_self bug, see CORE-PARITY-AUDIT/
+    %% _bug-reports/beamchain-getblockcount-fails-2026-05-24.md) restarts
+    %% beamchain_rpc. Previously this generated a fresh random cookie on
+    %% every restart, invalidating cached cookies held by in-flight RPC
+    %% clients (including the Phase B fuzz-diff harness which reads the
+    %% cookie once at startup). Now: if `.cookie` already exists in datadir
+    %% and looks like our `__cookie__:<hex>` format, reuse it; only
+    %% generate a fresh cookie on first start.
+    %% Mirrors Bitcoin Core's `GenerateAuthCookie` (httpserver.cpp), which
+    %% is invoked once per `bitcoind` start in `InitHTTPServer` and not
+    %% on any internal restart.
     DataDir = beamchain_config:datadir(),
     CookiePath = filename:join(DataDir, ".cookie"),
-    CookieContent = <<"__cookie__:", Cookie/binary>>,
-    case file:write_file(CookiePath, CookieContent) of
-        ok ->
-            file:change_mode(CookiePath, 8#0600),
-            ets:insert(?RPC_AUTH_TABLE, {cookie, Cookie}),
-            logger:info("rpc: cookie written to ~s", [CookiePath]);
-        {error, Reason} ->
-            logger:warning("rpc: failed to write cookie: ~p", [Reason])
+    Cookie = case existing_cookie(CookiePath) of
+        {ok, Existing} ->
+            logger:info("rpc: reusing existing cookie at ~s", [CookiePath]),
+            Existing;
+        none ->
+            New = beamchain_serialize:hex_encode(crypto:strong_rand_bytes(32)),
+            CookieContent = <<"__cookie__:", New/binary>>,
+            case file:write_file(CookiePath, CookieContent) of
+                ok ->
+                    file:change_mode(CookiePath, 8#0600),
+                    logger:info("rpc: cookie written to ~s", [CookiePath]);
+                {error, Reason} ->
+                    logger:warning("rpc: failed to write cookie: ~p", [Reason])
+            end,
+            New
     end,
+    ets:insert(?RPC_AUTH_TABLE, {cookie, Cookie}),
     %% Optional rpcuser/rpcpassword from config
     case {beamchain_config:get(rpcuser), beamchain_config:get(rpcpassword)} of
         {undefined, _} -> ok;
@@ -529,6 +548,17 @@ setup_auth() ->
         {U, P} ->
             ets:insert(?RPC_AUTH_TABLE,
                 {rpc_credentials, to_bin(U), to_bin(P)})
+    end.
+
+%% Returns {ok, Cookie} if .cookie exists and matches our format,
+%% else `none`. Tolerates stale / missing / malformed files (returns
+%% `none` → caller regenerates).
+existing_cookie(CookiePath) ->
+    case file:read_file(CookiePath) of
+        {ok, <<"__cookie__:", Cookie/binary>>} when byte_size(Cookie) > 0 ->
+            {ok, Cookie};
+        _ ->
+            none
     end.
 
 check_auth(Req) ->
