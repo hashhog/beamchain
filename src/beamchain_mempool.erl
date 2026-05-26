@@ -498,6 +498,19 @@ handle_call(_Request, _From, State) ->
 handle_cast({remove_for_block, Txids}, State) ->
     State2 = do_remove_for_block(Txids, State),
     {noreply, State2};
+%% Async orphan-promotion-after-block — cast from
+%% erase_orphans_for_block/1 so promotion runs in a context that has
+%% access to State (previously called add_transaction/1 directly which
+%% gen_server:calls SELF → calling_self exception → cascade restart;
+%% see CORE-PARITY-AUDIT/_bug-reports/beamchain-getblockcount-fails-
+%% 2026-05-24.md). Fold each block-txid through reprocess_orphans/2,
+%% threading State so promoted-orphan mutations accumulate.
+handle_cast({reprocess_orphans_for_block, BlockTxids}, State) ->
+    State2 = lists:foldl(
+        fun(Txid, AccState) -> reprocess_orphans(Txid, AccState) end,
+        State,
+        BlockTxids),
+    {noreply, State2};
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
@@ -813,8 +826,9 @@ do_add_transaction(Tx, State) ->
             total_count = State3#state.total_count + 1 - length(AllEvictedTxids)
         },
 
-        %% 19. check if any orphans now have parents
-        reprocess_orphans(Txid),
+        %% 19. check if any orphans now have parents (state-threaded so
+        %% promoted orphans' state changes propagate into subsequent steps)
+        State4 = reprocess_orphans(Txid, State4),
 
         %% 20. ZMQ notification for mempool acceptance
         ZmqSeq = State4#state.zmq_seq,
@@ -1511,12 +1525,13 @@ accept_package_txs(TxEntries, EphemeralDeps, State) ->
         %% Update cluster membership
         St2 = cluster_add_tx(Txid, Tx, Fee, VSize, St),
 
-        %% Reprocess orphans
-        reprocess_orphans(Txid),
+        %% Reprocess orphans (state-threaded — promoted orphans' state
+        %% changes propagate into the final struct update below).
+        St3 = reprocess_orphans(Txid, St2),
 
-        St2#state{
-            total_bytes = St2#state.total_bytes + VSize,
-            total_count = St2#state.total_count + 1
+        St3#state{
+            total_bytes = St3#state.total_bytes + VSize,
+            total_count = St3#state.total_count + 1
         }
     end, State, lists:reverse(TxEntries)).
 
@@ -2595,31 +2610,50 @@ add_orphan(Tx, Wtxid, Txid) ->
 %% checking whether any input's prev_out hash matches NewTxid.
 %% The secondary ?MEMPOOL_ORPHAN_BY_TXID index is not used here because the
 %% children reference their parent by txid in prev_out, not by wtxid.
-reprocess_orphans(NewTxid) ->
+reprocess_orphans(NewTxid, State) ->
+    %% Take a snapshot of the orphans table up front; do_add_transaction
+    %% can mutate ets state as it promotes / inserts entries.
     Orphans = ets:tab2list(?MEMPOOL_ORPHANS),
-    lists:foreach(fun({OrphanWtxid, OrphanTx, _Expiry}) ->
-        HasParent = lists:any(
-            fun(#tx_in{prev_out = #outpoint{hash = H}}) ->
-                H =:= NewTxid
-            end,
-            OrphanTx#transaction.inputs),
-        case HasParent of
-            true ->
-                %% Remove from both tables before re-submission
-                OrphanTxid = beamchain_serialize:tx_hash(OrphanTx),
-                ets:delete(?MEMPOOL_ORPHANS, OrphanWtxid),
-                ets:delete(?MEMPOOL_ORPHAN_BY_TXID, OrphanTxid),
-                case add_transaction(OrphanTx) of
-                    {ok, _} ->
-                        logger:debug("mempool: promoted orphan wtxid=~s",
-                                     [short_hex(OrphanWtxid)]);
-                    {error, _} ->
-                        ok
-                end;
-            false ->
-                ok
-        end
-    end, Orphans).
+    %% State-threading foldl: each orphan that promotes returns the new
+    %% State to accumulate into the next iteration; failures keep the
+    %% current State. Uses the INTERNAL do_add_transaction/2 helper
+    %% directly — calling the external add_transaction/1 API here is
+    %% gen_server:call(?SERVER, ...) → calling_self exception → mempool
+    %% gen_server dies → beamchain_node_sup's rest_for_one restarts the
+    %% rpc and 10 other downstream children → cookie rotates →
+    %% in-flight RPC clients (including Phase B harness) get HTTP 401 →
+    %% misreported as "CORRUPT (getblockcount failed)". Yesterday's
+    %% 526bca7 cookie-preserve fix prevents the cookie symptom; this
+    %% fix prevents the underlying restart cascade entirely. See
+    %% CORE-PARITY-AUDIT/_bug-reports/beamchain-getblockcount-fails-
+    %% 2026-05-24.md for the full root-cause analysis.
+    lists:foldl(
+        fun({OrphanWtxid, OrphanTx, _Expiry}, AccState) ->
+            HasParent = lists:any(
+                fun(#tx_in{prev_out = #outpoint{hash = H}}) ->
+                    H =:= NewTxid
+                end,
+                OrphanTx#transaction.inputs),
+            case HasParent of
+                true ->
+                    %% Remove from both tables before re-submission
+                    OrphanTxid = beamchain_serialize:tx_hash(OrphanTx),
+                    ets:delete(?MEMPOOL_ORPHANS, OrphanWtxid),
+                    ets:delete(?MEMPOOL_ORPHAN_BY_TXID, OrphanTxid),
+                    case do_add_transaction(OrphanTx, AccState) of
+                        {ok, _PromotedTxid, NewState} ->
+                            logger:debug("mempool: promoted orphan wtxid=~s",
+                                         [short_hex(OrphanWtxid)]),
+                            NewState;
+                        {error, _} ->
+                            AccState
+                    end;
+                false ->
+                    AccState
+            end
+        end,
+        State,
+        Orphans).
 
 %%% ===================================================================
 %%% Internal: entry management
@@ -3037,7 +3071,14 @@ erase_orphans_for_block(BlockTxids) ->
     end,
     %% Category (b): promote orphans whose parents are now confirmed.
     %% reprocess_orphans is a no-op if no matching orphan is found.
-    lists:foreach(fun(Txid) -> reprocess_orphans(Txid) end, BlockTxids),
+    %% Cast asynchronously into the gen_server so promotion runs from
+    %% within a context that has State — calling reprocess_orphans/2
+    %% directly here would require threading State through
+    %% erase_orphans_for_block, which is called from contexts (chain-
+    %% connect notification, etc.) that don't have it. The cast is
+    %% handled by handle_cast/2 below, which calls
+    %% reprocess_orphans/2 with its own State.
+    gen_server:cast(?SERVER, {reprocess_orphans_for_block, BlockTxids}),
     ok.
 
 %% @doc Erase orphans announced only by a disconnecting peer.
