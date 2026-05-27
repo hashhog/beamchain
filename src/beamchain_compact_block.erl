@@ -84,8 +84,9 @@ init_compact_block(#{header := Header, nonce := Nonce,
         %% Process prefilled transactions (indexes are differential).
         %% Each index is relative to the previous prefilled tx + 1.
         %% Core blockencodings.cpp:73-86.
-        {TxnAvailable1, _LastIdx} = lists:foldl(
-            fun(#{index := DiffIdx, tx := Tx}, {Arr, PrevIdx}) ->
+        ShortIdsLen = length(ShortIds),
+        {TxnAvailable1, _LastIdx, _LastI} = lists:foldl(
+            fun(#{index := DiffIdx, tx := Tx}, {Arr, PrevIdx, I}) ->
                 %% BUG-8 fix: reject null/empty prefilled tx
                 %% (Core: cmpctblock.prefilledtxn[i].tx->IsNull()).
                 is_null_tx(Tx) andalso throw(null_prefilled_tx),
@@ -96,17 +97,23 @@ init_compact_block(#{header := Header, nonce := Nonce,
                 %% (Core: lastprefilledindex > std::numeric_limits<uint16_t>::max()).
                 AbsIdx > 65535 andalso throw(prefilled_index_overflow),
 
-                %% BUG-4 fix: absolute index must not skip past shorttxids + fills.
-                %% Core: (uint32_t)lastprefilledindex > cmpctblock.shorttxids.size() + i
-                %% We compute this check below (would require tracking i separately;
-                %% we defer to the AbsIdx < TxnCount check as an approximation,
-                %% supplemented by the >= TxnCount guard already in place).
-                AbsIdx >= TxnCount andalso throw(invalid_prefilled_index),
+                %% BUG-4 fix: per-iteration strict check matching Core.
+                %% Core blockencodings.cpp:80:
+                %%   if ((uint32_t)lastprefilledindex > cmpctblock.shorttxids.size() + i)
+                %%       return READ_STATUS_INVALID;
+                %% Earlier this was approximated by AbsIdx >= TxnCount, which is a
+                %% WEAKER check (TxnCount = shorttxids.size() + prefilled.size(),
+                %% so the bound was always relaxed by prefilled.size()-1-i bytes).
+                %% A peer could insert a prefilled tx at an index that left no
+                %% room for the remaining short_ids — Core rejects, beamchain
+                %% used to silently accept. Now we track i and enforce Core's
+                %% exact bound.
+                AbsIdx > ShortIdsLen + I andalso throw(invalid_prefilled_index),
 
                 Arr2 = array:set(AbsIdx, Tx, Arr),
-                {Arr2, AbsIdx}
+                {Arr2, AbsIdx, I + 1}
             end,
-            {TxnAvailable0, -1},
+            {TxnAvailable0, -1, 0},
             Prefilled),
 
         %% Convert prefilled to absolute indexes for storage
@@ -168,13 +175,17 @@ try_reconstruct(#compact_state{short_ids = ShortIds, k0 = K0, k1 = K1,
         {#{}, 0},
         ShortIds),
 
-    %% Try to match mempool transactions
-    {TxnAvailable1, MatchCount1} = match_mempool_txns(
+    %% Try to match mempool transactions.  Threads a "touched" set so the
+    %% extra-tx pass also respects Core's have_txn=true semantics — a slot
+    %% that was already touched (filled or collision-cleared) by the mempool
+    %% loop must not be re-filled by the extra-tx loop, matching Core
+    %% blockencodings.cpp:151-169 which checks have_txn before refilling.
+    {TxnAvailable1, MatchCount1, Touched1} = match_mempool_txns(
         ShortIdMap, K0, K1, TxnAvailable0),
 
     %% Try to match extra transactions (recently received)
     {TxnAvailable2, MatchCount2} = match_extra_txns(
-        ExtraTxns, ShortIdMap, K0, K1, TxnAvailable1),
+        ExtraTxns, ShortIdMap, K0, K1, TxnAvailable1, Touched1),
 
     TotalMatched = MatchCount1 + MatchCount2,
     MissingCount = State#compact_state.missing_count - TotalMatched,
@@ -278,71 +289,105 @@ skip_prefilled(Idx, PrefilledIdxs) ->
 %% Match mempool transactions against short ids.
 %% BUG-5 fix: when a collision clears a slot, we must also decrement the
 %% match count so the caller's MissingCount stays accurate.
-%% Core InitData: mempool_count-- on collision.
+%% BUG-11 fix: track which slots have ever been "touched" (have_txn in Core)
+%% so that a third+ collision on the same slot doesn't re-fill it.  Without
+%% this, A→fill, B→clear, C→re-fill leaves the wrong tx in the slot,
+%% which then causes a merkle-root mismatch at build_block (extra round-trip)
+%% rather than the prompt getblocktxn fallback Core takes (Core never re-fills
+%% because it keeps have_txn=true even after the slot pointer is cleared,
+%% blockencodings.cpp:124-136).
 match_mempool_txns(ShortIdMap, K0, K1, TxnAvailable) ->
     Txids = beamchain_mempool:get_all_txids(),
     lists:foldl(
-        fun(Txid, {Arr, Count}) ->
+        fun(Txid, {Arr, AccCount, Touched}) ->
             case beamchain_mempool:get_tx(Txid) of
                 {ok, Tx} ->
                     Wtxid = beamchain_serialize:wtx_hash(Tx),
                     ShortId = compute_short_id(K0, K1, Wtxid),
                     case maps:find(ShortId, ShortIdMap) of
                         {ok, Idx} ->
-                            case array:get(Idx, Arr) of
-                                undefined ->
-                                    %% First match: fill the slot
-                                    {array:set(Idx, Tx, Arr), Count + 1};
-                                _Existing ->
-                                    %% Collision: two mempool txns share a short id.
-                                    %% Clear the slot to force a getblocktxn fetch.
-                                    %% Decrement Count because the prior fill is now
-                                    %% undone (mirrors Core: mempool_count--).
-                                    {array:set(Idx, undefined, Arr), Count - 1}
+                            case {array:get(Idx, Arr),
+                                  sets:is_element(Idx, Touched)} of
+                                {undefined, false} ->
+                                    %% First match: fill the slot, mark touched.
+                                    {array:set(Idx, Tx, Arr),
+                                     AccCount + 1,
+                                     sets:add_element(Idx, Touched)};
+                                {_, false} ->
+                                    %% Already filled (e.g. by prefill) — collision.
+                                    %% Should be unreachable because prefilled
+                                    %% indices were skipped from ShortIdMap, but
+                                    %% defensive: clear + mark touched.
+                                    {array:set(Idx, undefined, Arr),
+                                     AccCount - 1,
+                                     sets:add_element(Idx, Touched)};
+                                {_, true} ->
+                                    %% Slot was previously filled by some mempool
+                                    %% tx (and possibly already cleared by a
+                                    %% collision).  Keep it cleared and do NOT
+                                    %% re-fill; Count was already decremented on
+                                    %% the first collision.
+                                    {array:set(Idx, undefined, Arr),
+                                     AccCount, Touched}
                             end;
                         error ->
-                            {Arr, Count}
+                            {Arr, AccCount, Touched}
                     end;
                 not_found ->
-                    {Arr, Count}
+                    {Arr, AccCount, Touched}
             end
         end,
-        {TxnAvailable, 0},
+        {TxnAvailable, 0, sets:new([{version, 2}])},
         Txids).
 
 %% Match extra transactions against short ids.
 %% Core InitData extra_txn loop (lines 147-176).
 %% Collision with a *different* wtxid clears the slot; same wtxid is a no-op.
-match_extra_txns(ExtraTxns, ShortIdMap, K0, K1, TxnAvailable) ->
-    lists:foldl(
-        fun(Tx, {Arr, Count}) ->
+%% Touched is the set of indices the mempool loop already filled or cleared;
+%% an index in Touched MUST NOT be re-filled by the extra loop (Core checks
+%% have_txn before filling, blockencodings.cpp:151).
+match_extra_txns(ExtraTxns, ShortIdMap, K0, K1, TxnAvailable, Touched0) ->
+    {Arr2, Count, _Touched} = lists:foldl(
+        fun(Tx, {Arr, AccCount, Touched}) ->
             Wtxid = beamchain_serialize:wtx_hash(Tx),
             ShortId = compute_short_id(K0, K1, Wtxid),
             case maps:find(ShortId, ShortIdMap) of
                 {ok, Idx} ->
-                    case array:get(Idx, Arr) of
-                        undefined ->
-                            {array:set(Idx, Tx, Arr), Count + 1};
-                        Existing ->
-                            %% Check for collision with different tx.
-                            %% Core: compare witness hashes to avoid mempool/extra dup
-                            %% triggering a false collision (extra_count--).
+                    case {array:get(Idx, Arr),
+                          sets:is_element(Idx, Touched)} of
+                        {undefined, false} ->
+                            %% First-time fill from extra pool.
+                            {array:set(Idx, Tx, Arr),
+                             AccCount + 1,
+                             sets:add_element(Idx, Touched)};
+                        {undefined, true} ->
+                            %% Already touched (mempool collision cleared it).
+                            %% Do not re-fill; the slot stays missing.
+                            {Arr, AccCount, Touched};
+                        {Existing, _} ->
+                            %% Slot already has a tx.  Compare wtxid to avoid
+                            %% mempool/extra dup triggering false collision
+                            %% (Core: compares witness hashes, line 163-164).
                             ExistingWtxid = beamchain_serialize:wtx_hash(Existing),
                             case ExistingWtxid =:= Wtxid of
                                 true ->
                                     %% Same tx in both mempool and extra — no-op.
-                                    {Arr, Count};
+                                    {Arr, AccCount, Touched};
                                 false ->
-                                    %% Real collision: clear slot, fix count.
-                                    {array:set(Idx, undefined, Arr), Count - 1}
+                                    %% Real collision: clear slot, mark touched.
+                                    %% Decrement to undo the mempool-loop's fill.
+                                    {array:set(Idx, undefined, Arr),
+                                     AccCount - 1,
+                                     sets:add_element(Idx, Touched)}
                             end
                     end;
                 error ->
-                    {Arr, Count}
+                    {Arr, AccCount, Touched}
             end
         end,
-        {TxnAvailable, 0},
-        ExtraTxns).
+        {TxnAvailable, 0, Touched0},
+        ExtraTxns),
+    {Arr2, Count}.
 
 %% Build the final block from fully reconstructed txn_available
 build_block(#compact_state{header = Header, block_hash = BlockHash,

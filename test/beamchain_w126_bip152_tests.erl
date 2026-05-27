@@ -416,9 +416,14 @@ g20_no_bucket_size_dos_check_test() ->
 g21_mempool_collision_clears_and_decrements_test() ->
     %% Confirmed indirectly via match_mempool_txns/4 source: the
     %% collision branch returns {array:set(Idx, undefined, Arr),
-    %% Count - 1}.
+    %% AccCount - 1, ...}.  The W170 audit refactor renamed the
+    %% accumulator from `Count' to `AccCount' and added a 3rd element
+    %% (the `Touched' set) to fold accumulator so a same-slot collision
+    %% is not re-filled by a later mempool tx (Core have_txn semantics).
     ?assert(src_contains("beamchain_compact_block.erl",
-                         <<"{array:set(Idx, undefined, Arr), Count - 1}">>)).
+                         <<"array:set(Idx, undefined, Arr)">>)),
+    ?assert(src_contains("beamchain_compact_block.erl",
+                         <<"AccCount - 1">>)).
 
 %%% ===================================================================
 %%% G22 extra_txn-side collision: compare wtxids before clearing
