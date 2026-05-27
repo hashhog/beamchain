@@ -827,13 +827,19 @@ do_add_transaction(Tx, State) ->
         },
 
         %% 19. check if any orphans now have parents (state-threaded so
-        %% promoted orphans' state changes propagate into subsequent steps)
-        State4 = reprocess_orphans(Txid, State4),
+        %% promoted orphans' state changes propagate into subsequent steps).
+        %% Must bind to a NEW variable: reprocess_orphans returns a modified
+        %% state record whenever an orphan is promoted (cluster_count /
+        %% zmq_seq / rolling_min_fee all change), and Erlang's `=' is a
+        %% pattern match — `State4 = reprocess_orphans(..., State4)' would
+        %% raise badmatch on the first successful promotion and crash the
+        %% mempool gen_server (sibling of the W124 calling_self cascade).
+        State4b = reprocess_orphans(Txid, State4),
 
         %% 20. ZMQ notification for mempool acceptance
-        ZmqSeq = State4#state.zmq_seq,
+        ZmqSeq = State4b#state.zmq_seq,
         beamchain_zmq:notify_transaction(Tx, mempool_add, ZmqSeq),
-        State5 = State4#state{zmq_seq = ZmqSeq + 1},
+        State5 = State4b#state{zmq_seq = ZmqSeq + 1},
 
         %% 21. Fee estimator: record this tx so that when it is confirmed
         %% in a block, process_block/2 can compute its confirmation latency.
