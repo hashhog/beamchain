@@ -29,6 +29,8 @@
 
 %% Block interaction
 -export([remove_for_block/1, remove_for_block_async/1]).
+%% Block interaction with full tx data (preferred — enables proper conflict eviction)
+-export([remove_for_block_with_txs/1, remove_for_block_with_txs_async/1]).
 
 %% Orphan cleanup — W103 BUG-10 + BUG-13 fix
 -export([erase_orphans_for_block/1, erase_orphans_for_peer/1]).
@@ -310,6 +312,10 @@ collect_by_fee_desc({_FeeRate, Txid} = Key, Acc) ->
     collect_by_fee_desc(ets:prev(?MEMPOOL_BY_FEE, Key), Acc2).
 
 %% @doc Remove confirmed transactions from the mempool (synchronous).
+%%
+%% NOTE: this txid-only variant cannot perform Core-equivalent conflict
+%% eviction — it has no way to compute which outpoints the confirmed txs
+%% spent.  See remove_for_block_with_txs/1 for the preferred path.
 -spec remove_for_block([binary()]) -> ok.
 remove_for_block(Txids) ->
     gen_server:call(?SERVER, {remove_for_block, Txids}, 30000).
@@ -324,6 +330,23 @@ remove_for_block_async([]) ->
     ok;
 remove_for_block_async(Txids) ->
     gen_server:cast(?SERVER, {remove_for_block, Txids}).
+
+%% @doc Remove confirmed transactions from the mempool, supplying the full
+%% block transactions so we can also evict mempool conflicts (txs that
+%% double-spend an outpoint just consumed by the block).
+%% Mirrors Bitcoin Core CTxMemPool::removeForBlock(vtx, height) which
+%% iterates `tx->vin` to feed `removeConflicts` (txmempool.cpp:419).
+-spec remove_for_block_with_txs([#transaction{}]) -> ok.
+remove_for_block_with_txs(Txs) ->
+    gen_server:call(?SERVER, {remove_for_block_with_txs, Txs}, 30000).
+
+%% @doc Async variant of remove_for_block_with_txs. Preferred path from
+%% chainstate's connect-block hook — avoids chainstate↔mempool deadlock.
+-spec remove_for_block_with_txs_async([#transaction{}]) -> ok.
+remove_for_block_with_txs_async([]) ->
+    ok;
+remove_for_block_with_txs_async(Txs) ->
+    gen_server:cast(?SERVER, {remove_for_block_with_txs, Txs}).
 
 %% @doc Trim mempool to fit within MaxBytes.
 -spec trim_to_size(non_neg_integer()) -> ok.
@@ -472,6 +495,10 @@ handle_call({remove_for_block, Txids}, _From, State) ->
     State2 = do_remove_for_block(Txids, State),
     {reply, ok, State2};
 
+handle_call({remove_for_block_with_txs, Txs}, _From, State) ->
+    State2 = do_remove_for_block_with_txs(Txs, State),
+    {reply, ok, State2};
+
 handle_call({trim_to_size, MaxBytes}, _From, State) ->
     State2 = do_trim_to_size(MaxBytes, State),
     {reply, ok, State2};
@@ -497,6 +524,12 @@ handle_call(_Request, _From, State) ->
 %% deadlock).  Just reuses the existing synchronous handler logic.
 handle_cast({remove_for_block, Txids}, State) ->
     State2 = do_remove_for_block(Txids, State),
+    {noreply, State2};
+%% Async variant of remove_for_block_with_txs — preferred path from
+%% chainstate connect-block hook because it carries the full block
+%% transactions, enabling proper double-spend conflict eviction.
+handle_cast({remove_for_block_with_txs, Txs}, State) ->
+    State2 = do_remove_for_block_with_txs(Txs, State),
     {noreply, State2};
 %% Async orphan-promotion-after-block — cast from
 %% erase_orphans_for_block/1 so promotion runs in a context that has
@@ -2777,44 +2810,128 @@ do_remove_for_block(Txids, State) ->
         total_count = max(0, State3#state.total_count - TotalCount)
     }.
 
-%% After confirming block transactions, check if any remaining mempool
-%% transactions now double-spend a confirmed output. Remove them.
-remove_block_conflicts(ConfirmedTxids, State) ->
-    %% Build set of outpoints spent by confirmed txs
-    %% For each confirmed txid, its outputs are now in the UTXO set,
-    %% and any mempool tx spending the same inputs as a confirmed tx
-    %% is now invalid.
-    ConfSet = sets:from_list(ConfirmedTxids),
-    AllEntries = ets:tab2list(?MEMPOOL_TXS),
-    lists:foldl(fun({Txid, Entry}, {Bytes, Count, St}) ->
-        %% skip if we already removed it
-        case sets:is_element(Txid, ConfSet) of
-            true -> {Bytes, Count, St};
+%% Preferred connect-block hook: pass full transactions so we can
+%% extract input outpoints and properly evict mempool double-spends.
+%% Mirrors Bitcoin Core CTxMemPool::removeForBlock(vtx, height)
+%% (txmempool.cpp:405): per-tx removeUnchecked + removeConflicts.
+do_remove_for_block_with_txs(Txs, State) ->
+    Now = erlang:system_time(second),
+    State0 = State#state{block_since_bump = true, last_fee_update = Now},
+
+    %% Compute all txids and the set of outpoints they spend.  Skip
+    %% the coinbase (it has a "null" input that never matches a
+    %% real outpoint, but it would also be filtered by the MEMPOOL_OUTPOINTS
+    %% lookup returning [] anyway).
+    {Txids, SpentOutpoints} = lists:foldl(
+        fun(Tx, {TidAcc, OutAcc}) ->
+            Tid = beamchain_serialize:tx_hash(Tx),
+            Outs = [{In#tx_in.prev_out#outpoint.hash,
+                     In#tx_in.prev_out#outpoint.index}
+                    || In <- Tx#transaction.inputs],
+            {[Tid | TidAcc], Outs ++ OutAcc}
+        end,
+        {[], []},
+        Txs),
+
+    %% 1. remove confirmed transactions and update clusters
+    {RemovedBytes, RemovedCount, State2} = lists:foldl(
+        fun(Txid, {Bytes, Count, St}) ->
+            case remove_entry(Txid) of
+                #mempool_entry{vsize = VSize} ->
+                    St2 = cluster_remove_tx(Txid, St),
+                    {Bytes + VSize, Count + 1, St2};
+                not_found ->
+                    {Bytes, Count, St}
+            end
+        end,
+        {0, 0, State0},
+        Txids),
+
+    %% 1b. clean orphan pool (same as the legacy path).
+    erase_orphans_for_block(Txids),
+
+    %% 2. evict double-spend conflicts using the SpentOutpoints set —
+    %%    this is the path that the txid-only do_remove_for_block can NOT take.
+    ConfirmedSet = sets:from_list(Txids),
+    {ConflictBytes, ConflictCount, State3} =
+        remove_block_conflicts_by_outpoint(SpentOutpoints, ConfirmedSet, State2),
+
+    TotalBytes = RemovedBytes + ConflictBytes,
+    TotalCount = RemovedCount + ConflictCount,
+    case TotalCount > 0 of
+        true ->
+            logger:debug("mempool: removed ~B txs for block (~B confirmed, "
+                         "~B conflicts) [with_txs path]",
+                         [TotalCount, RemovedCount, ConflictCount]);
+        false -> ok
+    end,
+    State3#state{
+        total_bytes = max(0, State3#state.total_bytes - TotalBytes),
+        total_count = max(0, State3#state.total_count - TotalCount)
+    }.
+
+%% Legacy txid-only conflict eviction (used by the deprecated
+%% remove_for_block/1 path).  This is intentionally a no-op:
+%% the old implementation falsely treated a mempool tx that SPENT
+%% a confirmed parent as a "conflict" and evicted it (those are
+%% legitimate CPFP children, not conflicts).  The real conflicts
+%% (mempool txs double-spending an outpoint just consumed by a block
+%% tx) require the block tx's inputs, which the txid-only API does
+%% not provide.  Use remove_for_block_with_txs/1 to evict real
+%% double-spends; otherwise rely on do_expire_old/0 to garbage-collect
+%% any orphaned mempool txs whose inputs are no longer in the UTXO
+%% set.  Returns the unchanged state and zero counters so the caller's
+%% accounting is unaffected.
+remove_block_conflicts(_ConfirmedTxids, State) ->
+    {0, 0, State}.
+
+%% Outpoint-based conflict eviction — preferred path.  Given the set of
+%% outpoints spent by the just-confirmed block transactions, look each
+%% one up in the MEMPOOL_OUTPOINTS index to find any mempool tx that
+%% was about to spend the same outpoint.  Evict those (and their
+%% descendants) since the outpoint is now consumed by the block and
+%% the mempool tx would fail revalidation.
+%%
+%% Mirrors Bitcoin Core CTxMemPool::removeConflicts (txmempool.cpp:388):
+%%   for each (txin in confirmed_tx.vin):
+%%       it = mapNextTx.find(txin.prevout);
+%%       if (it != mapNextTx.end()) removeRecursive(it->second, CONFLICT);
+remove_block_conflicts_by_outpoint(SpentOutpoints, ConfirmedSet, State) ->
+    %% Find all mempool spenders of any of the SpentOutpoints.
+    Spenders = lists:foldl(
+        fun({H, I}, Acc) ->
+            case ets:lookup(?MEMPOOL_OUTPOINTS, {H, I}) of
+                [{_, SpendingTxid}] ->
+                    %% Don't re-evict the just-confirmed tx itself.
+                    case sets:is_element(SpendingTxid, ConfirmedSet) of
+                        true -> Acc;
+                        false -> sets:add_element(SpendingTxid, Acc)
+                    end;
+                [] ->
+                    Acc
+            end
+        end,
+        sets:new([{version, 2}]),
+        SpentOutpoints),
+    %% Each spender plus its descendants must be removed (Core: removeRecursive).
+    lists:foldl(fun(Txid, {Bytes, Count, St}) ->
+        case ets:member(?MEMPOOL_TXS, Txid) of
+            true ->
+                Desc = get_all_descendants(Txid),
+                AllRemove = [Txid | Desc],
+                lists:foldl(fun(RTxid, {B, C, St2}) ->
+                    case remove_entry_with_zmq(RTxid, mempool_remove, St2) of
+                        {#mempool_entry{vsize = VS}, St3} ->
+                            St4 = cluster_remove_tx(RTxid, St3),
+                            {B + VS, C + 1, St4};
+                        {not_found, St3} -> {B, C, St3}
+                    end
+                end, {Bytes, Count, St}, AllRemove);
             false ->
-                %% check if any input's previous output was just confirmed
-                HasConflict = lists:any(
-                    fun(#tx_in{prev_out = #outpoint{hash = H}}) ->
-                        sets:is_element(H, ConfSet)
-                    end,
-                    (Entry#mempool_entry.tx)#transaction.inputs),
-                case HasConflict of
-                    true ->
-                        %% remove this tx and its descendants
-                        Desc = get_all_descendants(Txid),
-                        AllRemove = [Txid | Desc],
-                        lists:foldl(fun(RTxid, {B, C, St2}) ->
-                            case remove_entry_with_zmq(RTxid, mempool_remove, St2) of
-                                {#mempool_entry{vsize = VS}, St3} ->
-                                    St4 = cluster_remove_tx(RTxid, St3),
-                                    {B + VS, C + 1, St4};
-                                {not_found, St3} -> {B, C, St3}
-                            end
-                        end, {Bytes, Count, St}, AllRemove);
-                    false ->
-                        {Bytes, Count, St}
-                end
+                %% Already removed by an earlier iteration (descendant overlap).
+                {Bytes, Count, St}
         end
-    end, {0, 0, State}, AllEntries).
+    end, {0, 0, State}, sets:to_list(Spenders)).
 
 %%% ===================================================================
 %%% Internal: trimming / eviction (cluster-based)

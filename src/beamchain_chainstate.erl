@@ -1002,21 +1002,27 @@ do_connect_block_inner(#block{header = Header} = Block,
                 %% Uses the async cast variant to avoid a chainstate ↔ mempool
                 %% gen_server deadlock (mempool may concurrently call back into
                 %% chainstate during accept_to_memory_pool).  We skip the
-                %% coinbase txid (it can never appear in the mempool) and skip
+                %% coinbase tx (it can never appear in the mempool) and skip
                 %% entirely during reorg (do_reorganize_atomic batches
                 %% disconnects+connects and then refills via the
                 %% refill_mempool_after_reorg path, which is the symmetric
                 %% Core "DisconnectPool" mechanic).
+                %%
+                %% Pass the full block transactions (not just txids) so the
+                %% mempool can compute the set of outpoints spent by the
+                %% block and properly evict mempool double-spends — see
+                %% beamchain_mempool:do_remove_for_block_with_txs/2 and
+                %% Core txmempool.cpp:419 (removeConflicts).
                 case State4#state.reorg_in_progress of
                     true  -> ok;
                     false ->
-                        ConfirmedTxids = case Block#block.transactions of
-                            [] -> [];
-                            [_Coinbase | RegularTxs] ->
-                                [beamchain_serialize:tx_hash(T)
-                                 || T <- RegularTxs]
+                        {RegularTxs, ConfirmedTxids} = case Block#block.transactions of
+                            [] -> {[], []};
+                            [_Coinbase | Rest] ->
+                                {Rest,
+                                 [beamchain_serialize:tx_hash(T) || T <- Rest]}
                         end,
-                        beamchain_mempool:remove_for_block_async(ConfirmedTxids),
+                        beamchain_mempool:remove_for_block_with_txs_async(RegularTxs),
                         %% Fee estimator: update confirmation latency stats for
                         %% every non-coinbase tx in this block.  Cast is
                         %% non-blocking so it cannot delay the connect path.

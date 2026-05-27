@@ -537,9 +537,13 @@ do_submit_block(HexBlock) ->
                         %% Active-chain advance (either direct extension
                         %% or a reorg flip).  Mempool + announce as
                         %% before.
-                        Txids = [beamchain_serialize:tx_hash(Tx)
-                                 || Tx <- Block#block.transactions],
-                        beamchain_mempool:remove_for_block(Txids),
+                        %% Pass full block transactions (sans coinbase) so
+                        %% the mempool can evict double-spend conflicts.
+                        RegularTxs = case Block#block.transactions of
+                            [] -> [];
+                            [_Coinbase | Rest] -> Rest
+                        end,
+                        beamchain_mempool:remove_for_block_with_txs(RegularTxs),
 
                         BlockHash = beamchain_serialize:block_hash(
                             Block#block.header),
