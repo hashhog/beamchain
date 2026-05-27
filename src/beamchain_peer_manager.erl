@@ -772,11 +772,11 @@ handle_info({peer_disconnected, Pid, Reason}, State) ->
     logger:debug("peer manager: ~p disconnected: ~p",
                  [Pid, Reason]),
     beamchain_sync:notify_peer_disconnected(Pid),
-    %% W103 BUG-13 fix: clean orphans announced by this peer.
+    %% W103 BUG-13 + W125 fix: clean orphans announced by this peer.
     %% Mirrors Bitcoin Core TxOrphanage::EraseForPeer(nodeid) on disconnect.
-    %% NOTE: full per-peer orphan pruning requires BUG-14 schema fix (PeerId
-    %% field in orphan records); erase_orphans_for_peer/1 is a no-op stub
-    %% until that is done.
+    %% As of W125 the orphan record carries the peer's pid, so this is now
+    %% an actual prune (not the old no-op stub).  Bounded eviction over the
+    %% by-peer ordered_set index — O(k log N) where k = orphans-from-peer.
     beamchain_mempool:erase_orphans_for_peer(Pid),
     State2 = remove_peer_and_update(Pid, State),
     {noreply, State2};
