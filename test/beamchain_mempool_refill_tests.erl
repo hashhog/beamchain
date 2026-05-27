@@ -102,6 +102,9 @@ stub_mempool_start(ReplyFun) ->
 init(ReplyFun) ->
     {ok, #stub_state{reply_fun = ReplyFun}}.
 
+handle_call({add_tx, _Tx, _Peer}, _From, #stub_state{
+                                              reply_fun = throw_per_tx}) ->
+    erlang:error(simulated_mempool_failure);
 handle_call({add_tx, _Tx}, _From, #stub_state{
                                      reply_fun = throw_per_tx}) ->
     %% Deliberately error on every call so refill helper exercises
@@ -110,6 +113,11 @@ handle_call({add_tx, _Tx}, _From, #stub_state{
     %% the helper's `catch _:_` traps it.  No state update — the
     %% server is about to die.
     erlang:error(simulated_mempool_failure);
+%% W125: new peer-attributed shape — refill path uses ?ORPHAN_LOCAL_PEER.
+handle_call({add_tx, Tx, _Peer}, _From,
+            #stub_state{calls = Calls, reply_fun = F} = St) ->
+    Reply = F(Tx),
+    {reply, Reply, St#stub_state{calls = [Tx | Calls]}};
 handle_call({add_tx, Tx}, _From,
             #stub_state{calls = Calls, reply_fun = F} = St) ->
     Reply = F(Tx),

@@ -329,11 +329,14 @@ route_message(Peer, getblocktxn, Payload, State) ->
     end,
     State;
 
-%% Handle incoming tx message: validate via AcceptToMemoryPool and relay
+%% Handle incoming tx message: validate via AcceptToMemoryPool and relay.
+%% W125: pass Peer to accept_to_memory_pool/2 so any resulting orphan is
+%% attributed for per-peer DoS-score eviction (mirrors Core's
+%% PeerManagerImpl::ProcessMessage(NetMsgType::TX) → AddTx(tx, nodeid)).
 route_message(Peer, tx, Payload, State) ->
     case beamchain_p2p_msg:decode_payload(tx, Payload) of
         {ok, Tx} ->
-            case beamchain_mempool:accept_to_memory_pool(Tx) of
+            case beamchain_mempool:accept_to_memory_pool(Tx, Peer) of
                 {ok, Txid} ->
                     logger:info("sync: accepted tx ~s from ~p",
                                 [beamchain_serialize:hex_encode(Txid), Peer]),

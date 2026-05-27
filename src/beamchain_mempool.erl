@@ -16,7 +16,9 @@
 -export([start_link/0]).
 
 %% Transaction submission
--export([accept_to_memory_pool/1, add_transaction/1, accept_package/1]).
+-export([accept_to_memory_pool/1, accept_to_memory_pool/2,
+         add_transaction/1, add_transaction/2,
+         accept_package/1]).
 %% Dry-run variants (testmempoolaccept — validate without mutating mempool)
 -export([accept_to_memory_pool_dry_run/1, accept_package_dry_run/1]).
 
@@ -34,6 +36,9 @@
 
 %% Orphan cleanup — W103 BUG-10 + BUG-13 fix
 -export([erase_orphans_for_block/1, erase_orphans_for_peer/1]).
+%% W125: add_orphan/4 + orphan_count_for_peer/1 exported for unit tests of
+%% the per-peer DoS-score eviction policy (not part of the public API).
+-export([add_orphan/4, orphan_count_for_peer/1]).
 
 %% Maintenance
 -export([trim_to_size/1, expire_old/0]).
@@ -117,8 +122,20 @@
 -define(MEMPOOL_TXS, mempool_txs).           %% txid -> mempool_entry
 -define(MEMPOOL_BY_FEE, mempool_by_fee).     %% ordered {fee_rate, txid}
 -define(MEMPOOL_OUTPOINTS, mempool_outpoints). %% {txid, vout} -> spending_txid
--define(MEMPOOL_ORPHANS, mempool_orphans).         %% wtxid -> {tx, expiry}  (BIP-339 primary key)
+-define(MEMPOOL_ORPHANS, mempool_orphans).         %% wtxid -> {tx, expiry, peer_id}  (BIP-339 primary key)
 -define(MEMPOOL_ORPHAN_BY_TXID, mempool_orphan_by_txid). %% txid -> wtxid  (secondary index)
+%% Per-peer DoS eviction (W125 — mirrors Core TxOrphanage::PeerOrphanInfo).
+%%  ORPHAN_PEER_COUNT: peer_id -> non_neg_integer() — fast O(1) DoS-score lookup.
+%%  ORPHANS_BY_PEER:   ordered_set keyed by {peer_id, wtxid} so we can scan one
+%%                     peer's orphans in O(k) on disconnect or random-evict.
+-define(MEMPOOL_ORPHAN_PEER_COUNT, mempool_orphan_peer_count).
+-define(MEMPOOL_ORPHANS_BY_PEER, mempool_orphans_by_peer).
+
+%% Sentinel peer-id for orphans that arrived without a P2P attribution
+%% (RPC sendrawtransaction, mempool.dat reload). Treated like any other peer
+%% by the DoS-score eviction — `local` will likely accumulate orphans during
+%% RPC stress tests, and that's accurate accounting, not a bug.
+-define(ORPHAN_LOCAL_PEER, local).
 -define(MEMPOOL_CLUSTERS, mempool_clusters). %% cluster_id -> cluster_data
 -define(MEMPOOL_EPHEMERAL, mempool_ephemeral). %% {parent_txid, anchor_index} -> child_txid
 
@@ -196,12 +213,27 @@ start_link() ->
 %% cluster mempool limits.
 -spec accept_to_memory_pool(#transaction{}) -> {ok, binary()} | {error, term()}.
 accept_to_memory_pool(Tx) ->
-    add_transaction(Tx).
+    add_transaction(Tx, ?ORPHAN_LOCAL_PEER).
 
-%% @doc Submit a transaction to the mempool.
+%% @doc Peer-attributed AcceptToMemoryPool — when a P2P `tx` message arrives the
+%% caller passes the originating peer's identity so any resulting orphan can be
+%% attributed for DoS-score eviction (W125, mirrors Core TxOrphanage::AddTx).
+-spec accept_to_memory_pool(#transaction{}, term()) ->
+    {ok, binary()} | {error, term()}.
+accept_to_memory_pool(Tx, PeerId) ->
+    add_transaction(Tx, PeerId).
+
+%% @doc Submit a transaction to the mempool (local/RPC path — no peer).
 -spec add_transaction(#transaction{}) -> {ok, binary()} | {error, term()}.
 add_transaction(Tx) ->
-    gen_server:call(?SERVER, {add_tx, Tx}, 30000).
+    add_transaction(Tx, ?ORPHAN_LOCAL_PEER).
+
+%% @doc Submit a peer-attributed transaction. PeerId is recorded against any
+%% resulting orphan so the per-peer DoS eviction policy can blame the right peer.
+-spec add_transaction(#transaction{}, term()) ->
+    {ok, binary()} | {error, term()}.
+add_transaction(Tx, PeerId) ->
+    gen_server:call(?SERVER, {add_tx, Tx, PeerId}, 30000).
 
 %% @doc Submit a package of related transactions to the mempool.
 %% Transactions must be topologically sorted (parents before children).
@@ -418,6 +450,8 @@ init([]) ->
                                   {write_concurrency, true}]),
     ets:new(?MEMPOOL_ORPHANS, [set, public, named_table]),
     ets:new(?MEMPOOL_ORPHAN_BY_TXID, [set, public, named_table]),
+    ets:new(?MEMPOOL_ORPHAN_PEER_COUNT, [set, public, named_table]),
+    ets:new(?MEMPOOL_ORPHANS_BY_PEER, [ordered_set, public, named_table]),
     ets:new(?MEMPOOL_CLUSTERS, [set, public, named_table,
                                  {read_concurrency, true}]),
     ets:new(?MEMPOOL_EPHEMERAL, [set, public, named_table]),
@@ -444,13 +478,17 @@ init([]) ->
         last_fee_update = erlang:system_time(second)
     }}.
 
-handle_call({add_tx, Tx}, _From, State) ->
-    case do_add_transaction(Tx, State) of
+handle_call({add_tx, Tx, PeerId}, _From, State) ->
+    case do_add_transaction(Tx, PeerId, State) of
         {ok, Txid, State2} ->
             {reply, {ok, Txid}, State2};
         {error, Reason} ->
             {reply, {error, Reason}, State}
     end;
+%% Backwards-compat clause for any in-flight {add_tx, Tx} message that crosses
+%% a code-upgrade boundary or an older external caller. Attributes to ?ORPHAN_LOCAL_PEER.
+handle_call({add_tx, Tx}, From, State) ->
+    handle_call({add_tx, Tx, ?ORPHAN_LOCAL_PEER}, From, State);
 
 handle_call({accept_package, Package}, _From, State) ->
     case do_accept_package(Package, State) of
@@ -593,7 +631,11 @@ terminate(_Reason, _State) ->
 %%% Internal: add transaction
 %%% ===================================================================
 
+%% Backwards-compat shim — callers without peer attribution land on `local`.
 do_add_transaction(Tx, State) ->
+    do_add_transaction(Tx, ?ORPHAN_LOCAL_PEER, State).
+
+do_add_transaction(Tx, PeerId, State) ->
     Txid = beamchain_serialize:tx_hash(Tx),
     Wtxid = beamchain_serialize:wtx_hash(Tx),
 
@@ -887,7 +929,7 @@ do_add_transaction(Tx, State) ->
         throw:{validation, Reason} ->
             {error, Reason};
         throw:orphan ->
-            add_orphan(Tx, Wtxid, Txid),
+            add_orphan(Tx, Wtxid, Txid, PeerId),
             {error, orphan};
         throw:Reason ->
             {error, Reason}
@@ -2612,36 +2654,140 @@ get_ancestors_loop([Txid | Rest], Visited, Acc) ->
 %%% Internal: orphan pool
 %%% ===================================================================
 
-%% add_orphan/3 — primary key is Wtxid (BIP-339); secondary txid→wtxid index
+%% add_orphan/4 — primary key is Wtxid (BIP-339); secondary txid→wtxid index
 %% kept so reprocess_orphans/1 can resolve children by their input prev_out hash
 %% (which is the parent's txid, not wtxid).
-add_orphan(Tx, Wtxid, Txid) ->
-    OrphanCount = ets:info(?MEMPOOL_ORPHANS, size),
-    case OrphanCount < ?MAX_ORPHAN_TXS of
+%%
+%% W125 (today): each orphan now carries a PeerId so eviction can blame the
+%% peer that delivered it (Core's per-peer DoS-score policy — see
+%% bitcoin-core/src/node/txorphanage.cpp LimitOrphans / EraseForPeer).
+%% PeerId of ?ORPHAN_LOCAL_PEER means the orphan came from RPC / mempool.dat
+%% reload (no P2P attribution available).
+add_orphan(Tx, Wtxid, Txid, PeerId) ->
+    %% If the wtxid is already in the pool, do not re-insert — keep the
+    %% original announcer attribution (matches Core's first-write-wins
+    %% AddTx semantic; subsequent AddAnnouncer is a separate API beamchain
+    %% doesn't expose yet).
+    case ets:member(?MEMPOOL_ORPHANS, Wtxid) of
         true ->
-            Expiry = erlang:system_time(second) + ?ORPHAN_TX_EXPIRE_TIME,
-            ets:insert(?MEMPOOL_ORPHANS, {Wtxid, Tx, Expiry}),
-            ets:insert(?MEMPOOL_ORPHAN_BY_TXID, {Txid, Wtxid}),
-            logger:debug("mempool: added orphan wtxid=~s (~B total)",
-                         [short_hex(Wtxid), OrphanCount + 1]);
+            ok;
         false ->
-            %% evict a random orphan to make room
-            case ets:first(?MEMPOOL_ORPHANS) of
-                '$end_of_table' -> ok;
-                OldWtxid ->
-                    %% Remove secondary index entry for the evicted orphan
-                    case ets:lookup(?MEMPOOL_ORPHANS, OldWtxid) of
-                        [{OldWtxid, OldTx, _}] ->
-                            OldTxid = beamchain_serialize:tx_hash(OldTx),
-                            ets:delete(?MEMPOOL_ORPHAN_BY_TXID, OldTxid);
-                        [] -> ok
-                    end,
-                    ets:delete(?MEMPOOL_ORPHANS, OldWtxid)
+            OrphanCount = ets:info(?MEMPOOL_ORPHANS, size),
+            case OrphanCount >= ?MAX_ORPHAN_TXS of
+                true ->
+                    %% At cap — find the highest-DoS-score peer and evict
+                    %% a random orphan from them.  Selecting BEFORE we add
+                    %% the new orphan means the new orphan is not a
+                    %% candidate for its own eviction (matches Core's
+                    %% NeedsTrim/LimitOrphans order in AddTx).
+                    evict_one_dos_orphan();
+                false ->
+                    ok
             end,
             Expiry = erlang:system_time(second) + ?ORPHAN_TX_EXPIRE_TIME,
-            ets:insert(?MEMPOOL_ORPHANS, {Wtxid, Tx, Expiry}),
-            ets:insert(?MEMPOOL_ORPHAN_BY_TXID, {Txid, Wtxid})
+            insert_orphan_entry(Wtxid, Tx, Expiry, Txid, PeerId),
+            logger:debug("mempool: added orphan wtxid=~s peer=~p (~B total, ~B from peer)",
+                         [short_hex(Wtxid), PeerId,
+                          ets:info(?MEMPOOL_ORPHANS, size),
+                          orphan_count_for_peer(PeerId)])
     end.
+
+%% --- W125 orphan-table helpers ---------------------------------------------
+%% All inserts/deletes for an orphan MUST go through these so the three ETS
+%% tables (primary, txid-index, peer-count, by-peer-index) stay in sync.
+
+insert_orphan_entry(Wtxid, Tx, Expiry, Txid, PeerId) ->
+    ets:insert(?MEMPOOL_ORPHANS, {Wtxid, Tx, Expiry, PeerId}),
+    ets:insert(?MEMPOOL_ORPHAN_BY_TXID, {Txid, Wtxid}),
+    ets:insert(?MEMPOOL_ORPHANS_BY_PEER, {{PeerId, Wtxid}, true}),
+    ets:update_counter(?MEMPOOL_ORPHAN_PEER_COUNT, PeerId, 1, {PeerId, 0}),
+    ok.
+
+erase_orphan_entry(Wtxid, Txid, PeerId) ->
+    ets:delete(?MEMPOOL_ORPHANS, Wtxid),
+    ets:delete(?MEMPOOL_ORPHAN_BY_TXID, Txid),
+    ets:delete(?MEMPOOL_ORPHANS_BY_PEER, {PeerId, Wtxid}),
+    case ets:update_counter(?MEMPOOL_ORPHAN_PEER_COUNT, PeerId, {2, -1, 0, 0}, {PeerId, 0}) of
+        0 -> ets:delete(?MEMPOOL_ORPHAN_PEER_COUNT, PeerId);
+        _ -> ok
+    end,
+    ok.
+
+orphan_count_for_peer(PeerId) ->
+    case ets:lookup(?MEMPOOL_ORPHAN_PEER_COUNT, PeerId) of
+        [{PeerId, N}] -> N;
+        []            -> 0
+    end.
+
+%% Pick the peer with the highest current orphan count and evict one of
+%% their orphans at random. This mirrors Core's LimitOrphans intent: bound
+%% the worst offender first, leave well-behaved peers' orphans alone.
+%%
+%% We use orphan-count (not Core's full DoS-fraction over latency + weight)
+%% because beamchain's orphan record carries neither weight nor a latency
+%% score, and count is the dominant signal at our cap of 100 anyway: a peer
+%% holding ≥51 of 100 orphans IS the DoS attacker by definition. The full
+%% Core algorithm degenerates to "evict max-count peer" once weights are
+%% uniform, which they effectively are for the small txs that fill an
+%% orphan pool. A follow-up that adds weight tracking can extend this to
+%% (count, weight) tiebreaking without disturbing callers.
+evict_one_dos_orphan() ->
+    case pick_worst_peer() of
+        none ->
+            ok;
+        WorstPeer ->
+            evict_random_orphan_from_peer(WorstPeer)
+    end.
+
+pick_worst_peer() ->
+    %% Fold the per-peer-count table; O(P) where P = distinct peers with
+    %% orphans (bounded by simultaneous peer count, usually ≤125 on mainnet).
+    case ets:foldl(
+           fun({PeerId, Count}, {_, BestCount} = Best) ->
+                   if Count > BestCount -> {PeerId, Count};
+                      true              -> Best
+                   end
+           end,
+           {none, 0},
+           ?MEMPOOL_ORPHAN_PEER_COUNT) of
+        {none, 0}      -> none;
+        {WorstPeer, _} -> WorstPeer
+    end.
+
+evict_random_orphan_from_peer(PeerId) ->
+    %% Enumerate this peer's wtxids via the ordered_set by-peer index and
+    %% pick one uniformly at random.  Adversary cannot pin a particular
+    %% orphan at the "first" slot any more (the old ets:first/1 bug).
+    Wtxids = peer_orphan_wtxids(PeerId),
+    case Wtxids of
+        [] ->
+            %% Shouldn't happen — peer-count > 0 implies ≥1 entry — but
+            %% don't crash the gen_server on a transient race.
+            ok;
+        _ ->
+            Pick = lists:nth(rand:uniform(length(Wtxids)), Wtxids),
+            case ets:lookup(?MEMPOOL_ORPHANS, Pick) of
+                [{Pick, EvictTx, _Expiry, PeerId}] ->
+                    EvictTxid = beamchain_serialize:tx_hash(EvictTx),
+                    erase_orphan_entry(Pick, EvictTxid, PeerId),
+                    logger:debug("mempool: DoS-evicted orphan wtxid=~s peer=~p",
+                                 [short_hex(Pick), PeerId]);
+                _ ->
+                    ok
+            end
+    end.
+
+peer_orphan_wtxids(PeerId) ->
+    %% Walk the ordered_set by-peer prefix range. ets:next/2 over an
+    %% ordered_set is O(log N) per step.
+    walk_peer_orphans(PeerId, ets:next(?MEMPOOL_ORPHANS_BY_PEER, {PeerId, <<>>}), []).
+
+walk_peer_orphans(_PeerId, '$end_of_table', Acc) -> lists:reverse(Acc);
+walk_peer_orphans(PeerId, {PeerId, Wtxid} = Key, Acc) ->
+    walk_peer_orphans(PeerId, ets:next(?MEMPOOL_ORPHANS_BY_PEER, Key), [Wtxid | Acc]);
+walk_peer_orphans(_PeerId, _OtherKey, Acc) ->
+    %% Crossed into another peer's range — done.
+    lists:reverse(Acc).
 
 %% Attempt to re-process orphans whose missing parent might now exist.
 %% NewTxid is the txid (non-witness hash) of the newly accepted parent.
@@ -2655,7 +2801,7 @@ reprocess_orphans(NewTxid, State) ->
     Orphans = ets:tab2list(?MEMPOOL_ORPHANS),
     %% State-threading foldl: each orphan that promotes returns the new
     %% State to accumulate into the next iteration; failures keep the
-    %% current State. Uses the INTERNAL do_add_transaction/2 helper
+    %% current State. Uses the INTERNAL do_add_transaction/3 helper
     %% directly — calling the external add_transaction/1 API here is
     %% gen_server:call(?SERVER, ...) → calling_self exception → mempool
     %% gen_server dies → beamchain_node_sup's rest_for_one restarts the
@@ -2666,8 +2812,12 @@ reprocess_orphans(NewTxid, State) ->
     %% fix prevents the underlying restart cascade entirely. See
     %% CORE-PARITY-AUDIT/_bug-reports/beamchain-getblockcount-fails-
     %% 2026-05-24.md for the full root-cause analysis.
+    %%
+    %% W125: orphan records now carry PeerId (4-tuple) — preserve it when
+    %% promoting so that if the promoted-orphan path were to re-orphan, the
+    %% attribution doesn't get laundered through `local`.
     lists:foldl(
-        fun({OrphanWtxid, OrphanTx, _Expiry}, AccState) ->
+        fun({OrphanWtxid, OrphanTx, _Expiry, OrphanPeer}, AccState) ->
             HasParent = lists:any(
                 fun(#tx_in{prev_out = #outpoint{hash = H}}) ->
                     H =:= NewTxid
@@ -2675,11 +2825,10 @@ reprocess_orphans(NewTxid, State) ->
                 OrphanTx#transaction.inputs),
             case HasParent of
                 true ->
-                    %% Remove from both tables before re-submission
+                    %% Remove from all 3 tables before re-submission
                     OrphanTxid = beamchain_serialize:tx_hash(OrphanTx),
-                    ets:delete(?MEMPOOL_ORPHANS, OrphanWtxid),
-                    ets:delete(?MEMPOOL_ORPHAN_BY_TXID, OrphanTxid),
-                    case do_add_transaction(OrphanTx, AccState) of
+                    erase_orphan_entry(OrphanWtxid, OrphanTxid, OrphanPeer),
+                    case do_add_transaction(OrphanTx, OrphanPeer, AccState) of
                         {ok, _PromotedTxid, NewState} ->
                             logger:debug("mempool: promoted orphan wtxid=~s",
                                          [short_hex(OrphanWtxid)]),
@@ -3122,12 +3271,11 @@ do_expire_old(State) ->
 do_expire_orphans() ->
     Now = erlang:system_time(second),
     Orphans = ets:tab2list(?MEMPOOL_ORPHANS),
-    Expired = lists:foldl(fun({Wtxid, Tx, Expiry}, Count) ->
+    Expired = lists:foldl(fun({Wtxid, Tx, Expiry, PeerId}, Count) ->
         case Now >= Expiry of
             true ->
                 Txid = beamchain_serialize:tx_hash(Tx),
-                ets:delete(?MEMPOOL_ORPHANS, Wtxid),
-                ets:delete(?MEMPOOL_ORPHAN_BY_TXID, Txid),
+                erase_orphan_entry(Wtxid, Txid, PeerId),
                 Count + 1;
             false ->
                 Count
@@ -3164,7 +3312,7 @@ erase_orphans_for_block([]) -> ok;
 erase_orphans_for_block(BlockTxids) ->
     ConfirmedSet = sets:from_list(BlockTxids),
     Orphans = ets:tab2list(?MEMPOOL_ORPHANS),
-    Erased = lists:foldl(fun({Wtxid, Tx, _Expiry}, Count) ->
+    Erased = lists:foldl(fun({Wtxid, Tx, _Expiry, PeerId}, Count) ->
         %% Category (a): orphan spends an outpoint already confirmed/spent by the block.
         %% An orphan referencing prev_out hash H where H is a DIFFERENT confirmed tx
         %% (not the parent of this orphan) indicates a double-spend conflict.
@@ -3179,8 +3327,7 @@ erase_orphans_for_block(BlockTxids) ->
         case HasConfirmedParent of
             true ->
                 OrphanTxid = beamchain_serialize:tx_hash(Tx),
-                ets:delete(?MEMPOOL_ORPHANS, Wtxid),
-                ets:delete(?MEMPOOL_ORPHAN_BY_TXID, OrphanTxid),
+                erase_orphan_entry(Wtxid, OrphanTxid, PeerId),
                 Count + 1;
             false ->
                 Count
@@ -3204,21 +3351,35 @@ erase_orphans_for_block(BlockTxids) ->
     gen_server:cast(?SERVER, {reprocess_orphans_for_block, BlockTxids}),
     ok.
 
-%% @doc Erase orphans announced only by a disconnecting peer.
-%% W103 BUG-13 fix.  Mirrors Bitcoin Core TxOrphanage::EraseForPeer.
+%% @doc Erase orphans announced by a disconnecting peer.
+%% W103 BUG-13 + W125 (today): orphan records now carry PeerId, so this
+%% actually prunes the disconnected peer's orphans (rather than waiting
+%% the 20-min expiry the original BUG-13 fix relied on).
+%% Mirrors Bitcoin Core TxOrphanage::EraseForPeer.
 %%
-%% NOTE: beamchain orphan records carry no announcer/peer field (BUG-14).
-%% Full per-peer attribution requires adding a PeerId to the orphan schema.
-%% Until that is done, this function cannot selectively remove a peer's orphans.
-%% It is exported and called on disconnect so the plumbing is in place; the
-%% orphan records that survive here will still be reaped by do_expire_orphans/0
-%% (ORPHAN_TX_EXPIRE_TIME = 1200 s) or by erase_orphans_for_block/1 on the
-%% next block.  Callers must upgrade the schema (add peerId field) to get full
-%% Core parity.
+%% Bounded eviction: walks ONLY this peer's prefix in the by-peer ordered_set
+%% index, so cost is O(k log N) where k = orphans-from-this-peer (≤100), not
+%% O(N) over the whole orphan pool.
 -spec erase_orphans_for_peer(term()) -> ok.
-erase_orphans_for_peer(_PeerId) ->
-    %% TODO(W103/BUG-14): no peer field in orphan records — cannot prune
-    %% per-peer without schema change.  Hook is in place for future upgrade.
+erase_orphans_for_peer(PeerId) ->
+    Wtxids = peer_orphan_wtxids(PeerId),
+    Erased = lists:foldl(
+      fun(Wtxid, Count) ->
+              case ets:lookup(?MEMPOOL_ORPHANS, Wtxid) of
+                  [{Wtxid, Tx, _Expiry, PeerId}] ->
+                      Txid = beamchain_serialize:tx_hash(Tx),
+                      erase_orphan_entry(Wtxid, Txid, PeerId),
+                      Count + 1;
+                  _ ->
+                      Count
+              end
+      end, 0, Wtxids),
+    case Erased > 0 of
+        true ->
+            logger:debug("mempool: erased ~B orphans for disconnected peer=~p",
+                         [Erased, PeerId]);
+        false -> ok
+    end,
     ok.
 
 %%% ===================================================================
