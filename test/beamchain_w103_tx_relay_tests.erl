@@ -445,18 +445,20 @@ bug10_orphan_not_cleaned_on_block_connect_test() ->
 %%% ===================================================================
 
 %% Core: TxOrphanage tracks UsageByPeer + ReservedPeerUsage per peer.
-%% W125 FIX: add_orphan/4 now takes (Tx, Wtxid, Txid, PeerId) and the
-%% mempool_orphan_peer_count ETS table holds per-peer orphan counts so
-%% LimitOrphans can evict the worst offender first.  Full byte-weight
-%% accounting (ReservedPeerUsage) is not implemented — beamchain still
-%% caps on count (MAX_ORPHAN_TXS = 100), but the count IS attributed
-%% per-peer now, so the DoS pattern of "one peer fills the pool" is
-%% bounded by the eviction policy rather than ignored.
+%% W125 FIX (yesterday): add_orphan/4 records (Tx, Wtxid, Txid, PeerId);
+%% mempool_orphan_peer_count tracks per-peer orphan COUNT.
+%% W126 FIX (today): mempool_orphan_peer_weight tracks per-peer orphan
+%% WEIGHT (BIP-141 tx_weight) and a per-peer reserved budget of 404000
+%% (?ORPHAN_RESERVED_WEIGHT_PER_PEER) is enforced. A peer over the
+%% reserved-weight cap is evicted first, regardless of count. This is
+%% full Core parity with ReservedPeerUsage = 404000.
 bug11_no_per_peer_orphan_limit_test() ->
-    %% add_orphan/4 must now exist (peer-attributed insert).
+    %% add_orphan/4 must exist (peer-attributed insert).
     ?assertEqual(true, erlang:function_exported(beamchain_mempool, add_orphan, 4)),
     %% Public API for peer-attributed accept must exist.
-    ?assertEqual(true, erlang:function_exported(beamchain_mempool, accept_to_memory_pool, 2)).
+    ?assertEqual(true, erlang:function_exported(beamchain_mempool, accept_to_memory_pool, 2)),
+    %% W126: per-peer weight accessor exported.
+    ?assertEqual(true, erlang:function_exported(beamchain_mempool, orphan_weight_for_peer, 1)).
 
 %%% ===================================================================
 %%% BUG-12: Orphan eviction uses ets:first (deterministic) not random
@@ -514,14 +516,19 @@ bug13_orphan_not_cleaned_on_peer_disconnect_test() ->
 %%% ===================================================================
 
 %% Core: OrphanInfo contains a set<NodeId> announcers.
-%% W125 FIX: orphan entries are now {Wtxid, Tx, Expiry, PeerId} (4-tuple);
-%% the single-announcer model is a simplification of Core's set<NodeId>
-%% (Core supports the same orphan being re-announced by multiple peers, beamchain
-%% currently keeps the first-write-wins announcer — Core parity for the
-%% common case, divergence acknowledged for multi-announcer attribution).
+%% W125 (yesterday): orphan entries became {Wtxid, Tx, Expiry, PeerId};
+%% single-announcer first-write-wins.
+%% W126 FIX (today): orphan entries are {Wtxid, Tx, Expiry, Announcers,
+%% Weight} where Announcers is an ordsets:ordset(peer_id()) — full Core
+%% parity with std::set<NodeId> announcers. A repeat add_orphan/4 from a
+%% different peer unions that peer into the announcer set rather than
+%% being a no-op; on peer disconnect, only that peer's announcement is
+%% removed (orphan stays if other peers still announce it).
 bug14_orphan_has_no_announcer_tracking_test() ->
-    %% Peer-attributed insert now exists.
-    ?assertEqual(true, erlang:function_exported(beamchain_mempool, add_orphan, 4)).
+    %% Peer-attributed insert exists.
+    ?assertEqual(true, erlang:function_exported(beamchain_mempool, add_orphan, 4)),
+    %% W126: announcer-set accessor exported.
+    ?assertEqual(true, erlang:function_exported(beamchain_mempool, orphan_announcers, 1)).
 
 %%% ===================================================================
 %%% BUG-15: No GETDATA_TX_INTERVAL timeout (60 s request expiry)
@@ -911,15 +918,17 @@ w125_dos_eviction_targets_highest_count_peer_test_() ->
              ?assertEqual([{Spammer, 99}],
                           ets:lookup(mempool_orphan_peer_count, Spammer)),
              %% Honest orphan is still in the primary table.
-             ?assertMatch([{HonestW, _, _, Honest}],
+             %% W126: orphan tuple is now {Wtxid, Tx, Expiry, Announcers, Weight}.
+             ?assertMatch([{HonestW, _, _, [Honest], _}],
                           ets:lookup(mempool_orphans, HonestW))
          end]
      end}.
 
-%% Re-inserting the same wtxid is a no-op (first-write-wins announcer
-%% attribution). Without this, a peer could overwrite another's attribution
-%% by re-announcing the same orphan.
-w125_duplicate_wtxid_does_not_overwrite_peer_test_() ->
+%% Re-inserting the same wtxid from a DIFFERENT peer adds that peer as a
+%% new announcer (W126 — Core's TxOrphanage::AddAnnouncer behavior). The
+%% announcer set is a union, not a first-write-wins overwrite.
+%% Re-inserting from the SAME peer is idempotent (no double-count).
+w125_duplicate_wtxid_adds_announcer_test_() ->
     {setup, fun orphan_dos_eviction_setup/0, fun orphan_dos_eviction_cleanup/1,
      fun(_Pid) ->
         [fun() ->
@@ -929,19 +938,257 @@ w125_duplicate_wtxid_does_not_overwrite_peer_test_() ->
              W = crypto:hash(sha256, <<"shared-w">>),
              T = crypto:hash(sha256, <<"shared-t">>),
              beamchain_mempool:add_orphan(Tx, W, T, PeerA),
-             %% PeerA owns the orphan.
+             %% PeerA owns the orphan with a single-element announcer set.
              ?assertEqual([{PeerA, 1}],
                           ets:lookup(mempool_orphan_peer_count, PeerA)),
-             %% PeerB tries to re-announce the same wtxid.
+             ?assertEqual([PeerA], beamchain_mempool:orphan_announcers(W)),
+             %% PeerB announces the same wtxid — joins announcer set.
              beamchain_mempool:add_orphan(Tx, W, T, PeerB),
-             %% Attribution unchanged.
+             ?assertEqual(ordsets:from_list([PeerA, PeerB]),
+                          beamchain_mempool:orphan_announcers(W)),
+             %% Each peer is credited 1 orphan independently.
              ?assertEqual([{PeerA, 1}],
                           ets:lookup(mempool_orphan_peer_count, PeerA)),
-             ?assertEqual([], ets:lookup(mempool_orphan_peer_count, PeerB)),
-             ?assertMatch([{W, _, _, PeerA}],
-                          ets:lookup(mempool_orphans, W))
+             ?assertEqual([{PeerB, 1}],
+                          ets:lookup(mempool_orphan_peer_count, PeerB)),
+             %% Idempotent: PeerA re-announces, no double-count.
+             beamchain_mempool:add_orphan(Tx, W, T, PeerA),
+             ?assertEqual([{PeerA, 1}],
+                          ets:lookup(mempool_orphan_peer_count, PeerA)),
+             ?assertEqual(ordsets:from_list([PeerA, PeerB]),
+                          beamchain_mempool:orphan_announcers(W)),
+             %% Primary table holds one orphan (de-duplicated by wtxid).
+             ?assertEqual(1, ets:info(mempool_orphans, size)),
+             %% By-peer index has one entry per (peer, wtxid) pair = 2.
+             ?assertEqual(2, ets:info(mempool_orphans_by_peer, size))
          end]
      end}.
+
+%%% ===================================================================
+%%% W126 follow-ups: per-peer byte-weight + multi-announcer eviction
+%%% ===================================================================
+%%
+%% These tests exercise the W126 additions on top of W125's per-peer
+%% count-based DoS eviction:
+%%   1. Per-peer byte-weight tracking (mirrors Core's UsageByPeer +
+%%      ReservedPeerUsage = 404000).
+%%   2. Multi-announcer set per orphan: peer disconnect removes only the
+%%      announcer's attribution; the orphan stays for other announcers.
+
+%% Build an orphan tx whose serialized weight will be approximately Target
+%% (BIP-141 weight = 4*non_witness + witness bytes). We pad the script_sig
+%% with NOPs so the caller can dial the weight up without changing the
+%% input/output count. Returns {Tx, Wtxid, Txid}.
+make_weighted_orphan(Tag, TargetWeight) ->
+    %% Each NOP opcode (0x61) adds 1 weight when in script_sig (non-witness x4).
+    %% Start from the baseline empty-script orphan weight and pad up.
+    Base = make_dummy_orphan_tx(Tag),
+    BaseWeight = beamchain_serialize:tx_weight(Base),
+    PadBytes = max(0, (TargetWeight - BaseWeight) div 4),
+    PadScript = binary:copy(<<16#61>>, PadBytes),
+    [Input] = Base#transaction.inputs,
+    PaddedInput = Input#tx_in{script_sig = PadScript},
+    Tx = Base#transaction{inputs = [PaddedInput]},
+    W = crypto:hash(sha256, <<"weighted-w-", Tag:64>>),
+    T = crypto:hash(sha256, <<"weighted-t-", Tag:64>>),
+    {Tx, W, T}.
+
+w126_per_peer_weight_tracked_test_() ->
+    {setup, fun orphan_dos_eviction_setup/0, fun orphan_dos_eviction_cleanup/1,
+     fun(_Pid) ->
+        [fun() ->
+             PeerA = {peer, a},
+             PeerB = {peer, b},
+             {Tx1, W1, T1} = make_weighted_orphan(101, 1000),
+             {Tx2, W2, T2} = make_weighted_orphan(102, 2000),
+             {Tx3, W3, T3} = make_weighted_orphan(103, 500),
+             beamchain_mempool:add_orphan(Tx1, W1, T1, PeerA),
+             beamchain_mempool:add_orphan(Tx2, W2, T2, PeerA),
+             beamchain_mempool:add_orphan(Tx3, W3, T3, PeerB),
+             %% Per-peer weight = sum of orphan weights credited to peer.
+             %% Use actual tx_weight values rather than the padded targets
+             %% (padding overshoots slightly because of varint encoding).
+             ExpectedA = beamchain_serialize:tx_weight(Tx1)
+                       + beamchain_serialize:tx_weight(Tx2),
+             ExpectedB = beamchain_serialize:tx_weight(Tx3),
+             ?assertEqual(ExpectedA,
+                          beamchain_mempool:orphan_weight_for_peer(PeerA)),
+             ?assertEqual(ExpectedB,
+                          beamchain_mempool:orphan_weight_for_peer(PeerB)),
+             %% Removing PeerA on disconnect returns the credit to 0.
+             beamchain_mempool:erase_orphans_for_peer(PeerA),
+             ?assertEqual(0, beamchain_mempool:orphan_weight_for_peer(PeerA)),
+             %% PeerB's credit unaffected.
+             ?assertEqual(ExpectedB,
+                          beamchain_mempool:orphan_weight_for_peer(PeerB))
+         end]
+     end}.
+
+%% A peer that exceeds ORPHAN_RESERVED_WEIGHT_PER_PEER (404000) is targeted
+%% for eviction BEFORE a peer with more orphans by count but lower weight.
+%% This is the byte-axis DoS scenario: spammer pins large orphans, honest
+%% peer holds many small ones.
+w126_weight_axis_evicts_heaviest_peer_test_() ->
+    {setup, fun orphan_dos_eviction_setup/0, fun orphan_dos_eviction_cleanup/1,
+     fun(_Pid) ->
+        [fun() ->
+             Heavy = {peer, heavy},
+             Many  = {peer, many},
+             %% Heavy peer: 2 huge orphans (~250k weight each) → ~500k > 404k.
+             {HTx1, HW1, HT1} = make_weighted_orphan(201, 250000),
+             {HTx2, HW2, HT2} = make_weighted_orphan(202, 250000),
+             beamchain_mempool:add_orphan(HTx1, HW1, HT1, Heavy),
+             beamchain_mempool:add_orphan(HTx2, HW2, HT2, Heavy),
+             %% Confirm Heavy is over the per-peer reserved weight.
+             ?assert(beamchain_mempool:orphan_weight_for_peer(Heavy) > 404000),
+             %% Many peer: lots of small orphans by count (10), low weight.
+             lists:foreach(
+               fun(I) ->
+                       Tag = 300 + I,
+                       Tx = make_dummy_orphan_tx(Tag),
+                       W = crypto:hash(sha256, <<Tag:64, "w">>),
+                       T = crypto:hash(sha256, <<Tag:64, "t">>),
+                       beamchain_mempool:add_orphan(Tx, W, T, Many)
+               end, lists:seq(1, 10)),
+             %% Many has more orphans by count, but is well under 404k weight.
+             ?assert(beamchain_mempool:orphan_count_for_peer(Many) >
+                     beamchain_mempool:orphan_count_for_peer(Heavy)),
+             ?assert(beamchain_mempool:orphan_weight_for_peer(Many) < 404000),
+             %% At total 12 orphans we're well under the count cap; force
+             %% an eviction by directly invoking the policy path (via the
+             %% test-stress route: fill to cap and add one more).
+             %% Pad with synthetic orphans up to MAX_ORPHAN_TXS - 1.
+             insert_n_orphans({peer, filler}, 9000, 100 - 12),
+             ?assertEqual(100, ets:info(mempool_orphans, size)),
+             %% Trigger eviction with one more insert from a new peer.
+             TriggerTx = make_dummy_orphan_tx(9999),
+             TW = crypto:hash(sha256, <<"trigger-w">>),
+             TT = crypto:hash(sha256, <<"trigger-t">>),
+             beamchain_mempool:add_orphan(TriggerTx, TW, TT, {peer, trigger}),
+             %% After eviction, Heavy (the over-weight peer) must have lost
+             %% one orphan — NOT Many or filler, even though filler has the
+             %% highest count.
+             ?assertEqual(1, beamchain_mempool:orphan_count_for_peer(Heavy)),
+             %% Many's count is untouched.
+             ?assertEqual(10, beamchain_mempool:orphan_count_for_peer(Many))
+         end]
+     end}.
+
+%% Disconnecting a peer that ALSO has another peer announcing the same
+%% orphan must NOT remove the orphan — it only removes that peer's
+%% announcer attribution. The orphan stays for the surviving announcer.
+w126_disconnect_preserves_orphan_with_other_announcers_test_() ->
+    {setup, fun orphan_dos_eviction_setup/0, fun orphan_dos_eviction_cleanup/1,
+     fun(_Pid) ->
+        [fun() ->
+             PeerA = {peer, dis_a},
+             PeerB = {peer, dis_b},
+             PeerC = {peer, dis_c},
+             %% Orphan announced by all three peers.
+             Tx = make_dummy_orphan_tx(401),
+             W = crypto:hash(sha256, <<"shared-orphan-w">>),
+             T = crypto:hash(sha256, <<"shared-orphan-t">>),
+             beamchain_mempool:add_orphan(Tx, W, T, PeerA),
+             beamchain_mempool:add_orphan(Tx, W, T, PeerB),
+             beamchain_mempool:add_orphan(Tx, W, T, PeerC),
+             ?assertEqual(1, ets:info(mempool_orphans, size)),
+             ?assertEqual(ordsets:from_list([PeerA, PeerB, PeerC]),
+                          beamchain_mempool:orphan_announcers(W)),
+             %% Disconnect PeerA — orphan stays, only PeerA's announcement
+             %% removed.
+             beamchain_mempool:erase_orphans_for_peer(PeerA),
+             ?assertEqual(1, ets:info(mempool_orphans, size)),
+             ?assertEqual(ordsets:from_list([PeerB, PeerC]),
+                          beamchain_mempool:orphan_announcers(W)),
+             ?assertEqual(0, beamchain_mempool:orphan_count_for_peer(PeerA)),
+             %% Disconnect PeerB — orphan still stays for PeerC.
+             beamchain_mempool:erase_orphans_for_peer(PeerB),
+             ?assertEqual(1, ets:info(mempool_orphans, size)),
+             ?assertEqual([PeerC],
+                          beamchain_mempool:orphan_announcers(W)),
+             %% Disconnect PeerC — last announcer gone, orphan now removed.
+             beamchain_mempool:erase_orphans_for_peer(PeerC),
+             ?assertEqual(0, ets:info(mempool_orphans, size)),
+             %% By-peer index also fully drained.
+             ?assertEqual(0, ets:info(mempool_orphans_by_peer, size))
+         end]
+     end}.
+
+%% DoS-eviction picking an orphan announced by multiple peers must only
+%% drop the targeted peer's announcement, not the whole orphan. The
+%% other announcers' attribution stays intact.
+w126_dos_eviction_drops_only_targeted_announcer_test_() ->
+    {setup, fun orphan_dos_eviction_setup/0, fun orphan_dos_eviction_cleanup/1,
+     fun(_Pid) ->
+        [fun() ->
+             Spammer = {peer, w126_spammer},
+             Honest  = {peer, w126_honest},
+             %% Fill 99 spammer orphans first.
+             insert_n_orphans(Spammer, 5000, 99),
+             %% 100th orphan: jointly announced by Spammer + Honest.
+             SharedTx = make_dummy_orphan_tx(9100),
+             SW = crypto:hash(sha256, <<"shared-100-w">>),
+             ST = crypto:hash(sha256, <<"shared-100-t">>),
+             beamchain_mempool:add_orphan(SharedTx, SW, ST, Spammer),
+             beamchain_mempool:add_orphan(SharedTx, SW, ST, Honest),
+             ?assertEqual(100, ets:info(mempool_orphans, size)),
+             ?assertEqual(100,
+                          beamchain_mempool:orphan_count_for_peer(Spammer)),
+             ?assertEqual(1,
+                          beamchain_mempool:orphan_count_for_peer(Honest)),
+             %% At cap; insert a 101st orphan from a new peer to trigger
+             %% Spammer (highest count) eviction. The random pick MIGHT
+             %% land on the shared orphan — if so, only the spammer's
+             %% announcement should be dropped, not the whole orphan.
+             %% Run the test in a loop until we hit the shared orphan to
+             %% exercise the multi-announcer eviction path deterministically.
+             ok = force_shared_orphan_eviction(Spammer, SW, 500),
+             %% After hitting the shared orphan: orphan still in pool
+             %% (Honest still announces it), but Spammer's announcement
+             %% gone. Honest's count unchanged at 1.
+             ?assertEqual(1,
+                          beamchain_mempool:orphan_count_for_peer(Honest)),
+             %% Shared orphan's announcer set no longer contains Spammer.
+             Announcers = beamchain_mempool:orphan_announcers(SW),
+             ?assertNot(ordsets:is_element(Spammer, Announcers)),
+             ?assert(ordsets:is_element(Honest, Announcers))
+         end]
+     end}.
+
+%% Helper: re-trigger evictions from the spammer until the shared orphan
+%% has been targeted by the random pick (its spammer-side announcer
+%% removed). Each attempt adds an at-cap orphan from a fresh throwaway
+%% peer — that forces evict_one_dos_orphan/0 to pick the current
+%% highest-count peer (the spammer, until we drain it). After the cap
+%% trim, the throwaway also lands in the pool (size stays at MAX_ORPHAN_TXS).
+%% Subsequent calls keep adding more throwaway peers; spammer's count
+%% drops by 1 per attempt because each cap-trim picks a random spammer
+%% orphan (the shared one is in spammer's set so each pick has
+%% probability 1/spammer_count of being the shared orphan).
+%% Bounded by MaxAttempts to avoid an infinite loop on a stuck rand seed.
+%% Expected attempts to hit a 1-in-100 target: ~70 for >50% probability;
+%% we allow 500 to be conservative on the binomial tail.
+force_shared_orphan_eviction(Spammer, SharedW, MaxAttempts) when MaxAttempts > 0 ->
+    case ordsets:is_element(Spammer,
+                            beamchain_mempool:orphan_announcers(SharedW)) of
+        false ->
+            ok;  %% Spammer's announcement was dropped — done.
+        true ->
+            Tag = 50000 + MaxAttempts,
+            Tx = make_dummy_orphan_tx(Tag),
+            W = crypto:hash(sha256, <<"force-", Tag:64, "-w">>),
+            T = crypto:hash(sha256, <<"force-", Tag:64, "-t">>),
+            beamchain_mempool:add_orphan(Tx, W, T, {peer, {force, Tag}}),
+            force_shared_orphan_eviction(Spammer, SharedW, MaxAttempts - 1)
+    end;
+force_shared_orphan_eviction(_Spammer, _SharedW, 0) ->
+    %% Eviction never hit the shared orphan in MaxAttempts cap-trims.
+    %% With each attempt picking uniformly from the spammer's orphans,
+    %% missing the shared orphan 500 times in a row has probability
+    %% bounded above by (1-1/100)^500 ≈ 0.0066. Hitting this floor signals
+    %% an rng catastrophe or a bug in evict_random_orphan_from_peer/1.
+    ?assert(false, "force_shared_orphan_eviction exhausted MaxAttempts"),
+    ok.
 
 %% Helper: insert N synthetic orphans attributed to PeerId. TagBase is the
 %% prefix for unique tx tags so different peers can't collide on wtxid.
