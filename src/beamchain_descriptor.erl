@@ -1212,25 +1212,90 @@ decode_xkey(Str) ->
                 true ->
                     <<Version:4/binary, Depth:8, Fingerprint:4/binary,
                       ChildIndex:32/big, ChainCode:32/binary, KeyData:33/binary>> = Data,
-                    case Version of
-                        <<16#04, 16#88, 16#b2, 16#1e>> -> %% xpub
-                            {ok, pub, KeyData, ChainCode, Depth, Fingerprint, ChildIndex};
-                        <<16#04, 16#88, 16#ad, 16#e4>> -> %% xprv
-                            <<0, PrivKey:32/binary>> = KeyData,
-                            {ok, priv, PrivKey, ChainCode, Depth, Fingerprint, ChildIndex};
-                        <<16#04, 16#35, 16#87, 16#cf>> -> %% tpub
-                            {ok, pub, KeyData, ChainCode, Depth, Fingerprint, ChildIndex};
-                        <<16#04, 16#35, 16#83, 16#94>> -> %% tprv
-                            <<0, PrivKey:32/binary>> = KeyData,
-                            {ok, priv, PrivKey, ChainCode, Depth, Fingerprint, ChildIndex};
-                        _ ->
-                            {error, unknown_xkey_version}
-                    end
+                    decode_xkey_body(Version, Depth, Fingerprint, ChildIndex,
+                                     ChainCode, KeyData)
             end;
         {ok, _} ->
             {error, invalid_xkey_length};
         {error, _} = Err ->
             Err
+    end.
+
+%% BIP-32 §"Serialization format" + Bitcoin Core CExtKey::Decode parity:
+%% reject malformed xpub/xprv strings (BIP-32 test vector #5) instead of
+%% letting binary pattern-match crash. Validates: known version bytes,
+%% structural sanity (depth=0 ⇒ parent fingerprint=0000 and child_index=0,
+%% per Core's `pubkey.cpp:CExtPubKey::Decode` lines 235-243), and per-
+%% variant key-data prefix (xprv first byte MUST be 0x00; xpub first byte
+%% MUST be 0x02 or 0x03 for a compressed secp256k1 point).
+decode_xkey_body(Version, Depth, Fingerprint, ChildIndex, ChainCode, KeyData) ->
+    case classify_xkey_version(Version) of
+        unknown ->
+            {error, unknown_xkey_version};
+        {pub, _Net} ->
+            case validate_xkey_structure(Depth, Fingerprint, ChildIndex) of
+                ok ->
+                    case validate_xpub_keydata(KeyData) of
+                        ok -> {ok, pub, KeyData, ChainCode, Depth, Fingerprint, ChildIndex};
+                        {error, _} = E -> E
+                    end;
+                {error, _} = E -> E
+            end;
+        {priv, _Net} ->
+            case validate_xkey_structure(Depth, Fingerprint, ChildIndex) of
+                ok ->
+                    case KeyData of
+                        <<0, PrivKey:32/binary>> ->
+                            case validate_xprv_keydata(PrivKey) of
+                                ok ->
+                                    {ok, priv, PrivKey, ChainCode,
+                                     Depth, Fingerprint, ChildIndex};
+                                {error, _} = E -> E
+                            end;
+                        _ ->
+                            {error, invalid_xprv_prefix}
+                    end;
+                {error, _} = E -> E
+            end
+    end.
+
+classify_xkey_version(<<16#04, 16#88, 16#b2, 16#1e>>) -> {pub, mainnet};
+classify_xkey_version(<<16#04, 16#88, 16#ad, 16#e4>>) -> {priv, mainnet};
+classify_xkey_version(<<16#04, 16#35, 16#87, 16#cf>>) -> {pub, testnet};
+classify_xkey_version(<<16#04, 16#35, 16#83, 16#94>>) -> {priv, testnet};
+classify_xkey_version(_) -> unknown.
+
+%% Core CExtPubKey::Decode (pubkey.cpp:235-243): depth=0 master keys MUST
+%% have zeroed parent-fingerprint and child_index. Non-zero values at
+%% depth=0 indicate forged / corrupted serialization.
+validate_xkey_structure(0, <<0,0,0,0>>, 0) -> ok;
+validate_xkey_structure(0, _, _) -> {error, invalid_master_metadata};
+validate_xkey_structure(_, _, _) -> ok.
+
+%% Compressed secp256k1 pubkey prefix must be 0x02 or 0x03 (BIP-32 xpubs
+%% are always compressed). Anything else — including the 0x00 leading-zero
+%% byte that appears in BIP-32 test vector #5 invalid strings — is malformed.
+%% Beyond the prefix check we ALSO run a curve-point parse via libsecp's
+%% `secp256k1_ec_pubkey_tweak_add` (zero tweak ⇒ no-op but performs full
+%% parse + range check), mirroring Core `CExtPubKey::Decode`'s implicit
+%% `CPubKey::IsValid()` check.
+validate_xpub_keydata(<<Prefix, _:32/binary>> = PubKey)
+  when Prefix =:= 16#02; Prefix =:= 16#03 ->
+    case beamchain_crypto:pubkey_tweak_add(PubKey, <<0:256>>) of
+        {ok, _} -> ok;
+        {error, _} -> {error, invalid_xpub_point}
+    end;
+validate_xpub_keydata(_) ->
+    {error, invalid_xpub_prefix}.
+
+%% BIP-32 §"Serialization format": private key body MUST satisfy
+%% 0 < k < n. Validate by attempting an identity tweak — libsecp's
+%% `secp256k1_ec_seckey_tweak_add` runs `secp256k1_ec_seckey_verify`
+%% which rejects k=0 and k>=n.
+validate_xprv_keydata(PrivKey) when byte_size(PrivKey) =:= 32 ->
+    case beamchain_crypto:seckey_tweak_add(PrivKey, <<0:256>>) of
+        {ok, _} -> ok;
+        {error, _} -> {error, invalid_xprv_scalar}
     end.
 
 %% Decode base58 string to raw bytes (no version/checksum handling)
