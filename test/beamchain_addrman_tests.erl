@@ -51,12 +51,14 @@ bucket_determinism_test_() ->
         fun(_Setup) ->
             [
                 fun() ->
-                    %% Same address+source should always get same bucket
+                    %% Same address+source should always get same bucket.
+                    %% Pre-2026-04 tests used 192.168.x and 10.x.x.x — both
+                    %% now rejected by addrman as non-routable (BUG-2 fix
+                    %% mirroring Core addrman.cpp AddSingle()). Switch to
+                    %% public-IP addresses outside RFC 1918 / RFC 6598 / RFC 5737.
                     _Secret = beamchain_addrman:get_secret(),
-                    Addr1 = {{192, 168, 1, 1}, 8333},
-
-                    %% Add the address
-                    beamchain_addrman:add_address(Addr1, 0, {{10, 0, 0, 1}, 8333}),
+                    Addr1 = {{8, 8, 8, 1}, 8333},
+                    beamchain_addrman:add_address(Addr1, 0, {{1, 1, 1, 1}, 8333}),
                     timer:sleep(50),  %% Let cast process
 
                     {NewCount, _} = beamchain_addrman:count(),
@@ -80,7 +82,8 @@ add_and_select_test_() ->
                 end},
 
                 {"Adding address makes it selectable", fun() ->
-                    Addr = {{192, 168, 1, 100}, 8333},
+                    %% Use a routable IP (was 192.168.1.100, RFC 1918 → dropped).
+                    Addr = {{8, 8, 8, 100}, 8333},
                     beamchain_addrman:add_address(Addr, 0, dns),
                     timer:sleep(50),
 
@@ -109,7 +112,8 @@ mark_tried_test_() ->
         fun(_Setup) ->
             [
                 fun() ->
-                    Addr = {{10, 20, 30, 40}, 8333},
+                    %% Use a routable IP (was 10.20.30.40, RFC 1918 → dropped).
+                    Addr = {{20, 30, 40, 50}, 8333},
 
                     %% Add to new table
                     beamchain_addrman:add_address(Addr, 0, dns),
@@ -206,14 +210,16 @@ get_addresses_test_() ->
                 fun() ->
                     %% Add 10 addresses from 10 distinct /16 netgroups so
                     %% each lands in a different new-table bucket regardless
-                    %% of the random secret.  Using addresses all in the same
-                    %% /16 (e.g. 10.0.0.x) can cause two to hash to the same
-                    %% slot and one is silently dropped, making the count
-                    %% non-deterministic.
+                    %% of the random secret.  Avoid any /8 that is_routable/2
+                    %% rejects: 0,10,100,127,172 (with 2nd in 16..31), 169,192
+                    %% (with 2nd =:= 168), 198 (with 2nd in 18,19,51), 203
+                    %% (with 2nd =:= 0 and 3rd =:= 113).  Pick 10 first
+                    %% octets that are all clearly routable.
+                    Firsts = [11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
                     lists:foreach(fun(I) ->
                         Addr = {{I, I, 0, 1}, 8333},
                         beamchain_addrman:add_address(Addr, 0, dns)
-                    end, lists:seq(1, 10)),
+                    end, Firsts),
                     timer:sleep(100),
 
                     %% Request 5

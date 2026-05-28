@@ -270,8 +270,16 @@ run_analyzepsbt(PsbtB64) ->
     %% Cowboy uses by hand-rolling the request → handle_method shape.
     %% The helper is exported only for test-mode; in production the
     %% method goes through the auth + JSON layer.
+    %%
+    %% Pattern Y / sentinel-numerics refactor (see beamchain_rpc.erl around
+    %% the BTC-amount sentinel helpers): rpc_analyzepsbt now returns
+    %% {ok_raw_json, Bin} so jsx-encoded BTC amounts bypass float re-encode.
+    %% Decode here so test cases continue to assert against a map.
     case erlang:apply(beamchain_rpc, rpc_analyzepsbt, [[PsbtB64]]) of
-        Result -> Result
+        {ok_raw_json, JsonBin} when is_binary(JsonBin) ->
+            {ok, jsx:decode(JsonBin, [return_maps])};
+        Other ->
+            Other
     end.
 
 %% Register/unregister the test wallet under the production registered
