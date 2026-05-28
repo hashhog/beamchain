@@ -632,10 +632,12 @@ g23_bip32_hardened_test_() ->
          "BIP-32.",
          fun() ->
              Src = read_src(descriptor_src()),
+             %% W161 BUG-2 fix renamed Index → CurIndex inside the retry
+             %% helper; the hardened-branch shape is otherwise unchanged.
              ?assert(string:find(Src,
-                       "Data = case Index >= ?HARDENED of") =/= nomatch),
+                       "Data = case CurIndex >= ?HARDENED of") =/= nomatch),
              ?assert(string:find(Src,
-                       "<<0, PrivKey/binary, Index:32/big>>") =/= nomatch)
+                       "<<0, PrivKey/binary, CurIndex:32/big>>") =/= nomatch)
          end}
     ].
 

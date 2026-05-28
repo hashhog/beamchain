@@ -64,6 +64,57 @@ bip32_test_vector_2_test() ->
     ?assertEqual(ExpPriv, element(2, Master)).
 
 %%% -------------------------------------------------------------------
+%%% BIP-32 Test Vector 5 — Invalid xprv/xpub strings MUST be rejected.
+%%% Mirrors Bitcoin Core's `bip32_tests.cpp::bip32_test5` (TEST5 list at
+%%% src/test/bip32_tests.cpp:104). Each string is malformed for one of:
+%%%   - pubkey body starts with 0x00 (not a valid compressed pubkey prefix)
+%%%   - prvkey body starts with non-zero byte (BIP-32 mandates 0x00)
+%%%   - non-zero parent fingerprint at depth=0
+%%%   - non-zero child_index at depth=0
+%%%   - unknown version bytes
+%%%   - bad base58 checksum
+%%% Pre-W161-fix the decoder hard-pattern-matched the prvkey prefix and
+%%% crashed with `badmatch` on most of these. Post-fix it returns a
+%%% well-typed `{error, _}` for every entry — same contract as
+%%% Core's `!DecodeExtKey().key.IsValid()`.
+%%% -------------------------------------------------------------------
+-define(BIP32_TEST5_INVALID, [
+    "xpub661MyMwAqRbcEYS8w7XLSVeEsBXy79zSzH1J8vCdxAZningWLdN3zgtU6LBpB85b3D2yc8sfvZU521AAwdZafEz7mnzBBsz4wKY5fTtTQBm",
+    "xprv9s21ZrQH143K24Mfq5zL5MhWK9hUhhGbd45hLXo2Pq2oqzMMo63oStZzFGTQQD3dC4H2D5GBj7vWvSQaaBv5cxi9gafk7NF3pnBju6dwKvH",
+    "xpub661MyMwAqRbcEYS8w7XLSVeEsBXy79zSzH1J8vCdxAZningWLdN3zgtU6Txnt3siSujt9RCVYsx4qHZGc62TG4McvMGcAUjeuwZdduYEvFn",
+    "xprv9s21ZrQH143K24Mfq5zL5MhWK9hUhhGbd45hLXo2Pq2oqzMMo63oStZzFGpWnsj83BHtEy5Zt8CcDr1UiRXuWCmTQLxEK9vbz5gPstX92JQ",
+    "xpub661MyMwAqRbcEYS8w7XLSVeEsBXy79zSzH1J8vCdxAZningWLdN3zgtU6N8ZMMXctdiCjxTNq964yKkwrkBJJwpzZS4HS2fxvyYUA4q2Xe4",
+    "xprv9s21ZrQH143K24Mfq5zL5MhWK9hUhhGbd45hLXo2Pq2oqzMMo63oStZzFAzHGBP2UuGCqWLTAPLcMtD9y5gkZ6Eq3Rjuahrv17fEQ3Qen6J",
+    "xprv9s2SPatNQ9Vc6GTbVMFPFo7jsaZySyzk7L8n2uqKXJen3KUmvQNTuLh3fhZMBoG3G4ZW1N2kZuHEPY53qmbZzCHshoQnNf4GvELZfqTUrcv",
+    "xpub661no6RGEX3uJkY4bNnPcw4URcQTrSibUZ4NqJEw5eBkv7ovTwgiT91XX27VbEXGENhYRCf7hyEbWrR3FewATdCEebj6znwMfQkhRYHRLpJ",
+    "xprv9s21ZrQH4r4TsiLvyLXqM9P7k1K3EYhA1kkD6xuquB5i39AU8KF42acDyL3qsDbU9NmZn6MsGSUYZEsuoePmjzsB3eFKSUEh3Gu1N3cqVUN",
+    "xpub661MyMwAuDcm6CRQ5N4qiHKrJ39Xe1R1NyfouMKTTWcguwVcfrZJaNvhpebzGerh7gucBvzEQWRugZDuDXjNDRmXzSZe4c7mnTK97pTvGS8",
+    "DMwo58pR1QLEFihHiXPVykYB6fJmsTeHvyTp7hRThAtCX8CvYzgPcn8XnmdfHGMQzT7ayAmfo4z3gY5KfbrZWZ6St24UVf2Qgo6oujFktLHdHY4",
+    "DMwo58pR1QLEFihHiXPVykYB6fJmsTeHvyTp7hRThAtCX8CvYzgPcn8XnmdfHPmHJiEDXkTiJTVV9rHEBUem2mwVbbNfvT2MTcAqj3nesx8uBf9",
+    "xprv9s21ZrQH143K24Mfq5zL5MhWK9hUhhGbd45hLXo2Pq2oqzMMo63oStZzF93Y5wvzdUayhgkkFoicQZcP3y52uPPxFnfoLZB21Teqt1VvEHx",
+    "xprv9s21ZrQH143K24Mfq5zL5MhWK9hUhhGbd45hLXo2Pq2oqzMMo63oStZzFAzHGBP2UuGCqWLTAPLcMtD5SDKr24z3aiUvKr9bJpdrcLg1y3G",
+    "xpub661MyMwAqRbcEYS8w7XLSVeEsBXy79zSzH1J8vCdxAZningWLdN3zgtU6Q5JXayek4PRsn35jii4veMimro1xefsM58PgBMrvdYre8QyULY",
+    "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHL"
+]).
+
+bip32_test_vector_5_invalid_xpub_rejected_test_() ->
+    [ {"xpub reject: " ++ string:slice(S, 0, 16),
+       fun() ->
+           Result = (catch beamchain_descriptor:decode_xpub(S)),
+           %% Must be a well-typed {error, _} — NOT a crash, NOT an {ok, _}.
+           ?assertMatch({error, _}, Result)
+       end}
+     || S <- ?BIP32_TEST5_INVALID ].
+
+bip32_test_vector_5_invalid_xprv_rejected_test_() ->
+    [ {"xprv reject: " ++ string:slice(S, 0, 16),
+       fun() ->
+           Result = (catch beamchain_descriptor:decode_xprv(S)),
+           ?assertMatch({error, _}, Result)
+       end}
+     || S <- ?BIP32_TEST5_INVALID ].
+
+%%% -------------------------------------------------------------------
 %%% Path parsing tests
 %%% -------------------------------------------------------------------
 
