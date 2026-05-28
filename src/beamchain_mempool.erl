@@ -38,7 +38,10 @@
 -export([erase_orphans_for_block/1, erase_orphans_for_peer/1]).
 %% W125: add_orphan/4 + orphan_count_for_peer/1 exported for unit tests of
 %% the per-peer DoS-score eviction policy (not part of the public API).
--export([add_orphan/4, orphan_count_for_peer/1]).
+%% W126: orphan_weight_for_peer/1 + orphan_announcers/1 exported for tests
+%% of the byte-weight accounting + multi-announcer set additions.
+-export([add_orphan/4, orphan_count_for_peer/1,
+         orphan_weight_for_peer/1, orphan_announcers/1]).
 
 %% Maintenance
 -export([trim_to_size/1, expire_old/0]).
@@ -107,6 +110,18 @@
 -define(DUST_RELAY_TX_FEE, 3000).          % 3000 sat/kvB for dust calc
 -define(MAX_ORPHAN_TXS, 100).
 -define(ORPHAN_TX_EXPIRE_TIME, 1200).      % 20 minutes
+%% Per-peer reserved orphan weight (mirrors Core's
+%% DEFAULT_RESERVED_ORPHAN_WEIGHT_PER_PEER = 404'000 in
+%% bitcoin-core/src/node/txorphanage.h:20). A peer that holds more than
+%% this many bytes (BIP-141 tx_weight) of orphans is considered to have
+%% exceeded its share and becomes the preferred eviction target — Core's
+%% ReservedPeerUsage. The count cap (MAX_ORPHAN_TXS) is unchanged; weight
+%% is an additional axis, so a peer hitting EITHER limit qualifies as
+%% "worst peer" for eviction. 404000 == 4 * 101000 = 4 max-weight
+%% standard transactions (MAX_STANDARD_TX_WEIGHT). Smaller orphans let a
+%% peer hold many before triggering the weight gate; larger orphans
+%% trigger the gate at fewer items.
+-define(ORPHAN_RESERVED_WEIGHT_PER_PEER, 404000).
 %% MAX_RBF_EVICTIONS = 100 is now in beamchain_protocol.hrl as ?MAX_RBF_EVICTIONS.
 %% Cluster limits — mirrors Bitcoin Core policy/policy.h:72-74 (DEFAULT_CLUSTER_LIMIT=64,
 %% DEFAULT_CLUSTER_SIZE_LIMIT_KVB=101).
@@ -122,13 +137,24 @@
 -define(MEMPOOL_TXS, mempool_txs).           %% txid -> mempool_entry
 -define(MEMPOOL_BY_FEE, mempool_by_fee).     %% ordered {fee_rate, txid}
 -define(MEMPOOL_OUTPOINTS, mempool_outpoints). %% {txid, vout} -> spending_txid
--define(MEMPOOL_ORPHANS, mempool_orphans).         %% wtxid -> {tx, expiry, peer_id}  (BIP-339 primary key)
+-define(MEMPOOL_ORPHANS, mempool_orphans).         %% wtxid -> {tx, expiry, announcers, weight}  (BIP-339 primary key)
 -define(MEMPOOL_ORPHAN_BY_TXID, mempool_orphan_by_txid). %% txid -> wtxid  (secondary index)
-%% Per-peer DoS eviction (W125 — mirrors Core TxOrphanage::PeerOrphanInfo).
-%%  ORPHAN_PEER_COUNT: peer_id -> non_neg_integer() — fast O(1) DoS-score lookup.
-%%  ORPHANS_BY_PEER:   ordered_set keyed by {peer_id, wtxid} so we can scan one
-%%                     peer's orphans in O(k) on disconnect or random-evict.
+%% Per-peer DoS eviction (W125 + W126 — mirrors Core TxOrphanage::PeerOrphanInfo).
+%%  ORPHAN_PEER_COUNT:  peer_id -> non_neg_integer() — fast O(1) count lookup.
+%%  ORPHAN_PEER_WEIGHT: peer_id -> non_neg_integer() — total tx_weight of this
+%%                      peer's orphans (Core's UsageByPeer); compared to
+%%                      ORPHAN_RESERVED_WEIGHT_PER_PEER (Core's ReservedPeerUsage).
+%%  ORPHANS_BY_PEER:    ordered_set keyed by {peer_id, wtxid} so we can scan one
+%%                      peer's orphans in O(k) on disconnect or random-evict.
+%%
+%% W126 (today): orphan record's 3rd field is now an ordsets:ordset(peer_id())
+%% (Core's std::set<NodeId> announcers). A single orphan may be announced by
+%% multiple peers; the by-peer index has one entry per (peer, wtxid) pair, and
+%% the count/weight tables credit each announcer for the same orphan
+%% independently (mirrors Core's per-peer accounting where the same orphan
+%% contributes to every announcer's UsageByPeer).
 -define(MEMPOOL_ORPHAN_PEER_COUNT, mempool_orphan_peer_count).
+-define(MEMPOOL_ORPHAN_PEER_WEIGHT, mempool_orphan_peer_weight).
 -define(MEMPOOL_ORPHANS_BY_PEER, mempool_orphans_by_peer).
 
 %% Sentinel peer-id for orphans that arrived without a P2P attribution
@@ -451,6 +477,7 @@ init([]) ->
     ets:new(?MEMPOOL_ORPHANS, [set, public, named_table]),
     ets:new(?MEMPOOL_ORPHAN_BY_TXID, [set, public, named_table]),
     ets:new(?MEMPOOL_ORPHAN_PEER_COUNT, [set, public, named_table]),
+    ets:new(?MEMPOOL_ORPHAN_PEER_WEIGHT, [set, public, named_table]),
     ets:new(?MEMPOOL_ORPHANS_BY_PEER, [ordered_set, public, named_table]),
     ets:new(?MEMPOOL_CLUSTERS, [set, public, named_table,
                                  {read_concurrency, true}]),
@@ -2658,58 +2685,174 @@ get_ancestors_loop([Txid | Rest], Visited, Acc) ->
 %% kept so reprocess_orphans/1 can resolve children by their input prev_out hash
 %% (which is the parent's txid, not wtxid).
 %%
-%% W125 (today): each orphan now carries a PeerId so eviction can blame the
+%% W125 (yesterday): each orphan carries a PeerId so eviction can blame the
 %% peer that delivered it (Core's per-peer DoS-score policy — see
 %% bitcoin-core/src/node/txorphanage.cpp LimitOrphans / EraseForPeer).
 %% PeerId of ?ORPHAN_LOCAL_PEER means the orphan came from RPC / mempool.dat
 %% reload (no P2P attribution available).
+%%
+%% W126 (today, this commit): two follow-ups land —
+%%   1. The single PeerId field is replaced by an ordsets:ordset(peer_id())
+%%      (Core's std::set<NodeId> announcers). A repeat add_orphan/4 with the
+%%      same Wtxid + a different peer now UNIONS the new peer into the set
+%%      instead of being a no-op. On peer disconnect (erase_orphans_for_peer)
+%%      we remove that single peer from each orphan's set; only when the set
+%%      becomes empty is the orphan itself evicted.
+%%   2. The eviction heuristic considers byte-weight (BIP-141 tx_weight) in
+%%      addition to count. A new per-peer weight ETS table tracks the sum
+%%      of orphan weights credited to each peer (each announcer gets credit
+%%      for the orphan, mirroring Core's UsageByPeer accounting). A peer
+%%      that exceeds ORPHAN_RESERVED_WEIGHT_PER_PEER (Core's
+%%      ReservedPeerUsage = 404000) is targeted for eviction BEFORE any
+%%      peer that exceeds only the count axis — even if the over-weight
+%%      peer holds fewer orphans by count, they're holding more bytes.
 add_orphan(Tx, Wtxid, Txid, PeerId) ->
-    %% If the wtxid is already in the pool, do not re-insert — keep the
-    %% original announcer attribution (matches Core's first-write-wins
-    %% AddTx semantic; subsequent AddAnnouncer is a separate API beamchain
-    %% doesn't expose yet).
-    case ets:member(?MEMPOOL_ORPHANS, Wtxid) of
-        true ->
-            ok;
-        false ->
-            OrphanCount = ets:info(?MEMPOOL_ORPHANS, size),
-            case OrphanCount >= ?MAX_ORPHAN_TXS of
+    case ets:lookup(?MEMPOOL_ORPHANS, Wtxid) of
+        [{Wtxid, ExistingTx, Expiry, Announcers, Weight}] ->
+            %% Same wtxid already in the pool — add the new peer as an
+            %% announcer (Core's TxOrphanage::AddAnnouncer semantic). If
+            %% the peer was already an announcer (or is ourself re-adding
+            %% the same orphan), this is idempotent.
+            case ordsets:is_element(PeerId, Announcers) of
                 true ->
-                    %% At cap — find the highest-DoS-score peer and evict
-                    %% a random orphan from them.  Selecting BEFORE we add
-                    %% the new orphan means the new orphan is not a
-                    %% candidate for its own eviction (matches Core's
-                    %% NeedsTrim/LimitOrphans order in AddTx).
-                    evict_one_dos_orphan();
+                    ok;
                 false ->
-                    ok
-            end,
+                    NewAnnouncers = ordsets:add_element(PeerId, Announcers),
+                    ets:insert(?MEMPOOL_ORPHANS,
+                               {Wtxid, ExistingTx, Expiry, NewAnnouncers, Weight}),
+                    ets:insert(?MEMPOOL_ORPHANS_BY_PEER, {{PeerId, Wtxid}, true}),
+                    credit_peer(PeerId, Weight),
+                    logger:debug("mempool: added announcer peer=~p to orphan wtxid=~s (~B announcers, ~B weight from peer)",
+                                 [PeerId, short_hex(Wtxid),
+                                  ordsets:size(NewAnnouncers),
+                                  orphan_weight_for_peer(PeerId)])
+            end;
+        [] ->
+            %% At cap — find the highest-DoS-score peer and evict orphans
+            %% until we're below cap.  We loop because under W126
+            %% multi-announcer semantics, a single pick may only drop an
+            %% announcer (orphan stays for other peers) without freeing a
+            %% slot. evict_one_dos_orphan/0 always reduces SOME peer's
+            %% count by 1, so progress is bounded by MAX_ORPHAN_TXS
+            %% iterations worst-case. Matches Core's LimitOrphans `do {
+            %% ... } while (NeedsTrim())` loop in node/txorphanage.cpp:478.
+            ensure_pool_under_cap(),
             Expiry = erlang:system_time(second) + ?ORPHAN_TX_EXPIRE_TIME,
-            insert_orphan_entry(Wtxid, Tx, Expiry, Txid, PeerId),
-            logger:debug("mempool: added orphan wtxid=~s peer=~p (~B total, ~B from peer)",
-                         [short_hex(Wtxid), PeerId,
+            Weight = safe_tx_weight(Tx),
+            Announcers = ordsets:from_list([PeerId]),
+            insert_orphan_entry(Wtxid, Tx, Expiry, Txid, Announcers, Weight),
+            logger:debug("mempool: added orphan wtxid=~s peer=~p weight=~B (~B total orphans, ~B count/~B weight from peer)",
+                         [short_hex(Wtxid), PeerId, Weight,
                           ets:info(?MEMPOOL_ORPHANS, size),
-                          orphan_count_for_peer(PeerId)])
+                          orphan_count_for_peer(PeerId),
+                          orphan_weight_for_peer(PeerId)])
     end.
 
-%% --- W125 orphan-table helpers ---------------------------------------------
-%% All inserts/deletes for an orphan MUST go through these so the three ETS
-%% tables (primary, txid-index, peer-count, by-peer-index) stay in sync.
+%% Compute BIP-141 weight for an orphan tx. Defensive: a malformed orphan
+%% (caller-supplied #transaction{} record) should not crash the gen_server,
+%% so on any serializer error we fall back to a 0 weight. A 0 weight is
+%% the safe direction: it means the orphan contributes nothing to the
+%% per-peer weight axis and eviction will pick on count alone.
+safe_tx_weight(Tx) ->
+    try beamchain_serialize:tx_weight(Tx)
+    catch _:_ -> 0
+    end.
 
-insert_orphan_entry(Wtxid, Tx, Expiry, Txid, PeerId) ->
-    ets:insert(?MEMPOOL_ORPHANS, {Wtxid, Tx, Expiry, PeerId}),
+%% --- W125 + W126 orphan-table helpers --------------------------------------
+%% All inserts/deletes for an orphan MUST go through these so the four ETS
+%% tables (primary, txid-index, peer-count, peer-weight, by-peer-index) stay
+%% in sync. Announcers is an ordsets:ordset(peer_id()).
+
+insert_orphan_entry(Wtxid, Tx, Expiry, Txid, Announcers, Weight) ->
+    ets:insert(?MEMPOOL_ORPHANS, {Wtxid, Tx, Expiry, Announcers, Weight}),
     ets:insert(?MEMPOOL_ORPHAN_BY_TXID, {Txid, Wtxid}),
-    ets:insert(?MEMPOOL_ORPHANS_BY_PEER, {{PeerId, Wtxid}, true}),
-    ets:update_counter(?MEMPOOL_ORPHAN_PEER_COUNT, PeerId, 1, {PeerId, 0}),
+    lists:foreach(
+      fun(PeerId) ->
+              ets:insert(?MEMPOOL_ORPHANS_BY_PEER, {{PeerId, Wtxid}, true}),
+              credit_peer(PeerId, Weight)
+      end,
+      ordsets:to_list(Announcers)),
     ok.
 
-erase_orphan_entry(Wtxid, Txid, PeerId) ->
+%% Erase the whole orphan and decrement the per-peer count + weight for
+%% every announcer. Used when the orphan is being removed regardless of
+%% peer (expiry, block-eviction, DoS-eviction, EraseTx).
+erase_orphan_entry(Wtxid, Txid, Announcers, Weight) ->
     ets:delete(?MEMPOOL_ORPHANS, Wtxid),
     ets:delete(?MEMPOOL_ORPHAN_BY_TXID, Txid),
-    ets:delete(?MEMPOOL_ORPHANS_BY_PEER, {PeerId, Wtxid}),
-    case ets:update_counter(?MEMPOOL_ORPHAN_PEER_COUNT, PeerId, {2, -1, 0, 0}, {PeerId, 0}) of
+    lists:foreach(
+      fun(PeerId) ->
+              ets:delete(?MEMPOOL_ORPHANS_BY_PEER, {PeerId, Wtxid}),
+              debit_peer(PeerId, Weight)
+      end,
+      ordsets:to_list(Announcers)),
+    ok.
+
+%% Remove a SINGLE announcer from an orphan (peer disconnect path). If the
+%% orphan still has at least one other announcer, the orphan stays in the
+%% pool — only this peer's by-peer index entry and per-peer count/weight
+%% credit are removed. If the announcer set becomes empty, the orphan is
+%% fully erased (last announcer left ⇒ no peer is interested any more).
+%% Returns 'evicted' if the orphan was removed entirely, 'kept' otherwise.
+%% Core's TxOrphanage::EraseForPeer is the analog: "If an orphan has been
+%% announced by another peer, don't erase, just remove this peer from the
+%% list of announcers."
+erase_announcer(Wtxid, PeerId) ->
+    case ets:lookup(?MEMPOOL_ORPHANS, Wtxid) of
+        [{Wtxid, Tx, Expiry, Announcers, Weight}] ->
+            case ordsets:is_element(PeerId, Announcers) of
+                false ->
+                    %% Defensive: by-peer index said this peer announced
+                    %% it, but the announcer set says otherwise. Nothing
+                    %% to do here — leave the orphan intact.
+                    kept;
+                true ->
+                    Remaining = ordsets:del_element(PeerId, Announcers),
+                    ets:delete(?MEMPOOL_ORPHANS_BY_PEER, {PeerId, Wtxid}),
+                    debit_peer(PeerId, Weight),
+                    case ordsets:size(Remaining) of
+                        0 ->
+                            Txid = beamchain_serialize:tx_hash(Tx),
+                            ets:delete(?MEMPOOL_ORPHANS, Wtxid),
+                            ets:delete(?MEMPOOL_ORPHAN_BY_TXID, Txid),
+                            evicted;
+                        _ ->
+                            ets:insert(?MEMPOOL_ORPHANS,
+                                       {Wtxid, Tx, Expiry, Remaining, Weight}),
+                            kept
+                    end
+            end;
+        [] ->
+            %% Race: orphan already gone (expiry, block eviction). Nothing
+            %% to clean up.
+            kept
+    end.
+
+credit_peer(PeerId, Weight) ->
+    ets:update_counter(?MEMPOOL_ORPHAN_PEER_COUNT, PeerId, 1, {PeerId, 0}),
+    case Weight of
+        0 -> ok;
+        _ ->
+            ets:update_counter(?MEMPOOL_ORPHAN_PEER_WEIGHT, PeerId,
+                               Weight, {PeerId, 0}),
+            ok
+    end.
+
+debit_peer(PeerId, Weight) ->
+    case ets:update_counter(?MEMPOOL_ORPHAN_PEER_COUNT,
+                            PeerId, {2, -1, 0, 0}, {PeerId, 0}) of
         0 -> ets:delete(?MEMPOOL_ORPHAN_PEER_COUNT, PeerId);
         _ -> ok
+    end,
+    case Weight of
+        0 -> ok;
+        _ ->
+            case ets:update_counter(?MEMPOOL_ORPHAN_PEER_WEIGHT,
+                                    PeerId, {2, -Weight, 0, 0},
+                                    {PeerId, 0}) of
+                0 -> ets:delete(?MEMPOOL_ORPHAN_PEER_WEIGHT, PeerId);
+                _ -> ok
+            end
     end,
     ok.
 
@@ -2719,29 +2862,100 @@ orphan_count_for_peer(PeerId) ->
         []            -> 0
     end.
 
-%% Pick the peer with the highest current orphan count and evict one of
-%% their orphans at random. This mirrors Core's LimitOrphans intent: bound
-%% the worst offender first, leave well-behaved peers' orphans alone.
+orphan_weight_for_peer(PeerId) ->
+    case ets:lookup(?MEMPOOL_ORPHAN_PEER_WEIGHT, PeerId) of
+        [{PeerId, W}] -> W;
+        []            -> 0
+    end.
+
+%% Test accessor: return the announcer set for an orphan as an ordset.
+%% Returns [] if the orphan isn't in the pool (collapsed with the "no
+%% announcers" case — callers in tests should check membership first if
+%% the distinction matters).
+orphan_announcers(Wtxid) ->
+    case ets:lookup(?MEMPOOL_ORPHANS, Wtxid) of
+        [{Wtxid, _Tx, _Expiry, Announcers, _Weight}] -> Announcers;
+        []                                           -> []
+    end.
+
+%% Pick the worst peer for eviction. Priority order:
 %%
-%% We use orphan-count (not Core's full DoS-fraction over latency + weight)
-%% because beamchain's orphan record carries neither weight nor a latency
-%% score, and count is the dominant signal at our cap of 100 anyway: a peer
-%% holding ≥51 of 100 orphans IS the DoS attacker by definition. The full
-%% Core algorithm degenerates to "evict max-count peer" once weights are
-%% uniform, which they effectively are for the small txs that fill an
-%% orphan pool. A follow-up that adds weight tracking can extend this to
-%% (count, weight) tiebreaking without disturbing callers.
-evict_one_dos_orphan() ->
-    case pick_worst_peer() of
-        none ->
+%%   1. Any peer whose total orphan weight exceeds
+%%      ORPHAN_RESERVED_WEIGHT_PER_PEER (Core's ReservedPeerUsage) —
+%%      these peers have busted the byte-weight share and are evicted
+%%      first regardless of count. Among multiple over-weight peers, the
+%%      highest weight wins.
+%%   2. Otherwise the peer with the highest orphan count (W125 policy).
+%%
+%% This mirrors Core's LimitOrphans intent: bound the worst offender first
+%% on whichever resource axis they're abusing. The weight axis matters
+%% even at our 100-orphan cap because a peer can pin large orphans (up to
+%% MAX_STANDARD_TX_WEIGHT = 400000 weight units each) and force a
+%% disproportionate share of memory even while well under the count cap.
+%% Loop pick-worst-peer + drop-one-of-their-orphans until the pool is
+%% below the count cap. A single eviction may only drop an announcer
+%% (orphan retained for other peers), so one call isn't always enough to
+%% free a slot. Bounded by MAX_ORPHAN_TXS * 10 to guarantee termination
+%% — each call reduces some peer's count by 1, and the total per-peer-
+%% count sum is bounded by MAX_ORPHAN_TXS * announcer_count (in the
+%% pathological case where every orphan has every peer as an announcer).
+%% In practice the loop exits in 1-2 iterations.
+ensure_pool_under_cap() ->
+    ensure_pool_under_cap(?MAX_ORPHAN_TXS * 10).
+
+ensure_pool_under_cap(0) ->
+    %% Defensive: if we somehow loop MAX_ORPHAN_TXS * 10 times without
+    %% getting under cap, log + give up so we don't hang the gen_server.
+    %% In practice unreachable; would indicate a bookkeeping bug between
+    %% the count tables and the primary orphans table.
+    logger:warning("mempool: ensure_pool_under_cap exhausted, pool size=~B",
+                   [ets:info(?MEMPOOL_ORPHANS, size)]),
+    ok;
+ensure_pool_under_cap(N) ->
+    case ets:info(?MEMPOOL_ORPHANS, size) >= ?MAX_ORPHAN_TXS of
+        false ->
             ok;
-        WorstPeer ->
-            evict_random_orphan_from_peer(WorstPeer)
+        true ->
+            case pick_worst_peer() of
+                none ->
+                    %% No DoS-candidate peer (all per-peer counts are 0)
+                    %% yet pool is at cap — inconsistent state, bail out.
+                    logger:warning("mempool: ensure_pool_under_cap at cap with no candidate peer, size=~B",
+                                   [ets:info(?MEMPOOL_ORPHANS, size)]),
+                    ok;
+                WorstPeer ->
+                    evict_random_orphan_from_peer(WorstPeer),
+                    ensure_pool_under_cap(N - 1)
+            end
     end.
 
 pick_worst_peer() ->
-    %% Fold the per-peer-count table; O(P) where P = distinct peers with
-    %% orphans (bounded by simultaneous peer count, usually ≤125 on mainnet).
+    case pick_worst_weight_peer() of
+        {Peer, _W} -> Peer;
+        none       -> pick_worst_count_peer()
+    end.
+
+%% Pick the peer whose total orphan weight is the highest AND exceeds the
+%% reserved-weight cap. Returns 'none' if no peer is over the cap.
+pick_worst_weight_peer() ->
+    ets:foldl(
+      fun({PeerId, W}, Best) ->
+              case W > ?ORPHAN_RESERVED_WEIGHT_PER_PEER of
+                  false -> Best;
+                  true ->
+                      case Best of
+                          none                       -> {PeerId, W};
+                          {_, BestW} when W > BestW  -> {PeerId, W};
+                          _                          -> Best
+                      end
+              end
+      end,
+      none,
+      ?MEMPOOL_ORPHAN_PEER_WEIGHT).
+
+%% W125 count-based selection (unchanged): pick the peer with the highest
+%% orphan count.
+pick_worst_count_peer() ->
     case ets:foldl(
            fun({PeerId, Count}, {_, BestCount} = Best) ->
                    if Count > BestCount -> {PeerId, Count};
@@ -2758,6 +2972,12 @@ evict_random_orphan_from_peer(PeerId) ->
     %% Enumerate this peer's wtxids via the ordered_set by-peer index and
     %% pick one uniformly at random.  Adversary cannot pin a particular
     %% orphan at the "first" slot any more (the old ets:first/1 bug).
+    %%
+    %% W126: the orphan we pick may have OTHER announcers — in that case
+    %% we only remove this peer's announcement (erase_announcer), the
+    %% orphan stays for the other peers. From this peer's accounting POV
+    %% the eviction succeeded (their count + weight both dropped by one
+    %% orphan), which is what the DoS policy demanded.
     Wtxids = peer_orphan_wtxids(PeerId),
     case Wtxids of
         [] ->
@@ -2766,14 +2986,13 @@ evict_random_orphan_from_peer(PeerId) ->
             ok;
         _ ->
             Pick = lists:nth(rand:uniform(length(Wtxids)), Wtxids),
-            case ets:lookup(?MEMPOOL_ORPHANS, Pick) of
-                [{Pick, EvictTx, _Expiry, PeerId}] ->
-                    EvictTxid = beamchain_serialize:tx_hash(EvictTx),
-                    erase_orphan_entry(Pick, EvictTxid, PeerId),
-                    logger:debug("mempool: DoS-evicted orphan wtxid=~s peer=~p",
+            case erase_announcer(Pick, PeerId) of
+                evicted ->
+                    logger:debug("mempool: DoS-evicted orphan wtxid=~s peer=~p (last announcer)",
                                  [short_hex(Pick), PeerId]);
-                _ ->
-                    ok
+                kept ->
+                    logger:debug("mempool: DoS-removed announcer peer=~p from orphan wtxid=~s (other announcers remain)",
+                                 [PeerId, short_hex(Pick)])
             end
     end.
 
@@ -2813,11 +3032,17 @@ reprocess_orphans(NewTxid, State) ->
     %% CORE-PARITY-AUDIT/_bug-reports/beamchain-getblockcount-fails-
     %% 2026-05-24.md for the full root-cause analysis.
     %%
-    %% W125: orphan records now carry PeerId (4-tuple) — preserve it when
+    %% W125: orphan records carry PeerId — preserve attribution when
     %% promoting so that if the promoted-orphan path were to re-orphan, the
     %% attribution doesn't get laundered through `local`.
+    %% W126: PeerId is now an ordsets:ordset() of peers. On promotion we
+    %% drop the whole orphan (all announcers) and attribute the re-attempt
+    %% to one of them — first one in the set, deterministic by ordsets
+    %% ordering. Any other announcers don't get charged for the re-attempt
+    %% because we've already returned their per-peer count + weight credit
+    %% via erase_orphan_entry/4.
     lists:foldl(
-        fun({OrphanWtxid, OrphanTx, _Expiry, OrphanPeer}, AccState) ->
+        fun({OrphanWtxid, OrphanTx, _Expiry, Announcers, Weight}, AccState) ->
             HasParent = lists:any(
                 fun(#tx_in{prev_out = #outpoint{hash = H}}) ->
                     H =:= NewTxid
@@ -2825,10 +3050,11 @@ reprocess_orphans(NewTxid, State) ->
                 OrphanTx#transaction.inputs),
             case HasParent of
                 true ->
-                    %% Remove from all 3 tables before re-submission
+                    %% Remove from all 4 tables before re-submission
                     OrphanTxid = beamchain_serialize:tx_hash(OrphanTx),
-                    erase_orphan_entry(OrphanWtxid, OrphanTxid, OrphanPeer),
-                    case do_add_transaction(OrphanTx, OrphanPeer, AccState) of
+                    erase_orphan_entry(OrphanWtxid, OrphanTxid, Announcers, Weight),
+                    PromotionPeer = first_announcer(Announcers),
+                    case do_add_transaction(OrphanTx, PromotionPeer, AccState) of
                         {ok, _PromotedTxid, NewState} ->
                             logger:debug("mempool: promoted orphan wtxid=~s",
                                          [short_hex(OrphanWtxid)]),
@@ -2842,6 +3068,14 @@ reprocess_orphans(NewTxid, State) ->
         end,
         State,
         Orphans).
+
+%% Return any single peer from an announcer set. Used when we need a
+%% representative attribution (orphan promotion re-attempt) but the
+%% specific choice doesn't matter — Core's TxOrphanage chooses
+%% non-reconsiderable then oldest; we don't expose that ordering so we
+%% just take the first element in ordsets order.
+first_announcer([]) -> ?ORPHAN_LOCAL_PEER;
+first_announcer([P | _]) -> P.
 
 %%% ===================================================================
 %%% Internal: entry management
@@ -3271,11 +3505,11 @@ do_expire_old(State) ->
 do_expire_orphans() ->
     Now = erlang:system_time(second),
     Orphans = ets:tab2list(?MEMPOOL_ORPHANS),
-    Expired = lists:foldl(fun({Wtxid, Tx, Expiry, PeerId}, Count) ->
+    Expired = lists:foldl(fun({Wtxid, Tx, Expiry, Announcers, Weight}, Count) ->
         case Now >= Expiry of
             true ->
                 Txid = beamchain_serialize:tx_hash(Tx),
-                erase_orphan_entry(Wtxid, Txid, PeerId),
+                erase_orphan_entry(Wtxid, Txid, Announcers, Weight),
                 Count + 1;
             false ->
                 Count
@@ -3312,7 +3546,7 @@ erase_orphans_for_block([]) -> ok;
 erase_orphans_for_block(BlockTxids) ->
     ConfirmedSet = sets:from_list(BlockTxids),
     Orphans = ets:tab2list(?MEMPOOL_ORPHANS),
-    Erased = lists:foldl(fun({Wtxid, Tx, _Expiry, PeerId}, Count) ->
+    Erased = lists:foldl(fun({Wtxid, Tx, _Expiry, Announcers, Weight}, Count) ->
         %% Category (a): orphan spends an outpoint already confirmed/spent by the block.
         %% An orphan referencing prev_out hash H where H is a DIFFERENT confirmed tx
         %% (not the parent of this orphan) indicates a double-spend conflict.
@@ -3327,7 +3561,7 @@ erase_orphans_for_block(BlockTxids) ->
         case HasConfirmedParent of
             true ->
                 OrphanTxid = beamchain_serialize:tx_hash(Tx),
-                erase_orphan_entry(Wtxid, OrphanTxid, PeerId),
+                erase_orphan_entry(Wtxid, OrphanTxid, Announcers, Weight),
                 Count + 1;
             false ->
                 Count
@@ -3351,33 +3585,37 @@ erase_orphans_for_block(BlockTxids) ->
     gen_server:cast(?SERVER, {reprocess_orphans_for_block, BlockTxids}),
     ok.
 
-%% @doc Erase orphans announced by a disconnecting peer.
-%% W103 BUG-13 + W125 (today): orphan records now carry PeerId, so this
-%% actually prunes the disconnected peer's orphans (rather than waiting
-%% the 20-min expiry the original BUG-13 fix relied on).
-%% Mirrors Bitcoin Core TxOrphanage::EraseForPeer.
+%% @doc Erase a peer's announcements when they disconnect.
+%% W103 BUG-13 + W125 + W126: orphan records carry an ordsets:ordset() of
+%% announcer peers, so this prunes only THIS peer's announcement from each
+%% orphan. The orphan itself is evicted only when its announcer set
+%% becomes empty — if another connected peer still vouches for the same
+%% wtxid, the orphan stays in the pool for them.
+%% Mirrors Bitcoin Core TxOrphanage::EraseForPeer: "If an orphan has been
+%% announced by another peer, don't erase, just remove this peer from the
+%% list of announcers."
 %%
 %% Bounded eviction: walks ONLY this peer's prefix in the by-peer ordered_set
 %% index, so cost is O(k log N) where k = orphans-from-this-peer (≤100), not
 %% O(N) over the whole orphan pool.
+%%
+%% Counters: returns count of full-orphan evictions and announcer-only
+%% removals separately for the debug log. An "evicted" orphan was the last
+%% one to vouch for that wtxid; a "kept" orphan still has other announcers.
 -spec erase_orphans_for_peer(term()) -> ok.
 erase_orphans_for_peer(PeerId) ->
     Wtxids = peer_orphan_wtxids(PeerId),
-    Erased = lists:foldl(
-      fun(Wtxid, Count) ->
-              case ets:lookup(?MEMPOOL_ORPHANS, Wtxid) of
-                  [{Wtxid, Tx, _Expiry, PeerId}] ->
-                      Txid = beamchain_serialize:tx_hash(Tx),
-                      erase_orphan_entry(Wtxid, Txid, PeerId),
-                      Count + 1;
-                  _ ->
-                      Count
+    {Evicted, Kept} = lists:foldl(
+      fun(Wtxid, {Ev, Kp}) ->
+              case erase_announcer(Wtxid, PeerId) of
+                  evicted -> {Ev + 1, Kp};
+                  kept    -> {Ev, Kp + 1}
               end
-      end, 0, Wtxids),
-    case Erased > 0 of
+      end, {0, 0}, Wtxids),
+    case Evicted + Kept > 0 of
         true ->
-            logger:debug("mempool: erased ~B orphans for disconnected peer=~p",
-                         [Erased, PeerId]);
+            logger:debug("mempool: peer=~p disconnect — evicted ~B orphans, kept ~B with other announcers",
+                         [PeerId, Evicted, Kept]);
         false -> ok
     end,
     ok.
