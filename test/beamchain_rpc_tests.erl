@@ -1058,7 +1058,13 @@ bip22_result_bad_witness_test() ->
 
 bip22_result_bad_cb_amount_test() ->
     ?assertEqual(<<"bad-cb-amount">>, beamchain_rpc:bip22_result(bad_cb_amount)),
-    ?assertEqual(<<"bad-cb-amount">>, beamchain_rpc:bip22_result(insufficient_input)).
+    %% `insufficient_input` is a tx-level error (`nValueIn < nValueOut`) — Core
+    %% maps it to `bad-txns-in-belowout` per
+    %% bitcoin-core/src/consensus/tx_verify.cpp Consensus::CheckTxInputs():
+    %%     state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-in-belowout", ...)
+    %% NOT to bad-cb-amount (which is block-level: coinbase outputs > subsidy+fees).
+    ?assertEqual(<<"bad-txns-in-belowout">>,
+                 beamchain_rpc:bip22_result(insufficient_input)).
 
 bip22_result_bad_blk_sigops_test() ->
     ?assertEqual(<<"bad-blk-sigops">>, beamchain_rpc:bip22_result(bad_blk_sigops)).
@@ -1079,7 +1085,12 @@ bip22_result_duplicate_test() ->
     ?assertEqual(<<"duplicate">>, beamchain_rpc:bip22_result(duplicate)).
 
 bip22_result_mandatory_script_test() ->
-    ?assertEqual(<<"mandatory-script-verify-flag-failed">>,
+    %% `mandatory-script-verify-flag-failed` is the **mempool** AcceptToMempool
+    %% reject reason (Core validation.cpp CheckInputScripts with
+    %% cacheSigStore=true). `block-script-verify-flag-failed` is the
+    %% **block-context** reject reason (ConnectBlock path). bip22_result/1 is
+    %% only used by submitblock, so block-context is the right mapping.
+    ?assertEqual(<<"block-script-verify-flag-failed">>,
                  beamchain_rpc:bip22_result({bad_tx, script_failed})).
 
 bip22_result_catchall_test() ->
