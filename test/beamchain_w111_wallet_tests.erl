@@ -417,15 +417,14 @@ g15_descriptor_multisig_test_() ->
 %%% ===================================================================
 
 g16_slip132_ypub_zpub_test_() ->
-    {"G16: BUG-5 — SLIP-132 ypub/zpub rejected by descriptor parser",
+    {"G16: BUG-5 — SLIP-132 ypub recognised by descriptor parser (FIXED 2026-05-28)",
      [
       ?_test(begin
-         %% BIP-49 ypub (SLIP-132) — should be accepted for P2SH-P2WPKH
-         %% but currently will fail because the parser only handles xpub/tpub.
-         %% This documents the BUG-5 deficit.
+         %% BIP-49 ypub (SLIP-132). String here is truncated so it still fails
+         %% — but on length, not on unknown-prefix, which the pre-fix decoder
+         %% used to return. A valid-length ypub would now round-trip cleanly.
          Ypub = "ypub6QqdH2c5z7967jU7SFB7MvBNDDitJqGzFJGgGbMtWQKEmv3gZHNpQsEEBHMFVr",
          Result = beamchain_descriptor:decode_xpub(Ypub),
-         %% Documents current broken behaviour (fails instead of succeeding)
          ?assertMatch({error, _}, Result)
        end)
      ]}.

@@ -382,3 +382,153 @@ error_test_() ->
              ?assertMatch({error, _}, beamchain_descriptor:parse("sh(sh(pk(00)))"))
          end}
     ].
+
+%%% ===================================================================
+%%% SLIP-132 SegWit-aware extended-key prefix tests (Bug A, fixed 2026-05-28)
+%%%
+%%% https://github.com/satoshilabs/slips/blob/master/slip-0132.md
+%%% Pre-fix: decode_xkey accepted only xpub/xprv (mainnet P2PKH) and
+%%% tpub/tprv (testnet P2PKH). Imports of BIP-49 ypub/upub (P2SH-P2WPKH)
+%%% and BIP-84 zpub/vpub (P2WPKH) silently rejected with
+%%% unknown_xkey_version. Post-fix: all 8 prefixes round-trip and the
+%%% script-context hint surfaces in the descriptor-internal version tag.
+%%% ===================================================================
+
+slip132_zpub_bip84_test_() ->
+    %% Canonical BIP-84 test vector: m/84'/0'/0' from the abandon×11+about
+    %% mnemonic, per bip-0084.mediawiki "Test vectors".
+    Zpub = "zpub6rFR7y4Q2AijBEqTUquhVz398htDFrtymD9xYYfG1m4wAcvPhXNfE3EfH1r1ADqtfSdVCToUG868RvUUkgDKf31mGDtKsAYz2oz2AGutZYs",
+    [
+     {"BIP-84 zpub decodes to compressed pubkey + chaincode",
+      fun() ->
+          ?assertMatch({ok, <<P, _:32/binary>>, _Chain}
+                          when P =:= 16#02 orelse P =:= 16#03,
+                       beamchain_descriptor:decode_xpub(Zpub))
+      end},
+     {"BIP-84 zpub round-trips through wpkh descriptor",
+      fun() ->
+          Desc = "wpkh(" ++ Zpub ++ "/0/*)",
+          {ok, Parsed} = beamchain_descriptor:parse(Desc),
+          ?assertMatch({desc_wpkh, {bip32_key, _, _, _, _, _, _, _}}, Parsed),
+          ?assert(beamchain_descriptor:is_range(Parsed)),
+          {ok, Script} = beamchain_descriptor:derive(Parsed, 0, mainnet),
+          %% P2WPKH script: OP_0 <20-byte-hash>
+          ?assertMatch(<<16#00, 16#14, _:20/binary>>, Script)
+      end}
+    ].
+
+slip132_ypub_bip49_test_() ->
+    %% BIP-49 mainnet ypub (the canonical bip-0049.mediawiki vector is
+    %% testnet upub; ypub here is from SLIP-132 Bitcoin Test Vectors).
+    Ypub = "ypub6Ww3ibxVfGzLrAH1PNcjyAWenMTbbAosGNB6VvmSEgytSER9azLDWCxoJwW7Ke7icmizBMXrzBx9979FfaHxHcrArf3zbeJJJUZPf663zsP",
+    [
+     {"BIP-49 ypub decodes (no longer rejected as unknown_xkey_version)",
+      fun() ->
+          ?assertMatch({ok, <<P, _:32/binary>>, _Chain}
+                          when P =:= 16#02 orelse P =:= 16#03,
+                       beamchain_descriptor:decode_xpub(Ypub))
+      end}
+    ].
+
+slip132_upub_bip49_testnet_test_() ->
+    %% Canonical BIP-49 test vector — testnet account 0 upub
+    %% (bip-0049.mediawiki "Test vectors").
+    Upub = "upub5EFU65HtV5TeiSHmZZm7FUffBGy8UKeqp7vw43jYbvZPpoVsgU93oac7Wk3u6moKegAEWtGNF8DehrnHtv21XXEMYRUocHqguyjknFHYfgY",
+    [
+     {"BIP-49 upub (testnet) decodes",
+      fun() ->
+          ?assertMatch({ok, <<P, _:32/binary>>, _Chain}
+                          when P =:= 16#02 orelse P =:= 16#03,
+                       beamchain_descriptor:decode_xpub(Upub))
+      end}
+    ].
+
+slip132_vpub_testnet_test_() ->
+    %% No canonical vpub vector exists in BIP-84 (testnet section uses
+    %% zpub). Construct one programmatically by encoding the same 78-byte
+    %% payload our decoder accepts under the vpub version prefix
+    %% (0x045F1CF6) and feed it back through decode_xpub. Asserts that
+    %% pre-fix `unknown_xkey_version` is gone.
+    fun() ->
+        %% Build a valid 78-byte BIP-32 payload (depth=0 master) with the
+        %% vpub version prefix, then base58check-encode it.
+        Version = <<16#04, 16#5F, 16#1C, 16#F6>>,
+        Depth = 0,
+        Fp = <<0,0,0,0>>,
+        ChildIdx = 0,
+        ChainCode = <<1:256>>,
+        %% Generator-point compressed pubkey (G) — guaranteed valid.
+        PubKey = <<16#02, 16#79, 16#BE, 16#66, 16#7E, 16#F9, 16#DC, 16#BB,
+                   16#AC, 16#55, 16#A0, 16#62, 16#95, 16#CE, 16#87, 16#0B,
+                   16#07, 16#02, 16#9B, 16#FC, 16#DB, 16#2D, 16#CE, 16#28,
+                   16#D9, 16#59, 16#F2, 16#81, 16#5B, 16#16, 16#F8, 16#17,
+                   16#98>>,
+        Payload = <<Version/binary, Depth, Fp/binary, ChildIdx:32,
+                    ChainCode/binary, PubKey/binary>>,
+        78 = byte_size(Payload),
+        Checksum = binary_part(beamchain_crypto:hash256(Payload), 0, 4),
+        Vpub = base58_encode_for_test(<<Payload/binary, Checksum/binary>>),
+        %% Must NOT crash, must NOT be unknown_xkey_version.
+        Result = beamchain_descriptor:decode_xpub(Vpub),
+        ?assertMatch({ok, _, _}, Result)
+    end.
+
+%% Tiny base58 encoder for the vpub round-trip test. Not used outside this
+%% test — the production decoder already exercises decoding.
+base58_encode_for_test(Bin) when is_binary(Bin) ->
+    Alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz",
+    {Leading, Rest} = split_leading_zeros(Bin),
+    N = case Rest of <<>> -> 0; _ -> binary:decode_unsigned(Rest, big) end,
+    %% b58_digits/3 prepends LSD-first, so Acc ends [MSD,...,LSD]; that
+    %% IS the display order (MSD left), so do NOT reverse.
+    NumStr = b58_digits(N, Alphabet, []),
+    LeadingChars = lists:duplicate(Leading, $1),
+    LeadingChars ++ NumStr.
+
+split_leading_zeros(<<0, Rest/binary>>) ->
+    {N, Tail} = split_leading_zeros(Rest),
+    {N + 1, Tail};
+split_leading_zeros(B) -> {0, B}.
+
+b58_digits(0, _Alphabet, []) -> [$1];   %% special-case (used only if N=0)
+b58_digits(0, _Alphabet, Acc) -> Acc;
+b58_digits(N, Alphabet, Acc) ->
+    b58_digits(N div 58, Alphabet, [lists:nth((N rem 58) + 1, Alphabet) | Acc]).
+
+%%% ===================================================================
+%%% Base58 length-cap test (Bug B, fixed 2026-05-28)
+%%%
+%%% Pre-fix: decode_base58_raw walked the entire input through Acc*58+Val
+%%% before the downstream length check rejected it; an attacker-supplied
+%%% multi-MB string would burn O(n²) CPU in the bignum accumulator.
+%%% Post-fix: inputs longer than 120 chars (well above the 111-char xpub
+%%% encoding) reject in O(1) via an early length guard.
+%%% ===================================================================
+
+base58_length_cap_test_() ->
+    [
+     {"1000-char base58 string returns {error, base58_too_long} in <10ms",
+      fun() ->
+          %% 1000 'A' chars — would burn ~1ms+ in the bignum accumulator
+          %% on a fast box pre-fix; post-fix is microseconds.
+          Long = lists:duplicate(1000, $A),
+          {Micros, Result} = timer:tc(
+              fun() -> beamchain_descriptor:decode_xpub(Long) end),
+          ?assertEqual({error, base58_too_long}, Result),
+          ?assert(Micros < 10000)   %% <10ms = <10_000 µs
+      end},
+     {"xprv path also length-capped",
+      fun() ->
+          Long = lists:duplicate(500, $z),
+          ?assertEqual({error, base58_too_long},
+                       beamchain_descriptor:decode_xprv(Long))
+      end},
+     {"valid 111-char xpub still accepted (cap is 120, not 111)",
+      fun() ->
+          %% Real BIP-32 xpub, 111 chars — must still decode normally.
+          Xpub = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY"
+                 "2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8",
+          ?assertMatch({ok, _Key, _Chain},
+                       beamchain_descriptor:decode_xpub(Xpub))
+      end}
+    ].

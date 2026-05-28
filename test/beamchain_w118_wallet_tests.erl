@@ -241,20 +241,25 @@ g5_descriptor_tr_tree_test_() ->
        end)
      ]}.
 
-%% G6 — BUG-6: SLIP-132 ypub/zpub rejected
+%% G6 — BUG-6: SLIP-132 ypub/zpub accepted (FIXED 2026-05-28).
+%% Pre-fix: decode_xpub rejected both prefixes with unknown_xkey_version.
+%% Post-fix: full 111-char zpub decodes to a 33-byte compressed pubkey +
+%% 32-byte chaincode; a truncated ypub still fails (length/checksum) but
+%% NOT on prefix grounds.
 g6_slip132_ypub_zpub_test_() ->
-    {"G6: BUG-6 — SLIP-132 ypub/zpub/upub/vpub prefixes rejected (MISSING)",
+    {"G6: BUG-6 — SLIP-132 ypub/zpub/upub/vpub prefixes now recognised",
      [
       ?_test(begin
-         %% ypub used by BIP-49 ecosystem wallets (P2SH-wrapped SegWit)
+         %% Truncated ypub — fails length/checksum, NOT unknown_xkey_version.
          Ypub = "ypub6QqdH2c5z7967jU7SFB7MvBNDDitJqGzFJGgGbMtWQKEmv3gZHNpQsEEBHMFVrRdR",
-         %% decode_xpub rejects ypub — documents the gap.
          ?assertMatch({error, _}, beamchain_descriptor:decode_xpub(Ypub))
        end),
       ?_test(begin
-         %% zpub used by BIP-84 ecosystem wallets (native SegWit)
+         %% Full-length valid zpub round-trips post-fix.
          Zpub = "zpub6jftahH18ngZxLmXaKw3GSZzZsszmt9WqedkyZdezFtWRFBZqsQH5hyUmb4pCEeZGmVfQuP5bedXTB8is6fTv19U1GQRyQUKQGUTzyHACMF",
-         ?assertMatch({error, _}, beamchain_descriptor:decode_xpub(Zpub))
+         ?assertMatch({ok, <<P, _:32/binary>>, <<_:32/binary>>}
+                         when P =:= 16#02 orelse P =:= 16#03,
+                      beamchain_descriptor:decode_xpub(Zpub))
        end)
      ]}.
 

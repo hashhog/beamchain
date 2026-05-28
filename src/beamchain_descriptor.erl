@@ -624,12 +624,28 @@ take_key_string([C | Rest], Acc) ->
     take_key_string(Rest, [C | Acc]).
 
 identify_and_parse_key(KeyStr, XOnly, Origin) ->
-    %% Check for xpub/xprv/tpub/tprv prefix
+    %% Check for xpub/xprv/tpub/tprv + SLIP-132 SegWit-prefix variants.
+    %% Recognised: BIP-44 (xpub/xprv mainnet, tpub/tprv testnet) +
+    %% BIP-49 (ypub/yprv mainnet, upub/uprv testnet — P2SH-P2WPKH) +
+    %% BIP-84 (zpub/zprv mainnet, vpub/vprv testnet — P2WPKH).
+    %% Per SLIP-132 (https://github.com/satoshilabs/slips/blob/master/slip-0132.md)
+    %% these encode the same BIP-32 extended-key payload — only the 4-byte
+    %% version prefix differs, hinting at the intended script context. The
+    %% actual descriptor expression (pkh/wpkh/sh/wsh/tr) still drives script
+    %% generation; the version-tag is recorded for downstream wallet UX.
     case KeyStr of
         "xpub" ++ _ -> parse_extended_key(KeyStr, XOnly, Origin, pub);
         "xprv" ++ _ -> parse_extended_key(KeyStr, XOnly, Origin, priv);
         "tpub" ++ _ -> parse_extended_key(KeyStr, XOnly, Origin, pub);
         "tprv" ++ _ -> parse_extended_key(KeyStr, XOnly, Origin, priv);
+        "ypub" ++ _ -> parse_extended_key(KeyStr, XOnly, Origin, pub);
+        "yprv" ++ _ -> parse_extended_key(KeyStr, XOnly, Origin, priv);
+        "zpub" ++ _ -> parse_extended_key(KeyStr, XOnly, Origin, pub);
+        "zprv" ++ _ -> parse_extended_key(KeyStr, XOnly, Origin, priv);
+        "upub" ++ _ -> parse_extended_key(KeyStr, XOnly, Origin, pub);
+        "uprv" ++ _ -> parse_extended_key(KeyStr, XOnly, Origin, priv);
+        "vpub" ++ _ -> parse_extended_key(KeyStr, XOnly, Origin, pub);
+        "vprv" ++ _ -> parse_extended_key(KeyStr, XOnly, Origin, priv);
         _ ->
             %% Try hex pubkey or WIF
             case length(KeyStr) of
@@ -700,7 +716,7 @@ parse_extended_key(KeyStr, XOnly, Origin, Type) ->
 
 parse_xkey_base(BaseKeyStr, Path, DeriveType, XOnly, Origin, ExpectedType) ->
     case decode_xkey(BaseKeyStr) of
-        {ok, Type, Key, ChainCode, Depth, Fp, _ChildIdx} when Type =:= ExpectedType ->
+        {ok, Type, _Tag, Key, ChainCode, Depth, Fp, _ChildIdx} when Type =:= ExpectedType ->
             BIP32Key = #bip32_key{
                 extkey = {Type, Key, ChainCode},
                 fingerprint = Fp,
@@ -711,7 +727,7 @@ parse_xkey_base(BaseKeyStr, Path, DeriveType, XOnly, Origin, ExpectedType) ->
                 origin = Origin
             },
             {ok, set_xonly(BIP32Key, XOnly)};
-        {ok, _, _, _, _, _, _} ->
+        {ok, _, _, _, _, _, _, _} ->
             {error, key_type_mismatch};
         {error, _} = Err ->
             Err
@@ -1177,24 +1193,41 @@ compact_size(N) -> <<255, N:64/little>>.
 %%% ===================================================================
 
 %% Version bytes
+%% BIP-32 default prefixes (mainnet/testnet, P2PKH/P2SH script context).
 -define(MAINNET_XPUB, <<16#04, 16#88, 16#b2, 16#1e>>).
 -define(MAINNET_XPRV, <<16#04, 16#88, 16#ad, 16#e4>>).
 -define(TESTNET_TPUB, <<16#04, 16#35, 16#87, 16#cf>>).
 -define(TESTNET_TPRV, <<16#04, 16#35, 16#83, 16#94>>).
+%% SLIP-132 SegWit-aware prefixes (https://github.com/satoshilabs/slips/blob/master/slip-0132.md).
+%% Same BIP-32 payload bytes — only the 4-byte version differs and hints at the
+%% intended script type (P2SH-P2WPKH for ypub/upub; P2WPKH for zpub/vpub).
+-define(MAINNET_YPUB, <<16#04, 16#9D, 16#7C, 16#B2>>).  %% BIP-49  P2SH-P2WPKH mainnet
+-define(MAINNET_YPRV, <<16#04, 16#9D, 16#78, 16#78>>).
+-define(MAINNET_ZPUB, <<16#04, 16#B2, 16#47, 16#46>>).  %% BIP-84  P2WPKH      mainnet
+-define(MAINNET_ZPRV, <<16#04, 16#B2, 16#43, 16#0C>>).
+-define(TESTNET_UPUB, <<16#04, 16#4A, 16#52, 16#62>>).  %% BIP-49  P2SH-P2WPKH testnet
+-define(TESTNET_UPRV, <<16#04, 16#4A, 16#4E, 16#28>>).
+-define(TESTNET_VPUB, <<16#04, 16#5F, 16#1C, 16#F6>>).  %% BIP-84  P2WPKH      testnet
+-define(TESTNET_VPRV, <<16#04, 16#5F, 16#18, 16#BC>>).
 
+%% Public decode shape: {ok, Key, ChainCode}. The SLIP-132 script-context
+%% tag (e.g. {p2wpkh, mainnet} for zpub) is preserved internally in
+%% decode_xkey/1's return tuple and consumed by parse_xkey_base/6, but not
+%% surfaced through the simple decode_xpub/1 / decode_xprv/1 public API to
+%% preserve backward-compat with existing wallet callers.
 -spec decode_xpub(string()) -> {ok, binary(), binary()} | {error, term()}.
 decode_xpub(Str) ->
     case decode_xkey(Str) of
-        {ok, pub, Key, ChainCode, _D, _Fp, _Idx} -> {ok, Key, ChainCode};
-        {ok, priv, _, _, _, _, _} -> {error, not_xpub};
+        {ok, pub, _Tag, Key, ChainCode, _D, _Fp, _Idx} -> {ok, Key, ChainCode};
+        {ok, priv, _Tag, _, _, _, _, _} -> {error, not_xpub};
         {error, _} = Err -> Err
     end.
 
 -spec decode_xprv(string()) -> {ok, binary(), binary()} | {error, term()}.
 decode_xprv(Str) ->
     case decode_xkey(Str) of
-        {ok, priv, Key, ChainCode, _D, _Fp, _Idx} -> {ok, Key, ChainCode};
-        {ok, pub, _, _, _, _, _} -> {error, not_xprv};
+        {ok, priv, _Tag, Key, ChainCode, _D, _Fp, _Idx} -> {ok, Key, ChainCode};
+        {ok, pub, _Tag, _, _, _, _, _} -> {error, not_xprv};
         {error, _} = Err -> Err
     end.
 
@@ -1228,27 +1261,34 @@ decode_xkey(Str) ->
 %% per Core's `pubkey.cpp:CExtPubKey::Decode` lines 235-243), and per-
 %% variant key-data prefix (xprv first byte MUST be 0x00; xpub first byte
 %% MUST be 0x02 or 0x03 for a compressed secp256k1 point).
+%%
+%% Return shape: {ok, pub|priv, {ScriptHint, Network}, Key, ChainCode,
+%%                Depth, Fingerprint, ChildIndex}. ScriptHint reflects the
+%% SLIP-132 prefix convention (p2pkh | p2sh_p2wpkh | p2wpkh) so wallet code
+%% can default-route descriptor-less imports to the right script context.
+%% Descriptor parsing itself ignores the hint — the `pkh`/`wpkh`/`sh(...)`
+%% wrapper drives script generation per BIP-380.
 decode_xkey_body(Version, Depth, Fingerprint, ChildIndex, ChainCode, KeyData) ->
     case classify_xkey_version(Version) of
         unknown ->
             {error, unknown_xkey_version};
-        {pub, _Net} ->
+        {pub, Tag} ->
             case validate_xkey_structure(Depth, Fingerprint, ChildIndex) of
                 ok ->
                     case validate_xpub_keydata(KeyData) of
-                        ok -> {ok, pub, KeyData, ChainCode, Depth, Fingerprint, ChildIndex};
+                        ok -> {ok, pub, Tag, KeyData, ChainCode, Depth, Fingerprint, ChildIndex};
                         {error, _} = E -> E
                     end;
                 {error, _} = E -> E
             end;
-        {priv, _Net} ->
+        {priv, Tag} ->
             case validate_xkey_structure(Depth, Fingerprint, ChildIndex) of
                 ok ->
                     case KeyData of
                         <<0, PrivKey:32/binary>> ->
                             case validate_xprv_keydata(PrivKey) of
                                 ok ->
-                                    {ok, priv, PrivKey, ChainCode,
+                                    {ok, priv, Tag, PrivKey, ChainCode,
                                      Depth, Fingerprint, ChildIndex};
                                 {error, _} = E -> E
                             end;
@@ -1259,10 +1299,18 @@ decode_xkey_body(Version, Depth, Fingerprint, ChildIndex, ChainCode, KeyData) ->
             end
     end.
 
-classify_xkey_version(<<16#04, 16#88, 16#b2, 16#1e>>) -> {pub, mainnet};
-classify_xkey_version(<<16#04, 16#88, 16#ad, 16#e4>>) -> {priv, mainnet};
-classify_xkey_version(<<16#04, 16#35, 16#87, 16#cf>>) -> {pub, testnet};
-classify_xkey_version(<<16#04, 16#35, 16#83, 16#94>>) -> {priv, testnet};
+classify_xkey_version(?MAINNET_XPUB) -> {pub,  {p2pkh,       mainnet}};
+classify_xkey_version(?MAINNET_XPRV) -> {priv, {p2pkh,       mainnet}};
+classify_xkey_version(?TESTNET_TPUB) -> {pub,  {p2pkh,       testnet}};
+classify_xkey_version(?TESTNET_TPRV) -> {priv, {p2pkh,       testnet}};
+classify_xkey_version(?MAINNET_YPUB) -> {pub,  {p2sh_p2wpkh, mainnet}};
+classify_xkey_version(?MAINNET_YPRV) -> {priv, {p2sh_p2wpkh, mainnet}};
+classify_xkey_version(?MAINNET_ZPUB) -> {pub,  {p2wpkh,      mainnet}};
+classify_xkey_version(?MAINNET_ZPRV) -> {priv, {p2wpkh,      mainnet}};
+classify_xkey_version(?TESTNET_UPUB) -> {pub,  {p2sh_p2wpkh, testnet}};
+classify_xkey_version(?TESTNET_UPRV) -> {priv, {p2sh_p2wpkh, testnet}};
+classify_xkey_version(?TESTNET_VPUB) -> {pub,  {p2wpkh,      testnet}};
+classify_xkey_version(?TESTNET_VPRV) -> {priv, {p2wpkh,      testnet}};
 classify_xkey_version(_) -> unknown.
 
 %% Core CExtPubKey::Decode (pubkey.cpp:235-243): depth=0 master keys MUST
@@ -1298,7 +1346,22 @@ validate_xprv_keydata(PrivKey) when byte_size(PrivKey) =:= 32 ->
         {error, _} -> {error, invalid_xprv_scalar}
     end.
 
-%% Decode base58 string to raw bytes (no version/checksum handling)
+%% Decode base58 string to raw bytes (no version/checksum handling).
+%%
+%% Defensive DoS guard: the Acc*58+Val accumulator in decode_base58_chars/3
+%% grows as an Erlang bignum; a multi-megabyte input would burn O(n²) CPU/RAM
+%% before the downstream byte_size check in decode_xkey/1 rejects it. Cap
+%% inputs at 120 chars — well above the 111-char base58check encoding of an
+%% 82-byte xpub/xprv payload — and reject longer strings immediately. Not
+%% currently reachable through the RPC layer (cowboy enforces body limits)
+%% but cheap defence-in-depth against future callers that hand untrusted
+%% strings straight to this decoder.
+-define(BASE58_RAW_MAX_LEN, 120).
+
+decode_base58_raw(Str) when is_list(Str), length(Str) > ?BASE58_RAW_MAX_LEN ->
+    {error, base58_too_long};
+decode_base58_raw(Str) when is_binary(Str), byte_size(Str) > ?BASE58_RAW_MAX_LEN ->
+    {error, base58_too_long};
 decode_base58_raw(Str) ->
     Alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz",
     {LeadingOnes, Rest} = count_leading_ones(Str),
