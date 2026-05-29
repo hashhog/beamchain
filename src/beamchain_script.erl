@@ -2632,17 +2632,42 @@ verify_witness_program(0, Program, Witness, Flags, SigChecker, _IsP2SH)
                     case byte_size(WitnessScript) > ?MAX_SCRIPT_SIZE of
                         true -> {error, witness_script_too_large};
                         false ->
-                            %% Reverse stack items: wire order is bottom-to-top,
-                            %% but our list HEAD = top of stack
-                            case eval_script(WitnessScript, lists:reverse(StackItems),
-                                           Flags, SigChecker, witness_v0) of
-                                {ok, [Top]} ->
-                                    case script_bool(Top) of
-                                        true -> {ok, [Top]};
-                                        false -> {error, witness_program_failed}
-                                    end;
-                                {ok, _} -> {error, witness_cleanstack};
-                                {error, _} = E -> E
+                            %% Core (interpreter.cpp:1858-1861) gate inside
+                            %% ExecuteWitnessScript: every element of the
+                            %% INITIAL witness stack (i.e. all items remaining
+                            %% after the witness script is popped off the back)
+                            %% must be <= MAX_SCRIPT_ELEMENT_SIZE (520 bytes),
+                            %% else SCRIPT_ERR_PUSH_SIZE. This runs for ALL
+                            %% witness sigversions including WITNESS_V0 (P2WSH);
+                            %% only the TAPSCRIPT MAX_STACK_SIZE check above it
+                            %% is tapscript-gated. Was missing here — a
+                            %% witness-supplied 521+ byte P2WSH stack element
+                            %% bypassed the gate (false-accept).
+                            case lists:any(
+                                   fun(E) ->
+                                       byte_size(E) > ?MAX_SCRIPT_ELEMENT_SIZE
+                                   end, StackItems) of
+                                true ->
+                                    {error, push_size_exceeded};
+                                false ->
+                                    %% Reverse stack items: wire order is
+                                    %% bottom-to-top, but our list HEAD = top
+                                    %% of stack
+                                    case eval_script(WitnessScript,
+                                                     lists:reverse(StackItems),
+                                                     Flags, SigChecker,
+                                                     witness_v0) of
+                                        {ok, [Top]} ->
+                                            case script_bool(Top) of
+                                                true -> {ok, [Top]};
+                                                false ->
+                                                    {error,
+                                                     witness_program_failed}
+                                            end;
+                                        {ok, _} ->
+                                            {error, witness_cleanstack};
+                                        {error, _} = E -> E
+                                    end
                             end
                     end;
                 false ->
