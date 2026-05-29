@@ -78,16 +78,23 @@ params(mainnet) ->
         %% check, matching on both height AND block hash.
         %% 91842 and 91880 are the REPEAT blocks; 91722 and 91812 are the
         %% ORIGINALS (whose coinbases were overwritten — never in UTXO set).
+        %% INTERNAL byte order (display_hex_to_bin): compared against
+        %% beamchain_serialize:block_hash/1 (raw hash256, internal LE) at the
+        %% BIP30 check (beamchain_validation.erl:1101). hex_to_bin left these in
+        %% display order so `BlockHash =:= ExHash` never matched -> BIP30 stayed
+        %% enforced at 91842 -> forward-sync stalled at 91841 (W149 byte-order bug).
         bip30_exceptions => [
-            {91842, hex_to_bin("00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec")},
-            {91880, hex_to_bin("00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721")}
+            {91842, display_hex_to_bin("00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec")},
+            {91880, display_hex_to_bin("00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721")}
         ],
 
         %% BIP34 canonical activation hash.  Bitcoin Core checks this via
         %% pindexBIP34height->GetBlockHash() == BIP34Hash (validation.cpp:2462)
         %% to confirm we are on the known canonical chain before skipping
         %% BIP30 checks above the BIP34 activation height.
-        bip34_hash => hex_to_bin(
+        %% INTERNAL byte order (display_hex_to_bin): compared against the block
+        %% index hash at bip34_height (block_hash/1, internal LE) in Gate (b).
+        bip34_hash => display_hex_to_bin(
             "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8"),
 
         %% address encoding
@@ -533,6 +540,14 @@ mainnet_assumeutxo() ->
             utxo_hash => display_hex_to_bin(
                 "e4b90ef9eae834f56c4b64d2d50143cee10ad87994c614d7d04125e2a6025050"),
             chain_tx_count => 1305397408
+        },
+        %% Block 944,183
+        944183 => #{
+            block_hash => display_hex_to_bin(
+                "0000000000000000000146180a1603839d0e9ac6c00d17a5ab45323398ced817"),
+            utxo_hash => display_hex_to_bin(
+                "2eaf71725669a83c1c7947517b84c09b0d65f4e7c813087c74840320bcbc88a8"),
+            chain_tx_count => 1334000000
         }
     }.
 
