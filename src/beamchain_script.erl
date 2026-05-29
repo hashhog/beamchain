@@ -42,11 +42,22 @@
     exec_stack = []   :: [boolean()],   %% IF/ELSE nesting
     op_count = 0      :: non_neg_integer(),
     codesep_pos = 16#ffffffff :: non_neg_integer(),
+    %% BYTE offset into `script` of the first byte AFTER the most-recently
+    %% executed OP_CODESEPARATOR. Mirrors Core's `pbegincodehash` iterator
+    %% (interpreter.cpp:422 init = script.begin(); :1054 pbegincodehash = pc,
+    %% where `pc` already points just past the codesep byte). Used by the
+    %% LEGACY (BASE) and WITNESS_V0 sighash builders to slice scriptCode =
+    %% CScript(pbegincodehash, pend). Default 0 = no codesep executed, so the
+    %% whole script is the scriptCode (subscript_from_codesep/2 sentinel).
+    %% This is DISTINCT from `codesep_pos` (the 0-based opcode INDEX the
+    %% BIP-341 tapscript sigmsg commits to); the two are not interchangeable
+    %% because one is a byte offset and the other an opcode count.
+    codesep_byte = 0  :: non_neg_integer(),
     %% BIP-341: 0-based opcode index counter.  Mirrors Core's `opcode_pos`
     %% (interpreter.cpp:433, incremented at the top of the for-loop).
     %% Used by OP_CODESEPARATOR to record the position committed to the
     %% tapscript sigmsg (interpreter.cpp:1055, 1565).  Counts every opcode
-    %% including push-data ops; unlike `codesep_pos` (byte offset used for
+    %% including push-data ops; unlike `codesep_byte` (byte offset used for
     %% legacy scriptCode slicing), this is always the opcode index.
     opcode_pos = 0    :: non_neg_integer(),
     flags = 0         :: non_neg_integer(),
@@ -1475,13 +1486,31 @@ execute_codesep(Rest, Pos, State) ->
                              ?SCRIPT_VERIFY_CONST_SCRIPTCODE) =/= 0 ->
                             {error, op_codeseparator_in_legacy};
                         _ ->
-                            %% BIP-341: codesep_pos = 0-based opcode index.
-                            %% State1#script_state.opcode_pos was already
+                            %% TWO distinct positions are recorded here,
+                            %% mirroring Core interpreter.cpp:1053-1055:
+                            %%   pbegincodehash = pc;            (byte offset)
+                            %%   execdata.m_codeseparator_pos = opcode_pos;
+                            %%
+                            %% (1) codesep_byte = BYTE offset of the first
+                            %% byte AFTER this OP_CODESEPARATOR. `Pos` here is
+                            %% exactly that: the catch-all dispatch advanced it
+                            %% to `byte_of_codesep + 1` (execute_remaining
+                            %% calls execute_codesep(Rest, Pos+1, ...)), which
+                            %% equals Core's `pc` after GetOp consumed the
+                            %% codesep byte. Used by the LEGACY (with
+                            %% FindAndDelete) and WITNESS_V0 (slice
+                            %% witnessScript) sighash builders.
+                            %%
+                            %% (2) codesep_pos = 0-based opcode INDEX for the
+                            %% BIP-341 tapscript sigmsg. opcode_pos was already
                             %% incremented once by inc_opcode_pos in the
-                            %% catchall execute/3 clause, so the current
-                            %% opcode's index is opcode_pos - 1.
+                            %% catch-all execute/3 clause, so the current
+                            %% opcode's index is opcode_pos - 1. (Unchanged —
+                            %% must NOT regress tapscript codesep commitment.)
                             CodesepIdx = State1#script_state.opcode_pos - 1,
-                            State2 = State1#script_state{codesep_pos = CodesepIdx},
+                            State2 = State1#script_state{
+                                codesep_pos = CodesepIdx,
+                                codesep_byte = Pos},
                             execute(Rest, Pos, State2)
                     end
             end;
@@ -1506,6 +1535,55 @@ do_checksig(Rest, Pos, #script_state{sig_version = tapscript} = State) ->
     do_checksig_tapscript(Rest, Pos, State);
 do_checksig(Rest, Pos, State) ->
     do_checksig_ecdsa(Rest, Pos, State).
+
+%% Prepare the scriptCode for an ECDSA (BASE/WITNESS_V0) CHECKSIG, exactly
+%% as Core EvalChecksigPreTapscript (interpreter.cpp:325-339):
+%%   1. scriptCode = CScript(pbegincodehash, pend)  — slice at codesep BYTE
+%%   2. (BASE only) FindAndDelete(scriptCode, <push sig>); if any deletion
+%%      occurred AND CONST_SCRIPTCODE is set, reject (sig_findanddelete).
+%% The result is the FINAL subscript over which the sighash is taken. We
+%% stash it back in `script` and clear `codesep_byte` so the downstream
+%% `compute_sig_hash` consumes the prepared subscript verbatim
+%% (subscript_from_codesep(S, 0) -> S).
+%%
+%% For WITNESS_V0 there is no FindAndDelete (Core only deletes for BASE), but
+%% the scriptCode IS still sliced at codesep_byte — we leave `script` +
+%% `codesep_byte` untouched so compute_sig_hash slices the witnessScript
+%% itself (the witness_v0 sighash uses the program/witnessScript, sliced).
+checksig_prepare_scriptcode(#script_state{sig_version = base,
+                                          script = FullScript,
+                                          codesep_byte = CodesepByte} = State,
+                            Sig, Flags) ->
+    SubScript0 = subscript_from_codesep(FullScript, CodesepByte),
+    SubScript1 = find_and_delete(SubScript0, Sig),
+    case SubScript1 =/= SubScript0 andalso
+         (Flags band ?SCRIPT_VERIFY_CONST_SCRIPTCODE) =/= 0 of
+        true  -> {error, sig_findanddelete};
+        false -> {ok, State#script_state{script = SubScript1, codesep_byte = 0}}
+    end;
+checksig_prepare_scriptcode(State, _Sig, _Flags) ->
+    %% witness_v0 (and any non-base): no FindAndDelete; compute_sig_hash will
+    %% slice `script` at codesep_byte for the witness_v0 sighash.
+    {ok, State}.
+
+%% CHECKMULTISIG variant: same scriptCode preparation as
+%% checksig_prepare_scriptcode but FindAndDelete EACH of the multisig sigs
+%% (Core interpreter.cpp:1139-1149). Slice at codesep_byte first, then
+%% FindAndDelete on the slice, then stash + clear codesep_byte.
+checkmultisig_prepare_scriptcode(#script_state{sig_version = base,
+                                               script = FullScript,
+                                               codesep_byte = CodesepByte} = State,
+                                 Sigs, Flags) ->
+    SubScript0 = subscript_from_codesep(FullScript, CodesepByte),
+    SubScript1 = lists:foldl(
+        fun(S, Sc) -> find_and_delete(Sc, S) end, SubScript0, Sigs),
+    case SubScript1 =/= SubScript0 andalso
+         (Flags band ?SCRIPT_VERIFY_CONST_SCRIPTCODE) =/= 0 of
+        true  -> {error, sig_findanddelete};
+        false -> {ok, State#script_state{script = SubScript1, codesep_byte = 0}}
+    end;
+checkmultisig_prepare_scriptcode(State, _Sigs, _Flags) ->
+    {ok, State}.
 
 do_checksig_ecdsa(Rest, Pos, State) ->
     %% pop2 returns {ok, deeper, top, State} — deeper=Sig, top=PubKey
@@ -1535,22 +1613,15 @@ do_checksig_ecdsa(Rest, Pos, State) ->
                             case check_sig_encoding(SigBody, HashTypeByte, PubKey, Flags) of
                                 {error, _} = E -> E;
                                 ok ->
-                                    %% FindAndDelete: for legacy scripts, remove the
-                                    %% signature from the scriptCode before computing sighash.
-                                    %% CONST_SCRIPTCODE (interpreter.cpp:329-332): if any
-                                    %% deletion occurred, reject with sig_findanddelete.
-                                    State2Result = case State1#script_state.sig_version of
-                                        base ->
-                                            OldScript = State1#script_state.script,
-                                            S2 = find_and_delete(OldScript, Sig),
-                                            case S2 =/= OldScript andalso
-                                                 (Flags band ?SCRIPT_VERIFY_CONST_SCRIPTCODE) =/= 0 of
-                                                true  -> {error, sig_findanddelete};
-                                                false -> {ok, State1#script_state{script = S2}}
-                                            end;
-                                        _ ->
-                                            {ok, State1}
-                                    end,
+                                    %% Core EvalChecksigPreTapscript
+                                    %% (interpreter.cpp:325-332): scriptCode =
+                                    %% CScript(pbegincodehash, pend) — sliced
+                                    %% at the last codesep BYTE offset FIRST —
+                                    %% and only THEN FindAndDelete(<push sig>).
+                                    %% CONST_SCRIPTCODE: if any deletion
+                                    %% occurred, reject with sig_findanddelete.
+                                    State2Result = checksig_prepare_scriptcode(
+                                        State1, Sig, Flags),
                                     case State2Result of
                                         {error, _} = FadErr -> FadErr;
                                         {ok, State2} ->
@@ -1771,20 +1842,12 @@ do_checksig_result(State, Pos) ->
                             case check_sig_encoding(SigBody, HashTypeByte, PubKey, Flags) of
                                 {error, _} = E -> E;
                                 ok ->
-                                    %% FindAndDelete for legacy scripts.
+                                    %% Slice scriptCode at the last codesep
+                                    %% BYTE offset FIRST, then FindAndDelete on
+                                    %% the slice (Core interpreter.cpp:325-332).
                                     %% CONST_SCRIPTCODE: reject if deletion occurred.
-                                    State2Result = case State1#script_state.sig_version of
-                                        base ->
-                                            OldScript2 = State1#script_state.script,
-                                            S2 = find_and_delete(OldScript2, Sig),
-                                            case S2 =/= OldScript2 andalso
-                                                 (Flags band ?SCRIPT_VERIFY_CONST_SCRIPTCODE) =/= 0 of
-                                                true  -> {error, sig_findanddelete};
-                                                false -> {ok, State1#script_state{script = S2}}
-                                            end;
-                                        _ ->
-                                            {ok, State1}
-                                    end,
+                                    State2Result = checksig_prepare_scriptcode(
+                                        State1, Sig, Flags),
                                     case State2Result of
                                         {error, _} = FadErr2 -> FadErr2;
                                         {ok, State2} ->
@@ -1939,28 +2002,13 @@ do_checkmultisig_eval(State, Pos) ->
                                                          Dummy =/= <<>> of
                                                         true -> {error, nulldummy_failed};
                                                         false ->
-                                                            %% FindAndDelete: for legacy scripts, remove
-                                                            %% all sigs from the scriptCode before verifying.
-                                                            %% CONST_SCRIPTCODE (interpreter.cpp:1145-1149):
-                                                            %% reject if any deletion occurred.
-                                                            case (fun() ->
-                                                                case State6#script_state.sig_version of
-                                                                    base ->
-                                                                        OrigScript = State6#script_state.script,
-                                                                        CleanedScript = lists:foldl(
-                                                                            fun(S, Sc) -> find_and_delete(Sc, S) end,
-                                                                            OrigScript,
-                                                                            Sigs),
-                                                                        case CleanedScript =/= OrigScript andalso
-                                                                             (Flags band ?SCRIPT_VERIFY_CONST_SCRIPTCODE) =/= 0 of
-                                                                            true  -> {error, sig_findanddelete};
-                                                                            false ->
-                                                                                {ok, State6#script_state{script = CleanedScript}}
-                                                                        end;
-                                                                    _ ->
-                                                                        {ok, State6}
-                                                                end
-                                                            end)() of
+                                                            %% Core (interpreter.cpp:1139-1149):
+                                                            %% scriptCode = CScript(pbegincodehash, pend)
+                                                            %% sliced at the codesep BYTE offset FIRST,
+                                                            %% then (BASE only) FindAndDelete each sig.
+                                                            %% CONST_SCRIPTCODE: reject on any deletion.
+                                                            case checkmultisig_prepare_scriptcode(
+                                                                     State6, Sigs, Flags) of
                                                                 {error, _} = FadErr3 -> FadErr3;
                                                                 {ok, State7} ->
                                                                     Result = verify_multisig_sigs(
@@ -2318,9 +2366,12 @@ compute_sig_hash(#script_state{sig_checker = #{compute_sighash := Fun}},
 compute_sig_hash(#script_state{sig_checker = {Tx, InputIndex, Amount, _PrevOuts},
                                sig_version = SigVersion,
                                script = Script,
-                               codesep_pos = CodesepPos},
+                               codesep_byte = CodesepByte},
                  HashType, _Pos) ->
-    ScriptCode = subscript_from_codesep(Script, CodesepPos),
+    %% scriptCode = CScript(pbegincodehash, pend): slice at the BYTE offset
+    %% recorded by the last executed OP_CODESEPARATOR (Core
+    %% interpreter.cpp:326). codesep_byte, NOT codesep_pos (opcode index).
+    ScriptCode = subscript_from_codesep(Script, CodesepByte),
     case SigVersion of
         witness_v0 ->
             sighash_witness_v0(Tx, InputIndex, ScriptCode, Amount, HashType);
@@ -2330,9 +2381,9 @@ compute_sig_hash(#script_state{sig_checker = {Tx, InputIndex, Amount, _PrevOuts}
 compute_sig_hash(#script_state{sig_checker = {Tx, InputIndex, Amount},
                                sig_version = SigVersion,
                                script = Script,
-                               codesep_pos = CodesepPos},
+                               codesep_byte = CodesepByte},
                  HashType, _Pos) ->
-    ScriptCode = subscript_from_codesep(Script, CodesepPos),
+    ScriptCode = subscript_from_codesep(Script, CodesepByte),
     case SigVersion of
         witness_v0 ->
             sighash_witness_v0(Tx, InputIndex, ScriptCode, Amount, HashType);
