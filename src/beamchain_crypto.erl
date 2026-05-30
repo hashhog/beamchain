@@ -918,8 +918,18 @@ validate_der_int(_) ->
 strip_sign_byte(<<0, Rest/binary>>) when byte_size(Rest) > 0 -> Rest;
 strip_sign_byte(Bin) -> Bin.
 
-%% Encode a positive integer as a DER integer element
-encode_der_int(Bin) ->
+%% Encode a positive integer as a *canonical* DER integer element:
+%% strip any leading zero bytes to the minimal magnitude, then prepend a
+%% single 0x00 iff the high bit is set.  The strip is load-bearing for
+%% consensus: normalize_s/1 returns a fixed-width (byte_size(S)) encoding of
+%% N - S, which carries leading zero byte(s) when the high-S value S is near
+%% the curve order N.  Without stripping, encode_der_int would emit a
+%% non-canonical DER integer (unnecessary leading 0x00), and the verify NIF's
+%% strict secp256k1_ecdsa_signature_parse_der rejects it -> a valid high-S
+%% signature is false-rejected (Bitcoin Core's CPubKey::Verify normalizes S
+%% and re-serializes canonically regardless of the LOW_S policy flag).
+encode_der_int(Bin0) ->
+    Bin = strip_leading_zeros(Bin0),
     Padded = case Bin of
         <<B, _/binary>> when B >= 16#80 -> <<0, Bin/binary>>;
         _ -> Bin
