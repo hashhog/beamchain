@@ -157,6 +157,28 @@ parse_args(["--datadir", Value | Rest], Cmd, Opts) ->
 parse_args(["--datadir=" ++ Value | Rest], Cmd, Opts) ->
     parse_args(Rest, Cmd, Opts#{datadir => Value});
 
+%% --connect=<ip:port> (repeatable): connect ONLY to the listed peer(s).
+%% Mirrors bitcoin-core -connect: when set, DNS seed resolution and the
+%% addrman/auto-outbound dialing loop are disabled, and the node dials
+%% (and reconnects) only the pinned peer(s). Accumulates into a list so
+%% multiple --connect flags pin multiple peers. Equivalent to clearbit's
+%% dedicated connect branch (peer.zig:7009) + connect_address==null gate
+%% on the outbound-fill loop (peer.zig:7050).
+parse_args(["--connect", Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, append_connect(Value, Opts));
+parse_args(["--connect=" ++ Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, append_connect(Value, Opts));
+
+%% --nodnsseed / --dnsseed=0: suppress DNS seed resolution independently
+%% of --connect. Mirrors bitcoin-core -dnsseed=0 / clearbit --nodnsseed
+%% (sets dns_seed=false). --dnsseed=1 re-enables (the default).
+parse_args(["--nodnsseed" | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{nodnsseed => true});
+parse_args(["--dnsseed=" ++ Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{nodnsseed => not parse_bool(Value)});
+parse_args(["--dnsseed", Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{nodnsseed => not parse_bool(Value)});
+
 parse_args(["--rpc-port", Value | Rest], Cmd, Opts) ->
     parse_args(Rest, Cmd, Opts#{rpc_port => list_to_integer(Value)});
 parse_args(["--rpc-port=" ++ Value | Rest], Cmd, Opts) ->
@@ -298,6 +320,10 @@ print_usage() ->
         "  --conf=<file>     config file (default: <datadir>/beamchain.conf)~n"
         "  --rpc-port=<n>    rpc port override~n"
         "  --p2p-port=<n>    p2p port override~n"
+        "  --connect=<ip:port>  connect ONLY to this peer (repeatable);~n"
+        "                    disables DNS seeds + addrman auto-outbound~n"
+        "                    (Core -connect semantics)~n"
+        "  --nodnsseed       do not resolve DNS seeds (alias --dnsseed=0)~n"
         "  --pid=<file>      pid file path (default: <datadir>/beamchain.pid)~n"
         "  --daemon          fork into the background after starting~n"
         "  --printtoconsole  also write log lines to stdout~n"
@@ -704,6 +730,23 @@ apply_opts(Opts) ->
         undefined -> ok;
         P2pPort -> application:set_env(beamchain, p2pport, P2pPort, [{persistent, true}])
     end,
+    %% --connect=<ip:port> (repeatable): pin outbound connections to ONLY
+    %% these peers and disable DNS + addrman auto-outbound (Core -connect
+    %% semantics). Promoted to application env so beamchain_peer_manager's
+    %% init/1 reads it directly (same env path as p2pport above).
+    case maps:get(connect, Opts, undefined) of
+        undefined -> ok;
+        []        -> ok;
+        Connect when is_list(Connect) ->
+            application:set_env(beamchain, connect, Connect, [{persistent, true}])
+    end,
+    %% --nodnsseed / --dnsseed=0: suppress DNS seed resolution independently
+    %% of --connect.
+    case maps:get(nodnsseed, Opts, undefined) of
+        undefined -> ok;
+        true  -> application:set_env(beamchain, nodnsseed, true,  [{persistent, true}]);
+        false -> application:set_env(beamchain, nodnsseed, false, [{persistent, true}])
+    end,
     %% W119 FIX-64: TLS termination paths. Promoted to application env
     %% so beamchain_config:init/1 can mirror them into the ETS table
     %% (same path the rpcport / p2pport overrides take).
@@ -786,6 +829,13 @@ apply_opts(Opts) ->
         TP when is_list(TP) -> os:putenv("BEAMCHAIN_TORPASSWORD", TP)
     end,
     ok.
+
+%% Accumulate a --connect=<ip:port> value into the opts map. Repeatable:
+%% each flag appends to a list (preserving order). Stored as raw strings;
+%% the peer manager resolves/parses them at init time.
+append_connect(Value, Opts) ->
+    Existing = maps:get(connect, Opts, []),
+    Opts#{connect => Existing ++ [Value]}.
 
 %% Parse the --cfilter=<N> argument.  Accepts integer-as-string only;
 %% defers to apply_opts/1 for range validation so we surface a single
