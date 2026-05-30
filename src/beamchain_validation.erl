@@ -8,6 +8,11 @@
 %% Context-free checks
 -export([check_transaction/1]).
 -export([check_block_header/2, check_block/2]).
+%% CVE-2012-2459 merkle-mutation predicate (Core merkle.cpp:46-63 port).
+%% Exported so the phaseb merkleroot shim drives the REAL check rather
+%% than a divergent mirror; check_block/2 itself routes through
+%% check_merkle_malleation/1 which calls this.
+-export([merkle_mutated/1]).
 
 %% Contextual checks (need chain state)
 -export([contextual_check_block_header/3]).
@@ -758,25 +763,50 @@ check_no_dup_txids([Txid | Rest], Seen) ->
 check_merkle_malleation([]) -> ok;
 check_merkle_malleation([_]) -> ok;
 check_merkle_malleation(Hashes) ->
-    check_merkle_malleation_level(Hashes).
-
-check_merkle_malleation_level([_]) -> ok;
-check_merkle_malleation_level([]) -> ok;
-check_merkle_malleation_level(Hashes) ->
-    Len = length(Hashes),
-    case Len rem 2 =:= 1 andalso Len >= 2 of
-        true ->
-            Last = lists:last(Hashes),
-            SecondLast = lists:nth(Len - 1, Hashes),
-            case Last =:= SecondLast of
-                true -> throw(mutated_merkle);
-                false -> ok
-            end;
+    case merkle_mutated(Hashes) of
+        true  -> throw(mutated_merkle);
         false -> ok
-    end,
-    %% check next level up
-    NextLevel = merkle_pairs_check(Hashes),
-    check_merkle_malleation_level(NextLevel).
+    end.
+
+%% @doc CVE-2012-2459 detection — exact port of Bitcoin Core's
+%% ComputeMerkleRoot(std::vector<uint256> hashes, bool* mutated)
+%% (bitcoin-core/src/consensus/merkle.cpp:46-63).
+%%
+%% Core, at the TOP of every level-collapse iteration and BEFORE the
+%% odd-tail duplication, scans every COMPLETE adjacent pair:
+%%     for (pos = 0; pos + 1 < hashes.size(); pos += 2)
+%%         if (hashes[pos] == hashes[pos + 1]) mutation = true;
+%% then, if the level size is odd, duplicates the last element
+%% (push_back(hashes.back())), then hashes the pairs and shrinks.
+%%
+%% The lone trailing element at an odd level is intentionally NOT compared
+%% at this level (pos+1<size excludes it) — but once it is duplicated it
+%% becomes an identical adjacent pair caught on the NEXT level's scan.
+%%
+%% This is strictly wider than the previous beamchain check (which only
+%% compared the LAST two entries at an ODD level), and so catches the
+%% leaf-duplication form of the attack (an odd-N honest block whose last
+%% tx is duplicated to an even-N mutated block — the duplicated pair sits
+%% mid-list, not at an odd tail). Scanning complete pairs only and BEFORE
+%% the odd-dup is essential: an honest odd-N level must NOT false-positive
+%% on its (un-duplicated) trailing element.
+merkle_mutated(Hashes) -> merkle_mutated_level(Hashes, false).
+
+%% Terminate once the level has collapsed to <= 1 element (Core's
+%% `while (hashes.size() > 1)`), returning the accumulated mutation flag.
+merkle_mutated_level([], Mutation)  -> Mutation;
+merkle_mutated_level([_], Mutation) -> Mutation;
+merkle_mutated_level(Hashes, Mutation0) ->
+    %% (1) scan complete adjacent pairs BEFORE any odd-tail duplication.
+    Mutation = Mutation0 orelse scan_adjacent_pairs(Hashes),
+    %% (2) collapse this level (odd tail duplicated inside merkle_pairs_check).
+    merkle_mutated_level(merkle_pairs_check(Hashes), Mutation).
+
+%% Mirror of Core's `for (pos=0; pos+1<size; pos+=2) if (h[pos]==h[pos+1])`.
+%% Only COMPLETE pairs are examined; a lone trailing element is skipped.
+scan_adjacent_pairs([A, A | _Rest]) -> true;
+scan_adjacent_pairs([_A, _B | Rest]) -> scan_adjacent_pairs(Rest);
+scan_adjacent_pairs(_) -> false.
 
 merkle_pairs_check([]) -> [];
 merkle_pairs_check([A]) ->
