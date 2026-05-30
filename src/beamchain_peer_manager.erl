@@ -28,6 +28,7 @@
 %%   called from check_inbound_internal which dialyzer may still flag as dead
 %%   because it cascades from the find_peer_by_address analysis.
 -dialyzer({nowarn_function, [try_anchor_connections/1,
+                              connect_pinned_peers/2,
                               attempt_connection/3,
                               check_inbound_internal/2,
                               has_netgroup_diversity/2,
@@ -219,7 +220,19 @@
     %% operate normally.
     dns_warmup_done = false :: boolean(),
     %% Timer for periodic ASMap health check (every 3600 s)
-    asmap_health_timer :: reference() | undefined
+    asmap_health_timer :: reference() | undefined,
+    %% -connect peer pinning (Bitcoin Core -connect / clearbit --connect).
+    %% When non-empty the node connects to ONLY these addresses and:
+    %%   * DNS seed resolution is skipped (bootstrap + connect_tick fallback),
+    %%   * the addrman/auto-outbound fill loop is disabled
+    %%     (maybe_open_connection is a no-op; only the pinned peers are
+    %%     (re)dialed). Mirrors clearbit's connect_address==null gate
+    %%     (peer.zig:7050). Empty list = normal discovery behavior.
+    connect_addrs = [] :: [{inet:ip_address(), inet:port_number()}],
+    %% -nodnsseed / -dnsseed=0: suppress DNS seed resolution independently
+    %% of -connect (Core -dnsseed=0 / clearbit --nodnsseed). Implied true
+    %% whenever connect_addrs is non-empty.
+    no_dns_seed = false :: boolean()
 }).
 
 %%% ===================================================================
@@ -612,6 +625,20 @@ init([]) ->
                                          asmap_health_check),
     Now = erlang:system_time(second),
     MaxInbound = beamchain_config:get(max_inbound, ?MAX_INBOUND_DEFAULT),
+    %% -connect / -nodnsseed (Core peer-pinning). Read straight from the
+    %% application env, the same path beamchain_cli:apply_opts/1 writes to.
+    ConnectAddrs = load_connect_addrs(),
+    NoDnsSeed0 = application:get_env(beamchain, nodnsseed, false) =:= true,
+    %% -connect implies -dnsseed=0 (Core init.cpp). Force DNS off whenever
+    %% the connect list is non-empty.
+    NoDnsSeed = NoDnsSeed0 orelse ConnectAddrs =/= [],
+    case ConnectAddrs of
+        [] when NoDnsSeed -> logger:info("peer manager: DNS seeds disabled (-nodnsseed)");
+        [] -> ok;
+        _  -> logger:info("peer manager: -connect pinning to ~B peer(s); "
+                          "DNS seeds + addrman auto-outbound disabled: ~p",
+                          [length(ConnectAddrs), ConnectAddrs])
+    end,
     {ok, #state{our_nonce = Nonce, connect_timer = Timer,
                 listen_socket = ListenSock, acceptor = Acceptor,
                 max_inbound = MaxInbound, anchors = Anchors,
@@ -620,7 +647,9 @@ init([]) ->
                 last_tip_update = Now,
                 stale_tip_timer = StaleTipTimer,
                 periodic_header_timer = PeriodicHdrTimer,
-                asmap_health_timer = AsmapHealthTimer}}.
+                asmap_health_timer = AsmapHealthTimer,
+                connect_addrs = ConnectAddrs,
+                no_dns_seed = NoDnsSeed}}.
 
 handle_call({connect_to, IP, Port}, _From, State) ->
     Address = {IP, Port},
@@ -700,6 +729,11 @@ handle_cast({disconnect_peer, Pid}, State) ->
     end,
     {noreply, State};
 
+handle_cast(resolve_dns_seeds, #state{no_dns_seed = true} = State) ->
+    %% DNS seeds suppressed by -nodnsseed / -connect. Defense-in-depth: any
+    %% caller (bootstrap, connect_tick fallback, low-peers re-trigger) is a
+    %% no-op so we never resolve seeds in pinned/no-DNS mode.
+    {noreply, State};
 handle_cast(resolve_dns_seeds, #state{dns_pending = true} = State) ->
     %% Already resolving, skip
     {noreply, State};
@@ -790,17 +824,35 @@ handle_info({peer_banned, Pid, Address}, State) ->
     Banned2 = maps:put(Address, BanUntil, State2#state.banned),
     {noreply, State2#state{banned = Banned2}};
 
+%% Bootstrap: -connect mode — dial ONLY the pinned peers, no DNS, no
+%% anchors, no addrman discovery. Mirrors clearbit's dedicated connect
+%% branch (peer.zig:7009) which skips dnsSeeds() entirely.
+handle_info(bootstrap, #state{connect_addrs = [_ | _] = Pinned} = State) ->
+    State2 = connect_pinned_peers(Pinned, State),
+    %% Release the connect_tick loop immediately so dropped pinned peers
+    %% get re-dialed (maybe_open_connection is gated to redial-only below).
+    Timer = erlang:send_after(?CONNECT_INTERVAL_FAST, self(), connect_tick),
+    {noreply, State2#state{dns_warmup_done = true, connect_timer = Timer}};
+
 %% Bootstrap: resolve DNS seeds and load from addrman on first start
 handle_info(bootstrap, State) ->
     %% First try anchor connections
     State2 = try_anchor_connections(State),
-    %% Always trigger DNS seed resolution on startup, regardless of the
-    %% current addrman count. A stale-but-large peers.dets can mask the
+    %% Trigger DNS seed resolution on startup unless suppressed by
+    %% -nodnsseed / -dnsseed=0. A stale-but-large peers.dets can mask the
     %% fact that none of the persisted addresses still accept connections,
     %% so we warm the pool with fresh seeds on every cold start and gate
     %% the connect_tick loop on the first resolution completing.
-    gen_server:cast(self(), resolve_dns_seeds),
-    {noreply, State2};
+    case State2#state.no_dns_seed of
+        true ->
+            %% No DNS: release the connect_tick loop now so addrman /
+            %% anchors / persisted peers can still be dialed.
+            Timer = erlang:send_after(?CONNECT_INTERVAL, self(), connect_tick),
+            {noreply, State2#state{dns_warmup_done = true, connect_timer = Timer}};
+        false ->
+            gen_server:cast(self(), resolve_dns_seeds),
+            {noreply, State2}
+    end;
 
 %% Connection maintenance tick
 handle_info(connect_tick, State) ->
@@ -1062,6 +1114,78 @@ try_anchor_connections(#state{anchors = Anchors} = State) ->
         end
     end, State#state{anchors = []}, Anchors).
 
+%% @doc Read the -connect peer list from the application env (written by
+%% beamchain_cli:apply_opts/1) and resolve each "ip:port" / "ip" string to
+%% {IP, Port}. Unparseable / unresolvable entries are dropped with a
+%% warning. Returns [] when -connect is unset.
+load_connect_addrs() ->
+    case application:get_env(beamchain, connect, []) of
+        [] -> [];
+        Specs when is_list(Specs) ->
+            Params = beamchain_config:network_params(),
+            DefaultPort = Params#network_params.default_port,
+            lists:filtermap(
+              fun(Spec) -> parse_connect_spec(Spec, DefaultPort) end,
+              Specs)
+    end.
+
+parse_connect_spec(Spec, DefaultPort) when is_binary(Spec) ->
+    parse_connect_spec(binary_to_list(Spec), DefaultPort);
+parse_connect_spec(Spec, DefaultPort) when is_list(Spec) ->
+    {Host, Port} = case string:split(Spec, ":", trailing) of
+        [H, PortStr] ->
+            case catch list_to_integer(PortStr) of
+                P when is_integer(P), P > 0, P =< 65535 -> {H, P};
+                _ -> {Spec, DefaultPort}  %% colon but bad port: treat whole as host
+            end;
+        [H] ->
+            {H, DefaultPort}
+    end,
+    case inet:parse_address(Host) of
+        {ok, IP} ->
+            {true, {IP, Port}};
+        {error, _} ->
+            case inet:getaddr(Host, inet) of
+                {ok, IP} -> {true, {IP, Port}};
+                {error, _} ->
+                    logger:warning("peer manager: -connect cannot resolve ~p; "
+                                   "ignoring", [Spec]),
+                    false
+            end
+    end.
+
+%% @doc Dial every pinned -connect peer that is not already connected.
+%% Pinned peers are flagged manual=true so the eviction / ban paths never
+%% touch them (Core marks -connect peers ConnectionType::MANUAL). Banned
+%% pinned addresses are still dialed: -connect is an explicit operator
+%% override of discovery, not of consensus bans, so we honor the ban check
+%% via can_connect to stay consistent with addnode.
+connect_pinned_peers(Pinned, State) ->
+    lists:foldl(
+      fun(Address, S) ->
+          case find_peer_by_address(Address) of
+              {ok, _Pid} ->
+                  S;  %% already connected — nothing to do
+              error ->
+                  case can_connect(Address, S) of
+                      true ->
+                          case do_connect(Address, full_relay, true, S) of
+                              {ok, _Pid, S2} ->
+                                  logger:info("peer manager: -connect dialing "
+                                              "pinned peer ~p", [Address]),
+                                  S2;
+                              {error, Reason} ->
+                                  logger:debug("peer manager: -connect peer ~p "
+                                               "dial failed: ~p",
+                                               [Address, Reason]),
+                                  S
+                          end;
+                      false ->
+                          S
+                  end
+          end
+      end, State, Pinned).
+
 %%% ===================================================================
 %%% Internal: netgroup secret and keyed netgroup
 %%% ===================================================================
@@ -1086,6 +1210,12 @@ calculate_keyed_netgroup(Address, #state{netgroup_secret = Secret}) ->
 %%% Internal: outbound connection logic
 %%% ===================================================================
 
+%% -connect mode: never fill outbound slots from addrman/DNS. Only
+%% re-dial pinned peers that are not currently connected. Mirrors
+%% clearbit gating maintainOutbound() on connect_address==null
+%% (peer.zig:7050) while still reconnecting the manual/pinned peer.
+maybe_open_connection(#state{connect_addrs = [_ | _] = Pinned} = State) ->
+    connect_pinned_peers(Pinned, State);
 maybe_open_connection(State) ->
     Outbound = outbound_count(),
     Target = ?MAX_OUTBOUND_FULL_RELAY + ?MAX_BLOCK_RELAY_ONLY,
