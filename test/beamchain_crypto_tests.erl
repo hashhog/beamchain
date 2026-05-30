@@ -1032,3 +1032,43 @@ w95_batch_schnorr_verify_mixed_test() ->
     ?assert(R0),
     ?assert(R1),
     ?assertNot(R2).
+
+%%% ===================================================================
+%%% Regression: high-S normalization must re-encode as CANONICAL DER.
+%%%
+%%% LOW_S is policy-only, so consensus accepts high-S ECDSA sigs; Core's
+%%% CPubKey::Verify normalizes S (high -> low) and re-serializes canonically
+%%% before the strict secp256k1_ecdsa_signature_parse_der in verify.
+%%% normalize_s/1 returns a FIXED-WIDTH (byte_size(S)) encoding of N - S, which
+%%% carries a leading 0x00 byte when the high-S value S is near the curve
+%%% order N (N - S < 2^248).  encode_der_int/1 must strip that leading zero,
+%%% else it emits a non-canonical DER integer and the verify NIF rejects a
+%%% VALID high-S signature.  Found via the pre-Taproot real-block differential
+%%% corpus: beamchain false-rejected real mainnet txs at heights 227931 /
+%%% 300000 / 350000 (~1/128 of high-S sigs) that Core + every other impl accept.
+%%% ===================================================================
+
+%% Real high-S signature S value from mainnet block 227931, tx index 240,
+%% input 1 (P2PKH, SIGHASH_ALL).  N - S has a leading zero byte.
+normalize_s_high_s_near_n_canonical_der_test() ->
+    R  = hex("b2c9b3be73affec31e416ec9d39751691ade007e32c0106b58709ac4f5c36fba"),
+    S  = hex("ff9b0b5c440a4c018f9cd32a31d20ba6d615953d6c92717d3d577aafb12144b0"),
+    S2 = beamchain_crypto:normalize_s(S),
+    %% normalized S is low-S ...
+    ?assert(beamchain_crypto:is_low_s(S2)),
+    %% ... and N - S here is small enough to have a leading zero byte.
+    ?assertEqual(16#00, binary:first(S2)),
+    %% The re-encoded signature MUST be canonical strict DER (the bug emitted
+    %% a non-canonical integer with the unnecessary leading 0x00).
+    Sig = beamchain_crypto:encode_der_signature(R, S2),
+    ?assert(beamchain_crypto:check_strict_der(Sig)).
+
+%% A low-S value passes through normalize_s unchanged and stays canonical.
+normalize_s_low_s_unchanged_canonical_test() ->
+    R    = hex("b2c9b3be73affec31e416ec9d39751691ade007e32c0106b58709ac4f5c36fba"),
+    LowS = hex("0000000000000000000000000000000000000000000000000000000000000001"),
+    ?assert(beamchain_crypto:is_low_s(LowS)),
+    ?assertEqual(LowS, beamchain_crypto:normalize_s(LowS)),
+    %% even a non-minimal (leading-zero) low-S re-encodes to canonical DER.
+    Sig = beamchain_crypto:encode_der_signature(R, LowS),
+    ?assert(beamchain_crypto:check_strict_der(Sig)).
