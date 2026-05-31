@@ -89,6 +89,10 @@
 
 %% W93/B1: BIP30→BIP34 canonical-chain proof (exported for testing)
 -export([bip34_canonical_chain_active/3]).
+%% Phase-B: BIP30 enforcement DECISION (gate a/b/c) + HaveCoin overwrite SCAN,
+%% extracted verbatim from connect_block/4 (default-preserving) so the
+%% duplicate-txid / CVE-2012-1909 differential can drive the REAL leaves.
+-export([enforce_bip30/3, bip30_scan/1]).
 
 %% UTXO rollback (used by chainstate terminate for crash recovery)
 -export([rollback_block_utxos/2]).
@@ -1219,43 +1223,17 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
         %% See: validation.cpp:6189-6199 (IsBIP30Repeat / IsBIP30Unspendable),
         %%      validation.cpp:2402, 2460-2476.
         BlockHash = beamchain_serialize:block_hash(Header),
-        Bip30Exceptions = maps:get(bip30_exceptions, Params, []),
-        Bip34Height = maps:get(bip34_height, Params, 0),
-        Bip34Hash = maps:get(bip34_hash, Params, <<0:256>>),
 
-        %% Gate (a): enforce unless this IS one of the two known repeat blocks.
-        IsBip30Repeat = lists:any(fun({ExH, ExHash}) ->
-            Height =:= ExH andalso BlockHash =:= ExHash
-        end, Bip30Exceptions),
-        EnforceBip30_A = not IsBip30Repeat,
-
-        %% Gate (b): turn off enforcement if BIP34 is active on the *canonical*
-        %% chain.  Bitcoin Core (validation.cpp:2460-2462) walks
-        %% pindex->pprev->GetAncestor(BIP34Height) and checks
-        %% pindexBIP34height->GetBlockHash() == params.BIP34Hash.  This
-        %% canonical-chain proof is REQUIRED — a side-branch reorg that diverges
-        %% before BIP34Height but is now past it would have a different ancestor
-        %% hash, and Core would correctly keep BIP30 enforced for safety.
-        %%
-        %% Bug-fix W93/B1: previously beamchain only checked that
-        %% Height >= Bip34Height AND Bip34Hash is non-zero, omitting the actual
-        %% hash equality.  That bypassed Core's canonical-chain proof and could
-        %% disable BIP30 enforcement on side-branch / alternative-chain blocks.
-        Bip34Active = bip34_canonical_chain_active(Height, Bip34Height, Bip34Hash),
-        EnforceBip30_B = EnforceBip30_A andalso (not Bip34Active),
-
-        %% Gate (c): always enforce at height >= BIP34_IMPLIES_BIP30_LIMIT.
-        EnforceBip30 = EnforceBip30_B orelse (Height >= 1983702),
-
-        case EnforceBip30 of
-            true ->
-                lists:foreach(fun(Tx) ->
-                    Txid = beamchain_serialize:tx_hash(Tx),
-                    NumOutputs = length(Tx#transaction.outputs),
-                    check_no_existing_outputs(Txid, NumOutputs)
-                end, Txs);
-            false ->
-                ok
+        %% W93/B1 + Phase-B refactor: the gate (a)/(b)/(c) enforcement decision
+        %% is now the exported leaf enforce_bip30/3 (verbatim extraction — same
+        %% bip30_exceptions / bip34_canonical_chain_active / 1983702 logic), and
+        %% the HaveCoin overwrite scan is bip30_scan/1.  connect_block/4 calls
+        %% them here so the leaves are LIVE (not dead code); the Phase-B
+        %% differential drives the same two leaves directly over a seeded
+        %% chainstate so a divergence is a real beamchain consensus bug.
+        case enforce_bip30(Height, BlockHash, Params) of
+            true  -> bip30_scan(Txs);
+            false -> ok
         end,
 
         %% get script flags for this height
@@ -1574,6 +1552,49 @@ fetch_input_coins(#transaction{inputs = Inputs}) ->
                 throw(missing_inputs)
         end
     end, Inputs).
+
+%% @doc BIP30 enforcement DECISION — gate (a)/(b)/(c), verbatim extraction of
+%% the logic previously inline in connect_block/4 (default-preserving). Returns
+%% true iff the HaveCoin overwrite scan must run for a block at `Height` with
+%% header hash `BlockHash` under `Params`. Bitcoin Core validation.cpp:2402,
+%% 2460-2476:
+%%   (a) fEnforceBIP30 = !IsBIP30Repeat(pindex)  — exempt the two known repeat
+%%       blocks (91842, 91880), matched on BOTH height AND hash.
+%%   (b) fEnforceBIP30 &&= !(ancestor@BIP34Height.hash == BIP34Hash) — disable
+%%       once BIP34 is known-active on the canonical chain (no new dup coinbase
+%%       possible). bip34_canonical_chain_active/3 is the canonical-chain proof.
+%%   (c) ALWAYS enforce at Height >= BIP34_IMPLIES_BIP30_LIMIT (1,983,702),
+%%       because some pre-BIP34 coinbases encode heights at/above that point.
+-spec enforce_bip30(non_neg_integer(), binary(), map()) -> boolean().
+enforce_bip30(Height, BlockHash, Params) ->
+    Bip30Exceptions = maps:get(bip30_exceptions, Params, []),
+    Bip34Height = maps:get(bip34_height, Params, 0),
+    Bip34Hash = maps:get(bip34_hash, Params, <<0:256>>),
+    %% Gate (a): enforce unless this IS one of the two known repeat blocks.
+    IsBip30Repeat = lists:any(fun({ExH, ExHash}) ->
+        Height =:= ExH andalso BlockHash =:= ExHash
+    end, Bip30Exceptions),
+    EnforceBip30_A = not IsBip30Repeat,
+    %% Gate (b): turn off enforcement once BIP34 is active on the *canonical*
+    %% chain (canonical-chain proof required — a side-branch reorg past
+    %% BIP34Height with a different ancestor hash keeps BIP30 enforced).
+    Bip34Active = bip34_canonical_chain_active(Height, Bip34Height, Bip34Hash),
+    EnforceBip30_B = EnforceBip30_A andalso (not Bip34Active),
+    %% Gate (c): always enforce at height >= BIP34_IMPLIES_BIP30_LIMIT.
+    EnforceBip30_B orelse (Height >= 1983702).
+
+%% @doc BIP30 overwrite SCAN — for every output (txid,o) of every tx in the
+%% block, reject the block if the chainstate already has an unspent coin at that
+%% outpoint (Core view.HaveCoin -> "bad-txns-BIP30"). Throws bad_txns_bip30 on
+%% the first hit; otherwise returns ok. Exported so the Phase-B differential can
+%% drive the REAL scan over a seeded chainstate.
+-spec bip30_scan([#transaction{}]) -> ok | no_return().
+bip30_scan(Txs) ->
+    lists:foreach(fun(Tx) ->
+        Txid = beamchain_serialize:tx_hash(Tx),
+        NumOutputs = length(Tx#transaction.outputs),
+        check_no_existing_outputs(Txid, NumOutputs)
+    end, Txs).
 
 %% @doc Check BIP 30: reject the block if any transaction would overwrite an
 %% existing unspent output.
