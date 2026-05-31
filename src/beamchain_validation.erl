@@ -37,6 +37,15 @@
 %% Coinbase maturity (exported for testing)
 -export([check_coinbase_maturity/2]).
 
+%% Connect-time economic input check (Consensus::CheckTxInputs,
+%% tx_verify.cpp:164-214): per-coin + running-sum MoneyRange,
+%% value-in >= value-out (no-inflation), and coinbase maturity.
+%% Exported so the phaseb connecttx shim drives the REAL economic
+%% verdict over a seeded input-coin list rather than a divergent
+%% mirror; connect_block/4 itself routes its per-tx economic step
+%% through this exact function.
+-export([check_tx_inputs/3]).
+
 %% BIP 68 sequence locks
 -export([calculate_sequence_lock_pair/3]).
 -export([check_sequence_locks/4]).
@@ -1211,31 +1220,19 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
                         %% a. verify all inputs exist in UTXO set
                         InputCoins = fetch_input_coins(Tx),
 
-                        %% b. Check for negative or overflow input values.
-                        %% Core: consensus/tx_verify.cpp:184-188 — per-coin MoneyRange check
-                        %% AND running-sum MoneyRange check after each addition.
-                        %% CVE-2010-5139 class: a single coin with an out-of-range value
-                        %% or a running sum that overflows must be caught here, not just
-                        %% after the full fold completes.
-                        TotalIn = lists:foldl(fun(C, Acc) ->
-                            CoinVal = C#utxo.value,
-                            (CoinVal >= 0 andalso CoinVal =< ?MAX_MONEY)
-                                orelse throw(input_values_outofrange),
-                            NewAcc = Acc + CoinVal,
-                            (NewAcc >= 0 andalso NewAcc =< ?MAX_MONEY)
-                                orelse throw(input_values_outofrange),
-                            NewAcc
-                        end, 0, InputCoins),
-                        TotalOut = lists:foldl(fun(#tx_out{value = V}, A) ->
-                            A + V
-                        end, 0, Tx#transaction.outputs),
-
-                        %% c. verify amounts
-                        %% (per-coin range already checked in fold above)
-                        TotalIn >= TotalOut orelse throw(insufficient_input),
-
-                        %% d. check coinbase maturity
-                        check_coinbase_maturity(InputCoins, Height),
+                        %% b/c/d/h. Connect-time economic input check —
+                        %% Consensus::CheckTxInputs (tx_verify.cpp:164-214):
+                        %% per-coin + running-sum MoneyRange (CVE-2010-5139),
+                        %% value-in >= value-out (no inflation), coinbase
+                        %% maturity, and fee MoneyRange. Delegated to the
+                        %% exported check_tx_inputs/3 (single source of truth;
+                        %% the phaseb connecttx shim drives this exact fn). On
+                        %% reject we re-throw the same token the inline code
+                        %% used so connect_block/4's catch maps it unchanged.
+                        Fee = case check_tx_inputs(Tx, InputCoins, Height) of
+                            {ok, F} -> F;
+                            {error, Reason0} -> throw(Reason0)
+                        end,
 
                         %% e. BIP 68 relative locktime (gated on CSV activation)
                         %% Core: LOCKTIME_VERIFY_SEQUENCE only set when BIP68/CSV active.
@@ -1260,14 +1257,8 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
                             false -> [{Tx, InputCoins} | JobsAcc]
                         end,
 
-                        %% h. per-transaction fee must be in money range.
-                        %% Core: consensus/tx_verify.cpp:202-209 — fee = in - out;
-                        %% !MoneyRange(txfee_aux) → "bad-txns-fee-outofrange".
-                        %% (Unreachable in practice given the guards above, but
-                        %% Core checks it explicitly for defence-in-depth.)
-                        Fee = TotalIn - TotalOut,
-                        (Fee >= 0 andalso Fee =< ?MAX_MONEY)
-                            orelse throw(fee_outofrange),
+                        %% h. per-transaction fee MoneyRange is enforced
+                        %% inside check_tx_inputs/3 above (Fee is its result).
 
                         %% i. accumulated block fees must stay in money range.
                         %% Core: validation.cpp:2543-2547 — after nFees += txfee,
@@ -1520,6 +1511,55 @@ check_no_existing_outputs(Txid, NumOutputs) ->
             false -> ok
         end
     end, lists:seq(0, NumOutputs - 1)).
+
+%% @doc Connect-time economic input check — Consensus::CheckTxInputs
+%% (bitcoin-core/src/consensus/tx_verify.cpp:164-214). Given a tx, the
+%% list of input coins (#utxo{} per input, in input order — exactly what
+%% fetch_input_coins/1 returns at connect time) and the spend height,
+%% enforce the economic invariants and return the tx fee:
+%%   - per-coin AND running-sum MoneyRange   (bad-txns-inputvalues-outofrange)
+%%   - value-in >= value-out / no-inflation  (bad-txns-in-belowout)
+%%   - coinbase maturity (>= COINBASE_MATURITY) (bad-txns-premature-spend-of-coinbase)
+%%   - fee in MoneyRange                      (bad-txns-fee-outofrange)
+%% This is the SAME logic the connect_block/4 fold runs inline (steps
+%% b/c/d/h); the fold delegates here so there is a single source of
+%% truth and the phaseb connecttx shim drives the real check. Missing /
+%% spent inputs (bad-txns-inputs-missingorspent) are handled by the
+%% caller's coin-fetch (fetch_input_coins/1 throws missing_inputs); the
+%% shim models a missing input as an omitted coin, so it never reaches
+%% this function for those rows.
+-spec check_tx_inputs(#transaction{}, [#utxo{}], non_neg_integer()) ->
+    {ok, integer()} | {error, atom()}.
+check_tx_inputs(Tx, InputCoins, Height) ->
+    try
+        %% b. Per-coin + running-sum MoneyRange (tx_verify.cpp:184-188).
+        TotalIn = lists:foldl(fun(C, Acc) ->
+            CoinVal = C#utxo.value,
+            (CoinVal >= 0 andalso CoinVal =< ?MAX_MONEY)
+                orelse throw(input_values_outofrange),
+            NewAcc = Acc + CoinVal,
+            (NewAcc >= 0 andalso NewAcc =< ?MAX_MONEY)
+                orelse throw(input_values_outofrange),
+            NewAcc
+        end, 0, InputCoins),
+        TotalOut = lists:foldl(fun(#tx_out{value = V}, A) ->
+            A + V
+        end, 0, Tx#transaction.outputs),
+
+        %% c. value-in >= value-out (no inflation).
+        TotalIn >= TotalOut orelse throw(insufficient_input),
+
+        %% d. coinbase maturity.
+        check_coinbase_maturity(InputCoins, Height),
+
+        %% h. fee in MoneyRange (tx_verify.cpp:202-209).
+        Fee = TotalIn - TotalOut,
+        (Fee >= 0 andalso Fee =< ?MAX_MONEY)
+            orelse throw(fee_outofrange),
+        {ok, Fee}
+    catch
+        throw:Reason -> {error, Reason}
+    end.
 
 %% @doc Check coinbase maturity: inputs spending coinbase outputs must
 %% have at least COINBASE_MATURITY confirmations.
