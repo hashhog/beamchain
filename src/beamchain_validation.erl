@@ -8,6 +8,14 @@
 %% Context-free checks
 -export([check_transaction/1]).
 -export([check_block_header/2, check_block/2]).
+%% Arity-3 variants accept an explicit CheckPow boolean, faithful Core
+%% CheckBlock(..., fCheckPOW) / CheckBlockHeader(..., fCheckPOW) parity
+%% (validation.cpp:3997 CheckBlock / 3980 CheckBlockHeader). The /2 forms
+%% delegate with CheckPow=true so all existing callers are byte-for-byte
+%% unaffected. CheckPow=false is used ONLY by the validate-only differential
+%% checkblock harness, whose final/mutated block hexes miss the mainnet PoW
+%% target by construction.
+-export([check_block_header/3, check_block/3]).
 %% CVE-2012-2459 merkle-mutation predicate (Core merkle.cpp:46-63 port).
 %% Exported so the phaseb merkleroot shim drives the REAL check rather
 %% than a divergent mirror; check_block/2 itself routes through
@@ -82,13 +90,32 @@
 %% Checks PoW and basic timestamp sanity.
 -spec check_block_header(#block_header{}, map()) -> ok | {error, atom()}.
 check_block_header(Header, Params) ->
+    %% Default CheckPow=true preserves the current behavior for every existing
+    %% caller (Core's CheckBlockHeader default fCheckPOW=true).
+    check_block_header(Header, Params, true).
+
+%% CheckPow gates ONLY the proof-of-work test (Core CheckBlockHeader's
+%% fCheckPOW, validation.cpp:3980-3989). Every other header check (future
+%% timestamp, bits-in-powlimit range) always runs regardless. When CheckPow
+%% is false, the block hash is never tested against the target — used solely
+%% by the validate-only differential harness on final/mutated hexes.
+-spec check_block_header(#block_header{}, map(), boolean()) ->
+    ok | {error, atom()}.
+check_block_header(Header, Params, CheckPow) ->
     try
         PowLimit = maps:get(pow_limit, Params),
 
-        %% 1. verify PoW: block hash <= target from bits
-        BlockHash = beamchain_serialize:block_hash(Header),
-        beamchain_pow:check_pow(BlockHash, Header#block_header.bits, PowLimit)
-            orelse throw(high_hash),
+        %% 1. verify PoW: block hash <= target from bits (gated on CheckPow,
+        %% faithful to Core's fCheckPOW parameter).
+        case CheckPow of
+            true ->
+                BlockHash = beamchain_serialize:block_hash(Header),
+                beamchain_pow:check_pow(BlockHash, Header#block_header.bits,
+                                        PowLimit)
+                    orelse throw(high_hash);
+            false ->
+                ok
+        end,
 
         %% 2. verify timestamp is not more than 2 hours in the future
         MaxFutureTime = erlang:system_time(second) + 2 * 60 * 60,
@@ -112,10 +139,22 @@ check_block_header(Header, Params) ->
 
 %% @doc Validate block structure without chain context.
 -spec check_block(#block{}, map()) -> ok | {error, atom()}.
-check_block(#block{header = Header, transactions = Txs}, Params) ->
+check_block(Block, Params) ->
+    %% Default CheckPow=true preserves the current behavior for every existing
+    %% caller (Core's CheckBlock default fCheckPOW=true, which forwards to
+    %% CheckBlockHeader). connect_block/4's defense-in-depth re-check uses /2.
+    check_block(Block, Params, true).
+
+%% CheckPow forwards Core's fCheckPOW to the header check only (validation.cpp
+%% 3997-4015 CheckBlock -> CheckBlockHeader(..., fCheckPOW)). All context-free
+%% body checks (coinbase position, per-tx CheckTransaction, duplicate txids,
+%% merkle root, CVE-2012-2459 malleation, block weight, legacy sigops) ALWAYS
+%% run regardless of CheckPow.
+-spec check_block(#block{}, map(), boolean()) -> ok | {error, atom()}.
+check_block(#block{header = Header, transactions = Txs}, Params, CheckPow) ->
     try
-        %% 1. check header
-        case check_block_header(Header, Params) of
+        %% 1. check header (PoW gated on CheckPow)
+        case check_block_header(Header, Params, CheckPow) of
             ok -> ok;
             {error, E} -> throw(E)
         end,
