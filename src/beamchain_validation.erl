@@ -16,6 +16,17 @@
 %% checkblock harness, whose final/mutated block hexes miss the mainnet PoW
 %% target by construction.
 -export([check_block_header/3, check_block/3]).
+%% Arity-4 variants add an explicit CheckTime boolean gating ONLY the wall-clock
+%% future-timestamp clamp. In Bitcoin Core that "time-too-new" test lives in the
+%% CONTEXTUAL header check (ContextualCheckBlockHeader, validation.cpp:4108), not
+%% the context-free CheckBlock; it depends on NodeClock::now(), not the block's
+%% bytes. The /2 and /3 forms delegate with CheckTime=true so all existing
+%% callers are byte-identical. CheckTime=false is used ONLY by the DETERMINISTIC
+%% reorg differential, whose crafted-synthetic side-branch blocks carry
+%% far-future timestamps by construction (the wall-clock test is the one
+%% non-deterministic gate that would otherwise mask the real connect-tail
+%% economic/script verdict under test).
+-export([check_block_header/4, check_block/4]).
 %% CVE-2012-2459 merkle-mutation predicate (Core merkle.cpp:46-63 port).
 %% Exported so the phaseb merkleroot shim drives the REAL check rather
 %% than a divergent mirror; check_block/2 itself routes through
@@ -99,9 +110,28 @@ check_block_header(Header, Params) ->
 %% timestamp, bits-in-powlimit range) always runs regardless. When CheckPow
 %% is false, the block hash is never tested against the target — used solely
 %% by the validate-only differential harness on final/mutated hexes.
+%%
+%% The /3 arity preserves the historical behavior (future-time clamp ON).
 -spec check_block_header(#block_header{}, map(), boolean()) ->
     ok | {error, atom()}.
 check_block_header(Header, Params, CheckPow) ->
+    check_block_header(Header, Params, CheckPow, true).
+
+%% CheckTime gates ONLY the wall-clock future-timestamp clamp. In Bitcoin Core
+%% the "time-too-new" (MAX_FUTURE_BLOCK_TIME) test is part of the CONTEXTUAL
+%% header check ContextualCheckBlockHeader (validation.cpp:4108-4110), NOT the
+%% context-free CheckBlockHeader/CheckBlock — it depends on the node's adjusted
+%% wall clock (NodeClock::now()), not on the block's own bytes. We keep it in
+%% this function for the production header-acceptance path (CheckTime defaults
+%% to true, so every existing caller is byte-identical), but expose a gate so a
+%% DETERMINISTIC differential over crafted-synthetic blocks (whose timestamps
+%% are intentionally far-future, exactly as the reorg corpus uses) can skip the
+%% non-deterministic wall-clock test the SAME way CheckPow skips the PoW test.
+%% This is purely the reorg/checkblock differential harness path; consensus
+%% behavior for real blocks is unchanged.
+-spec check_block_header(#block_header{}, map(), boolean(), boolean()) ->
+    ok | {error, atom()}.
+check_block_header(Header, Params, CheckPow, CheckTime) ->
     try
         PowLimit = maps:get(pow_limit, Params),
 
@@ -117,10 +147,16 @@ check_block_header(Header, Params, CheckPow) ->
                 ok
         end,
 
-        %% 2. verify timestamp is not more than 2 hours in the future
-        MaxFutureTime = erlang:system_time(second) + 2 * 60 * 60,
-        Header#block_header.timestamp =< MaxFutureTime
-            orelse throw(time_too_new),
+        %% 2. verify timestamp is not more than 2 hours in the future.
+        %% Gated on CheckTime (Core: ContextualCheckBlockHeader, wall-clock).
+        case CheckTime of
+            true ->
+                MaxFutureTime = erlang:system_time(second) + 2 * 60 * 60,
+                Header#block_header.timestamp =< MaxFutureTime
+                    orelse throw(time_too_new);
+            false ->
+                ok
+        end,
 
         %% 3. verify bits is within pow_limit
         Target = beamchain_pow:bits_to_target(Header#block_header.bits),
@@ -151,10 +187,22 @@ check_block(Block, Params) ->
 %% merkle root, CVE-2012-2459 malleation, block weight, legacy sigops) ALWAYS
 %% run regardless of CheckPow.
 -spec check_block(#block{}, map(), boolean()) -> ok | {error, atom()}.
-check_block(#block{header = Header, transactions = Txs}, Params, CheckPow) ->
+check_block(Block, Params, CheckPow) ->
+    %% /3 preserves the historical context-free behavior (future-time clamp ON).
+    check_block(Block, Params, CheckPow, true).
+
+%% CheckTime gates ONLY the wall-clock future-timestamp clamp in the header
+%% check (see check_block_header/4). Defaults to true via the /3 arity, so all
+%% existing callers (production CheckBlock, connect_block/4 defense-in-depth
+%% re-check, the checkblock differential) are unchanged. The reorg differential
+%% passes false because the crafted-synthetic side-branch blocks deliberately
+%% carry far-future timestamps and the wall-clock test is non-deterministic;
+%% Core places this exact check in ContextualCheckBlockHeader, not CheckBlock.
+-spec check_block(#block{}, map(), boolean(), boolean()) -> ok | {error, atom()}.
+check_block(#block{header = Header, transactions = Txs}, Params, CheckPow, CheckTime) ->
     try
-        %% 1. check header (PoW gated on CheckPow)
-        case check_block_header(Header, Params, CheckPow) of
+        %% 1. check header (PoW gated on CheckPow, future-time on CheckTime)
+        case check_block_header(Header, Params, CheckPow, CheckTime) of
             ok -> ok;
             {error, E} -> throw(E)
         end,
