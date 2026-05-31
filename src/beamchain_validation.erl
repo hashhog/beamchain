@@ -153,9 +153,15 @@ check_block_header(Header, Params, CheckPow, CheckTime) ->
 
         %% 2. verify timestamp is not more than 2 hours in the future.
         %% Gated on CheckTime (Core: ContextualCheckBlockHeader, wall-clock).
+        %% The "now" comes from adjusted_time_now/0, which reads the live
+        %% wall clock (erlang:system_time(second)) in production and is
+        %% overridable ONLY via a persistent_term mock hook — see that
+        %% function's note. Faithful to Core, which sources this from
+        %% NodeClock::now() (validation.cpp:4108) and itself makes that
+        %% clock mockable (SetMockTime / GetTime, util/time.cpp).
         case CheckTime of
             true ->
-                MaxFutureTime = erlang:system_time(second) + 2 * 60 * 60,
+                MaxFutureTime = adjusted_time_now() + 2 * 60 * 60,
                 Header#block_header.timestamp =< MaxFutureTime
                     orelse throw(time_too_new);
             false ->
@@ -171,6 +177,23 @@ check_block_header(Header, Params, CheckPow, CheckTime) ->
         ok
     catch
         throw:Reason -> {error, Reason}
+    end.
+
+%% Wall-clock source for the future-timestamp ("time-too-new") clamp.
+%% Production behavior is byte-identical to the previous inline expression:
+%% it returns erlang:system_time(second) whenever no mock is installed (the
+%% persistent_term key is absent), which is the steady state of every real
+%% node. The ONLY way to override it is to set the persistent_term key
+%% `beamchain_mocktime` to an integer epoch-seconds value — a deterministic
+%% test/differential hook with no production code path that writes it. This
+%% mirrors Bitcoin Core, where the same future-time test (validation.cpp:4108)
+%% reads NodeClock::now() and that clock is mockable for tests via SetMockTime
+%% / GetTime (util/time.cpp). Default-preserving and faithful to Core.
+-spec adjusted_time_now() -> integer().
+adjusted_time_now() ->
+    case persistent_term:get(beamchain_mocktime, undefined) of
+        T when is_integer(T) -> T;
+        _ -> erlang:system_time(second)
     end.
 
 %%% -------------------------------------------------------------------
