@@ -109,6 +109,18 @@
 -define(EVICT_HIGH_WATER, 8000000).
 -define(EVICT_LOW_WATER, 6000000).
 
+%% Snapshot-load flush chunk size. The assumeutxo snapshot at mainnet
+%% height 944183 holds ~180M coins; flushing them in one WriteBatch would
+%% allocate ~180M op tuples in the BEAM heap AND a multi-GB native RocksDB
+%% WriteBatch at once. flush_snapshot_chunked/1 streams them in batches of
+%% this many coins so peak transient memory is bounded (≈ this many op
+%% tuples + one bounded WriteBatch live at a time). Same idea as
+%% beamchain_db:scrub_unspendable/0's ?SCRUB_BATCH_SIZE (5000); 50000 is a
+%% larger value because these are pure inserts on a fresh CF (no read
+%% amplification) and ~180M / 50000 ≈ 3600 batches keeps per-batch
+%% rocksdb:write call overhead low.
+-define(SNAPSHOT_FLUSH_CHUNK, 50000).
+
 %% Maximum reorg depth — matches Bitcoin Core's m_chainman.MaxReorgDepth()
 %% behaviour. A reorg deeper than this many blocks is rejected outright;
 %% the node operator is expected to investigate (it indicates a major
@@ -759,7 +771,35 @@ handle_call(wipe_chainstate, _From, State) ->
 handle_call({load_snapshot, Path}, _From, State) ->
     case do_load_snapshot(Path, State) of
         {ok, State2, Height} ->
-            {reply, {ok, Height}, State2};
+            %% Synchronously persist the snapshot-loaded chainstate to
+            %% RocksDB BEFORE returning. populate_utxo_cache_from_snapshot
+            %% only writes the coins to the in-memory ETS cache (marked
+            %% DIRTY/FRESH) and sets tip_hash/tip_height in State; nothing
+            %% reaches disk. The CLI `import-utxo` command halt(0)s right
+            %% after this call returns, and halt/1 does NOT run the OTP
+            %% terminate/2 callback (which is the only other place a flush
+            %% happens on shutdown), so without this the imported UTXO set
+            %% and the chain tip would never be persisted — a subsequent
+            %% `start` would read an empty DB (chain_tip not_found) and
+            %% reconnect genesis, discarding the snapshot.
+            %%
+            %% We must NOT use do_flush/1 here: at mainnet height 944183 the
+            %% snapshot holds ~180M coins, all marked DIRTY. do_flush builds
+            %% ONE in-memory Ops list over the whole DIRTY table (≈180M
+            %% tuples) and hands a single multi-GB WriteBatch to rocksdb:write
+            %% — that doubles peak memory on top of the already-resident ETS
+            %% tables and risks OOM / a multi-minute write stall on the
+            %% gen_server. Instead flush in bounded chunks (same pattern as
+            %% beamchain_db:scrub_unspendable/0, which chunks at 5000 ops to
+            %% "keep WriteBatch footprint bounded on a multi-million-coin
+            %% chainstate"). flush_snapshot_chunked/1 streams the DIRTY coins
+            %% to the chainstate CF in ?SNAPSHOT_FLUSH_CHUNK-sized batches,
+            %% then writes the chain_tip / utxo_flush_height / HEAD_BLOCKS
+            %% meta keys in a final small batch. On the next `start`, the
+            %% main-role init reads chain_tip via load_chain_tip/0 and
+            %% forward-syncs from BaseHeight.
+            State3 = flush_snapshot_chunked(State2),
+            {reply, {ok, Height}, State3};
         {error, Reason} ->
             {reply, {error, Reason}, State}
     end;
@@ -1967,6 +2007,129 @@ build_flush_ops() ->
     end, [], ?UTXO_SPENT),
 
     DirtyOps ++ SpentOps.
+
+%% @doc Chunked, memory-bounded flush used ONLY by the snapshot-import
+%% path (handle_call {load_snapshot, _}).
+%%
+%% Why this exists separately from do_flush/1: a freshly imported mainnet
+%% assumeutxo snapshot at height 944183 leaves ~180M coins in the UTXO_CACHE
+%% / UTXO_DIRTY / UTXO_FRESH ETS tables. do_flush/1 folds the entire DIRTY
+%% table into one Ops list and submits a single rocksdb:write WriteBatch.
+%% At 180M coins that single list + native batch is multiple GB of transient
+%% allocation on top of the already-resident ETS tables — an OOM / long-stall
+%% hazard. Here we stream the DIRTY coins to the chainstate CF in
+%% ?SNAPSHOT_FLUSH_CHUNK-sized rocksdb:write batches, deleting the DIRTY /
+%% FRESH markers as we go so the live op-list never exceeds one chunk.
+%%
+%% A snapshot import only ADDS coins (no spends), so UTXO_SPENT is empty and
+%% there is no spent/undo handling to do — this is purely puts to the
+%% chainstate CF. The chain_tip / utxo_flush_height / HEAD_BLOCKS meta keys
+%% are written LAST, in their own small batch, so the durable tip only
+%% becomes visible after every coin is on disk: if the process dies mid-flush
+%% the next `start` sees no chain_tip (genesis re-sync, safe) rather than a
+%% tip at 944183 over a partial UTXO set (silent corruption).
+%%
+%% Durability note: rocksdb:write/3 here uses default (async) write options,
+%% matching do_flush/1 and every other write path in beamchain_db. The bytes
+%% reach the RocksDB WAL via the OS write() syscall before each call returns,
+%% so a clean halt(0) (the import-utxo exit path) is recovered on reopen.
+%% This is NOT power-loss durable (no fsync), which is fine for the import
+%% workflow but means an OS-level crash between import and the next start
+%% could lose the import.
+flush_snapshot_chunked(#state{tip_hash = undefined} = State) ->
+    State;
+flush_snapshot_chunked(#state{tip_hash = TipHash,
+                              tip_height = TipHeight} = State) ->
+    DirtyCount = ets:info(?UTXO_DIRTY, size),
+    logger:info("chainstate: snapshot flush starting — ~B dirty coins "
+                "in chunks of ~B", [DirtyCount, ?SNAPSHOT_FLUSH_CHUNK]),
+    Written = flush_snapshot_loop(ets:first(?UTXO_DIRTY), [], 0, 0),
+
+    %% Clear the dirty/fresh/spent tracking tables in one shot AFTER the
+    %% read-only sweep above (flush_snapshot_loop must not mutate ?UTXO_DIRTY
+    %% mid-traversal — see its header comment; doing so on a `set` table skips
+    %% keys). The coins themselves stay resident in ?UTXO_CACHE for serving.
+    ets:delete_all_objects(?UTXO_DIRTY),
+    ets:delete_all_objects(?UTXO_FRESH),
+    ets:delete_all_objects(?UTXO_SPENT),
+
+    %% Final small batch: durable chain tip + flush height + crash marker.
+    %% Written AFTER all coins so a partial flush never advertises a tip.
+    TipValue = <<TipHash:32/binary, TipHeight:64/big>>,
+    Marker = <<TipHash/binary, TipHeight:64/big>>,
+    TipOps = [
+        {put, meta, <<"chain_tip">>, TipValue},
+        {put, meta, <<"utxo_flush_height">>, <<TipHeight:64/big>>},
+        {put, meta, <<"HEAD_BLOCKS">>, Marker}
+    ],
+    case beamchain_db:direct_write_batch(TipOps) of
+        ok ->
+            %% Clear crash-recovery marker (best-effort, matches do_flush/1).
+            beamchain_db:put_meta(<<"HEAD_BLOCKS">>, <<>>),
+            logger:info("chainstate: snapshot flush complete — ~B coins "
+                        "persisted, tip set to height ~B",
+                        [Written, TipHeight]),
+            State#state{blocks_since_flush = 0};
+        {error, Reason} ->
+            logger:error("chainstate: snapshot tip flush failed: ~p — "
+                         "coins were written but tip NOT set; next start "
+                         "will re-sync from genesis", [Reason]),
+            State
+    end.
+
+%% Stream the UTXO_DIRTY table to the chainstate CF in bounded batches.
+%% Accumulates put-ops until ?SNAPSHOT_FLUSH_CHUNK, writes them, then
+%% continues. The BEAM heap never holds more than one chunk of ops at a time.
+%%
+%% READ-ONLY TRAVERSAL: ?UTXO_DIRTY is a `set` (hash) table — see ets:new in
+%% init/1. On a `set`/`bag` table the ets:first/ets:next traversal order is
+%% only guaranteed stable if the table is NOT mutated during the sweep; any
+%% insert/delete may rehash and silently skip or repeat keys (Erlang ets(3),
+%% "Traversal … is only safe on ordered_set, or if no … delete happens").
+%% An earlier version of this loop deleted each key from ?UTXO_DIRTY right
+%% after staging it, which corrupted the saved Next cursor and dropped ~2.4%
+%% of coins (165,095,935 loaded -> 161,087,309 persisted on the 944183 mainnet
+%% snapshot); the first post-base block then failed to connect with
+%% missing_inputs because the coins it spent were never written. So we do NOT
+%% mutate ?UTXO_DIRTY/?UTXO_FRESH here — flush_snapshot_chunked/1 clears both
+%% tables in one ets:delete_all_objects after the sweep returns.
+flush_snapshot_loop('$end_of_table', Batch, BatchLen, Written) ->
+    case BatchLen of
+        0 -> Written;
+        _ ->
+            ok = snapshot_write_chunk(Batch),
+            Written + BatchLen
+    end;
+flush_snapshot_loop(Key, Batch, BatchLen, Written) ->
+    %% Read-only: get the next key, never delete during the traversal.
+    Next = ets:next(?UTXO_DIRTY, Key),
+    {NewBatch, NewLen} = case ets:lookup(?UTXO_CACHE, Key) of
+        [{Key, Utxo}] ->
+            {Txid, Vout} = Key,
+            OutpointKey = <<Txid:32/binary, Vout:32/big>>,
+            {[{put, chainstate, OutpointKey, encode_utxo(Utxo)} | Batch],
+             BatchLen + 1};
+        [] ->
+            %% Coin vanished between mark and flush — skip (matches
+            %% build_flush_ops/0's empty-lookup branch).
+            {Batch, BatchLen}
+    end,
+    case NewLen >= ?SNAPSHOT_FLUSH_CHUNK of
+        true ->
+            ok = snapshot_write_chunk(NewBatch),
+            flush_snapshot_loop(Next, [], 0, Written + NewLen);
+        false ->
+            flush_snapshot_loop(Next, NewBatch, NewLen, Written)
+    end.
+
+snapshot_write_chunk(Ops) ->
+    case beamchain_db:direct_write_batch(Ops) of
+        ok -> ok;
+        {error, Reason} ->
+            logger:error("chainstate: snapshot flush chunk write failed: ~p",
+                         [Reason]),
+            error({snapshot_flush_write_failed, Reason})
+    end.
 
 %% @doc Evict clean UTXO cache entries after flush to bound memory.
 %% After a flush, dirty/fresh/spent tables are empty so every entry in
