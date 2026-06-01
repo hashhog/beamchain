@@ -110,7 +110,27 @@ handle_cast({peer_connected, Peer, Info}, State) ->
     beamchain_block_sync:handle_peer_connected(Peer, Info),
     %% If we're idle or complete, kick off header sync
     State2 = maybe_start_header_sync(State),
-    {noreply, State2};
+    %% SNAPSHOT-BOOTSTRAP body-gap fill (gated, default-preserving).
+    %%
+    %% After an assumeutxo snapshot import the header chain is backfilled to the
+    %% network tip (header_tip == peer tip) while the *block* chainstate sits at
+    %% the snapshot base height (chain_tip == base, far below header_tip). In
+    %% that state header_sync sees "no peer ahead of our header tip" and never
+    %% fires notify_headers_complete (see beamchain_header_sync:
+    %% handle_cast({peer_connected,…}) guard PeerHeight > tip_height, and the
+    %% pick_sync_peer_and_start `none` branch), so block_sync is never told to
+    %% download the body gap base+1..header_tip — the node wedges at the base.
+    %% Normal IBD never hits this: there chain_tip tracks header_tip, so the gap
+    %% below is zero and this is a no-op.
+    %%
+    %% Detect the gap directly (chain_tip < header_tip) and start block_sync to
+    %% fill it. Idempotent: block_sync:start_sync recomputes its start height
+    %% from the chainstate tip + rejects a redundant re-arm, so issuing this on
+    %% every peer_connected while the gap persists is safe. Mirrors Bitcoin
+    %% Core, where post-snapshot the background/active chainstate downloads
+    %% blocks up to the validated header tip regardless of header-sync state.
+    State3 = maybe_fill_snapshot_block_gap(State2),
+    {noreply, State3};
 
 %% Peer disconnected
 handle_cast({peer_disconnected, Peer}, State) ->
@@ -374,6 +394,48 @@ maybe_start_header_sync(#state{phase = complete} = State) ->
     State#state{phase = headers, header_check_timer = Timer};
 maybe_start_header_sync(State) ->
     State.
+
+%% SNAPSHOT-BOOTSTRAP body-gap fill. If the connected header chain is ahead of
+%% the validated block chainstate (the assumeutxo post-import signature), arm
+%% block_sync to download the missing bodies base+1..header_tip. Gated on the
+%% gap being strictly positive, so it is a no-op during normal IBD (where
+%% chain_tip == header_tip) and once the snapshot gap is filled. Leaves the
+%% orchestrator phase as-is: block_sync's own start_sync handles idempotent
+%% re-arm/complete-state transitions, and the header-sync poll/complete path
+%% remains the trigger for the ordinary (non-snapshot) case.
+maybe_fill_snapshot_block_gap(State) ->
+    try
+        ChainTip = case beamchain_chainstate:get_tip_height() of
+            {ok, H} when is_integer(H) -> H;
+            _ -> 0
+        end,
+        HeaderTip = case beamchain_db:get_header_tip() of
+            {ok, #{height := HH}} when is_integer(HH) -> HH;
+            _ -> 0
+        end,
+        %% Gate on ChainTip > 0 so this fires ONLY for the snapshot-bootstrap
+        %% start phase (chain_tip == base, e.g. 944183) and never for the
+        %% import-utxo phase, whose transient pre-flush chainstate sits at the
+        %% genesis height 0 — there the gap base+1..header_tip is the whole
+        %% chain, and triggering a genesis-up block download would steal CPU/IO
+        %% from the snapshot import running in the same node. (Ordinary genesis
+        %% IBD also has chain_tip 0 early on; the header-sync-complete path is
+        %% its trigger, and block_sync:start_sync is idempotent regardless.)
+        case ChainTip > 0 andalso HeaderTip > ChainTip of
+            true ->
+                logger:info("sync: snapshot body gap detected "
+                            "(chainstate ~B < header ~B) — starting block "
+                            "download to fill gap", [ChainTip, HeaderTip]),
+                start_block_sync(HeaderTip, State);
+            false ->
+                State
+        end
+    catch
+        Class:Reason ->
+            logger:debug("sync: snapshot gap check skipped: ~p:~p",
+                         [Class, Reason]),
+            State
+    end.
 
 %% Poll header sync status and transition if complete.
 check_header_sync_status(State) ->
