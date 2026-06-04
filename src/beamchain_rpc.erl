@@ -733,6 +733,9 @@ handle_method(<<"getmininginfo">>, _, _W) -> rpc_getmininginfo();
 handle_method(<<"getblocktemplate">>, P, _W) -> rpc_getblocktemplate(P);
 handle_method(<<"submitblock">>, P, _W) -> rpc_submitblock(P);
 
+%% -- UTXO-set scanning (wallet recovery) --
+handle_method(<<"scantxoutset">>, P, _W) -> rpc_scantxoutset(P);
+
 %% -- Generating (regtest only) --
 handle_method(<<"generatetoaddress">>, P, _W) -> rpc_generatetoaddress(P);
 handle_method(<<"generateblock">>, P, _W) -> rpc_generateblock(P);
@@ -751,6 +754,7 @@ handle_method(<<"verifymessage">>, P, _W) -> rpc_verifymessage(P);
 
 %% -- Wallet (multi-wallet aware) --
 handle_method(<<"createwallet">>, P, _W) -> rpc_createwallet(P);
+handle_method(<<"restorewallet">>, P, _W) -> rpc_restorewallet(P);
 handle_method(<<"loadwallet">>, P, _W) -> rpc_loadwallet(P);
 handle_method(<<"unloadwallet">>, P, _W) -> rpc_unloadwallet(P);
 handle_method(<<"listwallets">>, _, _W) -> rpc_listwallets();
@@ -3259,6 +3263,134 @@ tally_coins(Coins) ->
       Coins).
 
 %%% ===================================================================
+%%% scantxoutset — scan the UTXO set by scriptPubKey (wallet recovery)
+%%% ===================================================================
+
+%% scantxoutset "action" [ scanobjects ]
+%% Only the "start" action is supported; it performs a synchronous scan of
+%% the entire UTXO set for the given scan objects. Each scan object is
+%% either a descriptor string ("addr(<address>)", "raw(<hex-spk>)",
+%% "combo(<address>)") or a bare address / raw-hex string. Mirrors Bitcoin
+%% Core's scantxoutset (rpc/blockchain.cpp) shape:
+%%   { success, txouts, height, bestblock, unspents:[...], total_amount }
+rpc_scantxoutset([<<"start">>, ScanObjects]) when is_list(ScanObjects) ->
+    Network = beamchain_config:network(),
+    case build_scan_script_set(ScanObjects, Network) of
+        {error, Reason} ->
+            {error, ?RPC_INVALID_PARAMS, Reason};
+        {ok, ScriptSet} ->
+            Matches = beamchain_chainstate:scan_utxos(ScriptSet),
+            {TipHeight, BestHash} =
+                case beamchain_chainstate:get_tip() of
+                    {ok, {H, Ht}} -> {Ht, hash_to_hex(H)};
+                    _ -> {0, hash_to_hex(<<0:256>>)}
+                end,
+            {Unspents, Total} = lists:foldl(
+                fun({Txid, Vout, #utxo{value = Value, script_pubkey = SPK,
+                                       height = CoinHeight,
+                                       is_coinbase = CB}}, {Acc, Sum}) ->
+                    U = #{
+                        <<"txid">>         => hash_to_hex(Txid),
+                        <<"vout">>         => Vout,
+                        <<"scriptPubKey">> => beamchain_serialize:hex_encode(SPK),
+                        <<"amount">>       => format_amount_sentinel(Value),
+                        <<"coinbase">>     => CB,
+                        <<"height">>       => CoinHeight
+                    },
+                    {[U | Acc], Sum + Value}
+                end, {[], 0}, Matches),
+            Result = #{
+                <<"success">>      => true,
+                <<"txouts">>       => length(Matches),
+                <<"height">>       => TipHeight,
+                <<"bestblock">>    => BestHash,
+                <<"unspents">>     => lists:reverse(Unspents),
+                <<"total_amount">> => format_amount_sentinel(Total)
+            },
+            {ok_raw_json, replace_btc_sentinels(jsx:encode(Result))}
+    end;
+rpc_scantxoutset([<<"start">>]) ->
+    rpc_scantxoutset([<<"start">>, []]);
+rpc_scantxoutset([<<"status">>]) ->
+    %% Scans are synchronous, so there is never one in progress.
+    {ok_raw_json, jsx:encode(null)};
+rpc_scantxoutset([<<"status">> | _]) ->
+    {ok_raw_json, jsx:encode(null)};
+rpc_scantxoutset([<<"abort">> | _]) ->
+    {ok, false};
+rpc_scantxoutset(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"scantxoutset \"action\" ( [scanobjects,...] )">>}.
+
+%% Build a sets:set/0 of raw scriptPubKey binaries from the scan objects.
+build_scan_script_set(ScanObjects, Network) ->
+    try
+        Set = lists:foldl(
+            fun(Obj, Acc) ->
+                case scan_object_to_script(Obj, Network) of
+                    {ok, SPK} -> sets:add_element(SPK, Acc);
+                    {error, R} -> throw({scan_err, R})
+                end
+            end, sets:new(), ScanObjects),
+        {ok, Set}
+    catch
+        throw:{scan_err, R} -> {error, R}
+    end.
+
+%% A scan object may be given as a plain string or as a JSON object
+%% {"desc": "...", "range": N}. We accept both and reduce to a descriptor
+%% string, then to a scriptPubKey.
+scan_object_to_script(Obj, Network) when is_map(Obj) ->
+    case maps:get(<<"desc">>, Obj, undefined) of
+        undefined -> {error, <<"Scan object missing 'desc'">>};
+        Desc      -> descriptor_to_script(Desc, Network)
+    end;
+scan_object_to_script(Obj, Network) when is_binary(Obj) ->
+    descriptor_to_script(Obj, Network).
+
+%% Reduce a descriptor / address / raw-hex string to a scriptPubKey.
+descriptor_to_script(Desc, Network) when is_binary(Desc) ->
+    %% Strip an optional "#checksum" suffix as Core does.
+    Bare = hd(binary:split(Desc, [<<"#">>])),
+    case Bare of
+        <<"addr(", Rest/binary>> ->
+            address_descriptor_to_script(strip_close_paren(Rest), Network);
+        <<"combo(", Rest/binary>> ->
+            address_descriptor_to_script(strip_close_paren(Rest), Network);
+        <<"raw(", Rest/binary>> ->
+            raw_descriptor_to_script(strip_close_paren(Rest));
+        _ ->
+            %% Bare value: try address first, then raw hex.
+            case address_descriptor_to_script(Bare, Network) of
+                {ok, _} = Ok -> Ok;
+                {error, _}   -> raw_descriptor_to_script(Bare)
+            end
+    end.
+
+strip_close_paren(Bin) ->
+    %% Remove a single trailing ")" if present.
+    Sz = byte_size(Bin),
+    case Sz > 0 andalso binary:at(Bin, Sz - 1) =:= $) of
+        true  -> binary:part(Bin, 0, Sz - 1);
+        false -> Bin
+    end.
+
+address_descriptor_to_script(AddrBin, Network) ->
+    case beamchain_address:address_to_script(binary_to_list(AddrBin), Network) of
+        {ok, SPK}  -> {ok, SPK};
+        {error, _} -> {error, iolist_to_binary(
+                                [<<"Invalid address in scan object: ">>, AddrBin])}
+    end.
+
+raw_descriptor_to_script(HexBin) ->
+    try beamchain_serialize:hex_decode(HexBin) of
+        SPK when is_binary(SPK), byte_size(SPK) > 0 -> {ok, SPK};
+        _ -> {error, <<"Invalid raw scriptPubKey hex in scan object">>}
+    catch
+        _:_ -> {error, <<"Invalid raw scriptPubKey hex in scan object">>}
+    end.
+
+%%% ===================================================================
 %%% Mempool methods
 %%% ===================================================================
 
@@ -3879,7 +4011,7 @@ rpc_generatetoaddress([NBlocks, Address, MaxTries])
         regtest ->
             %% Convert address to scriptPubKey
             Network = beamchain_config:network(),
-            NetType = case Network of mainnet -> mainnet; _ -> testnet end,
+            NetType = Network,
             AddrStr = binary_to_list(Address),
             case beamchain_address:address_to_script(AddrStr, NetType) of
                 {ok, Script} ->
@@ -3916,7 +4048,7 @@ rpc_generateblock([Output, Transactions, Submit])
         regtest ->
             %% Convert output address to scriptPubKey
             Network = beamchain_config:network(),
-            NetType = case Network of mainnet -> mainnet; _ -> testnet end,
+            NetType = Network,
             OutputStr = binary_to_list(Output),
             case beamchain_address:address_to_script(OutputStr, NetType) of
                 {ok, Script} ->
@@ -4076,7 +4208,7 @@ rpc_estimaterawfee(_) ->
 rpc_validateaddress([Address]) when is_binary(Address) ->
     AddrStr = binary_to_list(Address),
     Network = beamchain_config:network(),
-    NetType = case Network of mainnet -> mainnet; _ -> testnet end,
+    NetType = Network,
     case beamchain_address:address_to_script(AddrStr, NetType) of
         {ok, Script} ->
             Type = beamchain_address:classify_script(Script),
@@ -4140,7 +4272,7 @@ rpc_decodescript([HexStr]) when is_binary(HexStr) ->
     try
         Script = beamchain_serialize:hex_decode(HexStr),
         Network = beamchain_config:network(),
-        NetType = case Network of mainnet -> mainnet; _ -> testnet end,
+        NetType = Network,
         {ok, ds_build_result(Script, NetType)}
     catch
         _:_ ->
@@ -4356,7 +4488,7 @@ rpc_signmessage(_, _) ->
 rpc_verifymessage([Address, Signature, Message])
   when is_binary(Address), is_binary(Signature), is_binary(Message) ->
     Network = beamchain_config:network(),
-    NetType = case Network of mainnet -> mainnet; _ -> testnet end,
+    NetType = Network,
     AddrStr = binary_to_list(Address),
     case beamchain_address:address_to_script(AddrStr, NetType) of
         {ok, Script} ->
@@ -5182,6 +5314,41 @@ rpc_createwallet([Name]) when is_binary(Name) ->
     end;
 rpc_createwallet(_) ->
     {error, ?RPC_INVALID_PARAMS, <<"createwallet ( \"name\" )">>}.
+
+%% @doc Restore a wallet from a BIP-39 mnemonic (seed-only recovery).
+%% restorewallet "name" "mnemonic" ( "passphrase" )
+%% The mnemonic may be a space-separated string or a JSON array of words.
+%% This is the seed-only recovery entry point: restoring the same mnemonic
+%% deterministically reconstructs the identical keypool and addresses, so a
+%% subsequent scantxoutset rediscovers all funds.
+rpc_restorewallet([Name, Mnemonic]) ->
+    rpc_restorewallet([Name, Mnemonic, <<>>]);
+rpc_restorewallet([Name, Mnemonic, Passphrase])
+  when is_binary(Name), is_binary(Passphrase) ->
+    Words = case Mnemonic of
+        M when is_binary(M) ->
+            [W || W <- binary:split(M, [<<" ">>], [global]), W =/= <<>>];
+        L when is_list(L) ->
+            [ensure_bin(W) || W <- L]
+    end,
+    case beamchain_wallet_sup:restore_wallet(Name, Words, Passphrase) of
+        {ok, _Pid} ->
+            WalletName = case Name of <<>> -> <<"default">>; _ -> Name end,
+            {ok, #{<<"name">> => WalletName, <<"warning">> => <<>>}};
+        {error, wallet_already_loaded} ->
+            {error, ?RPC_MISC_ERROR, <<"Wallet already loaded">>};
+        {error, bad_checksum} ->
+            {error, ?RPC_INVALID_PARAMS, <<"Invalid mnemonic checksum">>};
+        {error, Reason} ->
+            {error, ?RPC_MISC_ERROR, iolist_to_binary(
+                io_lib:format("Failed to restore wallet: ~p", [Reason]))}
+    end;
+rpc_restorewallet(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"restorewallet \"name\" \"mnemonic\" ( \"passphrase\" )">>}.
+
+ensure_bin(B) when is_binary(B) -> B;
+ensure_bin(L) when is_list(L)   -> list_to_binary(L).
 
 %% @doc Load a wallet from file.
 %% loadwallet "name" - Loads wallet with the given name.
@@ -7841,7 +8008,7 @@ opcode_name(N)     -> iolist_to_binary(io_lib:format("OP_UNKNOWN(~B)", [N])).
 %%
 %% Network is mainnet | testnet (atom from beamchain_config:network()).
 infer_spk_descriptor(Script, Network) ->
-    NetType = case Network of mainnet -> mainnet; _ -> testnet end,
+    NetType = Network,
     Payload = case Script of
         %% OP_1 (0x51) + push 32 bytes (0x20) + 32-byte x-only pubkey
         <<16#51, 16#20, XOnly:32/binary>> ->
@@ -7886,7 +8053,7 @@ format_psbt_spk_json(Script, Network) ->
     },
     %% Suppress address for bare-pubkey / multisig / nonstandard / OP_RETURN —
     %% mirrors Core's `if (type != TxoutType::PUBKEY)` guard in ScriptToUniv.
-    NetType = case Network of mainnet -> mainnet; _ -> testnet end,
+    NetType = Network,
     case beamchain_address:script_to_address(Script, NetType) of
         unknown     -> Base;
         "OP_RETURN" -> Base;

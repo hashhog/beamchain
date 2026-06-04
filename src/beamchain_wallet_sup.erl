@@ -10,6 +10,7 @@
 
 %% Wallet management API
 -export([create_wallet/1, create_wallet/2,
+         restore_wallet/2, restore_wallet/3,
          load_wallet/1, load_wallet/2,
          unload_wallet/1,
          list_wallets/0,
@@ -57,6 +58,48 @@ create_wallet(Name, Passphrase) when is_binary(Name) ->
                 {error, _} = Err ->
                     Err
             end
+    end.
+
+%% @doc Restore a wallet from a BIP-39 mnemonic (seed-only recovery).
+%% Mnemonic is a list of word binaries; it is checksum-validated before
+%% the BIP-32 master key is derived, so an identical mnemonic always
+%% reconstructs the identical keypool / addresses. Optional BIP-39
+%% passphrase salts the seed (BIP-39 "From mnemonic to seed").
+-spec restore_wallet(binary(), [binary()]) -> {ok, pid()} | {error, term()}.
+restore_wallet(Name, Mnemonic) ->
+    restore_wallet(Name, Mnemonic, <<>>).
+
+-spec restore_wallet(binary(), [binary()], binary()) ->
+          {ok, pid()} | {error, term()}.
+restore_wallet(Name, Mnemonic, Bip39Passphrase)
+  when is_binary(Name), is_list(Mnemonic), is_binary(Bip39Passphrase) ->
+    case beamchain_bip39:validate_mnemonic(Mnemonic) of
+        ok ->
+            case get_wallet(Name) of
+                {ok, _Pid} ->
+                    {error, wallet_already_loaded};
+                {error, wallet_not_found} ->
+                    Seed = beamchain_bip39:mnemonic_to_seed(
+                             Mnemonic, Bip39Passphrase),
+                    case supervisor:start_child(?SERVER, [Name]) of
+                        {ok, Pid} ->
+                            true = ets:insert(?WALLET_REGISTRY, {Name, Pid}),
+                            case gen_server:call(
+                                   Pid,
+                                   {create_bip39, Seed, Mnemonic, undefined}) of
+                                {ok, _} ->
+                                    {ok, Pid};
+                                {error, _} = Err ->
+                                    supervisor:terminate_child(?SERVER, Pid),
+                                    ets:delete(?WALLET_REGISTRY, Name),
+                                    Err
+                            end;
+                        {error, _} = Err ->
+                            Err
+                    end
+            end;
+        Err ->
+            Err
     end.
 
 %% @doc Load a wallet from file.
