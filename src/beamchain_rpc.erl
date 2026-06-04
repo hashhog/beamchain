@@ -5625,10 +5625,23 @@ rpc_sendtoaddress([Address, AmountBtc, _Comment], WalletName) when is_binary(Add
     case resolve_wallet(WalletName) of
         {ok, Pid} ->
             Amount = btc_to_satoshi(AmountBtc),
-            %% Get wallet UTXOs for coin selection
-            Utxos = beamchain_wallet:get_wallet_utxos(),
-            %% Use default fee rate (1 sat/vB for now)
-            FeeRate = 1,
+            %% Get wallet UTXOs for coin selection.  Use the maturity-filtered
+            %% spendable set so coin-selection never picks an immature coinbase
+            %% (those would be rejected at broadcast with
+            %% premature_spend_of_coinbase).  Falls back to the full set only if
+            %% the chain tip is not yet known.
+            Utxos = case beamchain_chainstate:get_tip_height() of
+                {ok, TipHeight} -> beamchain_wallet:get_spendable_utxos(TipHeight);
+                not_found       -> beamchain_wallet:get_wallet_utxos()
+            end,
+            %% Fee rate (sat/vB) used for coin-selection's fee reservation.
+            %% The select_coins vsize model slightly undershoots the true tx
+            %% size, so at exactly the 1 sat/vB relay floor the resulting fee
+            %% rounds just under min-relay and the broadcast is rejected with
+            %% "mempool min fee not met".  Use a modest default above the floor
+            %% (Core's wallet likewise pads above min-relay) so a default send
+            %% reliably clears relay; regtest fees are inconsequential.
+            FeeRate = 5,
             case beamchain_wallet:select_coins(Amount, FeeRate, Utxos) of
                 {ok, Selected, Change} ->
                     %% Build and sign transaction
@@ -5637,7 +5650,12 @@ rpc_sendtoaddress([Address, AmountBtc, _Comment], WalletName) when is_binary(Add
                     %% Add change output if needed
                     FinalOutputs = case Change > 546 of  %% Dust threshold
                         true ->
-                            {ok, ChangeAddr} = beamchain_wallet:get_change_address(p2wpkh),
+                            %% Use the per-wallet Pid variant — the pid-less
+                            %% get_change_address/1 targets the registered
+                            %% default wallet, which returns {error,no_wallet}
+                            %% for a named wallet and crashed the send.
+                            {ok, ChangeAddr} =
+                                beamchain_wallet:get_change_address(Pid, p2wpkh),
                             Outputs ++ [{ChangeAddr, Change}];
                         false ->
                             Outputs
@@ -5664,7 +5682,12 @@ rpc_sendtoaddress([Address, AmountBtc, _Comment], WalletName) when is_binary(Add
                                             %% Broadcast transaction
                                             case beamchain_mempool:accept_to_memory_pool(SignedTx) of
                                                 {ok, Txid} ->
-                                                    {ok, beamchain_serialize:hex_encode(Txid)};
+                                                    %% Return the Core-style
+                                                    %% display txid (reversed),
+                                                    %% matching sendrawtransaction
+                                                    %% and getrawmempool — not the
+                                                    %% internal non-reversed order.
+                                                    {ok, hash_to_hex(Txid)};
                                                 {error, Reason} ->
                                                     {error, ?RPC_VERIFY_REJECTED, iolist_to_binary(
                                                         io_lib:format("TX rejected: ~p", [Reason]))}
@@ -6695,6 +6718,14 @@ rpc_listunspent(Params, WalletName) ->
                                     unknown -> <<>>;
                                     A -> iolist_to_binary(A)
                                 end,
+                                %% Immature coinbase coins are listed but flagged
+                                %% non-spendable, matching Core's
+                                %% getrawchangeaddress / AvailableCoins semantics
+                                %% (a coinbase at height H matures once
+                                %% CurrentHeight - H >= COINBASE_MATURITY).
+                                Spendable = (not Utxo#utxo.is_coinbase)
+                                    orelse (CurrentHeight - Utxo#utxo.height)
+                                           >= ?COINBASE_MATURITY,
                                 {true, #{
                                     <<"txid">> => beamchain_serialize:hex_encode(Txid),
                                     <<"vout">> => Vout,
@@ -6703,9 +6734,9 @@ rpc_listunspent(Params, WalletName) ->
                                     %% exact 8-decimal formatting via ok_raw_json.
                                     <<"amount">> => format_amount_sentinel(Utxo#utxo.value),
                                     <<"confirmations">> => Confs,
-                                    <<"spendable">> => true,
+                                    <<"spendable">> => Spendable,
                                     <<"solvable">> => true,
-                                    <<"safe">> => true
+                                    <<"safe">> => Spendable
                                 }};
                             false ->
                                 false

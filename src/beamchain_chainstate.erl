@@ -1097,6 +1097,20 @@ do_connect_block_inner(#block{header = Header} = Block,
                 _ = (catch beamchain_blockfilter_index:add_block(
                         Block#block{hash = BlockHash}, Height)),
 
+                %% Wallet UTXO ledger: scan the connected block for outputs
+                %% paying wallet addresses (credit) and inputs spending wallet
+                %% coins (debit).  Mirrors Core's CWallet::blockConnected
+                %% notification.  Best-effort — a failure here must never roll
+                %% back a fully-validated block (the wallet ledger is
+                %% reconstructible via rescan / scantxoutset).  The wallet
+                %% reads/writes its own public ETS table directly, so this is
+                %% a pure function call with no gen_server round-trip and no
+                %% deadlock risk against the chainstate process.  We pass the
+                %% computed Height because Block#block.height is not populated
+                %% on the connect path.
+                _ = (catch beamchain_wallet:scan_block_for_wallet(
+                        Block, Height)),
+
                 %% Notify peer manager that our tip advanced (stale tip detection)
                 beamchain_peer_manager:notify_tip_updated(),
 
@@ -1601,6 +1615,13 @@ do_disconnect_block(#state{tip_hash = TipHash, tip_height = TipHeight,
                     %% the disconnected block.  Best-effort, default-off.
                     _ = (catch beamchain_blockfilter_index:remove_block(
                             TipHash, TipHeight)),
+
+                    %% Wallet UTXO ledger: reverse this block's credits so the
+                    %% ledger does not over-count coins that no longer exist on
+                    %% the active chain after a reorg.  Best-effort, symmetric
+                    %% to the scan_block_for_wallet credit on connect.
+                    _ = (catch beamchain_wallet:unscan_block_for_wallet(
+                            Block, TipHeight)),
 
                     State2 = State#state{
                         tip_hash = PrevHash,

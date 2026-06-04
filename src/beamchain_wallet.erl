@@ -88,10 +88,15 @@
          register_wallet_script/2,
          is_wallet_script/1,
          add_wallet_utxo/5,
+         add_wallet_utxo/6,
          spend_wallet_utxo/2,
          get_wallet_utxos/0,
+         get_spendable_utxos/1,
          get_wallet_balance/0,
-         scan_block_for_wallet/1]).
+         scan_block_for_wallet/1,
+         scan_block_for_wallet/2,
+         unscan_block_for_wallet/1,
+         unscan_block_for_wallet/2]).
 
 %% Keypool
 -export([get_keypool_size/0]).
@@ -107,7 +112,12 @@
 -define(SERVER, ?MODULE).
 -define(HARDENED, 16#80000000).
 
-%% ETS table for wallet UTXOs: {Txid, Vout} -> {Value, ScriptPubKey, Height}
+%% ETS table for wallet UTXOs:
+%%   {Txid, Vout} -> {Value, ScriptPubKey, Height, IsCoinbase}
+%% IsCoinbase is tracked so coin-selection / getbalance can enforce Core's
+%% 100-confirmation coinbase maturity rule (premature_spend_of_coinbase).
+%% Legacy 3-tuples {Value, ScriptPubKey, Height} are still tolerated on read
+%% (treated as IsCoinbase=false) so an in-flight wallet survives the upgrade.
 -define(WALLET_UTXO_TABLE, beamchain_wallet_utxos).
 %% ETS table for script -> address lookup
 -define(WALLET_SCRIPT_TABLE, beamchain_wallet_scripts).
@@ -598,18 +608,22 @@ handle_call({get_change_address, Type}, _From, State) ->
 handle_call(list_addresses, _From, State) ->
     {reply, {ok, State#wallet_state.addresses}, State};
 
-handle_call(get_balance, _From, #wallet_state{addresses = Addrs,
-                                               network = Network} = State) ->
-    Balance = lists:foldl(fun(AddrInfo, Acc) ->
-        Address = maps:get(<<"address">>, AddrInfo),
-        case beamchain_address:address_to_script(binary_to_list(Address),
-                                                  Network) of
-            {ok, ScriptPubKey} ->
-                Acc + scan_utxos_for_script(ScriptPubKey);
-            _ ->
-                Acc
-        end
-    end, 0, Addrs),
+handle_call(get_balance, _From, State) ->
+    %% Core's getbalance counts only spendable coins: confirmed and (for
+    %% coinbase) past the 100-confirmation maturity window.  Every entry in
+    %% the wallet UTXO table is wallet-owned (only is_wallet_script outputs are
+    %% ever credited), so we sum the maturity-filtered spendable set at the
+    %% current chain tip.  Immature coinbase is excluded — matching the
+    %% premature_spend_of_coinbase rule the mempool/validation enforce on spend.
+    Balance = case current_tip_height() of
+        {ok, TipHeight} ->
+            lists:foldl(fun({_Txid, _Vout, U}, Acc) ->
+                Acc + U#utxo.value
+            end, 0, get_spendable_utxos(TipHeight));
+        not_found ->
+            %% No chain tip yet (empty chain): nothing is confirmed.
+            0
+    end,
     {reply, {ok, Balance}, State};
 
 handle_call({get_private_key, _Address}, _From,
@@ -1736,18 +1750,30 @@ iterate_key(Pass, Salt, N, Acc) ->
 
 %% @doc Scan the wallet UTXO table for outputs matching a given scriptPubKey.
 %% Returns the total value of all UTXOs matching this script.
+%% NOTE: this counts ALL matching coins regardless of coinbase maturity; the
+%% maturity-aware spendable balance is computed in get_balance/0,1 which knows
+%% the current chain height.  scan_utxos_for_script is retained for raw totals.
 -spec scan_utxos_for_script(binary()) -> non_neg_integer().
 scan_utxos_for_script(ScriptPubKey) ->
     case ets:whereis(?WALLET_UTXO_TABLE) of
         undefined -> 0;
         _ ->
-            ets:foldl(fun({{_Txid, _Vout}, {Value, Script, _Height}}, Acc) ->
+            ets:foldl(fun({{_Txid, _Vout}, Entry}, Acc) ->
+                {Value, Script, _Height, _CB} = normalize_utxo_entry(Entry),
                 case Script =:= ScriptPubKey of
                     true -> Acc + Value;
                     false -> Acc
                 end
             end, 0, ?WALLET_UTXO_TABLE)
     end.
+
+%% Normalize a stored ETS UTXO value tuple to the canonical 4-tuple
+%% {Value, ScriptPubKey, Height, IsCoinbase}.  Tolerates the legacy 3-tuple
+%% {Value, ScriptPubKey, Height} written before coinbase tracking landed.
+normalize_utxo_entry({Value, Script, Height, IsCoinbase}) ->
+    {Value, Script, Height, IsCoinbase};
+normalize_utxo_entry({Value, Script, Height}) ->
+    {Value, Script, Height, false}.
 
 %% @doc Register a script as belonging to the wallet (for UTXO tracking).
 -spec register_wallet_script(binary(), binary()) -> ok.
@@ -1763,11 +1789,19 @@ is_wallet_script(ScriptPubKey) ->
         _ -> ets:member(?WALLET_SCRIPT_TABLE, ScriptPubKey)
     end.
 
-%% @doc Add a UTXO to the wallet's tracked set.
+%% @doc Add a UTXO to the wallet's tracked set (non-coinbase).
 -spec add_wallet_utxo(binary(), non_neg_integer(), non_neg_integer(),
                        binary(), non_neg_integer()) -> ok.
 add_wallet_utxo(Txid, Vout, Value, ScriptPubKey, Height) ->
-    ets:insert(?WALLET_UTXO_TABLE, {{Txid, Vout}, {Value, ScriptPubKey, Height}}),
+    add_wallet_utxo(Txid, Vout, Value, ScriptPubKey, Height, false).
+
+%% @doc Add a UTXO to the wallet's tracked set, recording whether the funding
+%% transaction was a coinbase so maturity can be enforced on spend.
+-spec add_wallet_utxo(binary(), non_neg_integer(), non_neg_integer(),
+                       binary(), non_neg_integer(), boolean()) -> ok.
+add_wallet_utxo(Txid, Vout, Value, ScriptPubKey, Height, IsCoinbase) ->
+    ets:insert(?WALLET_UTXO_TABLE,
+               {{Txid, Vout}, {Value, ScriptPubKey, Height, IsCoinbase}}),
     ok.
 
 %% @doc Remove a UTXO from the wallet's tracked set (when spent).
@@ -1776,63 +1810,151 @@ spend_wallet_utxo(Txid, Vout) ->
     ets:delete(?WALLET_UTXO_TABLE, {Txid, Vout}),
     ok.
 
-%% @doc Get all unspent wallet UTXOs.
+%% @doc Get all unspent wallet UTXOs (mature and immature alike). Callers that
+%% must respect coinbase maturity should use get_spendable_utxos/1 instead.
 -spec get_wallet_utxos() -> [{binary(), non_neg_integer(), #utxo{}}].
 get_wallet_utxos() ->
     case ets:whereis(?WALLET_UTXO_TABLE) of
         undefined -> [];
         _ ->
-            ets:foldl(fun({{Txid, Vout}, {Value, ScriptPubKey, Height}}, Acc) ->
+            ets:foldl(fun({{Txid, Vout}, Entry}, Acc) ->
+                {Value, ScriptPubKey, Height, IsCoinbase} =
+                    normalize_utxo_entry(Entry),
                 Utxo = #utxo{
                     value = Value,
                     script_pubkey = ScriptPubKey,
-                    is_coinbase = false,  %% Wallet UTXOs are typically not coinbase
+                    is_coinbase = IsCoinbase,
                     height = Height
                 },
                 [{Txid, Vout, Utxo} | Acc]
             end, [], ?WALLET_UTXO_TABLE)
     end.
 
-%% @doc Get wallet balance from tracked UTXOs.
+%% @doc Get only the wallet UTXOs that are spendable at the given chain tip
+%% height, applying Bitcoin Core's 100-confirmation coinbase maturity rule
+%% (a coinbase at height H is spendable once TipHeight - H >= COINBASE_MATURITY,
+%% i.e. it has COINBASE_MATURITY+1 confirmations).  Non-coinbase coins are
+%% always spendable.  This is the set coin-selection runs over, and the set
+%% getbalance counts.
+-spec get_spendable_utxos(non_neg_integer()) ->
+    [{binary(), non_neg_integer(), #utxo{}}].
+get_spendable_utxos(TipHeight) ->
+    [ U || {_, _, Utxo} = U <- get_wallet_utxos(),
+           is_utxo_mature(Utxo, TipHeight) ].
+
+%% A coin is spendable when it is not coinbase, or when the coinbase has
+%% reached maturity at the current tip.  Mirrors
+%% beamchain_validation:check_coinbase_maturity/2.
+is_utxo_mature(#utxo{is_coinbase = false}, _TipHeight) ->
+    true;
+is_utxo_mature(#utxo{is_coinbase = true, height = H}, TipHeight) ->
+    (TipHeight - H) >= ?COINBASE_MATURITY.
+
+%% @doc Get wallet balance from tracked UTXOs (raw total, all coins).
 -spec get_wallet_balance() -> non_neg_integer().
 get_wallet_balance() ->
     case ets:whereis(?WALLET_UTXO_TABLE) of
         undefined -> 0;
         _ ->
-            ets:foldl(fun({{_Txid, _Vout}, {Value, _Script, _Height}}, Acc) ->
+            ets:foldl(fun({{_Txid, _Vout}, Entry}, Acc) ->
+                {Value, _Script, _Height, _CB} = normalize_utxo_entry(Entry),
                 Acc + Value
             end, 0, ?WALLET_UTXO_TABLE)
     end.
 
-%% @doc Scan a block for wallet-relevant transactions.
-%% This should be called when a new block is connected.
+%% @doc Scan a block for wallet-relevant transactions and update the wallet
+%% UTXO ledger.  Called from beamchain_chainstate:do_connect_block_inner/2 on
+%% every block that connects to the active tip (mirrors Core's
+%% CWallet::blockConnected / AddToWallet on a connect notification).
+%%
+%% For each transaction (in block order):
+%%   1. delete any wallet UTXO that this tx's inputs spend (debit), then
+%%   2. credit any output whose scriptPubKey is one of our registered scripts.
+%% Coinbase outputs are flagged so coin-selection / getbalance enforce the
+%% 100-confirmation maturity rule.
+%%
+%% Idempotent: re-scanning the same block is a no-op for credits (set insert by
+%% {Txid,Vout}) and harmless for debits (deleting an absent key is a no-op).
 -spec scan_block_for_wallet(#block{}) -> ok.
-scan_block_for_wallet(Block) ->
-    Height = Block#block.height,
-    lists:foreach(fun(Tx) ->
-        %% First, mark any spent inputs
-        lists:foreach(fun(Input) ->
-            #tx_in{prev_out = #outpoint{hash = Txid, index = Vout}} = Input,
-            spend_wallet_utxo(Txid, Vout)
-        end, Tx#transaction.inputs),
-        %% Then, add any outputs to wallet addresses
-        Txid = case Tx#transaction.txid of
-            undefined -> beamchain_serialize:tx_hash(Tx);
-            T -> T
+scan_block_for_wallet(#block{height = Height} = Block) ->
+    scan_block_for_wallet(Block, Height).
+
+-spec scan_block_for_wallet(#block{}, non_neg_integer() | undefined) -> ok.
+scan_block_for_wallet(#block{transactions = Txs}, Height) ->
+    lists:foldl(fun(Tx, IsCoinbase) ->
+        %% First, mark any spent inputs (skip the coinbase input, whose
+        %% prevout is the null outpoint and can never be a wallet UTXO).
+        case IsCoinbase of
+            true -> ok;
+            false ->
+                lists:foreach(fun(Input) ->
+                    #tx_in{prev_out =
+                               #outpoint{hash = PrevTxid, index = PrevVout}} =
+                        Input,
+                    spend_wallet_utxo(PrevTxid, PrevVout)
+                end, Tx#transaction.inputs)
         end,
+        %% Then, credit any outputs paying one of our scripts.
+        Txid = tx_id_of(Tx),
         lists:foldl(fun(Output, Idx) ->
             ScriptPubKey = Output#tx_out.script_pubkey,
             case is_wallet_script(ScriptPubKey) of
                 true ->
                     add_wallet_utxo(Txid, Idx, Output#tx_out.value,
-                                     ScriptPubKey, Height);
+                                     ScriptPubKey, Height, IsCoinbase);
                 false ->
                     ok
             end,
             Idx + 1
-        end, 0, Tx#transaction.outputs)
-    end, Block#block.transactions),
+        end, 0, Tx#transaction.outputs),
+        %% Only the first transaction in a block is the coinbase.
+        false
+    end, true, Txs),
     ok.
+
+%% @doc Reverse scan_block_for_wallet for a block being disconnected (reorg).
+%% Removes the credits this block created.  Note: this does NOT restore coins
+%% spent by the disconnected block's inputs — beamchain has no per-spend undo in
+%% the wallet ledger, and the standard recovery path (rescan / scantxoutset)
+%% rebuilds the set authoritatively.  Best-effort, keeps the ledger from
+%% over-counting coins that no longer exist on the active chain.
+-spec unscan_block_for_wallet(#block{}) -> ok.
+unscan_block_for_wallet(#block{height = Height} = Block) ->
+    unscan_block_for_wallet(Block, Height).
+
+-spec unscan_block_for_wallet(#block{}, non_neg_integer() | undefined) -> ok.
+unscan_block_for_wallet(#block{transactions = Txs}, _Height) ->
+    lists:foreach(fun(Tx) ->
+        Txid = tx_id_of(Tx),
+        lists:foldl(fun(Output, Idx) ->
+            case is_wallet_script(Output#tx_out.script_pubkey) of
+                true  -> spend_wallet_utxo(Txid, Idx);
+                false -> ok
+            end,
+            Idx + 1
+        end, 0, Tx#transaction.outputs)
+    end, Txs),
+    ok.
+
+%% The internal txid (non-reversed double-SHA256) used as the outpoint key,
+%% consistent with how outpoints are stored in tx_in records and the chainstate
+%% UTXO set.  This is the same byte order build_transaction/3 uses for prevouts.
+tx_id_of(#transaction{txid = undefined} = Tx) ->
+    beamchain_serialize:tx_hash(Tx);
+tx_id_of(#transaction{txid = Txid}) ->
+    Txid.
+
+%% Current active-chain tip height, read from the chainstate ETS meta table
+%% (a direct ETS read, NOT a gen_server call — safe to invoke from inside the
+%% wallet gen_server with no deadlock risk).  Returns not_found before the
+%% chainstate is running / before genesis is connected.
+current_tip_height() ->
+    try beamchain_chainstate:get_tip_height() of
+        {ok, Height} -> {ok, Height};
+        not_found    -> not_found
+    catch
+        _:_ -> not_found
+    end.
 
 find_address(AddrBin, #wallet_state{addresses = Addrs}) ->
     case lists:search(fun(A) ->
