@@ -97,7 +97,8 @@
          scan_block_for_wallet/2,
          scan_block_for_wallet/4,
          unscan_block_for_wallet/1,
-         unscan_block_for_wallet/2]).
+         unscan_block_for_wallet/2,
+         rescan_chain/2]).
 
 %% Wallet transaction history (listtransactions / gettransaction).
 -export([get_tx_history/0,
@@ -1984,6 +1985,49 @@ scan_block_for_wallet(#block{transactions = Txs}, Height, BlockHash, BlockTime) 
         false
     end, true, Txs),
     ok.
+
+%% @doc rescan_chain/2 — the BACKWARD counterpart of the block-connect scan.
+%% Walk the EXISTING on-chain blocks in [StartHeight, StopHeight] (inclusive,
+%% in ascending order) and run the SAME credit/debit/history scan that
+%% scan_block_for_wallet/4 runs at connect time, so a wallet whose in-memory
+%% UTXO ledger is empty (e.g. just restored from seed, or after a node restart
+%% that dropped the in-memory ETS ledger) rediscovers all of its on-chain funds
+%% and transaction history.  Mirrors Bitcoin Core's
+%% CWallet::ScanForWalletTransactions (wallet/wallet.cpp), which the
+%% rescanblockchain RPC drives over a height range.
+%%
+%% Each block is read from the block DB by height; the connecting header's
+%% block hash + timestamp are passed through so the history entries are stamped
+%% identically to the connect path.  Reusing scan_block_for_wallet/4 keeps the
+%% rescan and connect paths in lock-step: a credit produced on connect is
+%% reproduced byte-for-byte on rescan (idempotent for credits, harmless for
+%% debits).  Returns the height of the last block actually scanned (the
+%% rescanblockchain `stop_height`), or StartHeight-1 if the range was empty.
+-spec rescan_chain(non_neg_integer(), non_neg_integer()) -> non_neg_integer().
+rescan_chain(StartHeight, StopHeight)
+  when is_integer(StartHeight), is_integer(StopHeight),
+       StartHeight >= 0, StopHeight >= StartHeight ->
+    rescan_chain_loop(StartHeight, StopHeight, StartHeight - 1);
+rescan_chain(StartHeight, StopHeight)
+  when is_integer(StartHeight), is_integer(StopHeight) ->
+    %% Empty range (StopHeight < StartHeight): nothing scanned.
+    StartHeight - 1.
+
+rescan_chain_loop(H, StopHeight, LastScanned) when H > StopHeight ->
+    LastScanned;
+rescan_chain_loop(H, StopHeight, LastScanned) ->
+    case beamchain_db:get_block_by_height(H) of
+        {ok, #block{header = Header} = Block} ->
+            BlockHash = beamchain_serialize:block_hash(Header),
+            BlockTime = Header#block_header.timestamp,
+            scan_block_for_wallet(Block, H, BlockHash, BlockTime),
+            rescan_chain_loop(H + 1, StopHeight, H);
+        not_found ->
+            %% Gap in the height index (should not happen on a contiguous
+            %% active chain).  Stop at the last height we successfully scanned,
+            %% matching Core's behaviour of scanning up to the connected tip.
+            LastScanned
+    end.
 
 %% Look up the stored value of a wallet UTXO without removing it; undefined if
 %% the outpoint is not (or is no longer) a tracked wallet coin.
