@@ -95,8 +95,13 @@
          get_wallet_balance/0,
          scan_block_for_wallet/1,
          scan_block_for_wallet/2,
+         scan_block_for_wallet/4,
          unscan_block_for_wallet/1,
          unscan_block_for_wallet/2]).
+
+%% Wallet transaction history (listtransactions / gettransaction).
+-export([get_tx_history/0,
+         get_tx_history/1]).
 
 %% Keypool
 -export([get_keypool_size/0]).
@@ -121,6 +126,16 @@
 -define(WALLET_UTXO_TABLE, beamchain_wallet_utxos).
 %% ETS table for script -> address lookup
 -define(WALLET_SCRIPT_TABLE, beamchain_wallet_scripts).
+%% ETS table for wallet TRANSACTION HISTORY (listtransactions / gettransaction).
+%%   Txid -> #{height, blockhash, blocktime, time, is_coinbase,
+%%             credits   :: [{Vout, Value, ScriptPubKey}],   %% outputs paying us
+%%             debits    :: [{Value}],                        %% wallet inputs spent
+%%             value_out :: non_neg_integer()}                %% sum of ALL outputs
+%% Recorded by scan_block_for_wallet/4 at block-connect time (mirrors Core's
+%% CWallet::AddToWallet on a blockConnected notification); removed by
+%% unscan_block_for_wallet on disconnect so a reorg cannot leave stale history.
+%% fee (send) = value_out - sum(debits); net = sum(credit values) - sum(debits).
+-define(WALLET_HISTORY_TABLE, beamchain_wallet_history).
 
 %%% -------------------------------------------------------------------
 %%% HD key record
@@ -480,6 +495,12 @@ init_ets_tables() ->
         undefined ->
             ets:new(?WALLET_SCRIPT_TABLE, [named_table, set, public,
                                             {read_concurrency, true}]);
+        _ -> ok
+    end,
+    case ets:whereis(?WALLET_HISTORY_TABLE) of
+        undefined ->
+            ets:new(?WALLET_HISTORY_TABLE, [named_table, set, public,
+                                             {read_concurrency, true}]);
         _ -> ok
     end,
     ok.
@@ -1880,37 +1901,112 @@ scan_block_for_wallet(#block{height = Height} = Block) ->
     scan_block_for_wallet(Block, Height).
 
 -spec scan_block_for_wallet(#block{}, non_neg_integer() | undefined) -> ok.
-scan_block_for_wallet(#block{transactions = Txs}, Height) ->
+scan_block_for_wallet(Block, Height) ->
+    scan_block_for_wallet(Block, Height, undefined, undefined).
+
+%% @doc scan_block_for_wallet/4 — same UTXO-ledger maintenance as /2 plus a
+%% Core-shaped wallet TRANSACTION-HISTORY record per wallet-relevant tx, so
+%% listtransactions / gettransaction can report the wallet's own
+%% receive/send/coinbase transactions.  BlockHash + BlockTime come from the
+%% connecting block's header (the wallet has no other way to learn them on the
+%% connect path).  Mirrors Core's CWallet::AddToWallet on a blockConnected
+%% notification: a tx is recorded iff it credits a wallet output (receive /
+%% generate) OR debits a wallet UTXO (send).
+%%
+%% Per tx we record, in block order:
+%%   credits   = outputs paying one of our scripts  [{Vout, Value, Script}]
+%%   debits    = wallet UTXO VALUES this tx's inputs spend  [{Value}]
+%%   value_out = sum of ALL output values (for the Core fee = value_out - debit)
+%% Inputs are inspected for their stored value BEFORE the UTXO is deleted, so a
+%% send's debit total is captured exactly.
+-spec scan_block_for_wallet(#block{}, non_neg_integer() | undefined,
+                            binary() | undefined,
+                            non_neg_integer() | undefined) -> ok.
+scan_block_for_wallet(#block{transactions = Txs}, Height, BlockHash, BlockTime) ->
     lists:foldl(fun(Tx, IsCoinbase) ->
-        %% First, mark any spent inputs (skip the coinbase input, whose
+        Txid = tx_id_of(Tx),
+        %% First, debit any spent inputs (skip the coinbase input, whose
         %% prevout is the null outpoint and can never be a wallet UTXO).
-        case IsCoinbase of
-            true -> ok;
+        %% Capture each spent wallet UTXO's value before deleting it.
+        Debits = case IsCoinbase of
+            true -> [];
             false ->
-                lists:foreach(fun(Input) ->
+                lists:foldl(fun(Input, Acc) ->
                     #tx_in{prev_out =
                                #outpoint{hash = PrevTxid, index = PrevVout}} =
                         Input,
-                    spend_wallet_utxo(PrevTxid, PrevVout)
-                end, Tx#transaction.inputs)
+                    SpentVal = lookup_wallet_utxo_value(PrevTxid, PrevVout),
+                    spend_wallet_utxo(PrevTxid, PrevVout),
+                    case SpentVal of
+                        undefined -> Acc;
+                        V         -> [{V} | Acc]
+                    end
+                end, [], Tx#transaction.inputs)
         end,
-        %% Then, credit any outputs paying one of our scripts.
-        Txid = tx_id_of(Tx),
-        lists:foldl(fun(Output, Idx) ->
-            ScriptPubKey = Output#tx_out.script_pubkey,
-            case is_wallet_script(ScriptPubKey) of
-                true ->
-                    add_wallet_utxo(Txid, Idx, Output#tx_out.value,
-                                     ScriptPubKey, Height, IsCoinbase);
-                false ->
-                    ok
-            end,
-            Idx + 1
-        end, 0, Tx#transaction.outputs),
+        %% Then, credit any outputs paying one of our scripts, while summing
+        %% the total output value (for the fee computation).
+        {Credits, ValueOut, _} = lists:foldl(
+            fun(Output, {CAcc, VOut, Idx}) ->
+                ScriptPubKey = Output#tx_out.script_pubkey,
+                Value = Output#tx_out.value,
+                CAcc2 = case is_wallet_script(ScriptPubKey) of
+                    true ->
+                        add_wallet_utxo(Txid, Idx, Value,
+                                         ScriptPubKey, Height, IsCoinbase),
+                        [{Idx, Value, ScriptPubKey} | CAcc];
+                    false ->
+                        CAcc
+                end,
+                {CAcc2, VOut + Value, Idx + 1}
+            end, {[], 0, 0}, Tx#transaction.outputs),
+        %% Record a history entry iff this tx touched the wallet (credit or
+        %% debit).  Pure send-only txs (debits, no credits) and pure receives
+        %% are both captured.  Coinbase txs only ever credit.
+        case (Credits =/= []) orelse (Debits =/= []) of
+            true ->
+                TxHex = beamchain_serialize:hex_encode(
+                          beamchain_serialize:encode_transaction(Tx)),
+                record_tx_history(Txid, #{
+                    height     => Height,
+                    blockhash  => BlockHash,
+                    blocktime  => BlockTime,
+                    time       => BlockTime,
+                    is_coinbase => IsCoinbase,
+                    credits    => lists:reverse(Credits),
+                    debits     => Debits,
+                    value_out  => ValueOut,
+                    txhex      => TxHex
+                });
+            false ->
+                ok
+        end,
         %% Only the first transaction in a block is the coinbase.
         false
     end, true, Txs),
     ok.
+
+%% Look up the stored value of a wallet UTXO without removing it; undefined if
+%% the outpoint is not (or is no longer) a tracked wallet coin.
+lookup_wallet_utxo_value(Txid, Vout) ->
+    case ets:whereis(?WALLET_UTXO_TABLE) of
+        undefined -> undefined;
+        _ ->
+            case ets:lookup(?WALLET_UTXO_TABLE, {Txid, Vout}) of
+                [{_, Entry}] ->
+                    {Value, _Script, _Height, _CB} = normalize_utxo_entry(Entry),
+                    Value;
+                [] ->
+                    undefined
+            end
+    end.
+
+%% Insert/overwrite the history record for a wallet tx (idempotent: re-scanning
+%% the same block overwrites with identical data).
+record_tx_history(Txid, Entry) ->
+    case ets:whereis(?WALLET_HISTORY_TABLE) of
+        undefined -> ok;
+        _ -> ets:insert(?WALLET_HISTORY_TABLE, {Txid, Entry}), ok
+    end.
 
 %% @doc Reverse scan_block_for_wallet for a block being disconnected (reorg).
 %% Removes the credits this block created.  Note: this does NOT restore coins
@@ -1932,9 +2028,44 @@ unscan_block_for_wallet(#block{transactions = Txs}, _Height) ->
                 false -> ok
             end,
             Idx + 1
-        end, 0, Tx#transaction.outputs)
+        end, 0, Tx#transaction.outputs),
+        %% Drop the wallet transaction-history entry this block created, so a
+        %% reorg cannot leave listtransactions / gettransaction reporting a tx
+        %% that is no longer on the active chain.  Symmetric to the
+        %% record_tx_history credit on connect.
+        delete_tx_history(Txid)
     end, Txs),
     ok.
+
+%% Remove a wallet history record (reorg disconnect).
+delete_tx_history(Txid) ->
+    case ets:whereis(?WALLET_HISTORY_TABLE) of
+        undefined -> ok;
+        _ -> ets:delete(?WALLET_HISTORY_TABLE, Txid), ok
+    end.
+
+%% @doc Return the full wallet transaction history as [{Txid, EntryMap}].
+%% Each EntryMap has the keys documented at ?WALLET_HISTORY_TABLE.  The RPC
+%% layer turns these into Core-shaped listtransactions / gettransaction
+%% results, applying confirmations/category at the current chain tip.
+-spec get_tx_history() -> [{binary(), map()}].
+get_tx_history() ->
+    case ets:whereis(?WALLET_HISTORY_TABLE) of
+        undefined -> [];
+        _ -> ets:tab2list(?WALLET_HISTORY_TABLE)
+    end.
+
+%% @doc Look up a single wallet tx's history entry by internal txid.
+-spec get_tx_history(binary()) -> {ok, map()} | not_found.
+get_tx_history(Txid) ->
+    case ets:whereis(?WALLET_HISTORY_TABLE) of
+        undefined -> not_found;
+        _ ->
+            case ets:lookup(?WALLET_HISTORY_TABLE, Txid) of
+                [{_, Entry}] -> {ok, Entry};
+                []           -> not_found
+            end
+    end.
 
 %% The internal txid (non-reversed double-SHA256) used as the outpoint key,
 %% consistent with how outpoints are stored in tx_in records and the chainstate
