@@ -2,6 +2,9 @@
 
 -include("beamchain.hrl").
 
+-type network() :: mainnet | testnet | testnet4 | signet | regtest.
+-export_type([network/0]).
+
 %% Base58Check
 -export([base58check_encode/2, base58check_decode/1]).
 
@@ -99,12 +102,12 @@ bech32m_decode(Str) ->
 %%% High-level: scriptPubKey → address
 %%% -------------------------------------------------------------------
 
--spec script_to_address(binary(), mainnet | testnet) -> string() | unknown.
+-spec script_to_address(binary(), network()) -> string() | unknown.
 %% P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
 script_to_address(<<16#76, 16#a9, 16#14, Hash:20/binary, 16#88, 16#ac>>, Network) ->
     Version = case Network of
         mainnet -> 16#00;
-        testnet -> 16#6f
+        _       -> 16#6f   %% testnet/testnet4/signet/regtest share 0x6f
     end,
     base58check_encode(Version, Hash);
 
@@ -112,7 +115,7 @@ script_to_address(<<16#76, 16#a9, 16#14, Hash:20/binary, 16#88, 16#ac>>, Network
 script_to_address(<<16#a9, 16#14, Hash:20/binary, 16#87>>, Network) ->
     Version = case Network of
         mainnet -> 16#05;
-        testnet -> 16#c4
+        _       -> 16#c4   %% testnet/testnet4/signet/regtest share 0xc4
     end,
     base58check_encode(Version, Hash);
 
@@ -121,8 +124,9 @@ script_to_address(<<WitVer:8, Len:8, Program:Len/binary>>, Network)
   when (WitVer =:= 16#00 orelse (WitVer >= 16#51 andalso WitVer =< 16#60)),
        (Len >= 2 andalso Len =< 40) ->
     Hrp = case Network of
-        mainnet -> "bc";
-        testnet -> "tb"
+        mainnet  -> "bc";
+        regtest  -> "bcrt";
+        _        -> "tb"   %% testnet/testnet4/signet
     end,
     Version = case WitVer of
         16#00 -> 0;
@@ -145,7 +149,7 @@ script_to_address(_, _) ->
 %%% High-level: address → scriptPubKey
 %%% -------------------------------------------------------------------
 
--spec address_to_script(string(), mainnet | testnet) -> {ok, binary()} | {error, term()}.
+-spec address_to_script(string(), network()) -> {ok, binary()} | {error, term()}.
 address_to_script(Address, Network) ->
     %% try bech32/bech32m first, then base58check
     case try_decode_segwit(Address, Network) of
@@ -412,8 +416,11 @@ extract_bits(Acc, Bits, _ToBits, _MaxV, Ret) ->
 
 try_decode_segwit(Address, Network) ->
     ExpectedHrp = case Network of
-        mainnet -> "bc";
-        testnet -> "tb"
+        mainnet  -> "bc";
+        testnet  -> "tb";
+        testnet4 -> "tb";
+        signet   -> "tb";
+        regtest  -> "bcrt"
     end,
     %% try bech32 first, then bech32m
     case try_decode_segwit_variant(Address, ExpectedHrp) of
@@ -474,6 +481,18 @@ address_version_to_script(16#05, Hash, mainnet) when byte_size(Hash) =:= 20 ->
     {ok, <<16#a9, 16#14, Hash/binary, 16#87>>};
 address_version_to_script(16#c4, Hash, testnet) when byte_size(Hash) =:= 20 ->
     %% testnet P2SH
+    {ok, <<16#a9, 16#14, Hash/binary, 16#87>>};
+%% regtest / signet / testnet4 share testnet's base58 version bytes
+%% (0x6f P2PKH, 0xc4 P2SH); the segwit HRP differs but base58 is identical.
+address_version_to_script(16#6f, Hash, Net) when byte_size(Hash) =:= 20,
+                                                  (Net =:= regtest orelse
+                                                   Net =:= signet orelse
+                                                   Net =:= testnet4) ->
+    {ok, <<16#76, 16#a9, 16#14, Hash/binary, 16#88, 16#ac>>};
+address_version_to_script(16#c4, Hash, Net) when byte_size(Hash) =:= 20,
+                                                  (Net =:= regtest orelse
+                                                   Net =:= signet orelse
+                                                   Net =:= testnet4) ->
     {ok, <<16#a9, 16#14, Hash/binary, 16#87>>};
 address_version_to_script(_, _, _) ->
     {error, unknown_version}.

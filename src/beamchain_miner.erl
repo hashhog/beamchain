@@ -918,11 +918,19 @@ witness_commitment_output(SelectedEntries, CbInput) ->
     #tx_out{value = 0, script_pubkey = Script}.
 
 %% Encode block height for BIP 34 coinbase scriptSig.
-%% Heights are pushed as minimal little-endian byte arrays.
+%%
+%% MUST match the consensus check in beamchain_validation:encode_bip34_height/1
+%% (CScript() << nHeight per Core script.h:433-448), otherwise blocks this
+%% miner produces are rejected by our own validator with bad_cb_height:
+%%   0       → <<0x00>>            (OP_0)
+%%   1..16   → <<0x50 + Height>>   (OP_1..OP_16, single byte)
+%%   17+     → <<Len, LE-bytes...>> (length-prefixed sign-magnitude CScriptNum)
+%% Previously the 1..16 case emitted a length-prefixed push (<<1, Height>>),
+%% which is the non-canonical form Core/our validator reject.
 encode_coinbase_height(0) ->
-    <<0>>;
+    <<16#00>>;  %% OP_0
 encode_coinbase_height(Height) when Height >= 1, Height =< 16 ->
-    <<1, Height:8>>;
+    <<(16#50 + Height):8>>;  %% OP_1..OP_16
 encode_coinbase_height(Height) ->
     Bytes = le_minimal(Height),
     Len = byte_size(Bytes),
