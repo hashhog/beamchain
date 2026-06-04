@@ -776,6 +776,8 @@ handle_method(<<"walletpassphrase">>, P, W) -> rpc_walletpassphrase(P, W);
 handle_method(<<"walletlock">>, _, W) -> rpc_walletlock(W);
 handle_method(<<"signrawtransactionwithwallet">>, P, W) -> rpc_signrawtransactionwithwallet(P, W);
 handle_method(<<"importdescriptors">>, P, W) -> rpc_importdescriptors(P, W);
+handle_method(<<"importprivkey">>, P, W) -> rpc_importprivkey(P, W);
+handle_method(<<"rescanblockchain">>, P, W) -> rpc_rescanblockchain(P, W);
 handle_method(<<"walletcreatefundedpsbt">>, P, W) -> rpc_walletcreatefundedpsbt(P, W);
 %% W118 BUG-2 / BUG-3 closure: BIP-125 RBF fee bumping.
 handle_method(<<"bumpfee">>, P, W) -> rpc_bumpfee(P, W);
@@ -921,6 +923,8 @@ rpc_help_list() ->
         <<"loadwallet \"name\"">>,
         <<"lockunspent unlock ( [{\"txid\":\"hex\",\"vout\":n},...] persistent )">>,
         <<"importdescriptors \"requests\"">>,
+        <<"importprivkey \"privkey\" ( \"label\" rescan )">>,
+        <<"rescanblockchain ( start_height stop_height )">>,
         <<"sendtoaddress \"address\" amount ( \"comment\" )">>,
         <<"signrawtransactionwithwallet \"hexstring\" ( [{\"txid\":\"hex\",\"vout\":n,\"scriptPubKey\":\"hex\"},...] )">>,
         <<"unloadwallet ( \"name\" )">>,
@@ -7462,6 +7466,154 @@ rpc_importdescriptors([Requests], WalletName) when is_list(Requests) ->
 rpc_importdescriptors(_, _) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"Usage: importdescriptors \"requests\"">>}.
+
+%%% ===================================================================
+%%% rescanblockchain — wallet rescan of EXISTING chain blocks
+%%% ===================================================================
+%%
+%% rescanblockchain ( start_height stop_height )
+%%   -> { "start_height": N, "stop_height": M }
+%%
+%% Rescans the block chain for transactions affecting wallet addresses,
+%% crediting every wallet-owned output found in the height range into the
+%% wallet UTXO ledger + transaction history (and debiting spent wallet
+%% inputs).  This is the BACKWARD counterpart of the block-connect scan: where
+%% the connect path scans a block as it attaches to the tip, rescanblockchain
+%% walks blocks already on disk.  Unlike scantxoutset (which reads the
+%% chainstate UTXO set directly and bypasses the wallet entirely), this is a
+%% REAL wallet rescan that rebuilds the wallet's own ledger — the recovery path
+%% Bitcoin Core exposes after a restore-from-seed or a node restart that
+%% dropped the in-memory wallet state.
+%%
+%% Shape + semantics follow bitcoin-core src/wallet/rpc/transactions.cpp
+%% rescanblockchain (which drives CWallet::ScanForWalletTransactions over a
+%% [start_height, stop_height] range): start_height defaults to 0, stop_height
+%% defaults to the current tip; an out-of-range start_height is rejected with
+%% RPC_INVALID_PARAMETER.
+rpc_rescanblockchain(Params, WalletName) ->
+    case resolve_wallet(WalletName) of
+        {ok, _Pid} ->
+            TipHeight = case beamchain_chainstate:get_tip() of
+                {ok, {_H, Ht}} -> Ht;
+                _ -> 0
+            end,
+            case rescan_resolve_range(Params, TipHeight) of
+                {error, Code, Msg} ->
+                    {error, Code, Msg};
+                {ok, StartHeight, StopHeight} ->
+                    Scanned = beamchain_wallet:rescan_chain(
+                                StartHeight, StopHeight),
+                    %% stop_height is the last block actually scanned.  For a
+                    %% normal (non-empty, contiguous) range this is StopHeight.
+                    Reported = case Scanned >= StartHeight of
+                        true  -> Scanned;
+                        false -> StopHeight
+                    end,
+                    {ok, #{
+                        <<"start_height">> => StartHeight,
+                        <<"stop_height">>  => Reported
+                    }}
+            end;
+        {error, _} ->
+            wallet_not_found_error(WalletName)
+    end.
+
+%% Resolve the (optional) start_height / stop_height params against the tip,
+%% validating like Core's rescanblockchain.
+rescan_resolve_range([], TipHeight) ->
+    {ok, 0, TipHeight};
+rescan_resolve_range([Start], TipHeight) when is_integer(Start) ->
+    case Start < 0 orelse Start > TipHeight of
+        true  -> {error, ?RPC_INVALID_PARAMETER, <<"Invalid start_height">>};
+        false -> {ok, Start, TipHeight}
+    end;
+rescan_resolve_range([Start, Stop], TipHeight)
+  when is_integer(Start), is_integer(Stop) ->
+    case Start < 0 orelse Start > TipHeight of
+        true ->
+            {error, ?RPC_INVALID_PARAMETER, <<"Invalid start_height">>};
+        false ->
+            case Stop < Start orelse Stop > TipHeight of
+                true  -> {error, ?RPC_INVALID_PARAMETER,
+                          <<"Invalid stop_height">>};
+                false -> {ok, Start, Stop}
+            end
+    end;
+rescan_resolve_range(_, _) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"rescanblockchain ( start_height stop_height )">>}.
+
+%%% ===================================================================
+%%% importprivkey — import a single WIF private key + rescan its funds
+%%% ===================================================================
+%%
+%% importprivkey "privkey" ( "label" rescan )
+%%
+%% Decode the WIF, derive the key's address(es)/scripts, register them as
+%% wallet-owned, and — if rescan (default true) — rescan the chain so the
+%% imported key's existing on-chain funds are credited into the wallet.
+%% Mirrors bitcoin-core src/wallet/rpc/backup.cpp importprivkey
+%% (DecodeSecret -> AddKeyPubKey -> RescanWallet).  Because beamchain's wallet
+%% UTXO/script tables are keyed by scriptPubKey, importing a foreign key is a
+%% matter of registering its scripts and letting the same rescan that powers
+%% rescanblockchain credit the funds.  We register both the P2WPKH (native
+%% segwit, the wallet default) and P2PKH (legacy) scripts for the key so funds
+%% sent to either form are discovered.
+rpc_importprivkey([Wif], WalletName) ->
+    rpc_importprivkey([Wif, <<>>, true], WalletName);
+rpc_importprivkey([Wif, Label], WalletName) ->
+    rpc_importprivkey([Wif, Label, true], WalletName);
+rpc_importprivkey([Wif, Label, Rescan], WalletName)
+  when is_binary(Wif), is_binary(Label) ->
+    case resolve_wallet(WalletName) of
+        {ok, _Pid} ->
+            case wif_to_privkey(Wif) of
+                {ok, {PrivKey, _Compressed}} ->
+                    Network = beamchain_config:network(),
+                    PubKey = beamchain_wallet:privkey_to_pubkey(PrivKey),
+                    %% Register every standard single-key script for this key so
+                    %% funds at any of its address forms are discoverable.
+                    P2wpkhAddr = beamchain_wallet:pubkey_to_p2wpkh(PubKey,
+                                                                   Network),
+                    P2pkhAddr  = beamchain_wallet:pubkey_to_p2pkh(PubKey,
+                                                                  Network),
+                    lists:foreach(fun(AddrStr) ->
+                        case beamchain_address:address_to_script(AddrStr,
+                                                                 Network) of
+                            {ok, SPK} ->
+                                beamchain_wallet:register_wallet_script(
+                                    SPK, list_to_binary(AddrStr));
+                            {error, _} -> ok
+                        end
+                    end, [P2wpkhAddr, P2pkhAddr]),
+                    %% rescan (default true): credit the imported key's existing
+                    %% on-chain funds by walking the chain through the wallet.
+                    DoRescan = case Rescan of
+                        false -> false;
+                        _     -> true
+                    end,
+                    case DoRescan of
+                        true ->
+                            TipHeight = case beamchain_chainstate:get_tip() of
+                                {ok, {_H, Ht}} -> Ht;
+                                _ -> 0
+                            end,
+                            _ = beamchain_wallet:rescan_chain(0, TipHeight);
+                        false ->
+                            ok
+                    end,
+                    %% Core's importprivkey returns null on success.
+                    {ok_raw_json, jsx:encode(null)};
+                {error, _} ->
+                    {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+                     <<"Invalid private key encoding">>}
+            end;
+        {error, _} ->
+            wallet_not_found_error(WalletName)
+    end;
+rpc_importprivkey(_, _) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"importprivkey \"privkey\" ( \"label\" rescan )">>}.
 
 %%% ===================================================================
 %%% PSBT methods (BIP 174)
