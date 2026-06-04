@@ -768,6 +768,7 @@ handle_method(<<"dumpprivkey">>, P, W) -> rpc_dumpprivkey(P, W);
 handle_method(<<"sendtoaddress">>, P, W) -> rpc_sendtoaddress(P, W);
 handle_method(<<"listunspent">>, P, W) -> rpc_listunspent(P, W);
 handle_method(<<"listtransactions">>, P, W) -> rpc_listtransactions(P, W);
+handle_method(<<"gettransaction">>, P, W) -> rpc_gettransaction(P, W);
 handle_method(<<"lockunspent">>, P, W) -> rpc_lockunspent(P, W);
 handle_method(<<"listlockunspent">>, _, W) -> rpc_listlockunspent(W);
 handle_method(<<"encryptwallet">>, P, W) -> rpc_encryptwallet(P, W);
@@ -908,6 +909,7 @@ rpc_help_list() ->
         <<"getbalance">>,
         <<"getnewaddress ( \"label\" \"address_type\" )">>,
         <<"getrawchangeaddress ( \"address_type\" )">>,
+        <<"gettransaction \"txid\" ( include_watchonly verbose )">>,
         <<"gettxout \"txid\" n ( include_mempool )">>,
         <<"getwalletinfo">>,
         <<"getwalletmnemonic">>,
@@ -6750,16 +6752,316 @@ rpc_listunspent(Params, WalletName) ->
             wallet_not_found_error(WalletName)
     end.
 
-%% @doc List transactions (multi-wallet aware).
-rpc_listtransactions(_Params, WalletName) ->
+%% @doc listtransactions ( "label" count skip include_watchonly )
+%%
+%% Mirrors `bitcoin-core/src/wallet/rpc/transactions.cpp::listtransactions` +
+%% ListTransactions / WalletTxToJSON.  Returns the `count` most recent wallet
+%% transactions (skipping `skip`), each expanded into one entry PER
+%% wallet-relevant output: a "send" entry (negative amount, negative fee) for
+%% each output of a tx that debited the wallet, then a receive/generate/
+%% immature entry (positive amount) for each output that credited the wallet.
+%%
+%% Sign + field conventions follow Core exactly:
+%%   send:    amount = -output_value, fee = -tx_fee, vout = output index
+%%   receive: amount = +output_value (non-coinbase)
+%%   generate/immature: coinbase credit, matured (>=100 conf) -> generate
+%%   common:  address, category, confirmations, generated (coinbase only),
+%%            blockhash, blockheight, blocktime, txid, time
+%%
+%% Ordering: Core returns oldest-first within the trimmed window
+%% (ret is built newest-first per-tx then the LAST `count` are taken and the
+%% slice reversed).  We sort wallet txs by (blockheight, then stable txid) and
+%% return the most recent `count`.
+rpc_listtransactions(Params, WalletName) ->
     case resolve_wallet(WalletName) of
         {ok, _Pid} ->
-            %% TODO: Implement transaction history
-            %% For now, return empty list
-            {ok, []};
+            {_Label, Count, Skip} = parse_listtransactions_params(Params),
+            Network = beamchain_config:network(),
+            TipHeight = case beamchain_chainstate:get_tip_height() of
+                {ok, H}   -> H;
+                not_found -> 0
+            end,
+            History = beamchain_wallet:get_tx_history(),
+            %% Sort ascending by (height, txid) so the trimmed window is the
+            %% most-recent `count` txs, returned oldest-first like Core.
+            Sorted = lists:sort(
+                fun({TxidA, EA}, {TxidB, EB}) ->
+                    HA = maps:get(height, EA, 0),
+                    HB = maps:get(height, EB, 0),
+                    case HA =:= HB of
+                        true  -> TxidA =< TxidB;
+                        false -> HA < HB
+                    end
+                end, History),
+            %% Expand each tx into its send + receive detail entries.
+            AllEntries = lists:flatmap(
+                fun({Txid, Entry}) ->
+                    history_entry_to_list_items(Txid, Entry, TipHeight,
+                                                Network, true)
+                end, Sorted),
+            %% Apply skip + count over the most-recent window (Core trims the
+            %% tail then reverses; AllEntries is already oldest-first, so take
+            %% the last Count after dropping `skip` from the tail).
+            Total = length(AllEntries),
+            From = max(0, Total - Skip - Count),
+            ToDrop = max(0, Total - Skip),
+            Windowed = lists:sublist(AllEntries, From + 1, ToDrop - From),
+            {ok_raw_json, replace_btc_sentinels(jsx:encode(Windowed))};
         {error, _} ->
             wallet_not_found_error(WalletName)
     end.
+
+%% Parse listtransactions params: ( "label" count skip include_watchonly ).
+%% Defaults: label "*" (all), count 10, skip 0.  Non-integers tolerated.
+parse_listtransactions_params(Params) ->
+    Label = case Params of
+        [L | _] when is_binary(L) -> L;
+        _ -> <<"*">>
+    end,
+    Count = case Params of
+        [_, C | _] when is_integer(C), C >= 0 -> C;
+        _ -> 10
+    end,
+    Skip = case Params of
+        [_, _, S | _] when is_integer(S), S >= 0 -> S;
+        _ -> 0
+    end,
+    {Label, Count, Skip}.
+
+%% Build the Core ListTransactions per-output entries for one wallet tx.
+%% Long?=true includes the WalletTxToJSON block fields (confirmations etc.);
+%% Long?=false (gettransaction details) omits them.
+history_entry_to_list_items(Txid, Entry, TipHeight, Network, Long) ->
+    Height    = maps:get(height, Entry, 0),
+    BlockHash = maps:get(blockhash, Entry, undefined),
+    BlockTime = maps:get(blocktime, Entry, undefined),
+    Time      = maps:get(time, Entry, BlockTime),
+    IsCoinbase = maps:get(is_coinbase, Entry, false),
+    Credits   = maps:get(credits, Entry, []),
+    Debits    = maps:get(debits, Entry, []),
+    ValueOut  = maps:get(value_out, Entry, 0),
+    Confirmations = confirmations_at(Height, TipHeight),
+    DebitTotal = lists:sum([V || {V} <- Debits]),
+    %% Core's displayed send fee is NEGATIVE.  In CachedTxGetAmounts
+    %% (receive.cpp:153) nFee = nDebit - nValueOut (positive: inputs-outputs);
+    %% ListTransactions emits ValueFromAmount(-nFee) (transactions.cpp:331),
+    %% i.e. (nValueOut - nDebit) = outputs - inputs, a negative number.  We
+    %% compute exactly that.
+    Fee = case Debits of
+        [] -> 0;
+        _  -> ValueOut - DebitTotal
+    end,
+    DisplayTxid = hash_to_hex(Txid),
+    %% Common block/tx fields appended to each long entry (WalletTxToJSON).
+    LongFields = case Long of
+        true -> tx_long_fields(Confirmations, IsCoinbase, BlockHash,
+                               Height, BlockTime, DisplayTxid, Time);
+        false -> #{}
+    end,
+    %% Send entries: one per output of a tx that debited the wallet.  Core
+    %% emits a send line for every COutputEntry in listSent (each output that
+    %% is not change / paid out of the wallet).  We approximate with the
+    %% wallet-debiting txs' outputs paying foreign scripts (non-credit
+    %% outputs); change outputs (credits) appear as receive lines instead.
+    SendEntries = case Debits of
+        [] -> [];
+        _  -> build_send_entries(Entry, Fee, Network, LongFields,
+                                 DisplayTxid)
+    end,
+    %% Receive / generate / immature entries: one per wallet-credited output.
+    RecvEntries = lists:map(
+        fun({Vout, Value, Script}) ->
+            Category = credit_category(IsCoinbase, Confirmations),
+            Addr = script_addr(Script, Network),
+            Base = #{
+                <<"address">>  => Addr,
+                <<"category">> => Category,
+                <<"amount">>   => format_amount_sentinel(Value),
+                <<"vout">>     => Vout,
+                <<"abandoned">> => false
+            },
+            maps:merge(Base, LongFields)
+        end, Credits),
+    SendEntries ++ RecvEntries.
+
+%% Build the "send" detail entries for a wallet-debiting tx.  Core emits a send
+%% line per output paid out of the wallet (the foreign outputs); the change
+%% output (a wallet credit) is reported separately as a receive line, so the
+%% send lines are the tx outputs that do NOT credit the wallet.  We reconstruct
+%% the foreign outputs from the stored raw tx, skipping any output index that
+%% appears in `credits` (change).
+build_send_entries(Entry, Fee, Network, LongFields, _DisplayTxid) ->
+    Credits = maps:get(credits, Entry, []),
+    ChangeVouts = [V || {V, _, _} <- Credits],
+    TxHex = maps:get(txhex, Entry, <<>>),
+    Outputs = decode_tx_outputs(TxHex),
+    lists:filtermap(
+        fun({Vout, Value, Script}) ->
+            case lists:member(Vout, ChangeVouts) of
+                true  -> false;  %% change -> reported as a receive line
+                false ->
+                    Addr = script_addr(Script, Network),
+                    Base = #{
+                        <<"address">>  => Addr,
+                        <<"category">> => <<"send">>,
+                        <<"amount">>   => format_amount_sentinel(-Value),
+                        %% Core emits ValueFromAmount(-nFee); our Fee already
+                        %% equals (outputs - inputs) = -nFee, so emit it as-is
+                        %% (a negative number for a real fee).
+                        <<"fee">>      => format_amount_sentinel(Fee),
+                        <<"abandoned">> => false
+                    },
+                    {true, maps:merge(Base, LongFields)}
+            end
+        end, Outputs).
+
+%% Decode the [{Vout, Value, ScriptPubKey}] list from a stored raw-tx hex.
+decode_tx_outputs(<<>>) -> [];
+decode_tx_outputs(TxHex) when is_binary(TxHex) ->
+    try
+        Bin = beamchain_serialize:hex_decode(TxHex),
+        {Tx, _Rest} = beamchain_serialize:decode_transaction(Bin),
+        {_, Outs} = lists:foldl(
+            fun(#tx_out{value = V, script_pubkey = S}, {Idx, Acc}) ->
+                {Idx + 1, [{Idx, V, S} | Acc]}
+            end, {0, []}, Tx#transaction.outputs),
+        lists:reverse(Outs)
+    catch _:_ -> [] end.
+
+%% Core WalletTxToJSON common fields (long form).
+tx_long_fields(Confirmations, IsCoinbase, BlockHash, Height, BlockTime,
+               DisplayTxid, Time) ->
+    Base = #{
+        <<"confirmations">> => Confirmations,
+        <<"txid">>          => DisplayTxid,
+        <<"time">>          => safe_time(Time),
+        <<"timereceived">>  => safe_time(Time),
+        <<"bip125-replaceable">> => <<"no">>
+    },
+    Base1 = case IsCoinbase of
+        true  -> Base#{<<"generated">> => true};
+        false -> Base
+    end,
+    %% Confirmed (in a block) -> blockhash/blockheight/blocktime, like Core's
+    %% TxStateConfirmed branch.  Every history entry is block-confirmed.
+    case (BlockHash =/= undefined) andalso (Confirmations >= 1) of
+        true ->
+            Base1#{
+                <<"blockhash">>   => hash_to_hex(BlockHash),
+                <<"blockheight">> => Height,
+                <<"blocktime">>   => safe_time(BlockTime)
+            };
+        false ->
+            Base1#{<<"trusted">> => (Confirmations >= 0)}
+    end.
+
+safe_time(undefined) -> 0;
+safe_time(T) when is_integer(T) -> T;
+safe_time(_) -> 0.
+
+confirmations_at(_Height, 0) -> 0;
+confirmations_at(Height, TipHeight) when is_integer(Height) ->
+    case TipHeight - Height + 1 of
+        C when C > 0 -> C;
+        _ -> 0
+    end;
+confirmations_at(_, _) -> 0.
+
+%% Coinbase credit category by maturity (Core: orphan / immature / generate);
+%% non-coinbase credit -> receive.
+credit_category(true, Confirmations) ->
+    if
+        Confirmations < 1 -> <<"orphan">>;
+        Confirmations =< ?COINBASE_MATURITY -> <<"immature">>;
+        true -> <<"generate">>
+    end;
+credit_category(false, _Confirmations) ->
+    <<"receive">>.
+
+%% scriptPubKey -> address string (or "" when undecodable), as a binary.
+script_addr(Script, Network) ->
+    case beamchain_address:script_to_address(Script, Network) of
+        unknown -> <<>>;
+        A       -> iolist_to_binary(A)
+    end.
+
+%% @doc gettransaction "txid" ( include_watchonly verbose )
+%%
+%% Mirrors `bitcoin-core/src/wallet/rpc/transactions.cpp::gettransaction`.
+%% Returns the wallet's view of a single transaction:
+%%   amount  = net effect on the wallet (credit - debit) minus the fee
+%%   fee     = present only when the wallet funded the inputs (a send)
+%%   + WalletTxToJSON common fields (confirmations / generated / blockhash /
+%%     blockheight / blocktime / txid / time)
+%%   details = the per-output ListTransactions array (short form)
+%%   hex     = the raw serialized transaction
+rpc_gettransaction([TxidHex | _Rest], WalletName) when is_binary(TxidHex) ->
+    case resolve_wallet(WalletName) of
+        {ok, _Pid} ->
+            %% User supplies the Core display txid (reversed); the history table
+            %% is keyed by the internal (non-reversed) txid.
+            Txid = hex_to_internal_hash(TxidHex),
+            case beamchain_wallet:get_tx_history(Txid) of
+                {ok, Entry} ->
+                    {ok_raw_json,
+                     replace_btc_sentinels(
+                       jsx:encode(build_gettransaction(Txid, Entry)))};
+                not_found ->
+                    {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+                     <<"Invalid or non-wallet transaction id">>}
+            end;
+        {error, _} ->
+            wallet_not_found_error(WalletName)
+    end;
+rpc_gettransaction(_, _WalletName) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"gettransaction \"txid\" ( include_watchonly verbose )">>}.
+
+build_gettransaction(Txid, Entry) ->
+    Network = beamchain_config:network(),
+    TipHeight = case beamchain_chainstate:get_tip_height() of
+        {ok, H}   -> H;
+        not_found -> 0
+    end,
+    Height     = maps:get(height, Entry, 0),
+    BlockHash  = maps:get(blockhash, Entry, undefined),
+    BlockTime  = maps:get(blocktime, Entry, undefined),
+    Time       = maps:get(time, Entry, BlockTime),
+    IsCoinbase = maps:get(is_coinbase, Entry, false),
+    Credits    = maps:get(credits, Entry, []),
+    Debits     = maps:get(debits, Entry, []),
+    ValueOut   = maps:get(value_out, Entry, 0),
+    TxHex      = maps:get(txhex, Entry, <<>>),
+    Confirmations = confirmations_at(Height, TipHeight),
+    DisplayTxid = hash_to_hex(Txid),
+    CreditTotal = lists:sum([V || {_, V, _} <- Credits]),
+    DebitTotal  = lists:sum([V || {V} <- Debits]),
+    %% Core: nNet = nCredit - nDebit; nFee = (IsFromMe ? GetValueOut - nDebit : 0);
+    %% amount = nNet - nFee.
+    Fee = case Debits of
+        [] -> 0;
+        _  -> ValueOut - DebitTotal
+    end,
+    Net = CreditTotal - DebitTotal,
+    Amount = Net - Fee,
+    LongFields = tx_long_fields(Confirmations, IsCoinbase, BlockHash,
+                                Height, BlockTime, DisplayTxid, Time),
+    %% details: the short-form ListTransactions array (Long?=false).
+    Details = history_entry_to_list_items(Txid, Entry, TipHeight, Network,
+                                          false),
+    Base = #{
+        <<"amount">>  => format_amount_sentinel(Amount),
+        <<"details">> => Details,
+        <<"hex">>     => TxHex
+    },
+    %% fee only when the wallet funded inputs (a send).  Core's gettransaction
+    %% emits ValueFromAmount(nFee) with nFee = GetValueOut - nDebit (negative
+    %% for a real fee) — our Fee equals exactly that, so emit it as-is.
+    Base1 = case Debits of
+        [] -> Base;
+        _  -> Base#{<<"fee">> => format_amount_sentinel(Fee)}
+    end,
+    maps:merge(Base1, LongFields).
 
 %% @doc lockunspent unlock ( [{"txid":...,"vout":n},...] persistent )
 %%
@@ -8157,16 +8459,23 @@ replace_btc_sentinels(Bin) ->
 replace_btc_sentinels(<<>>, Acc) ->
     Acc;
 replace_btc_sentinels(<<"\"__BTC__", Rest/binary>>, Acc) ->
-    %% Consume digits up to closing quote
-    {Digits, Rest2} = consume_digits(Rest, <<>>),
+    %% Consume an optional leading minus sign (negative amounts: the wallet
+    %% listtransactions/gettransaction "send" amount and "fee" are negative)
+    %% followed by the digits up to the closing quote.
+    {SignChars, Rest1} = case Rest of
+        <<"-", R/binary>> -> {<<"-">>, R};
+        _                 -> {<<>>, Rest}
+    end,
+    {Digits, Rest2} = consume_digits(Rest1, <<>>),
     case Rest2 of
-        <<"\"", Tail/binary>> ->
-            Sats = binary_to_integer(Digits),
+        <<"\"", Tail/binary>> when Digits =/= <<>> ->
+            Sats = binary_to_integer(<<SignChars/binary, Digits/binary>>),
             Decimal = format_btc_amount_exact(Sats),
             replace_btc_sentinels(Tail, <<Acc/binary, Decimal/binary>>);
         _ ->
             %% Malformed sentinel — pass through unchanged (defensive)
-            replace_btc_sentinels(Rest2, <<Acc/binary, "\"__BTC__", Digits/binary>>)
+            replace_btc_sentinels(Rest2,
+                <<Acc/binary, "\"__BTC__", SignChars/binary, Digits/binary>>)
     end;
 replace_btc_sentinels(<<C, Rest/binary>>, Acc) ->
     replace_btc_sentinels(Rest, <<Acc/binary, C>>).

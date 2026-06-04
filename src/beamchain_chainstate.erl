@@ -1107,9 +1107,13 @@ do_connect_block_inner(#block{header = Header} = Block,
                 %% a pure function call with no gen_server round-trip and no
                 %% deadlock risk against the chainstate process.  We pass the
                 %% computed Height because Block#block.height is not populated
-                %% on the connect path.
+                %% on the connect path.  BlockHash + the header timestamp let
+                %% the wallet record a Core-shaped transaction-history entry
+                %% (blockhash / blockheight / blocktime) per wallet-relevant tx
+                %% so listtransactions / gettransaction can surface it.
                 _ = (catch beamchain_wallet:scan_block_for_wallet(
-                        Block, Height)),
+                        Block, Height, BlockHash,
+                        Header#block_header.timestamp)),
 
                 %% Notify peer manager that our tip advanced (stale tip detection)
                 beamchain_peer_manager:notify_tip_updated(),
