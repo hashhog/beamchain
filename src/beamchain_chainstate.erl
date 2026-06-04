@@ -76,6 +76,9 @@
 %% Cache statistics
 -export([cache_stats/0, cache_memory_usage/0]).
 
+%% scantxoutset support: scan the whole UTXO set by scriptPubKey set.
+-export([scan_utxos/1]).
+
 %% assumeUTXO support
 -export([load_snapshot/1, compute_utxo_hash/0, compute_utxo_muhash/0]).
 -export([is_snapshot_chainstate/0, get_snapshot_base_height/0]).
@@ -361,6 +364,18 @@ compute_utxo_hash() ->
 -spec compute_utxo_muhash() -> binary().
 compute_utxo_muhash() ->
     gen_server:call(?SERVER, compute_utxo_muhash, 300000).
+
+%% @doc Scan the entire UTXO set for outputs whose scriptPubKey is a member
+%% of ScriptSet (a sets:set/0 of raw scriptPubKey binaries). Returns the
+%% matching coins as {Txid, Vout, #utxo{}} tuples. Mirrors Bitcoin Core's
+%% `scantxoutset` UTXO traversal (rpc/blockchain.cpp ScanCoins): it walks
+%% the whole coins view, not just wallet-tracked scripts. Merges the
+%% write-behind ETS cache with the on-disk chainstate exactly the way
+%% get_utxo/2 does (cache wins; ?UTXO_SPENT masks disk coins) so coins that
+%% have not yet been flushed to RocksDB are still found.
+-spec scan_utxos(sets:set(binary())) -> [{binary(), non_neg_integer(), #utxo{}}].
+scan_utxos(ScriptSet) ->
+    gen_server:call(?SERVER, {scan_utxos, ScriptSet}, 300000).
 
 %% @doc Check if this chainstate was loaded from a snapshot.
 -spec is_snapshot_chainstate() -> boolean().
@@ -811,6 +826,10 @@ handle_call(compute_utxo_hash, _From, State) ->
 handle_call(compute_utxo_muhash, _From, State) ->
     MuHash = do_compute_utxo_muhash(),
     {reply, MuHash, State};
+
+handle_call({scan_utxos, ScriptSet}, _From, State) ->
+    Matches = do_scan_utxos(ScriptSet),
+    {reply, Matches, State};
 
 handle_call(is_snapshot_chainstate, _From,
             #state{chainstate_role = Role} = State) ->
@@ -2445,6 +2464,41 @@ do_compute_utxo_muhash() ->
     AllEntries = ets:tab2list(?UTXO_CACHE),
     Coins = [{Txid, Vout, Utxo} || {{Txid, Vout}, Utxo} <- AllEntries],
     beamchain_snapshot:compute_txoutset_muhash_from_list(Coins).
+
+%% @private Scan the full UTXO set for outputs matching ScriptSet.
+%% Walks the write-behind ETS cache first, then the on-disk chainstate,
+%% skipping disk coins that are shadowed by the cache or masked by
+%% ?UTXO_SPENT. Returns matching {Txid, Vout, #utxo{}} tuples.
+do_scan_utxos(ScriptSet) ->
+    %% 1. Cache pass: collect matches and record every cached outpoint so
+    %%    the disk pass does not double-count entries already materialized
+    %%    in the cache (which holds the authoritative, possibly-newer copy).
+    {CacheMatches, Seen} =
+        ets:foldl(
+          fun({{Txid, Vout}, #utxo{script_pubkey = SPK} = U}, {Acc, S}) ->
+                  S1 = sets:add_element({Txid, Vout}, S),
+                  case sets:is_element(SPK, ScriptSet) of
+                      true  -> {[{Txid, Vout, U} | Acc], S1};
+                      false -> {Acc, S1}
+                  end
+          end, {[], sets:new()}, ?UTXO_CACHE),
+    %% 2. Disk pass: include disk coins that are neither in the cache nor
+    %%    in the pending-spent set. Defensive against fold errors.
+    DiskMatches =
+        case beamchain_db:fold_utxos(
+               fun({Txid, Vout, #utxo{script_pubkey = SPK} = U}, Acc) ->
+                       Key = {Txid, Vout},
+                       case (not sets:is_element(Key, Seen))
+                            andalso (not ets:member(?UTXO_SPENT, Key))
+                            andalso sets:is_element(SPK, ScriptSet) of
+                           true  -> [{Txid, Vout, U} | Acc];
+                           false -> Acc
+                       end
+               end, []) of
+            {error, _} -> [];
+            L when is_list(L) -> L
+        end,
+    CacheMatches ++ DiskMatches.
 
 %% Start background validation chainstate
 start_background_validation() ->
