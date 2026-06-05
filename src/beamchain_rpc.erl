@@ -53,6 +53,10 @@
 %% directly without spinning up the cowboy listener.
 -export([rpc_getblockfilter/1]).
 
+%% Exported for EUnit so tests can drive the index-status RPC handler
+%% directly without spinning up the cowboy listener.
+-export([rpc_getindexinfo/1]).
+
 %% Test-only exports — confirmations helpers (Pattern C1 regression tests).
 -ifdef(TEST).
 -export([confirmations/1, confirmations/2, is_block_in_active_chain/1]).
@@ -692,6 +696,7 @@ handle_method(<<"getblockstats">>, P, _W) -> rpc_getblockstats(P);
 handle_method(<<"getchaintxstats">>, P, _W) -> rpc_getchaintxstats(P);
 handle_method(<<"verifychain">>, P, _W) -> rpc_verifychain(P);
 handle_method(<<"getblockfilter">>, P, _W) -> rpc_getblockfilter(P);
+handle_method(<<"getindexinfo">>, P, _W) -> rpc_getindexinfo(P);
 handle_method(<<"invalidateblock">>, P, _W) -> rpc_invalidateblock(P);
 handle_method(<<"reconsiderblock">>, P, _W) -> rpc_reconsiderblock(P);
 handle_method(<<"flushchainstate">>, _, _W) -> rpc_flushchainstate();
@@ -1799,6 +1804,106 @@ do_getblockfilter(HashHex) ->
             {error, ?RPC_INVALID_ADDRESS_OR_KEY,
              <<"Block not found">>}
     end.
+
+%% @doc getindexinfo ( "index_name" ) — return the status of one or all
+%% indices currently running in the node.
+%%
+%% Mirrors Bitcoin Core `rpc/node.cpp:getindexinfo` + `SummaryToJSON`
+%% (node.cpp:351-410) backed by `BaseIndex::GetSummary` (index/base.cpp:
+%% 472-484).  Returns a *dynamic* JSON object keyed by the index's
+%% `GetName()` string; for each *running* index it pushes one entry whose
+%% value has EXACTLY two fields in this order:
+%%   { "<index name>": { "synced": <bool>, "best_block_height": <int> } }
+%% — never best_hash / best_block_hash / name-in-the-value / any extra key
+%% (IndexSummary carries best_block_hash internally but getindexinfo never
+%% emits it).
+%%
+%% An index appears ONLY if it is enabled/running (Core guards each with
+%% `if (g_txindex){...}` / `ForEachBlockFilterIndex(...)`).  beamchain runs
+%% at most two of Core's four indices: the transaction index (`txindex`,
+%% default on) and the basic block filter index ("basic block filter
+%% index", default off).  We do NOT fabricate coinstatsindex /
+%% txospenderindex — beamchain does not run those.
+%%
+%% The optional positional `index_name` arg filters to a single index:
+%% SummaryToJSON drops the entry when index_name is non-empty AND !=
+%% summary.name.  So `getindexinfo "txindex"` returns ONLY {"txindex":{}};
+%% `getindexinfo "no-such-index"` returns {} (an empty object, NOT an
+%% error).  Empty / omitted arg = all running indices.
+rpc_getindexinfo([]) ->
+    rpc_getindexinfo([<<>>]);
+rpc_getindexinfo([IndexName]) when is_binary(IndexName) ->
+    %% The active-chain tip height: each beamchain index is advanced
+    %% synchronously inside the block-connect path (txindex is part of the
+    %% same WriteBatch; the basic filter index via a synchronous call right
+    %% after), so an index that is running is at the chain tip.  `synced`
+    %% reflects whether the index's own best height has reached that tip.
+    ChainTipHeight = case beamchain_chainstate:get_tip_height() of
+        {ok, H} -> H;
+        not_found -> 0
+    end,
+    %% Collect summaries for every *running* index, in Core's emission order
+    %% (txindex first, then the basic block filter index — matching the
+    %% guard order in node.cpp:393-407).
+    Summaries =
+        index_summary_txindex(ChainTipHeight)
+        ++ index_summary_blockfilter(ChainTipHeight),
+    %% Apply the index_name filter (SummaryToJSON:354) and build the
+    %% dynamic object as an ordered proplist so jsx preserves both the
+    %% per-index key ordering AND the {synced, best_block_height} field
+    %% ordering (a map would alphabetise the keys).
+    Filtered = [Entry || {Name, _Value} = Entry <- Summaries,
+                         IndexName =:= <<>> orelse IndexName =:= Name],
+    case Filtered of
+        [] ->
+            %% jsx encodes the empty proplist [{}] as the JSON object {}.
+            {ok, [{}]};
+        _ ->
+            {ok, Filtered}
+    end;
+rpc_getindexinfo(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: getindexinfo ( \"index_name\" )">>}.
+
+%% txindex summary entry, or [] when the transaction index is not running.
+%% Name == Core's `GetName()` "txindex" (txindex.cpp:69).
+index_summary_txindex(ChainTipHeight) ->
+    case beamchain_config:txindex_enabled() of
+        false -> [];
+        true ->
+            %% The txindex is written atomically with each block connect, so
+            %% its best block IS the active-chain tip.  best_block_height =
+            %% the height the index reached (0 if no best block yet); synced
+            %% = index height has caught up to the tip.
+            index_summary_entry(<<"txindex">>, ChainTipHeight, ChainTipHeight)
+    end.
+
+%% basic block filter index summary entry, or [] when it is not running.
+%% Name == Core's `GetName()` "basic block filter index"
+%% (blockfilterindex.cpp:78 = BlockFilterTypeName(BASIC)+" block filter
+%% index").
+index_summary_blockfilter(ChainTipHeight) ->
+    case beamchain_blockfilter_index:is_enabled() of
+        false -> [];
+        true ->
+            %% tip_height/0 is the height the filter index has indexed to.
+            BestHeight = case beamchain_blockfilter_index:tip_height() of
+                N when is_integer(N), N >= 0 -> N;
+                _ -> 0
+            end,
+            index_summary_entry(<<"basic block filter index">>,
+                                BestHeight, ChainTipHeight)
+    end.
+
+%% Build one {Name, [{synced,...},{best_block_height,...}]} entry.  synced
+%% = the index's best height has caught up to the chain tip.  The value is
+%% an ordered proplist so the two fields serialise as synced then
+%% best_block_height (Core's pushKV order, SummaryToJSON:357-358) and never
+%% carry any extra key.
+index_summary_entry(Name, BestHeight, ChainTipHeight) ->
+    Synced = BestHeight >= ChainTipHeight,
+    [{Name, [{<<"synced">>, Synced},
+             {<<"best_block_height">>, BestHeight}]}].
 
 %% @doc invalidateblock - mark a block and all its descendants as invalid
 %% If the block is on the active chain, rewinds to just before it and switches
