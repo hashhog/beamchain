@@ -3421,8 +3421,16 @@ rpc_getmempoolinfo() ->
         <<"usage">> => Bytes,
         <<"total_fee">> => TotalFeeBtc,
         <<"maxmempool">> => ?DEFAULT_MEMPOOL_MAX_SIZE,
-        <<"mempoolminfee">> => ?DEFAULT_MIN_RELAY_TX_FEE / 100000.0,
-        <<"minrelaytxfee">> => ?DEFAULT_MIN_RELAY_TX_FEE / 100000.0,
+        %% Core rpc/mempool.cpp:1054-1055 reports these as
+        %% ValueFromAmount(min_relay_feerate.GetFeePerK()) — i.e. the fee rate in
+        %% sat/kvB divided by COIN (1e8) to yield BTC/kvB. DEFAULT_MIN_RELAY_TX_FEE
+        %% is already in sat/kvB, so the correct divisor is 1e8 (100000000.0), NOT
+        %% 1e5: the old /100000.0 over-reported the relay floor by 1000x
+        %% (0.01 BTC/kvB instead of 0.00001 BTC/kvB). Display-only: the ENFORCED
+        %% floor (beamchain_mempool GATE 14, DEFAULT_MIN_RELAY_TX_FEE/1000.0 sat/vB)
+        %% is unaffected and already Core-correct.
+        <<"mempoolminfee">> => ?DEFAULT_MIN_RELAY_TX_FEE / 100000000.0,
+        <<"minrelaytxfee">> => ?DEFAULT_MIN_RELAY_TX_FEE / 100000000.0,
         <<"incrementalrelayfee">> => 0.00001,
         <<"unbroadcastcount">> => 0,
         <<"fullrbf">> => beamchain_config:mempool_full_rbf()
@@ -3588,7 +3596,10 @@ rpc_getnetworkinfo() ->
             <<"proxy">> => <<>>,
             <<"proxy_randomize_credentials">> => false
         }],
-        <<"relayfee">> => ?DEFAULT_MIN_RELAY_TX_FEE / 100000.0,
+        %% Core rpc/net.cpp getnetworkinfo reports relayfee as
+        %% ValueFromAmount(min_relay_feerate.GetFeePerK()) = sat/kvB / 1e8 (BTC/kvB).
+        %% Same 1000x units bug as getmempoolinfo: /100000.0 -> /100000000.0.
+        <<"relayfee">> => ?DEFAULT_MIN_RELAY_TX_FEE / 100000000.0,
         <<"incrementalfee">> => 0.00001,
         <<"localaddresses">> => LocalAddrs,
         <<"warnings">> => <<>>
