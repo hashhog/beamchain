@@ -727,6 +727,8 @@ handle_method(<<"loadmempool">>, _, _W) -> rpc_loadmempool();
 handle_method(<<"getnetworkinfo">>, _, _W) -> rpc_getnetworkinfo();
 handle_method(<<"getpeerinfo">>, _, _W) -> rpc_getpeerinfo();
 handle_method(<<"getconnectioncount">>, _, _W) -> rpc_getconnectioncount();
+handle_method(<<"getnodeaddresses">>, P, _W) -> rpc_getnodeaddresses(P);
+handle_method(<<"addpeeraddress">>, P, _W) -> rpc_addpeeraddress(P);
 handle_method(<<"addnode">>, P, _W) -> rpc_addnode(P);
 handle_method(<<"disconnectnode">>, P, _W) -> rpc_disconnectnode(P);
 handle_method(<<"listbanned">>, _, _W) -> rpc_listbanned();
@@ -876,10 +878,12 @@ rpc_help_list() ->
         <<"">>,
         <<"== Network ==">>,
         <<"addnode \"node\" \"command\"">>,
+        <<"addpeeraddress \"address\" port ( tried )">>,
         <<"clearbanned">>,
         <<"disconnectnode ( \"address\" nodeid )">>,
         <<"getconnectioncount">>,
         <<"getnetworkinfo">>,
+        <<"getnodeaddresses ( count \"network\" )">>,
         <<"getpeerinfo">>,
         <<"listbanned">>,
         <<"setban \"subnet\" \"command\" ( bantime )">>,
@@ -3822,6 +3826,133 @@ rpc_getpeerinfo() ->
 
 rpc_getconnectioncount() ->
     {ok, beamchain_peer_manager:peer_count()}.
+
+%% getnodeaddresses ( count "network" )
+%%
+%% Returns known addresses from the address manager, after filtering for
+%% quality and recency. Mirrors Bitcoin Core rpc/net.cpp:941-967.
+%%
+%%   count   (positional 0, default 1): MAX number to return. 0 => return ALL
+%%           known. count < 0 => error -8 "Address count out of range".
+%%   network (positional 1, optional): restrict to one network. ParseNetwork
+%%           accepts ONLY ipv4|ipv6|onion|i2p|cjdns (case-insensitive); any
+%%           other string => error -8 "Network not recognized: <raw arg>".
+%%
+%% Each result object has EXACTLY 5 keys in Core order:
+%%   time (int unix secs), services (int bitfield), address (str, no port),
+%%   port (int), network (str). Source is the addrman (shuffled) — order is
+%%   non-deterministic. Empty addrman => [] (NOT an error).
+rpc_getnodeaddresses(Params) ->
+    Args = case Params of
+        L when is_list(L) -> L;
+        undefined -> [];
+        _ -> [Params]
+    end,
+    CountArg = case Args of
+        [C | _] -> C;
+        [] -> 1
+    end,
+    case coerce_int(CountArg) of
+        {error, _} ->
+            {error, ?RPC_TYPE_ERROR, <<"JSON value is not an integer as expected">>};
+        {ok, Count} when Count < 0 ->
+            {error, ?RPC_INVALID_PARAMETER, <<"Address count out of range">>};
+        {ok, Count} ->
+            NetArg = case Args of
+                [_, N | _] -> N;
+                _ -> undefined
+            end,
+            case parse_network_filter(NetArg) of
+                {error, BadNet} ->
+                    {error, ?RPC_INVALID_PARAMETER,
+                     iolist_to_binary([<<"Network not recognized: ">>, BadNet])};
+                {ok, NetworkFilter} ->
+                    Addrs = beamchain_addrman:get_node_addresses(Count, NetworkFilter),
+                    Result = [#{
+                        <<"time">>     => maps:get(time, A),
+                        <<"services">> => maps:get(services, A),
+                        <<"address">>  => maps:get(address, A),
+                        <<"port">>     => maps:get(port, A),
+                        <<"network">>  => maps:get(network, A)
+                    } || A <- Addrs],
+                    {ok, Result}
+            end
+    end.
+
+%% Parse the optional network filter (ParseNetwork, netbase.cpp:100-112).
+%% undefined/null/empty => no filter (`all`). Otherwise lowercase and accept
+%% only ipv4|ipv6|onion|i2p|cjdns, mapping to the BIP155 network id used by
+%% the addrman. Any other string => {error, RawArg} (NET_UNROUTABLE).
+parse_network_filter(undefined) -> {ok, all};
+parse_network_filter(null) -> {ok, all};
+parse_network_filter(Net) when is_binary(Net) ->
+    case string:lowercase(Net) of
+        <<"ipv4">>  -> {ok, 1};
+        <<"ipv6">>  -> {ok, 2};
+        <<"onion">> -> {ok, 4};
+        <<"i2p">>   -> {ok, 5};
+        <<"cjdns">> -> {ok, 6};
+        _ -> {error, Net}
+    end;
+parse_network_filter(Net) when is_list(Net) ->
+    parse_network_filter(list_to_binary(Net));
+parse_network_filter(Net) ->
+    {error, iolist_to_binary(io_lib:format("~p", [Net]))}.
+
+%% Coerce a JSON-decoded number to an integer. JSON integers may arrive as
+%% Erlang integers; some decoders deliver whole numbers as floats. Reject
+%% non-numeric / fractional values (Core's getInt<int> throws a type error).
+coerce_int(N) when is_integer(N) -> {ok, N};
+coerce_int(N) when is_float(N) ->
+    T = trunc(N),
+    case T == N of
+        true -> {ok, T};
+        false -> {error, not_integer}
+    end;
+coerce_int(B) when is_binary(B) ->
+    case catch binary_to_integer(B) of
+        I when is_integer(I) -> {ok, I};
+        _ -> {error, not_integer}
+    end;
+coerce_int(_) -> {error, not_integer}.
+
+%% addpeeraddress "address" port ( tried )
+%%
+%% Inserts a potential peer address into the address manager (testing only).
+%% Mirrors Bitcoin Core rpc/net.cpp:992. Returns {"success": bool}.
+%%   address (required): the IP address of the peer.
+%%   port    (required): the port number.
+%%   tried   (optional, default false): also attempt to add to the tried table.
+rpc_addpeeraddress([AddrArg, PortArg]) ->
+    rpc_addpeeraddress([AddrArg, PortArg, false]);
+rpc_addpeeraddress([AddrArg, PortArg, TriedArg | _]) when is_binary(AddrArg) ->
+    case coerce_int(PortArg) of
+        {ok, Port} when Port >= 0, Port =< 65535 ->
+            case inet:parse_address(binary_to_list(AddrArg)) of
+                {ok, IP} ->
+                    NetId = case tuple_size(IP) of
+                        4 -> 1;   %% IPv4
+                        8 -> 2;   %% IPv6
+                        _ -> 1
+                    end,
+                    Tried = (TriedArg =:= true),
+                    %% Core: ServiceFlags{NODE_NETWORK | NODE_WITNESS} = 1033.
+                    Services = (?NODE_NETWORK bor ?NODE_WITNESS),
+                    {ok, Success} = beamchain_addrman:add_peer_address(
+                        {IP, Port}, Services, Tried, NetId),
+                    case Success of
+                        true -> {ok, #{<<"success">> => true}};
+                        false -> {ok, #{<<"success">> => false}}
+                    end;
+                {error, _} ->
+                    {error, ?RPC_INVALID_ADDRESS_OR_KEY, <<"Invalid IP address">>}
+            end;
+        _ ->
+            {error, ?RPC_TYPE_ERROR, <<"port must be an integer 0-65535">>}
+    end;
+rpc_addpeeraddress(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: addpeeraddress \"address\" port ( tried )">>}.
 
 rpc_addnode([NodeStr, CommandStr]) when is_binary(NodeStr),
                                         is_binary(CommandStr) ->
