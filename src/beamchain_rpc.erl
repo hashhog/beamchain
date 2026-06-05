@@ -2423,7 +2423,36 @@ rpc_getrawtransaction([TxidHex, Verbose]) ->
     rpc_getrawtransaction([TxidHex, Verbose, null]);
 rpc_getrawtransaction([TxidHex, Verbose, BlockHashParam]) when is_binary(TxidHex) ->
     Txid = hex_to_internal_hash(TxidHex),
-    %% Parse verbosity: 0/false = hex, 1/true = JSON, 2 = JSON with prevout (not yet supported)
+    %% Special exception for the genesis block coinbase transaction, mirroring
+    %% bitcoin-core/src/rpc/rawtransaction.cpp getrawtransaction():
+    %%   if (txid == GenesisBlock().hashMerkleRoot) throw RPC_INVALID_ADDRESS_OR_KEY.
+    %% The genesis coinbase is unspendable and is never indexed, so Core rejects
+    %% it with a dedicated message rather than a generic "not found".
+    case is_genesis_coinbase_txid(Txid) of
+        true ->
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+             <<"The genesis block coinbase is not considered an ordinary "
+               "transaction and cannot be retrieved">>};
+        false ->
+            rpc_getrawtransaction_lookup(Txid, Verbose, BlockHashParam)
+    end;
+rpc_getrawtransaction(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: getrawtransaction \"txid\" ( verbose \"blockhash\" )">>}.
+
+%% True when the txid equals the active network's genesis-block merkle root
+%% (i.e. the genesis coinbase txid).  Both are in internal byte order.
+is_genesis_coinbase_txid(Txid) ->
+    try
+        Network = beamchain_config:network(),
+        #block{header = #block_header{merkle_root = MR}} =
+            beamchain_chain_params:genesis_block(Network),
+        Txid =:= MR
+    catch _:_ -> false
+    end.
+
+rpc_getrawtransaction_lookup(Txid, Verbose, BlockHashParam) ->
+    %% Parse verbosity: 0/false = hex, 1/true = JSON, 2 = JSON with prevout
     Verbosity = parse_verbosity(Verbose),
 
     %% Handle optional blockhash parameter
@@ -2442,10 +2471,7 @@ rpc_getrawtransaction([TxidHex, Verbose, BlockHashParam]) when is_binary(TxidHex
             end;
         _ ->
             {error, ?RPC_INVALID_PARAMS, <<"Invalid blockhash parameter">>}
-    end;
-rpc_getrawtransaction(_) ->
-    {error, ?RPC_INVALID_PARAMS,
-     <<"Usage: getrawtransaction \"txid\" ( verbose \"blockhash\" )">>}.
+    end.
 
 %% Parse verbosity parameter (0/false = hex, 1/true = JSON, 2 = JSON with prevout)
 parse_verbosity(0) -> 0;
