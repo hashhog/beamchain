@@ -2950,6 +2950,15 @@ format_mempool_error(rbf_too_many_evictions, _Txid) ->
     {error, ?RPC_VERIFY_REJECTED, <<"too many potential replacements">>};
 format_mempool_error(rbf_new_unconfirmed_inputs, _Txid) ->
     {error, ?RPC_VERIFY_REJECTED, <<"replacement-adds-unconfirmed">>};
+format_mempool_error(rbf_cluster_diagram_not_dominated, _Txid) ->
+    %% Core policy/rbf.cpp ImprovesFeerateDiagram → state.Invalid(
+    %% TX_RECONSIDERABLE, "replacement-failed", "insufficient feerate: does
+    %% not improve feerate diagram").  Categorised under insufficient fee.
+    {error, ?RPC_VERIFY_REJECTED, <<"insufficient fee, rejecting replacement (replacement-failed)">>};
+format_mempool_error(rbf_spends_conflicting_tx, _Txid) ->
+    %% Core policy/rbf.cpp EntriesAndTxidsDisjoint → validation.cpp
+    %% state.Invalid(TX_CONSENSUS, "bad-txns-spends-conflicting-tx", ...).
+    {error, ?RPC_VERIFY_REJECTED, <<"bad-txns-spends-conflicting-tx">>};
 format_mempool_error({script_verify_failed, Idx}, _Txid) ->
     {error, ?RPC_VERIFY_ERROR,
      iolist_to_binary(io_lib:format("mandatory-script-verify-flag-failed (input ~B)", [Idx]))};
@@ -2959,6 +2968,22 @@ format_mempool_error({validation, Reason}, _Txid) ->
 format_mempool_error(Reason, _Txid) ->
     {error, ?RPC_VERIFY_REJECTED,
      iolist_to_binary(io_lib:format("~p", [Reason]))}.
+
+%% @doc Map a mempool error atom to the Core-equivalent `reject-reason` string
+%% used by testmempoolaccept.  Reuses format_mempool_error/2 (the same mapping
+%% sendrawtransaction surfaces) so the two RPCs report the SAME category for a
+%% given rejection.  Previously testmempoolaccept dumped the raw Erlang atom via
+%% io_lib:format("~p", [Reason]) (e.g. "rbf_insufficient_fee"), which did not
+%% match Bitcoin Core's reject-reason category ("insufficient fee" /
+%% "txn-mempool-conflict").  Core rpc/mempool.cpp testmempoolaccept returns
+%% state.GetRejectReason(), the SAME string sendrawtransaction throws — so both
+%% must agree.  See policy/rbf.cpp PaysForRBF (Rules 3/4 → "insufficient fee")
+%% and the non-signaling conflict path ("txn-mempool-conflict").
+mempool_reject_reason(Reason, Txid) ->
+    case format_mempool_error(Reason, Txid) of
+        {error, _Code, Msg} when is_binary(Msg) -> Msg;
+        _ -> iolist_to_binary(io_lib:format("~p", [Reason]))
+    end.
 
 %% @doc testmempoolaccept — dry-run validation without mutating the mempool.
 %%
@@ -3006,7 +3031,7 @@ rpc_testmempoolaccept([RawTxs]) when is_list(RawTxs) ->
                            <<"wtxid">>         => hash_to_hex(Wtxid),
                            <<"allowed">>       => false,
                            <<"reject-reason">> =>
-                               iolist_to_binary(io_lib:format("~p", [Reason]))}]
+                               mempool_reject_reason(Reason, Txid)}]
                 end;
             _ ->
                 %% Multi-tx path — dry-run via accept_package_dry_run/1.
@@ -3030,7 +3055,7 @@ rpc_testmempoolaccept([RawTxs]) when is_list(RawTxs) ->
                                   <<"wtxid">>         => hash_to_hex(Wtxid),
                                   <<"allowed">>       => false,
                                   <<"reject-reason">> =>
-                                      iolist_to_binary(io_lib:format("~p", [Reason]))}
+                                      mempool_reject_reason(Reason, Txid)}
                         end, EntryList);
                     {error, Reason} ->
                         %% Structural package error — report for every tx
