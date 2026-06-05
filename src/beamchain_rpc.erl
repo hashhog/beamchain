@@ -1783,27 +1783,36 @@ rpc_getblockfilter([HashHex]) ->
     rpc_getblockfilter([HashHex, <<"basic">>]);
 rpc_getblockfilter([HashHex, FilterType]) when is_binary(HashHex) ->
     case validate_filter_type(FilterType) of
-        {ok, _FT} ->
+        {ok, FTName} ->
             case beamchain_blockfilter_index:is_enabled() of
                 false ->
+                    %% Core: RPC_MISC_ERROR (-1),
+                    %% "Index is not enabled for filtertype <name>"
+                    %% (blockchain.cpp:2987 — tfm::format with the
+                    %% requested filtertype name).
                     {error, ?RPC_MISC_ERROR,
-                     <<"Index is not enabled for filtertype basic">>};
+                     iolist_to_binary(
+                       [<<"Index is not enabled for filtertype ">>,
+                        FTName])};
                 true ->
                     do_getblockfilter(HashHex)
             end;
         {error, Msg} ->
-            {error, ?RPC_INVALID_PARAMETER, Msg}
+            %% Core: BlockFilterTypeByName failure throws
+            %% RPC_INVALID_ADDRESS_OR_KEY (-5), "Unknown filtertype"
+            %% (blockchain.cpp:2982).
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY, Msg}
     end;
 rpc_getblockfilter(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"Usage: getblockfilter \"blockhash\" ( \"filtertype\" )">>}.
 
-validate_filter_type(<<"basic">>) -> {ok, 0};
-validate_filter_type(0)            -> {ok, 0};
-validate_filter_type(Other) ->
-    {error,
-        iolist_to_binary(
-          io_lib:format("Unknown filtertype ~p", [Other]))}.
+validate_filter_type(<<"basic">>) -> {ok, <<"basic">>};
+validate_filter_type(0)            -> {ok, <<"basic">>};
+validate_filter_type(_Other) ->
+    %% Core message is the bare string "Unknown filtertype" with no
+    %% interpolated value (blockchain.cpp:2982).
+    {error, <<"Unknown filtertype">>}.
 
 do_getblockfilter(HashHex) ->
     Hash = hex_to_internal_hash(HashHex),
