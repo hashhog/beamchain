@@ -1314,17 +1314,32 @@ rpc_getblockheader([HashHex, Verbose]) when is_binary(HashHex) ->
                         0 -> ntx_from_core_rpc(HashHex);
                         N -> N
                     end,
-                    %% Get next block hash if it exists
-                    NextHash = case beamchain_db:get_block_index(Height + 1) of
-                        {ok, #{hash := NH}} -> hash_to_hex(NH);
-                        not_found -> null
-                    end,
+                    %% Core's ComputeNextBlockAndDepth (rpc/blockchain.cpp:116):
+                    %%   next = tip.GetAncestor(height + 1);
+                    %%   if next && next->pprev == &blockindex:
+                    %%       confirmations = tip.nHeight - blockindex.nHeight + 1
+                    %%   else: next = nullptr;
+                    %%         confirmations = (&blockindex == &tip) ? 1 : -1
+                    %% So both nextblockhash and confirmations hinge on whether
+                    %% this block (and its successor) are on the ACTIVE chain.
+                    InActiveChain = is_block_in_active_chain(Hash),
+                    {Confirmations, NextHash} =
+                        case InActiveChain of
+                            true ->
+                                {confirmations(Height),
+                                 case beamchain_db:get_block_index(Height + 1) of
+                                     {ok, #{hash := NH}} -> hash_to_hex(NH);
+                                     not_found -> undefined
+                                 end};
+                            false ->
+                                {-1, undefined}
+                        end,
                     Bits = Header#block_header.bits,
                     %% Build map with difficulty as a sentinel so jsx does not
                     %% reformat the 16-significant-digit float.
-                    Map = #{
+                    BaseMap = #{
                         <<"hash">> => hash_to_hex(Hash),
-                        <<"confirmations">> => confirmations(Height, Hash),
+                        <<"confirmations">> => Confirmations,
                         <<"height">> => Height,
                         <<"version">> => Header#block_header.version,
                         <<"versionHex">> => beamchain_serialize:hex_encode(
@@ -1336,16 +1351,30 @@ rpc_getblockheader([HashHex, Verbose]) when is_binary(HashHex) ->
                         <<"nonce">> => Header#block_header.nonce,
                         <<"bits">> => beamchain_serialize:hex_encode(
                             <<Bits:32/big>>),
+                        <<"target">> => bits_to_target_hex(Bits),
                         <<"difficulty">> => format_diff_sentinel(Bits),
                         <<"chainwork">> => beamchain_serialize:hex_encode(
                             Chainwork),
-                        <<"nTx">> => NTx,
-                        <<"previousblockhash">> => hash_to_hex(
-                            Header#block_header.prev_hash),
-                        <<"nextblockhash">> => NextHash,
-                        <<"target">> => bits_to_target_hex(Bits)
+                        <<"nTx">> => NTx
                     },
-                    {ok_raw_json, replace_all_sentinels(jsx:encode(Map))}
+                    %% previousblockhash present ONLY if the block has a parent
+                    %% (Core gates on blockindex.pprev — absent for genesis).
+                    PrevHash = Header#block_header.prev_hash,
+                    HasPrev = Height > 0 andalso PrevHash =/= <<0:256>>,
+                    Map1 = case HasPrev of
+                        true ->
+                            BaseMap#{<<"previousblockhash">> =>
+                                         hash_to_hex(PrevHash)};
+                        false ->
+                            BaseMap
+                    end,
+                    %% nextblockhash present ONLY if a next block exists
+                    %% (Core gates on pnext — absent for the tip).
+                    Map2 = case NextHash of
+                        undefined -> Map1;
+                        _         -> Map1#{<<"nextblockhash">> => NextHash}
+                    end,
+                    {ok_raw_json, replace_all_sentinels(jsx:encode(Map2))}
             end;
         not_found ->
             {error, ?RPC_INVALID_ADDRESS_OR_KEY, <<"Block not found">>}
