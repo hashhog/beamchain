@@ -3351,17 +3351,43 @@ rpc_gettxoutsetinfo([]) ->
     %% UTXO-set commitment back; defaulting to "none" silently strips the
     %% commitment field and breaks the harness probe.
     rpc_gettxoutsetinfo([<<"hash_serialized_3">>]);
-rpc_gettxoutsetinfo([HashType | _]) ->
+rpc_gettxoutsetinfo([HashType]) ->
+    rpc_gettxoutsetinfo([HashType, null]);
+rpc_gettxoutsetinfo([HashType, HashOrHeight | _]) ->
     %% Get UTXO set statistics. Per Core's gettxoutsetinfo (rpc/blockchain.cpp
-    %% around line 1090), hash_type ∈ {none, hash_serialized_3, muhash}
+    %% around line 1069), hash_type ∈ {none, hash_serialized_3, muhash}
     %% selects which UTXO-set commitment to surface. We honour this so callers
     %% can ask for either commitment by name. Anything else → invalid.
+    %%
+    %% Core's ParseHashType (rpc/blockchain.cpp:976) throws
+    %% RPC_INVALID_PARAMETER (-8) — NOT the generic JSON-RPC invalid-params
+    %% code — for an unrecognised hash_type. Match that exactly.
     case is_valid_utxo_hash_type(HashType) of
         false ->
-            {error, ?RPC_INVALID_PARAMS,
+            {error, ?RPC_INVALID_PARAMETER,
              <<"'", HashType/binary, "' is not a valid hash_type">>};
         true ->
-            do_rpc_gettxoutsetinfo(HashType)
+            %% Per-block / per-height queries (hash_or_height set) require
+            %% coinstatsindex, which beamchain does not run. Core
+            %% (rpc/blockchain.cpp:1085-1097) short-circuits these:
+            %%   * hash_serialized_3 + specific block -> RPC_INVALID_PARAMETER
+            %%     (-8) "hash_serialized_3 hash type cannot be queried for a
+            %%     specific block" (checked BEFORE the index gate, so it fires
+            %%     regardless of whether coinstatsindex is built).
+            %%   * any other hash_type + specific block -> requires
+            %%     coinstatsindex (-8).
+            case HashOrHeight of
+                null ->
+                    do_rpc_gettxoutsetinfo(HashType);
+                _ when HashType =:= <<"hash_serialized_3">> ->
+                    {error, ?RPC_INVALID_PARAMETER,
+                     <<"hash_serialized_3 hash type cannot be queried "
+                       "for a specific block">>};
+                _ ->
+                    {error, ?RPC_INVALID_PARAMETER,
+                     <<"Querying specific block heights requires "
+                       "coinstatsindex">>}
+            end
     end.
 
 is_valid_utxo_hash_type(<<"none">>)              -> true;
@@ -3406,6 +3432,12 @@ do_rpc_gettxoutsetinfo(HashType) ->
                         <<"bestblock">>    => hash_to_hex(TipHash),
                         <<"txouts">>       => maps:get(txouts,    Stats),
                         <<"bogosize">>     => maps:get(bogosize,  Stats),
+                        %% Core surfaces `transactions` (# of distinct txids
+                        %% with at least one unspent output) whenever
+                        %% coinstatsindex is NOT used (rpc/blockchain.cpp:1128).
+                        %% beamchain never runs coinstatsindex, so we always
+                        %% emit it from the single cursor walk.
+                        <<"transactions">> => maps:get(transactions, Stats),
                         <<"total_amount">> =>
                             format_amount_sentinel(maps:get(total_amount, Stats)),
                         <<"disk_size">>    => 0
@@ -3461,20 +3493,33 @@ compute_utxo_set_stats(<<"muhash">>) ->
     {Stats, Hex}.
 
 tally_coins(Coins) ->
-    lists:foldl(
-      fun({_Txid, _Vout, #utxo{script_pubkey = SPK, value = Value}}, Acc) ->
+    %% Track the set of distinct txids so we can report Core's
+    %% `nTransactions` (= # of txids with >=1 unspent output). Core
+    %% increments nTransactions once per coin group in ApplyStats
+    %% (kernel/coinstats.cpp:99); a sets:add_element accumulation over the
+    %% (unordered) coin list gives the same count without relying on the
+    %% cursor order.
+    Acc0 = #{txouts => 0, bogosize => 0, total_amount => 0,
+             txids => sets:new([{version, 2}])},
+    Final = lists:foldl(
+      fun({Txid, _Vout, #utxo{script_pubkey = SPK, value = Value}}, Acc) ->
               ScriptLen = byte_size(SPK),
               %% Core: 50 + scriptPubKey.size() — see
               %% kernel/coinstats.cpp ComputeBogoSize (49 + 1 amount byte
               %% per Core's accounting; we follow Core's actual constant).
               Bogo = 50 + ScriptLen,
-              #{txouts := T, bogosize := B, total_amount := A} = Acc,
+              #{txouts := T, bogosize := B, total_amount := A,
+                txids := S} = Acc,
               Acc#{txouts       => T + 1,
                    bogosize     => B + Bogo,
-                   total_amount => A + Value}
+                   total_amount => A + Value,
+                   txids        => sets:add_element(Txid, S)}
       end,
-      #{txouts => 0, bogosize => 0, total_amount => 0},
-      Coins).
+      Acc0,
+      Coins),
+    #{txids := TxidSet} = Final,
+    NTx = sets:size(TxidSet),
+    maps:put(transactions, NTx, maps:remove(txids, Final)).
 
 %%% ===================================================================
 %%% scantxoutset — scan the UTXO set by scriptPubKey (wallet recovery)
