@@ -1868,11 +1868,16 @@ rpc_getblockstats(_) ->
 
 %% @doc getchaintxstats - compute chain transaction statistics
 rpc_getchaintxstats([]) ->
-    %% Default: ~1 month (4320 blocks at 10 min/block for mainnet)
+    %% Default window = "one month" of blocks: 30*24*60*60 / nPowTargetSpacing
+    %% = 4320 on mainnet (600s spacing).  Mirrors Core
+    %% (rpc/blockchain.cpp getchaintxstats) which, when nblocks is null, clamps
+    %% the default to the block's height: max(0, min(blockcount, nHeight - 1)).
+    %% On a short chain (e.g. regtest) this collapses to height-1, never to
+    %% height (which would trip the >= height validation and error out).
     DefaultBlocks = 4320,
     case beamchain_chainstate:get_tip() of
         {ok, {Hash, Height}} ->
-            NBlocks = min(DefaultBlocks, Height),
+            NBlocks = max(0, min(DefaultBlocks, Height - 1)),
             calculate_and_format_chaintxstats(Hash, Height, NBlocks);
         not_found ->
             {error, ?RPC_MISC_ERROR, <<"Chain not found">>}
@@ -2255,10 +2260,15 @@ format_chaintxstats(BlockHash, Height, Header, StartHeight, _StartHeader, NBlock
     Result3 = case NBlocks > 0 of
         true ->
             R = Result2#{<<"window_interval">> => TimeDiff},
+            %% window_tx_count + txrate emit conditions mirror Core exactly
+            %% (rpc/blockchain.cpp getchaintxstats): BOTH endpoints' cumulative
+            %% counts must be non-zero (Core: m_chain_tx_count != 0 for pindex
+            %% AND past_block), and txrate is only emitted when window_interval
+            %% (nTimeDiff) is strictly > 0.
             case {TxCount, StartTxCount} of
                 {undefined, _} -> R;
                 {_, undefined} -> R;
-                {End, Start} when End > 0, Start >= 0 ->
+                {End, Start} when End =/= 0, Start =/= 0 ->
                     WindowTxCount = End - Start,
                     R2 = R#{<<"window_tx_count">> => WindowTxCount},
                     case TimeDiff > 0 of

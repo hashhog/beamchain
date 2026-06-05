@@ -651,8 +651,42 @@ direct_atomic_connect_writes(Block, Height, Chainwork, BlockHash, Status) ->
     TxOps = build_tx_index_ops(Block#block.transactions, BlockHash,
                                 Height, 0, TxCF, []),
 
-    AllOps = [BlockOp, IdxOp, RevOp | TxOps],
+    %% 5. Cumulative tx count (Core's CBlockIndex::m_chain_tx_count, chain.h:129):
+    %% the total number of transactions from genesis up to and including this
+    %% block.  Maintained as an O(1) running counter — prev_cumulative + nTx —
+    %% so getchaintxstats can emit txcount / window_tx_count / txrate exactly as
+    %% Core does (rpc/blockchain.cpp getchaintxstats).  Written into the SAME
+    %% atomic WriteBatch as the block index so the counter can never diverge from
+    %% the connected block on a partial write.  Keyed by height, matching
+    %% get_cumulative_tx_count/store_cumulative_tx_count ("cumtx:<height>").
+    PrevCum = direct_get_cumulative_tx_count(Height - 1),
+    NewCum = PrevCum + NTx,
+    CumKey = <<"cumtx:", (integer_to_binary(Height))/binary>>,
+    CumOp = {put, MetaCF, CumKey, <<NewCum:64/big>>},
+
+    AllOps = [BlockOp, IdxOp, RevOp, CumOp | TxOps],
     rocksdb:write(Db, AllOps, []).
+
+%% @doc Direct (gen_server-bypassing) read of the cumulative tx count at a
+%% height, for use inside direct_atomic_connect_writes on the IBD-hot path.
+%% Reads straight from the meta CF via the persistent_term handle.  A height
+%% below genesis (-1) has a cumulative count of 0 (the genesis predecessor).
+%% A missing entry at height >= 0 also yields 0: this only happens for a chain
+%% connected before the counter existed; from that point forward the running
+%% sum is internally consistent (window_tx_count is a difference of two
+%% post-migration heights, so an old gap self-cancels once both window
+%% endpoints are past the migration point).
+-spec direct_get_cumulative_tx_count(integer()) -> non_neg_integer().
+direct_get_cumulative_tx_count(Height) when Height < 0 ->
+    0;
+direct_get_cumulative_tx_count(Height) ->
+    Db = persistent_term:get(beamchain_db_handle),
+    MetaCF = persistent_term:get(beamchain_cf_meta),
+    Key = <<"cumtx:", (integer_to_binary(Height))/binary>>,
+    case rocksdb:get(Db, MetaCF, Key, []) of
+        {ok, <<Count:64/big>>} -> Count;
+        _ -> 0
+    end.
 
 %% @doc Resolve batch op CF name to persistent_term handle (direct path).
 resolve_direct_batch_op({put, CF, Key, Value}) ->
