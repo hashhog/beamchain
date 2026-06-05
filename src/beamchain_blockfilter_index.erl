@@ -269,6 +269,21 @@ init([]) ->
             case rocksdb:open(Path, Opts) of
                 {ok, Db} ->
                     logger:info("blockfilter_index: opened ~s", [Path]),
+                    %% BIP-157 header chain MUST be anchored at the genesis
+                    %% block: Core's BlockFilterIndex indexes from height 0,
+                    %% so the cfheader at height 1 chains from the genesis
+                    %% cfheader (NOT from the all-zero pre-genesis header).
+                    %% beamchain's chainstate connects genesis during its own
+                    %% init — which runs BEFORE this gen_server is started by
+                    %% node_sup (chainstate_sup precedes the filter index in
+                    %% the rest_for_one child list) — so the genesis
+                    %% block-connect's add_block call is a no-op (index not yet
+                    %% running). Without seeding genesis here, every later
+                    %% cfheader would diverge from Core. Seed it once, only on
+                    %% a fresh (empty) index, mirroring Core's genesis-anchored
+                    %% chain. See bitcoin-core/src/index/blockfilterindex.cpp
+                    %% (BaseIndex starts at the genesis CBlockIndex).
+                    maybe_index_genesis(Db),
                     {ok, #state{
                         db = Db,
                         enabled = true,
@@ -423,6 +438,45 @@ code_change(_Old, State, _Extra) ->
 %%% ===================================================================
 %%% Internal helpers
 %%% ===================================================================
+
+%% @doc Seed the genesis (height 0) filter entry on a fresh index so the
+%% BIP-157 cfheader chain is anchored at genesis exactly like Core. Idempotent:
+%% does nothing if the index already holds any entry (tip_height >= 0). The
+%% genesis cfheader uses the all-zero pre-genesis previous header per BIP-157,
+%% and the genesis block has no spent prevouts so the element set is just its
+%% (non-OP_RETURN) coinbase output script.
+maybe_index_genesis(undefined) -> ok;
+maybe_index_genesis(Db) ->
+    case read_tip_height(Db) of
+        H when is_integer(H), H >= 0 ->
+            %% Already populated — never re-seed.
+            ok;
+        _ ->
+            try
+                Network = beamchain_config:network(),
+                Genesis = beamchain_chain_params:genesis_block(Network),
+                GHash = block_hash_internal(Genesis),
+                %% Genesis has no non-coinbase inputs -> no prevout scripts.
+                FilterBytes = beamchain_blockfilter:build_basic_filter(
+                    Genesis#block{hash = GHash}, []),
+                PrevHeader = beamchain_blockfilter:genesis_prev_header(),
+                Header = beamchain_blockfilter:compute_header(
+                    FilterBytes, PrevHeader),
+                ok = put_kv(Db, fkey(GHash), FilterBytes),
+                ok = put_kv(Db, hkey(GHash), Header),
+                ok = put_kv(Db, height_key(0), GHash),
+                ok = put_kv(Db, rkey(GHash), <<0:32/little>>),
+                ok = put_kv(Db, mkey(?META_TIP_HEADER), Header),
+                ok = put_kv(Db, mkey(?META_TIP_HEIGHT), <<0:32/little>>),
+                logger:info("blockfilter_index: seeded genesis cfheader"),
+                ok
+            catch
+                Class:Reason:_ST ->
+                    logger:warning("blockfilter_index: genesis seed failed: "
+                                   "~p:~p", [Class, Reason]),
+                    ok
+            end
+    end.
 
 block_hash_internal(#block{hash = H}) when byte_size(H) =:= 32 -> H;
 block_hash_internal(#block{header = Header}) ->
