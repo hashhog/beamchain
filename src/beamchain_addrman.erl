@@ -29,6 +29,8 @@
          select_address/1,
          get_addresses/1,
          get_addrv2_addresses/1,
+         get_node_addresses/2,
+         add_peer_address/4,
          count/0,
          netgroup/1,
          netgroup/2,
@@ -159,6 +161,37 @@ get_addresses(N) ->
 -spec get_addrv2_addresses(non_neg_integer()) -> [map()].
 get_addrv2_addresses(N) ->
     gen_server:call(?SERVER, {get_addrv2_addresses, N}).
+
+%% @doc Dump known addresses for the getnodeaddresses RPC.
+%%
+%% Mirrors Bitcoin Core's CConnman::GetAddressesUnsafe(count, max_pct=0,
+%% network) → a SHUFFLED list of CAddress. `Count =:= 0` means "return ALL
+%% known"; otherwise return at most Count. NetworkFilter is `all` (no filter)
+%% or one of the BIP155 network ids (1=IPv4, 2=IPv6, 4=TorV3, 5=I2P, 6=CJDNS)
+%% to filter on. Order is intentionally non-deterministic (shuffled), matching
+%% Core — callers MUST NOT rely on index order.
+%%
+%% Each returned map carries the fields the RPC needs, with the address already
+%% rendered to its Core ToStringAddr form (ip literal / .onion / .b32.i2p):
+%%   #{ time => Unix, services => Svc, address => Bin, port => Port,
+%%      network => NetStr }
+-spec get_node_addresses(non_neg_integer(), all | non_neg_integer()) -> [map()].
+get_node_addresses(Count, NetworkFilter) ->
+    gen_server:call(?SERVER, {get_node_addresses, Count, NetworkFilter}).
+
+%% @doc Insert a single address synchronously (for the addpeeraddress RPC).
+%%
+%% Mirrors Bitcoin Core's addpeeraddress (rpc/net.cpp:992): inserts {Address,
+%% Port, Services} into the address manager and, if Tried, attempts to promote
+%% it into the tried table. Returns {ok, Success::boolean()}. Unlike
+%% add_address/4 (an async cast), this is a synchronous call so the companion
+%% getnodeaddresses RPC can read the address back deterministically.
+-spec add_peer_address({inet:ip_address(), inet:port_number()},
+                       non_neg_integer(), boolean(), non_neg_integer())
+        -> {ok, boolean()}.
+add_peer_address(Address, Services, Tried, NetworkId) ->
+    gen_server:call(?SERVER, {add_peer_address, Address, Services, Tried,
+                              NetworkId}).
 
 %% @doc Return count of new and tried addresses.
 -spec count() -> {non_neg_integer(), non_neg_integer()}.
@@ -306,6 +339,29 @@ handle_call({get_addresses, N}, _From, State) ->
 handle_call({get_addrv2_addresses, N}, _From, State) ->
     Result = do_get_addrv2_addresses(N, State),
     {reply, Result, State};
+
+handle_call({get_node_addresses, Count, NetworkFilter}, _From, State) ->
+    Result = do_get_node_addresses(Count, NetworkFilter, State),
+    {reply, Result, State};
+
+handle_call({add_peer_address, Address, Services, Tried, NetworkId}, _From,
+            State) ->
+    %% Insert into the new table (synchronous variant of do_add_address).
+    %% do_add_address is idempotent and returns the updated state. Detect
+    %% success by checking whether the address is present afterwards (Core's
+    %% addrman.Add() returns false for non-routable / already-stale addrs).
+    State2 = do_add_address(Address, Services, self(), NetworkId, State),
+    Present = case ets:lookup(State2#state.addr_table, Address) of
+        [_] -> true;
+        [] -> false
+    end,
+    %% If `tried` requested and the add succeeded, promote to the tried table
+    %% (mirrors addrman.Good() in Core's addpeeraddress).
+    State3 = case (Tried andalso Present) of
+        true -> do_mark_tried(Address, State2);
+        false -> State2
+    end,
+    {reply, {ok, Present}, State3};
 
 handle_call(count, _From, #state{new_count = New, tried_count = Tried} = State) ->
     {reply, {New, Tried}, State};
@@ -841,6 +897,66 @@ do_get_addrv2_addresses(N, #state{addr_table = AddrTab}) ->
     end, [], AddrTab),
     Shuffled = shuffle(All),
     lists:sublist(Shuffled, N).
+
+%% @doc Build the getnodeaddresses dump (Core GetAddressesUnsafe shape).
+%%
+%% Walks the address table, optionally filtering on NetworkFilter (a BIP155
+%% network id, or `all`), renders each address to its ToStringAddr form, and
+%% maps the network id to the Core network string. Shuffles the result, then
+%% truncates to Count (Count =:= 0 means "all").
+do_get_node_addresses(Count, NetworkFilter, #state{addr_table = AddrTab}) ->
+    Now = erlang:system_time(second),
+    All = ets:foldl(fun(#addr_info{address = {AddrOrIP, Port},
+                                   services = Svc, timestamp = T,
+                                   network_id = NetId0}, Acc) ->
+        NetId = case NetId0 of undefined -> 1; _ -> NetId0 end,
+        case NetworkFilter =:= all orelse NetworkFilter =:= NetId of
+            true ->
+                Entry = #{time => min(T, Now),  %% cap to current time
+                          services => Svc,
+                          address => addr_to_string(AddrOrIP, NetId),
+                          port => Port,
+                          network => network_id_to_name(NetId)},
+                [Entry | Acc];
+            false ->
+                Acc
+        end
+    end, [], AddrTab),
+    Shuffled = shuffle(All),
+    case Count of
+        0 -> Shuffled;                      %% 0 => return ALL known
+        _ -> lists:sublist(Shuffled, Count)
+    end.
+
+%% @doc Render a stored address to Core's ToStringAddr form (no port).
+%% IPv4/IPv6 use inet:ntoa; non-IP networks store the printable string
+%% (.onion / .b32.i2p / cjdns literal) directly as a binary or list.
+-spec addr_to_string(term(), non_neg_integer()) -> binary().
+addr_to_string(IP, NetId) when NetId =:= 1; NetId =:= 2 ->
+    case IP of
+        {_, _, _, _} ->
+            list_to_binary(inet:ntoa(IP));
+        {_, _, _, _, _, _, _, _} ->
+            list_to_binary(inet:ntoa(IP));
+        _ when is_binary(IP) -> IP;
+        _ when is_list(IP) -> list_to_binary(IP);
+        _ -> iolist_to_binary(io_lib:format("~p", [IP]))
+    end;
+addr_to_string(Addr, _NetId) when is_binary(Addr) -> Addr;
+addr_to_string(Addr, _NetId) when is_list(Addr) -> list_to_binary(Addr);
+addr_to_string(Addr, _NetId) ->
+    iolist_to_binary(io_lib:format("~p", [Addr])).
+
+%% @doc Map a BIP155 network id to the Core network name (netbase.cpp
+%% GetNetworkName). 1=IPv4, 2=IPv6, 4=TorV3, 5=I2P, 6=CJDNS; anything else
+%% falls back to "not_publicly_routable".
+-spec network_id_to_name(non_neg_integer()) -> binary().
+network_id_to_name(1) -> <<"ipv4">>;
+network_id_to_name(2) -> <<"ipv6">>;
+network_id_to_name(4) -> <<"onion">>;
+network_id_to_name(5) -> <<"i2p">>;
+network_id_to_name(6) -> <<"cjdns">>;
+network_id_to_name(_) -> <<"not_publicly_routable">>.
 
 %%% ===================================================================
 %%% Internal: persistence (DETS)
