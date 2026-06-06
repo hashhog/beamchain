@@ -41,6 +41,12 @@
 %% BIP-157 P2P helpers
 -export([get_filter_range/2, get_header_range/2, get_checkpoints/2]).
 
+%% Startup reconciliation (Core BaseIndex::Init/Sync/Rewind). The
+%% /3 arity is the injectable core, exposed for the regression test so it
+%% can drive a synthetic active chain without standing up the full
+%% chainstate + db gen_servers.
+-export([reconcile_index/3]).
+
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
@@ -284,6 +290,24 @@ init([]) ->
                     %% chain. See bitcoin-core/src/index/blockfilterindex.cpp
                     %% (BaseIndex starts at the genesis CBlockIndex).
                     maybe_index_genesis(Db),
+                    %% Reconcile the index against the active chainstate
+                    %% BEFORE serving any cfheaders/cffilters. Mirrors
+                    %% Core BaseIndex::Init -> Sync -> Rewind
+                    %% (index/base.cpp:104,201,290): the index keeps its
+                    %% OWN persisted tip (META_TIP_HEIGHT/HEADER) in a
+                    %% separate RocksDB, written synchronously per block,
+                    %% while the chainstate flushes its tip in batches. On
+                    %% an unclean exit the two diverge. If the index tip is
+                    %% AHEAD of (or on a fork from) the chainstate tip, the
+                    %% chainstate's restart-replay re-fires add_block for
+                    %% heights already present here, and because add_block
+                    %% chains the new cfheader onto read_tip_header(Db) —
+                    %% the index's own (stale, ahead) tip — the persisted
+                    %% cfheader chain gets actively corrupted. Rewinding to
+                    %% the highest common ancestor first makes the replay
+                    %% re-chain correctly and guarantees we never serve
+                    %% cfheaders inconsistent with / ahead of the chainstate.
+                    catch reconcile_with_chain(Db),
                     {ok, #state{
                         db = Db,
                         enabled = true,
@@ -477,6 +501,163 @@ maybe_index_genesis(Db) ->
                     ok
             end
     end.
+
+%% @doc Production entry point for startup reconciliation. Resolves the
+%% active chain's tip + per-height block hash from the chainstate/db and
+%% delegates to reconcile_index/3. Degrades to a no-op (with a log line)
+%% if the chainstate/db are not available — e.g. in unit-test contexts
+%% where the index gen_server is started standalone. Mirrors
+%% Core BaseIndex::Init reading m_chainstate->m_chain.
+reconcile_with_chain(undefined) -> ok;
+reconcile_with_chain(Db) ->
+    case chain_tip_height() of
+        not_found ->
+            logger:debug("blockfilter_index: chainstate tip unavailable, "
+                         "skipping startup reconcile"),
+            ok;
+        {ok, ChainTipHeight} ->
+            ChainHashFun =
+                fun(Height) ->
+                    case (catch beamchain_db:get_block_index(Height)) of
+                        {ok, #{hash := Hash}} when byte_size(Hash) =:= 32 ->
+                            {ok, Hash};
+                        _ ->
+                            not_found
+                    end
+                end,
+            reconcile_index(Db, ChainHashFun, ChainTipHeight)
+    end.
+
+%% Resolve the active chainstate tip height, tolerating an absent /
+%% not-yet-started chainstate.
+chain_tip_height() ->
+    case (catch beamchain_chainstate:get_tip()) of
+        {ok, {_Hash, Height}} when is_integer(Height), Height >= 0 ->
+            {ok, Height};
+        _ ->
+            not_found
+    end.
+
+%% @doc Reconcile (rewind) the persisted filter index against the active
+%% chain. Core BaseIndex::Init treats the persisted best block as the
+%% index head and, if it is not an ancestor of the active tip, Sync()
+%% calls Rewind() to roll the index back to the common ancestor before
+%% re-indexing forward (index/base.cpp:124-145, 239, 290).
+%%
+%% Here we implement the safety-critical half: find the highest height
+%% H such that the index's recorded block hash at H equals the active
+%% chain's block hash at H (the common ancestor), then DELETE every index
+%% entry strictly above H and reset the tip meta to H. Subsequent
+%% add_block calls from the chainstate's restart-replay then re-chain the
+%% cfheader from a consistent point instead of corrupting the chain by
+%% chaining onto a stale / ahead persisted tip.
+%%
+%%   * Index tip above the chain tip   -> rewind down to the chain tip
+%%     (or lower, to the first matching hash).
+%%   * Index forked from the chain     -> rewind to the fork point.
+%%   * Index at/behind the chain on a   -> no-op (the missing forward
+%%     consistent prefix                  heights get filled by replay /
+%%                                         normal block-connect).
+%%
+%% ChainHashFun :: fun((Height) -> {ok, Hash::binary()} | not_found).
+-spec reconcile_index(rocksdb:db_handle() | undefined,
+                      fun((non_neg_integer()) ->
+                              {ok, binary()} | not_found),
+                      integer()) -> ok.
+reconcile_index(undefined, _ChainHashFun, _ChainTipHeight) -> ok;
+reconcile_index(Db, ChainHashFun, ChainTipHeight) ->
+    IndexTip = read_tip_height(Db),
+    case IndexTip < 0 of
+        true ->
+            %% Empty index — nothing to reconcile.
+            ok;
+        false ->
+            %% Start the comparison at the lower of the two tips: any index
+            %% height above the chain tip is by definition not on the active
+            %% chain and must be rewound.
+            StartH = min(IndexTip, ChainTipHeight),
+            Ancestor = find_common_ancestor(Db, ChainHashFun, StartH),
+            case Ancestor < IndexTip of
+                true ->
+                    rewind_index_to(Db, IndexTip, Ancestor),
+                    logger:info("blockfilter_index: reconciled index "
+                                "tip ~B -> ~B against chainstate tip ~B "
+                                "(common ancestor ~B)",
+                                [IndexTip, Ancestor, ChainTipHeight,
+                                 Ancestor]),
+                    ok;
+                false ->
+                    %% Index is a consistent prefix of (or equal to) the
+                    %% active chain — nothing to rewind.
+                    ok
+            end
+    end.
+
+%% Walk down from StartH until the index's hash at H matches the active
+%% chain's hash at H. Returns that height (>= -1). -1 means even genesis
+%% diverged (treat the whole index as stale -> full rewind).
+find_common_ancestor(_Db, _ChainHashFun, H) when H < 0 -> -1;
+find_common_ancestor(Db, ChainHashFun, H) ->
+    case {lookup_height_internal(Db, H), ChainHashFun(H)} of
+        {{ok, Hash}, {ok, Hash}} ->
+            %% Same hash at this height on both index and active chain.
+            H;
+        _ ->
+            %% Either the index has no entry here, the chain has no entry
+            %% here, or the hashes differ (fork) -> keep walking down.
+            find_common_ancestor(Db, ChainHashFun, H - 1)
+    end.
+
+%% Delete every index entry for heights (Ancestor, IndexTip], then reset
+%% the tip meta to Ancestor. Equivalent to BaseIndex::Rewind disconnecting
+%% each block from current_tip down to new_tip.
+rewind_index_to(Db, IndexTip, Ancestor) when IndexTip > Ancestor ->
+    lists:foreach(
+      fun(H) ->
+          case lookup_height_internal(Db, H) of
+              {ok, BH} ->
+                  ok = delete_kv(Db, fkey(BH)),
+                  ok = delete_kv(Db, hkey(BH)),
+                  ok = delete_kv(Db, rkey(BH));
+              not_found ->
+                  ok
+          end,
+          ok = delete_kv(Db, height_key(H))
+      end,
+      lists:seq(Ancestor + 1, IndexTip)),
+    set_tip_meta(Db, Ancestor),
+    ok;
+rewind_index_to(_Db, _IndexTip, _Ancestor) ->
+    ok.
+
+%% Point the tip meta at height H (the new index head after a rewind).
+%% H < 0 means the index is now empty -> drop the tip meta entirely so
+%% read_tip_height returns -1 and read_tip_header falls back to the
+%% genesis pre-header.
+set_tip_meta(Db, H) when H < 0 ->
+    ok = delete_kv(Db, mkey(?META_TIP_HEIGHT)),
+    ok = delete_kv(Db, mkey(?META_TIP_HEADER)),
+    ok;
+set_tip_meta(Db, H) ->
+    case lookup_height_internal(Db, H) of
+        {ok, BH} ->
+            case get_kv(Db, hkey(BH)) of
+                {ok, Header} ->
+                    ok = put_kv(Db, mkey(?META_TIP_HEADER), Header);
+                not_found ->
+                    %% No header for the surviving tip (should not happen);
+                    %% fall back to the genesis pre-header so the next
+                    %% add_block chains onto a defined value rather than a
+                    %% stale one.
+                    ok = put_kv(Db, mkey(?META_TIP_HEADER),
+                                beamchain_blockfilter:genesis_prev_header())
+            end;
+        not_found ->
+            ok = put_kv(Db, mkey(?META_TIP_HEADER),
+                        beamchain_blockfilter:genesis_prev_header())
+    end,
+    ok = put_kv(Db, mkey(?META_TIP_HEIGHT), <<H:32/little>>),
+    ok.
 
 block_hash_internal(#block{hash = H}) when byte_size(H) =:= 32 -> H;
 block_hash_internal(#block{header = Header}) ->

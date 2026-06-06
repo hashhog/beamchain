@@ -805,20 +805,20 @@ handle_info({peer_connected, Pid, Info}, State) ->
 handle_info({peer_disconnected, Pid, Reason}, State) ->
     logger:debug("peer manager: ~p disconnected: ~p",
                  [Pid, Reason]),
-    beamchain_sync:notify_peer_disconnected(Pid),
-    %% W103 BUG-13 + W125 fix: clean orphans announced by this peer.
-    %% Mirrors Bitcoin Core TxOrphanage::EraseForPeer(nodeid) on disconnect.
-    %% As of W125 the orphan record carries the peer's pid, so this is now
-    %% an actual prune (not the old no-op stub).  Bounded eviction over the
-    %% by-peer ordered_set index — O(k log N) where k = orphans-from-peer.
-    beamchain_mempool:erase_orphans_for_peer(Pid),
-    State2 = remove_peer_and_update(Pid, State),
+    State2 = finalize_peer(Pid, State),
     {noreply, State2};
 
 %% Peer banned due to misbehavior
 handle_info({peer_banned, Pid, Address}, State) ->
     logger:info("peer manager: banning ~p", [Address]),
-    State2 = remove_peer_and_update(Pid, State),
+    %% A ban is a non-graceful removal: it does NOT flow through the
+    %% {peer_disconnected,_,_} path, so without finalize_peer/2 the sync
+    %% coordinator (and block_sync's in-flight map / header_sync's
+    %% peer_heights+sync_peer) would keep a zombie entry for this pid and
+    %% any blocks it had in flight would never be re-queued. Mirror Core,
+    %% where CConnman::DisconnectNodes funnels EVERY disconnect (graceful
+    %% or forced) through PeerManagerImpl::FinalizeNode exactly once.
+    State2 = finalize_peer(Pid, State),
     %% Ban for 24 hours
     BanUntil = erlang:system_time(second) + 86400,
     Banned2 = maps:put(Address, BanUntil, State2#state.banned),
@@ -974,7 +974,17 @@ handle_info({'DOWN', _MonRef, process, Pid, Reason}, State) ->
         [#peer_entry{address = Addr}] ->
             logger:debug("peer ~p (~p) process down: ~p",
                          [Addr, Pid, Reason]),
-            State2 = remove_peer_and_update(Pid, State),
+            %% Non-graceful death (peer process crashed / TCP reset /
+            %% kill) reaches us only via this monitor 'DOWN', NOT via
+            %% {peer_disconnected,_,_}. It must finalize the peer the
+            %% same way the graceful path does, or the sync coordinator
+            %% retains a zombie peer entry and block_sync leaves this
+            %% peer's in-flight blocks pinned forever (they are only
+            %% re-queued by block_sync:handle_peer_disconnect/2, which
+            %% runs off notify_peer_disconnected). Core funnels every
+            %% disconnect through FinalizeNode exactly once regardless of
+            %% cause; finalize_peer/2 is our single equivalent.
+            State2 = finalize_peer(Pid, State),
             {noreply, State2};
         [] ->
             {noreply, State}
@@ -1485,6 +1495,31 @@ evict_from_largest_netgroup(Candidates) ->
 %%% ===================================================================
 %%% Internal: peer registry helpers
 %%% ===================================================================
+
+%% @doc Single peer-finalization path, mirroring Bitcoin Core's
+%% PeerManagerImpl::FinalizeNode (net_processing.cpp:1675). Every
+%% disconnection — graceful ({peer_disconnected,_,_}), forced by a ban
+%% ({peer_banned,_,_}), or a non-graceful process death ('DOWN') — MUST
+%% funnel through here exactly once so that:
+%%   1. the sync coordinator drops the peer from header_sync's
+%%      peer_heights / sync_peer and block_sync's peers / peer_stats maps,
+%%      and block_sync re-queues any blocks that were in flight from it
+%%      (handle_peer_disconnect/2); without this the dead peer becomes a
+%%      zombie entry and its in-flight blocks wedge the pipeline forever;
+%%   2. the orphan pool is pruned of orphans announced by this peer
+%%      (Core TxOrphanage::EraseForPeer);
+%%   3. the ETS peer table + outbound netgroup set are updated.
+%% Idempotent: if the peer is already gone from the ETS table the sync /
+%% orphan notifications are still cheap no-ops downstream.
+finalize_peer(Pid, State) ->
+    beamchain_sync:notify_peer_disconnected(Pid),
+    %% W103 BUG-13 + W125 fix: clean orphans announced by this peer.
+    %% Mirrors Bitcoin Core TxOrphanage::EraseForPeer(nodeid) on disconnect.
+    %% As of W125 the orphan record carries the peer's pid, so this is now
+    %% an actual prune (not the old no-op stub).  Bounded eviction over the
+    %% by-peer ordered_set index — O(k log N) where k = orphans-from-peer.
+    beamchain_mempool:erase_orphans_for_peer(Pid),
+    remove_peer_and_update(Pid, State).
 
 remove_peer_and_update(Pid, State) ->
     case ets:lookup(?PEER_TABLE, Pid) of
