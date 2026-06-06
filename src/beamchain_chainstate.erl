@@ -1115,6 +1115,15 @@ do_connect_block_inner(#block{header = Header} = Block,
                         Block, Height, BlockHash,
                         Header#block_header.timestamp)),
 
+                %% Restart-persistence: tell the wallet its ledger is now
+                %% synced through this height so a node restart rescans only
+                %% the gap above it (and so a debounced durable flush of
+                %% last_synced_height is scheduled).  Async cast — never
+                %% block the connect path on the wallet, and the wallet
+                %% never calls back into chainstate here (no deadlock).
+                %% Best-effort: a down/unstarted wallet is a no-op.
+                _ = (catch beamchain_wallet:notify_block_connected(Height)),
+
                 %% Notify peer manager that our tip advanced (stale tip detection)
                 beamchain_peer_manager:notify_tip_updated(),
 
