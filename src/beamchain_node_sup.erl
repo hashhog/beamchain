@@ -20,7 +20,14 @@ init([]) ->
         child_spec(beamchain_db, worker),
         child_spec(beamchain_sig_cache, worker),
         child_spec(beamchain_chainstate_sup, supervisor),
-        child_spec(beamchain_mempool, worker),
+        %% Mempool gets an extended shutdown timeout so its terminate/2
+        %% has time to dump mempool.dat on graceful shutdown. The default
+        %% worker shutdown (5000ms) is normally plenty, but a large
+        %% mempool serialize + atomic write can exceed it; a SIGKILL of
+        %% the gen_server mid-dump would silently lose the whole mempool.
+        %% Pairs with process_flag(trap_exit,true) in beamchain_mempool's
+        %% init/1 (without that flag terminate/2 never runs at all).
+        mempool_child_spec(),
         child_spec(beamchain_erlay, worker),
         child_spec(beamchain_fee_estimator, worker),
         child_spec(beamchain_addrman, worker),
@@ -81,3 +88,9 @@ child_spec(Module, Type) ->
         type => Type,
         modules => [Module]
     }.
+
+%% Mempool worker with an explicit 30s shutdown timeout (vs the default
+%% 5000ms) so terminate/2 can finish dumping mempool.dat on a graceful
+%% stop. See the call site above for why.
+mempool_child_spec() ->
+    (child_spec(beamchain_mempool, worker))#{shutdown => 30000}.

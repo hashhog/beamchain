@@ -98,7 +98,8 @@
          scan_block_for_wallet/4,
          unscan_block_for_wallet/1,
          unscan_block_for_wallet/2,
-         rescan_chain/2]).
+         rescan_chain/2,
+         notify_block_connected/1]).
 
 %% Wallet transaction history (listtransactions / gettransaction).
 -export([get_tx_history/0,
@@ -186,8 +187,28 @@
     %% restored via beamchain_bip39. `undefined` for raw-seed wallets.
     %% Held in memory only for getwalletmnemonic export; not yet
     %% persisted to the wallet file.
-    mnemonic = undefined :: [binary()] | undefined
+    mnemonic = undefined :: [binary()] | undefined,
+    %% Highest block height whose credits/debits have been folded into the
+    %% wallet's (ETS) UTXO ledger and persisted to disk.  Mirrors Bitcoin
+    %% Core's CWallet::m_last_block_processed_height (wallet/wallet.h):
+    %% it lets a restarted node rescan ONLY the gap [last_synced_height+1,
+    %% tip] instead of the whole chain, and lets us recompute confirmations
+    %% from the current tip.  -1 means "nothing scanned yet" (fresh wallet).
+    last_synced_height = -1 :: integer(),
+    %% Debounce reference for the periodic "block_connected" flush.  We do
+    %% NOT fsync the wallet file on literally every connected block during
+    %% IBD (that would be thousands of fsyncs/sec); instead a connect
+    %% schedules a single coalesced flush a short time later.  A clean
+    %% shutdown / explicit mutation still persists synchronously.
+    flush_timer_ref = undefined :: reference() | undefined
 }).
+
+%% How long to wait (ms) after a block-connect before coalescing the
+%% wallet's last_synced_height into a durable on-disk write.  Short enough
+%% that a crash loses at most a couple of seconds of "height advanced"
+%% bookkeeping (re-derived on the next startup rescan anyway), long enough
+%% to collapse an IBD block storm into very few fsyncs.
+-define(WALLET_FLUSH_DEBOUNCE_MS, 2000).
 
 %% Default keypool size (1000 addresses lookahead per type)
 -define(DEFAULT_KEYPOOL_SIZE, 1000).
@@ -334,6 +355,18 @@ get_wallet_info() ->
 get_keypool_size() ->
     gen_server:call(?SERVER, get_keypool_size).
 
+%% @doc Notify the (default) wallet that a block was connected at Height so
+%% it can advance its persisted last_synced_height and schedule a durable
+%% flush.  Async (cast); a missing/unstarted default wallet is a silent
+%% no-op so the chainstate connect path is never affected.  Mirrors Core's
+%% blockConnected wallet notification.
+-spec notify_block_connected(non_neg_integer()) -> ok.
+notify_block_connected(Height) when is_integer(Height) ->
+    case whereis(?SERVER) of
+        undefined -> ok;
+        Pid       -> gen_server:cast(Pid, {block_connected, Height})
+    end.
+
 %%% ===================================================================
 %%% Wallet encryption API
 %%% ===================================================================
@@ -468,7 +501,7 @@ init([WalletName]) when is_binary(WalletName) ->
     end,
     %% Create ETS tables for wallet UTXOs and script lookup
     init_ets_tables(),
-    {ok, #wallet_state{
+    BlankState = #wallet_state{
         wallet_name  = WalletName,
         network      = Network,
         coin_type    = CoinType,
@@ -482,7 +515,64 @@ init([WalletName]) when is_binary(WalletName) ->
         encrypted_seed = undefined,
         encryption_salt = undefined,
         lock_timer_ref = undefined
-    }}.
+    },
+    %% Restart-persistence (requirements 2-4): auto-load the default
+    %% wallet from disk on boot.  An unencrypted default wallet is the
+    %% common case (encrypted/named wallets are opened later via
+    %% loadwallet); load it here so a node restart does NOT come up with a
+    %% blank wallet.  Fault-tolerant: a missing file is normal on a fresh
+    %% datadir (start blank), and a corrupt/truncated file must NOT crash
+    %% node startup — we log, keep the .bak, and start blank.
+    State = maybe_autoload_default(WalletName, BlankState),
+    %% Defer the chain reconcile (gap rescan) until the rest of the
+    %% supervision tree (chainstate, db) has booted.  This must not run
+    %% inside init/1 (the chainstate isn't up yet) — send ourselves a
+    %% message instead.  A blank/no-wallet state makes reconcile a no-op.
+    erlang:send_after(5000, self(), reconcile_wallet),
+    {ok, State}.
+
+%% Auto-load the on-disk default wallet (<datadir>/<net>/wallet/wallet.json)
+%% during init.  Only the default (unnamed, unencrypted) wallet is loaded
+%% automatically; encrypted wallets need a passphrase and are opened later
+%% via the loadwallet RPC.  Any failure leaves the blank state so the node
+%% always boots.
+maybe_autoload_default(<<>>, BlankState) ->
+    WalletDir = wallet_dir(BlankState#wallet_state.network),
+    WalletFile = WalletDir ++ "/wallet.json",
+    case filelib:is_regular(WalletFile) of
+        false ->
+            BlankState;
+        true ->
+            case load_wallet_file(WalletFile, undefined) of
+                {ok, WalletData} ->
+                    case maps:get(<<"encrypted">>, WalletData, false) of
+                        true ->
+                            %% Encrypted default wallet: load metadata but
+                            %% stay locked (no passphrase at boot). Keys
+                            %% unavailable until walletpassphrase; the UTXO
+                            %% ledger still rescans (scripts are public).
+                            logger:info("wallet: auto-loaded encrypted "
+                                        "default wallet (locked) from ~s",
+                                        [WalletFile]),
+                            apply_loaded_wallet(WalletData, WalletFile,
+                                                undefined, BlankState);
+                        false ->
+                            logger:info("wallet: auto-loaded default wallet "
+                                        "from ~s", [WalletFile]),
+                            apply_loaded_wallet(WalletData, WalletFile,
+                                                undefined, BlankState)
+                    end;
+                {error, Reason} ->
+                    logger:warning(
+                      "wallet: could not auto-load ~s (~p); starting with "
+                      "an empty wallet (existing file + .bak preserved)",
+                      [WalletFile, Reason]),
+                    BlankState
+            end
+    end;
+maybe_autoload_default(_NamedWallet, BlankState) ->
+    %% Named/multi-wallet processes are opened explicitly via loadwallet.
+    BlankState.
 
 %% @doc Initialize ETS tables for wallet UTXO tracking.
 init_ets_tables() ->
@@ -560,53 +650,14 @@ handle_call(getwalletmnemonic, _From, State) ->
 handle_call({load, FilePath, Passphrase}, _From, State) ->
     case load_wallet_file(FilePath, Passphrase) of
         {ok, WalletData} ->
-            Addrs = maps:get(<<"addresses">>, WalletData, []),
-            NextRecv = maps:get(<<"next_receive">>, WalletData,
-                                #{<<"p2wpkh">> => 0, <<"p2tr">> => 0,
-                                  <<"p2pkh">> => 0}),
-            NextChg = maps:get(<<"next_change">>, WalletData,
-                               #{<<"p2wpkh">> => 0, <<"p2tr">> => 0,
-                                 <<"p2pkh">> => 0}),
-            %% Check if wallet is encrypted at the JSON level
-            IsEncrypted = maps:get(<<"encrypted">>, WalletData, false),
-            NewState = case IsEncrypted of
-                true ->
-                    %% Encrypted wallet: load encrypted seed, start locked
-                    EncSeedHex = maps:get(<<"encrypted_seed">>, WalletData),
-                    EncSaltHex = maps:get(<<"encryption_salt">>, WalletData),
-                    EncSeed = hex_decode(EncSeedHex),
-                    EncSalt = hex_decode(EncSaltHex),
-                    State#wallet_state{
-                        master_key  = undefined,
-                        seed        = undefined,
-                        wallet_file = FilePath,
-                        passphrase  = Passphrase,
-                        addresses   = Addrs,
-                        next_receive = decode_index_map(NextRecv),
-                        next_change  = decode_index_map(NextChg),
-                        encrypted   = true,
-                        locked      = true,
-                        encrypted_seed = EncSeed,
-                        encryption_salt = EncSalt
-                    };
-                false ->
-                    %% Unencrypted wallet: load seed directly
-                    SeedHex = maps:get(<<"seed">>, WalletData),
-                    Seed = hex_decode(SeedHex),
-                    MasterKey = master_from_seed(Seed),
-                    State#wallet_state{
-                        master_key  = MasterKey,
-                        seed        = Seed,
-                        wallet_file = FilePath,
-                        passphrase  = Passphrase,
-                        addresses   = Addrs,
-                        next_receive = decode_index_map(NextRecv),
-                        next_change  = decode_index_map(NextChg),
-                        encrypted   = false,
-                        locked      = false
-                    }
-            end,
-            {reply, ok, NewState};
+            NewState = apply_loaded_wallet(WalletData, FilePath, Passphrase,
+                                           State),
+            %% Bring the freshly-loaded wallet's UTXO ledger up to the
+            %% chain tip on demand (rescan the gap). Same reconcile the
+            %% boot auto-load schedules; here it runs synchronously so the
+            %% loadwallet RPC returns a wallet that already reflects tip.
+            NewState2 = reconcile_to_tip(NewState),
+            {reply, ok, NewState2};
         {error, Reason} ->
             {reply, {error, Reason}, State}
     end;
@@ -753,8 +804,50 @@ handle_call(list_locked_coins, _From,
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_request}, State}.
 
+%% A block was connected by the chainstate connect-loop (requirement 4).
+%% The actual credit/debit ETS scan already ran (the connect loop calls
+%% scan_block_for_wallet/4 directly); here we only advance the wallet's
+%% last_synced_height and schedule a coalesced durable flush so a restart
+%% rescans only the gap above this height.  Async (cast) by design — the
+%% chainstate must never block on the wallet during IBD, and we must never
+%% block on it (no gen_server round-trip back into chainstate here).
+handle_cast({block_connected, Height}, State)
+  when is_integer(Height) ->
+    case Height > State#wallet_state.last_synced_height of
+        true ->
+            NewState = schedule_flush(
+                         State#wallet_state{last_synced_height = Height}),
+            {noreply, NewState};
+        false ->
+            {noreply, State}
+    end;
 handle_cast(_Msg, State) ->
     {noreply, State}.
+
+%% Coalesced durable flush fired by the debounce timer after block(s)
+%% connected.  Persists the advanced last_synced_height (and any other
+%% mutated state) to disk crash-safely.  Clearing the ref lets the next
+%% connect re-arm the timer.
+handle_info(flush_wallet, State) ->
+    NewState = State#wallet_state{flush_timer_ref = undefined},
+    _ = save_wallet(NewState),
+    {noreply, NewState};
+
+%% Startup reconcile (requirement 4): scheduled from init/1 after the
+%% supervision tree has booted (so chainstate/db are up).  Rescans the gap
+%% between the persisted last_synced_height and the current tip, rebuilding
+%% the in-memory UTXO/history ledger that does not survive a restart, then
+%% persists the new height.  Best-effort: a failure here logs and leaves
+%% the wallet usable (the user can always rescanblockchain manually).
+handle_info(reconcile_wallet, State) ->
+    NewState = try reconcile_to_tip(State)
+               catch Class:Reason:Stack ->
+                   logger:warning(
+                     "wallet: startup reconcile failed: ~p:~p~n  ~p",
+                     [Class, Reason, Stack]),
+                   State
+               end,
+    {noreply, NewState};
 
 handle_info(wallet_lock, State) ->
     %% Auto-lock timer fired
@@ -765,6 +858,12 @@ handle_info(_Info, State) ->
     {noreply, State}.
 
 terminate(_Reason, State) ->
+    %% Final durable flush on graceful shutdown so the latest
+    %% last_synced_height (and any un-flushed mutation) survives a clean
+    %% stop.  Crash-safe writes mean a SIGKILL/OOM that skips terminate/2
+    %% still loses at most the few seconds of height bookkeeping the next
+    %% startup rescan re-derives anyway.
+    _ = save_wallet(State),
     %% Clear sensitive data on shutdown
     case State#wallet_state.seed of
         undefined -> ok;
@@ -1681,62 +1780,280 @@ save_wallet(#wallet_state{addresses = Addrs,
                            next_receive = NextRecv, next_change = NextChg,
                            passphrase = Passphrase, wallet_file = File,
                            encrypted = Encrypted, encrypted_seed = EncSeed,
-                           encryption_salt = EncSalt, seed = Seed}) ->
+                           encryption_salt = EncSalt, seed = Seed,
+                           last_synced_height = LastSynced}) ->
     %% For encrypted wallets, save the encrypted seed
     %% For unencrypted wallets, save the plaintext seed
+    Common = #{
+        <<"addresses">>          => Addrs,
+        <<"next_receive">>       => encode_index_map(NextRecv),
+        <<"next_change">>        => encode_index_map(NextChg),
+        <<"last_synced_height">> => LastSynced,
+        <<"created_at">>         => erlang:system_time(second)
+    },
     WalletData = case Encrypted of
         true ->
-            #{
+            Common#{
                 <<"encrypted">>       => true,
                 <<"encrypted_seed">>  => hex_encode(EncSeed),
-                <<"encryption_salt">> => hex_encode(EncSalt),
-                <<"addresses">>       => Addrs,
-                <<"next_receive">>    => encode_index_map(NextRecv),
-                <<"next_change">>     => encode_index_map(NextChg),
-                <<"created_at">>      => erlang:system_time(second)
+                <<"encryption_salt">> => hex_encode(EncSalt)
             };
         false ->
-            #{
-                <<"seed">>         => hex_encode(Seed),
-                <<"addresses">>    => Addrs,
-                <<"next_receive">> => encode_index_map(NextRecv),
-                <<"next_change">>  => encode_index_map(NextChg),
-                <<"created_at">>   => erlang:system_time(second)
-            }
+            Common#{<<"seed">> => hex_encode(Seed)}
     end,
     Json = jsx:encode(WalletData, [space, indent]),
-    case Passphrase of
-        undefined ->
-            file:write_file(File, Json);
+    Bytes = case Passphrase of
+        undefined -> Json;
+        _         -> encrypt_payload(Json, Passphrase)
+    end,
+    atomic_write_wallet(File, Bytes).
+
+%% @doc Durable, crash-safe wallet write (requirement 1).
+%%
+%% Mirrors Bitcoin Core's BerkeleyBatch / SQLiteBatch durability and the
+%% pattern this node's OWN beamchain_mempool_persist:dump/1 already uses:
+%%   1. write the full file to a sibling temp path,
+%%   2. fsync the temp file's contents to stable storage,
+%%   3. rotate the previous good file to <file>.bak (so a torn/observer
+%%      crash still leaves one complete prior copy to recover from),
+%%   4. atomically rename temp -> final (POSIX rename is atomic; a reader
+%%      ever sees either the whole old file or the whole new file, never a
+%%      partially-written one),
+%%   5. fsync the containing directory so the rename itself is durable.
+%% A failure at any step leaves the previous good file (and its .bak)
+%% untouched, and never crashes the caller — save is best-effort by
+%% contract (every mutation handler does `ok = save_wallet(...)`, so we
+%% always return `ok`; a write error is logged, not propagated).
+atomic_write_wallet(File, Bytes) ->
+    Dir = filename:dirname(File),
+    Tmp = File ++ ".tmp",
+    Bak = File ++ ".bak",
+    _ = filelib:ensure_dir(File),
+    try
+        ok = write_and_sync(Tmp, Bytes),
+        %% Keep a backup of the last known-good file before clobbering it.
+        case filelib:is_regular(File) of
+            true  -> _ = file:copy(File, Bak);
+            false -> ok
+        end,
+        ok = file:rename(Tmp, File),
+        _ = fsync_dir(Dir),
+        ok
+    catch
+        Class:Reason:Stack ->
+            _ = file:delete(Tmp),
+            logger:warning("wallet: durable write of ~s failed: ~p:~p~n  ~p",
+                           [File, Class, Reason, Stack]),
+            ok
+    end.
+
+%% Write Bytes to Path and fsync the file contents (not just the metadata)
+%% before returning, so a power loss after we return cannot leave the data
+%% only in the page cache.
+write_and_sync(Path, Bytes) ->
+    case file:open(Path, [write, raw, binary]) of
+        {ok, Fd} ->
+            try
+                ok = file:write(Fd, Bytes),
+                _ = file:sync(Fd),   %% fsync file contents
+                ok
+            after
+                _ = file:close(Fd)
+            end;
+        {error, Reason} ->
+            error({wallet_open_failed, Reason})
+    end.
+
+%% fsync the directory so the rename is itself durable.  Best-effort:
+%% directory fsync is not portable to every filesystem/OS; a failure here
+%% is logged-by-omission and does not fail the write (the rename has
+%% already happened and is atomic regardless).
+fsync_dir(Dir) ->
+    case file:open(Dir, [read, raw]) of
+        {ok, Fd} ->
+            _ = file:sync(Fd),
+            _ = file:close(Fd),
+            ok;
+        {error, _} ->
+            ok
+    end.
+
+%% @doc Build wallet state from a decoded wallet-file map.  Shared by the
+%% explicit {load,...} handler and the boot auto-load so both paths decode
+%% identically AND both re-register the keypool scripts in ETS — the
+%% script table is lost on restart, so without re-registration is_wallet_
+%% script/1 would return false during the startup rescan and no UTXO would
+%% ever be re-credited.  Passphrase is undefined for unencrypted / boot
+%% auto-load; an encrypted wallet stays locked until walletpassphrase.
+apply_loaded_wallet(WalletData, FilePath, Passphrase, State) ->
+    Addrs = maps:get(<<"addresses">>, WalletData, []),
+    NextRecv = maps:get(<<"next_receive">>, WalletData,
+                        #{<<"p2wpkh">> => 0, <<"p2tr">> => 0,
+                          <<"p2pkh">> => 0}),
+    NextChg = maps:get(<<"next_change">>, WalletData,
+                       #{<<"p2wpkh">> => 0, <<"p2tr">> => 0,
+                         <<"p2pkh">> => 0}),
+    LastSynced = to_integer(maps:get(<<"last_synced_height">>, WalletData, -1)),
+    IsEncrypted = maps:get(<<"encrypted">>, WalletData, false),
+    %% Re-register every loaded address's scriptPubKey so UTXO matching
+    %% works again after a restart (the script ETS table is volatile).
+    reregister_address_scripts(Addrs, State#wallet_state.network),
+    Base = State#wallet_state{
+        wallet_file        = FilePath,
+        passphrase         = Passphrase,
+        addresses          = Addrs,
+        next_receive       = decode_index_map(NextRecv),
+        next_change        = decode_index_map(NextChg),
+        last_synced_height = LastSynced
+    },
+    case IsEncrypted of
+        true ->
+            EncSeed = hex_decode(maps:get(<<"encrypted_seed">>, WalletData)),
+            EncSalt = hex_decode(maps:get(<<"encryption_salt">>, WalletData)),
+            Base#wallet_state{
+                master_key      = undefined,
+                seed            = undefined,
+                encrypted       = true,
+                locked          = true,
+                encrypted_seed  = EncSeed,
+                encryption_salt = EncSalt
+            };
+        false ->
+            Seed = hex_decode(maps:get(<<"seed">>, WalletData)),
+            Base#wallet_state{
+                master_key = master_from_seed(Seed),
+                seed       = Seed,
+                encrypted  = false,
+                locked     = false
+            }
+    end.
+
+%% Re-insert each persisted address's scriptPubKey into the (volatile)
+%% script-lookup ETS table so is_wallet_script/1 recognises wallet outputs
+%% again after a restart.  Best-effort per address (a malformed entry is
+%% skipped, not fatal).
+reregister_address_scripts(Addrs, Network) ->
+    lists:foreach(
+      fun(AddrEntry) ->
+              try
+                  AddrBin = maps:get(<<"address">>, AddrEntry),
+                  AddrStr = binary_to_list(AddrBin),
+                  case beamchain_address:address_to_script(AddrStr, Network) of
+                      {ok, Script} ->
+                          register_wallet_script(Script, AddrBin);
+                      _ ->
+                          ok
+                  end
+              catch
+                  _:_ -> ok
+              end
+      end, Addrs),
+    ok.
+
+%% Reconcile the in-memory UTXO/history ledger up to the current chain tip
+%% (requirement 4).  Rescans the gap (last_synced_height, tip] and persists
+%% the advanced height.  No-op for a blank wallet (no master key / no
+%% addresses) or before the chainstate has a tip.
+reconcile_to_tip(#wallet_state{master_key = undefined} = State) ->
+    State;
+reconcile_to_tip(#wallet_state{addresses = []} = State) ->
+    State;
+reconcile_to_tip(#wallet_state{last_synced_height = Last} = State) ->
+    case current_tip_height() of
+        {ok, Tip} when Tip > Last ->
+            Start = max(0, Last + 1),
+            logger:info("wallet: reconciling ledger, rescanning blocks "
+                        "[~B, ~B]", [Start, Tip]),
+            LastScanned = rescan_chain(Start, Tip),
+            NewHeight = max(Last, LastScanned),
+            NewState = State#wallet_state{last_synced_height = NewHeight},
+            _ = save_wallet(NewState),
+            NewState;
         _ ->
-            encrypt_and_write(File, Json, Passphrase)
+            State
     end.
 
-load_wallet_file(FilePath, undefined) ->
-    case file:read_file(FilePath) of
-        {ok, Data} ->
-            {ok, jsx:decode(Data, [return_maps])};
-        {error, _} = Err ->
-            Err
-    end;
+%% Arm (or leave armed) the debounce timer that coalesces block-connect
+%% height advances into a single durable wallet write.  Idempotent: while a
+%% timer is already pending we do nothing, so an IBD block storm produces at
+%% most one flush per ?WALLET_FLUSH_DEBOUNCE_MS window.
+schedule_flush(#wallet_state{flush_timer_ref = Ref} = State)
+  when is_reference(Ref) ->
+    State;
+schedule_flush(State) ->
+    Ref = erlang:send_after(?WALLET_FLUSH_DEBOUNCE_MS, self(), flush_wallet),
+    State#wallet_state{flush_timer_ref = Ref}.
+
+%% Tolerant integer coercion for a JSON-decoded height (jsx yields an
+%% integer, but tolerate a binary/float just in case of an older/edited
+%% file).  Anything unparseable falls back to -1 ("nothing scanned").
+to_integer(N) when is_integer(N) -> N;
+to_integer(F) when is_float(F) -> trunc(F);
+to_integer(B) when is_binary(B) ->
+    try binary_to_integer(B) catch _:_ -> -1 end;
+to_integer(_) -> -1.
+
+%% @doc Fault-tolerant wallet-file load (requirement 3).
+%%
+%% A missing / corrupt / partially-written wallet file must NEVER crash
+%% the caller.  We try the primary file; if it is unreadable or unparseable
+%% we transparently fall back to the durable-write backup (<file>.bak),
+%% which atomic_write_wallet/2 leaves as the last known-good copy.  Both
+%% bad → {error, Reason} (callers decide whether that is fatal — for the
+%% boot auto-load it is NOT: the node starts with a fresh/empty wallet).
 load_wallet_file(FilePath, Passphrase) ->
-    case file:read_file(FilePath) of
-        {ok, EncData} ->
-            decrypt_and_parse(EncData, Passphrase);
+    case try_load_one(FilePath, Passphrase) of
+        {ok, _} = Ok ->
+            Ok;
+        {error, PrimaryReason} ->
+            Bak = FilePath ++ ".bak",
+            case filelib:is_regular(Bak) of
+                true ->
+                    logger:warning(
+                      "wallet: ~s unreadable (~p); trying backup ~s",
+                      [FilePath, PrimaryReason, Bak]),
+                    case try_load_one(Bak, Passphrase) of
+                        {ok, _} = Ok ->
+                            logger:info("wallet: recovered from backup ~s",
+                                        [Bak]),
+                            Ok;
+                        {error, BakReason} ->
+                            {error, {primary_and_backup_failed,
+                                     PrimaryReason, BakReason}}
+                    end;
+                false ->
+                    {error, PrimaryReason}
+            end
+    end.
+
+%% Read + parse a single wallet file path, tolerating I/O errors and
+%% malformed/truncated content (jsx/decrypt may throw — we catch).
+try_load_one(Path, Passphrase) ->
+    case file:read_file(Path) of
+        {ok, Data} ->
+            try
+                case Passphrase of
+                    undefined -> {ok, jsx:decode(Data, [return_maps])};
+                    _         -> decrypt_and_parse(Data, Passphrase)
+                end
+            catch
+                Class:Reason ->
+                    {error, {parse_failed, Class, Reason}}
+            end;
         {error, _} = Err ->
             Err
     end.
 
-encrypt_and_write(File, Plaintext, Passphrase) ->
+%% Build the encrypted on-disk payload (returned, not written, so the
+%% atomic-write path is the single point that touches the filesystem).
+%% File format: "BCWALLET" magic || salt(16) || iv(12) || tag(16) || ct.
+encrypt_payload(Plaintext, Passphrase) ->
     Salt = crypto:strong_rand_bytes(16),
     Key = derive_key(Passphrase, Salt),
     IV = crypto:strong_rand_bytes(12),
     {Ciphertext, Tag} = crypto:crypto_one_time_aead(
         aes_256_gcm, Key, IV, Plaintext, <<>>, true),
-    %% File format: "BCWALLET" magic || salt(16) || iv(12) || tag(16) || ciphertext
-    Encoded = <<"BCWALLET", Salt/binary, IV/binary, Tag/binary,
-                Ciphertext/binary>>,
-    file:write_file(File, Encoded).
+    <<"BCWALLET", Salt/binary, IV/binary, Tag/binary, Ciphertext/binary>>.
 
 decrypt_and_parse(<<"BCWALLET", Salt:16/binary, IV:12/binary,
                     Tag:16/binary, Ciphertext/binary>>, Passphrase) ->

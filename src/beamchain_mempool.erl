@@ -467,6 +467,14 @@ get_mempool_utxo(Txid, Vout) ->
 %%% ===================================================================
 
 init([]) ->
+    %% Trap exits so a supervisor-initiated shutdown runs terminate/2,
+    %% which dumps mempool.dat (warm-restart parity with Bitcoin Core).
+    %% Without this flag the gen_server is killed outright on the
+    %% supervisor's exit signal and terminate/2 — the dump — never runs,
+    %% silently losing the whole mempool across every restart. Pairs with
+    %% the shutdown=>30000 timeout on the mempool child_spec in
+    %% beamchain_node_sup so the dump has time to complete.
+    process_flag(trap_exit, true),
     %% Create ETS tables
     ets:new(?MEMPOOL_TXS, [set, public, named_table,
                             {read_concurrency, true},
