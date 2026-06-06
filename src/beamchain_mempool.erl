@@ -516,7 +516,15 @@ init([]) ->
 handle_call({add_tx, Tx, PeerId}, _From, State) ->
     case do_add_transaction(Tx, PeerId, State) of
         {ok, Txid, State2} ->
-            {reply, {ok, Txid}, State2};
+            %% Mirror Core AcceptToMemoryPool → LimitMempoolSize (validation.cpp):
+            %% after a successful single-tx admission, trim the pool back down to
+            %% the configured cap.  Relay policy only — never changes the validity
+            %% of the just-admitted tx (it may evict the lowest-feerate tails,
+            %% which can include this tx if it is the new worst).  Uses the
+            %% configured max_size (the live analogue of m_opts.max_size_bytes),
+            %% reusing do_trim_to_size/2 exactly as the trim_to_size RPC handler does.
+            State3 = do_trim_to_size(State2#state.max_size, State2),
+            {reply, {ok, Txid}, State3};
         {error, Reason} ->
             {reply, {error, Reason}, State}
     end;
@@ -528,7 +536,11 @@ handle_call({add_tx, Tx}, From, State) ->
 handle_call({accept_package, Package}, _From, State) ->
     case do_accept_package(Package, State) of
         {ok, Txids, State2} ->
-            {reply, {ok, Txids}, State2};
+            %% Mirror Core: package admission (ProcessNewPackage) is followed by
+            %% LimitMempoolSize.  Trim once, after the whole package has landed,
+            %% so we never double-apply per-tx within a single package operation.
+            State3 = do_trim_to_size(State2#state.max_size, State2),
+            {reply, {ok, Txids}, State3};
         {error, Reason} ->
             {reply, {error, Reason}, State}
     end;
@@ -3256,10 +3268,21 @@ do_remove_for_block_with_txs(Txs, State) ->
                          [TotalCount, RemovedCount, ConflictCount]);
         false -> ok
     end,
-    State3#state{
+    State4 = State3#state{
         total_bytes = max(0, State3#state.total_bytes - TotalBytes),
         total_count = max(0, State3#state.total_count - TotalCount)
-    }.
+    },
+    %% Mirror Bitcoin Core ConnectTip → LimitMempoolSize (validation.cpp), which
+    %% runs Expire(now - expiry) THEN TrimToSize(max_size) on every block connect
+    %% (txmempool.cpp).  Wire the EXISTING live-path-dead helpers in that exact
+    %% order: expire time-aged txs first (frees space and removes their
+    %% descendants), then trim the remaining worst-feerate tails to the cap.
+    %% Relay policy only — does not affect block/consensus validation.  Each
+    %% helper returns the updated State; thread it through.  block_since_bump was
+    %% already set true at the top of this function (State0), so a subsequent
+    %% get_min_fee will begin decaying the rolling minimum fee from this block.
+    {_ExpiredN, State5} = do_expire_old(State4),
+    do_trim_to_size(State5#state.max_size, State5).
 
 %% Legacy txid-only conflict eviction (used by the deprecated
 %% remove_for_block/1 path).  This is intentionally a no-op:
