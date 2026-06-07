@@ -129,6 +129,11 @@
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
+%% Method dispatch — exported so eunit suites can drive the RPC layer
+%% end-to-end (e.g. beamchain_getnodeaddresses_tests). Pure dispatch, no
+%% behavioural change.
+-export([handle_method/3]).
+
 -define(SERVER, ?MODULE).
 
 %%% -------------------------------------------------------------------
@@ -4113,13 +4118,18 @@ rpc_getnodeaddresses(Params) ->
                      iolist_to_binary([<<"Network not recognized: ">>, BadNet])};
                 {ok, NetworkFilter} ->
                     Addrs = beamchain_addrman:get_node_addresses(Count, NetworkFilter),
-                    Result = [#{
-                        <<"time">>     => maps:get(time, A),
-                        <<"services">> => maps:get(services, A),
-                        <<"address">>  => maps:get(address, A),
-                        <<"port">>     => maps:get(port, A),
-                        <<"network">>  => maps:get(network, A)
-                    } || A <- Addrs],
+                    %% Each object is an ORDERED proplist (not a map): jsx
+                    %% preserves proplist order but alphabetises map keys, so a
+                    %% map would emit address/network/port/services/time instead
+                    %% of Core's pushKV order. Core net.cpp:949-963 emits exactly
+                    %% time, services, address, port, network.
+                    Result = [[
+                        {<<"time">>,     maps:get(time, A)},
+                        {<<"services">>, maps:get(services, A)},
+                        {<<"address">>,  maps:get(address, A)},
+                        {<<"port">>,     maps:get(port, A)},
+                        {<<"network">>,  maps:get(network, A)}
+                    ] || A <- Addrs],
                     {ok, Result}
             end
     end.
