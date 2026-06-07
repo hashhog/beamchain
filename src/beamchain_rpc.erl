@@ -757,6 +757,9 @@ handle_method(<<"submitblock">>, P, _W) -> rpc_submitblock(P);
 %% -- UTXO-set scanning (wallet recovery) --
 handle_method(<<"scantxoutset">>, P, _W) -> rpc_scantxoutset(P);
 
+%% -- Block-filter scanning (BIP-157 index) --
+handle_method(<<"scanblocks">>, P, _W) -> rpc_scanblocks(P);
+
 %% -- Generating (regtest only) --
 handle_method(<<"generatetoaddress">>, P, _W) -> rpc_generatetoaddress(P);
 handle_method(<<"generateblock">>, P, _W) -> rpc_generateblock(P);
@@ -3710,6 +3713,202 @@ raw_descriptor_to_script(HexBin) ->
     catch
         _:_ -> {error, <<"Invalid raw scriptPubKey hex in scan object">>}
     end.
+
+%%% ===================================================================
+%%% scanblocks — scan the BIP-157 basic block filter index by script
+%%% ===================================================================
+
+%% scanblocks "action" ( [scanobjects] start_height stop_height "filtertype"
+%%                        options )
+%%
+%% Mirrors Bitcoin Core `rpc/blockchain.cpp::scanblocks`
+%% (bitcoin-core/src/rpc/blockchain.cpp). It drives the EXISTING basic block
+%% filter index (the same index getblockfilter serves) to return every block
+%% in [start_height, stop_height] whose BIP-158 GCS filter MATCHES any of the
+%% scanobjects' scriptPubKeys:
+%%   { from_height, to_height, relevant_blocks:[blockhash...], completed }.
+%%
+%% beamchain runs the scan SYNCHRONOUSLY inside this RPC call (like
+%% scantxoutset), so there is never a background scan in progress:
+%%   action="status" -> JSON null   (Core: "no scan in progress")
+%%   action="abort"  -> false       (Core: reserver free -> nothing to abort)
+%%   action="start"  -> does the real work
+%%   any other       -> error
+%%
+%% CENTRAL CAVEAT: block filters have FALSE POSITIVES (rate ~1/784931), so
+%% relevant_blocks is a SUPERSET — the contract is that a block actually
+%% containing a matched script MUST appear, never that the list is exact.
+%%
+%% Errors (codes are the hard parity requirement):
+%%   unknown action      -> -8  (RPC_INVALID_PARAMETER)
+%%   unknown filtertype  -> -5  (RPC_INVALID_ADDRESS_OR_KEY) "Unknown filtertype"
+%%   index disabled      -> -1  (RPC_MISC_ERROR) "Index is not enabled ..."
+%%   bad start/stop hght -> -1  (RPC_MISC_ERROR) "Invalid start_height" /
+%%                                                "Invalid stop_height"
+rpc_scanblocks([<<"status">> | _]) ->
+    %% Synchronous scans: never one in progress -> JSON null.
+    {ok_raw_json, jsx:encode(null)};
+rpc_scanblocks([<<"abort">> | _]) ->
+    %% No background scan to abort -> false (Core: reserver was free).
+    {ok, false};
+rpc_scanblocks([<<"start">>]) ->
+    %% scanobjects is required for "start".
+    {error, ?RPC_INVALID_PARAMS,
+     <<"scanobjects argument is required for the start action">>};
+rpc_scanblocks([<<"start">>, ScanObjects]) ->
+    rpc_scanblocks([<<"start">>, ScanObjects, null, null, <<"basic">>]);
+rpc_scanblocks([<<"start">>, ScanObjects, StartHeight]) ->
+    rpc_scanblocks([<<"start">>, ScanObjects, StartHeight, null, <<"basic">>]);
+rpc_scanblocks([<<"start">>, ScanObjects, StartHeight, StopHeight]) ->
+    rpc_scanblocks(
+      [<<"start">>, ScanObjects, StartHeight, StopHeight, <<"basic">>]);
+rpc_scanblocks([<<"start">>, ScanObjects, StartHeight, StopHeight, FilterType
+                | _Opts])
+  when is_list(ScanObjects) ->
+    %% (1) filtertype validation FIRST (Core validates BlockFilterTypeByName
+    %% before touching heights). Unknown -> RPC_INVALID_ADDRESS_OR_KEY (-5).
+    case validate_filter_type(FilterType) of
+        {error, FtMsg} ->
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY, FtMsg};
+        {ok, FTName} ->
+            %% (2) Index-enabled gate (Core: GetBlockFilterIndex == nullptr ->
+            %% RPC_MISC_ERROR "Index is not enabled for filtertype <name>").
+            case beamchain_blockfilter_index:is_enabled() of
+                false ->
+                    {error, ?RPC_MISC_ERROR,
+                     iolist_to_binary(
+                       [<<"Index is not enabled for filtertype ">>, FTName])};
+                true ->
+                    do_scanblocks(ScanObjects, StartHeight, StopHeight)
+            end
+    end;
+rpc_scanblocks([<<"start">> | _]) ->
+    %% start with a non-list scanobjects argument.
+    {error, ?RPC_INVALID_PARAMS,
+     <<"scanobjects argument must be an array for the start action">>};
+rpc_scanblocks([Action | _]) when is_binary(Action) ->
+    %% Unknown action. Core throws RPC_INVALID_PARAMETER (-8) here.
+    {error, ?RPC_INVALID_PARAMETER,
+     iolist_to_binary([<<"Invalid action '">>, Action, <<"'">>])};
+rpc_scanblocks(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"scanblocks \"action\" ( [scanobjects,...] start_height stop_height "
+       "\"filtertype\" options )">>}.
+
+%% Resolve the height range, build the needle set, and walk the basic block
+%% filter index over [Start, Stop], collecting every block whose GCS filter
+%% matches any needle. Returns the Core-shape result object.
+do_scanblocks(ScanObjects, StartHeightArg, StopHeightArg) ->
+    %% (3) Height range (Core uses RPC_MISC_ERROR (-1) for bad heights here,
+    %% NOT -8 like scantxoutset). Default start=genesis(0), default stop=tip.
+    Tip = case beamchain_chainstate:get_tip_height() of
+              {ok, H} -> H;
+              not_found -> 0
+          end,
+    Start = case StartHeightArg of
+                null      -> 0;
+                undefined -> 0;
+                S when is_integer(S) -> S;
+                _ -> -1   %% non-integer -> force the invalid-start branch
+            end,
+    case (not is_integer(Start)) orelse Start < 0 orelse Start > Tip of
+        true ->
+            {error, ?RPC_MISC_ERROR, <<"Invalid start_height">>};
+        false ->
+            Stop = case StopHeightArg of
+                       null      -> Tip;
+                       undefined -> Tip;
+                       St when is_integer(St) -> St;
+                       _ -> -1   %% non-integer -> force the invalid-stop branch
+                   end,
+            case (not is_integer(Stop)) orelse Stop < Start orelse Stop > Tip of
+                true ->
+                    {error, ?RPC_MISC_ERROR, <<"Invalid stop_height">>};
+                false ->
+                    %% (4) Build the needle scriptPubKey set (reuse the exact
+                    %% descriptor helper scantxoutset uses; addr()/raw() parity
+                    %% is already proven by the scantxoutset differential).
+                    Network = beamchain_config:network(),
+                    case build_scanblocks_needles(ScanObjects, Network) of
+                        {error, Reason} ->
+                            {error, ?RPC_INVALID_PARAMS, Reason};
+                        {ok, Needles} ->
+                            run_scanblocks(Needles, Start, Stop)
+                    end
+            end
+    end.
+
+%% Collect the distinct scriptPubKey binaries from the scan objects. An empty
+%% needle set is permitted (Core allows zero scanobjects); it simply matches
+%% nothing (empty relevant_blocks).
+build_scanblocks_needles(ScanObjects, Network) ->
+    try
+        Set = lists:foldl(
+                fun(Obj, Acc) ->
+                    case scan_object_to_script(Obj, Network) of
+                        {ok, SPK}  -> sets:add_element(SPK, Acc);
+                        {error, R} -> throw({scan_err, R})
+                    end
+                end, sets:new(), ScanObjects),
+        {ok, sets:to_list(Set)}
+    catch
+        throw:{scan_err, R} -> {error, R}
+    end.
+
+%% Walk [Start, Stop], match each block's GCS filter against the needle set,
+%% and assemble the Core-shape result. The scan is synchronous and never
+%% aborted, so `completed` is always true.
+run_scanblocks(Needles, Start, Stop) ->
+    Relevant = scanblocks_collect(Needles, Start, Stop, []),
+    %% Display order: Core appends matches in ascending height; we built the
+    %% accumulator head-first, so reverse to recover ascending height order.
+    Result = #{
+        <<"from_height">>     => Start,
+        <<"to_height">>       => Stop,
+        <<"relevant_blocks">> => lists:reverse(Relevant),
+        <<"completed">>       => true
+    },
+    {ok, Result}.
+
+%% Iterate heights Start..Stop inclusive, looking up the per-block filter from
+%% the basic block filter index and testing it against every needle via the
+%% same BIP-158 GCS matcher the P2P cfilter path uses. Empty needle set or a
+%% block whose filter is missing (index lagging) simply contributes no match.
+scanblocks_collect(_Needles, H, Stop, Acc) when H > Stop ->
+    Acc;
+scanblocks_collect([], _H, _Stop, Acc) ->
+    %% No needles -> nothing can match; short-circuit the whole range.
+    Acc;
+scanblocks_collect(Needles, H, Stop, Acc) ->
+    Acc2 =
+        case beamchain_blockfilter_index:get_block_hash_by_height(H) of
+            {ok, BlockHash} when byte_size(BlockHash) =:= 32 ->
+                case beamchain_blockfilter_index:get_filter(BlockHash) of
+                    {ok, FilterBytes} ->
+                        case block_filter_matches(BlockHash, FilterBytes,
+                                                  Needles) of
+                            true  -> [hash_to_hex(BlockHash) | Acc];
+                            false -> Acc
+                        end;
+                    not_found ->
+                        %% Index lagging this height: skip (Core's
+                        %% LookupFilterRange would also surface a gap; a missing
+                        %% filter cannot be a true match here).
+                        Acc
+                end;
+            _ ->
+                Acc
+        end,
+    scanblocks_collect(Needles, H + 1, Stop, Acc2).
+
+%% True iff the block's BIP-158 basic filter matches ANY needle scriptPubKey.
+%% The SipHash-2-4 key is derived from the (internal byte order) block hash,
+%% exactly as in beamchain_blockfilter:build_basic_filter_from_elements/2 and
+%% Core's GCSFilter. False positives are possible (and acceptable per the
+%% scanblocks superset contract).
+block_filter_matches(BlockHash, FilterBytes, Needles) ->
+    {K0, K1} = beamchain_blockfilter:siphash_key_from_block_hash(BlockHash),
+    beamchain_blockfilter:gcs_match_any(FilterBytes, Needles, K0, K1).
 
 %%% ===================================================================
 %%% Mempool methods
