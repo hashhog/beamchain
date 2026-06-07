@@ -3572,7 +3572,7 @@ rpc_scantxoutset([<<"start">>, ScanObjects]) when is_list(ScanObjects) ->
     case build_scan_script_set(ScanObjects, Network) of
         {error, Reason} ->
             {error, ?RPC_INVALID_PARAMS, Reason};
-        {ok, ScriptSet} ->
+        {ok, ScriptSet, DescMap} ->
             Matches = beamchain_chainstate:scan_utxos(ScriptSet),
             {TipHeight, BestHash} =
                 case beamchain_chainstate:get_tip() of
@@ -3583,13 +3583,25 @@ rpc_scantxoutset([<<"start">>, ScanObjects]) when is_list(ScanObjects) ->
                 fun({Txid, Vout, #utxo{value = Value, script_pubkey = SPK,
                                        height = CoinHeight,
                                        is_coinbase = CB}}, {Acc, Sum}) ->
+                    %% blockhash: hash of the block at the coin's height, in
+                    %% big-endian DISPLAY hex (Core:
+                    %% tip->GetAncestor(coin.nHeight)->GetBlockHash().GetHex()).
+                    BlockHash =
+                        case beamchain_db:get_block_index(CoinHeight) of
+                            {ok, #{hash := BH}} -> hash_to_hex(BH);
+                            _                   -> hash_to_hex(<<0:256>>)
+                        end,
                     U = #{
-                        <<"txid">>         => hash_to_hex(Txid),
-                        <<"vout">>         => Vout,
-                        <<"scriptPubKey">> => beamchain_serialize:hex_encode(SPK),
-                        <<"amount">>       => format_amount_sentinel(Value),
-                        <<"coinbase">>     => CB,
-                        <<"height">>       => CoinHeight
+                        <<"txid">>          => hash_to_hex(Txid),
+                        <<"vout">>          => Vout,
+                        <<"scriptPubKey">>  => beamchain_serialize:hex_encode(SPK),
+                        <<"desc">>          => maps:get(SPK, DescMap, <<>>),
+                        <<"amount">>        => format_amount_sentinel(Value),
+                        <<"coinbase">>      => CB,
+                        <<"height">>        => CoinHeight,
+                        <<"blockhash">>     => BlockHash,
+                        %% Core: tip->nHeight - coin.nHeight + 1.
+                        <<"confirmations">> => TipHeight - CoinHeight + 1
                     },
                     {[U | Acc], Sum + Value}
                 end, {[], 0}, Matches),
@@ -3616,20 +3628,35 @@ rpc_scantxoutset(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"scantxoutset \"action\" ( [scanobjects,...] )">>}.
 
-%% Build a sets:set/0 of raw scriptPubKey binaries from the scan objects.
+%% Build a sets:set/0 of raw scriptPubKey binaries from the scan objects,
+%% together with a #{SPK => DescriptorString} map so each matched unspent can
+%% report the descriptor that produced it (mirrors Core's
+%% `descriptors[txo.scriptPubKey]`, rpc/blockchain.cpp scantxoutset).
 build_scan_script_set(ScanObjects, Network) ->
     try
-        Set = lists:foldl(
-            fun(Obj, Acc) ->
+        {Set, DescMap} = lists:foldl(
+            fun(Obj, {Acc, DAcc}) ->
                 case scan_object_to_script(Obj, Network) of
-                    {ok, SPK} -> sets:add_element(SPK, Acc);
+                    {ok, SPK} ->
+                        {sets:add_element(SPK, Acc),
+                         maps:put(SPK, scan_object_descriptor(Obj), DAcc)};
                     {error, R} -> throw({scan_err, R})
                 end
-            end, sets:new(), ScanObjects),
-        {ok, Set}
+            end, {sets:new(), #{}}, ScanObjects),
+        {ok, Set, DescMap}
     catch
         throw:{scan_err, R} -> {error, R}
     end.
+
+%% Canonical descriptor string for a scan object, with any "#checksum" suffix
+%% stripped (Core normalizes the inferred descriptor the same way).
+scan_object_descriptor(Obj) when is_map(Obj) ->
+    case maps:get(<<"desc">>, Obj, undefined) of
+        undefined -> <<>>;
+        Desc      -> scan_object_descriptor(Desc)
+    end;
+scan_object_descriptor(Obj) when is_binary(Obj) ->
+    hd(binary:split(Obj, [<<"#">>])).
 
 %% A scan object may be given as a plain string or as a JSON object
 %% {"desc": "...", "range": N}. We accept both and reduce to a descriptor
