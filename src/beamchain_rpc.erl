@@ -134,6 +134,12 @@
 %% behavioural change.
 -export([handle_method/3]).
 
+%% Pure result-shape builder for getchaintxstats — exported so the eunit suite
+%% (beamchain_getchaintxstats_tests) can assert the encoded key BYTE ORDER
+%% without standing up a full chainstate. Builds an ordered proplist in Core's
+%% pushKV order; no DB access, no behavioural change.
+-export([chaintxstats_proplist/7]).
+
 -define(SERVER, ?MODULE).
 
 %%% -------------------------------------------------------------------
@@ -2399,48 +2405,68 @@ format_chaintxstats(BlockHash, Height, Header, StartHeight, _StartHeader, NBlock
     TxCount = get_cumulative_txcount_for_height(Height),
     StartTxCount = get_cumulative_txcount_for_height(StartHeight),
 
-    Result = #{
-        <<"time">> => Header#block_header.timestamp,
-        <<"window_final_block_hash">> => hash_to_hex(BlockHash),
-        <<"window_final_block_height">> => Height,
-        <<"window_block_count">> => NBlocks
-    },
+    Result = chaintxstats_proplist(Header#block_header.timestamp,
+                                   TxCount,
+                                   hash_to_hex(BlockHash),
+                                   Height,
+                                   NBlocks,
+                                   TimeDiff,
+                                   StartTxCount),
 
-    %% Add txcount if known
-    Result2 = case TxCount of
-        undefined -> Result;
-        _ -> Result#{<<"txcount">> => TxCount}
+    {ok, Result}.
+
+%% Build the getchaintxstats result as an ORDERED proplist (not a map): jsx
+%% preserves proplist order but alphabetises map keys, so a map would emit
+%% keys alphabetically (time, txcount, window_block_count, ...) instead of
+%% Core's pushKV order. Mirrors the getnodeaddresses fix (commit a67f827).
+%%
+%% Core order (rpc/blockchain.cpp getchaintxstats, ret.pushKV calls):
+%%   time, [txcount], window_final_block_hash, window_final_block_height,
+%%   window_block_count, [window_interval], [window_tx_count], [txrate]
+%%
+%% Presence conditions (preserved verbatim, order-only fix — NOT presence
+%% semantics): txcount only if TxCount =/= undefined; window_interval only if
+%% NBlocks > 0; window_tx_count only if both endpoints =/= undefined AND both
+%% =/= 0; txrate only if TimeDiff > 0. Exported so the eunit suite can assert
+%% the encoded byte order without a full chainstate.
+chaintxstats_proplist(TS, TxCount, BlockHashHex, Height, NBlocks, TimeDiff,
+                      StartTxCount) ->
+    TxCountKV = case TxCount of
+        undefined -> [];
+        _ -> [{<<"txcount">>, TxCount}]
     end,
-
+    Base = [{<<"time">>, TS}]
+           ++ TxCountKV
+           ++ [{<<"window_final_block_hash">>, BlockHashHex},
+               {<<"window_final_block_height">>, Height},
+               {<<"window_block_count">>, NBlocks}],
     %% Add window stats if nblocks > 0
-    Result3 = case NBlocks > 0 of
+    case NBlocks > 0 of
         true ->
-            R = Result2#{<<"window_interval">> => TimeDiff},
-            %% window_tx_count + txrate emit conditions mirror Core exactly
-            %% (rpc/blockchain.cpp getchaintxstats): BOTH endpoints' cumulative
-            %% counts must be non-zero (Core: m_chain_tx_count != 0 for pindex
-            %% AND past_block), and txrate is only emitted when window_interval
-            %% (nTimeDiff) is strictly > 0.
-            case {TxCount, StartTxCount} of
-                {undefined, _} -> R;
-                {_, undefined} -> R;
-                {End, Start} when End =/= 0, Start =/= 0 ->
-                    WindowTxCount = End - Start,
-                    R2 = R#{<<"window_tx_count">> => WindowTxCount},
-                    case TimeDiff > 0 of
-                        true ->
-                            TxRate = WindowTxCount / TimeDiff,
-                            R2#{<<"txrate">> => TxRate};
-                        false ->
-                            R2
-                    end;
-                _ -> R
-            end;
+            WindowKVs = chaintxstats_window_kvs(TxCount, StartTxCount, TimeDiff),
+            Base ++ [{<<"window_interval">>, TimeDiff}] ++ WindowKVs;
         false ->
-            Result2
-    end,
+            Base
+    end.
 
-    {ok, Result3}.
+%% window_tx_count + txrate KVs, in Core order (window_tx_count BEFORE txrate).
+%% window_tx_count + txrate emit conditions mirror Core exactly
+%% (rpc/blockchain.cpp getchaintxstats): BOTH endpoints' cumulative counts must
+%% be non-zero (Core: m_chain_tx_count != 0 for pindex AND past_block), and
+%% txrate is only emitted when window_interval (nTimeDiff) is strictly > 0.
+chaintxstats_window_kvs(undefined, _StartTxCount, _TimeDiff) -> [];
+chaintxstats_window_kvs(_TxCount, undefined, _TimeDiff) -> [];
+chaintxstats_window_kvs(End, Start, TimeDiff)
+  when End =/= 0, Start =/= 0 ->
+    WindowTxCount = End - Start,
+    case TimeDiff > 0 of
+        true ->
+            TxRate = WindowTxCount / TimeDiff,
+            [{<<"window_tx_count">>, WindowTxCount}, {<<"txrate">>, TxRate}];
+        false ->
+            [{<<"window_tx_count">>, WindowTxCount}]
+    end;
+chaintxstats_window_kvs(_End, _Start, _TimeDiff) -> [].
 
 %% Get cumulative tx count for a height (estimate if not stored)
 get_cumulative_txcount_for_height(Height) ->
