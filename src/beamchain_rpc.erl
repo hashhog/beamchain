@@ -62,6 +62,8 @@
 -export([confirmations/1, confirmations/2, is_block_in_active_chain/1]).
 %% Test-only exports — submitpackage helpers (mempool wave 2026-05-06).
 -export([rpc_submitpackage/1, decode_package_tx/1]).
+%% Test-only export — getorphantxs handler (Core v28 RPC-completeness gap).
+-export([rpc_getorphantxs/1]).
 %% Test-only exports — wallet wave (lockunspent + analyzepsbt + walletcreatefundedpsbt).
 -export([rpc_analyzepsbt/1, rpc_lockunspent/2, rpc_listlockunspent/1,
          rpc_walletcreatefundedpsbt/2,
@@ -719,6 +721,7 @@ handle_method(<<"getrawmempool">>, P, _W) -> rpc_getrawmempool(P);
 handle_method(<<"getmempoolentry">>, P, _W) -> rpc_getmempoolentry(P);
 handle_method(<<"getmempoolancestors">>, P, _W) -> rpc_getmempoolancestors(P);
 handle_method(<<"getmempooldescendants">>, P, _W) -> rpc_getmempooldescendants(P);
+handle_method(<<"getorphantxs">>, P, _W) -> rpc_getorphantxs(P);
 handle_method(<<"savemempool">>, _, _W) -> rpc_dumpmempool();
 handle_method(<<"dumpmempool">>, _, _W) -> rpc_dumpmempool();
 handle_method(<<"loadmempool">>, _, _W) -> rpc_loadmempool();
@@ -872,6 +875,7 @@ rpc_help_list() ->
         <<"getmempooldescendants \"txid\" ( verbose )">>,
         <<"getmempoolentry \"txid\"">>,
         <<"getmempoolinfo">>,
+        <<"getorphantxs ( verbosity )">>,
         <<"getrawmempool ( verbose )">>,
         <<"loadmempool">>,
         <<"savemempool">>,
@@ -3789,6 +3793,113 @@ rpc_getmempooldescendants([TxidHex, Verbose]) when is_binary(TxidHex) ->
 rpc_getmempooldescendants(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"Usage: getmempooldescendants \"txid\" ( verbose )">>}.
+
+%% getorphantxs ( verbosity ) — show transactions in the tx orphanage.
+%%
+%% Mirrors Bitcoin Core rpc/mempool.cpp::getorphantxs (added in Core v28)
+%% → PeerManager::GetOrphanTransactions() →
+%%   node/txorphanage.cpp::GetOrphanTransactions / OrphanToJSON.
+%%
+%% verbosity:
+%%   0 (default) — JSON array of orphan txid hex strings. (Core v0 pushes
+%%                 orphan.tx->GetHash() = the non-witness txid; the RPCResult
+%%                 doc labels it "txid". We emit the same.)
+%%   1           — array of objects {txid, wtxid, bytes, vsize, weight, from}.
+%%   2           — verbosity-1 objects PLUS "hex" (serialized tx hex).
+%% Anything outside 0..2 → RPC_INVALID_PARAMETER (-8), matching Core's
+%%   `JSONRPCError(RPC_INVALID_PARAMETER, "Invalid verbosity value " + N)`.
+%%
+%% Field shape exactly mirrors Core's OrphanDescription()/OrphanToJSON():
+%%   txid   — orphan tx hash (display-order hex)
+%%   wtxid  — orphan witness hash (display-order hex)
+%%   bytes  — total serialized size (Core ComputeTotalSize → with witness)
+%%   vsize  — BIP-141 virtual size
+%%   weight — BIP-141 weight
+%%   from   — array of announcing peer ids (Core's `announcers`)
+%%
+%% NOTE: this Core source (txorphanage.h OrphanInfo / OrphanToJSON) does NOT
+%% emit an "expiration" field — it was never part of the merged getorphantxs.
+%% We mirror Core exactly and omit it. (The orphan record DOES carry an
+%% Expiry; see get_all_orphans/0 — it is just not part of Core's RPC shape.)
+rpc_getorphantxs([]) ->
+    rpc_getorphantxs([0]);
+rpc_getorphantxs([Verbosity]) ->
+    case parse_orphan_verbosity(Verbosity) of
+        {ok, V} ->
+            Orphans = beamchain_mempool:get_all_orphans(),
+            {ok, [format_orphan(V, O) || O <- Orphans]};
+        {error, Bad} ->
+            {error, ?RPC_INVALID_PARAMETER,
+             iolist_to_binary([<<"Invalid verbosity value ">>,
+                               integer_to_binary(Bad)])}
+    end;
+rpc_getorphantxs(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: getorphantxs ( verbosity )">>}.
+
+%% Parse the getorphantxs verbosity arg. Core uses ParseVerbosity with
+%% allow_bool=false and default 0, supporting integers 0, 1, 2 only.
+%% An integer outside 0..2 is reported back so the caller can echo it in
+%% the RPC_INVALID_PARAMETER message exactly like Core. Non-integers fall
+%% through to the RPC_INVALID_PARAMS usage error via the [Verbosity] clause
+%% returning {error, _} only for in-range-type-but-out-of-range integers;
+%% a non-integer arg is treated as an invalid verbosity value too.
+parse_orphan_verbosity(V) when is_integer(V), V >= 0, V =< 2 -> {ok, V};
+parse_orphan_verbosity(V) when is_integer(V) -> {error, V};
+%% null (omitted positional) behaves as the default.
+parse_orphan_verbosity(null) -> {ok, 0};
+%% Floats with integral value (jsx may decode "1" args as integers, but be
+%% defensive about "1.0"): accept integral floats in range, else invalid.
+parse_orphan_verbosity(V) when is_float(V) ->
+    case V == trunc(V) of
+        true -> parse_orphan_verbosity(trunc(V));
+        false -> {error, trunc(V)}
+    end;
+%% Any other type (bool, binary string, etc.) is not a valid verbosity.
+%% Core rejects bools (allow_bool=false); use -1 as the echoed sentinel so
+%% the message is well-formed.
+parse_orphan_verbosity(_) -> {error, -1}.
+
+%% Build the per-orphan JSON object for the requested verbosity. O is the
+%% raw record from get_all_orphans/0: {Wtxid, Tx, Expiry, Announcers, Weight}.
+%% At verbosity 0 Core pushes orphan.tx->GetHash() = the (non-witness) txid
+%% (its RPCResult labels the array element "txid"). Match Core precisely.
+format_orphan(0, {_Wtxid, Tx, _Expiry, _Announcers, _Weight}) ->
+    %% Core v0: ret.push_back(orphan.tx->GetHash().ToString()) — GetHash()
+    %% is the (non-witness) txid. Emit the txid hex to match Core exactly.
+    hash_to_hex(beamchain_serialize:tx_hash(Tx));
+format_orphan(1, Orphan) ->
+    orphan_to_json(Orphan);
+format_orphan(2, {_Wtxid, Tx, _Expiry, _Announcers, _Weight} = Orphan) ->
+    Base = orphan_to_json(Orphan),
+    Hex = beamchain_serialize:hex_encode(
+            beamchain_serialize:encode_transaction(Tx)),
+    Base#{<<"hex">> => Hex}.
+
+%% orphan_to_json/1 — verbosity-1 object. Mirrors Core OrphanToJSON():
+%%   txid/wtxid (display-order hex), bytes (total serialized size),
+%%   vsize (BIP-141), weight (BIP-141), from (announcer peer-id array).
+orphan_to_json({_Wtxid, Tx, _Expiry, Announcers, _Weight}) ->
+    Txid  = beamchain_serialize:tx_hash(Tx),
+    Wtxid = beamchain_serialize:wtx_hash(Tx),
+    %% "bytes" = Core ComputeTotalSize() = full serialized (with witness) size.
+    Bytes = byte_size(beamchain_serialize:encode_transaction(Tx)),
+    #{
+        <<"txid">>   => hash_to_hex(Txid),
+        <<"wtxid">>  => hash_to_hex(Wtxid),
+        <<"bytes">>  => Bytes,
+        <<"vsize">>  => beamchain_serialize:tx_vsize(Tx),
+        <<"weight">> => beamchain_serialize:tx_weight(Tx),
+        <<"from">>   => [orphan_peer_id(P) || P <- ordsets:to_list(Announcers)]
+    }.
+
+%% Map an internal announcer term to a Core-style numeric peer id for the
+%% "from" array. Core emits NodeId integers; beamchain's announcer terms are
+%% arbitrary (a peer pid/identifier, or the ?ORPHAN_LOCAL_PEER sentinel for
+%% RPC/mempool.dat-sourced orphans). erlang:phash2/1 gives a stable
+%% non-negative integer per term so the array stays homogeneous + numeric
+%% like Core. See from_peer_source in the change notes for the caveat.
+orphan_peer_id(Peer) -> erlang:phash2(Peer).
 
 %% Persist mempool to <datadir>/mempool.dat (Bitcoin Core compatible).
 rpc_dumpmempool() ->

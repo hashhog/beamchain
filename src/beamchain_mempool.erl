@@ -25,6 +25,7 @@
 %% Queries
 -export([has_tx/1, get_tx/1, get_entry/1, get_wtxid/1]).
 -export([get_all_txids/0, get_all_entries/0, get_all_id_pairs/0, get_info/0]).
+-export([get_all_orphans/0]).
 -export([get_sorted_by_fee/0]).
 -export([get_tx_fee_rate/1]).
 -export([get_ancestors/1, get_descendants/1]).
@@ -348,6 +349,25 @@ get_all_entries() ->
 get_all_id_pairs() ->
     [{E#mempool_entry.txid, E#mempool_entry.wtxid}
      || {_Txid, E} <- ets:tab2list(?MEMPOOL_TXS)].
+
+%% @doc Get all orphan-pool entries (BIP-339 wtxid-keyed). Returns the raw
+%% records as stored by insert_orphan_entry/6:
+%%   {Wtxid, Tx, Expiry, Announcers, Weight}
+%% where Wtxid is the witness txid (internal byte order), Tx is the decoded
+%% #transaction{}, Expiry is the unix second at which the orphan is dropped
+%% (add-time + ?ORPHAN_TX_EXPIRE_TIME), Announcers is an ordsets:ordset() of
+%% the peer ids that announced the orphan (Core's std::set<NodeId> announcers,
+%% W126), and Weight is the cached BIP-141 tx weight.
+%%
+%% Mirrors the read-only ETS-scan style of get_all_entries/0 / get_all_txids/0
+%% (no gen_server round-trip — ?MEMPOOL_ORPHANS is a public named_table).
+%% Consumed by the getorphantxs RPC (Core rpc/mempool.cpp::getorphantxs →
+%% PeerManager::GetOrphanTransactions, added in Core v28).
+-spec get_all_orphans() ->
+    [{binary(), #transaction{}, non_neg_integer(),
+      ordsets:ordset(term()), non_neg_integer()}].
+get_all_orphans() ->
+    ets:tab2list(?MEMPOOL_ORPHANS).
 
 %% @doc Get mempool summary info.
 -spec get_info() -> map().
