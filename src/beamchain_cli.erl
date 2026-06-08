@@ -266,6 +266,19 @@ parse_args(["--cfilter", Value | Rest], Cmd, Opts) ->
 parse_args(["--cfilter=" ++ Value | Rest], Cmd, Opts) ->
     parse_args(Rest, Cmd, Opts#{cfilter => parse_cfilter_arg(Value)});
 
+%% --coinstatsindex[=0|1]: enable the persistent coinstatsindex (default
+%% off, matching Core -coinstatsindex). Bare --coinstatsindex == on.
+parse_args(["--coinstatsindex", "0" | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{coinstatsindex => 0});
+parse_args(["--coinstatsindex", "1" | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{coinstatsindex => 1});
+parse_args(["--coinstatsindex" | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{coinstatsindex => 1});
+parse_args(["--coinstatsindex=0" | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{coinstatsindex => 0});
+parse_args(["--coinstatsindex=1" | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{coinstatsindex => 1});
+
 %% Commands
 parse_args(["start" | Rest], undefined, Opts) ->
     parse_args(Rest, start, Opts);
@@ -337,6 +350,9 @@ print_usage() ->
         "                    Bitcoin Core's `dumptxoutset`); alias --load-snapshot~n"
         "  --cfilter=<n>     BIP-157/158 compact block filter index~n"
         "                    (0=off, 1=basic; mirrors Core -blockfilterindex)~n"
+        "  --coinstatsindex[=n] per-height UTXO-set commitment index for~n"
+        "                    gettxoutsetinfo at historical heights~n"
+        "                    (0=off default, 1=on; mirrors Core -coinstatsindex)~n"
         "  --listenonion=<n> 1 = register v3 hidden service via Tor control~n"
         "                    port (default 0; mirrors Core -listenonion)~n"
         "  --torcontrol=h:p  Tor control-port address~n"
@@ -811,6 +827,15 @@ apply_opts(Opts) ->
             io:format(standard_error,
                       "warning: --cfilter=~p ignored (only 0 or 1 supported)~n",
                       [Other])
+    end,
+    %% --coinstatsindex: route through BEAMCHAIN_COINSTATSINDEX so the
+    %% coinstatsindex_enabled/0 gate picks it up before init_table/0
+    %% reads ETS (config init runs after apply_opts; the env var is
+    %% checked first by the gate fn).
+    case maps:get(coinstatsindex, Opts, undefined) of
+        undefined -> ok;
+        0 -> os:putenv("BEAMCHAIN_COINSTATSINDEX", "0");
+        1 -> os:putenv("BEAMCHAIN_COINSTATSINDEX", "1")
     end,
     %% --listenonion / --torcontrol / --torpassword: route through the
     %% same BEAMCHAIN_* env vars that beamchain_config consults so the

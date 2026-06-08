@@ -22,6 +22,7 @@
          zmq_enabled/0,
          node_bloom_enabled/0,
          blockfilterindex_enabled/0,
+         coinstatsindex_enabled/0,
          rest_enabled/0,
          %% ASMap
          asmap_path/0,
@@ -257,6 +258,33 @@ blockfilterindex_enabled() ->
                 "1" -> true;
                 "true" -> true;
                 "basic" -> true;
+                1 -> true;
+                true -> true;
+                _ -> false
+            end;
+        _ -> true
+    end.
+
+%% @doc Check if the coinstatsindex is enabled.
+%% Reads from the env var (BEAMCHAIN_COINSTATSINDEX=1) first, then the
+%% config file (coinstatsindex=1). Defaults to false (disabled), matching
+%% Bitcoin Core's DEFAULT_COINSTATSINDEX = false
+%% (index/coinstatsindex.h:25, init.cpp:1919). When enabled, beamchain
+%% maintains a per-height running UTXO-set MuHash3072 commitment + scalar
+%% tallies on every block connect/disconnect, persisted in its own
+%% RocksDB at <datadir>/indexes/coinstats, so gettxoutsetinfo can answer a
+%% historical hash_or_height byte-exactly vs Core. When OFF the index
+%% gen_server stays mounted but inert (no RocksDB, every add/remove a
+%% no-op) so normal validation/sync is unchanged.
+-spec coinstatsindex_enabled() -> boolean().
+coinstatsindex_enabled() ->
+    case os:getenv("BEAMCHAIN_COINSTATSINDEX") of
+        "0" -> false;
+        "false" -> false;
+        false ->
+            case get(coinstatsindex, "0") of
+                "1" -> true;
+                "true" -> true;
                 1 -> true;
                 true -> true;
                 _ -> false
