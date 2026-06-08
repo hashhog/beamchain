@@ -2012,7 +2012,8 @@ rpc_getindexinfo([IndexName]) when is_binary(IndexName) ->
     %% guard order in node.cpp:393-407).
     Summaries =
         index_summary_txindex(ChainTipHeight)
-        ++ index_summary_blockfilter(ChainTipHeight),
+        ++ index_summary_blockfilter(ChainTipHeight)
+        ++ index_summary_coinstats(ChainTipHeight),
     %% Apply the index_name filter (SummaryToJSON:354) and build the
     %% dynamic object as an ordered proplist so jsx preserves both the
     %% per-index key ordering AND the {synced, best_block_height} field
@@ -2057,6 +2058,20 @@ index_summary_blockfilter(ChainTipHeight) ->
                 _ -> 0
             end,
             index_summary_entry(<<"basic block filter index">>,
+                                BestHeight, ChainTipHeight)
+    end.
+
+%% coinstatsindex summary entry, or [] when it is not running.
+%% Name == Core's GetName() "coinstatsindex" (coinstatsindex.cpp:90).
+index_summary_coinstats(ChainTipHeight) ->
+    case beamchain_coinstatsindex:is_enabled() of
+        false -> [];
+        true ->
+            BestHeight = case beamchain_coinstatsindex:tip_height() of
+                N when is_integer(N), N >= 0 -> N;
+                _ -> 0
+            end,
+            index_summary_entry(<<"coinstatsindex">>,
                                 BestHeight, ChainTipHeight)
     end.
 
@@ -3527,14 +3542,122 @@ rpc_gettxoutsetinfo([HashType, HashOrHeight | _]) ->
                 null ->
                     do_rpc_gettxoutsetinfo(HashType);
                 _ when HashType =:= <<"hash_serialized_3">> ->
+                    %% Core rejects hash_serialized_3 + specific block
+                    %% BEFORE the index gate (rpc/blockchain.cpp:1090-1093),
+                    %% regardless of whether coinstatsindex is built.
                     {error, ?RPC_INVALID_PARAMETER,
                      <<"hash_serialized_3 hash type cannot be queried "
                        "for a specific block">>};
                 _ ->
-                    {error, ?RPC_INVALID_PARAMETER,
-                     <<"Querying specific block heights requires "
-                       "coinstatsindex">>}
+                    %% muhash / none + specific block: requires the
+                    %% coinstatsindex (Core rpc/blockchain.cpp:1085-1088).
+                    %% When the index is enabled+running, resolve the target
+                    %% block and answer from the per-height running stats.
+                    case beamchain_coinstatsindex:is_enabled() of
+                        false ->
+                            {error, ?RPC_INVALID_PARAMETER,
+                             <<"Querying specific block heights requires "
+                               "coinstatsindex">>};
+                        true ->
+                            rpc_gettxoutsetinfo_at(HashType, HashOrHeight)
+                    end
             end
+    end.
+
+%% gettxoutsetinfo backed by the coinstatsindex, AS OF a specific block.
+%% HashOrHeight is a height integer or a block-hash hex string. Emits the
+%% Core index-path field shape (rpc/blockchain.cpp:1115-1172): height,
+%% bestblock, txouts, bogosize, [muhash], total_amount,
+%% total_unspendable_amount, block_info — and OMITS transactions/disk_size
+%% (those appear only on the non-index full-scan path, Core:1127-1129).
+rpc_gettxoutsetinfo_at(HashType, HashOrHeight) ->
+    Resolved =
+        case HashOrHeight of
+            H when is_integer(H), H >= 0 ->
+                case beamchain_chainstate:get_tip_height() of
+                    {ok, Tip} when H =< Tip ->
+                        beamchain_coinstatsindex:lookup_by_height(H);
+                    _ ->
+                        out_of_range
+                end;
+            HexHash when is_binary(HexHash) ->
+                case decode_block_hash_param(HexHash) of
+                    {ok, RawHash} ->
+                        beamchain_coinstatsindex:lookup_by_hash(RawHash);
+                    error ->
+                        bad_hash
+                end;
+            _ ->
+                bad_hash
+        end,
+    case Resolved of
+        out_of_range ->
+            {error, ?RPC_INVALID_PARAMETER, <<"Target block height ",
+              "after current tip">>};
+        bad_hash ->
+            {error, ?RPC_INVALID_PARAMETER, <<"Block not found">>};
+        not_found ->
+            %% Index not yet synced to the requested height.
+            {error, ?RPC_INTERNAL_ERROR,
+             <<"Unable to read UTXO set because coinstatsindex is still "
+               "syncing.">>};
+        {ok, Stats} ->
+            {ok_raw_json,
+             replace_btc_sentinels(
+               jsx:encode(coinstatsindex_result(HashType, Stats)))}
+    end.
+
+%% Build the ordered Core-parity result proplist from an index stats map.
+coinstatsindex_result(HashType, Stats) ->
+    #{height := Height, block_hash := BlockHash, txouts := TxOuts,
+      bogosize := Bogo, total_amount := TotalAmount, muhash := MuHashRaw,
+      total_unspendable_amount := TotalUnspendable,
+      block_info := BI} = Stats,
+    CommitFields =
+        case HashType of
+            <<"muhash">> ->
+                [{<<"muhash">>,
+                  beamchain_serialize:hex_encode(
+                    beamchain_serialize:reverse_bytes(MuHashRaw))}];
+            _ ->
+                %% "none": no commitment field (Core:1119/1122 omit it).
+                []
+        end,
+    #{prevout_spent := PvSpent, coinbase := CbAmt,
+      new_outputs_ex_coinbase := NewOut, unspendable := UnspAmt,
+      unspendables := Unsp} = BI,
+    #{genesis_block := UG, bip30 := UB, scripts := US,
+      unclaimed_rewards := UU} = Unsp,
+    BlockInfoObj = [
+        {<<"prevout_spent">>, format_amount_sentinel(PvSpent)},
+        {<<"coinbase">>, format_amount_sentinel(CbAmt)},
+        {<<"new_outputs_ex_coinbase">>, format_amount_sentinel(NewOut)},
+        {<<"unspendable">>, format_amount_sentinel(UnspAmt)},
+        {<<"unspendables">>, [
+            {<<"genesis_block">>, format_amount_sentinel(UG)},
+            {<<"bip30">>, format_amount_sentinel(UB)},
+            {<<"scripts">>, format_amount_sentinel(US)},
+            {<<"unclaimed_rewards">>, format_amount_sentinel(UU)}
+        ]}
+    ],
+    [{<<"height">>, Height},
+     {<<"bestblock">>, hash_to_hex(BlockHash)},
+     {<<"txouts">>, TxOuts},
+     {<<"bogosize">>, Bogo}]
+    ++ CommitFields
+    ++ [{<<"total_amount">>, format_amount_sentinel(TotalAmount)},
+        {<<"total_unspendable_amount">>,
+         format_amount_sentinel(TotalUnspendable)},
+        {<<"block_info">>, BlockInfoObj}].
+
+%% Decode a display-order (big-endian hex) block hash param to the
+%% internal (little-endian) 32-byte hash used as the chainstate key.
+decode_block_hash_param(HexHash) when is_binary(HexHash) ->
+    case (catch beamchain_serialize:hex_decode(HexHash)) of
+        Bin when byte_size(Bin) =:= 32 ->
+            {ok, beamchain_serialize:reverse_bytes(Bin)};
+        _ ->
+            error
     end.
 
 is_valid_utxo_hash_type(<<"none">>)              -> true;

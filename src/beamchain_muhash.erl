@@ -41,6 +41,13 @@
          add/2, remove/2,
          combine/2,
          finalize/1,
+         %% Persistence: round-trip the un-finalized accumulator (num/den)
+         %% to/from a fixed 768-byte blob (two LE384 fields). Required by
+         %% the coinstatsindex to store Core's DBVal{muhash} per height as
+         %% the partial accumulator (so per-height deltas + reorg rollback
+         %% can be reconstructed exactly).
+         serialize/1,
+         deserialize/1,
          %% Lower-level helpers exposed for tests.
          to_num3072/1,
          num3072_to_bytes/1,
@@ -100,6 +107,29 @@ finalize(#muhash{num = N, den = D}) ->
         end,
     Bytes = num3072_to_bytes(Combined),
     crypto:hash(sha256, Bytes).
+
+%%% ===================================================================
+%%% Persistence — un-finalized accumulator (numerator, denominator)
+%%% ===================================================================
+
+%% @doc Serialize the partial accumulator to a fixed 768-byte blob: the
+%% numerator and denominator each as a little-endian 384-byte integer
+%% (mod p, so always < 2^3072). This is the on-disk representation the
+%% coinstatsindex persists per height — Core stores DBVal{muhash} as the
+%% un-finalized accumulator (index/coinstatsindex.cpp) so that per-height
+%% deltas and reorg rollback can be reconstructed exactly, rather than
+%% only the collapsed digest. Both fields are first reduced mod p so the
+%% representation is canonical and round-trips identically.
+-spec serialize(muhash()) -> binary().
+serialize(#muhash{num = N, den = D}) ->
+    <<(num3072_to_bytes(N rem ?P))/binary,
+      (num3072_to_bytes(D rem ?P))/binary>>.
+
+%% @doc Inverse of serialize/1.
+-spec deserialize(binary()) -> muhash().
+deserialize(<<NB:?BYTE_SIZE/binary, DB:?BYTE_SIZE/binary>>) ->
+    #muhash{num = bytes_to_num3072(NB) rem ?P,
+            den = bytes_to_num3072(DB) rem ?P}.
 
 %%% ===================================================================
 %%% ToNum3072: SHA256 -> ChaCha20 keystream(384) -> LE integer
