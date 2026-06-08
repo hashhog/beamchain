@@ -1097,6 +1097,20 @@ do_connect_block_inner(#block{header = Header} = Block,
                 _ = (catch beamchain_blockfilter_index:add_block(
                         Block#block{hash = BlockHash}, Height)),
 
+                %% coinstatsindex: extend the per-height running UTXO-set
+                %% MuHash3072 commitment + scalar tallies (Core CustomAppend).
+                %% Best-effort — failure does not roll back the block.
+                %% Default-off (no-op when the index isn't running). The
+                %% index reads this block's spent prevouts from the on-disk
+                %% undo data (already written by connect_block above), so we
+                %% pass SpentCoins=undefined and let it resolve them. This is
+                %% the single canonical maintenance site (NOT a submitblock
+                %% special-case) and is reused by reorg / invalidateblock /
+                %% reconsiderblock, so the index stays correct across all of
+                %% them — exactly like txindex / blockfilterindex.
+                _ = (catch beamchain_coinstatsindex:add_block(
+                        Block#block{hash = BlockHash}, Height)),
+
                 %% Wallet UTXO ledger: scan the connected block for outputs
                 %% paying wallet addresses (credit) and inputs spending wallet
                 %% coins (debit).  Mirrors Core's CWallet::blockConnected
@@ -1627,6 +1641,16 @@ do_disconnect_block(#state{tip_hash = TipHash, tip_height = TipHeight,
                     %% BIP-157/158: roll back the filter index entry for
                     %% the disconnected block.  Best-effort, default-off.
                     _ = (catch beamchain_blockfilter_index:remove_block(
+                            TipHash, TipHeight)),
+
+                    %% coinstatsindex: roll back the disconnected tip block
+                    %% (Core CustomRemove + RevertBlock). Best-effort,
+                    %% default-off. The index copies the disconnected
+                    %% block's DBVal to its hash index (so a later query by
+                    %% the now-orphan hash still resolves) and rolls its tip
+                    %% back to TipHeight-1, whose stored DBVal is already the
+                    %% correct rolled-back state. No undo data needed here.
+                    _ = (catch beamchain_coinstatsindex:remove_block(
                             TipHash, TipHeight)),
 
                     %% Wallet UTXO ledger: reverse this block's credits so the

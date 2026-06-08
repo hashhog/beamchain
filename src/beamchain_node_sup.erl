@@ -63,6 +63,17 @@ init([]) ->
             true -> [child_spec(beamchain_blockfilter_index, worker)];
             false -> []
         end,
+    %% Optional coinstatsindex (default off, matches Core -coinstatsindex).
+    %% Must be mounted AFTER beamchain_chainstate_sup (which precedes it in
+    %% the rest_for_one child list) so its startup reconcile can read the
+    %% chainstate tip. When disabled the gen_server is NOT started, keeping
+    %% default fleet behaviour identical (no extra RocksDB instance, no
+    %% maintenance overhead on the connect/disconnect path).
+    CoinStatsChildren =
+        case beamchain_config:coinstatsindex_enabled() of
+            true -> [child_spec(beamchain_coinstatsindex, worker)];
+            false -> []
+        end,
     %% Optional Tor control-port client for v3 hidden-service inbound.
     %% Only started when listenonion=1 in beamchain.conf or
     %% BEAMCHAIN_LISTENONION=1 in the environment.  The client connects
@@ -77,7 +88,8 @@ init([]) ->
             false -> []
         end,
     Children = CoreChildren ++ RestChildren ++ ZmqChildren
-               ++ BlockFilterChildren ++ TorControlChildren,
+               ++ BlockFilterChildren ++ CoinStatsChildren
+               ++ TorControlChildren,
     {ok, {SupFlags, Children}}.
 
 child_spec(Module, Type) ->
