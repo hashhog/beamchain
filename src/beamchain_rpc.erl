@@ -60,6 +60,11 @@
 %% Test-only exports — confirmations helpers (Pattern C1 regression tests).
 -ifdef(TEST).
 -export([confirmations/1, confirmations/2, is_block_in_active_chain/1]).
+%% Test-only export — gettxout result builder. Core ALWAYS emits bestblock +
+%% confirmations (rpc/blockchain.cpp gettxout); the regression test asserts the
+%% two formerly-stripped fields are present, in Core's pushKV order, with
+%% confirmations = tip_height - coin_height + 1 (0 for mempool coins).
+-export([format_utxo_result/4]).
 %% Test-only exports — submitpackage helpers (mempool wave 2026-05-06).
 -export([rpc_submitpackage/1, decode_package_tx/1]).
 %% Test-only export — getorphantxs handler (Core v28 RPC-completeness gap).
@@ -3499,13 +3504,14 @@ rpc_gettxout([TxidHex, N, IncludeMempool]) when is_binary(TxidHex),
     end,
     case MempoolResult of
         {ok, #utxo{value = V, script_pubkey = Script}} ->
-            Map = format_utxo_result(V, Script, true),
+            %% Mempool coin: Core reports confirmations = 0 (MEMPOOL_HEIGHT).
+            Map = format_utxo_result(V, Script, true, mempool),
             {ok_raw_json, replace_btc_sentinels(jsx:encode(Map))};
         not_found ->
             case beamchain_chainstate:get_utxo(Txid, N) of
                 {ok, #utxo{value = V, script_pubkey = Script,
-                           is_coinbase = IsCb}} ->
-                    Map = format_utxo_result(V, Script, IsCb),
+                           is_coinbase = IsCb, height = Height}} ->
+                    Map = format_utxo_result(V, Script, IsCb, Height),
                     {ok_raw_json, replace_btc_sentinels(jsx:encode(Map))};
                 not_found ->
                     {ok, null}
@@ -6479,13 +6485,36 @@ block_time(Height) ->
 %% value uses the sentinel pattern so jsx encodes it as a JSON string and
 %% replace_btc_sentinels rewrites it to the exact Core-format decimal.
 %% scriptPubKey uses format_psbt_spk_json so asm + desc are included.
-format_utxo_result(Value, Script, IsCoinbase) ->
+%% gettxout result body, mirroring Core's rpc/blockchain.cpp gettxout pushKV
+%% order: bestblock, confirmations, value, scriptPubKey, coinbase.
+%%
+%% bestblock is the active-chain tip hash (Core: CoinsTip().GetBestBlock(), i.e.
+%% the block the UTXO set is current as of).  confirmations is
+%% tip_height - coin_height + 1 for a confirmed coin, or 0 for a coin only
+%% present in the mempool (Core's MEMPOOL_HEIGHT case).
+%%
+%% A proplist (list of 2-tuples) is used rather than a map so jsx preserves the
+%% Core field order; jsx sorts map keys but encodes a proplist in list order.
+format_utxo_result(Value, Script, IsCoinbase, CoinHeight) ->
     Network = beamchain_config:network(),
-    #{
-        <<"coinbase">>    => IsCoinbase,
-        <<"value">>       => format_amount_sentinel(Value),
-        <<"scriptPubKey">> => format_psbt_spk_json(Script, Network)
-    }.
+    {BestBlock, Confirmations} = case beamchain_chainstate:get_tip() of
+        {ok, {TipHash, TipHeight}} ->
+            Conf = case CoinHeight of
+                mempool -> 0;
+                H when is_integer(H) -> TipHeight - H + 1;
+                _ -> 0
+            end,
+            {hash_to_hex(TipHash), Conf};
+        not_found ->
+            {hash_to_hex(<<0:256>>), 0}
+    end,
+    [
+        {<<"bestblock">>,     BestBlock},
+        {<<"confirmations">>, Confirmations},
+        {<<"value">>,         format_amount_sentinel(Value)},
+        {<<"scriptPubKey">>,  format_psbt_spk_json(Script, Network)},
+        {<<"coinbase">>,      IsCoinbase}
+    ].
 
 %% Format IP:Port as binary string.
 format_addr({A, B, C, D}, Port) ->
