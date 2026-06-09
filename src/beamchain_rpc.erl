@@ -4839,41 +4839,65 @@ rpc_getnodeaddresses(Params) ->
         undefined -> [];
         _ -> [Params]
     end,
-    CountArg = case Args of
-        [C | _] -> C;
-        [] -> 1
-    end,
-    case coerce_int(CountArg) of
-        {error, _} ->
-            {error, ?RPC_TYPE_ERROR, <<"JSON value is not an integer as expected">>};
-        {ok, Count} when Count < 0 ->
-            {error, ?RPC_INVALID_PARAMETER, <<"Address count out of range">>};
-        {ok, Count} ->
-            NetArg = case Args of
-                [_, N | _] -> N;
-                _ -> undefined
-            end,
-            case parse_network_filter(NetArg) of
-                {error, BadNet} ->
-                    {error, ?RPC_INVALID_PARAMETER,
-                     iolist_to_binary([<<"Network not recognized: ">>, BadNet])};
-                {ok, NetworkFilter} ->
-                    Addrs = beamchain_addrman:get_node_addresses(Count, NetworkFilter),
-                    %% Each object is an ORDERED proplist (not a map): jsx
-                    %% preserves proplist order but alphabetises map keys, so a
-                    %% map would emit address/network/port/services/time instead
-                    %% of Core's pushKV order. Core net.cpp:949-963 emits exactly
-                    %% time, services, address, port, network.
-                    Result = [[
-                        {<<"time">>,     maps:get(time, A)},
-                        {<<"services">>, maps:get(services, A)},
-                        {<<"address">>,  maps:get(address, A)},
-                        {<<"port">>,     maps:get(port, A)},
-                        {<<"network">>,  maps:get(network, A)}
-                    ] || A <- Addrs],
-                    {ok, Result}
+    %% Core rpc/net.cpp:946:
+    %%   const int count{request.params[0].isNull() ? 1 : request.params[0].getInt<int>()};
+    %% An ABSENT or explicit JSON-null count both mean "default 1" (isNull()).
+    %% Otherwise getInt<int>() applies: checkType(VNUM) then std::from_chars on
+    %% the raw JSON token into an integral type. A float-literal token (e.g.
+    %% "1.0" or "1.5") leaves a non-matching '.' so from_chars fails and getInt
+    %% throws std::runtime_error("JSON integer out of range") -> RPC_MISC_ERROR
+    %% (univalue.h:140-150, rpc/server.cpp:514-515). jsx decodes JSON null as the
+    %% atom `null` and any float-literal number as an Erlang float, so reject
+    %% every float here (integral-valued 1.0 included) to match Core exactly.
+    case resolve_count(Args) of
+        not_integer ->
+            {error, ?RPC_MISC_ERROR, <<"JSON integer out of range">>};
+        {ok, CountArg} ->
+            case coerce_int(CountArg) of
+                {error, _} ->
+                    {error, ?RPC_TYPE_ERROR, <<"JSON value is not an integer as expected">>};
+                {ok, Count} when Count < 0 ->
+                    {error, ?RPC_INVALID_PARAMETER, <<"Address count out of range">>};
+                {ok, Count} ->
+                    NetArg = case Args of
+                        [_, N | _] -> N;
+                        _ -> undefined
+                    end,
+                    case parse_network_filter(NetArg) of
+                        {error, BadNet} ->
+                            {error, ?RPC_INVALID_PARAMETER,
+                             iolist_to_binary([<<"Network not recognized: ">>, BadNet])};
+                        {ok, NetworkFilter} ->
+                            Addrs = beamchain_addrman:get_node_addresses(Count, NetworkFilter),
+                            %% Each object is an ORDERED proplist (not a map): jsx
+                            %% preserves proplist order but alphabetises map keys, so a
+                            %% map would emit address/network/port/services/time instead
+                            %% of Core's pushKV order. Core net.cpp:949-963 emits exactly
+                            %% time, services, address, port, network.
+                            Result = [[
+                                {<<"time">>,     maps:get(time, A)},
+                                {<<"services">>, maps:get(services, A)},
+                                {<<"address">>,  maps:get(address, A)},
+                                {<<"port">>,     maps:get(port, A)},
+                                {<<"network">>,  maps:get(network, A)}
+                            ] || A <- Addrs],
+                            {ok, Result}
+                    end
             end
     end.
+
+%% Resolve the optional positional `count` arg for getnodeaddresses, matching
+%% Core's `request.params[0].isNull() ? 1 : params[0].getInt<int>()`:
+%%   * absent OR explicit JSON null (jsx atom `null`) => default 1 ({ok, 1});
+%%   * a float-literal JSON number (jsx Erlang float, e.g. 1.0 / 1.5) => Core's
+%%     getInt<int> from_chars failure (`not_integer` -> RPC_MISC_ERROR);
+%%   * anything else (integer / string / etc.) passes through unchanged to the
+%%     existing coerce_int path so the integer-accept and wrong-type (-3) cases
+%%     stay byte-identical to before.
+resolve_count([]) -> {ok, 1};
+resolve_count([null | _]) -> {ok, 1};
+resolve_count([C | _]) when is_float(C) -> not_integer;
+resolve_count([C | _]) -> {ok, C}.
 
 %% Parse the optional network filter (ParseNetwork, netbase.cpp:100-112).
 %% undefined/null/empty => no filter (`all`). Otherwise lowercase and accept
