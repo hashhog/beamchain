@@ -64,6 +64,10 @@
 -export([rpc_submitpackage/1, decode_package_tx/1]).
 %% Test-only export — getorphantxs handler (Core v28 RPC-completeness gap).
 -export([rpc_getorphantxs/1]).
+%% Test-only exports — getblockfrompeer handler + peer-id reverse lookup
+%% (Core RPC-completeness gap). The eunit suite drives the handler directly
+%% and asserts the peer-id->pid resolution matches getpeerinfo's convention.
+-export([rpc_getblockfrompeer/1, find_peer_pid_by_id/1]).
 %% Test-only exports — wallet wave (lockunspent + analyzepsbt + walletcreatefundedpsbt).
 -export([rpc_analyzepsbt/1, rpc_lockunspent/2, rpc_listlockunspent/1,
          rpc_walletcreatefundedpsbt/2,
@@ -754,6 +758,7 @@ handle_method(<<"loadmempool">>, _, _W) -> rpc_loadmempool();
 handle_method(<<"getnetworkinfo">>, _, _W) -> rpc_getnetworkinfo();
 handle_method(<<"getpeerinfo">>, _, _W) -> rpc_getpeerinfo();
 handle_method(<<"getconnectioncount">>, _, _W) -> rpc_getconnectioncount();
+handle_method(<<"getblockfrompeer">>, P, _W) -> rpc_getblockfrompeer(P);
 handle_method(<<"getnodeaddresses">>, P, _W) -> rpc_getnodeaddresses(P);
 handle_method(<<"addpeeraddress">>, P, _W) -> rpc_addpeeraddress(P);
 handle_method(<<"addnode">>, P, _W) -> rpc_addnode(P);
@@ -4732,6 +4737,80 @@ peerinfo_obj_proplist(F) ->
 
 rpc_getconnectioncount() ->
     {ok, beamchain_peer_manager:peer_count()}.
+
+%% getblockfrompeer "blockhash" peer_id
+%%
+%% Attempt to fetch a block from a specific connected peer. Mirrors Bitcoin
+%% Core rpc/blockchain.cpp::getblockfrompeer +
+%% net_processing.cpp::PeerManagerImpl::FetchBlock:
+%%
+%%   1. The block's HEADER must already be known (e.g. via header sync /
+%%      submitheader). Unknown header  -> RPC_MISC_ERROR (-1) "Block header
+%%      missing"  (blockchain.cpp:547).
+%%   2. If the block BODY is already stored locally, short-circuit with
+%%      RPC_MISC_ERROR (-1) "Block already downloaded" (blockchain.cpp:558).
+%%   3. Resolve peer_id to a CONNECTED peer. The peer_id uses the SAME
+%%      convention getpeerinfo emits: erlang:phash2({IP, Port}). A peer_id
+%%      that matches no connected peer -> RPC_MISC_ERROR (-1) "Peer does not
+%%      exist"  (net_processing.cpp:1966).
+%%   4. On success, send a block getdata (MSG_BLOCK | MSG_WITNESS_FLAG = the
+%%      witness-block inv, i.e. ?MSG_WITNESS_BLOCK 0x40000002) for the hash to
+%%      THAT peer and return {} (an empty JSON object) — fire-and-forget; the
+%%      block arrives asynchronously over P2P.
+rpc_getblockfrompeer([HashHex, PeerId]) when is_binary(HashHex),
+                                             is_integer(PeerId) ->
+    Hash = hex_to_internal_hash(HashHex),
+    %% (1) Header must be known. get_block_index_by_hash returns {ok, _} for
+    %%     any block whose header we have (header-sync or full), not_found
+    %%     otherwise — exactly Core's LookupBlockIndex semantics.
+    case beamchain_db:get_block_index_by_hash(Hash) of
+        not_found ->
+            {error, ?RPC_MISC_ERROR, <<"Block header missing">>};
+        {ok, _Index} ->
+            %% (2) Body already on disk -> nothing to fetch.
+            case beamchain_db:has_block(Hash) of
+                true ->
+                    {error, ?RPC_MISC_ERROR, <<"Block already downloaded">>};
+                false ->
+                    %% (3) Resolve peer_id -> connected peer pid.
+                    case find_peer_pid_by_id(PeerId) of
+                        {ok, Pid} ->
+                            %% (4) Fire the witness-block getdata at that peer.
+                            Inv = #{type => ?MSG_WITNESS_BLOCK, hash => Hash},
+                            beamchain_peer:send_message(
+                                Pid, {getdata, #{items => [Inv]}}),
+                            %% jsx encodes the empty proplist [{}] as the JSON
+                            %% object {} — Core returns UniValue::VOBJ here.
+                            {ok, [{}]};
+                        not_found ->
+                            {error, ?RPC_MISC_ERROR, <<"Peer does not exist">>}
+                    end
+            end
+    end;
+rpc_getblockfrompeer([HashHex, PeerId]) when is_binary(HashHex),
+                                             not is_integer(PeerId) ->
+    {error, ?RPC_TYPE_ERROR, <<"JSON value of type not integer is not of expected type number">>};
+rpc_getblockfrompeer(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: getblockfrompeer \"blockhash\" peer_id">>}.
+
+%% Resolve a getpeerinfo-style peer id to the peer's gen_statem pid.
+%% getpeerinfo emits id = erlang:phash2({IP, Port}) for each entry returned by
+%% beamchain_peer_manager:get_peers/0; we apply the inverse here so the
+%% peer_id an operator passes to getblockfrompeer matches what they saw in
+%% getpeerinfo. Only CONNECTED peers (handshake complete) are eligible — a
+%% disconnected / unknown id resolves to not_found ("Peer does not exist").
+-spec find_peer_pid_by_id(integer()) -> {ok, pid()} | not_found.
+find_peer_pid_by_id(PeerId) ->
+    Peers = beamchain_peer_manager:get_peers(),
+    Match = lists:filter(
+        fun(#{address := Address, connected := Connected}) ->
+            Connected andalso erlang:phash2(Address) =:= PeerId
+        end, Peers),
+    case Match of
+        [#{pid := Pid} | _] -> {ok, Pid};
+        []                  -> not_found
+    end.
 
 %% getnodeaddresses ( count "network" )
 %%
