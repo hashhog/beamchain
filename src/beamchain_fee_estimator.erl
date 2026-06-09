@@ -16,7 +16,7 @@
 
 %% API
 -export([start_link/0]).
--export([track_tx/3, process_block/2]).
+-export([track_tx/3, remove_tx/1, process_block/2]).
 -export([estimate_fee/1, estimate_raw_fee/2, get_fee_histogram/0]).
 -export([save_state/0]).
 
@@ -105,6 +105,18 @@ start_link() ->
 -spec track_tx(binary(), float(), integer()) -> ok.
 track_tx(Txid, FeeRate, Height) ->
     gen_server:cast(?SERVER, {track_tx, Txid, FeeRate, Height}).
+
+%% @doc Drop a transaction that left the mempool WITHOUT being mined
+%% (RBF replacement, expiry, size-trim, or block-conflict eviction).
+%% Removes the tracked row and decrements the in-mempool bucket counter
+%% in all three horizons so the bucket's resolved/in-mempool accounting
+%% stays correct (and the row no longer leaks).  No-op if the tx was not
+%% tracked.  Mirrors Bitcoin Core CBlockPolicyEstimator::removeTx (the
+%% non-block, inBlock=false path fired from removeUnchecked for every
+%% non-block MemPoolRemovalReason).
+-spec remove_tx(binary()) -> ok.
+remove_tx(Txid) ->
+    gen_server:cast(?SERVER, {remove_tx, Txid}).
 
 %% @doc Process a newly connected block. Updates confirmation stats
 %% for tracked transactions and applies exponential decay to all horizons.
@@ -214,6 +226,9 @@ handle_call(_Request, _From, State) ->
 handle_cast({track_tx, Txid, FeeRate, Height}, State) ->
     State2 = do_track_tx(Txid, FeeRate, Height, State),
     {noreply, State2};
+handle_cast({remove_tx, Txid}, State) ->
+    State2 = do_remove_tx(Txid, State),
+    {noreply, State2};
 handle_cast({process_block, Height, Txids}, State) ->
     State2 = do_process_block(Height, Txids, State),
     {noreply, State2};
@@ -296,6 +311,37 @@ horizon_add_tx(BucketIdx, #horizon{data = Data} = H) ->
     BD2 = BD#bucket_data{
         total = BD#bucket_data.total + 1.0,
         in_mempool = BD#bucket_data.in_mempool + 1.0
+    },
+    H#horizon{data = maps:put(BucketIdx, BD2, Data)}.
+
+%%% ===================================================================
+%%% Internal: remove transaction (non-block mempool removal)
+%%% ===================================================================
+
+%% Drop a tracked tx that left the mempool without being mined.  Look up
+%% its bucket, delete the ETS row, and decrement the in-mempool counter
+%% in every horizon.  We deliberately do NOT touch `total': mirroring Core
+%% (which leaves the bucket's tracked count and only decrements unconfTxs),
+%% the difference `total - in_mempool' = Resolved then correctly reflects a
+%% tx that left the pool unconfirmed, so the bucket's success rate accounts
+%% for it (Core's failAvg analogue).  No-op when the tx was never tracked.
+do_remove_tx(Txid, #state{short = Short, med = Med, long = Long} = State) ->
+    case ets:lookup(?FEE_EST_TRACKED, Txid) of
+        [{Txid, BucketIdx, _EntryHeight}] ->
+            ets:delete(?FEE_EST_TRACKED, Txid),
+            State#state{
+                short = horizon_remove_tx(BucketIdx, Short),
+                med   = horizon_remove_tx(BucketIdx, Med),
+                long  = horizon_remove_tx(BucketIdx, Long)
+            };
+        [] ->
+            State
+    end.
+
+horizon_remove_tx(BucketIdx, #horizon{data = Data} = H) ->
+    BD = maps:get(BucketIdx, Data, #bucket_data{}),
+    BD2 = BD#bucket_data{
+        in_mempool = max(0.0, BD#bucket_data.in_mempool - 1.0)
     },
     H#horizon{data = maps:put(BucketIdx, BD2, Data)}.
 

@@ -1779,7 +1779,14 @@ do_package_rbf(_TxPairs, TotalFee, TotalVSize, ConflictTxids) ->
 
     %% Evict all conflicting txs + descendants
     lists:foreach(fun(EvictTxid) ->
-        remove_entry(EvictTxid)
+        case remove_entry(EvictTxid) of
+            #mempool_entry{} ->
+                %% Package RBF replacement left these txs unmined — drop
+                %% their fee-estimator rows (Core removeTx, REPLACED).
+                beamchain_fee_estimator:remove_tx(EvictTxid);
+            not_found ->
+                ok
+        end
     end, AllEvictTxids),
 
     logger:debug("mempool: package rbf evicted ~B txs", [length(AllEvictTxids)]),
@@ -2331,7 +2338,11 @@ do_rbf(NewTx, ConflictTxids, SigopCost) ->
     %% Collect vbytes before removal for state update
     EvictedVBytes = lists:foldl(fun(EvictTxid, Acc) ->
         case remove_entry(EvictTxid) of
-            #mempool_entry{vsize = VS} -> Acc + VS;
+            #mempool_entry{vsize = VS} ->
+                %% RBF replacement: tx left the mempool unmined — drop its
+                %% fee-estimator tracking row (Core removeTx, REPLACED).
+                beamchain_fee_estimator:remove_tx(EvictTxid),
+                Acc + VS;
             not_found -> Acc
         end
     end, 0, AllEvictTxids),
@@ -3317,6 +3328,14 @@ remove_entry_with_zmq(Txid, Reason, #state{zmq_seq = ZmqSeq} = State) ->
         #mempool_entry{tx = Tx} = Entry ->
             %% Send ZMQ notification for mempool removal
             beamchain_zmq:notify_transaction(Tx, Reason, ZmqSeq),
+            %% Fee-estimator cleanup: this is a NON-BLOCK removal (expiry,
+            %% size-trim, or block-conflict eviction — every caller of this
+            %% helper passes a non-block reason; the block-confirm path uses
+            %% bare remove_entry/1 and is cleaned up by the estimator's own
+            %% process_block/2).  Drop the tracked row so it does not leak.
+            %% Mirrors Core CBlockPolicyEstimator::removeTx via
+            %% TransactionRemovedFromMempool (inBlock=false).
+            beamchain_fee_estimator:remove_tx(Txid),
             {Entry, State#state{zmq_seq = ZmqSeq + 1}};
         not_found ->
             {not_found, State}
@@ -4117,7 +4136,12 @@ do_truc_sibling_eviction(SiblingTxid, NewTx, NewFee) ->
                     AllEvict = [SiblingTxid | Descendants],
                     EvictedVBytes = lists:foldl(fun(Txid, Acc) ->
                         case remove_entry(Txid) of
-                            #mempool_entry{vsize = VS} -> Acc + VS;
+                            #mempool_entry{vsize = VS} ->
+                                %% TRUC sibling eviction left these txs
+                                %% unmined — drop their fee-estimator rows
+                                %% (Core removeTx, REPLACED).
+                                beamchain_fee_estimator:remove_tx(Txid),
+                                Acc + VS;
                             not_found -> Acc
                         end
                     end, 0, AllEvict),
