@@ -49,6 +49,15 @@
 
 %% Persistence (Bitcoin Core mempool.dat compatible)
 -export([dump_mempool/0, load_mempool/0, get_persistable_entries/0]).
+%% Prioritisetransaction / getprioritisedtransactions
+%% (Bitcoin Core mapDeltas — txmempool.cpp:630-688, rpc/mining.cpp:502-583).
+-export([prioritise_transaction/2, get_prioritised_transactions/0,
+         get_fee_delta/1, get_all_deltas/0, get_modified_fee/1,
+         get_persistable_entries_with_delta/0]).
+%% Internal helpers exported for unit-testing the prioritisation + mining
+%% effect at the ETS level (no gen_server / rocksdb / chainstate needed).
+-export([do_prioritise_transaction/2, do_prioritise_transaction/3,
+         modified_fee_of_entry/1]).
 
 %% UTXO lookups (called externally from validation)
 -export([get_mempool_utxo/2]).
@@ -165,6 +174,12 @@
 -define(ORPHAN_LOCAL_PEER, local).
 -define(MEMPOOL_CLUSTERS, mempool_clusters). %% cluster_id -> cluster_data
 -define(MEMPOOL_EPHEMERAL, mempool_ephemeral). %% {parent_txid, anchor_index} -> child_txid
+%% mapDeltas — txid -> i64 prioritisetransaction fee delta (signed satoshis).
+%% Mirrors Bitcoin Core CTxMemPool::mapDeltas (txmempool.h:299). A txid may
+%% have a delta WITHOUT being in ?MEMPOOL_TXS (pre-prioritised, not yet
+%% admitted), so this is a separate table — never folded into the entry
+%% record (keeps #mempool_entry{} arity stable for the miner's positional copy).
+-define(MEMPOOL_DELTAS, mempool_deltas).     %% txid -> integer() (signed sat)
 
 %%% -------------------------------------------------------------------
 %%% Mempool entry record
@@ -377,17 +392,59 @@ get_info() ->
 %% @doc Get mempool entries sorted by descending fee rate.
 -spec get_sorted_by_fee() -> [#mempool_entry{}].
 get_sorted_by_fee() ->
-    %% ordered_set is ascending by key, so collect and reverse
+    %% ordered_set is ascending by key, so collect and reverse.
+    %% Each returned entry has its prioritisetransaction delta FOLDED into the
+    %% fee/ancestor_fee/fee_rate fields (see apply_delta_to_entry/1) so the
+    %% block-template selection in beamchain_miner — which reads those fields
+    %% via ancestor_fee_rate/1 and the blockMinFeeRate gate — ranks by the
+    %% MODIFIED fee with no miner-side changes. Mirrors Core's mining selection
+    %% over GetModifiedFee.
     collect_by_fee_desc(ets:last(?MEMPOOL_BY_FEE), []).
 
 collect_by_fee_desc('$end_of_table', Acc) ->
     lists:reverse(Acc);
 collect_by_fee_desc({_FeeRate, Txid} = Key, Acc) ->
     Acc2 = case ets:lookup(?MEMPOOL_TXS, Txid) of
-        [{Txid, E}] -> [E | Acc];
+        [{Txid, E}] -> [apply_delta_to_entry(E) | Acc];
         [] -> Acc
     end,
     collect_by_fee_desc(ets:prev(?MEMPOOL_BY_FEE, Key), Acc2).
+
+%% Fold any prioritisetransaction delta into a #mempool_entry{}'s fee-bearing
+%% fields so downstream fee-rate readers (the miner's block-template
+%% selection) see the modified fee. For a single-entry tx (no in-mempool
+%% ancestors) the modified fee also replaces ancestor_fee and the cached
+%% fee_rate. Multi-ancestor entries keep ancestor_fee on the raw basis (the
+%% own-fee slice still reflects the delta) — the cross-ancestor delta fold is
+%% a separate follow-up, matching rustoshi's W106 G8 / FIX-72 note. Returns the
+%% entry unchanged when there is no delta (fast path).
+apply_delta_to_entry(#mempool_entry{txid = Txid, fee = Fee} = E) ->
+    case get_fee_delta(Txid) of
+        0 ->
+            E;
+        _Delta ->
+            ModFee = modified_fee_of_entry(E),
+            VSize = E#mempool_entry.vsize,
+            NewFeeRate = case VSize of
+                0 -> E#mempool_entry.fee_rate;
+                _ -> ModFee / VSize
+            end,
+            case E#mempool_entry.ancestor_count =< 1 of
+                true ->
+                    E#mempool_entry{fee = ModFee,
+                                    ancestor_fee = ModFee,
+                                    fee_rate = NewFeeRate};
+                false ->
+                    %% Has ancestors: shift ancestor_fee by the own-fee delta
+                    %% so the package fee reflects this tx's prioritisation,
+                    %% without attempting full cross-ancestor propagation.
+                    AncFee = E#mempool_entry.ancestor_fee,
+                    NewAncFee = max(0, AncFee + (ModFee - Fee)),
+                    E#mempool_entry{fee = ModFee,
+                                    ancestor_fee = NewAncFee,
+                                    fee_rate = NewFeeRate}
+            end
+    end.
 
 %% @doc Remove confirmed transactions from the mempool (synchronous).
 %%
@@ -459,6 +516,97 @@ get_persistable_entries() ->
     [{E#mempool_entry.tx, E#mempool_entry.time_added}
      || {_Txid, E} <- ets:tab2list(?MEMPOOL_TXS)].
 
+%% @doc Snapshot the mempool as `[{#transaction{}, Time, FeeDelta}]` so the
+%% persist module can write each tx's nFeeDelta (the in-mempool slice of
+%% mapDeltas) into mempool.dat, matching Bitcoin Core's
+%% DumpMempool (node/mempool_persist.cpp) which serializes
+%% `e.GetFee() - e.GetModifiedFee()`'s inverse, i.e. the applied delta.
+-spec get_persistable_entries_with_delta() ->
+    [{#transaction{}, integer(), integer()}].
+get_persistable_entries_with_delta() ->
+    [{E#mempool_entry.tx, E#mempool_entry.time_added,
+      get_fee_delta(Txid)}
+     || {Txid, E} <- ets:tab2list(?MEMPOOL_TXS)].
+
+%%% ===================================================================
+%%% Prioritisetransaction / getprioritisedtransactions (mapDeltas)
+%%% Mirrors Bitcoin Core:
+%%%   CTxMemPool::PrioritiseTransaction      (txmempool.cpp:630-655)
+%%%   CTxMemPool::GetPrioritisedTransactions (txmempool.cpp:673-688)
+%%%   CTxMemPoolEntry::GetModifiedFee        (kernel/mempool_entry.h)
+%%% ===================================================================
+
+%% @doc Stack a prioritisetransaction fee delta onto `Txid` (signed satoshis).
+%% Saturating-additive onto any existing delta; erases the entry on net-zero;
+%% updates the live mining/eviction ordering for an in-mempool tx; persists.
+%% Returns the new cumulative delta. Core: PrioritiseTransaction.
+-spec prioritise_transaction(binary(), integer()) -> integer().
+prioritise_transaction(Txid, FeeDelta) ->
+    gen_server:call(?SERVER, {prioritise_transaction, Txid, FeeDelta}, 30000).
+
+%% @doc Snapshot of every tracked prioritisetransaction delta, with mempool
+%% membership and the modified fee for in-mempool txs. Shape mirrors Core's
+%% `delta_info` vector consumed by the getprioritisedtransactions RPC:
+%%   [{Txid :: binary(), Delta :: integer(),
+%%     InMempool :: boolean(), ModifiedFee :: integer() | undefined}]
+%% ModifiedFee is `undefined` exactly when InMempool is false.
+-spec get_prioritised_transactions() ->
+    [{binary(), integer(), boolean(), integer() | undefined}].
+get_prioritised_transactions() ->
+    [begin
+         case ets:lookup(?MEMPOOL_TXS, Txid) of
+             [{Txid, Entry}] ->
+                 %% RPC display uses the SIGNED modified fee (Core GetModifiedFee,
+                 %% can be negative); selection/eviction keep the floored value.
+                 {Txid, Delta, true, modified_fee_signed_of_entry(Entry)};
+             [] ->
+                 {Txid, Delta, false, undefined}
+         end
+     end
+     || {Txid, Delta} <- ets:tab2list(?MEMPOOL_DELTAS)].
+
+%% @doc Current cumulative prioritise delta for `Txid` (0 if none). Pure ETS
+%% read — safe from any process. Core: ApplyDelta lookup (txmempool.cpp:657).
+-spec get_fee_delta(binary()) -> integer().
+get_fee_delta(Txid) ->
+    case ets:lookup(?MEMPOOL_DELTAS, Txid) of
+        [{Txid, Delta}] -> Delta;
+        [] -> 0
+    end.
+
+%% @doc All `{Txid, Delta}` pairs in mapDeltas (used by the persist module's
+%% deltas trailer). Core: the mapDeltas dump in node/mempool_persist.cpp.
+-spec get_all_deltas() -> [{binary(), integer()}].
+get_all_deltas() ->
+    ets:tab2list(?MEMPOOL_DELTAS).
+
+%% @doc Modified fee of an in-mempool tx by txid (base fee + delta, floored at
+%% 0). Returns not_found if the tx is not in the mempool. Core: GetModifiedFee.
+-spec get_modified_fee(binary()) -> {ok, integer()} | not_found.
+get_modified_fee(Txid) ->
+    case ets:lookup(?MEMPOOL_TXS, Txid) of
+        [{Txid, Entry}] -> {ok, modified_fee_of_entry(Entry)};
+        [] -> not_found
+    end.
+
+%% @doc Modified fee for a #mempool_entry{} = base fee + delta, floored at 0
+%% (Core never lets the modified fee go negative for selection purposes;
+%% GetModifiedFee returns a CAmount that mining/eviction treats as the
+%% effective absolute fee). Pure — reads ?MEMPOOL_DELTAS by the entry's txid.
+-spec modified_fee_of_entry(#mempool_entry{}) -> non_neg_integer().
+modified_fee_of_entry(#mempool_entry{txid = Txid, fee = Fee}) ->
+    Delta = get_fee_delta(Txid),
+    max(0, Fee + Delta).
+
+%% @doc SIGNED modified fee = base fee + delta, NOT floored — Core's
+%% GetModifiedFee/m_modified_fee is a signed CAmount (nFee + nFeeDelta,
+%% txmempool.h:120-128) and that exact value is what getprioritisedtransactions
+%% reports (rpc/mining.cpp:574). Used for the RPC display ONLY; selection +
+%% eviction keep the floored modified_fee_of_entry/1 (rustoshi-parity clamp).
+-spec modified_fee_signed_of_entry(#mempool_entry{}) -> integer().
+modified_fee_signed_of_entry(#mempool_entry{txid = Txid, fee = Fee}) ->
+    Fee + get_fee_delta(Txid).
+
 %% @doc Look up a mempool UTXO (output created by a mempool tx).
 -spec get_mempool_utxo(binary(), non_neg_integer()) ->
     {ok, #utxo{}} | not_found.
@@ -510,6 +658,8 @@ init([]) ->
     ets:new(?MEMPOOL_CLUSTERS, [set, public, named_table,
                                  {read_concurrency, true}]),
     ets:new(?MEMPOOL_EPHEMERAL, [set, public, named_table]),
+    ets:new(?MEMPOOL_DELTAS, [set, public, named_table,
+                              {read_concurrency, true}]),
 
     %% Schedule periodic orphan expiry
     erlang:send_after(60000, self(), expire_orphans),
@@ -620,6 +770,17 @@ handle_call({get_cluster, Txid}, _From, #state{union_find = UF} = State) ->
         false ->
             {reply, not_found, State}
     end;
+
+%% prioritisetransaction — stack a fee delta and, for an in-mempool tx,
+%% refresh its cluster so the new modified fee immediately drives mining
+%% selection (get_sorted_by_fee) AND eviction (cluster fee_rate / tail
+%% linearization). Core: PrioritiseTransaction (txmempool.cpp:630-655).
+handle_call({prioritise_transaction, Txid, FeeDelta}, _From, State) ->
+    {NewDelta, State2} = do_prioritise_transaction({Txid, FeeDelta}, State),
+    {reply, NewDelta, State2};
+
+handle_call(get_prioritised_transactions, _From, State) ->
+    {reply, get_prioritised_transactions(), State};
 
 handle_call(_Request, _From, State) ->
     {reply, {error, not_implemented}, State}.
@@ -3195,9 +3356,13 @@ do_remove_for_block(Txids, State) ->
     Now = erlang:system_time(second),
     State0 = State#state{block_since_bump = true, last_fee_update = Now},
 
-    %% 1. remove confirmed transactions and update clusters
+    %% 1. remove confirmed transactions and update clusters.
+    %%    Core removeForBlock (txmempool.cpp:420) clears each confirmed tx's
+    %%    prioritise delta via ClearPrioritisation so it does not linger and
+    %%    re-apply to a later same-txid resubmission.
     {RemovedBytes, RemovedCount, State2} = lists:foldl(
         fun(Txid, {Bytes, Count, St}) ->
+            clear_prioritisation(Txid),
             case remove_entry(Txid) of
                 #mempool_entry{vsize = VSize} ->
                     St2 = cluster_remove_tx(Txid, St),
@@ -3256,9 +3421,12 @@ do_remove_for_block_with_txs(Txs, State) ->
         {[], []},
         Txs),
 
-    %% 1. remove confirmed transactions and update clusters
+    %% 1. remove confirmed transactions and update clusters (clearing each
+    %%    confirmed tx's prioritise delta — Core removeForBlock
+    %%    ClearPrioritisation, txmempool.cpp:420).
     {RemovedBytes, RemovedCount, State2} = lists:foldl(
         fun(Txid, {Bytes, Count, St}) ->
+            clear_prioritisation(Txid),
             case remove_entry(Txid) of
                 #mempool_entry{vsize = VSize} ->
                     St2 = cluster_remove_tx(Txid, St),
@@ -3366,6 +3534,84 @@ remove_block_conflicts_by_outpoint(SpentOutpoints, ConfirmedSet, State) ->
                 {Bytes, Count, St}
         end
     end, {0, 0, State}, sets:to_list(Spenders)).
+
+%%% ===================================================================
+%%% Internal: prioritisetransaction (mapDeltas mutation)
+%%% ===================================================================
+
+%% @doc Core of PrioritiseTransaction. Saturating-stacks `FeeDelta` onto the
+%% existing delta for `Txid` in ?MEMPOOL_DELTAS; erases the entry when the
+%% cumulative delta returns to exactly zero (Core txmempool.cpp:644-646). If
+%% the tx is in the mempool, recompute its cluster so the new modified fee
+%% immediately re-ranks it for mining (get_sorted_by_fee) and eviction
+%% (cluster fee_rate + tail linearization). Returns `{NewDelta, State}`.
+%%
+%% Exported for unit tests so the mutation can be driven at the ETS level
+%% without a running gen_server.
+-spec do_prioritise_transaction({binary(), integer()}, #state{}) ->
+    {integer(), #state{}}.
+do_prioritise_transaction({Txid, FeeDelta}, State) ->
+    {NewDelta, UF2} =
+        prioritise_with_union_find(Txid, FeeDelta, State#state.union_find),
+    {NewDelta, State#state{union_find = UF2}}.
+
+%% Pure (state-record-free) core of the mutation — exported for unit tests so
+%% the prioritisation + cluster refresh can be driven with just a union_find
+%% map and the ETS tables, without constructing the private #state{} record.
+%% Stacks the delta (saturating i64), erases on net-zero, and — for an
+%% in-mempool tx — recomputes its cluster so the new modified fee drives
+%% eviction (cluster fee_rate / tail) and mining immediately. Returns
+%% {NewDelta, UnionFind2}.
+-spec do_prioritise_transaction(binary(), integer(), map()) ->
+    {integer(), map()}.
+do_prioritise_transaction(Txid, FeeDelta, UnionFind) ->
+    prioritise_with_union_find(Txid, FeeDelta, UnionFind).
+
+prioritise_with_union_find(Txid, FeeDelta, UnionFind) ->
+    Existing = get_fee_delta(Txid),
+    NewDelta = saturating_add_i64(Existing, FeeDelta),
+    case NewDelta of
+        0 -> ets:delete(?MEMPOOL_DELTAS, Txid);
+        _ -> ets:insert(?MEMPOOL_DELTAS, {Txid, NewDelta})
+    end,
+    %% Refresh the cluster of an in-mempool tx so the cluster's aggregate
+    %% fee_rate + linearization (which drive eviction) reflect the modified
+    %% fee right away. Out-of-mempool deltas stay queued in ?MEMPOOL_DELTAS
+    %% and are picked up on a later admission (Core ApplyDelta in addUnchecked).
+    UF2 =
+        case ets:member(?MEMPOOL_TXS, Txid) of
+            true ->
+                case maps:is_key(Txid, UnionFind) of
+                    true ->
+                        {Root, UFx} = uf_find(Txid, UnionFind),
+                        recompute_cluster(Root, UFx),
+                        UFx;
+                    false ->
+                        UnionFind
+                end;
+            false ->
+                UnionFind
+        end,
+    {NewDelta, UF2}.
+
+%% Drop a tracked delta for `Txid` without touching any entry. Mirrors Core
+%% CTxMemPool::ClearPrioritisation (txmempool.cpp:667-671). Called when a block
+%% confirms a prioritised tx so the delta does not re-apply to a future
+%% same-txid resubmission.
+clear_prioritisation(Txid) ->
+    ets:delete(?MEMPOOL_DELTAS, Txid).
+
+%% Signed 64-bit saturating addition (Core util::SaturatingAdd over CAmount).
+%% CAmount is int64_t; clamp to its representable range on overflow.
+-define(I64_MAX, 9223372036854775807).
+-define(I64_MIN, -9223372036854775808).
+saturating_add_i64(A, B) ->
+    S = A + B,
+    if
+        S > ?I64_MAX -> ?I64_MAX;
+        S < ?I64_MIN -> ?I64_MIN;
+        true -> S
+    end.
 
 %%% ===================================================================
 %%% Internal: trimming / eviction (cluster-based)
@@ -4232,7 +4478,16 @@ linearize_cluster([]) ->
 linearize_cluster([SingleTxid]) ->
     case ets:lookup(?MEMPOOL_TXS, SingleTxid) of
         [{SingleTxid, Entry}] ->
-            {[SingleTxid], Entry#mempool_entry.fee, Entry#mempool_entry.vsize};
+            %% FIX (prioritisetransaction): a singleton cluster's total_fee —
+            %% which becomes its aggregate fee_rate used by find_worst_cluster
+            %% for eviction — must use the MODIFIED fee (base + delta), so an
+            %% operator-prioritised tx is protected from trim-eviction and a
+            %% de-prioritised one is evicted first. Multi-tx clusters still
+            %% aggregate raw fees (delta folding across ancestors is a separate
+            %% follow-up, mirroring rustoshi W106 G8). Core: the chunk feerate
+            %% in TrimToSize uses GetModifiedFee.
+            {[SingleTxid], modified_fee_of_entry(Entry),
+             Entry#mempool_entry.vsize};
         [] ->
             {[], 0, 0}
     end;
