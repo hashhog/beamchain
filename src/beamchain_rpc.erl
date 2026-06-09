@@ -766,6 +766,8 @@ handle_method(<<"clearbanned">>, _, _W) -> rpc_clearbanned();
 handle_method(<<"getmininginfo">>, _, _W) -> rpc_getmininginfo();
 handle_method(<<"getblocktemplate">>, P, _W) -> rpc_getblocktemplate(P);
 handle_method(<<"submitblock">>, P, _W) -> rpc_submitblock(P);
+handle_method(<<"prioritisetransaction">>, P, _W) -> rpc_prioritisetransaction(P);
+handle_method(<<"getprioritisedtransactions">>, _, _W) -> rpc_getprioritisedtransactions();
 
 %% -- UTXO-set scanning (wallet recovery) --
 handle_method(<<"scantxoutset">>, P, _W) -> rpc_scantxoutset(P);
@@ -894,6 +896,8 @@ rpc_help_list() ->
         <<"generatetoaddress nblocks \"address\" ( maxtries ) [regtest only]">>,
         <<"getblocktemplate ( \"template_request\" )">>,
         <<"getmininginfo">>,
+        <<"getprioritisedtransactions">>,
+        <<"prioritisetransaction \"txid\" ( dummy ) fee_delta">>,
         <<"submitblock \"hexdata\"">>,
         <<"">>,
         <<"== Mempool ==">>,
@@ -4306,6 +4310,96 @@ rpc_getmempooldescendants([TxidHex, Verbose]) when is_binary(TxidHex) ->
 rpc_getmempooldescendants(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"Usage: getmempooldescendants \"txid\" ( verbose )">>}.
+
+%% prioritisetransaction "txid" ( dummy ) fee_delta
+%%
+%% Mirrors Bitcoin Core rpc/mining.cpp::prioritisetransaction:
+%%   - arg0 txid (hex string, display byte order)
+%%   - arg1 dummy: API-compat legacy arg; MUST be 0 or null. A non-zero
+%%     value is rejected with the Core-faithful RPC_INVALID_PARAMETER error.
+%%   - arg2 fee_delta: signed integer satoshis, STACKS additively onto any
+%%     existing delta (saturating i64), erases the entry on net-zero.
+%% Returns true (Core returns the bool literal true).
+%%
+%% Accepted call shapes (positional):
+%%   ["txid", FeeDelta]            (dummy omitted — preferred forward form)
+%%   ["txid", Dummy, FeeDelta]     (legacy 3-arg form; Dummy must be 0/null)
+rpc_prioritisetransaction([TxidHex, FeeDelta])
+  when is_binary(TxidHex), is_integer(FeeDelta) ->
+    do_prioritisetransaction(TxidHex, 0, FeeDelta);
+rpc_prioritisetransaction([TxidHex, Dummy, FeeDelta])
+  when is_binary(TxidHex), is_integer(FeeDelta) ->
+    do_prioritisetransaction(TxidHex, Dummy, FeeDelta);
+%% Tolerate a JSON float fee_delta that is integral (e.g. 10000.0) — Core's
+%% getInt<int64_t> would reject a non-integral value, but jsx may hand us a
+%% float for whole numbers; round only when it is exactly integral.
+rpc_prioritisetransaction([TxidHex, FeeDelta])
+  when is_binary(TxidHex), is_float(FeeDelta) ->
+    coerce_fee_delta_then(TxidHex, 0, FeeDelta);
+rpc_prioritisetransaction([TxidHex, Dummy, FeeDelta])
+  when is_binary(TxidHex), is_float(FeeDelta) ->
+    coerce_fee_delta_then(TxidHex, Dummy, FeeDelta);
+rpc_prioritisetransaction(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: prioritisetransaction \"txid\" ( dummy ) fee_delta">>}.
+
+coerce_fee_delta_then(TxidHex, Dummy, FeeDeltaF) ->
+    case FeeDeltaF == trunc(FeeDeltaF) of
+        true  -> do_prioritisetransaction(TxidHex, Dummy, trunc(FeeDeltaF));
+        false -> {error, ?RPC_TYPE_ERROR,
+                  <<"Amount is not a valid integer number of satoshis">>}
+    end.
+
+do_prioritisetransaction(TxidHex, Dummy, FeeDelta) ->
+    case dummy_is_zero(Dummy) of
+        false ->
+            %% Core: "Priority is no longer supported, dummy argument to
+            %% prioritisetransaction must be 0." (RPC_INVALID_PARAMETER)
+            {error, ?RPC_INVALID_PARAMETER,
+             <<"Priority is no longer supported, dummy argument to "
+               "prioritisetransaction must be 0.">>};
+        true ->
+            Txid = hex_to_internal_hash(TxidHex),
+            _NewDelta = beamchain_mempool:prioritise_transaction(Txid, FeeDelta),
+            {ok, true}
+    end.
+
+%% Core treats the dummy as null OR numeric-zero. Accept null, 0, 0.0.
+dummy_is_zero(null)      -> true;
+dummy_is_zero(undefined) -> true;
+dummy_is_zero(N) when is_number(N) -> N == 0;
+dummy_is_zero(_)         -> false.
+
+%% getprioritisedtransactions
+%%
+%% Mirrors Bitcoin Core rpc/mining.cpp::getprioritisedtransactions: a JSON
+%% object keyed by txid hex, each value an object:
+%%   { "fee_delta":   <i64, signed, ALWAYS present>,
+%%     "in_mempool":  <bool>,
+%%     "modified_fee": <i64> }   %% ONLY when in_mempool == true
+%% Empty mapDeltas -> {} (empty JSON object).
+rpc_getprioritisedtransactions() ->
+    Entries = beamchain_mempool:get_prioritised_transactions(),
+    case Entries of
+        [] ->
+            %% jsx encodes the empty proplist [{}] as the JSON object {}.
+            {ok, [{}]};
+        _ ->
+            Map = maps:from_list(
+                    [{hash_to_hex(Txid), prioritised_entry(D, InPool, ModFee)}
+                     || {Txid, D, InPool, ModFee} <- Entries]),
+            {ok_raw_json, jsx:encode(Map)}
+    end.
+
+%% Build the inner object for one prioritised tx. fee_delta + in_mempool are
+%% always present; modified_fee only when in_mempool is true (Core mining.cpp).
+prioritised_entry(Delta, true, ModFee) when is_integer(ModFee) ->
+    #{<<"fee_delta">>   => Delta,
+      <<"in_mempool">>  => true,
+      <<"modified_fee">> => ModFee};
+prioritised_entry(Delta, false, _ModFee) ->
+    #{<<"fee_delta">>  => Delta,
+      <<"in_mempool">> => false}.
 
 %% getorphantxs ( verbosity ) — show transactions in the tx orphanage.
 %%
