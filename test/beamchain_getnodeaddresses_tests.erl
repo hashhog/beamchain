@@ -253,3 +253,65 @@ default_count_test_() ->
             ]
         end
     }}.
+
+%%% ===================================================================
+%%% Case 8: explicit JSON null count behaves as default 1
+%%% (Core rpc/net.cpp:946: request.params[0].isNull() ? 1 : getInt<int>())
+%%% jsx decodes JSON null to the atom `null`; it must NOT type-error.
+%%% ===================================================================
+
+null_count_test_() ->
+    {"explicit null count behaves as default 1 (Core isNull() => 1)", {
+        setup, fun setup/0, fun cleanup/1,
+        fun(_Setup) ->
+            [
+                {"null count on empty addrman => []", fun() ->
+                    ?assertEqual({ok, []}, get_node_addresses([null]))
+                end},
+                {"null count caps to 1 (same as default)", fun() ->
+                    add_three_peers(),
+                    {ok, R} = get_node_addresses([null]),
+                    ?assertEqual(1, length(R))
+                end},
+                {"null count + network filter resolves count first", fun() ->
+                    add_peer(<<"8.8.8.1">>, 8333),
+                    {ok, R} = get_node_addresses([null, <<"ipv4">>]),
+                    ?assertEqual(1, length(R)),
+                    ?assertEqual(<<"ipv4">>,
+                                 get_field(<<"network">>, hd(R)))
+                end}
+            ]
+        end
+    }}.
+
+%%% ===================================================================
+%%% Case 9: non-integral / float-literal count is rejected like Core
+%%% getInt<int>() (from_chars on "1.0"/"1.5" fails -> runtime_error
+%%% "JSON integer out of range" -> RPC_MISC_ERROR (-1)). jsx delivers
+%%% every JSON float-literal as an Erlang float, including 1.0.
+%%% ===================================================================
+
+non_integral_count_test_() ->
+    {"float-literal count rejected with -1 'JSON integer out of range'", {
+        setup, fun setup/0, fun cleanup/1,
+        fun(_Setup) ->
+            [
+                {"count=1.5 (fractional) => -1", fun() ->
+                    ?assertEqual(
+                        {error, -1, <<"JSON integer out of range">>},
+                        get_node_addresses([1.5]))
+                end},
+                {"count=1.0 (integral-valued float) => -1 (Core rejects too)",
+                 fun() ->
+                    ?assertEqual(
+                        {error, -1, <<"JSON integer out of range">>},
+                        get_node_addresses([1.0]))
+                end},
+                {"count=1 (genuine integer) still accepted", fun() ->
+                    add_three_peers(),
+                    {ok, R} = get_node_addresses([1]),
+                    ?assertEqual(1, length(R))
+                end}
+            ]
+        end
+    }}.
