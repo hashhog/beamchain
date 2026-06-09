@@ -71,14 +71,19 @@ dump() ->
 
 -spec dump(file:filename_all()) -> {ok, non_neg_integer()} | {error, term()}.
 dump(Path) ->
-    Entries = safe_get_persistable_entries(),
+    %% Pull entries WITH their applied prioritisetransaction delta so each tx's
+    %% nFeeDelta is written (Core DumpMempool writes the per-tx applied delta),
+    %% plus the full mapDeltas trailer (which also carries deltas for txids that
+    %% are NOT currently in the mempool — Core's mapDeltas dump).
+    Entries = safe_get_persistable_entries_with_delta(),
     Count = length(Entries),
-    Txs = [{Tx, Time, 0}             %% no fee-delta priority yet
-           || {Tx, Time} <- Entries],
+    Txs = [{Tx, Time, FeeDelta}
+           || {Tx, Time, FeeDelta} <- Entries],
+    Deltas = safe_get_all_deltas(),
     Payload = #{
         txs           => Txs,
-        deltas        => [],   %% empty mapDeltas (no PrioritiseTransaction yet)
-        unbroadcast   => []    %% empty set (we don't track unbroadcast yet)
+        deltas        => Deltas,   %% full mapDeltas (in- and out-of-mempool)
+        unbroadcast   => []        %% empty set (we don't track unbroadcast yet)
     },
     Body = serialize_payload(Payload),
     Key = random_key(),
@@ -272,13 +277,13 @@ random_key() ->
 
 %% Re-submit loaded transactions, dropping any older than the configured
 %% mempool expiry. Mirrors Core's expired/already-there/failed counting.
-apply_loaded(#{txs := Txs} = _Payload) ->
+apply_loaded(#{txs := Txs} = Payload) ->
     Now = erlang:system_time(second),
     Cutoff = Now - (?MEMPOOL_EXPIRY_HOURS * 3600),
     Total = length(Txs),
     Init = #{accepted => 0, expired => 0, failed => 0, already => 0,
              total => Total},
-    lists:foldl(
+    Stats = lists:foldl(
       fun({Tx, Time, _FeeDelta}, Acc) ->
               case Time =< Cutoff of
                   true ->
@@ -296,7 +301,22 @@ apply_loaded(#{txs := Txs} = _Payload) ->
                               bump(failed, Acc)
                       end
               end
-      end, Init, Txs).
+      end, Init, Txs),
+    %% Re-apply the persisted mapDeltas so prioritisetransaction deltas survive
+    %% a warm restart (Core LoadMempool replays mapDeltas). The mapDeltas
+    %% trailer is authoritative for every delta — both in- and out-of-mempool —
+    %% so we drive prioritise_transaction from it rather than from the per-tx
+    %% nFeeDelta (which only covers in-mempool txs and would double-count). A
+    %% missing trailer (older v1 dumps) leaves Deltas = []. Each prioritise call
+    %% stacks onto a base of 0 (fresh mempool), so the absolute value is restored.
+    Deltas = maps:get(deltas, Payload, []),
+    lists:foreach(
+      fun({Txid, Delta}) when is_integer(Delta), Delta =/= 0 ->
+              catch beamchain_mempool:prioritise_transaction(Txid, Delta);
+         (_) ->
+              ok
+      end, Deltas),
+    Stats.
 
 bump(K, M) -> maps:update_with(K, fun(V) -> V + 1 end, 1, M).
 
@@ -306,9 +326,20 @@ bump(K, M) -> maps:update_with(K, fun(V) -> V + 1 end, 1, M).
 
 %% Pull entries from the running mempool. Returns [] if the gen_server
 %% isn't up (e.g. during unit tests that drive this module directly).
-safe_get_persistable_entries() ->
+%% Entries with each tx's applied prioritisetransaction delta (in-mempool
+%% slice of mapDeltas). Returns [] if the gen_server isn't up.
+safe_get_persistable_entries_with_delta() ->
     try
-        beamchain_mempool:get_persistable_entries()
+        beamchain_mempool:get_persistable_entries_with_delta()
+    catch
+        _:_ -> []
+    end.
+
+%% Full mapDeltas (txid -> signed sat), including out-of-mempool deltas.
+%% Returns [] if the gen_server isn't up.
+safe_get_all_deltas() ->
+    try
+        beamchain_mempool:get_all_deltas()
     catch
         _:_ -> []
     end.
