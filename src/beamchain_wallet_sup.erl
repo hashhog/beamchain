@@ -9,12 +9,13 @@
 -export([init/1]).
 
 %% Wallet management API
--export([create_wallet/1, create_wallet/2,
+-export([create_wallet/1, create_wallet/2, create_wallet/3,
          restore_wallet/2, restore_wallet/3,
          load_wallet/1, load_wallet/2,
          unload_wallet/1,
          list_wallets/0,
-         get_wallet/1]).
+         get_wallet/1,
+         wallet_file_path/1]).
 
 -define(SERVER, ?MODULE).
 -define(WALLET_REGISTRY, beamchain_wallet_registry).
@@ -51,6 +52,35 @@ create_wallet(Name, Passphrase) when is_binary(Name) ->
                             {ok, Pid};
                         {error, _} = Err ->
                             %% Cleanup on failure
+                            supervisor:terminate_child(?SERVER, Pid),
+                            ets:delete(?WALLET_REGISTRY, Name),
+                            Err
+                    end;
+                {error, _} = Err ->
+                    Err
+            end
+    end.
+
+%% @doc Create a new wallet with createwallet-RPC options (Core parity).
+%% Opts keys (atoms): disable_private_keys, blank, avoid_reuse — passed to
+%% the wallet's {create, Seed, Passphrase, Opts} clause, which also writes
+%% named wallets to <name>.json so loadwallet can find them again.
+-spec create_wallet(binary(), binary() | undefined, map()) ->
+          {ok, pid()} | {error, term()}.
+create_wallet(Name, Passphrase, Opts) when is_binary(Name), is_map(Opts) ->
+    case get_wallet(Name) of
+        {ok, _Pid} ->
+            {error, wallet_already_loaded};
+        {error, wallet_not_found} ->
+            case supervisor:start_child(?SERVER, [Name]) of
+                {ok, Pid} ->
+                    true = ets:insert(?WALLET_REGISTRY, {Name, Pid}),
+                    Seed = crypto:strong_rand_bytes(32),
+                    case gen_server:call(Pid, {create, Seed, Passphrase,
+                                               Opts}) of
+                        {ok, _} ->
+                            {ok, Pid};
+                        {error, _} = Err ->
                             supervisor:terminate_child(?SERVER, Pid),
                             ets:delete(?WALLET_REGISTRY, Name),
                             Err
@@ -215,7 +245,8 @@ init([]) ->
 %%% Internal functions
 %%% ===================================================================
 
-%% @doc Get the wallet file path for a given wallet name.
+%% @doc Get the wallet file path for a given wallet name.  Exported so the
+%% RPC layer can implement createwallet's -36 "already exists" check.
 wallet_file_path(<<>>) ->
     %% Default wallet
     wallet_dir() ++ "/wallet.json";

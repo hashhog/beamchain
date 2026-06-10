@@ -36,7 +36,10 @@
          get_private_key/2,
          get_wallet_info/1,
          is_locked/1,
-         import_address/5]).
+         import_address/5,
+         import_watch_entries/2,
+         private_keys_enabled/1,
+         get_address_entry/2]).
 
 %% Wallet encryption API
 -export([encryptwallet/1,
@@ -200,7 +203,14 @@
     %% IBD (that would be thousands of fsyncs/sec); instead a connect
     %% schedules a single coalesced flush a short time later.  A clean
     %% shutdown / explicit mutation still persists synchronously.
-    flush_timer_ref = undefined :: reference() | undefined
+    flush_timer_ref = undefined :: reference() | undefined,
+    %% Mirrors Core's WALLET_FLAG_DISABLE_PRIVATE_KEYS (inverted): false
+    %% for an enforced watch-only wallet created with
+    %% createwallet(..., disable_private_keys=true).  A dpk wallet still
+    %% carries a (hidden) seed so the boot reconcile's master_key guard
+    %% keeps restart rescans working — key USE is gated on this flag, not
+    %% key existence.  Persisted in the wallet file.
+    private_keys_enabled = true :: boolean()
 }).
 
 %% How long to wait (ms) after a block-connect before coalescing the
@@ -478,12 +488,48 @@ get_wallet_info(Pid) when is_pid(Pid) ->
 is_locked(Pid) when is_pid(Pid) ->
     gen_server:call(Pid, is_locked).
 
-%% @doc Import a watch-only address into the wallet.
-%% Stub — importdescriptors watch-only tracking is not yet implemented.
--spec import_address(pid(), string(), binary(), boolean(), binary()) -> ok.
-import_address(_Pid, _Address, _Label, _Internal, _Timestamp) ->
-    %% TODO: implement watch-only address tracking
-    ok.
+%% @doc Import a watch-only address into the wallet (legacy shim).
+%% Kept for API compatibility; routes through import_watch_entries/2.
+-spec import_address(pid(), string() | binary(), binary(), boolean(),
+                     term()) -> ok | {error, term()}.
+import_address(Pid, Address, Label, Internal, _Timestamp) ->
+    AddrBin = case Address of
+        A when is_binary(A) -> A;
+        A when is_list(A)   -> list_to_binary(A)
+    end,
+    import_watch_entries(Pid, [#{<<"address">>    => AddrBin,
+                                 <<"label">>      => Label,
+                                 <<"watch_only">> => true,
+                                 <<"change">>     => Internal =:= true}]).
+
+%% @doc Register watch-only entries in the wallet: each entry's
+%% scriptPubKey enters the owned-script ETS table (so the block-connect
+%% scan and rescans credit matching outputs) AND the entry is appended to
+%% state.addresses, which save_wallet persists and
+%% reregister_address_scripts re-registers on reload — watch-only imports
+%% therefore survive a restart with no extra load-path code.
+%% Entries are jsx-style maps: #{<<"address">>, <<"label">>, <<"desc">>,
+%% <<"watch_only">> => true, <<"change">>, <<"script_hex">>,
+%% <<"timestamp">>}; only <<"address">> (or <<"script_hex">>) is required.
+%% Mirrors Core's DescriptorScriptPubKeyMan setup in
+%% wallet/rpc/backup.cpp ProcessDescriptorImport (registration half; the
+%% caller drives the rescan half).
+-spec import_watch_entries(pid(), [map()]) -> ok | {error, term()}.
+import_watch_entries(Pid, Entries) when is_pid(Pid), is_list(Entries) ->
+    gen_server:call(Pid, {import_watch_entries, Entries}, 60000).
+
+%% @doc Whether the wallet can ever hold/use private keys (Core's
+%% !WALLET_FLAG_DISABLE_PRIVATE_KEYS — wallet/rpc/wallet.cpp:98).
+-spec private_keys_enabled(pid()) -> boolean().
+private_keys_enabled(Pid) when is_pid(Pid) ->
+    gen_server:call(Pid, private_keys_enabled).
+
+%% @doc Look up the wallet's address-book entry for getaddressinfo.
+%% For HD (path-carrying) entries the derived compressed pubkey is added
+%% under <<"pubkey_hex">> when the master key is available (not locked).
+-spec get_address_entry(pid(), binary()) -> {ok, map()} | not_found.
+get_address_entry(Pid, AddrBin) when is_pid(Pid), is_binary(AddrBin) ->
+    gen_server:call(Pid, {get_address_entry, AddrBin}).
 
 %%% ===================================================================
 %%% gen_server callbacks
@@ -636,6 +682,45 @@ handle_call({create_bip39, Seed, Mnemonic, Passphrase}, _From, State) ->
     ok = save_wallet(NewState),
     {reply, {ok, Seed}, NewState};
 
+%% Options-carrying create (createwallet RPC, Core arg parity).  Same as
+%% {create, Seed, Passphrase} plus:
+%%   disable_private_keys (boolean) — sets private_keys_enabled=false and
+%%     skips keypool generation (an enforced watch-only wallet has no
+%%     spendable addresses; Core's WALLET_FLAG_DISABLE_PRIVATE_KEYS).  The
+%%     seed is still stored so the boot reconcile's master_key guard keeps
+%%     restart rescans working; key USE is gated on the flag.
+%%   blank (boolean) — skip keypool generation (Core's WALLET_FLAG_BLANK).
+%% Named wallets persist to <name>.json (matching wallet_sup's
+%% wallet_file_path/1 so loadwallet finds them); the default wallet keeps
+%% wallet.json.  The legacy {create, Seed, Passphrase} clause is unchanged.
+handle_call({create, Seed, Passphrase, Opts}, _From, State)
+  when is_map(Opts) ->
+    Dpk = maps:get(disable_private_keys, Opts, false) =:= true,
+    Blank = maps:get(blank, Opts, false) =:= true,
+    MasterKey = master_from_seed(Seed),
+    WalletDir = wallet_dir(State#wallet_state.network),
+    ok = filelib:ensure_dir(WalletDir ++ "/"),
+    WalletFile = case State#wallet_state.wallet_name of
+        <<>> -> WalletDir ++ "/wallet.json";
+        Name -> WalletDir ++ "/" ++ binary_to_list(Name) ++ ".json"
+    end,
+    NewState0 = State#wallet_state{
+        master_key  = MasterKey,
+        seed        = Seed,
+        wallet_file = WalletFile,
+        passphrase  = Passphrase,
+        keypool_size = ?DEFAULT_KEYPOOL_SIZE,
+        gap_limit    = ?DEFAULT_GAP_LIMIT,
+        mnemonic    = undefined,
+        private_keys_enabled = not Dpk
+    },
+    NewState = case Dpk orelse Blank of
+        true  -> NewState0;                  %% no keys to pre-derive
+        false -> generate_keypool(NewState0)
+    end,
+    ok = save_wallet(NewState),
+    {reply, {ok, Seed}, NewState};
+
 handle_call(getwalletmnemonic, _From, State) ->
     case State#wallet_state.mnemonic of
         undefined ->
@@ -662,6 +747,11 @@ handle_call({load, FilePath, Passphrase}, _From, State) ->
             {reply, {error, Reason}, State}
     end;
 
+%% A disable_private_keys wallet must never hand out key-derived addresses
+%% (Core: "Error: This wallet has no available keys").
+handle_call({get_new_address, _Type}, _From,
+            #wallet_state{private_keys_enabled = false} = State) ->
+    {reply, {error, private_keys_disabled}, State};
 handle_call({get_new_address, _Type}, _From,
             #wallet_state{master_key = undefined} = State) ->
     {reply, {error, no_wallet}, State};
@@ -670,6 +760,9 @@ handle_call({get_new_address, Type}, _From, State) ->
     ok = save_wallet(NewState),
     {reply, {ok, Address}, NewState};
 
+handle_call({get_change_address, _Type}, _From,
+            #wallet_state{private_keys_enabled = false} = State) ->
+    {reply, {error, private_keys_disabled}, State};
 handle_call({get_change_address, _Type}, _From,
             #wallet_state{master_key = undefined} = State) ->
     {reply, {error, no_wallet}, State};
@@ -709,10 +802,23 @@ handle_call({get_private_key, Address}, _From, State) ->
     end,
     case find_address(AddrBin, State) of
         {ok, AddrInfo} ->
-            Path = maps:get(<<"path">>, AddrInfo),
-            PathList = parse_path(binary_to_list(Path)),
-            Key = derive_path(State#wallet_state.master_key, PathList),
-            {reply, {ok, Key#hd_key.private_key}, State};
+            %% Watch-only entries carry no derivation path (and a dpk wallet
+            %% must never expose keys): both answer not_found rather than
+            %% crashing the wallet on the missing <<"path">> key.
+            case {maps:get(<<"path">>, AddrInfo, undefined),
+                  State#wallet_state.private_keys_enabled,
+                  State#wallet_state.master_key} of
+                {undefined, _, _} ->
+                    {reply, {error, not_found}, State};
+                {_, false, _} ->
+                    {reply, {error, not_found}, State};
+                {_, _, undefined} ->
+                    {reply, {error, not_found}, State};
+                {Path, true, MasterKey} ->
+                    PathList = parse_path(binary_to_list(Path)),
+                    Key = derive_path(MasterKey, PathList),
+                    {reply, {ok, Key#hd_key.private_key}, State}
+            end;
         not_found ->
             {reply, {error, not_found}, State}
     end;
@@ -727,9 +833,85 @@ handle_call(get_wallet_info, _From, State) ->
         keypool_size => State#wallet_state.keypool_size,
         gap_limit    => State#wallet_state.gap_limit,
         encrypted    => State#wallet_state.encrypted,
-        locked       => State#wallet_state.locked
+        locked       => State#wallet_state.locked,
+        private_keys_enabled => State#wallet_state.private_keys_enabled
     },
     {reply, {ok, Info}, State};
+
+handle_call(private_keys_enabled, _From, State) ->
+    {reply, State#wallet_state.private_keys_enabled, State};
+
+%% Real watch-only registration (replaces the import_address/5 stub).
+%% Registers each entry's scriptPubKey in the owned-script ETS table and
+%% appends the entry (deduped by address) to state.addresses, then
+%% persists synchronously.  The script comes from <<"script_hex">> when
+%% present (authoritative — descriptor-derived) with address decoding as
+%% the fallback; reload re-registration is handled by
+%% reregister_address_scripts/2, which understands both.
+handle_call({import_watch_entries, Entries}, _From, State) ->
+    Network = State#wallet_state.network,
+    Existing = State#wallet_state.addresses,
+    NewEntries = lists:foldl(fun(Entry, Acc) when is_map(Entry) ->
+        AddrBin = maps:get(<<"address">>, Entry, <<>>),
+        Script = case maps:get(<<"script_hex">>, Entry, undefined) of
+            Hex when is_binary(Hex), Hex =/= <<>> ->
+                try beamchain_serialize:hex_decode(Hex)
+                catch _:_ -> undefined
+                end;
+            _ when AddrBin =/= <<>> ->
+                case beamchain_address:address_to_script(
+                         binary_to_list(AddrBin), Network) of
+                    {ok, S} -> S;
+                    _       -> undefined
+                end;
+            _ ->
+                undefined
+        end,
+        case Script of
+            undefined ->
+                Acc;
+            _ ->
+                register_wallet_script(Script, AddrBin),
+                AlreadyKnown =
+                    lists:any(fun(E) ->
+                                  maps:get(<<"address">>, E, undefined)
+                                      =:= AddrBin
+                              end, Existing ++ Acc),
+                case AlreadyKnown of
+                    true  -> Acc;
+                    false -> Acc ++ [Entry]
+                end
+        end
+    end, [], Entries),
+    NewState = State#wallet_state{addresses = Existing ++ NewEntries},
+    ok = save_wallet(NewState),
+    {reply, ok, NewState};
+
+%% getaddressinfo support: fetch the address-book entry; HD entries gain a
+%% derived <<"pubkey_hex">> when the master key is available.
+handle_call({get_address_entry, AddrBin}, _From, State) ->
+    case find_address(AddrBin, State) of
+        {ok, AddrInfo} ->
+            Enriched = case {maps:get(<<"path">>, AddrInfo, undefined),
+                             State#wallet_state.master_key} of
+                {Path, MasterKey} when is_binary(Path),
+                                       MasterKey =/= undefined ->
+                    try
+                        PathList = parse_path(binary_to_list(Path)),
+                        Key = derive_path(MasterKey, PathList),
+                        AddrInfo#{<<"pubkey_hex">> =>
+                            beamchain_serialize:hex_encode(
+                                Key#hd_key.public_key)}
+                    catch
+                        _:_ -> AddrInfo
+                    end;
+                _ ->
+                    AddrInfo
+            end,
+            {reply, {ok, Enriched}, State};
+        not_found ->
+            {reply, not_found, State}
+    end;
 
 handle_call(get_keypool_size, _From, State) ->
     %% Return the actual number of addresses in the keypool
@@ -1781,7 +1963,8 @@ save_wallet(#wallet_state{addresses = Addrs,
                            passphrase = Passphrase, wallet_file = File,
                            encrypted = Encrypted, encrypted_seed = EncSeed,
                            encryption_salt = EncSalt, seed = Seed,
-                           last_synced_height = LastSynced}) ->
+                           last_synced_height = LastSynced,
+                           private_keys_enabled = PrivKeysEnabled}) ->
     %% For encrypted wallets, save the encrypted seed
     %% For unencrypted wallets, save the plaintext seed
     Common = #{
@@ -1789,6 +1972,7 @@ save_wallet(#wallet_state{addresses = Addrs,
         <<"next_receive">>       => encode_index_map(NextRecv),
         <<"next_change">>        => encode_index_map(NextChg),
         <<"last_synced_height">> => LastSynced,
+        <<"private_keys_enabled">> => PrivKeysEnabled,
         <<"created_at">>         => erlang:system_time(second)
     },
     WalletData = case Encrypted of
@@ -1895,6 +2079,8 @@ apply_loaded_wallet(WalletData, FilePath, Passphrase, State) ->
                          <<"p2pkh">> => 0}),
     LastSynced = to_integer(maps:get(<<"last_synced_height">>, WalletData, -1)),
     IsEncrypted = maps:get(<<"encrypted">>, WalletData, false),
+    PrivKeysEnabled =
+        maps:get(<<"private_keys_enabled">>, WalletData, true) =/= false,
     %% Re-register every loaded address's scriptPubKey so UTXO matching
     %% works again after a restart (the script ETS table is volatile).
     reregister_address_scripts(Addrs, State#wallet_state.network),
@@ -1904,7 +2090,8 @@ apply_loaded_wallet(WalletData, FilePath, Passphrase, State) ->
         addresses          = Addrs,
         next_receive       = decode_index_map(NextRecv),
         next_change        = decode_index_map(NextChg),
-        last_synced_height = LastSynced
+        last_synced_height = LastSynced,
+        private_keys_enabled = PrivKeysEnabled
     },
     case IsEncrypted of
         true ->
@@ -1936,13 +2123,24 @@ reregister_address_scripts(Addrs, Network) ->
     lists:foreach(
       fun(AddrEntry) ->
               try
-                  AddrBin = maps:get(<<"address">>, AddrEntry),
-                  AddrStr = binary_to_list(AddrBin),
-                  case beamchain_address:address_to_script(AddrStr, Network) of
-                      {ok, Script} ->
+                  AddrBin = maps:get(<<"address">>, AddrEntry, <<>>),
+                  %% Watch-only entries persist the exact descriptor-derived
+                  %% scriptPubKey (authoritative, and the only option for
+                  %% address-less raw() scripts); plain HD entries decode
+                  %% their address as before.
+                  case maps:get(<<"script_hex">>, AddrEntry, undefined) of
+                      Hex when is_binary(Hex), Hex =/= <<>> ->
+                          Script = beamchain_serialize:hex_decode(Hex),
                           register_wallet_script(Script, AddrBin);
                       _ ->
-                          ok
+                          AddrStr = binary_to_list(AddrBin),
+                          case beamchain_address:address_to_script(AddrStr,
+                                                                   Network) of
+                              {ok, Script} ->
+                                  register_wallet_script(Script, AddrBin);
+                              _ ->
+                                  ok
+                          end
                   end
               catch
                   _:_ -> ok
