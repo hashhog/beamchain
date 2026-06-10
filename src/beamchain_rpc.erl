@@ -184,6 +184,13 @@
 -define(RPC_VERIFY_REJECTED, -26).
 -define(RPC_VERIFY_ALREADY_IN_CHAIN, -27).
 -define(RPC_IN_WARMUP, -28).
+-define(RPC_WALLET_ALREADY_LOADED, -35).
+-define(RPC_WALLET_ALREADY_EXISTS, -36).
+
+%% Core's TIMESTAMP_WINDOW (bitcoin-core/src/chain.h:37): rescans triggered
+%% by importdescriptors start this many seconds BEFORE the stated key
+%% birthday to compensate for non-monotonic block times.
+-define(IMPORT_TIMESTAMP_WINDOW, 7200).
 
 %% PSBT role enum — mirrors `bitcoin-core/src/psbt.h::PSBTRole`.
 %% Values are ordered so `min/2` ratchets toward the earliest role still
@@ -812,6 +819,7 @@ handle_method(<<"getrawchangeaddress">>, P, W) -> rpc_getrawchangeaddress(P, W);
 handle_method(<<"getbalance">>, _, W) -> rpc_getbalance(W);
 handle_method(<<"listaddresses">>, _, W) -> rpc_listaddresses(W);
 handle_method(<<"getwalletinfo">>, _, W) -> rpc_getwalletinfo(W);
+handle_method(<<"getaddressinfo">>, P, W) -> rpc_getaddressinfo(P, W);
 handle_method(<<"getwalletmnemonic">>, _, W) -> rpc_getwalletmnemonic(W);
 handle_method(<<"dumpprivkey">>, P, W) -> rpc_dumpprivkey(P, W);
 handle_method(<<"sendtoaddress">>, P, W) -> rpc_sendtoaddress(P, W);
@@ -6629,29 +6637,128 @@ format_mempool_entry(_) ->
 %%% Wallet methods
 %%% ===================================================================
 
-%% @doc Create a new wallet.
-%% createwallet "name" - Creates a new wallet with the given name.
+%% @doc Create a new wallet — Core's 8-argument contract
+%% (bitcoin-core/src/wallet/rpc/wallet.cpp:346-432):
+%%   createwallet "wallet_name" ( disable_private_keys blank "passphrase"
+%%                                avoid_reuse descriptors load_on_startup
+%%                                external_signer )
+%% Accepted as positional params OR a named-args object.  Behaviors:
+%%   * disable_private_keys=true -> keyless watch-only wallet
+%%     (WALLET_FLAG_DISABLE_PRIVATE_KEYS; getwalletinfo reports
+%%     private_keys_enabled=false).
+%%   * dpk + non-empty passphrase -> -4 (wallet/wallet.cpp:408-413).
+%%   * empty-string passphrase -> warning, wallet not encrypted.
+%%   * descriptors=false -> -4 (legacy wallets can no longer be created).
+%%   * external_signer=true -> -4 (no external-signer support).
+%% Response: {"name": ..., "warnings": [...]} (warnings only when
+%% non-empty — the modern array shape, not the deprecated "warning").
 rpc_createwallet([]) ->
     rpc_createwallet([<<>>]);  %% Default wallet name
-rpc_createwallet([Name]) when is_binary(Name) ->
-    case beamchain_wallet_sup:create_wallet(Name) of
-        {ok, _Pid} ->
-            WalletName = case Name of
-                <<>> -> <<"default">>;
-                _ -> Name
-            end,
-            {ok, #{
-                <<"name">> => WalletName,
-                <<"warning">> => <<>>
-            }};
-        {error, wallet_already_loaded} ->
-            {error, ?RPC_MISC_ERROR, <<"Wallet already loaded">>};
-        {error, Reason} ->
-            {error, ?RPC_MISC_ERROR, iolist_to_binary(
-                io_lib:format("Failed to create wallet: ~p", [Reason]))}
-    end;
+rpc_createwallet(Params) when is_list(Params), length(Params) =< 8 ->
+    [Name, Dpk, Blank, Pass, AvoidReuse, Descriptors, _LoadOnStartup,
+     ExtSigner] = pad_createwallet_args(Params),
+    HasPassArg = length(Params) >= 4 andalso lists:nth(4, Params) =/= null,
+    rpc_createwallet_opts(Name, Dpk, Blank, Pass, HasPassArg, AvoidReuse,
+                          Descriptors, ExtSigner);
+rpc_createwallet(Params) when is_map(Params) ->
+    %% Named-args object form.
+    Name = maps:get(<<"wallet_name">>, Params, <<>>),
+    Pass = case maps:get(<<"passphrase">>, Params, null) of
+        null -> <<>>;
+        P    -> P
+    end,
+    rpc_createwallet_opts(
+        Name,
+        maps:get(<<"disable_private_keys">>, Params, false),
+        maps:get(<<"blank">>, Params, false),
+        Pass,
+        maps:is_key(<<"passphrase">>, Params)
+            andalso maps:get(<<"passphrase">>, Params) =/= null,
+        maps:get(<<"avoid_reuse">>, Params, false),
+        maps:get(<<"descriptors">>, Params, true),
+        maps:get(<<"external_signer">>, Params, false));
 rpc_createwallet(_) ->
-    {error, ?RPC_INVALID_PARAMS, <<"createwallet ( \"name\" )">>}.
+    {error, ?RPC_INVALID_PARAMS,
+     <<"createwallet \"wallet_name\" ( disable_private_keys blank "
+       "\"passphrase\" avoid_reuse descriptors load_on_startup "
+       "external_signer )">>}.
+
+%% Pad the positional createwallet param list to all 8 args, mapping JSON
+%% null (and absence) to each argument's Core default.
+pad_createwallet_args(Params) ->
+    Defaults = [<<>>, false, false, <<>>, false, true, null, false],
+    Padded = Params ++ lists:nthtail(length(Params), Defaults),
+    lists:zipwith(fun(null, Def) -> Def;
+                     (V, _Def)   -> V
+                  end, Padded, Defaults).
+
+rpc_createwallet_opts(Name, _Dpk, _Blank, _Pass, _HasPass, _AvoidReuse,
+                      _Descriptors, _ExtSigner) when not is_binary(Name) ->
+    {error, ?RPC_TYPE_ERROR, <<"JSON value is not a string as expected">>};
+rpc_createwallet_opts(_Name, _Dpk, _Blank, _Pass, _HasPass, _AvoidReuse,
+                      false, _ExtSigner) ->
+    %% Core wallet.cpp:402-405.
+    {error, ?RPC_WALLET_ERROR,
+     <<"descriptors argument must be set to \"true\"; it is no longer "
+       "possible to create a legacy wallet.">>};
+rpc_createwallet_opts(_Name, _Dpk, _Blank, _Pass, _HasPass, _AvoidReuse,
+                      _Descriptors, true) ->
+    {error, ?RPC_WALLET_ERROR,
+     <<"Compiled without external signing support (required for external "
+       "signing)">>};
+rpc_createwallet_opts(_Name, true, _Blank, Pass, _HasPass, _AvoidReuse,
+                      _Descriptors, _ExtSigner)
+  when is_binary(Pass), Pass =/= <<>> ->
+    %% Core wallet/wallet.cpp:408-413 (FAILED_CREATE -> -4).
+    {error, ?RPC_WALLET_ERROR,
+     <<"Passphrase provided but private keys are disabled. A passphrase is "
+       "only used to encrypt private keys, so cannot be used for wallets "
+       "with private keys disabled.">>};
+rpc_createwallet_opts(Name, Dpk, Blank, Pass, HasPass, AvoidReuse,
+                      _Descriptors, _ExtSigner) ->
+    %% -36: a named wallet whose file already exists on disk must not be
+    %% silently overwritten (Core HandleWalletError FAILED_ALREADY_EXISTS).
+    AlreadyOnDisk = Name =/= <<>> andalso
+        filelib:is_regular(beamchain_wallet_sup:wallet_file_path(Name)),
+    case AlreadyOnDisk of
+        true ->
+            {error, ?RPC_WALLET_ALREADY_EXISTS,
+             iolist_to_binary(io_lib:format(
+                 "Wallet \"~s\" already exists.", [Name]))};
+        false ->
+            Warnings = case HasPass andalso Pass =:= <<>> of
+                true ->
+                    [<<"Empty string given as passphrase, wallet will "
+                       "not be encrypted.">>];
+                false ->
+                    []
+            end,
+            PassOpt = case Pass of
+                <<>> -> undefined;
+                _    -> Pass
+            end,
+            Opts = #{disable_private_keys => Dpk =:= true,
+                     blank                => Blank =:= true,
+                     avoid_reuse          => AvoidReuse =:= true},
+            case beamchain_wallet_sup:create_wallet(Name, PassOpt, Opts) of
+                {ok, _Pid} ->
+                    Display = case Name of
+                        <<>> -> <<"default">>;
+                        _    -> Name
+                    end,
+                    Result = [{<<"name">>, Display}]
+                        ++ [{<<"warnings">>, Warnings} || Warnings =/= []],
+                    {ok, Result};
+                {error, wallet_already_loaded} ->
+                    {error, ?RPC_WALLET_ALREADY_LOADED,
+                     iolist_to_binary(io_lib:format(
+                         "Wallet \"~s\" is already loaded.", [Name]))};
+                {error, Reason} ->
+                    {error, ?RPC_WALLET_ERROR, iolist_to_binary(
+                        io_lib:format("Failed to create wallet: ~p",
+                                      [Reason]))}
+            end
+    end.
 
 %% @doc Restore a wallet from a BIP-39 mnemonic (seed-only recovery).
 %% restorewallet "name" "mnemonic" ( "passphrase" )
@@ -6751,6 +6858,10 @@ rpc_getnewaddress(Params, WalletName) ->
                     {ok, iolist_to_binary(Address)};
                 {error, no_wallet} ->
                     {error, ?RPC_MISC_ERROR, <<"No wallet loaded">>};
+                {error, private_keys_disabled} ->
+                    %% Core: getnewaddress on a disable_private_keys wallet.
+                    {error, ?RPC_WALLET_ERROR,
+                     <<"Error: This wallet has no available keys">>};
                 {error, Reason} ->
                     {error, ?RPC_MISC_ERROR, iolist_to_binary(
                         io_lib:format("~p", [Reason]))}
@@ -6779,6 +6890,9 @@ rpc_getrawchangeaddress(Params, WalletName) ->
                     {ok, iolist_to_binary(Address)};
                 {error, no_wallet} ->
                     {error, ?RPC_MISC_ERROR, <<"No wallet loaded">>};
+                {error, private_keys_disabled} ->
+                    {error, ?RPC_WALLET_ERROR,
+                     <<"Error: This wallet has no available keys">>};
                 {error, Reason} ->
                     {error, ?RPC_MISC_ERROR, iolist_to_binary(
                         io_lib:format("~p", [Reason]))}
@@ -6851,7 +6965,10 @@ rpc_getwalletinfo(WalletName) ->
                         <<"txcount">> => 0,
                         <<"keypoolsize">> => maps:get(addresses, Info, 0),
                         <<"paytxfee">> => format_amount_sentinel(0),
-                        <<"private_keys_enabled">> => true,
+                        %% Core wallet/rpc/wallet.cpp:98 — false for an
+                        %% enforced watch-only (disable_private_keys) wallet.
+                        <<"private_keys_enabled">> =>
+                            maps:get(private_keys_enabled, Info, true),
                         <<"avoid_reuse">> => false,
                         <<"scanning">> => false
                     },
@@ -6874,6 +6991,179 @@ rpc_getwalletinfo(WalletName) ->
             end;
         {error, _} ->
             wallet_not_found_error(WalletName)
+    end.
+
+%% @doc getaddressinfo "address" — wallet-aware address introspection.
+%% Mirrors bitcoin-core/src/wallet/rpc/addresses.cpp:423-510 with the
+%% EXACT pushKV emit order (ordered proplist — jsx preserves proplist
+%% order but alphabetises maps; a1d01e1 idiom):
+%%   address, scriptPubKey, ismine, solvable, [desc iff solvable],
+%%   [parent_desc iff imported-descriptor-derived], iswatchonly (ALWAYS
+%%   false — deprecated, addresses.cpp:383,478), isscript, iswitness,
+%%   [witness_version, witness_program for segwit], [pubkey
+%%   (+iscompressed for P2PKH only) when known], ischange, [timestamp
+%%   when known], labels LAST (addresses.cpp:503-508).
+%% Watch-only: wpkh(PUB) import -> ismine:true solvable:true desc+
+%% parent_desc; addr(X) import -> ismine:true solvable:false NO desc,
+%% parent_desc=addr(X)#cksum.  Unknown-but-valid address -> ismine:false
+%% (not an error).  Invalid address -> -5 (addresses.cpp:434-439).
+rpc_getaddressinfo([Address], WalletName) when is_binary(Address) ->
+    case resolve_wallet(WalletName) of
+        {ok, Pid} ->
+            Network = cfg_network(),
+            case beamchain_address:address_to_script(
+                     binary_to_list(Address), Network) of
+                {ok, Script} ->
+                    {ok, getaddressinfo_proplist(Pid, Address, Script)};
+                {error, _} ->
+                    {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+                     <<"Invalid or unsupported Segwit (Bech32) or Base58 "
+                       "encoding.">>}
+            end;
+        {error, _} ->
+            wallet_not_found_error(WalletName)
+    end;
+rpc_getaddressinfo(_, _) ->
+    {error, ?RPC_INVALID_PARAMS, <<"getaddressinfo \"address\"">>}.
+
+getaddressinfo_proplist(Pid, Address, Script) ->
+    Entry = try beamchain_wallet:get_address_entry(Pid, Address) of
+        {ok, E}   -> E;
+        not_found -> undefined
+    catch
+        _:_ -> undefined
+    end,
+    IsMine = Entry =/= undefined,
+    Type = beamchain_address:classify_script(Script),
+    IsWitness = case Type of
+        p2wpkh -> true;
+        p2wsh -> true;
+        p2tr -> true;
+        {witness, _, _} -> true;
+        _ -> false
+    end,
+    IsScript = case Type of
+        p2sh -> true;
+        p2wsh -> true;
+        p2tr -> true;
+        {witness, _, WP} when byte_size(WP) > 20 -> true;
+        _ -> false
+    end,
+    %% Known pubkey: HD-derived (pubkey_hex from the wallet) or embedded in
+    %% a pubkey-carrying imported descriptor (wpkh/pkh(<66-hex>)).
+    EntryDesc = case Entry of
+        undefined -> undefined;
+        _ -> case maps:get(<<"desc">>, Entry, undefined) of
+                 D when is_binary(D) -> D;
+                 _ -> undefined
+             end
+    end,
+    PubHex = case Entry of
+        undefined -> undefined;
+        _ ->
+            case maps:get(<<"pubkey_hex">>, Entry, undefined) of
+                undefined -> desc_embedded_pubkey_hex(EntryDesc);
+                P when is_binary(P) -> P
+            end
+    end,
+    %% solvable + desc (desc ONLY when solvable — addresses.cpp:457-459).
+    {Solvable, DescOut} = address_solvability(Entry, EntryDesc, PubHex, Type),
+    Labels = case IsMine of
+        true ->
+            [case maps:get(<<"label">>, Entry, <<>>) of
+                 L when is_binary(L) -> L;
+                 _ -> <<>>
+             end];
+        false ->
+            []
+    end,
+    IsChange = IsMine andalso maps:get(<<"change">>, Entry, false) =:= true,
+    Timestamp = case Entry of
+        undefined -> undefined;
+        _ -> case maps:get(<<"timestamp">>, Entry, undefined) of
+                 T when is_integer(T) -> T;
+                 _ -> undefined
+             end
+    end,
+    [{<<"address">>, Address},
+     {<<"scriptPubKey">>, beamchain_serialize:hex_encode(Script)},
+     {<<"ismine">>, IsMine},
+     {<<"solvable">>, Solvable}]
+    ++ [{<<"desc">>, DescOut} || DescOut =/= undefined]
+    ++ [{<<"parent_desc">>, EntryDesc} || EntryDesc =/= undefined]
+    ++ [{<<"iswatchonly">>, false},      %% deprecated, Core hardcodes false
+        {<<"isscript">>, IsScript},
+        {<<"iswitness">>, IsWitness}]
+    ++ case IsWitness of
+           true ->
+               {WitVer, WitProg} = case {Type, Script} of
+                   {p2tr, <<_:8, WLen:8, WPr:WLen/binary>>} ->
+                       {1, beamchain_serialize:hex_encode(WPr)};
+                   {{witness, V, _}, <<_:8, WLen:8, WPr:WLen/binary>>} ->
+                       {V, beamchain_serialize:hex_encode(WPr)};
+                   {_, <<_:8, WLen:8, WPr:WLen/binary>>} ->
+                       {0, beamchain_serialize:hex_encode(WPr)};
+                   _ ->
+                       {0, <<>>}
+               end,
+               [{<<"witness_version">>, WitVer},
+                {<<"witness_program">>, WitProg}];
+           false ->
+               []
+       end
+    ++ [{<<"pubkey">>, PubHex} || PubHex =/= undefined]
+    ++ [{<<"iscompressed">>, byte_size(PubHex) =:= 66}
+        || PubHex =/= undefined, Type =:= p2pkh]
+    ++ [{<<"ischange">>, IsChange}]
+    ++ [{<<"timestamp">>, Timestamp} || Timestamp =/= undefined]
+    ++ [{<<"labels">>, Labels}].
+
+%% solvable + the descriptor to expose (Core: desc only when the wallet can
+%% solve the script).  HD entries with a derived pubkey infer their single
+%% descriptor; watch entries reuse the imported descriptor's solvability
+%% (addr()/raw() are not solvable — descriptor.cpp IsSolvable analogue).
+address_solvability(undefined, _EntryDesc, _PubHex, _Type) ->
+    {false, undefined};
+address_solvability(Entry, EntryDesc, PubHex, Type) ->
+    case maps:get(<<"pubkey_hex">>, Entry, undefined) of
+        P when is_binary(P) ->
+            Fn = case Type of
+                p2pkh -> "pkh";
+                p2tr  -> "tr";
+                _     -> "wpkh"
+            end,
+            Inferred = beamchain_descriptor:add_checksum(
+                           Fn ++ "(" ++ binary_to_list(P) ++ ")"),
+            {true, list_to_binary(Inferred)};
+        undefined when EntryDesc =/= undefined ->
+            Body = case binary:split(EntryDesc, <<"#">>) of
+                [B | _] -> B;
+                _       -> EntryDesc
+            end,
+            case beamchain_descriptor:parse(binary_to_list(Body)) of
+                {ok, Desc} ->
+                    case beamchain_descriptor:is_solvable(Desc) of
+                        true  -> {true, EntryDesc};
+                        false -> {false, undefined}
+                    end;
+                _ ->
+                    {false, undefined}
+            end;
+        undefined ->
+            _ = PubHex,
+            {false, undefined}
+    end.
+
+%% Extract an embedded compressed-pubkey hex from a single-key descriptor
+%% body like wpkh(02...)/pkh(03...).  addr()/raw() (and xpub-based)
+%% descriptors yield undefined.
+desc_embedded_pubkey_hex(undefined) ->
+    undefined;
+desc_embedded_pubkey_hex(DescBin) ->
+    case re:run(DescBin, <<"\\(((?:[0-9a-fA-F]){66})\\)">>,
+                [{capture, [1], binary}]) of
+        {match, [Hex]} -> Hex;
+        nomatch        -> undefined
     end.
 
 %% @doc Return the BIP-39 mnemonic backing the wallet, if any.
@@ -6962,6 +7252,41 @@ rpc_sendtoaddress([Address, AmountBtc], WalletName) when is_binary(Address) ->
 rpc_sendtoaddress([Address, AmountBtc, _Comment], WalletName) when is_binary(Address) ->
     case resolve_wallet(WalletName) of
         {ok, Pid} ->
+            %% Watch-only (disable_private_keys) wallets can never spend.
+            %% Core: CWallet::CreateTransaction guard — "Error: Private
+            %% keys are disabled for this wallet" (-4).  Checked up-front
+            %% so coin selection / signing never touches watched coins.
+            case wallet_priv_keys_enabled(Pid) of
+                false ->
+                    {error, ?RPC_WALLET_ERROR,
+                     <<"Error: Private keys are disabled for this wallet">>};
+                true ->
+                    rpc_sendtoaddress_spend(Address, AmountBtc, Pid)
+            end;
+        {error, _} ->
+            wallet_not_found_error(WalletName)
+    end;
+rpc_sendtoaddress(_, _WalletName) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"sendtoaddress \"address\" amount">>}.
+
+%% Whether the wallet can use private keys; defaults to true if the wallet
+%% process predates the flag (or the call fails) so legacy behavior is
+%% preserved.
+wallet_priv_keys_enabled(Pid) ->
+    try beamchain_wallet:private_keys_enabled(Pid)
+    catch _:_ -> true
+    end.
+
+%% Network with a mainnet fallback for environments where the config ETS
+%% isn't up (eunit drives handle_method/3 directly — same fallback the
+%% wallet's init/1 uses).
+cfg_network() ->
+    try beamchain_config:network()
+    catch _:_ -> mainnet
+    end.
+
+rpc_sendtoaddress_spend(Address, AmountBtc, Pid) ->
             Amount = btc_to_satoshi(AmountBtc),
             %% Get wallet UTXOs for coin selection.  Use the maturity-filtered
             %% spendable set so coin-selection never picks an immature coinbase
@@ -7054,13 +7379,7 @@ rpc_sendtoaddress([Address, AmountBtc, _Comment], WalletName) when is_binary(Add
                     end;
                 {error, insufficient_funds} ->
                     {error, ?RPC_MISC_ERROR, <<"Insufficient funds">>}
-            end;
-        {error, _} ->
-            wallet_not_found_error(WalletName)
-    end;
-rpc_sendtoaddress(_, _WalletName) ->
-    {error, ?RPC_INVALID_PARAMS,
-     <<"sendtoaddress \"address\" amount ( \"comment\" )">>}.
+            end.
 
 %% W118 BUG-1: real privkey lookup for each input. Walks the selected-coin
 %% list in order and resolves each prevout scriptPubKey → address → wallet
@@ -8735,69 +9054,329 @@ collect_script_info(Map) ->
     end,
     Acc2.
 
-%% @doc importdescriptors: Import descriptors into the wallet.
-%% Takes an array of descriptor request objects.
+%% @doc importdescriptors: Import descriptors into the wallet — REAL
+%% registration + rescan (replaces the import_address/5 stub path).
+%% Mirrors bitcoin-core/src/wallet/rpc/backup.cpp:302-460:
+%%   * The response array has the SAME length and order as the request;
+%%     a per-element failure NEVER aborts the batch (backup.cpp:146,
+%%     294-298, 388-402).
+%%   * EXCEPTION: timestamp validation is whole-batch — Core evaluates
+%%     GetImportTimestamp OUTSIDE the per-element try/catch
+%%     (backup.cpp:390), so a missing/mistyped timestamp aborts the whole
+%%     call with -3 (backup.cpp:127-139).
+%%   * Checksums are REQUIRED (Parse with require_checksum=true,
+%%     backup.cpp:158-161) — failures are per-element -5 with the exact
+%%     CheckChecksum strings (descriptor.cpp:2838-2869).
+%%   * Private-key material into a disable_private_keys wallet ->
+%%     per-element -4 (backup.cpp:223-226); the mirror (watch-only desc
+%%     into a privkeys-enabled wallet) -> -4 (backup.cpp:259-262).
+%%   * After the request loop, if >=1 element succeeded with a NUMERIC
+%%     timestamp, a SYNCHRONOUS rescan runs from the lowest timestamp
+%%     minus TIMESTAMP_WINDOW=7200s (wallet.cpp:1834, chain.h:37),
+%%     crediting pre-import funds.  "now" skips the deep scan (Core: tip
+%%     MTP).  Core blocks the RPC for the rescan too; on mainnet a
+%%     timestamp of 0 means a full-chain rescan in this request process —
+%%     document, don't "fix" with async.
+%%     Simplification vs Core: the timestamp->height mapping is a binary
+%%     search over stored block times (Core searches nTimeMax); the 7200s
+%%     window absorbs local non-monotonicity exactly as in Core.
 rpc_importdescriptors([Requests], WalletName) when is_list(Requests) ->
     case resolve_wallet(WalletName) of
         {ok, Pid} ->
-            Results = lists:map(fun(#{<<"desc">> := DescStr} = Req) ->
-                Timestamp = maps:get(<<"timestamp">>, Req, <<"now">>),
-                Internal = maps:get(<<"internal">>, Req, false),
-                Range = maps:get(<<"range">>, Req, null),
-                Label = maps:get(<<"label">>, Req, <<>>),
-                try
-                    case beamchain_descriptor:parse(DescStr) of
-                        {ok, Desc} ->
-                            %% Derive addresses for the descriptor range
-                            Addresses = case Range of
-                                [Start, End] when is_integer(Start), is_integer(End) ->
-                                    case beamchain_descriptor:expand(Desc, {Start, End}) of
-                                        {ok, Addrs} -> Addrs;
-                                        {error, _} -> []
-                                    end;
-                                _ ->
-                                    case beamchain_descriptor:derive(Desc, 0) of
-                                        {ok, Addr} -> [Addr];
-                                        {error, _} -> []
-                                    end
-                            end,
-                            %% Import each derived address into the wallet
-                            lists:foreach(fun(Addr) ->
-                                beamchain_wallet:import_address(Pid, Addr, Label,
-                                    Internal, Timestamp)
-                            end, Addresses),
-                            #{<<"success">> => true};
-                        {error, ParseErr} ->
-                            #{<<"success">> => false,
-                              <<"error">> => #{
-                                  <<"code">> => ?RPC_INVALID_PARAMETER,
-                                  <<"message">> => iolist_to_binary(
-                                      io_lib:format("Invalid descriptor: ~p", [ParseErr]))
-                              }}
-                    end
-                catch
-                    _:Err ->
-                        #{<<"success">> => false,
-                          <<"error">> => #{
-                              <<"code">> => ?RPC_MISC_ERROR,
-                              <<"message">> => iolist_to_binary(
-                                  io_lib:format("Error: ~p", [Err]))
-                          }}
-                end;
-            (_InvalidReq) ->
-                #{<<"success">> => false,
-                  <<"error">> => #{
-                      <<"code">> => ?RPC_INVALID_PARAMS,
-                      <<"message">> => <<"Missing required field 'desc'">>
-                  }}
-            end, Requests),
-            {ok, Results};
+            %% Whole-batch timestamp gate (Core backup.cpp:390 — outside
+            %% the per-element try/catch).
+            case validate_import_timestamps(Requests) of
+                {error, Msg} ->
+                    {error, ?RPC_TYPE_ERROR, Msg};
+                {ok, Timestamps} ->
+                    Network = cfg_network(),
+                    PrivEnabled = wallet_priv_keys_enabled(Pid),
+                    Outcomes = lists:zipwith(
+                        fun(Req, Ts) ->
+                            import_one_descriptor(Pid, Req, Ts, Network,
+                                                  PrivEnabled)
+                        end, Requests, Timestamps),
+                    Results = [R || {R, _Ok} <- Outcomes],
+                    SuccessTs = [Ts || {{_R, true}, Ts}
+                                       <- lists:zip(Outcomes, Timestamps)],
+                    ok = maybe_import_rescan(SuccessTs),
+                    {ok, Results}
+            end;
         {error, _} ->
             wallet_not_found_error(WalletName)
     end;
 rpc_importdescriptors(_, _) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"Usage: importdescriptors \"requests\"">>}.
+
+%% Per-element error result in Core's shape (backup.cpp:295-296).
+imp_err(Code, Msg) ->
+    {#{<<"success">> => false,
+       <<"error">> => #{<<"code">> => Code,
+                        <<"message">> => iolist_to_binary(Msg)}},
+     false}.
+
+%% ── whole-batch timestamp validation (Core GetImportTimestamp) ─────────
+%% Returns {ok, [integer() | now]} or {error, Core-exact -3 message}.
+validate_import_timestamps(Requests) ->
+    try
+        {ok, lists:map(fun import_timestamp_of/1, Requests)}
+    catch
+        throw:{bad_timestamp, Msg} ->
+            {error, Msg}
+    end.
+
+import_timestamp_of(Req) when is_map(Req) ->
+    case maps:get(<<"timestamp">>, Req, missing) of
+        missing ->
+            throw({bad_timestamp,
+                   <<"Missing required timestamp field for key">>});
+        <<"now">> ->
+            now;
+        N when is_integer(N) ->
+            N;
+        F when is_float(F) ->
+            trunc(F);
+        Other ->
+            throw({bad_timestamp, iolist_to_binary(io_lib:format(
+                "Expected number or \"now\" timestamp value for key. "
+                "got type ~s", [import_json_type_name(Other)]))})
+    end;
+import_timestamp_of(_NonObject) ->
+    throw({bad_timestamp,
+           <<"Missing required timestamp field for key">>}).
+
+%% UniValue type names, for the -3 message (Core univalue uvTypeName).
+import_json_type_name(B) when is_binary(B)  -> "string";
+import_json_type_name(B) when is_boolean(B) -> "bool";
+import_json_type_name(null)                 -> "null";
+import_json_type_name(L) when is_list(L)    -> "array";
+import_json_type_name(M) when is_map(M)     -> "object";
+import_json_type_name(_)                    -> "unknown".
+
+%% ── BIP-380 checksum gate (Core descriptor.cpp:2838-2869 CheckChecksum,
+%% reached via Parse(..., require_checksum=true) at backup.cpp:158) ─────
+%% Returns {ok, BodyWithoutChecksum} or {error, Core-exact message}.
+check_descriptor_checksum(DescStr) when is_list(DescStr) ->
+    case string:split(DescStr, "#", all) of
+        [_NoHash] ->
+            {error, <<"Missing checksum">>};
+        [Body, Given] ->
+            case length(Given) of
+                8 ->
+                    try beamchain_descriptor:checksum(Body) of
+                        Given ->
+                            {ok, Body};
+                        Expected ->
+                            {error, iolist_to_binary(io_lib:format(
+                                "Provided checksum '~s' does not match "
+                                "computed checksum '~s'",
+                                [Given, Expected]))}
+                    catch
+                        throw:{invalid_char, _} ->
+                            {error, <<"Invalid characters in payload">>}
+                    end;
+                N ->
+                    {error, iolist_to_binary(io_lib:format(
+                        "Expected 8 character checksum, not ~B characters",
+                        [N]))}
+            end;
+        _MoreThanTwo ->
+            {error, <<"Multiple '#' symbols">>}
+    end.
+
+%% ── one request element (Core ProcessDescriptorImport, backup.cpp:141-300).
+%% Returns {ResultMap, Succeeded::boolean()}.  All errors are caught and
+%% reported per-element; the batch never aborts here.
+import_one_descriptor(Pid, Req, Ts, Network, PrivEnabled) when is_map(Req) ->
+    try
+        case maps:get(<<"desc">>, Req, undefined) of
+            undefined ->
+                %% backup.cpp:147-149.
+                imp_err(?RPC_INVALID_PARAMETER, <<"Descriptor not found.">>);
+            DescBin when is_binary(DescBin) ->
+                case check_descriptor_checksum(binary_to_list(DescBin)) of
+                    {error, Msg} ->
+                        imp_err(?RPC_INVALID_ADDRESS_OR_KEY, Msg);
+                    {ok, Body} ->
+                        case beamchain_descriptor:parse(Body) of
+                            {error, ParseErr} ->
+                                %% Parse failures are -5 (backup.cpp:159).
+                                imp_err(?RPC_INVALID_ADDRESS_OR_KEY,
+                                        io_lib:format("Invalid descriptor: ~p",
+                                                      [ParseErr]));
+                            {ok, Desc} ->
+                                import_parsed_descriptor(
+                                    Pid, Req, Desc, Body, Ts, Network,
+                                    PrivEnabled)
+                        end
+                end;
+            _NonString ->
+                imp_err(?RPC_TYPE_ERROR, <<"Descriptor must be a string">>)
+        end
+    catch
+        _:Err ->
+            imp_err(?RPC_MISC_ERROR, io_lib:format("Error: ~p", [Err]))
+    end;
+import_one_descriptor(_Pid, _NonObject, _Ts, _Network, _PrivEnabled) ->
+    imp_err(?RPC_INVALID_PARAMETER, <<"Invalid parameter, expected object">>).
+
+import_parsed_descriptor(Pid, Req, Desc, Body, Ts, Network, PrivEnabled) ->
+    HasPriv = beamchain_descriptor:has_private_keys(Desc),
+    if
+        HasPriv andalso not PrivEnabled ->
+            %% backup.cpp:223-226.
+            imp_err(?RPC_WALLET_ERROR,
+                    <<"Cannot import private keys to a wallet with "
+                      "private keys disabled">>);
+        (not HasPriv) andalso PrivEnabled ->
+            %% backup.cpp:259-262 (mirror rule).
+            imp_err(?RPC_WALLET_ERROR,
+                    <<"Cannot import descriptor without private keys to a "
+                      "wallet with private keys enabled">>);
+        true ->
+            IsRange = beamchain_descriptor:is_range(Desc),
+            RangeOpt = maps:get(<<"range">>, Req, undefined),
+            case {IsRange, RangeOpt} of
+                {false, RO} when RO =/= undefined, RO =/= null ->
+                    %% backup.cpp:173-174.
+                    imp_err(?RPC_INVALID_PARAMETER,
+                            <<"Range should not be specified for an "
+                              "un-ranged descriptor">>);
+                {false, _} ->
+                    case beamchain_descriptor:derive(Desc, 0, Network) of
+                        {ok, Script} ->
+                            import_register_scripts(Pid, Req, Body, Ts,
+                                                    Network, [{0, Script}]);
+                        {error, Reason} ->
+                            imp_err(?RPC_INVALID_ADDRESS_OR_KEY,
+                                    io_lib:format("Cannot derive script: ~p",
+                                                  [Reason]))
+                    end;
+                {true, RO} when RO =:= undefined; RO =:= null ->
+                    %% backup.cpp range checks.
+                    imp_err(?RPC_INVALID_PARAMETER,
+                            <<"Descriptor is ranged, please specify the "
+                              "range">>);
+                {true, RO} ->
+                    case import_parse_range(RO) of
+                        {ok, Start, End} ->
+                            case beamchain_descriptor:expand(
+                                     Desc, {Start, End}, Network) of
+                                {ok, Pairs} ->
+                                    import_register_scripts(
+                                        Pid, Req, Body, Ts, Network, Pairs);
+                                {error, Reason} ->
+                                    imp_err(?RPC_INVALID_ADDRESS_OR_KEY,
+                                            io_lib:format(
+                                                "Cannot derive script: ~p",
+                                                [Reason]))
+                            end;
+                        {error, Msg} ->
+                            imp_err(?RPC_INVALID_PARAMETER, Msg)
+                    end
+            end
+    end.
+
+%% Core's ParseRange: int N -> [0, N]; [begin, end] pair otherwise.
+import_parse_range(N) when is_integer(N), N >= 0 ->
+    {ok, 0, N};
+import_parse_range([S, E]) when is_integer(S), is_integer(E), S >= 0,
+                                E >= S ->
+    {ok, S, E};
+import_parse_range(_) ->
+    {error, <<"Invalid range">>}.
+
+%% Register every derived scriptPubKey as wallet-owned (persisted +
+%% reload-safe via the wallet's addresses list).  The ongoing
+%% block-connect scan then credits matching outputs automatically; the
+%% caller's post-loop rescan credits historical ones.
+import_register_scripts(Pid, Req, Body, Ts, Network, Pairs) ->
+    Label = case maps:get(<<"label">>, Req, <<>>) of
+        L when is_binary(L) -> L;
+        _ -> <<>>
+    end,
+    Internal = maps:get(<<"internal">>, Req, false) =:= true,
+    CanonDesc = list_to_binary(beamchain_descriptor:add_checksum(Body)),
+    TsInt = case Ts of
+        now -> erlang:system_time(second);
+        _   -> max(Ts, 1)      %% Core clamps to minimum_timestamp=1
+    end,
+    Entries = [#{<<"address">>    => script_to_address_bin(Script, Network),
+                 <<"label">>      => Label,
+                 <<"desc">>       => CanonDesc,
+                 <<"watch_only">> => true,
+                 <<"change">>     => Internal,
+                 <<"script_hex">> =>
+                     beamchain_serialize:hex_encode(Script),
+                 <<"timestamp">>  => TsInt}
+               || {_Idx, Script} <- Pairs],
+    ok = beamchain_wallet:import_watch_entries(Pid, Entries),
+    {#{<<"success">> => true}, true}.
+
+%% ── post-loop rescan (Core backup.cpp:398-409 + RescanFromTime) ────────
+%% Runs iff >=1 element succeeded with a numeric timestamp; scans
+%% synchronously from the height of the first block at/after
+%% lowest_timestamp - TIMESTAMP_WINDOW.  "now" entries skip the deep scan.
+maybe_import_rescan(SuccessTs) ->
+    case [T || T <- SuccessTs, is_integer(T)] of
+        [] ->
+            ok;
+        NumTs ->
+            Lowest = max(lists:min(NumTs), 1),
+            Tip = try beamchain_chainstate:get_tip_height() of
+                {ok, H}   -> H;
+                not_found -> undefined
+            catch
+                _:_ -> undefined
+            end,
+            case Tip of
+                undefined ->
+                    ok;
+                _ ->
+                    Start = import_rescan_start_height(Lowest, Tip),
+                    case Start =< Tip of
+                        true  -> _ = beamchain_wallet:rescan_chain(Start, Tip),
+                                 ok;
+                        false -> ok
+                    end
+            end
+    end.
+
+%% First height whose block time is >= Timestamp - TIMESTAMP_WINDOW
+%% (lower-bound binary search; Tip+1 when every block is older — nothing
+%% to scan).  Timestamps at/below the window scan from genesis.
+import_rescan_start_height(Timestamp, Tip) ->
+    Target = Timestamp - ?IMPORT_TIMESTAMP_WINDOW,
+    case Target =< 0 of
+        true  -> 0;
+        false -> import_time_lower_bound(0, Tip + 1, Target)
+    end.
+
+import_time_lower_bound(Lo, Hi, _Target) when Lo >= Hi ->
+    Lo;
+import_time_lower_bound(Lo, Hi, Target) ->
+    Mid = (Lo + Hi) div 2,
+    case import_block_time_at(Mid) of
+        {ok, T} when T >= Target ->
+            import_time_lower_bound(Lo, Mid, Target);
+        {ok, _} ->
+            import_time_lower_bound(Mid + 1, Hi, Target);
+        error ->
+            %% Unreadable block: fail SAFE toward scanning more (treat as
+            %% new enough to be included).
+            import_time_lower_bound(Lo, Mid, Target)
+    end.
+
+import_block_time_at(Height) ->
+    try beamchain_db:get_block_by_height(Height) of
+        {ok, #block{header = Header}} ->
+            {ok, Header#block_header.timestamp};
+        not_found ->
+            error
+    catch
+        _:_ -> error
+    end.
 
 %%% ===================================================================
 %%% rescanblockchain — wallet rescan of EXISTING chain blocks
