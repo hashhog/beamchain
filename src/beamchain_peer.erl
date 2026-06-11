@@ -34,7 +34,8 @@
          build_v2_initiator_handshake/2,
          scan_terminator/5,
          extract_v2_packet/1,
-         make_test_v2_peer/2]).
+         make_test_v2_peer/2,
+         advertised_services/0]).
 -endif.
 
 %%% -------------------------------------------------------------------
@@ -1287,32 +1288,7 @@ do_send_version(#peer_data{address = {IP, Port}, our_nonce = Nonce} = Data) ->
     %% lockstep — beamchain_peer_manager:handle_peer_message(_, mempool, _)
     %% disconnects peers that send MEMPOOL when this bit is off. Default-true
     %% mirrors Core's `-peerbloomfilters` default.
-    BaseServices = ?NODE_NETWORK bor ?NODE_WITNESS,
-    Services0 = case beamchain_config:node_bloom_enabled() of
-        true  -> BaseServices bor ?NODE_BLOOM;
-        false -> BaseServices
-    end,
-    %% BIP-157: advertise NODE_COMPACT_FILTERS only when the
-    %% blockfilterindex is enabled AND its gen_server is alive.  We
-    %% gate on both the config flag and the index process being up,
-    %% because peers that get NODE_COMPACT_FILTERS in our services
-    %% will issue getcfilters / getcfheaders / getcfcheckpt and we
-    %% must be able to answer them (BIP-157 §"Service bit").
-    Services1 = case beamchain_config:blockfilterindex_enabled() andalso
-                     beamchain_blockfilter_index:is_enabled() of
-        true  -> Services0 bor ?NODE_COMPACT_FILTERS;
-        false -> Services0
-    end,
-    %% BIP-159: advertise NODE_NETWORK_LIMITED when prune mode is on so
-    %% peers know we serve only the recent ~288-block window.  Mirrors
-    %% Core's `init.cpp` (`nLocalServices |= NODE_NETWORK_LIMITED` when
-    %% `IsPruneMode()` is true).  Core advertises NODE_NETWORK alongside
-    %% NODE_NETWORK_LIMITED in the auto-prune case (the node still has
-    %% the recent-288 window), so we keep NODE_NETWORK set as well.
-    Services = case beamchain_config:prune_enabled() of
-        true  -> Services1 bor ?NODE_NETWORK_LIMITED;
-        false -> Services1
-    end,
+    Services = advertised_services(),
     Now = erlang:system_time(second),
     %% start_height MUST report our actual current tip height. Bitcoin
     %% Core peers use this to decide whether the remote is a synced
@@ -1342,6 +1318,45 @@ do_send_version(#peer_data{address = {IP, Port}, our_nonce = Nonce} = Data) ->
     }),
     Data2 = do_send_raw(version, Payload, Data),
     Data2#peer_data{version_sent = true}.
+
+%% @doc Assemble the service-flags bitset we advertise in the `version'
+%% message. Bitcoin Core's full-node local-services set is
+%% NODE_NETWORK | NODE_WITNESS | NODE_NETWORK_LIMITED (init.cpp:863 seeds
+%% NODE_NETWORK_LIMITED | NODE_WITNESS unconditionally, init.cpp:1949-1950
+%% ORs in NODE_NETWORK in non-prune mode), giving 0x409. We additionally
+%% advertise NODE_BLOOM / NODE_COMPACT_FILTERS when those subsystems are
+%% enabled. NODE_P2P_V2 is NOT advertised: BIP-324 v2 transport is
+%% default-off here, so advertising the bit would claim an off-wire
+%% capability.
+-spec advertised_services() -> non_neg_integer().
+advertised_services() ->
+    BaseServices = ?NODE_NETWORK bor ?NODE_WITNESS,
+    Services0 = case beamchain_config:node_bloom_enabled() of
+        true  -> BaseServices bor ?NODE_BLOOM;
+        false -> BaseServices
+    end,
+    %% BIP-157: advertise NODE_COMPACT_FILTERS only when the
+    %% blockfilterindex is enabled AND its gen_server is alive.  We
+    %% gate on both the config flag and the index process being up,
+    %% because peers that get NODE_COMPACT_FILTERS in our services
+    %% will issue getcfilters / getcfheaders / getcfcheckpt and we
+    %% must be able to answer them (BIP-157 §"Service bit").
+    Services1 = case beamchain_config:blockfilterindex_enabled() andalso
+                     beamchain_blockfilter_index:is_enabled() of
+        true  -> Services0 bor ?NODE_COMPACT_FILTERS;
+        false -> Services0
+    end,
+    %% BIP-159: advertise NODE_NETWORK_LIMITED UNCONDITIONALLY. Bitcoin
+    %% Core sets it on the base local-services bitset for EVERY node, not
+    %% just pruned ones (init.cpp:863:
+    %% `g_local_services = ServiceFlags(NODE_NETWORK_LIMITED | NODE_WITNESS)`),
+    %% then adds NODE_NETWORK in non-prune mode (init.cpp:1949-1950). A full
+    %% node always serves at least the recent ~288-block window, so the
+    %% NODE_NETWORK_LIMITED guarantee holds regardless of prune mode. The
+    %% earlier prune-only gate was a Core-parity error. We keep NODE_NETWORK
+    %% set (non-pruned full node), giving NODE_NETWORK | NODE_WITNESS |
+    %% NODE_NETWORK_LIMITED = 0x409.
+    Services1 bor ?NODE_NETWORK_LIMITED.
 
 handle_version_msg(_Payload, #peer_data{version_recv = true} = Data) ->
     logger:warning("peer ~p duplicate version", [Data#peer_data.address]),
