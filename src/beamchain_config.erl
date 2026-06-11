@@ -12,6 +12,7 @@
          get/2,
          network/0,
          network_params/0,
+         network_params/1,
          datadir/0,
          magic/0,
          txindex_enabled/0,
@@ -728,6 +729,51 @@ network_params(mainnet) ->
             "dnsseed.emzy.de",
             "seed.bitcoin.wiz.biz"
         ],
+        %% Fixed-seed fallback (Core vFixedSeeds, IPv4-only routable set).
+        %% Dialled only when DNS seeding is empty/failed AND the address book
+        %% is still empty (see maybe_add_fixed_seeds/1 in the peer manager).
+        fixed_seeds = [
+            "2.121.116.198:8333",
+            "3.86.179.235:8333",
+            "4.2.51.251:8333",
+            "5.2.23.226:8333",
+            "12.11.29.34:8333",
+            "14.49.142.41:8333",
+            "18.27.125.103:8333",
+            "23.93.18.82:8333",
+            "24.16.202.74:8333",
+            "27.83.109.113:8333",
+            "31.41.23.249:8333",
+            "34.65.45.157:8333",
+            "35.78.97.86:8333",
+            "37.15.61.236:8333",
+            "38.52.3.192:8333",
+            "40.160.1.232:8333",
+            "44.223.26.178:8333",
+            "45.19.130.200:8333",
+            "46.126.216.3:8333",
+            "47.90.137.13:8333",
+            "50.4.123.66:8333",
+            "51.154.0.142:8333",
+            "52.182.185.242:8333",
+            "60.241.1.72:8333",
+            "62.34.57.141:8333",
+            "63.247.147.166:8333",
+            "64.23.97.128:8333",
+            "65.94.134.253:8333",
+            "66.35.84.14:8333",
+            "67.4.139.122:8333",
+            "68.61.69.53:8333",
+            "69.4.94.226:8333",
+            "70.44.20.24:8333",
+            "71.56.178.136:8333",
+            "72.88.192.74:8333",
+            "73.42.33.255:8333",
+            "74.48.195.218:8333",
+            "75.80.3.4:8333",
+            "76.124.35.108:8333",
+            "77.38.72.37:8333"
+        ],
         bip34_height = 227931,
         bip65_height = 388381,
         bip66_height = 363725,
@@ -754,6 +800,7 @@ network_params(testnet) ->
             "seed.testnet.bitcoin.sprovoost.nl",
             "testnet-seed.bluematt.me"
         ],
+        fixed_seeds = [],
         bip34_height = 21111,
         bip65_height = 581885,
         bip66_height = 330776,
@@ -778,6 +825,7 @@ network_params(testnet4) ->
             "seed.testnet4.bitcoin.sprovoost.nl",
             "seed.testnet4.wiz.biz"
         ],
+        fixed_seeds = [],
         bip34_height = 1,
         bip65_height = 1,
         bip66_height = 1,
@@ -799,6 +847,9 @@ network_params(regtest) ->
         genesis_hash = hexstr_to_bin(
             "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"),
         dns_seeds = [],
+        %% Regtest MUST carry an empty fixed-seed list (Core clears
+        %% vFixedSeeds for regtest) so the fallback can never fire there.
+        fixed_seeds = [],
         bip34_height = 1,
         bip65_height = 1,
         bip66_height = 1,
@@ -822,6 +873,7 @@ network_params(signet) ->
         dns_seeds = [
             "seed.signet.bitcoin.sprovoost.nl"
         ],
+        fixed_seeds = [],
         bip34_height = 1,
         bip65_height = 1,
         bip66_height = 1,

@@ -179,6 +179,16 @@ parse_args(["--dnsseed=" ++ Value | Rest], Cmd, Opts) ->
 parse_args(["--dnsseed", Value | Rest], Cmd, Opts) ->
     parse_args(Rest, Cmd, Opts#{nodnsseed => not parse_bool(Value)});
 
+%% --nofixedseeds / --fixedseeds=0: suppress the fixed-seed fallback
+%% (Core -fixedseeds=0). The fallback is enabled by default; -connect
+%% forces it off in the peer manager. --fixedseeds=1 re-enables.
+parse_args(["--nofixedseeds" | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{nofixedseeds => true});
+parse_args(["--fixedseeds=" ++ Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{nofixedseeds => not parse_bool(Value)});
+parse_args(["--fixedseeds", Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{nofixedseeds => not parse_bool(Value)});
+
 parse_args(["--rpc-port", Value | Rest], Cmd, Opts) ->
     parse_args(Rest, Cmd, Opts#{rpc_port => list_to_integer(Value)});
 parse_args(["--rpc-port=" ++ Value | Rest], Cmd, Opts) ->
@@ -337,6 +347,8 @@ print_usage() ->
         "                    disables DNS seeds + addrman auto-outbound~n"
         "                    (Core -connect semantics)~n"
         "  --nodnsseed       do not resolve DNS seeds (alias --dnsseed=0)~n"
+        "  --nofixedseeds    disable the fixed-seed fallback (alias~n"
+        "                    --fixedseeds=0; Core -fixedseeds=0)~n"
         "  --pid=<file>      pid file path (default: <datadir>/beamchain.pid)~n"
         "  --daemon          fork into the background after starting~n"
         "  --printtoconsole  also write log lines to stdout~n"
@@ -762,6 +774,12 @@ apply_opts(Opts) ->
         undefined -> ok;
         true  -> application:set_env(beamchain, nodnsseed, true,  [{persistent, true}]);
         false -> application:set_env(beamchain, nodnsseed, false, [{persistent, true}])
+    end,
+    %% --nofixedseeds / --fixedseeds=0: suppress the fixed-seed fallback.
+    case maps:get(nofixedseeds, Opts, undefined) of
+        undefined -> ok;
+        true  -> application:set_env(beamchain, nofixedseeds, true,  [{persistent, true}]);
+        false -> application:set_env(beamchain, nofixedseeds, false, [{persistent, true}])
     end,
     %% W119 FIX-64: TLS termination paths. Promoted to application env
     %% so beamchain_config:init/1 can mirror them into the ETS table

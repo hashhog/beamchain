@@ -67,6 +67,11 @@
     rpc_port           :: non_neg_integer(),
     genesis_hash       :: binary(),     %% 32 bytes
     dns_seeds          :: [string()],
+    %% Fixed-seed fallback (Bitcoin Core vFixedSeeds): hard-coded "IP:port"
+    %% strings dialled only when DNS seeding is empty/failed AND the address
+    %% book is empty (net.cpp:2604-2643, ThreadOpenConnections). Mainnet only;
+    %% MUST be [] for regtest (Core clears vFixedSeeds for regtest).
+    fixed_seeds        :: [string()],
     bip34_height       :: non_neg_integer(),
     bip65_height       :: non_neg_integer(),
     bip66_height       :: non_neg_integer(),

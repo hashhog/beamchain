@@ -81,6 +81,10 @@
 %% Exposed for testing (BIP-130 announce branching)
 -export([pick_announce_msg/3]).
 
+%% Exposed for testing (fixed-seed fallback: Core vFixedSeeds parity)
+-export([parse_fixed_seeds/2, fixed_seed_addrs/0,
+         should_fire_fixed_seeds/6]).
+
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2]).
@@ -142,6 +146,13 @@
 %% 500ms fast-connect cadence. First completed DNS resolution (or this
 %% deadline, whichever fires first) releases the connect_tick loop.
 -define(DNS_WARMUP_TIMEOUT, 30000).          %% 30 seconds
+
+%% Fixed-seed fallback grace (Bitcoin Core net.cpp:2614,
+%% `GetTime() > start + 1min`): give DNS / -addnode / -seednode 60s to
+%% populate the address book before falling back on the hard-coded seeds.
+%% When DNS is disabled and there is no other peer source, the fallback
+%% fires immediately instead (net.cpp:2620 `!dnsseed && !use_seednodes`).
+-define(FIXED_SEED_GRACE, 60).               %% 60 seconds (in seconds)
 
 -record(peer_entry, {
     pid         :: pid(),
@@ -232,7 +243,20 @@
     %% -nodnsseed / -dnsseed=0: suppress DNS seed resolution independently
     %% of -connect (Core -dnsseed=0 / clearbit --nodnsseed). Implied true
     %% whenever connect_addrs is non-empty.
-    no_dns_seed = false :: boolean()
+    no_dns_seed = false :: boolean(),
+    %% -nofixedseeds / -fixedseeds=0: suppress the fixed-seed fallback
+    %% (Core -fixedseeds=0). Implied true whenever connect_addrs is
+    %% non-empty (Core -connect bypasses ThreadOpenConnections fixed-seed
+    %% logic). Default false (fallback enabled), matching Core net.cpp.
+    no_fixed_seed = false :: boolean(),
+    %% One-shot guard: set true after the fixed-seed fallback has fired
+    %% once, so a later connect_tick / deadline cannot double-inject
+    %% (Core sets add_fixed_seeds=false after the single injection).
+    fixed_seeds_added = false :: boolean(),
+    %% Connection-loop start timestamp (erlang:system_time(second)),
+    %% anchored at bootstrap BEFORE the first DNS resolve — the Core
+    %% `auto start = GetTime()` reference for the 60s fixed-seed grace.
+    start_time :: non_neg_integer() | undefined
 }).
 
 %%% ===================================================================
@@ -632,6 +656,12 @@ init([]) ->
     %% -connect implies -dnsseed=0 (Core init.cpp). Force DNS off whenever
     %% the connect list is non-empty.
     NoDnsSeed = NoDnsSeed0 orelse ConnectAddrs =/= [],
+    %% -nofixedseeds / -fixedseeds=0 (Core -fixedseeds default true). Read
+    %% from the same application env that beamchain_cli:apply_opts/1 writes.
+    %% -connect bypasses ThreadOpenConnections fixed-seed logic entirely, so
+    %% force the fallback off whenever the connect list is non-empty.
+    NoFixedSeed0 = application:get_env(beamchain, nofixedseeds, false) =:= true,
+    NoFixedSeed = NoFixedSeed0 orelse ConnectAddrs =/= [],
     case ConnectAddrs of
         [] when NoDnsSeed -> logger:info("peer manager: DNS seeds disabled (-nodnsseed)");
         [] -> ok;
@@ -649,7 +679,9 @@ init([]) ->
                 periodic_header_timer = PeriodicHdrTimer,
                 asmap_health_timer = AsmapHealthTimer,
                 connect_addrs = ConnectAddrs,
-                no_dns_seed = NoDnsSeed}}.
+                no_dns_seed = NoDnsSeed,
+                no_fixed_seed = NoFixedSeed,
+                start_time = Now}}.
 
 handle_call({connect_to, IP, Port}, _From, State) ->
     Address = {IP, Port},
@@ -845,17 +877,28 @@ handle_info(bootstrap, State) ->
     %% the connect_tick loop on the first resolution completing.
     case State2#state.no_dns_seed of
         true ->
+            %% No DNS: there is no other peer source to wait on, so the
+            %% fixed-seed fallback fires immediately when the address book
+            %% is empty (Core net.cpp:2620 `!dnsseed && !use_seednodes`
+            %% cheap shortcut). maybe_add_fixed_seeds/1 is a no-op when the
+            %% fallback is disabled, already fired, or the book is populated.
+            State3 = maybe_add_fixed_seeds(State2),
             %% No DNS: release the connect_tick loop now so addrman /
             %% anchors / persisted peers can still be dialed.
             Timer = erlang:send_after(?CONNECT_INTERVAL, self(), connect_tick),
-            {noreply, State2#state{dns_warmup_done = true, connect_timer = Timer}};
+            {noreply, State3#state{dns_warmup_done = true, connect_timer = Timer}};
         false ->
             gen_server:cast(self(), resolve_dns_seeds),
             {noreply, State2}
     end;
 
 %% Connection maintenance tick
-handle_info(connect_tick, State) ->
+handle_info(connect_tick, State0) ->
+    %% Core ThreadOpenConnections checks the fixed-seed fallback on every
+    %% loop iteration (net.cpp:2607): fire once the 60s grace has elapsed
+    %% and the address book is still empty (DNS returned nothing usable).
+    %% One-shot — guarded inside maybe_add_fixed_seeds/1.
+    State = maybe_add_fixed_seeds(State0),
     State2 = maybe_open_connection(State),
     %% Schedule next tick based on how many outbounds we need
     Outbound = outbound_count(),
@@ -877,8 +920,12 @@ handle_info(dns_warmup_deadline, State) ->
     logger:warning("peer manager: DNS warm-up timed out after ~Bs, "
                    "starting connect_tick with whatever addresses are available",
                    [?DNS_WARMUP_TIMEOUT div 1000]),
+    %% DNS never returned within the warm-up window. Attempt the fixed-seed
+    %% fallback now (no-op until the 60s grace has elapsed and only when the
+    %% address book is still empty); the connect_tick loop re-checks too.
+    State2 = maybe_add_fixed_seeds(State),
     Timer = erlang:send_after(?CONNECT_INTERVAL, self(), connect_tick),
-    {noreply, State#state{dns_warmup_done = true, connect_timer = Timer}};
+    {noreply, State2#state{dns_warmup_done = true, connect_timer = Timer}};
 
 %% DNS seed resolution completed
 handle_info({dns_seeds_resolved, Addrs}, State) ->
@@ -2471,6 +2518,148 @@ resolve_one_seed(Seed, Port) ->
             logger:debug("dns seed ~s: ~B addresses", [Seed, length(IPs)]),
             [{IP, Port} || IP <- IPs]
     end.
+
+%%% ===================================================================
+%%% Internal: fixed-seed fallback (Bitcoin Core vFixedSeeds)
+%%% ===================================================================
+%%
+%% Last-resort bootstrap: when DNS seeding is empty/disabled AND the
+%% address book is still empty, dial a hard-coded set of reachable peers.
+%% Mirrors Core net.cpp:2604-2643 (ThreadOpenConnections). One-shot:
+%% layered AFTER normal DNS bootstrap, never replacing it.
+
+%% @doc Fire the one-shot fixed-seed fallback iff the Core-faithful
+%% predicate holds (net.cpp:2604-2643). No-op otherwise. Returns the
+%% (possibly updated) state with `discovered` merged and the one-shot
+%% guard set.
+-spec maybe_add_fixed_seeds(#state{}) -> #state{}.
+maybe_add_fixed_seeds(State) ->
+    Now = erlang:system_time(second),
+    Start = case State#state.start_time of
+        undefined -> Now;
+        S -> S
+    end,
+    case should_fire_fixed_seeds(
+            State#state.fixed_seeds_added,
+            State#state.no_fixed_seed,
+            State#state.discovered,
+            State#state.no_dns_seed,
+            Start, Now) of
+        false ->
+            State;
+        true ->
+            Seeds = fixed_seed_addrs(),
+            case Seeds of
+                [] ->
+                    %% No fixed seeds for this network (regtest/testnet*):
+                    %% still mark the guard so we don't re-scan every tick.
+                    State#state{fixed_seeds_added = true};
+                _ ->
+                    Merged = lists:usort(Seeds ++ State#state.discovered),
+                    logger:info("peer manager: address book empty, adding ~B "
+                                "fixed seeds as fallback", [length(Seeds)]),
+                    State#state{discovered = Merged, fixed_seeds_added = true}
+            end
+    end.
+
+%% @doc Core-faithful fixed-seed firing predicate (net.cpp:2604-2643),
+%% factored out as a pure function so it can be unit-tested directly.
+%% Fire the one-shot injection ONLY when ALL hold:
+%%   * not already fired (one-shot guard);
+%%   * fixed-seeds enabled (NoFixedSeed=false, i.e. -fixedseeds!=0 and not
+%%     -connect);
+%%   * the address book (Discovered) is empty — Core's reachable-empty-net
+%%     proxy;
+%%   * EITHER DNS seeding is disabled (NoDnsSeed=true) so there is nothing
+%%     else to wait on and we fire immediately (net.cpp:2620), OR the 60s
+%%     grace since loop start has elapsed (net.cpp:2614).
+-spec should_fire_fixed_seeds(boolean(), boolean(),
+                              [{inet:ip_address(), inet:port_number()}],
+                              boolean(), non_neg_integer(),
+                              non_neg_integer()) -> boolean().
+should_fire_fixed_seeds(true, _NoFixed, _Discovered, _NoDns, _Start, _Now) ->
+    false;  %% already fired (one-shot)
+should_fire_fixed_seeds(_Added, true, _Discovered, _NoDns, _Start, _Now) ->
+    false;  %% fixed seeds disabled (-fixedseeds=0 / -connect)
+should_fire_fixed_seeds(_Added, _NoFixed, [_ | _], _NoDns, _Start, _Now) ->
+    false;  %% address book non-empty (some source populated it first)
+should_fire_fixed_seeds(false, false, [], NoDns, Start, Now) ->
+    %% Book empty, enabled, not yet fired: fire immediately when DNS is off,
+    %% else only after the 60s grace.
+    NoDns orelse (Now >= Start + ?FIXED_SEED_GRACE).
+
+%% @doc Parse the network's configured fixed-seed "IP:port" strings into
+%% routable IPv4 {Ip, Port} tuples (non-routable / unparseable entries are
+%% dropped, mirroring Core's addrman.Add() reachable-net filter).
+-spec fixed_seed_addrs() -> [{inet:ip_address(), inet:port_number()}].
+fixed_seed_addrs() ->
+    Params = beamchain_config:network_params(),
+    Specs = Params#network_params.fixed_seeds,
+    DefaultPort = Params#network_params.default_port,
+    parse_fixed_seeds(Specs, DefaultPort).
+
+-spec parse_fixed_seeds([string()], inet:port_number()) ->
+    [{inet:ip_address(), inet:port_number()}].
+parse_fixed_seeds(Specs, DefaultPort) ->
+    lists:filtermap(fun(Spec) ->
+        case parse_fixed_seed(Spec, DefaultPort) of
+            {ok, {IP, _Port} = Addr} ->
+                %% Core's addrman.Add() drops non-routable seeds. Mirror the
+                %% reachable-net filter (the curated set is public IPv4).
+                case is_routable_ipv4(IP) of
+                    true  -> {true, Addr};
+                    false ->
+                        logger:warning("peer manager: fixed seed ~s not "
+                                       "routable; skipping", [Spec]),
+                        false
+                end;
+            error ->
+                logger:warning("peer manager: cannot parse fixed seed ~s; "
+                               "skipping", [Spec]),
+                false
+        end
+    end, Specs).
+
+%% @doc Parse a single "IP:port" (or bare "IP") fixed-seed entry.
+-spec parse_fixed_seed(string(), inet:port_number()) ->
+    {ok, {inet:ip_address(), inet:port_number()}} | error.
+parse_fixed_seed(Spec, DefaultPort) when is_list(Spec) ->
+    {Host, Port} = case string:split(Spec, ":", trailing) of
+        [H, PortStr] ->
+            case catch list_to_integer(PortStr) of
+                P when is_integer(P), P > 0, P =< 65535 -> {H, P};
+                _ -> {Spec, DefaultPort}  %% colon but bad port: whole as host
+            end;
+        [H] ->
+            {H, DefaultPort}
+    end,
+    case inet:parse_address(Host) of
+        {ok, IP}    -> {ok, {IP, Port}};
+        {error, _}  -> error
+    end.
+
+%% @doc True iff a parsed IPv4 address is publicly routable (mirrors the
+%% reachable-net filter Core's addrman.Add() applies — RFC1918/loopback/
+%% link-local/documentation/CGN/benchmark ranges are NOT routable).
+%% Non-IPv4 addresses are not part of the curated fixed-seed set.
+-spec is_routable_ipv4(inet:ip_address()) -> boolean().
+is_routable_ipv4({A, B, _C, _D}) ->
+    not (
+        %% Loopback 127.0.0.0/8 or unspecified 0.0.0.0/8
+        A =:= 127 orelse A =:= 0 orelse
+        %% RFC 1918 private
+        A =:= 10 orelse
+        (A =:= 172 andalso B >= 16 andalso B =< 31) orelse
+        (A =:= 192 andalso B =:= 168) orelse
+        %% RFC 6598 carrier-grade NAT 100.64.0.0/10
+        (A =:= 100 andalso B >= 64 andalso B =< 127) orelse
+        %% RFC 2544 benchmarking 198.18.0.0/15
+        (A =:= 198 andalso (B =:= 18 orelse B =:= 19)) orelse
+        %% RFC 3927 link-local 169.254.0.0/16
+        (A =:= 169 andalso B =:= 254)
+    );
+is_routable_ipv4(_) ->
+    false.
 
 %%% ===================================================================
 %%% Internal: helpers
