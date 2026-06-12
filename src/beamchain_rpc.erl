@@ -57,6 +57,10 @@
 %% directly without spinning up the cowboy listener.
 -export([rpc_getindexinfo/1]).
 
+%% Exported for EUnit so tests can drive the gettxspendingprevout RPC
+%% handler directly (error codes + result shape) without cowboy.
+-export([rpc_gettxspendingprevout/1]).
+
 %% Test-only exports — confirmations helpers (Pattern C1 regression tests).
 -ifdef(TEST).
 -export([confirmations/1, confirmations/2, is_block_in_active_chain/1]).
@@ -753,6 +757,7 @@ handle_method(<<"createrawtransaction">>, P, _W) -> rpc_createrawtransaction(P);
 handle_method(<<"testmempoolaccept">>, P, _W) -> rpc_testmempoolaccept(P);
 handle_method(<<"submitpackage">>, P, _W) -> rpc_submitpackage(P);
 handle_method(<<"gettxout">>, P, _W) -> rpc_gettxout(P);
+handle_method(<<"gettxspendingprevout">>, P, _W) -> rpc_gettxspendingprevout(P);
 handle_method(<<"gettxoutsetinfo">>, P, _W) -> rpc_gettxoutsetinfo(P);
 
 %% -- Mempool --
@@ -2061,7 +2066,8 @@ rpc_getindexinfo([IndexName]) when is_binary(IndexName) ->
     Summaries =
         index_summary_txindex(ChainTipHeight)
         ++ index_summary_blockfilter(ChainTipHeight)
-        ++ index_summary_coinstats(ChainTipHeight),
+        ++ index_summary_coinstats(ChainTipHeight)
+        ++ index_summary_txospender(ChainTipHeight),
     %% Apply the index_name filter (SummaryToJSON:354) and build the
     %% dynamic object as an ordered proplist so jsx preserves both the
     %% per-index key ordering AND the {synced, best_block_height} field
@@ -2120,6 +2126,20 @@ index_summary_coinstats(ChainTipHeight) ->
                 _ -> 0
             end,
             index_summary_entry(<<"coinstatsindex">>,
+                                BestHeight, ChainTipHeight)
+    end.
+
+%% txospenderindex summary entry, or [] when it is not running.
+%% Name == Core's GetName() "txospenderindex" (txospenderindex.cpp).
+index_summary_txospender(ChainTipHeight) ->
+    case beamchain_txospenderindex:is_enabled() of
+        false -> [];
+        true ->
+            BestHeight = case beamchain_txospenderindex:tip_height() of
+                N when is_integer(N), N >= 0 -> N;
+                _ -> 0
+            end,
+            index_summary_entry(<<"txospenderindex">>,
                                 BestHeight, ChainTipHeight)
     end.
 
@@ -3644,6 +3664,240 @@ rpc_gettxout([TxidHex, N, IncludeMempool]) when is_binary(TxidHex),
 rpc_gettxout(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"Usage: gettxout \"txid\" n ( include_mempool )">>}.
+
+%% @doc gettxspendingprevout — scan the mempool (and the txospenderindex, if
+%% available) to find transactions spending any of the given outputs.
+%% Mirrors Bitcoin Core rpc/mempool.cpp::gettxspendingprevout (v31.99)
+%% exactly, including the four error codes:
+%%   empty outputs        -> -8  (RPC_INVALID_PARAMETER) "Invalid parameter, outputs are missing"
+%%   negative vout        -> -8  (RPC_INVALID_PARAMETER) "Invalid parameter, vout cannot be negative"
+%%   strict unknown key   -> -3  (RPC_TYPE_ERROR)        "Unexpected key ..." (also missing/wrong-type fields)
+%%   index unavailable    -> -1  (RPC_MISC_ERROR)        "Mempool lacks a relevant spend, and txospenderindex is unavailable."
+%% options is strict {mempool_only (default = txospenderindex unavailable),
+%% return_spending_tx (default false)}. The mempool reverse-index is searched
+%% first; per-output pushKV order is txid, vout, spendingtxid (if found),
+%% spendingtx (iff return_spending_tx), blockhash (CONFIRMED/index path only).
+rpc_gettxspendingprevout([Outputs]) ->
+    rpc_gettxspendingprevout([Outputs, null]);
+rpc_gettxspendingprevout([Outputs, OptionsArg]) ->
+    %% Core: const UniValue& output_params = request.params[0].get_array();
+    %%       if (output_params.empty()) throw "Invalid parameter, outputs are missing".
+    case Outputs of
+        L when is_list(L), L =/= [] ->
+            try
+                IndexAvail = beamchain_txospenderindex:is_enabled(),
+                {MempoolOnly, ReturnSpendingTx} =
+                    parse_gtspo_options(OptionsArg, IndexAvail),
+                Worklist = parse_gtspo_outputs(L),
+                do_gettxspendingprevout(Worklist, MempoolOnly,
+                                        ReturnSpendingTx, IndexAvail)
+            catch
+                throw:{gtspo_error, Code, Msg} ->
+                    {error, Code, Msg}
+            end;
+        L when is_list(L) ->
+            {error, ?RPC_INVALID_PARAMETER,
+             <<"Invalid parameter, outputs are missing">>};
+        _ ->
+            {error, ?RPC_INVALID_PARAMETER,
+             <<"Invalid parameter, outputs are missing">>}
+    end;
+rpc_gettxspendingprevout(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: gettxspendingprevout [{\"txid\":\"id\",\"vout\":n},...] "
+       "( options )">>}.
+
+%% Parse the strict {mempool_only, return_spending_tx} options object.
+%% Core RPCTypeCheckObj(..., fStrict=true): an unknown key or wrong-type
+%% value throws RPC_TYPE_ERROR (-3). mempool_only default = !g_txospenderindex.
+parse_gtspo_options(null, IndexAvail) ->
+    {not IndexAvail, false};
+parse_gtspo_options(Opts, IndexAvail) when is_map(Opts) ->
+    maps:foreach(
+      fun(K, _V) ->
+          case K of
+              <<"mempool_only">> -> ok;
+              <<"return_spending_tx">> -> ok;
+              _ -> throw({gtspo_error, ?RPC_TYPE_ERROR,
+                          <<"Unexpected key ", K/binary>>})
+          end
+      end, Opts),
+    MempoolOnly = case maps:find(<<"mempool_only">>, Opts) of
+        {ok, B1} when is_boolean(B1) -> B1;
+        {ok, _} -> throw({gtspo_error, ?RPC_TYPE_ERROR,
+                          <<"JSON value of type ... for field mempool_only "
+                            "is not of expected type bool">>});
+        error -> not IndexAvail
+    end,
+    ReturnSpendingTx = case maps:find(<<"return_spending_tx">>, Opts) of
+        {ok, B2} when is_boolean(B2) -> B2;
+        {ok, _} -> throw({gtspo_error, ?RPC_TYPE_ERROR,
+                          <<"JSON value of type ... for field "
+                            "return_spending_tx is not of expected type bool">>});
+        error -> false
+    end,
+    {MempoolOnly, ReturnSpendingTx};
+parse_gtspo_options(_Other, _IndexAvail) ->
+    throw({gtspo_error, ?RPC_TYPE_ERROR, <<"Expected options object">>}).
+
+%% Parse the outputs array into a worklist of
+%% {OutpointTxidInternal, Vout, TxidHexExternal} tuples, preserving order.
+%% Strict per-output object: only txid + vout (Core RPCTypeCheckObj strict).
+parse_gtspo_outputs(L) ->
+    [ parse_gtspo_output(O) || O <- L ].
+
+parse_gtspo_output(O) when is_map(O) ->
+    %% Strict: reject any key other than txid / vout (-3 RPC_TYPE_ERROR).
+    maps:foreach(
+      fun(K, _V) ->
+          case K of
+              <<"txid">> -> ok;
+              <<"vout">> -> ok;
+              _ -> throw({gtspo_error, ?RPC_TYPE_ERROR,
+                          <<"Unexpected key ", K/binary>>})
+          end
+      end, O),
+    TxidHex = case maps:find(<<"txid">>, O) of
+        {ok, T} when is_binary(T) -> T;
+        {ok, _} -> throw({gtspo_error, ?RPC_TYPE_ERROR,
+                          <<"JSON value of type ... for field txid is not of "
+                            "expected type string">>});
+        error -> throw({gtspo_error, ?RPC_TYPE_ERROR, <<"Missing txid">>})
+    end,
+    Vout = case maps:find(<<"vout">>, O) of
+        {ok, V} when is_integer(V) -> V;
+        {ok, _} -> throw({gtspo_error, ?RPC_TYPE_ERROR,
+                          <<"JSON value of type ... for field vout is not of "
+                            "expected type number">>});
+        error -> throw({gtspo_error, ?RPC_TYPE_ERROR, <<"Missing vout">>})
+    end,
+    %% Core: if (nOutput < 0) throw "Invalid parameter, vout cannot be negative".
+    Vout >= 0 orelse
+        throw({gtspo_error, ?RPC_INVALID_PARAMETER,
+               <<"Invalid parameter, vout cannot be negative">>}),
+    Txid = gtspo_parse_txid(TxidHex),
+    {Txid, Vout, TxidHex};
+parse_gtspo_output(_Other) ->
+    throw({gtspo_error, ?RPC_TYPE_ERROR, <<"Expected object">>}).
+
+%% Parse a display-order txid hex string to internal byte order, validating
+%% that it is exactly 32 bytes (64 hex chars). Core ParseHashO throws on bad
+%% hex / wrong length.
+gtspo_parse_txid(TxidHex) ->
+    try hex_to_internal_hash(TxidHex) of
+        Bin when byte_size(Bin) =:= 32 -> Bin;
+        _ -> throw({gtspo_error, ?RPC_INVALID_PARAMETER,
+                    <<TxidHex/binary, " must be of length 64 (not ",
+                      (integer_to_binary(byte_size(TxidHex)))/binary,
+                      ", for ", TxidHex/binary, ")">>})
+    catch
+        error:_ ->
+            throw({gtspo_error, ?RPC_INVALID_PARAMETER,
+                   <<TxidHex/binary, " must be hexadecimal string (not '",
+                     TxidHex/binary, "')">>})
+    end.
+
+%% Core algorithm (mempool.cpp:988-1038): mempool reverse-index FIRST; for
+%% each output, if a mempool spender is found OR this is a mempool_only
+%% request, emit it and drop from the worklist. Return early if all resolved.
+%% Otherwise the index must be available+synced, else RPC_MISC_ERROR (-1);
+%% then resolve the remainder from the index.
+do_gettxspendingprevout(Worklist, MempoolOnly, ReturnSpendingTx, IndexAvail) ->
+    %% Phase 1 — mempool first.
+    {Resolved, Remaining} =
+        lists:foldl(
+          fun({Txid, Vout, TxidHex} = E, {AccR, AccRem}) ->
+              case beamchain_mempool:find_spending_tx(Txid, Vout) of
+                  {ok, SpendingTx} ->
+                      Obj = gtspo_make_output(TxidHex, Vout, ReturnSpendingTx,
+                                              {mempool, SpendingTx}),
+                      {[Obj | AccR], AccRem};
+                  not_found when MempoolOnly ->
+                      %% mempool-only and unspent in mempool -> bare txid+vout.
+                      Obj = gtspo_make_output(TxidHex, Vout, ReturnSpendingTx,
+                                              unspent),
+                      {[Obj | AccR], AccRem};
+                  not_found ->
+                      {AccR, [E | AccRem]}
+              end
+          end, {[], []}, Worklist),
+    case lists:reverse(Remaining) of
+        [] ->
+            %% All handled by the mempool search (Core early-return).
+            gtspo_reply(lists:reverse(Resolved));
+        Rem ->
+            %% Core: !g_txospenderindex || !BlockUntilSyncedToCurrentChain()
+            %% -> RPC_MISC_ERROR. We require the index enabled AND synced to
+            %% the active chain tip (the index keeps a persisted best tip).
+            case IndexAvail andalso gtspo_index_synced() of
+                false ->
+                    {error, ?RPC_MISC_ERROR,
+                     <<"Mempool lacks a relevant spend, and "
+                       "txospenderindex is unavailable.">>};
+                true ->
+                    IndexObjs =
+                        [ gtspo_resolve_from_index(E, ReturnSpendingTx)
+                          || E <- Rem ],
+                    gtspo_reply(lists:reverse(Resolved) ++ IndexObjs)
+            end
+    end.
+
+%% The index must have caught up to the active chain tip before we trust an
+%% "unspent" answer (Core BlockUntilSyncedToCurrentChain).
+gtspo_index_synced() ->
+    IndexTip = beamchain_txospenderindex:tip_height(),
+    case beamchain_chainstate:get_tip() of
+        {ok, {_Hash, ChainHeight}} when is_integer(ChainHeight) ->
+            IndexTip >= ChainHeight;
+        _ ->
+            %% No chain tip yet -> treat the index as synced (nothing to lag).
+            IndexTip >= 0
+    end.
+
+gtspo_resolve_from_index({Txid, Vout, TxidHex}, ReturnSpendingTx) ->
+    case beamchain_txospenderindex:find_spender(Txid, Vout) of
+        {ok, #{spending_txid := STxid, block_hash := BH,
+               spending_tx := TxBin}} ->
+            gtspo_make_output(TxidHex, Vout, ReturnSpendingTx,
+                              {index, STxid, BH, TxBin});
+        not_found ->
+            %% Unspent on-chain -> only txid+vout (Core make_output(prevout)).
+            gtspo_make_output(TxidHex, Vout, ReturnSpendingTx, unspent)
+    end.
+
+%% Build one per-output object as an ordered proplist so jsx preserves the
+%% exact Core pushKV order: txid, vout, [spendingtxid], [spendingtx],
+%% [blockhash]. blockhash is emitted ONLY on the index/confirmed path.
+gtspo_make_output(TxidHex, Vout, _ReturnSpendingTx, unspent) ->
+    [{<<"txid">>, TxidHex}, {<<"vout">>, Vout}];
+gtspo_make_output(TxidHex, Vout, ReturnSpendingTx, {mempool, SpendingTx}) ->
+    SpendTxid = beamchain_serialize:tx_hash(SpendingTx),
+    Base = [{<<"txid">>, TxidHex}, {<<"vout">>, Vout},
+            {<<"spendingtxid">>, hash_to_hex(SpendTxid)}],
+    case ReturnSpendingTx of
+        true ->
+            TxBin = beamchain_serialize:encode_transaction(SpendingTx, witness),
+            Base ++ [{<<"spendingtx">>,
+                      beamchain_serialize:hex_encode(TxBin)}];
+        false ->
+            Base
+    end;
+gtspo_make_output(TxidHex, Vout, ReturnSpendingTx,
+                  {index, STxid, BH, TxBin}) ->
+    Base = [{<<"txid">>, TxidHex}, {<<"vout">>, Vout},
+            {<<"spendingtxid">>, hash_to_hex(STxid)}],
+    WithTx = case ReturnSpendingTx of
+        true -> Base ++ [{<<"spendingtx">>,
+                          beamchain_serialize:hex_encode(TxBin)}];
+        false -> Base
+    end,
+    %% blockhash ONLY on the confirmed/index path.
+    WithTx ++ [{<<"blockhash">>, hash_to_hex(BH)}].
+
+%% Encode the result array. Each element is an ordered proplist; jsx encodes
+%% a list of proplists as a JSON array of objects, preserving key order.
+gtspo_reply(Objs) ->
+    {ok_raw_json, jsx:encode(Objs)}.
 
 rpc_gettxoutsetinfo([]) ->
     %% Per Core (rpc/blockchain.cpp:1017), the default hash_type is
