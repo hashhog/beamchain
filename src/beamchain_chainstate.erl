@@ -1111,6 +1111,18 @@ do_connect_block_inner(#block{header = Header} = Block,
                 _ = (catch beamchain_coinstatsindex:add_block(
                         Block#block{hash = BlockHash}, Height)),
 
+                %% txospenderindex: record spent_outpoint -> spending tx for
+                %% every non-coinbase input of every tx (Core CustomAppend).
+                %% Best-effort -- failure does not roll back the block.
+                %% Default-off (no-op when the index isn't running). Same
+                %% single canonical maintenance site as coinstats/txindex; it
+                %% re-derives its keys from the block's own inputs, so the
+                %% disconnect side erases exactly these on reorg /
+                %% invalidateblock / reconsiderblock (all of which reuse
+                %% do_connect_block / do_disconnect_block).
+                _ = (catch beamchain_txospenderindex:add_block(
+                        Block#block{hash = BlockHash}, Height)),
+
                 %% Wallet UTXO ledger: scan the connected block for outputs
                 %% paying wallet addresses (credit) and inputs spending wallet
                 %% coins (debit).  Mirrors Core's CWallet::blockConnected
@@ -1652,6 +1664,20 @@ do_disconnect_block(#state{tip_hash = TipHash, tip_height = TipHeight,
                     %% correct rolled-back state. No undo data needed here.
                     _ = (catch beamchain_coinstatsindex:remove_block(
                             TipHash, TipHeight)),
+
+                    %% txospenderindex: roll back the disconnected block by
+                    %% RE-DERIVING its spend keys from its OWN inputs and
+                    %% erasing them (Core CustomRemove(BuildSpenderPositions)).
+                    %% Best-effort, default-off. This is the SAME canonical
+                    %% disconnect site the LIVE reorg path
+                    %% (do_reorganize_atomic -> disconnect_to ->
+                    %% do_disconnect_block) and invalidateblock both reuse,
+                    %% disconnect-before-connect, so the index follows the
+                    %% active chain across every reorg. We pass the full Block
+                    %% (already loaded above) so the index can re-derive the
+                    %% keys without undo data.
+                    _ = (catch beamchain_txospenderindex:remove_block(
+                            Block, TipHeight)),
 
                     %% Wallet UTXO ledger: reverse this block's credits so the
                     %% ledger does not over-count coins that no longer exist on

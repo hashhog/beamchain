@@ -24,6 +24,7 @@
 
 %% Queries
 -export([has_tx/1, get_tx/1, get_entry/1, get_wtxid/1]).
+-export([find_spending_tx/2]).
 -export([get_all_txids/0, get_all_entries/0, get_all_id_pairs/0, get_info/0]).
 -export([get_all_orphans/0]).
 -export([get_sorted_by_fee/0]).
@@ -317,6 +318,23 @@ get_tx(Txid) ->
         [{Txid, Entry}] -> {ok, Entry#mempool_entry.tx};
         [] -> not_found
     end.
+
+%% @doc Find the mempool transaction (if any) that spends the outpoint
+%% (Txid, Vout). Mirrors Bitcoin Core CTxMemPool::GetConflictTx, the
+%% mempool reverse-index lookup that backs gettxspendingprevout's
+%% mempool-first search: the MEMPOOL_OUTPOINTS table maps a spent outpoint
+%% {txid, vout} -> the spending txid, so this is an O(1) lookup followed by
+%% a fetch of the spending tx. Returns {ok, #transaction{}} for the
+%% spending tx or not_found when no mempool tx spends the outpoint.
+-spec find_spending_tx(binary(), non_neg_integer()) ->
+    {ok, #transaction{}} | not_found.
+find_spending_tx(Txid, Vout)
+  when byte_size(Txid) =:= 32, is_integer(Vout), Vout >= 0 ->
+    case ets:lookup(?MEMPOOL_OUTPOINTS, {Txid, Vout}) of
+        [{{Txid, Vout}, SpendingTxid}] -> get_tx(SpendingTxid);
+        [] -> not_found
+    end;
+find_spending_tx(_, _) -> not_found.
 
 %% @doc Get the full mempool entry for a txid.
 -spec get_entry(binary()) -> {ok, #mempool_entry{}} | not_found.
