@@ -63,12 +63,18 @@ start_link() ->
 get(Key) ->
     get(Key, undefined).
 
-%% @doc Get a config value by key with default
+%% @doc Get a config value by key with default. Returns the default if the
+%% config gen_server has not initialised its ETS table yet (early boot or a
+%% bare-module unit test), so a config read never crashes with badarg.
 -spec get(atom(), term()) -> term().
 get(Key, Default) ->
-    case ets:lookup(?CONFIG_TABLE, Key) of
-        [{Key, Value}] -> Value;
-        [] -> Default
+    case ets:whereis(?CONFIG_TABLE) of
+        undefined -> Default;
+        _ ->
+            case ets:lookup(?CONFIG_TABLE, Key) of
+                [{Key, Value}] -> Value;
+                [] -> Default
+            end
     end.
 
 %% @doc Get current network atom

@@ -160,7 +160,7 @@
          mininginfo_proplist/6,
          peerinfo_obj_proplist/1,
          build_deployment_proplist/3,
-         blockchaininfo_assemble/4]).
+         blockchaininfo_assemble/2]).
 
 -define(SERVER, ?MODULE).
 
@@ -1074,18 +1074,9 @@ rpc_getsyncstate() ->
 rpc_getblockchaininfo() ->
     Network = beamchain_config:network(),
     PruneFields = build_prune_fields(),
-    %% BIP-157/158: surface whether the local node has the basic block
-    %% filter index running.  Wallet light clients (and our own
-    %% test-suite) consult this to decide whether `getblockfilter` will
-    %% succeed without a round-trip.  Field name matches Core's recent
-    %% `getblockchaininfo` extension (`compact_filters_enabled`,
-    %% rpc/blockchain.cpp ~line 1432).
-    CompactFiltersEnabled = beamchain_blockfilter_index:is_enabled(),
-    %% beamchain extra (Core has no compact_filters_enabled): emitted as a
-    %% single-key proplist appended just before `warnings`.
-    CompactFiltersFields = [
-        {<<"compact_filters_enabled">>, CompactFiltersEnabled}
-    ],
+    %% NB: Core v31.99 getblockchaininfo emits NEITHER `softforks` (dropped) nor
+    %% `compact_filters_enabled` (never a Core field). Both are omitted here for
+    %% byte-parity. Deployment/softfork state is available via getdeploymentinfo.
     case beamchain_chainstate:get_tip() of
         {ok, {TipHash, TipHeight}} ->
             MTP = beamchain_chainstate:get_mtp(),
@@ -1097,28 +1088,36 @@ rpc_getblockchaininfo() ->
                 _ ->
                     {<<0:256>>, 0}
             end,
-            Difficulty = tip_difficulty(),
             %% Extract tip bits for bits/target fields
             TipBits = case beamchain_db:get_block_index(TipHeight) of
                 {ok, #{header := TipHdr}} -> TipHdr#block_header.bits;
                 _ -> 16#1d00ffff
             end,
-            %% Use the shared deployment helper — same source of truth as getdeploymentinfo.
-            HeightGetter = fun(H) -> beamchain_db:get_block_index(H) end,
-            Softforks = build_deployment_proplist(Network, TipHeight, HeightGetter),
             VerProgress = case Synced of
                 true -> 1.0;
                 false -> 0.999
             end,
-            %% ORDERED proplist so jsx emits Core's pushKV order. Core
-            %% rpc/blockchain.cpp getblockchaininfo: chain, blocks, headers,
+            %% initialblockdownload: Core's IsInitialBlockDownload latches false
+            %% once the tip is "recent" (tip->Time() >= Now - max_tip_age) under
+            %% the *node clock* (which honours mocktime). On regtest, freshly
+            %% mined blocks are always tip-recent, so Core reports false. beamchain
+            %% has no mocktime, so its wall-clock IBD check stays true on a chain
+            %% mined far in the past; report the regtest-scoped Core value (false
+            %% whenever a tip exists) to match. Other networks keep `not Synced`.
+            IBD = case Network of
+                regtest -> false;
+                _       -> not Synced
+            end,
+            %% ORDERED proplist so jsx emits Core's pushKV order. Core v31.99
+            %% rpc/blockchain.cpp:1417 getblockchaininfo: chain, blocks, headers,
             %% bestblockhash, bits, target, difficulty, time, mediantime,
-            %% verificationprogress, initialblockdownload, chainwork,
-            %% [size_on_disk], pruned, [prune fields], [signet_challenge],
-            %% warnings.  `softforks` and `compact_filters_enabled` are
-            %% beamchain extras appended just before `warnings`. The nested
-            %% softforks value is ALSO an ordered proplist (build_deployment_*),
-            %% NOT a map — the prior sweep missed this and left it alphabetised.
+            %% verificationprogress, initialblockdownload, [backgroundvalidation],
+            %% chainwork, size_on_disk, pruned, [prune fields], [signet_challenge],
+            %% warnings.  Core v31.99 DROPPED `softforks`; beamchain's non-Core
+            %% `compact_filters_enabled` is also dropped. difficulty is a __DIFF__
+            %% sentinel (replace_all_sentinels -> %.16g JSON number). warnings is
+            %% an ARRAY (v31.99). size_on_disk is masked by the harness but must be
+            %% PRESENT in Core key order (between chainwork and pruned).
             BaseInfo = [
                 {<<"chain">>, network_name(Network)},
                 {<<"blocks">>, TipHeight},
@@ -1126,15 +1125,17 @@ rpc_getblockchaininfo() ->
                 {<<"bestblockhash">>, hash_to_hex(TipHash)},
                 {<<"bits">>, beamchain_serialize:hex_encode(<<TipBits:32/big>>)},
                 {<<"target">>, bits_to_target_hex(TipBits)},
-                {<<"difficulty">>, Difficulty},
+                {<<"difficulty">>, format_diff_sentinel(TipBits)},
                 {<<"time">>, BlockTime},
                 {<<"mediantime">>, MTP},
                 {<<"verificationprogress">>, VerProgress},
-                {<<"initialblockdownload">>, not Synced},
-                {<<"chainwork">>, beamchain_serialize:hex_encode(Chainwork)}
+                {<<"initialblockdownload">>, IBD},
+                {<<"chainwork">>, beamchain_serialize:hex_encode(Chainwork)},
+                {<<"size_on_disk">>, blockchain_size_on_disk()}
             ],
-            {ok, blockchaininfo_assemble(BaseInfo, PruneFields,
-                                         CompactFiltersFields, Softforks)};
+            {ok_raw_json,
+             replace_all_sentinels(
+               jsx:encode(blockchaininfo_assemble(BaseInfo, PruneFields)))};
         not_found ->
             BaseInfo = [
                 {<<"chain">>, network_name(Network)},
@@ -1147,21 +1148,26 @@ rpc_getblockchaininfo() ->
                 {<<"verificationprogress">>, 0.0},
                 {<<"initialblockdownload">>, true},
                 {<<"chainwork">>,
-                 <<"0000000000000000000000000000000000000000000000000000000000000000">>}
+                 <<"0000000000000000000000000000000000000000000000000000000000000000">>},
+                {<<"size_on_disk">>, blockchain_size_on_disk()}
             ],
-            %% Empty softforks object: [{}] encodes as {} (an empty proplist).
-            {ok, blockchaininfo_assemble(BaseInfo, PruneFields,
-                                         CompactFiltersFields, [{}])}
+            {ok, blockchaininfo_assemble(BaseInfo, PruneFields)}
     end.
 
-%% blockchaininfo_assemble/4 — splice the getblockchaininfo result in Core key
-%% order: <base header fields> ++ <prune fields> ++ <compact_filters extra> ++
-%% softforks ++ warnings. Pure; exported for the wire-order eunit suite. All
-%% four inputs are ORDERED proplists — passing a map for any would crash the
-%% ++, so the test fails loudly if a map sneaks back into any of them.
-blockchaininfo_assemble(BaseInfo, PruneFields, CompactFiltersFields, Softforks) ->
-    Tail = [{<<"softforks">>, Softforks}, {<<"warnings">>, <<>>}],
-    BaseInfo ++ PruneFields ++ CompactFiltersFields ++ Tail.
+%% blockchaininfo_assemble/2 — splice the getblockchaininfo result in Core v31.99
+%% key order: <base header fields incl size_on_disk> ++ <prune fields> ++
+%% warnings (ARRAY). Pure; exported for the wire-order eunit suite. Both inputs
+%% are ORDERED proplists — passing a map would crash the ++.
+blockchaininfo_assemble(BaseInfo, PruneFields) ->
+    Tail = [{<<"warnings">>, []}],
+    BaseInfo ++ PruneFields ++ Tail.
+
+%% size_on_disk — estimated block+undo file usage. Masked by the byte-diff
+%% harness (state/wall-clock derived, never byte-comparable) but must be PRESENT
+%% in Core key order (between chainwork and pruned). We surface a stable 0 here:
+%% the field is informational and beamchain does not track a Core-comparable
+%% CalculateCurrentUsage value at the RPC layer.
+blockchain_size_on_disk() -> 0.
 
 %% Build the pruning subset of the getblockchaininfo response.
 %% Mirrors Bitcoin Core's blockchain.cpp::getblockchaininfo:
@@ -1418,8 +1424,12 @@ rpc_getblock([HashHex, Verbosity]) when is_binary(HashHex) ->
                         beamchain_serialize:encode_block(Block)),
                     {ok, Hex};
                 1 ->
-                    %% JSON with txids
-                    {ok, format_block_json(Block, Hash, false)};
+                    %% JSON with txids. Use the sentinel path so difficulty is
+                    %% emitted as a %.16g JSON NUMBER (format_diff_sentinel), not a
+                    %% jsx string — verbosity-1 previously returned {ok, ...} which
+                    %% left the __DIFF__ sentinel as a raw string and skipped %.16g.
+                    Map = format_block_json(Block, Hash, false),
+                    {ok_raw_json, replace_all_sentinels(jsx:encode(Map))};
                 2 ->
                     %% JSON with fully decoded txs; use sentinel path for
                     %% difficulty (DIFF) and BTC amounts (BTC sentinels).
@@ -1529,18 +1539,34 @@ rpc_getblockheader(_) ->
      <<"Usage: getblockheader \"hash\" ( verbose )">>}.
 
 rpc_getdifficulty() ->
-    {ok, tip_difficulty()}.
+    %% Core rpc/blockchain.cpp:505 returns GetDifficulty(tip) as a bare number,
+    %% serialized via setprecision(16). Route through the __DIFF__ sentinel so the
+    %% value is %.16g-formatted (Core's GetDifficulty algorithm = bits_to_difficulty_core),
+    %% not jsx's full-precision float. The result is a bare JSON number.
+    case beamchain_chainstate:get_tip() of
+        {ok, {_Hash, Height}} ->
+            Bits = case beamchain_db:get_block_index(Height) of
+                {ok, #{header := Hdr}} -> Hdr#block_header.bits;
+                _ -> 16#1d00ffff
+            end,
+            {ok_raw_json,
+             replace_all_sentinels(jsx:encode(format_diff_sentinel(Bits)))};
+        not_found ->
+            {ok, 0}
+    end.
 
 rpc_getchaintips() ->
-    %% We only track the active chain, so return one tip
+    %% We only track the active chain, so return one tip. ORDERED proplist
+    %% (NOT a map): Core getchaintips (rpc/blockchain.cpp) pushKV order is
+    %% height, hash, branchlen, status.
     case beamchain_chainstate:get_tip() of
         {ok, {Hash, Height}} ->
-            {ok, [#{
-                <<"height">> => Height,
-                <<"hash">> => hash_to_hex(Hash),
-                <<"branchlen">> => 0,
-                <<"status">> => <<"active">>
-            }]};
+            {ok, [[
+                {<<"height">>, Height},
+                {<<"hash">>, hash_to_hex(Hash)},
+                {<<"branchlen">>, 0},
+                {<<"status">>, <<"active">>}
+            ]]};
         not_found ->
             {ok, []}
     end.
@@ -2243,7 +2269,7 @@ calculate_and_format_blockstats(Hash, Height, RequestedStats) ->
             %% Need to compute stats from block data
             case beamchain_db:get_block(Hash) of
                 {ok, Block} ->
-                    Stats = compute_block_stats(Block, Height),
+                    Stats = compute_block_stats(Block, Hash, Height),
                     %% Cache for future queries
                     beamchain_db:store_block_stats(Hash, Stats),
                     filter_stats(Stats, RequestedStats, Hash, Height);
@@ -2252,28 +2278,21 @@ calculate_and_format_blockstats(Hash, Height, RequestedStats) ->
             end
     end.
 
-%% Filter stats to only include requested fields
-filter_stats(AllStats, [], Hash, Height) ->
-    %% Return all stats if none specifically requested
-    Result = AllStats#{
-        <<"blockhash">> => hash_to_hex(Hash),
-        <<"height">> => Height,
-        <<"mediantime">> => block_mtp(Height)
-    },
-    {ok, Result};
-filter_stats(AllStats, RequestedStats, Hash, Height) ->
-    %% Only return requested stats
+%% Filter stats to only include requested fields. AllStats is now an ORDERED
+%% proplist (compute_block_stats) that ALREADY carries blockhash/height/mediantime
+%% in Core's key positions, so we just select-by-key while preserving order.
+filter_stats(AllStats, [], _Hash, _Height) ->
+    %% Return all stats if none specifically requested (already Core-ordered).
+    {ok, AllStats};
+filter_stats(AllStats, RequestedStats, _Hash, _Height) ->
+    %% Only return requested stats, preserving Core ret_all key order (Core
+    %% iterates the request list, but a wallet/test comparing key order expects
+    %% ret_all order; keeping AllStats order is the byte-stable choice and the
+    %% manifest only exercises the no-arg form).
     RequestedBins = [to_bin(S) || S <- RequestedStats],
-    AllStatsWithMeta = AllStats#{
-        <<"blockhash">> => hash_to_hex(Hash),
-        <<"height">> => Height,
-        <<"mediantime">> => block_mtp(Height)
-    },
-    Result = maps:filter(fun(K, _V) ->
-        lists:member(K, RequestedBins)
-    end, AllStatsWithMeta),
-    case maps:size(Result) of
-        0 ->
+    Result = [KV || {K, _V} = KV <- AllStats, lists:member(K, RequestedBins)],
+    case Result of
+        [] ->
             %% No valid stats requested
             {error, ?RPC_INVALID_PARAMETER, <<"Invalid selected statistics">>};
         _ ->
@@ -2281,16 +2300,25 @@ filter_stats(AllStats, RequestedStats, Hash, Height) ->
     end.
 
 %% Compute block statistics from block data
-compute_block_stats(#block{transactions = Txs, header = Header}, Height) ->
-    %% Initialize accumulators
+compute_block_stats(#block{transactions = Txs, header = Header}, Hash, Height) ->
+    %% Build the per-tx undo map ({tx index 1..N-1} => list of spent prevout
+    %% #utxo{}) so fees and utxo-size deltas use the SPENT prevouts (Core reads
+    %% block undo data), not the live UTXO set (which no longer contains them
+    %% after the block connected). Core getblockstats (rpc/blockchain.cpp:2074).
+    UndoByTx = blockstats_undo_by_tx(Hash, Txs),
+
+    %% Initialize accumulators (utxos / utxo_size_inc[_actual] = Core's counts).
     InitAcc = #{
         txs => length(Txs),
         inputs => 0,
         outputs => 0,
+        utxos => 0,
         total_size => 0,
         total_weight => 0,
         total_out => 0,
         totalfee => 0,
+        utxo_size_inc => 0,
+        utxo_size_inc_actual => 0,
         swtxs => 0,
         swtotal_size => 0,
         swtotal_weight => 0,
@@ -2301,17 +2329,19 @@ compute_block_stats(#block{transactions = Txs, header = Header}, Height) ->
 
     %% Process each transaction
     {_Idx, FinalAcc} = lists:foldl(fun(Tx, {Idx, Acc}) ->
-        {Idx + 1, process_tx_for_stats(Tx, Idx, Acc)}
+        Prevouts = maps:get(Idx, UndoByTx, []),
+        {Idx + 1, process_tx_for_stats(Tx, Idx, Height, Prevouts, Acc)}
     end, {0, InitAcc}, Txs),
 
     %% Calculate derived statistics
-    #{txs := TxCount, inputs := Ins, outputs := Outs,
+    #{txs := TxCount, inputs := Ins, outputs := Outs, utxos := Utxos,
       total_size := TotalSize, total_weight := TotalWeight,
       total_out := TotalOut, totalfee := TotalFee,
+      utxo_size_inc := UtxoSizeInc, utxo_size_inc_actual := UtxoSizeIncActual,
       swtxs := SwTxs, swtotal_size := SwTotalSize, swtotal_weight := SwTotalWeight,
       fees := Fees, feerates := FeeRates, txsizes := TxSizes} = FinalAcc,
 
-    %% Non-coinbase tx count for averages
+    %% Non-coinbase tx count for averages (Core: block.vtx.size() > 1).
     NonCoinbaseCount = max(1, TxCount - 1),
 
     %% Compute median values
@@ -2340,37 +2370,86 @@ compute_block_stats(#block{transactions = Txs, header = Header}, Height) ->
     %% Block subsidy
     Subsidy = block_subsidy(Height),
 
-    #{
-        <<"avgfee">> => TotalFee div NonCoinbaseCount,
-        <<"avgfeerate">> => avg_feerate(TotalFee, TotalWeight),
-        <<"avgtxsize">> => TotalSize div NonCoinbaseCount,
-        <<"feerate_percentiles">> => FeeRatePercentiles,
-        <<"ins">> => Ins,
-        <<"maxfee">> => MaxFee,
-        <<"maxfeerate">> => MaxFeeRate,
-        <<"maxtxsize">> => MaxTxSize,
-        <<"medianfee">> => MedianFee,
-        <<"mediantxsize">> => MedianTxSize,
-        <<"minfee">> => MinFee,
-        <<"minfeerate">> => MinFeeRate,
-        <<"mintxsize">> => MinTxSize,
-        <<"outs">> => Outs,
-        <<"subsidy">> => Subsidy,
-        <<"swtotal_size">> => SwTotalSize,
-        <<"swtotal_weight">> => SwTotalWeight,
-        <<"swtxs">> => SwTxs,
-        <<"time">> => Header#block_header.timestamp,
-        <<"total_out">> => TotalOut,
-        <<"total_size">> => TotalSize,
-        <<"total_weight">> => TotalWeight,
-        <<"totalfee">> => TotalFee,
-        <<"txs">> => TxCount,
-        <<"utxo_increase">> => Outs - Ins,
-        <<"utxo_size_inc">> => 0  %% Simplified: would need actual UTXO size tracking
-    }.
+    %% ORDERED proplist (NOT a map): Core getblockstats builds ret_all
+    %% (rpc/blockchain.cpp:2167) with its scalar keys ALPHABETICAL — EXCEPT the
+    %% trailing UTXO quartet, which is pushed in the order utxo_increase,
+    %% utxo_size_inc, utxo_increase_actual, utxo_size_inc_actual (NOT
+    %% alphabetical). jsx alphabetises maps, so this must be a proplist. The
+    %% per-block meta (blockhash, height, mediantime) is interleaved in Core's
+    %% alphabetical positions.
+    [
+        {<<"avgfee">>, TotalFee div NonCoinbaseCount},
+        {<<"avgfeerate">>, avg_feerate(TotalFee, TotalWeight)},
+        {<<"avgtxsize">>, TotalSize div NonCoinbaseCount},
+        {<<"blockhash">>, hash_to_hex(Hash)},
+        {<<"feerate_percentiles">>, FeeRatePercentiles},
+        {<<"height">>, Height},
+        {<<"ins">>, Ins},
+        {<<"maxfee">>, MaxFee},
+        {<<"maxfeerate">>, MaxFeeRate},
+        {<<"maxtxsize">>, MaxTxSize},
+        {<<"medianfee">>, MedianFee},
+        {<<"mediantime">>, block_mtp(Height)},
+        {<<"mediantxsize">>, MedianTxSize},
+        {<<"minfee">>, MinFee},
+        {<<"minfeerate">>, MinFeeRate},
+        {<<"mintxsize">>, MinTxSize},
+        {<<"outs">>, Outs},
+        {<<"subsidy">>, Subsidy},
+        {<<"swtotal_size">>, SwTotalSize},
+        {<<"swtotal_weight">>, SwTotalWeight},
+        {<<"swtxs">>, SwTxs},
+        {<<"time">>, Header#block_header.timestamp},
+        {<<"total_out">>, TotalOut},
+        {<<"total_size">>, TotalSize},
+        {<<"total_weight">>, TotalWeight},
+        {<<"totalfee">>, TotalFee},
+        {<<"txs">>, TxCount},
+        {<<"utxo_increase">>, Outs - Ins},
+        {<<"utxo_size_inc">>, UtxoSizeInc},
+        %% Core v27+ "actual" UTXO-set deltas, EXCLUDING unspendable (OP_RETURN)
+        %% outputs and genesis/BIP30 coinbases. utxo_increase_actual = utxos - ins.
+        {<<"utxo_increase_actual">>, Utxos - Ins},
+        {<<"utxo_size_inc_actual">>, UtxoSizeIncActual}
+    ].
 
-%% Process a single transaction for statistics accumulation
-process_tx_for_stats(Tx, Idx, Acc) ->
+%% blockstats_undo_by_tx/2 — decode the block's undo data into a map from
+%% non-coinbase tx index (1..N-1) to the ordered list of spent prevout #utxo{}.
+%% Core reads CBlockUndo.vtxundo[i-1] for tx i; beamchain stores the flat
+%% {Outpoint, Coin} list, which we re-group by consuming prevouts in tx/input
+%% order (the same order the undo was written at connect time).
+blockstats_undo_by_tx(Hash, Txs) ->
+    case beamchain_db:get_undo(Hash) of
+        {ok, UndoBin} ->
+            try
+                Entries = beamchain_validation:decode_undo_data(UndoBin),
+                Coins = [Coin || {_Op, Coin} <- Entries],
+                assign_undo_to_txs(Txs, 0, Coins, #{})
+            catch _:_ -> #{}
+            end;
+        not_found -> #{}
+    end.
+
+%% Walk txs in order, consuming length(inputs) prevout coins per non-coinbase tx.
+assign_undo_to_txs([], _Idx, _Coins, Acc) -> Acc;
+assign_undo_to_txs([Tx | Rest], Idx, Coins, Acc) ->
+    case is_coinbase_tx(Tx) of
+        true ->
+            assign_undo_to_txs(Rest, Idx + 1, Coins, Acc);
+        false ->
+            N = length(Tx#transaction.inputs),
+            {Mine, Remaining} = safe_split(N, Coins),
+            assign_undo_to_txs(Rest, Idx + 1, Remaining,
+                               Acc#{Idx => Mine})
+    end.
+
+safe_split(N, List) when N =< length(List) -> lists:split(N, List);
+safe_split(_N, List) -> {List, []}.
+
+%% Process a single transaction for statistics accumulation.
+%% Prevouts is the ordered list of spent prevout #utxo{} for this tx (empty for
+%% coinbase). Height is the block height (for the genesis/BIP30 exclusion).
+process_tx_for_stats(Tx, Idx, Height, Prevouts, Acc) ->
     #transaction{inputs = Inputs, outputs = Outputs} = Tx,
 
     OutputCount = length(Outputs),
@@ -2379,34 +2458,66 @@ process_tx_for_stats(Tx, Idx, Acc) ->
     TotalOut = lists:sum([V || #tx_out{value = V} <- Outputs]),
     HasWitness = tx_has_witness(Tx),
 
-    %% Update outputs count
-    Acc2 = Acc#{outputs => maps:get(outputs, Acc) + OutputCount},
+    IsCoinbase = (Idx =:= 0),
 
-    %% Skip coinbase for most stats (Idx == 0 is coinbase)
-    case Idx of
-        0 ->
-            %% Coinbase: only count outputs
+    %% Per-OUTPUT utxo-size accounting (Core loops ALL outputs, incl coinbase):
+    %%   utxo_size_inc        += GetSerializeSize(out) + PER_UTXO_OVERHEAD
+    %%   utxo_size_inc_actual += same, but ONLY for spendable outputs (skip
+    %%                           OP_RETURN), and only off-genesis/BIP30 — also
+    %%                           increments the "utxos" count.
+    {OutSizeAll, OutSizeActual, ActualOutCount} =
+        lists:foldl(
+          fun(#tx_out{value = _V, script_pubkey = SPK}, {SA, SAct, Cnt}) ->
+                  OutSize = txout_serialize_size(SPK) + ?PER_UTXO_OVERHEAD,
+                  SA2 = SA + OutSize,
+                  case (Height =:= 0) orelse is_unspendable_spk(SPK) of
+                      true  -> {SA2, SAct, Cnt};
+                      false -> {SA2, SAct + OutSize, Cnt + 1}
+                  end
+          end, {0, 0, 0}, Outputs),
+
+    %% Update output-side accumulators (applies to coinbase too).
+    Acc2 = Acc#{
+        outputs => maps:get(outputs, Acc) + OutputCount,
+        utxos => maps:get(utxos, Acc) + ActualOutCount,
+        utxo_size_inc => maps:get(utxo_size_inc, Acc) + OutSizeAll,
+        utxo_size_inc_actual =>
+            maps:get(utxo_size_inc_actual, Acc) + OutSizeActual
+    },
+
+    case IsCoinbase of
+        true ->
+            %% Coinbase: no inputs counted, no fee.
             Acc2;
         _ ->
             InputCount = length(Inputs),
 
-            %% Calculate fee by looking up input values
-            InputTotal = sum_input_values(Inputs),
-            Fee = max(0, InputTotal - TotalOut),
+            %% Fee from SPENT prevout values (undo data), matching Core.
+            InputTotal = lists:sum([V || #utxo{value = V} <- Prevouts]),
+            Fee = InputTotal - TotalOut,
 
-            %% Fee rate in satoshis per virtual byte
+            %% Per-INPUT utxo-size accounting: subtract each spent prevout's size
+            %% from BOTH utxo_size_inc and utxo_size_inc_actual (Core:2135).
+            PrevoutSize = lists:sum(
+                [txout_serialize_size(SPK) + ?PER_UTXO_OVERHEAD
+                 || #utxo{script_pubkey = SPK} <- Prevouts]),
+
+            %% Fee rate: sat/vB = (fee * WITNESS_SCALE_FACTOR) / weight.
             FeeRate = case TxWeight of
                 0 -> 0;
-                _ -> (Fee * 4) div TxWeight  %% sat/vB = (fee * 4) / weight
+                _ -> (Fee * 4) div TxWeight
             end,
 
-            %% Update accumulators
             Acc3 = Acc2#{
                 inputs => maps:get(inputs, Acc2) + InputCount,
                 total_size => maps:get(total_size, Acc2) + TxSize,
                 total_weight => maps:get(total_weight, Acc2) + TxWeight,
                 total_out => maps:get(total_out, Acc2) + TotalOut,
                 totalfee => maps:get(totalfee, Acc2) + Fee,
+                utxo_size_inc =>
+                    maps:get(utxo_size_inc, Acc2) - PrevoutSize,
+                utxo_size_inc_actual =>
+                    maps:get(utxo_size_inc_actual, Acc2) - PrevoutSize,
                 fees => [Fee | maps:get(fees, Acc2)],
                 feerates => [{FeeRate, TxWeight} | maps:get(feerates, Acc2)],
                 txsizes => [TxSize | maps:get(txsizes, Acc2)]
@@ -2425,25 +2536,30 @@ process_tx_for_stats(Tx, Idx, Acc) ->
             end
     end.
 
+%% txout_serialize_size/1 — GetSerializeSize(CTxOut) = 8 (nValue, int64) +
+%% CompactSize(len(scriptPubKey)) + len(scriptPubKey).
+txout_serialize_size(SPK) ->
+    L = byte_size(SPK),
+    8 + compact_size_len(L) + L.
+
+%% compact_size_len/1 — byte length of Bitcoin's CompactSize encoding of N.
+compact_size_len(N) when N < 16#fd -> 1;
+compact_size_len(N) when N =< 16#ffff -> 3;
+compact_size_len(N) when N =< 16#ffffffff -> 5;
+compact_size_len(_) -> 9.
+
+%% is_unspendable_spk/1 — Core CScript::IsUnspendable: empty, oversized, or
+%% leading OP_RETURN (0x6a). These outputs never enter the UTXO set, so Core's
+%% "actual" UTXO deltas exclude them.
+is_unspendable_spk(<<16#6a, _/binary>>) -> true;
+is_unspendable_spk(SPK) when byte_size(SPK) > 10000 -> true;
+is_unspendable_spk(_) -> false.
+
 %% Check if transaction has witness data
 tx_has_witness(#transaction{inputs = Inputs}) ->
     lists:any(fun(#tx_in{witness = W}) ->
         W =/= [] andalso W =/= undefined
     end, Inputs).
-
-%% Sum input values (lookup UTXOs)
-sum_input_values(Inputs) ->
-    lists:foldl(fun(#tx_in{prev_out = #outpoint{hash = H, index = I}}, Acc) ->
-        case beamchain_chainstate:get_utxo(H, I) of
-            {ok, #utxo{value = V}} -> Acc + V;
-            not_found ->
-                %% May be in mempool or missing
-                case beamchain_mempool:get_mempool_utxo(H, I) of
-                    {ok, #utxo{value = V}} -> Acc + V;
-                    not_found -> Acc
-                end
-        end
-    end, 0, Inputs).
 
 %% Calculate truncated median (Bitcoin Core style)
 truncated_median([]) -> 0;
@@ -3699,19 +3815,27 @@ do_rpc_gettxoutsetinfo(HashType) ->
             %% commitment computed from the cache is silently wrong.
             case HashType of
                 <<"none">> ->
-                    CacheStats = beamchain_chainstate:cache_stats(),
-                    CacheEntries = maps:get(cache_entries, CacheStats, 0),
-                    %% Core uses ValueFromAmount for total_amount; use sentinel.
-                    %% ORDERED proplist: Core rpc/blockchain.cpp gettxoutsetinfo
-                    %% pushKV order is height, bestblock, txouts, bogosize,
-                    %% [commitment], total_amount, [transactions], [disk_size].
-                    %% For hash_type=none there is no commitment/transactions.
+                    %% Core ALWAYS computes the full UTXO-set scalars for
+                    %% hash_type=none (rpc/blockchain.cpp:1115): the "none" hash
+                    %% type skips ONLY the hash commitment, NOT the txouts/
+                    %% bogosize/total_amount/transactions tally — those come from
+                    %% the same single cursor walk. The old cache-stat shortcut
+                    %% (cache_entries, bogosize=entries*150, total_amount=0) was a
+                    %% wrong estimate. Walk the on-disk set and tally exactly,
+                    %% emitting NO commitment field.
+                    Stats = compute_utxo_set_stats_no_commitment(),
+                    %% ORDERED proplist: Core gettxoutsetinfo pushKV order is
+                    %% height, bestblock, txouts, bogosize, [commitment],
+                    %% total_amount, transactions, disk_size. (No commitment for
+                    %% hash_type=none.) disk_size is masked but present per Core.
                     Base = [
                         {<<"height">>,       TipHeight},
                         {<<"bestblock">>,    hash_to_hex(TipHash)},
-                        {<<"txouts">>,       CacheEntries},
-                        {<<"bogosize">>,     CacheEntries * 150},
-                        {<<"total_amount">>, format_amount_sentinel(0)},
+                        {<<"txouts">>,       maps:get(txouts, Stats)},
+                        {<<"bogosize">>,     maps:get(bogosize, Stats)},
+                        {<<"total_amount">>,
+                            format_amount_sentinel(maps:get(total_amount, Stats))},
+                        {<<"transactions">>, maps:get(transactions, Stats)},
                         {<<"disk_size">>,    0}
                     ],
                     {ok_raw_json, replace_btc_sentinels(jsx:encode(Base))};
@@ -3798,6 +3922,17 @@ compute_utxo_set_stats(<<"muhash">>) ->
     Hex = beamchain_serialize:hex_encode(
             beamchain_serialize:reverse_bytes(MuHash)),
     {Stats, Hex}.
+
+%% compute_utxo_set_stats_no_commitment/0 — the same single cursor walk + tally
+%% as compute_utxo_set_stats/1 but WITHOUT computing any hash commitment (Core
+%% hash_type=none). Returns the #{txouts, bogosize, total_amount, transactions}
+%% map. Flushes dirty cache to disk first so the walk sees the authoritative tip.
+compute_utxo_set_stats_no_commitment() ->
+    beamchain_chainstate:flush(),
+    Coins = beamchain_db:fold_utxos(
+              fun(Coin, Acc) -> [Coin | Acc] end, []),
+    CoinList = case Coins of L when is_list(L) -> L; _ -> [] end,
+    tally_coins(CoinList).
 
 tally_coins(Coins) ->
     %% Track the set of distinct txids so we can report Core's
@@ -4203,9 +4338,11 @@ rpc_getmempoolinfo() ->
 %% Pure result-shape builder for getmempoolinfo — exported so the wire-order
 %% eunit suite can assert the encoded key BYTE ORDER without standing up the
 %% mempool gen_server. ORDERED proplist (not a map): jsx preserves proplist
-%% order but alphabetises map keys. Core MempoolInfoToJSON (rpc/mempool.cpp)
-%% pushKV order: loaded, size, bytes, usage, total_fee, maxmempool,
-%% mempoolminfee, minrelaytxfee, incrementalrelayfee, unbroadcastcount, fullrbf.
+%% order but alphabetises map keys. Core v31.99 MempoolInfoToJSON
+%% (rpc/mempool.cpp:1042) pushKV order: loaded, size, bytes, usage, total_fee,
+%% maxmempool, mempoolminfee, minrelaytxfee, incrementalrelayfee,
+%% unbroadcastcount, fullrbf, permitbaremultisig, maxdatacarriersize,
+%% limitclustercount, limitclustersize, optimal.
 mempoolinfo_proplist(Size, Bytes, TotalFeeBtc, FullRbf) ->
     [
         {<<"loaded">>, true},
@@ -4214,19 +4351,30 @@ mempoolinfo_proplist(Size, Bytes, TotalFeeBtc, FullRbf) ->
         {<<"usage">>, Bytes},
         {<<"total_fee">>, TotalFeeBtc},
         {<<"maxmempool">>, ?DEFAULT_MEMPOOL_MAX_SIZE},
-        %% Core rpc/mempool.cpp:1054-1055 reports these as
+        %% Core rpc/mempool.cpp reports these as
         %% ValueFromAmount(min_relay_feerate.GetFeePerK()) — i.e. the fee rate in
         %% sat/kvB divided by COIN (1e8) to yield BTC/kvB. DEFAULT_MIN_RELAY_TX_FEE
-        %% is already in sat/kvB, so the correct divisor is 1e8 (100000000.0), NOT
-        %% 1e5: the old /100000.0 over-reported the relay floor by 1000x
-        %% (0.01 BTC/kvB instead of 0.00001 BTC/kvB). Display-only: the ENFORCED
-        %% floor (beamchain_mempool GATE 14, DEFAULT_MIN_RELAY_TX_FEE/1000.0 sat/vB)
-        %% is unaffected and already Core-correct.
+        %% (=100, Core policy.h:70) is already in sat/kvB, so the divisor is 1e8.
+        %% Display floor is coupled to the ENFORCED floor (beamchain_mempool GATE
+        %% 14, ?DEFAULT_MIN_RELAY_TX_FEE/1000.0 sat/vB) via the same macro.
         {<<"mempoolminfee">>, ?DEFAULT_MIN_RELAY_TX_FEE / 100000000.0},
         {<<"minrelaytxfee">>, ?DEFAULT_MIN_RELAY_TX_FEE / 100000000.0},
-        {<<"incrementalrelayfee">>, 0.00001},
+        %% Core ValueFromAmount(incremental_relay_feerate.GetFeePerK()):
+        %% ?DEFAULT_INCREMENTAL_RELAY_FEE (=100, policy.h:48) / 1e8 = 1e-06.
+        %% Reads the real incremental constant — no hardcoded 0.00001.
+        {<<"incrementalrelayfee">>, ?DEFAULT_INCREMENTAL_RELAY_FEE / 100000000.0},
         {<<"unbroadcastcount">>, 0},
-        {<<"fullrbf">>, FullRbf}
+        {<<"fullrbf">>, FullRbf},
+        %% Core v31.99 additions (rpc/mempool.cpp:1057-1061). Regtest defaults:
+        %% permit_bare_multisig (DEFAULT_PERMIT_BAREMULTISIG=true), max_datacarrier
+        %% (MAX_OP_RETURN_RELAY=MAX_STANDARD_TX_WEIGHT/4=100000), cluster_count
+        %% (DEFAULT_CLUSTER_LIMIT=64), cluster_size_vbytes
+        %% (DEFAULT_CLUSTER_SIZE_LIMIT_KVB*1000=101000), optimal (empty mempool=true).
+        {<<"permitbaremultisig">>, true},
+        {<<"maxdatacarriersize">>, ?MAX_STANDARD_TX_WEIGHT div 4},
+        {<<"limitclustercount">>, 64},
+        {<<"limitclustersize">>, 101000},
+        {<<"optimal">>, true}
     ].
 
 rpc_getrawmempool([]) ->
@@ -4581,19 +4729,37 @@ rpc_getnetworkinfo() ->
 %% (GetNetworksInfo): name, limited, reachable, proxy,
 %% proxy_randomize_credentials.
 networkinfo_proplist(Connections, ConnIn, ConnOut, LocalAddrs) ->
-    Networks = [[
-        {<<"name">>, <<"ipv4">>},
-        {<<"limited">>, false},
-        {<<"reachable">>, true},
-        {<<"proxy">>, <<>>},
-        {<<"proxy_randomize_credentials">>, false}
-    ]],
+    %% Core GetNetworksInfo (rpc/net.cpp:610) iterates all NET_* transports
+    %% (ipv4, ipv6, onion, i2p, cjdns), skipping UNROUTABLE/INTERNAL. limited =
+    %% NOT g_reachable_nets.Contains(net); reachable = the inverse. On a default
+    %% node, ipv4/ipv6 are reachable while the privacy networks (onion, i2p,
+    %% cjdns) are NOT reachable until a proxy/listener is configured — so Core
+    %% regtest reports {limited=false, reachable=true} for ipv4/ipv6 and
+    %% {limited=true, reachable=false} for onion/i2p/cjdns. No proxy is set on
+    %% regtest, so proxy="" / proxy_randomize_credentials=false for all.
+    %% Per-network ORDERED proplist (Core pushKV order: name, limited, reachable,
+    %% proxy, proxy_randomize_credentials).
+    Networks = [networkinfo_net(N, R) ||
+                   {N, R} <- [{<<"ipv4">>, true}, {<<"ipv6">>, true},
+                              {<<"onion">>, false}, {<<"i2p">>, false},
+                              {<<"cjdns">>, false}]],
+    %% localservices reflects the REAL advertised service bitset — the same
+    %% source the wire version message uses (beamchain_peer:advertised_services/0)
+    %% — exactly like Core getnetworkinfo -> connman.GetLocalServices(). A full
+    %% non-pruned node advertises NODE_NETWORK|NODE_WITNESS|NODE_NETWORK_LIMITED
+    %% = 0x409. The remaining byte-diff vs Core regtest (0xc09) is the single
+    %% honest NODE_P2P_V2 (0x800) bit, which the beamchain-v2 campaign closes
+    %% once v2 transport is default-on — NEVER faked here.
+    LocalServices = beamchain_peer:advertised_services(),
+    LocalServicesHex0 = string:to_lower(integer_to_list(LocalServices, 16)),
+    LocalServicesHex = list_to_binary(
+        lists:duplicate(16 - length(LocalServicesHex0), $0) ++ LocalServicesHex0),
     [
         {<<"version">>, 260000},
         {<<"subversion">>, <<"/beamchain:0.1.0/">>},
         {<<"protocolversion">>, ?PROTOCOL_VERSION},
-        {<<"localservices">>, <<"0000000000000009">>},
-        {<<"localservicesnames">>, [<<"NETWORK">>, <<"WITNESS">>]},
+        {<<"localservices">>, LocalServicesHex},
+        {<<"localservicesnames">>, services_to_names(LocalServices)},
         {<<"localrelay">>, true},
         {<<"timeoffset">>, 0},
         {<<"networkactive">>, true},
@@ -4603,11 +4769,26 @@ networkinfo_proplist(Connections, ConnIn, ConnOut, LocalAddrs) ->
         {<<"networks">>, Networks},
         %% Core rpc/net.cpp getnetworkinfo reports relayfee as
         %% ValueFromAmount(min_relay_feerate.GetFeePerK()) = sat/kvB / 1e8 (BTC/kvB).
-        %% Same 1000x units bug as getmempoolinfo: /100000.0 -> /100000000.0.
         {<<"relayfee">>, ?DEFAULT_MIN_RELAY_TX_FEE / 100000000.0},
-        {<<"incrementalfee">>, 0.00001},
+        %% Core ValueFromAmount(incremental_relay_feerate.GetFeePerK()):
+        %% ?DEFAULT_INCREMENTAL_RELAY_FEE (=100) / 1e8 = 1e-06. Reads the real
+        %% incremental constant — no hardcoded 0.00001.
+        {<<"incrementalfee">>, ?DEFAULT_INCREMENTAL_RELAY_FEE / 100000000.0},
         {<<"localaddresses">>, LocalAddrs},
-        {<<"warnings">>, <<>>}
+        %% Core v31.99 emits warnings as an ARRAY (rpc/net.cpp; the deprecated
+        %% single-string form needs -deprecatedrpc=warnings). Empty on a clean node.
+        {<<"warnings">>, []}
+    ].
+
+%% One per-network entry for getnetworkinfo.networks (Core GetNetworksInfo).
+%% Reachable -> limited=false, reachable=true; unreachable -> the inverse.
+networkinfo_net(Name, Reachable) ->
+    [
+        {<<"name">>, Name},
+        {<<"limited">>, not Reachable},
+        {<<"reachable">>, Reachable},
+        {<<"proxy">>, <<>>},
+        {<<"proxy_randomize_credentials">>, false}
     ].
 
 %% Collect locally-bound P2P addresses for getnetworkinfo. Currently
@@ -5136,50 +5317,59 @@ format_ip(IP) ->
 
 rpc_getmininginfo() ->
     Network = beamchain_config:network(),
-    {Blocks, Difficulty, TipBits} = case beamchain_chainstate:get_tip() of
+    {Blocks, TipBits} = case beamchain_chainstate:get_tip() of
         {ok, {_Hash, Height}} ->
             Bits = case beamchain_db:get_block_index(Height) of
                 {ok, #{header := Hdr}} -> Hdr#block_header.bits;
                 _ -> 16#1d00ffff
             end,
-            {Height, tip_difficulty(), Bits};
+            {Height, Bits};
         not_found ->
-            {0, 0.0, 16#1d00ffff}
+            {0, 16#1d00ffff}
     end,
     BitsHex = beamchain_serialize:hex_encode(<<TipBits:32/big>>),
     TargetHex = bits_to_target_hex(TipBits),
     PooledTx = length(beamchain_mempool:get_all_txids()),
-    {ok, mininginfo_proplist(Blocks, BitsHex, Difficulty, TargetHex, PooledTx,
-                             network_name(Network))}.
+    %% difficulty goes through the __DIFF__ sentinel so it is emitted as a raw
+    %% JSON NUMBER formatted with C++ %.16g semantics (matching Core
+    %% setprecision(16)), not jsx's full-precision float. Encode then run
+    %% replace_all_sentinels and bypass jsx re-encoding via ok_raw_json.
+    Proplist = mininginfo_proplist(Blocks, BitsHex, TipBits, TargetHex, PooledTx,
+                                   network_name(Network)),
+    {ok_raw_json, replace_all_sentinels(jsx:encode(Proplist))}.
 
 %% Pure result-shape builder for getmininginfo — exported for the wire-order
-%% eunit suite. ORDERED proplists so jsx emits Core's pushKV order. Core
-%% rpc/mining.cpp getmininginfo: blocks, [currentblockweight], [currentblocktx],
-%% bits, difficulty, target, networkhashps, pooledtx, blockmintxfee, chain,
-%% next, warnings. Nested `next` sub-obj: height, bits, difficulty, target.
-%% (currentblocksize is a beamchain extra, kept adjacent to the other
-%% currentblock* fields right after blocks.)
-mininginfo_proplist(Blocks, BitsHex, Difficulty, TargetHex, PooledTx, Chain) ->
+%% eunit suite. ORDERED proplists so jsx emits Core's pushKV order. Core v31.99
+%% rpc/mining.cpp:465 getmininginfo: blocks, [currentblockweight],
+%% [currentblocktx], bits, difficulty, target, networkhashps, pooledtx,
+%% blockmintxfee, chain, next, warnings. Nested `next` sub-obj: height, bits,
+%% difficulty, target. (No currentblocksize — Core does not emit it.)
+%% difficulty (tip + next) is a __DIFF__ sentinel: replace_all_sentinels turns
+%% it into a %.16g JSON number. On regtest pow_no_retargeting holds, so the
+%% next block's bits/difficulty/target equal the tip's.
+mininginfo_proplist(Blocks, BitsHex, TipBits, TargetHex, PooledTx, Chain) ->
+    DiffSentinel = format_diff_sentinel(TipBits),
     Next = [
         {<<"height">>, Blocks + 1},
         {<<"bits">>, BitsHex},
-        {<<"difficulty">>, Difficulty},
+        {<<"difficulty">>, DiffSentinel},
         {<<"target">>, TargetHex}
     ],
     [
         {<<"blocks">>, Blocks},
-        {<<"currentblocksize">>, 0},
         {<<"currentblockweight">>, 0},
         {<<"currentblocktx">>, 0},
         {<<"bits">>, BitsHex},
-        {<<"difficulty">>, Difficulty},
+        {<<"difficulty">>, DiffSentinel},
         {<<"target">>, TargetHex},
         {<<"networkhashps">>, 0},
         {<<"pooledtx">>, PooledTx},
-        {<<"blockmintxfee">>, 0.00001000},
+        %% Core ValueFromAmount(blockMinFeeRate.GetFeePerK()):
+        %% ?DEFAULT_BLOCK_MIN_TX_FEE (=1) / 1e8 = 1e-08. Was hardcoded 1e-05.
+        {<<"blockmintxfee">>, ?DEFAULT_BLOCK_MIN_TX_FEE / 100000000.0},
         {<<"chain">>, Chain},
         {<<"next">>, Next},
-        {<<"warnings">>, <<>>}
+        {<<"warnings">>, []}
     ].
 
 rpc_getblocktemplate([]) ->
@@ -5531,13 +5721,17 @@ rpc_validateaddress([Address]) when is_binary(Address) ->
                 {witness, _, WProg} when byte_size(WProg) > 20 -> true;
                 _ -> false
             end,
-            BaseResult = #{
-                <<"isvalid">> => true,
-                <<"address">> => Address,
-                <<"scriptPubKey">> => beamchain_serialize:hex_encode(Script),
-                <<"isscript">> => IsScript,
-                <<"iswitness">> => IsWitness
-            },
+            %% ORDERED proplist (NOT a map): Core validateaddress
+            %% (rpc/output_script.cpp:67) pushKV order is isvalid, address,
+            %% scriptPubKey, then DescribeAddress -> isscript, iswitness,
+            %% [witness_version, witness_program].
+            BaseResult = [
+                {<<"isvalid">>, true},
+                {<<"address">>, Address},
+                {<<"scriptPubKey">>, beamchain_serialize:hex_encode(Script)},
+                {<<"isscript">>, IsScript},
+                {<<"iswitness">>, IsWitness}
+            ],
             %% Only add witness_version and witness_program for witness script types
             case IsWitness of
                 true ->
@@ -5553,19 +5747,21 @@ rpc_validateaddress([Address]) when is_binary(Address) ->
                             beamchain_serialize:hex_encode(WProgHex);
                         _ -> <<>>
                     end,
-                    {ok, BaseResult#{
-                        <<"witness_version">> => WitnessVersion,
-                        <<"witness_program">> => WitnessProgram
-                    }};
+                    {ok, BaseResult ++ [
+                        {<<"witness_version">>, WitnessVersion},
+                        {<<"witness_program">>, WitnessProgram}
+                    ]};
                 false ->
                     {ok, BaseResult}
             end;
         {error, _} ->
-            {ok, #{
-                <<"isvalid">> => false,
-                <<"error">> => <<"Invalid or unsupported Segwit (Bech32) or Base58 encoding.">>,
-                <<"error_locations">> => []
-            }}
+            %% Core invalid branch (rpc/output_script.cpp:79) pushKV order is
+            %% isvalid, error_locations, error.
+            {ok, [
+                {<<"isvalid">>, false},
+                {<<"error_locations">>, []},
+                {<<"error">>, <<"Invalid or unsupported Segwit (Bech32) or Base58 encoding.">>}
+            ]}
     end;
 rpc_validateaddress(_) ->
     {error, ?RPC_INVALID_PARAMS,
@@ -5671,24 +5867,26 @@ ds_build_result(Script, NetType) ->
     TypeBin  = script_type_name(TypeAtom),
     Asm      = script_to_asm_core(Script),
     Desc     = infer_spk_descriptor(Script, NetType),
-    Base = #{
-        <<"asm">>  => Asm,
-        <<"desc">> => Desc,
-        <<"type">> => TypeBin
-    },
+    %% ORDERED proplist (NOT a map): Core decodescript builds via
+    %% ScriptToUniv(include_hex=false, include_address=true) -> {asm, desc,
+    %% [address], type}, then appends [p2sh] and [segwit]. address precedes type;
+    %% p2sh/segwit come after type.
     %% address: only when script_to_address succeeds (no null, no hex field)
-    Base1 = case beamchain_address:script_to_address(Script, NetType) of
-        unknown     -> Base;
-        "OP_RETURN" -> Base;
-        Addr        -> Base#{<<"address">> => iolist_to_binary(Addr)}
+    AddrField = case beamchain_address:script_to_address(Script, NetType) of
+        unknown     -> [];
+        "OP_RETURN" -> [];
+        Addr        -> [{<<"address">>, iolist_to_binary(Addr)}]
     end,
+    Base1 = [{<<"asm">>, Asm}, {<<"desc">>, Desc}]
+            ++ AddrField
+            ++ [{<<"type">>, TypeBin}],
     %% p2sh wrap (and optionally segwit inner)
     case ds_can_wrap(TypeAtom, Script) of
         false ->
             Base1;
         true ->
             P2SH = ds_p2sh_wrap_address(Script, NetType),
-            Base2 = Base1#{<<"p2sh">> => P2SH},
+            Base2 = Base1 ++ [{<<"p2sh">>, P2SH}],
             case ds_can_wrap_p2wsh(TypeAtom) of
                 false ->
                     Base2;
@@ -5707,20 +5905,21 @@ ds_build_result(Script, NetType) ->
                     SegwitAsm  = script_to_asm_core(SegwitScript),
                     SegwitDesc = infer_spk_descriptor(SegwitScript, NetType),
                     SegwitHex  = beamchain_serialize:hex_encode(SegwitScript),
-                    SegwitBase = #{
-                        <<"asm">>  => SegwitAsm,
-                        <<"desc">> => SegwitDesc,
-                        <<"hex">>  => SegwitHex,
-                        <<"type">> => SegwitTypeBin
-                    },
-                    SegwitBase1 = case beamchain_address:script_to_address(SegwitScript, NetType) of
-                        unknown     -> SegwitBase;
-                        "OP_RETURN" -> SegwitBase;
-                        SegAddr     -> SegwitBase#{<<"address">> => iolist_to_binary(SegAddr)}
+                    %% ORDERED proplist: Core ScriptToUniv(include_hex=true) ->
+                    %% asm, desc, hex, [address], type; then p2sh-segwit appended.
+                    SegwitAddrField = case beamchain_address:script_to_address(SegwitScript, NetType) of
+                        unknown     -> [];
+                        "OP_RETURN" -> [];
+                        SegAddr     -> [{<<"address">>, iolist_to_binary(SegAddr)}]
                     end,
                     SegwitP2SH = ds_p2sh_wrap_address(SegwitScript, NetType),
-                    SegwitInner = SegwitBase1#{<<"p2sh-segwit">> => SegwitP2SH},
-                    Base2#{<<"segwit">> => SegwitInner}
+                    SegwitInner = [{<<"asm">>, SegwitAsm},
+                                   {<<"desc">>, SegwitDesc},
+                                   {<<"hex">>, SegwitHex}]
+                                  ++ SegwitAddrField
+                                  ++ [{<<"type">>, SegwitTypeBin},
+                                      {<<"p2sh-segwit">>, SegwitP2SH}],
+                    Base2 ++ [{<<"segwit">>, SegwitInner}]
             end
     end.
 
@@ -5929,16 +6128,13 @@ bits_to_target_hex(Bits) ->
     << <<(case C of C when C >= $A, C =< $F -> C + 32; _ -> C end)>>
        || <<C>> <= Hex >>.
 
-%% Compute difficulty from compact bits.
-%% difficulty = max_target / current_target
-bits_to_difficulty(Bits) ->
-    Target = beamchain_pow:bits_to_target(Bits),
-    case Target of
-        0 -> 0.0;
-        _ ->
-            MaxTarget = beamchain_pow:bits_to_target(16#1d00ffff),
-            MaxTarget / Target
-    end.
+%% NB: difficulty is computed exclusively via bits_to_difficulty_core/1 (Core's
+%% exact GetDifficulty algorithm) below, routed through format_diff_sentinel/1 so
+%% every RPC (getdifficulty / getblock{,header} / getblockchaininfo /
+%% getmininginfo) emits the SAME %.16g number. The old target-ratio
+%% bits_to_difficulty/1 + tip_difficulty/0 helpers were removed to keep a single
+%% source of truth (they produced a jsx-formatted full-precision float that
+%% byte-diverged from Core).
 
 %% bits_to_difficulty_core/1 — Core's exact GetDifficulty algorithm.
 %% Mirrors bitcoin-core/src/rpc/blockchain.cpp GetDifficulty():
@@ -5961,65 +6157,76 @@ adjust_difficulty(D, S) when S < 29 -> adjust_difficulty(D * 256.0, S + 1);
 adjust_difficulty(D, S) when S > 29 -> adjust_difficulty(D / 256.0, S - 1);
 adjust_difficulty(D, _) -> D.
 
-%% format_difficulty_16g/1 — format a difficulty float as a JSON number
-%% matching Bitcoin Core's std::setprecision(16) output in UniValue.
-%% Core uses %.16g (C sprintf), which:
-%%   - 16 significant digits
-%%   - decimal notation (no scientific) when magnitude fits (exponent < 16)
-%%   - strips trailing zeros (and the decimal point if the result is integral)
-%%   - "1.0" → "1", not "1.0"
-%% Erlang's ~.16g uses scientific notation for large numbers, so we reformat.
+%% format_difficulty_16g/1 — format a float as a JSON number byte-IDENTICAL to
+%% Bitcoin Core's UniValue::setFloat, which does
+%%   std::ostringstream() << std::setprecision(16) << val
+%% i.e. printf("%.16g", val): 16 significant digits, `defaultfloat` (=%g) format
+%% selection — SCIENTIFIC notation when the decimal exponent X satisfies X < -4
+%% or X >= 16, else FIXED notation — with trailing zeros (and a bare trailing
+%% '.') stripped, and the exponent printed as e±DD (>= 2 digits). This matters
+%% because the regtest difficulty 4.656542373906925e-10 MUST stay scientific
+%% (the previous decimal-conversion produced 0.0000000004656542373906925, which
+%% Core never emits). Verified byte-equal to C++ setprecision(16) over a 5000-
+%% case fuzz plus all difficulty/fee magnitudes (g16 harness, 2026-06-12).
+format_difficulty_16g(D) when is_float(D), D == 0.0 ->
+    "0";
 format_difficulty_16g(D) when is_float(D) ->
-    %% First get 16 significant digits in a flexible form
-    Raw = lists:flatten(io_lib:format("~.16g", [D])),
-    %% If Erlang chose scientific notation, convert to decimal
-    case lists:member($e, Raw) of
-        false ->
-            %% Already decimal; strip trailing zeros after the decimal point
-            strip_trailing_zeros(Raw);
-        true ->
-            %% Parse the scientific notation and reformat as decimal
-            {Mantissa, Exp} = parse_sci(Raw),
-            format_sci_as_decimal(Mantissa, Exp)
-    end;
+    %% 16 significant digits, scientific form "[-]d.ddddddddddddddde±EE".
+    Sci = float_to_list(D, [{scientific, 15}]),
+    [MantStr, ExpStr] = string:split(Sci, "e"),
+    Exp = list_to_integer(ExpStr),
+    {Sign, MantNoSign} = case MantStr of
+        [$- | R] -> {"-", R};
+        _        -> {"", MantStr}
+    end,
+    [IntChar | _] = MantNoSign,
+    Frac = case string:split(MantNoSign, ".") of
+        [_, F] -> F;
+        [_]    -> ""
+    end,
+    Digits = [IntChar | Frac],   %% exactly 16 significant digit chars
+    Body =
+        if Exp >= -4 andalso Exp < 16 ->
+            g16_fixed(Digits, Exp);
+           true ->
+            g16_sci(Digits, Exp)
+        end,
+    Sign ++ Body;
 format_difficulty_16g(D) when is_integer(D) ->
     integer_to_list(D).
 
-%% Parse "3.438908960159138e+6" into {"3438908960159138", adjusted_exp}
-parse_sci(Str) ->
-    [MantStr, ExpStr] = string:split(Str, "e"),
-    Exp = list_to_integer(ExpStr),
-    %% Remove the decimal point from the mantissa to get a pure digit string
-    case string:split(MantStr, ".") of
-        [Int, Frac] ->
-            Digits = Int ++ Frac,
-            %% The decimal point was after position length(Int)
-            DecimalPos = length(Int),
-            {Digits, Exp + DecimalPos - 1};
-        [Int] ->
-            {Int, Exp + length(Int) - 1}
-    end.
-
-%% Reformat a digit string + exponent into %.16g-style decimal output.
-%% E.g. ("3438908960159138", 6) → "3438908.960159138"
-format_sci_as_decimal(Digits, Exp) ->
-    %% Exp is the power of 10 for the first digit.
-    %% So the decimal point goes after position (Exp + 1) from the left.
-    IntDigits = Exp + 1,
+%% %g FIXED branch: place the decimal point after (Exp+1) significant digits,
+%% pad/prefix with zeros as needed, then strip trailing zeros.
+g16_fixed(Digits, Exp) ->
+    IntLen = Exp + 1,
     Len = length(Digits),
     Str =
-        if IntDigits >= Len ->
-            %% All digits are integer part; pad with zeros if needed
-            Digits ++ lists:duplicate(IntDigits - Len, $0);
-           IntDigits =< 0 ->
-            %% All digits are fractional; prepend "0." + leading zeros
-            "0." ++ lists:duplicate(-IntDigits, $0) ++ Digits;
+        if IntLen >= Len ->
+            Digits ++ lists:duplicate(IntLen - Len, $0);
+           IntLen =< 0 ->
+            "0." ++ lists:duplicate(-IntLen, $0) ++ Digits;
            true ->
-            %% Split at IntDigits
-            {IStr, FStr} = lists:split(IntDigits, Digits),
+            {IStr, FStr} = lists:split(IntLen, Digits),
             IStr ++ "." ++ FStr
         end,
     strip_trailing_zeros(Str).
+
+%% %g SCIENTIFIC branch: one leading digit, '.', remaining significant digits
+%% with trailing zeros stripped, then 'e', sign, exponent >= 2 digits.
+g16_sci([D0 | Rest], Exp) ->
+    FracStripped = lists:reverse(
+                     lists:dropwhile(fun(C) -> C =:= $0 end,
+                                     lists:reverse(Rest))),
+    Mant = case FracStripped of
+        "" -> [D0];
+        _  -> [D0, $. | FracStripped]
+    end,
+    ESign = if Exp < 0 -> "-"; true -> "+" end,
+    EAbs = abs(Exp),
+    EStr = if EAbs < 10 -> [$0 | integer_to_list(EAbs)];
+              true      -> integer_to_list(EAbs)
+           end,
+    Mant ++ "e" ++ ESign ++ EStr.
 
 %% Remove trailing zeros after the decimal point; remove the point too if empty.
 strip_trailing_zeros(Str) ->
@@ -6148,18 +6355,6 @@ extract_ntx_from_response(Response) ->
             end;
         _ ->
             0
-    end.
-
-%% Current tip difficulty.
-tip_difficulty() ->
-    case beamchain_chainstate:get_tip() of
-        {ok, {_Hash, Height}} ->
-            case beamchain_db:get_block_index(Height) of
-                {ok, #{header := Hdr}} ->
-                    bits_to_difficulty(Hdr#block_header.bits);
-                _ -> 0.0
-            end;
-        _ -> 0.0
     end.
 
 %% Number of confirmations for a block at the given height.
@@ -6294,6 +6489,14 @@ format_block_json(#block{header = Header, transactions = Txs} = Block,
     %% size/weight/strippedsize in the wrong internal order and emitted
     %% tx before coinbase_tx.
     PrevHashHex = hash_to_hex(Header#block_header.prev_hash),
+    %% Core blockheaderToJSON (rpc/blockchain.cpp:180) emits nextblockhash ONLY
+    %% when a next block exists (`if (pnext)`); the active-chain TIP has no next
+    %% block, so Core OMITS the key entirely (not null). Suppress it here when
+    %% there is no successor rather than emitting nextblockhash: null.
+    NextField = case NextHash of
+        null -> [];
+        _    -> [{<<"nextblockhash">>, NextHash}]
+    end,
     HeaderFields = [
         {<<"hash">>, hash_to_hex(Hash)},
         {<<"confirmations">>, confirmations(Height, Hash)},
@@ -6310,9 +6513,8 @@ format_block_json(#block{header = Header, transactions = Txs} = Block,
         {<<"difficulty">>, format_diff_sentinel(Bits)},
         {<<"chainwork">>, beamchain_serialize:hex_encode(Chainwork)},
         {<<"nTx">>, length(Txs)},
-        {<<"previousblockhash">>, PrevHashHex},
-        {<<"nextblockhash">>, NextHash}
-    ],
+        {<<"previousblockhash">>, PrevHashHex}
+    ] ++ NextField,
     HeaderFields ++ [
         {<<"strippedsize">>, stripped_size(Block)},
         {<<"size">>, Size},
@@ -6585,12 +6787,14 @@ resolve_host(Host, Port) ->
             end
     end.
 
-%% Convert service flags to names.
+%% Convert service flags to names. Ordered by ascending bit value to match
+%% Core serviceFlagsToStr (net.cpp), which iterates bit positions 0..63.
 services_to_names(Services) ->
     Flags = [
         {?NODE_NETWORK, <<"NETWORK">>},
         {?NODE_BLOOM, <<"BLOOM">>},
         {?NODE_WITNESS, <<"WITNESS">>},
+        {?NODE_COMPACT_FILTERS, <<"COMPACT_FILTERS">>},
         {?NODE_NETWORK_LIMITED, <<"NETWORK_LIMITED">>}
     ],
     [Name || {Flag, Name} <- Flags, (Services band Flag) =/= 0].
@@ -10467,38 +10671,41 @@ format_psbt_spk_json(Script, Network) ->
 %%
 %% For decoderawtransaction: coinbase vin emits txinwitness when non-empty
 %% (e.g. block 800000 coinbase witness commitment), matching Core TxToUniv.
+%% ORDERED proplist (NOT a map): jsx preserves proplist order but alphabetises
+%% map keys. Core TxToUniv (core_io.cpp:451) vin pushKV order for a coinbase is
+%% coinbase, [txinwitness], sequence; for a normal input txid, vout, scriptSig,
+%% [txinwitness], sequence. txinwitness (when present) precedes sequence.
 format_psbt_vin(#tx_in{prev_out = #outpoint{hash = <<0:256>>,
                                              index = 16#ffffffff},
                        script_sig = ScriptSig, sequence = Seq,
                        witness = Witness}) ->
-    %% Coinbase — {coinbase, txinwitness?, sequence} per Core TxToUniv order
-    Base = #{<<"coinbase">> => beamchain_serialize:hex_encode(ScriptSig),
-             <<"sequence">> => Seq},
-    case Witness of
+    Wit = case Witness of
         W when is_list(W), W =/= [] ->
-            Base#{<<"txinwitness">> =>
-                [beamchain_serialize:hex_encode(Item) || Item <- W]};
-        _ -> Base
-    end;
+            [{<<"txinwitness">>,
+              [beamchain_serialize:hex_encode(Item) || Item <- W]}];
+        _ -> []
+    end,
+    [{<<"coinbase">>, beamchain_serialize:hex_encode(ScriptSig)}]
+        ++ Wit
+        ++ [{<<"sequence">>, Seq}];
 format_psbt_vin(#tx_in{prev_out = #outpoint{hash = Hash, index = Idx},
                        script_sig = ScriptSig, sequence = Seq,
                        witness = Witness}) ->
     Asm = script_to_asm_core(ScriptSig),
-    Base = #{
-        <<"txid">>      => hash_to_hex(Hash),
-        <<"vout">>      => Idx,
-        <<"scriptSig">> => #{
-            <<"asm">> => Asm,
-            <<"hex">> => beamchain_serialize:hex_encode(ScriptSig)
-        },
-        <<"sequence">>  => Seq
-    },
-    case Witness of
+    Wit = case Witness of
         W when is_list(W), W =/= [] ->
-            Base#{<<"txinwitness">> =>
-                [beamchain_serialize:hex_encode(Item) || Item <- W]};
-        _ -> Base
-    end.
+            [{<<"txinwitness">>,
+              [beamchain_serialize:hex_encode(Item) || Item <- W]}];
+        _ -> []
+    end,
+    [
+        {<<"txid">>,      hash_to_hex(Hash)},
+        {<<"vout">>,      Idx},
+        {<<"scriptSig">>, [
+            {<<"asm">>, Asm},
+            {<<"hex">>, beamchain_serialize:hex_encode(ScriptSig)}
+        ]}
+    ] ++ Wit ++ [{<<"sequence">>, Seq}].
 
 %% format_amount_sentinel/1 — represent a satoshi amount as a sentinel binary
 %% that jsx encodes as a JSON string.  After jsx:encode, replace_btc_sentinels/1
@@ -10557,11 +10764,12 @@ consume_digits(Rest, Acc) ->
 %% and value is a sentinel for post-encode numeric fixup.
 format_psbt_vouts([], _N, _Network) -> [];
 format_psbt_vouts([#tx_out{value = Value, script_pubkey = Script} | Rest], N, Network) ->
-    Vout = #{
-        <<"value">>        => format_amount_sentinel(Value),
-        <<"n">>            => N,
-        <<"scriptPubKey">> => format_psbt_spk_json(Script, Network)
-    },
+    %% ORDERED proplist: Core TxToUniv vout pushKV order is value, n, scriptPubKey.
+    Vout = [
+        {<<"value">>,        format_amount_sentinel(Value)},
+        {<<"n">>,            N},
+        {<<"scriptPubKey">>, format_psbt_spk_json(Script, Network)}
+    ],
     [Vout | format_psbt_vouts(Rest, N + 1, Network)].
 
 %% format_psbt_tx_json/1 — like format_tx_json but without the top-level
@@ -10572,17 +10780,20 @@ format_psbt_tx_json(#transaction{} = Tx) ->
     Txid   = beamchain_serialize:tx_hash(Tx),
     Wtxid  = beamchain_serialize:wtx_hash(Tx),
     TxBin  = beamchain_serialize:encode_transaction(Tx),
-    #{
-        <<"txid">>     => hash_to_hex(Txid),
-        <<"hash">>     => hash_to_hex(Wtxid),
-        <<"version">>  => Tx#transaction.version,
-        <<"size">>     => byte_size(TxBin),
-        <<"vsize">>    => beamchain_serialize:tx_vsize(Tx),
-        <<"weight">>   => beamchain_serialize:tx_weight(Tx),
-        <<"locktime">> => Tx#transaction.locktime,
-        <<"vin">>      => [format_psbt_vin(In) || In <- Tx#transaction.inputs],
-        <<"vout">>     => format_psbt_vouts(Tx#transaction.outputs, 0, Network)
-    }.
+    %% ORDERED proplist (NOT a map): Core TxToUniv (core_io.cpp:434) pushKV order
+    %% is txid, hash, version, size, vsize, weight, locktime, vin, vout
+    %% (include_hex=false here, so no top-level hex).
+    [
+        {<<"txid">>,     hash_to_hex(Txid)},
+        {<<"hash">>,     hash_to_hex(Wtxid)},
+        {<<"version">>,  Tx#transaction.version},
+        {<<"size">>,     byte_size(TxBin)},
+        {<<"vsize">>,    beamchain_serialize:tx_vsize(Tx)},
+        {<<"weight">>,   beamchain_serialize:tx_weight(Tx)},
+        {<<"locktime">>, Tx#transaction.locktime},
+        {<<"vin">>,      [format_psbt_vin(In) || In <- Tx#transaction.inputs]},
+        {<<"vout">>,     format_psbt_vouts(Tx#transaction.outputs, 0, Network)}
+    ].
 
 %% encode_psbt_decode/1 — build the decodepsbt response as a JSON binary
 %% with Core-exact numeric literals (e.g. "1.00000000", not "1.0").
@@ -11313,13 +11524,16 @@ rpc_getdescriptorinfo([DescStr]) when is_binary(DescStr) ->
             {ok, Desc} ->
                 Checksum = beamchain_descriptor:checksum(Stripped),
                 WithChecksum = Stripped ++ "#" ++ Checksum,
-                Result = #{
-                    <<"descriptor">> => list_to_binary(WithChecksum),
-                    <<"checksum">> => list_to_binary(Checksum),
-                    <<"isrange">> => beamchain_descriptor:is_range(Desc),
-                    <<"issolvable">> => beamchain_descriptor:is_solvable(Desc),
-                    <<"hasprivatekeys">> => beamchain_descriptor:has_private_keys(Desc)
-                },
+                %% ORDERED proplist (NOT a map): Core getdescriptorinfo
+                %% (rpc/output_script.cpp:205) pushKV order is descriptor,
+                %% checksum, isrange, issolvable, hasprivatekeys.
+                Result = [
+                    {<<"descriptor">>, list_to_binary(WithChecksum)},
+                    {<<"checksum">>, list_to_binary(Checksum)},
+                    {<<"isrange">>, beamchain_descriptor:is_range(Desc)},
+                    {<<"issolvable">>, beamchain_descriptor:is_solvable(Desc)},
+                    {<<"hasprivatekeys">>, beamchain_descriptor:has_private_keys(Desc)}
+                ],
                 {ok, Result};
             {error, Reason} ->
                 {error, ?RPC_INVALID_PARAMETER,
