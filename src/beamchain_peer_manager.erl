@@ -615,6 +615,14 @@ init([]) ->
         _ ->
             ok  %% table already exists (e.g., from tests)
     end,
+    %% Seed the BIP-324 v2 per-address v1-only fallback cache here so the
+    %% long-lived manager OWNS it.  ETS tables die with their owning
+    %% process; if a short-lived dialing peer created it, a v1-only mark
+    %% set on a v2-probe disconnect would vanish when that peer stops and
+    %% the re-dial would re-probe v2 forever.  Owning it on the manager
+    %% makes the mark survive across peer-process churn (Core
+    %% ShouldReconnectV1 fallback parity).
+    beamchain_peer:ensure_v1_only_table(),
     Nonce = generate_nonce(),
     DataDir = beamchain_config:datadir(),
     %% Generate or load netgroup secret

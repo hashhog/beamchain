@@ -21,6 +21,7 @@
 %% BIP-324 v2 outbound: per-address v1-only cache + env-var gate.
 -export([bip324_v2_outbound_enabled/0,
          mark_v1_only/1, is_v1_only/1,
+         ensure_v1_only_table/0,
          clear_v1_only_cache/0]).
 
 %% Advertised service bitset (single source of truth for both the wire
@@ -312,12 +313,24 @@ clear_v1_only_cache() ->
     end,
     ok.
 
+%% @doc Eagerly create the v1-only fallback cache, owned by the caller.
+%% The peer manager calls this from its init/1 so the LONG-LIVED manager
+%% process owns the table — not a short-lived dialing peer.  This is
+%% load-bearing for v1 fallback: an ETS table dies with its owner, so if
+%% a doomed v2-probe peer created it, mark_v1_only/1 from that same peer
+%% would vanish the instant the peer stops, and the manager's re-dial
+%% would re-probe v2 forever (observed B1 loop, 2026-06-12).  Idempotent.
+-spec ensure_v1_only_table() -> ok.
+ensure_v1_only_table() ->
+    ensure_fallback_table().
+
 %% Lazily create the v1-only cache table.  ETS tables are owned by the
-%% process that creates them; on first call we create it from whichever
-%% process happened to dial first.  Subsequent processes find it
-%% existing.  We use named_table + public so any peer process can
-%% read+write without going through a coordinator.  heir_data is set so
-%% the table survives the creator dying.
+%% process that creates them and DIE when that process exits.  The peer
+%% manager seeds it eagerly via ensure_v1_only_table/0 at startup so the
+%% long-lived manager owns it; this lazy path is the defensive fallback
+%% (e.g. unit tests that exercise mark/is_v1_only without a manager).  We
+%% use named_table + public so any peer process can read+write without a
+%% coordinator.
 ensure_fallback_table() ->
     case ets:info(?V2_FALLBACK_TABLE) of
         undefined ->
@@ -453,10 +466,12 @@ connecting(state_timeout, send_version, Data) ->
 connecting(internal, send_version, Data) ->
     start_handshake(Data);
 
-connecting(info, {tcp_closed, _}, _Data) ->
+connecting(info, {tcp_closed, _}, Data) ->
+    maybe_mark_v1_fallback(Data),
     {stop, connection_closed};
 
-connecting(info, {tcp_error, _, Reason}, _Data) ->
+connecting(info, {tcp_error, _, Reason}, Data) ->
+    maybe_mark_v1_fallback(Data),
     {stop, {tcp_error, Reason}};
 
 connecting(cast, disconnect, _Data) ->
@@ -512,10 +527,12 @@ handshaking(info, {tcp, Socket, Bin}, #peer_data{socket = Socket} = Data) ->
 
 handshaking(info, {tcp_closed, _}, Data) ->
     logger:info("peer ~p closed during handshake", [Data#peer_data.address]),
+    maybe_mark_v1_fallback(Data),
     {stop, normal};
 
 handshaking(info, {tcp_error, _, Reason}, Data) ->
     logger:warning("peer ~p tcp error: ~p", [Data#peer_data.address, Reason]),
+    maybe_mark_v1_fallback(Data),
     {stop, {tcp_error, Reason}};
 
 handshaking(info, {'DOWN', Ref, process, _, _}, #peer_data{handler_mon = Ref}) ->
@@ -1110,6 +1127,42 @@ raw_socket_send(#peer_data{socket = Socket} = Data, Bytes) ->
 %%     v2_enabled and !self.isV1Only(address)  (peer.zig:1868).
 should_init_v2_outbound(Address) ->
     bip324_v2_outbound_enabled() andalso not is_v1_only(Address).
+
+%% True iff we are mid-v2-outbound-handshake and the peer dropped the
+%% socket without ever replying — the signature of a v1-only peer that
+%% read our 64-byte ellswift pubkey as a malformed v1 header and reset
+%% the connection (it never sends a v1 ``version`` for classify_v2_response
+%% to catch).  This mirrors Core V2Transport::ShouldReconnectV1
+%% (net.cpp:1555): m_initiating && m_recv_state==KEY (we are still in a
+%% cipher-handshake substate, no peer bytes processed) &&
+%% m_sent_v1_header_worth (we sent >= a v1 header worth — our 64-byte
+%% pubkey).  When true the caller marks the address v1-only so the
+%% manager's next re-dial skips the v2 probe and completes over v1.
+-spec v2_probe_unanswered(#peer_data{}) -> boolean().
+v2_probe_unanswered(#peer_data{direction = outbound,
+                               v2_initiator = true,
+                               v2_phase = Phase})
+  when Phase =:= recv_pubkey;
+       Phase =:= recv_garbterm;
+       Phase =:= drain_decoy ->
+    true;
+v2_probe_unanswered(_) ->
+    false.
+
+%% If this disconnect happened mid-v2-outbound-probe with no peer reply,
+%% mark the address v1-only (Core ShouldReconnectV1 fallback) so the
+%% pinned/addrman re-dial loop retries over v1.  No-op for v1 peers,
+%% inbound peers, and any peer that completed the cipher handshake.
+maybe_mark_v1_fallback(Data) ->
+    case v2_probe_unanswered(Data) of
+        true ->
+            logger:info("peer ~p dropped during v2 probe with no reply; "
+                        "marking v1-only and falling back",
+                        [Data#peer_data.address]),
+            mark_v1_only(Data#peer_data.address);
+        false ->
+            ok
+    end.
 
 %% Build an initialised initiator cipher and return the OUTGOING wire
 %% prefix that is computable BEFORE peer's pubkey arrives — namely the
