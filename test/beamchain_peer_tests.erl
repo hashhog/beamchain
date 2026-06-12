@@ -582,27 +582,31 @@ v2_initiator_scan_terminator_too_long_test() ->
     ?assertEqual(too_long, Result).
 
 %% Fallback path: env-var / app-config + per-address cache.
-v2_outbound_default_off_test() ->
-    %% No env var set, no app env set → off.
+v2_outbound_default_on_test() ->
+    %% No env var set, no app env set → ON by default (BIP-324 v2 flipped
+    %% default-on once outbound interop with Core v2 was proven). Only an
+    %% explicit opt-out turns it off.
     os:unsetenv("BEAMCHAIN_BIP324_V2_OUTBOUND"),
     application:unset_env(beamchain, bip324_v2_outbound),
-    ?assertEqual(false, beamchain_peer:bip324_v2_outbound_enabled()).
+    ?assertEqual(true, beamchain_peer:bip324_v2_outbound_enabled()).
 
 v2_outbound_env_var_truthy_test() ->
     application:unset_env(beamchain, bip324_v2_outbound),
-    %% Various truthy spellings.
+    %% Various truthy spellings, plus the empty string (env present but blank
+    %% is NOT an explicit opt-out, so it stays on under the default-on policy).
     lists:foreach(fun(Val) ->
         os:putenv("BEAMCHAIN_BIP324_V2_OUTBOUND", Val),
         ?assertEqual(true, beamchain_peer:bip324_v2_outbound_enabled())
-    end, ["1", "true", "TRUE", "yes", "on"]),
+    end, ["1", "true", "TRUE", "yes", "on", ""]),
     os:unsetenv("BEAMCHAIN_BIP324_V2_OUTBOUND").
 
 v2_outbound_env_var_falsy_test() ->
     application:unset_env(beamchain, bip324_v2_outbound),
+    %% Only explicit opt-out spellings turn it off.
     lists:foreach(fun(Val) ->
         os:putenv("BEAMCHAIN_BIP324_V2_OUTBOUND", Val),
         ?assertEqual(false, beamchain_peer:bip324_v2_outbound_enabled())
-    end, ["0", "false", "no", ""]),
+    end, ["0", "false", "no", "off"]),
     os:unsetenv("BEAMCHAIN_BIP324_V2_OUTBOUND").
 
 v2_outbound_app_env_test() ->
