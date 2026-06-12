@@ -1490,20 +1490,32 @@ handshake_complete(_) ->
 %%% ===================================================================
 
 %% Send sendtxrcncl if conditions are met:
+%% - BIP-330 transaction reconciliation is enabled (`-txreconciliation`).
+%%   Bitcoin Core gates this OFF BY DEFAULT (DEFAULT_TXRECONCILIATION_ENABLE
+%%   == false, net_processing.h:40): it only builds m_txreconciliation — and
+%%   therefore only sends SENDTXRCNCL during the handshake — when the operator
+%%   opts in (net_processing.cpp:2018-2023, 3723-3735). beamchain previously
+%%   sent it unconditionally; now it respects the same opt-in flag.
 %% - Peer supports wtxidrelay (required for Erlay)
 %% - Peer allows tx relay (not block-only)
 %% - We're in protocol version >= 70016 (WTXID relay version)
 maybe_send_sendtxrcncl(#peer_data{peer_relay = true, wtxidrelay = true,
                                    peer_version = V} = Data) when V >= 70016 ->
-    %% Pre-register with Erlay module to get our local salt
-    LocalSalt = beamchain_erlay:pre_register_peer(self()),
-    ErlayVersion = beamchain_erlay:version(),
-    Payload = beamchain_p2p_msg:encode_payload(sendtxrcncl, #{
-        version => ErlayVersion,
-        salt => LocalSalt
-    }),
-    Data2 = do_send_raw(sendtxrcncl, Payload, Data),
-    Data2#peer_data{erlay_local_salt = LocalSalt};
+    case beamchain_config:txreconciliation() of
+        false ->
+            %% Erlay not enabled — never announce txreconciliation (Core default).
+            Data;
+        true ->
+            %% Pre-register with Erlay module to get our local salt
+            LocalSalt = beamchain_erlay:pre_register_peer(self()),
+            ErlayVersion = beamchain_erlay:version(),
+            Payload = beamchain_p2p_msg:encode_payload(sendtxrcncl, #{
+                version => ErlayVersion,
+                salt => LocalSalt
+            }),
+            Data2 = do_send_raw(sendtxrcncl, Payload, Data),
+            Data2#peer_data{erlay_local_salt = LocalSalt}
+    end;
 maybe_send_sendtxrcncl(Data) ->
     %% Conditions not met for Erlay
     Data.

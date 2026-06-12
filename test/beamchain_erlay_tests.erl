@@ -18,6 +18,46 @@ erlay_test_() ->
       {"p2p message encoding/decoding", fun test_p2p_messages/0}
      ]}.
 
+%% BIP-330 txreconciliation (Erlay) is OFF BY DEFAULT, matching Bitcoin
+%% Core DEFAULT_TXRECONCILIATION_ENABLE == false (net_processing.h:40).
+%% Core only sends SENDTXRCNCL when `-txreconciliation` is set; beamchain
+%% now respects the same opt-in via beamchain_config:txreconciliation/0.
+txreconciliation_default_off_test_() ->
+    [
+     %% No config ETS table, no env var -> Core default (false).
+     {"txreconciliation defaults to false (Core default)", fun() ->
+         OldEnv = os:getenv("BEAMCHAIN_TXRECONCILIATION"),
+         os:unsetenv("BEAMCHAIN_TXRECONCILIATION"),
+         try
+             ?assertEqual(false, beamchain_config:txreconciliation())
+         after
+             restore_env("BEAMCHAIN_TXRECONCILIATION", OldEnv)
+         end
+     end},
+     %% Explicit opt-in via env enables it.
+     {"BEAMCHAIN_TXRECONCILIATION=1 enables it", fun() ->
+         OldEnv = os:getenv("BEAMCHAIN_TXRECONCILIATION"),
+         os:putenv("BEAMCHAIN_TXRECONCILIATION", "1"),
+         try
+             ?assertEqual(true, beamchain_config:txreconciliation())
+         after
+             restore_env("BEAMCHAIN_TXRECONCILIATION", OldEnv)
+         end
+     end},
+     {"BEAMCHAIN_TXRECONCILIATION=0 keeps it off", fun() ->
+         OldEnv = os:getenv("BEAMCHAIN_TXRECONCILIATION"),
+         os:putenv("BEAMCHAIN_TXRECONCILIATION", "0"),
+         try
+             ?assertEqual(false, beamchain_config:txreconciliation())
+         after
+             restore_env("BEAMCHAIN_TXRECONCILIATION", OldEnv)
+         end
+     end}
+    ].
+
+restore_env(Var, false) -> os:unsetenv(Var);
+restore_env(Var, Val)   -> os:putenv(Var, Val).
+
 setup() ->
     %% Start crypto for hash functions
     application:ensure_all_started(crypto),

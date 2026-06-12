@@ -10056,6 +10056,12 @@ rpc_decodepsbt([PsbtB64]) when is_binary(PsbtB64) ->
         case beamchain_psbt:decode(PsbtBin) of
             {ok, Psbt} ->
                 {ok_raw_json, encode_psbt_decode(Psbt)};
+            {error, unsupported_psbt_version} ->
+                %% Bitcoin Core surfaces this as
+                %% "TX decode failed Unsupported version number"
+                %% (rawtransaction.cpp:1064-1065 -> psbt.h:1323).
+                {error, ?RPC_DESERIALIZATION_ERROR,
+                 <<"TX decode failed Unsupported version number">>};
             {error, Reason} ->
                 {error, ?RPC_DESERIALIZATION_ERROR,
                  iolist_to_binary(io_lib:format("PSBT decode failed: ~p", [Reason]))}

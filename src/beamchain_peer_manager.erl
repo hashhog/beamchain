@@ -2236,10 +2236,10 @@ spend_addr_tokens([Addr | Rest], Bucket, RateLimited, Acc, Dropped) ->
 %%      answer getaddr on a connection WE opened.
 %%   2. Answer only the FIRST getaddr per connection (Core m_getaddr_recvd,
 %%      net_processing.cpp:4833). Repeats are silently dropped.
-%%   3. Cap the response at min(MAX_ADDR_TO_SEND, ceil(0.23 * addrman_size))
+%%   3. Cap the response at min(MAX_ADDR_TO_SEND, floor(0.23 * addrman_size))
 %%      (Core GetAddresses(..., MAX_ADDR_TO_SEND=1000, MAX_PCT_ADDR_TO_SEND=23),
-%%      net_processing.cpp:4842). Returning the whole table is a privacy /
-%%      bandwidth-amplification vector.
+%%      net_processing.cpp:4842 -> addrman.cpp:800, integer floor). Returning
+%%      the whole table is a privacy / bandwidth-amplification vector.
 handle_getaddr_msg(Pid, State) ->
     case ets:lookup(?PEER_TABLE, Pid) of
         [#peer_entry{direction = outbound}] ->
@@ -2271,18 +2271,19 @@ handle_getaddr_msg(Pid, State) ->
             {noreply, State}
     end.
 
-%% @doc Compute the getaddr response cap: min(MAX_ADDR_TO_SEND,
-%% ceil(MAX_PCT_ADDR_TO_SEND/100 * Size)). Mirrors Bitcoin Core
-%% AddrManImpl::GetAddr_ nNodes = size; nNodes * max_pct / 100 with a ceil
-%% (net_processing.cpp MAX_PCT_ADDR_TO_SEND=23 capped at MAX_ADDR_TO_SEND).
-%% Always returns at least 1 when the table is non-empty so a tiny addrman
-%% can still seed a peer.
+%% @doc Compute the getaddr response cap. Mirrors Bitcoin Core
+%% AddrManImpl::GetAddr_ (addrman.cpp:800): nNodes = max_pct * nNodes / 100
+%% — INTEGER DIVISION (FLOOR), not ceil — then min with max_addresses
+%% (MAX_ADDR_TO_SEND=1000). max_pct == MAX_PCT_ADDR_TO_SEND == 23
+%% (net_processing.cpp:188). Core does NOT clamp the floor up to 1: a tiny
+%% addrman where 23*Size < 100 yields 0 (e.g. Size=1..4 -> 0), so we must
+%% NOT add a max(1, _) — that would over-disclose addresses Core withholds.
 -spec getaddr_cap(non_neg_integer()) -> non_neg_integer().
 getaddr_cap(0) -> 0;
 getaddr_cap(Size) ->
-    %% ceil(0.23 * Size) == (Size * 23 + 99) div 100
-    Pct = (Size * ?MAX_PCT_ADDR_TO_SEND + 99) div 100,
-    min(?MAX_ADDR_TO_SEND, max(1, Pct)).
+    %% floor(0.23 * Size) == (Size * 23) div 100
+    Pct = (Size * ?MAX_PCT_ADDR_TO_SEND) div 100,
+    min(?MAX_ADDR_TO_SEND, Pct).
 
 %% @doc Relay an addr message to up to 2 random connected peers (not the source).
 relay_addr_to_random_peers(SourcePid, Msg, _State) ->

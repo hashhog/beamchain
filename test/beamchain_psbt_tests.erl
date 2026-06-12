@@ -3,6 +3,7 @@
 -include_lib("eunit/include/eunit.hrl").
 -include("beamchain.hrl").
 -include("beamchain_protocol.hrl").
+-include("beamchain_psbt.hrl").
 
 %%% ===================================================================
 %%% Test fixtures
@@ -72,7 +73,11 @@ encode_decode_test_() ->
     {"PSBT encode/decode tests", [
         {"roundtrip basic", fun encode_decode_roundtrip/0},
         {"decode invalid magic", fun decode_invalid_magic/0},
-        {"encode with witness utxo", fun encode_with_witness_utxo/0}
+        {"encode with witness utxo", fun encode_with_witness_utxo/0},
+        {"decode rejects PSBT global version > 0",
+         fun decode_rejects_unsupported_version/0},
+        {"decode accepts PSBT global version 0",
+         fun decode_accepts_version_zero/0}
     ]}.
 
 encode_decode_roundtrip() ->
@@ -101,6 +106,40 @@ encode_with_witness_utxo() ->
     {ok, Decoded} = beamchain_psbt:decode(Encoded),
     InputMap = beamchain_psbt:get_input(Decoded, 0),
     ?assertMatch({50000, _}, maps:get(witness_utxo, InputMap)).
+
+%% Bitcoin Core psbt.h:1322-1323: a PSBT whose global version exceeds
+%% PSBT_HIGHEST_VERSION (0) is rejected on deserialization with
+%% "Unsupported version number"; decodepsbt surfaces this as
+%% RPC_DESERIALIZATION_ERROR (-22). PSBTv2 (version 2 / BIP-370) is
+%% therefore not decodable by this v0/v1 deserializer.
+decode_rejects_unsupported_version() ->
+    Tx = sample_unsigned_tx(),
+    {ok, Psbt0} = beamchain_psbt:create(Tx),
+    %% Force a global version of 2 (PSBTv2). The encoder emits the
+    %% PSBT_GLOBAL_VERSION (0xfb) key with this value because it is > 0.
+    PsbtV2 = Psbt0#psbt{version = 2},
+    EncodedV2 = beamchain_psbt:encode(PsbtV2),
+    %% Sanity: the encoded bytes actually carry the version-2 KV
+    %% (key 0x01<0xfb> ... value 0x04 02000000). Pin the 0xfb type byte.
+    ?assertNotEqual(nomatch, binary:match(EncodedV2, <<16#fb>>)),
+    %% The deserializer must reject it (mirrors Core's throw).
+    ?assertEqual({error, unsupported_psbt_version},
+                 beamchain_psbt:decode(EncodedV2)),
+    %% Version 3 (any value > 0) is likewise rejected.
+    PsbtV3 = Psbt0#psbt{version = 3},
+    ?assertEqual({error, unsupported_psbt_version},
+                 beamchain_psbt:decode(beamchain_psbt:encode(PsbtV3))).
+
+%% Confirm the version-0 path is unaffected (Core PSBT_HIGHEST_VERSION == 0
+%% accepts version 0). The encoder omits the version KV at v0, so this also
+%% guards the "no version key present -> default 0 -> accept" path.
+decode_accepts_version_zero() ->
+    Tx = sample_unsigned_tx(),
+    {ok, Psbt0} = beamchain_psbt:create(Tx),
+    ?assertEqual(0, beamchain_psbt:get_version(Psbt0)),
+    Encoded = beamchain_psbt:encode(Psbt0),
+    {ok, Decoded} = beamchain_psbt:decode(Encoded),
+    ?assertEqual(0, beamchain_psbt:get_version(Decoded)).
 
 %%% ===================================================================
 %%% Update tests
