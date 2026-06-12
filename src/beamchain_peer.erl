@@ -23,6 +23,10 @@
          mark_v1_only/1, is_v1_only/1,
          clear_v1_only_cache/0]).
 
+%% Advertised service bitset (single source of truth for both the wire
+%% version message and getnetworkinfo localservices).
+-export([advertised_services/0]).
+
 %% gen_statem callbacks
 -export([callback_mode/0, init/1, terminate/3]).
 -export([connecting/3, handshaking/3, ready/3]).

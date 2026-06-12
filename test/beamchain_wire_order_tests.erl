@@ -97,7 +97,10 @@ getmempoolinfo_order_test() ->
     assert_order(Json, [
         <<"loaded">>, <<"size">>, <<"bytes">>, <<"usage">>, <<"total_fee">>,
         <<"maxmempool">>, <<"mempoolminfee">>, <<"minrelaytxfee">>,
-        <<"incrementalrelayfee">>, <<"unbroadcastcount">>, <<"fullrbf">>
+        <<"incrementalrelayfee">>, <<"unbroadcastcount">>, <<"fullrbf">>,
+        %% Core v31.99 additions:
+        <<"permitbaremultisig">>, <<"maxdatacarriersize">>,
+        <<"limitclustercount">>, <<"limitclustersize">>, <<"optimal">>
     ]).
 
 %%% ===================================================================
@@ -148,19 +151,22 @@ getnetworkinfo_nested_localaddr_order_test() ->
 %%% ===================================================================
 
 getmininginfo_order_test() ->
-    PL = beamchain_rpc:mininginfo_proplist(800000, <<"170331db">>, 1.0e12,
+    %% 3rd arg is now the compact tip bits (integer) — the proplist routes it
+    %% through the __DIFF__ sentinel for difficulty. Core v31.99 dropped
+    %% currentblocksize.
+    PL = beamchain_rpc:mininginfo_proplist(800000, <<"170331db">>, 16#170331db,
                                            <<"00000000000000000000">>, 5,
                                            <<"main">>),
     Json = encode_wire(PL),
     assert_order(Json, [
-        <<"blocks">>, <<"currentblocksize">>, <<"currentblockweight">>,
+        <<"blocks">>, <<"currentblockweight">>,
         <<"currentblocktx">>, <<"bits">>, <<"difficulty">>, <<"target">>,
         <<"networkhashps">>, <<"pooledtx">>, <<"blockmintxfee">>,
         <<"chain">>, <<"next">>, <<"warnings">>
     ]).
 
 getmininginfo_nested_next_order_test() ->
-    PL = beamchain_rpc:mininginfo_proplist(800000, <<"170331db">>, 1.0e12,
+    PL = beamchain_rpc:mininginfo_proplist(800000, <<"170331db">>, 16#170331db,
                                            <<"00000000000000000000">>, 5,
                                            <<"main">>),
     Json = encode_wire(PL),
@@ -220,36 +226,33 @@ getpeerinfo_mapped_as_not_last_test() ->
 %%% ===================================================================
 
 %% Assemble the full getblockchaininfo result from the production splicer with
-%% representative parts (no DB), then assert the top-level Core key order.
+%% representative parts (no DB), then assert the top-level Core v31.99 key order.
+%% Core v31.99 DROPPED softforks; beamchain's compact_filters_enabled is also
+%% gone. size_on_disk now sits between chainwork and pruned; warnings is last.
 getblockchaininfo_toplevel_order_test() ->
     Base = blockchaininfo_base(),
     Prune = [{<<"pruned">>, false}],
-    Compact = [{<<"compact_filters_enabled">>, true}],
-    Softforks = beamchain_rpc:build_deployment_proplist(mainnet, 900000,
-                                                        stub_getter()),
-    Result = beamchain_rpc:blockchaininfo_assemble(Base, Prune, Compact,
-                                                   Softforks),
+    Result = beamchain_rpc:blockchaininfo_assemble(Base, Prune),
     Json = encode_wire(Result),
     assert_order(Json, [
         <<"chain">>, <<"blocks">>, <<"headers">>, <<"bestblockhash">>,
         <<"bits">>, <<"target">>, <<"difficulty">>, <<"time">>,
         <<"mediantime">>, <<"verificationprogress">>,
-        <<"initialblockdownload">>, <<"chainwork">>, <<"pruned">>,
-        <<"compact_filters_enabled">>, <<"softforks">>, <<"warnings">>
-    ]).
+        <<"initialblockdownload">>, <<"chainwork">>, <<"size_on_disk">>,
+        <<"pruned">>, <<"warnings">>
+    ]),
+    %% v31.99 no longer carries softforks / compact_filters_enabled.
+    ?assertEqual(nomatch, binary:match(Json, <<"softforks">>)),
+    ?assertEqual(nomatch, binary:match(Json, <<"compact_filters_enabled">>)).
 
-%% The KNOWN MISS of the prior sweep: the nested softforks value must be an
-%% ordered object too. Assert (a) the softfork NAMES are in canonical order and
-%% (b) the inner keys of a buried entry and a bip9 entry are in Core pushKV
-%% order. Anchored after the "softforks" key so the top-level chain fields do
-%% not satisfy the inner-key search.
+%% build_deployment_proplist is still the getdeploymentinfo source of truth
+%% (no longer spliced into getblockchaininfo). Assert (a) the softfork NAMES are
+%% in canonical order and (b) the inner keys of a buried entry and a bip9 entry
+%% are in Core pushKV order.
 getblockchaininfo_softforks_nested_order_test() ->
-    Base = blockchaininfo_base(),
     Softforks = beamchain_rpc:build_deployment_proplist(mainnet, 900000,
                                                         stub_getter()),
-    Result = beamchain_rpc:blockchaininfo_assemble(Base, [{<<"pruned">>, false}],
-                                                   [], Softforks),
-    Json = encode_wire(Result),
+    Json = encode_wire([{<<"softforks">>, Softforks}]),
     SfFrom = key_pos(Json, <<"softforks">>),
     %% (a) deployment names in order (buried defs first, then bip9-only tail).
     assert_order_from(Json, [
@@ -284,7 +287,8 @@ blockchaininfo_base() ->
         {<<"mediantime">>, 1699999000},
         {<<"verificationprogress">>, 1.0},
         {<<"initialblockdownload">>, false},
-        {<<"chainwork">>, <<"00work">>}
+        {<<"chainwork">>, <<"00work">>},
+        {<<"size_on_disk">>, 0}
     ].
 
 %%% ===================================================================
