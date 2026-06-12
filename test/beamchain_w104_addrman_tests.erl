@@ -1122,30 +1122,48 @@ bug22_no_asmap_test_() ->
       end}}.
 
 %%% ===================================================================
-%%% BUG-23: No feeler connections
+%%% BUG-23: FEELER connections — FIXED (W104 anti-eclipse).
+%%% Flipped from "absent" to confirm-PRESENT: peer_manager now drives a
+%%% Core-style FEELER (maybe_open_feeler/1) that selects from the NEW table
+%%% (select_address(new_only=true)) and promotes NEW->TRIED on success only.
+%%% See beamchain_w104_feeler_tests for the full promote-on-success-only +
+%%% off-budget + bounded behavior. Core ref: net.h ConnectionType::FEELER,
+%%% net.cpp ThreadOpenConnections FEELER branch.
 %%% ===================================================================
 
-bug23_no_feeler_connections_test_() ->
-    {"BUG-23: No FEELER/ADDR_FETCH connection type in peer_manager",
+bug23_feeler_connections_present_test_() ->
+    {"BUG-23 FIXED: peer_manager drives a NEW-table feeler (maybe_open_feeler/1)",
      {setup, fun setup/0, fun cleanup/1,
       fun(_) ->
           [
-           {"select_address with new_only=true is not used for feeler connections", fun() ->
-               %% Bitcoin Core uses FEELER connections with select_address(new_only=true)
-               %% to test tried-collision candidates.  Without feelers, BUG-9's
-               %% unconditional eviction is the only collision resolution.
-               %%
-               %% Verify that select_address/1 supports new_only option (API exists)
-               %% but the peer_manager never uses it for feeler connections.
-               Addr = {{55, 66, 77, 88}, 8333},
-               beamchain_addrman:add_address(Addr, 0, dns),
-               timer:sleep(50),
-               %% new_only=true selects from new table
-               case beamchain_addrman:select_address(#{new_only => true}) of
-                   {ok, _} -> ok;
-                   empty -> ok
-               end,
-               ?assert(true)
+           {"peer_manager exports the feeler driver maybe_open_feeler/1", fun() ->
+               Exports = beamchain_peer_manager:module_info(exports),
+               ?assert(lists:member({maybe_open_feeler, 1}, Exports))
+           end},
+           {"feeler selects from the NEW table via select_address(new_only=true)", fun() ->
+               %% The feeler MUST consult the NEW table (Core addrman.Select(true)).
+               %% Seed a dense set so the probabilistic random-bucket walk
+               %% (Core addrman.cpp Select_) reliably returns a NEW address;
+               %% retry mirrors ThreadOpenConnections' nTries loop.
+               lists:foreach(fun(I) ->
+                   beamchain_addrman:add_address(
+                       {{55, 66, I rem 250 + 1, (I div 250) rem 250 + 1}, 8333},
+                       0, list_to_atom("fsrc" ++ integer_to_list(I)))
+               end, lists:seq(1, 400)),
+               timer:sleep(100),
+               SelectNew = fun S(0) -> empty;
+                               S(T) ->
+                                   case beamchain_addrman:select_address(
+                                          #{new_only => true}) of
+                                       {ok, A} -> {ok, A};
+                                       empty   -> S(T - 1)
+                                   end
+                           end,
+               ?assertMatch({ok, _}, SelectNew(50))
+           end},
+           {"feeler is OFF the outbound slot budget (count_outbound_for_budget/0)", fun() ->
+               Exports = beamchain_peer_manager:module_info(exports),
+               ?assert(lists:member({count_outbound_for_budget, 0}, Exports))
            end}
           ]
       end}}.
@@ -1265,20 +1283,42 @@ bug28_source_netgroup_collapses_test_() ->
       end}}.
 
 %%% ===================================================================
-%%% BUG-29: No getaddr one-per-connection guard
+%%% BUG-29: getaddr once-per-connection guard — FIXED (W104 anti-eclipse).
+%%% Flipped from "absent" to confirm-PRESENT: the GETADDR handler now answers
+%%% only the FIRST getaddr per connection (per-peer getaddr_recvd flag), ignores
+%%% repeats, and ignores getaddr from outbound peers. Core ref
+%%% net_processing.cpp:4833 (Peer::m_getaddr_recvd) + :4821 (inbound-only).
 %%% ===================================================================
 
-bug29_getaddr_no_once_guard_test_() ->
-    {"BUG-29: getaddr sent on every new outbound connection — no one-per-peer guard",
+bug29_getaddr_once_guard_present_test_() ->
+    {"BUG-29 FIXED: getaddr answered once per connection; repeats + outbound ignored",
      {setup, fun setup/0, fun cleanup/1,
       fun(_) ->
           [
-           {"No getaddr_sent flag in peer_entry record", fun() ->
-               %% Bitcoin Core tracks m_getaddr_sent per peer and only sends once.
-               %% Beamchain's peer_manager sends getaddr unconditionally on every
-               %% peer_connected event for outbound peers (peer_manager:615-617).
-               %% There is no per-peer flag to prevent repeated sends.
-               ?assert(true)   %% structural defect confirmed by code inspection
+           {"GETADDR handler answers the first request, then ignores the repeat", fun() ->
+               beamchain_peer_manager:test_ensure_peer_table(),
+               %% seed a couple of addresses so the answer is non-empty
+               lists:foreach(fun(I) ->
+                   beamchain_addrman:add_address({{40, 50, I, 1}, 8333}, 0, dns)
+               end, lists:seq(1, 8)),
+               timer:sleep(50),
+               P = spawn(fun() -> receive stop -> ok end end),
+               beamchain_peer_manager:test_insert_peer(P, inbound, full_relay, normal),
+               ?assertMatch({answered, _},
+                            beamchain_peer_manager:test_handle_getaddr(P, st)),
+               ?assertEqual(ignored_repeat,
+                            beamchain_peer_manager:test_handle_getaddr(P, st)),
+               P ! stop,
+               catch ets:delete(beamchain_peers)
+           end},
+           {"GETADDR from an outbound peer is ignored (anti-fingerprint)", fun() ->
+               beamchain_peer_manager:test_ensure_peer_table(),
+               P = spawn(fun() -> receive stop -> ok end end),
+               beamchain_peer_manager:test_insert_peer(P, outbound, full_relay, normal),
+               ?assertEqual(ignored_outbound,
+                            beamchain_peer_manager:test_handle_getaddr(P, st)),
+               P ! stop,
+               catch ets:delete(beamchain_peers)
            end}
           ]
       end}}.

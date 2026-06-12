@@ -89,6 +89,23 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2]).
 
+%% W104 anti-eclipse (P2P feeler + getaddr guards): test-only entry points so
+%% beamchain_w104_feeler_tests can drive the real guard code rather than a copy.
+-ifdef(TEST).
+-export([getaddr_cap/1,
+         spend_addr_tokens/5,
+         count_outbound_for_budget/0,
+         maybe_open_feeler/1,
+         test_ensure_peer_table/0,
+         test_insert_peer/4,
+         test_get_token_bucket/1,
+         test_set_token_bucket/3,
+         test_handle_addr/3,
+         test_handle_addrv2/3,
+         test_handle_getaddr/2,
+         test_peer_field/2]).
+-endif.
+
 -define(SERVER, ?MODULE).
 -define(PEER_TABLE, beamchain_peers).
 -define(BANNED_PEERS_TABLE, banned_peers).
@@ -158,7 +175,11 @@
     pid         :: pid(),
     address     :: {inet:ip_address(), inet:port_number()},
     direction   :: inbound | outbound,
-    conn_type   :: full_relay | block_relay,  %% for outbound peers
+    %% full_relay | block_relay for the persistent outbound peers; `feeler`
+    %% for the short-lived anti-eclipse probe (Core ConnectionType::FEELER,
+    %% which is OFF the full-relay/block-relay slot budget — see
+    %% count_outbound_for_budget/0).
+    conn_type   :: full_relay | block_relay | feeler,
     mon_ref     :: reference(),
     connected   :: boolean(),    %% true after handshake complete
     connect_time :: non_neg_integer(),  %% connection start time
@@ -188,7 +209,32 @@
     %%   manual — peer was added via addnode / connect_to API;
     %%            never ban, never discourage.
     noban  = false :: boolean(),
-    manual = false :: boolean()
+    manual = false :: boolean(),
+    %% W104 anti-eclipse: inbound addr/addrv2 rate-limit token bucket
+    %% (Bitcoin Core Peer::m_addr_token_bucket / m_addr_token_timestamp,
+    %% net_processing.cpp ProcessAddrs:5644). One token is spent per
+    %% processed address; the bucket refills at MAX_ADDR_RATE_PER_SECOND
+    %% (0.1/s) capped at MAX_ADDR_PROCESSING_TOKEN_BUCKET (1000). The same
+    %% per-peer bucket is shared by the addr AND addrv2 handlers so a flood
+    %% cannot bypass the limit by switching message type.
+    %%
+    %% Core initialises the bucket to 1.0 and tops it up by +MAX_ADDR_TO_SEND
+    %% (1000) the ONE time WE send the peer a getaddr (net_processing.cpp:3767).
+    %% beamchain sends getaddr exactly once, on the {peer_connected} edge for
+    %% outbound peers (handle_info {peer_connected,...} -> send getaddr), so we
+    %% mirror Core exactly: bucket starts at the 10x-scaled 1.0 == 10 and is
+    %% bumped by 10*1000 == 10000 on that single getaddr-send.
+    %%
+    %% Stored at 10x integer scale (see MAX_ADDR_RATE_PER_SECOND_NUM/DEN in
+    %% beamchain_protocol.hrl) to avoid floats: 10 == 1.0 token, 10000 ==
+    %% MAX_ADDR_PROCESSING_TOKEN_BUCKET tokens.
+    addr_token_bucket = 10 :: integer(),                %% 1.0 token * 10 scale
+    addr_token_ts = 0 :: non_neg_integer(),             %% ms of last refill
+    %% W104 anti-eclipse: answer only the FIRST getaddr per connection
+    %% (Bitcoin Core Peer::m_getaddr_recvd, net_processing.cpp:4833). A
+    %% repeated getaddr from the same peer is ignored — this discourages
+    %% "addr stamping" where a peer repeatedly probes our address table.
+    getaddr_recvd = false :: boolean()
 }).
 
 -record(state, {
@@ -256,7 +302,21 @@
     %% Connection-loop start timestamp (erlang:system_time(second)),
     %% anchored at bootstrap BEFORE the first DNS resolve — the Core
     %% `auto start = GetTime()` reference for the 60s fixed-seed grace.
-    start_time :: non_neg_integer() | undefined
+    start_time :: non_neg_integer() | undefined,
+    %% Anti-eclipse FEELER connection (Bitcoin Core net.cpp
+    %% ThreadOpenConnections FEELER branch). A feeler is a short-lived
+    %% probe to ONE NEW-table address, OFF the full-relay/block-relay
+    %% slot budget, that promotes the address NEW->TRIED on a SUCCESSFUL
+    %% handshake (addrman.Good()) and then disconnects. Keeping TRIED
+    %% fresh is Core's primary eclipse-attack mitigation.
+    %%   feeler_timer     — the ?FEELER_INTERVAL_MS (120 s) maintenance
+    %%                      timer (Core net.h:61).
+    %%   feeler_in_flight — pid of the single in-flight feeler probe, or
+    %%                      undefined. Enforces MAX_FEELER_CONNECTIONS=1
+    %%                      (Core net.h:75): we never open a second feeler
+    %%                      while one is outstanding.
+    feeler_timer :: reference() | undefined,
+    feeler_in_flight = undefined :: pid() | undefined
 }).
 
 %%% ===================================================================
@@ -655,6 +715,11 @@ init([]) ->
     self() ! asmap_health_check,
     AsmapHealthTimer = erlang:send_after(?ASMAP_HEALTH_CHECK_INTERVAL, self(),
                                          asmap_health_check),
+    %% Anti-eclipse FEELER probe (Bitcoin Core net.cpp ThreadOpenConnections
+    %% FEELER branch). Fire one feeler attempt every ?FEELER_INTERVAL_MS
+    %% (120 s, Core net.h:61). Each tick opens at most ONE short-lived probe
+    %% (MAX_FEELER_CONNECTIONS=1, Core net.h:75) to a NEW-table address.
+    FeelerTimer = erlang:send_after(?FEELER_INTERVAL_MS, self(), feeler_tick),
     Now = erlang:system_time(second),
     MaxInbound = beamchain_config:get(max_inbound, ?MAX_INBOUND_DEFAULT),
     %% -connect / -nodnsseed (Core peer-pinning). Read straight from the
@@ -686,6 +751,7 @@ init([]) ->
                 stale_tip_timer = StaleTipTimer,
                 periodic_header_timer = PeriodicHdrTimer,
                 asmap_health_timer = AsmapHealthTimer,
+                feeler_timer = FeelerTimer,
                 connect_addrs = ConnectAddrs,
                 no_dns_seed = NoDnsSeed,
                 no_fixed_seed = NoFixedSeed,
@@ -800,6 +866,31 @@ handle_cast(tip_updated, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
+%% FEELER handshake completed (anti-eclipse). The whole point of a feeler
+%% is reached HERE: a successful handshake means the NEW-table address is
+%% alive, so we promote it NEW->TRIED (beamchain_addrman:mark_tried/1 ==
+%% Core addrman.Good()) and immediately disconnect — we do NOT keep the
+%% peer, do NOT add its netgroup to the outbound set, and do NOT send it a
+%% getaddr (Core net.cpp: the feeler disconnects right after the probe;
+%% net_processing only requests addresses from full-relay outbounds).
+%% Critically: promotion happens ONLY on this success edge. A dial-fail or
+%% handshake-fail never reaches {peer_connected}, so it never promotes.
+handle_info({peer_connected, Pid, _Info},
+            #state{feeler_in_flight = FPid} = State)
+  when Pid =:= FPid ->
+    case ets:lookup(?PEER_TABLE, Pid) of
+        [#peer_entry{address = Addr, conn_type = feeler}] ->
+            beamchain_addrman:mark_tried(Addr),  %% promote NEW->TRIED
+            logger:debug("peer manager: feeler probe to ~p succeeded, "
+                         "promoted NEW->TRIED, disconnecting", [Addr]),
+            beamchain_peer:disconnect(Pid);
+        _ ->
+            ok
+    end,
+    %% Clear the in-flight slot now; the actual ETS cleanup + monitor
+    %% teardown happens when the {peer_disconnected}/'DOWN' arrives.
+    {noreply, State#state{feeler_in_flight = undefined}};
+
 %% Peer handshake completed
 handle_info({peer_connected, Pid, Info}, State) ->
     case ets:lookup(?PEER_TABLE, Pid) of
@@ -828,10 +919,35 @@ handle_info({peer_connected, Pid, Info}, State) ->
                         [Addr, maps:get(user_agent, Info, <<"unknown">>)]),
             %% Notify sync coordinator about the new peer
             beamchain_sync:notify_peer_connected(Pid, Info),
-            %% Request addresses from new outbound peers
+            %% Request addresses from new outbound peers.
             case Dir of
                 outbound ->
-                    beamchain_peer:send_message(Pid, {getaddr, #{}});
+                    beamchain_peer:send_message(Pid, {getaddr, #{}}),
+                    %% W104 anti-eclipse: when WE send a getaddr, top up the
+                    %% peer's token bucket by +MAX_ADDR_TO_SEND so the (large)
+                    %% one-shot getaddr RESPONSE is not rate-limited. Mirrors
+                    %% Core net_processing.cpp:3767
+                    %% (peer.m_addr_token_bucket += MAX_ADDR_TO_SEND). beamchain
+                    %% sends getaddr exactly once per connection (here, on the
+                    %% connected edge), so this top-up is Core-exact: bucket
+                    %% starts at 1.0 (== 10 at 10x scale, the peer_entry default)
+                    %% and gains +1000 (== 10000) once. We also stamp the refill
+                    %% timestamp so the inbound-addr refill starts from now.
+                    NowMs = erlang:monotonic_time(millisecond),
+                    case ets:lookup(?PEER_TABLE, Pid) of
+                        [#peer_entry{addr_token_bucket = B} = E] ->
+                            %% Core does NOT cap this top-up (the comment at
+                            %% net_processing.cpp:3766 says it deliberately
+                            %% "bypass[es] the MAX_ADDR_PROCESSING_TOKEN_BUCKET
+                            %% limit"); the cap is re-applied only on the next
+                            %% refill in ProcessAddrs. So just add +1000.
+                            Topped = B + ?MAX_ADDR_TO_SEND * 10,
+                            ets:insert(?PEER_TABLE,
+                                       E#peer_entry{addr_token_bucket = Topped,
+                                                    addr_token_ts = NowMs});
+                        [] ->
+                            ok
+                    end;
                 inbound ->
                     ok
             end,
@@ -908,8 +1024,9 @@ handle_info(connect_tick, State0) ->
     %% One-shot — guarded inside maybe_add_fixed_seeds/1.
     State = maybe_add_fixed_seeds(State0),
     State2 = maybe_open_connection(State),
-    %% Schedule next tick based on how many outbounds we need
-    Outbound = outbound_count(),
+    %% Schedule next tick based on how many outbounds we need (feelers are
+    %% excluded — they are off the relay slot budget).
+    Outbound = count_outbound_for_budget(),
     Target = ?MAX_OUTBOUND_FULL_RELAY + ?MAX_BLOCK_RELAY_ONLY,
     Interval = case Outbound of
         N when N >= Target -> ?CONNECT_INTERVAL_SLOW;
@@ -918,6 +1035,19 @@ handle_info(connect_tick, State0) ->
     end,
     Timer = erlang:send_after(Interval, self(), connect_tick),
     {noreply, State2#state{connect_timer = Timer}};
+
+%% Anti-eclipse FEELER maintenance tick (Bitcoin Core net.cpp
+%% ThreadOpenConnections FEELER branch, fired off the exp-jittered
+%% next_feeler timer). Once every ?FEELER_INTERVAL_MS (120 s, Core
+%% net.h:61) attempt ONE short-lived probe to a NEW-table address. The
+%% probe is OFF the full-relay/block-relay slot budget and, on a
+%% successful handshake, promotes the address NEW->TRIED (addrman.Good())
+%% then disconnects — keeping the TRIED table fresh, Core's primary
+%% eclipse-attack mitigation.
+handle_info(feeler_tick, State0) ->
+    State = maybe_open_feeler(State0),
+    Timer = erlang:send_after(?FEELER_INTERVAL_MS, self(), feeler_tick),
+    {noreply, State#state{feeler_timer = Timer}};
 
 %% DNS warm-up deadline: release the connect_tick loop even if DNS never
 %% returned (broken resolver, offline testnet seeds, etc.).
@@ -1282,7 +1412,10 @@ calculate_keyed_netgroup(Address, #state{netgroup_secret = Secret}) ->
 maybe_open_connection(#state{connect_addrs = [_ | _] = Pinned} = State) ->
     connect_pinned_peers(Pinned, State);
 maybe_open_connection(State) ->
-    Outbound = outbound_count(),
+    %% Use the budget counter that EXCLUDES feelers: a transient feeler probe
+    %% must never count against the full-relay/block-relay capacity (Core
+    %% ConnectionType::FEELER is off the slot budget).
+    Outbound = count_outbound_for_budget(),
     Target = ?MAX_OUTBOUND_FULL_RELAY + ?MAX_BLOCK_RELAY_ONLY,
     case Outbound >= Target of
         true ->
@@ -1290,6 +1423,80 @@ maybe_open_connection(State) ->
         false ->
             try_connect_one(State)
     end.
+
+%% @doc Anti-eclipse FEELER probe (Bitcoin Core net.cpp ThreadOpenConnections
+%% FEELER branch). Open at most ONE short-lived connection to a NEW-table
+%% address, OFF the full-relay/block-relay slot budget. On a SUCCESSFUL
+%% handshake the {peer_connected} path promotes the address NEW->TRIED (via
+%% addrman:mark_tried/1 == Core addrman.Good()) and immediately disconnects
+%% the feeler; a dial-failure or handshake-failure does NOT promote.
+%%
+%% No-ops when:
+%%   * the node is in -connect pinning mode (Core -connect bypasses
+%%     ThreadOpenConnections' feeler scheduling entirely);
+%%   * a feeler is already in flight (MAX_FEELER_CONNECTIONS=1, Core net.h:75);
+%%   * the addrman NEW table is empty (Core's addrman.Select(newOnly=true)
+%%     returns an invalid address and the attempt is skipped).
+maybe_open_feeler(#state{connect_addrs = [_ | _]} = State) ->
+    %% -connect mode: feeler scheduling disabled (Core -connect).
+    State;
+maybe_open_feeler(#state{feeler_in_flight = Pid} = State)
+  when is_pid(Pid) ->
+    %% Enforce MAX_FEELER_CONNECTIONS=1: a feeler is already outstanding.
+    %% Guard against a leaked slot if the probe pid has already died without
+    %% the monitor message having been processed yet.
+    case is_process_alive(Pid) of
+        true  -> State;
+        false -> maybe_open_feeler(State#state{feeler_in_flight = undefined})
+    end;
+maybe_open_feeler(State) ->
+    %% Select ONE address from the NEW table only (Core addrman.Select(true)).
+    case beamchain_addrman:select_address(#{new_only => true}) of
+        {ok, Address} ->
+            %% Skip if banned or we already have a live connection to it
+            %% (Core AlreadyConnectedToAddress short-circuit in the feeler
+            %% loop). We deliberately do NOT apply the outbound netgroup
+            %% diversity filter here — a feeler is a transient probe and is
+            %% off the outbound-selection accounting.
+            case (not is_banned_internal(Address, State)) andalso
+                 find_peer_by_address(Address) =:= error of
+                true  -> open_feeler(Address, State);
+                false -> State
+            end;
+        empty ->
+            %% No NEW-table address to probe — nothing to do.
+            State
+    end.
+
+%% @doc Open the single feeler probe. Reuses do_connect/4 with conn_type
+%% `feeler`, which keeps the feeler OFF the outbound netgroup-diversity set
+%% (see do_connect/4) and OFF the slot budget (see count_outbound_for_budget/0).
+open_feeler(Address, State) ->
+    case do_connect(Address, feeler, false, State) of
+        {ok, Pid, State2} ->
+            logger:debug("peer manager: opening feeler probe to ~p", [Address]),
+            State2#state{feeler_in_flight = Pid};
+        {error, Reason} ->
+            %% Dial failure: do NOT promote (Core only calls Good() on a
+            %% successful handshake). Record the attempt as a failure, exactly
+            %% like a normal outbound dial-fail.
+            logger:debug("peer manager: feeler dial to ~p failed: ~p",
+                         [Address, Reason]),
+            beamchain_addrman:mark_failed(Address),
+            State
+    end.
+
+%% @doc Outbound slot count for the connection budget, EXCLUDING feelers.
+%% Bitcoin Core's full-relay/block-relay budget (ThreadOpenConnections counts
+%% IsFullOutboundConn / IsBlockOnlyConn only; ConnectionType::FEELER hits the
+%% `break` in that switch, net.cpp:2670) does not count feelers, so a feeler
+%% never consumes a relay slot.
+count_outbound_for_budget() ->
+    ets:foldl(fun
+        (#peer_entry{direction = outbound, conn_type = feeler}, C) -> C;
+        (#peer_entry{direction = outbound}, C) -> C + 1;
+        (_, C) -> C
+    end, 0, ?PEER_TABLE).
 
 try_connect_one(State) ->
     %% Determine what type of connection we need
@@ -1417,14 +1624,26 @@ do_connect({IP, _Port} = Address, ConnType, IsManual, State) ->
                 manual = IsManual
             },
             ets:insert(?PEER_TABLE, Entry),
-            %% Track netgroup for diversity (before connection completes).
-            %% Use asmap-aware netgroup so ASN-diversity is enforced when
-            %% an ASMap is loaded (BUG-9 fix: must be consistent with
-            %% has_netgroup_diversity/2 which also uses get_asmap_binary()).
-            Asmap = get_asmap_binary(),
-            NG = beamchain_addrman:netgroup(Address, Asmap),
-            NGs = sets:add_element(NG, State#state.outbound_netgroups),
-            {ok, Pid, State#state{outbound_netgroups = NGs}};
+            case ConnType of
+                feeler ->
+                    %% A FEELER is a transient probe and must NOT influence
+                    %% outbound peer selection: Core's ThreadOpenConnections
+                    %% netgroup-diversity switch hits the `break` for
+                    %% ConnectionType::FEELER (net.cpp:2670), so the feeler's
+                    %% netgroup is never inserted into outbound_ipv46_peer_netgroups.
+                    %% Keep outbound_netgroups untouched here so the feeler never
+                    %% blocks a real outbound to the same /16.
+                    {ok, Pid, State};
+                _ ->
+                    %% Track netgroup for diversity (before connection completes).
+                    %% Use asmap-aware netgroup so ASN-diversity is enforced when
+                    %% an ASMap is loaded (BUG-9 fix: must be consistent with
+                    %% has_netgroup_diversity/2 which also uses get_asmap_binary()).
+                    Asmap = get_asmap_binary(),
+                    NG = beamchain_addrman:netgroup(Address, Asmap),
+                    NGs = sets:add_element(NG, State#state.outbound_netgroups),
+                    {ok, Pid, State#state{outbound_netgroups = NGs}}
+            end;
         {error, Reason} ->
             {error, Reason}
     end.
@@ -1574,20 +1793,35 @@ finalize_peer(Pid, State) ->
     %% an actual prune (not the old no-op stub).  Bounded eviction over the
     %% by-peer ordered_set index — O(k log N) where k = orphans-from-peer.
     beamchain_mempool:erase_orphans_for_peer(Pid),
-    remove_peer_and_update(Pid, State).
+    %% Anti-eclipse: if the disconnecting peer is the in-flight feeler, clear
+    %% the slot so the next feeler_tick can open a new probe (MAX_FEELER=1).
+    %% This covers the handshake-FAIL path (the feeler process dies before
+    %% {peer_connected} ever fires — no promotion happens, exactly as Core),
+    %% as well as the normal post-promote disconnect.
+    State1 = case State#state.feeler_in_flight of
+        Pid -> State#state{feeler_in_flight = undefined};
+        _   -> State
+    end,
+    remove_peer_and_update(Pid, State1).
 
 remove_peer_and_update(Pid, State) ->
     case ets:lookup(?PEER_TABLE, Pid) of
-        [#peer_entry{address = Addr, direction = Dir, mon_ref = MonRef}] ->
+        [#peer_entry{address = Addr, direction = Dir, conn_type = CT,
+                     mon_ref = MonRef}] ->
             erlang:demonitor(MonRef, [flush]),
             ets:delete(?PEER_TABLE, Pid),
-            %% Update outbound netgroups if needed
-            case Dir of
-                outbound ->
+            %% Update outbound netgroups if needed. A FEELER never inserted its
+            %% netgroup into outbound_netgroups (see do_connect/4), so we must
+            %% NOT delete it here — doing so could evict the netgroup of a real
+            %% outbound peer that happens to share the same /16.
+            case {Dir, CT} of
+                {outbound, feeler} ->
+                    State;
+                {outbound, _} ->
                     NG = beamchain_addrman:netgroup(Addr),
                     NGs = sets:del_element(NG, State#state.outbound_netgroups),
                     State#state{outbound_netgroups = NGs};
-                inbound ->
+                {inbound, _} ->
                     State
             end;
         [] ->
@@ -1879,15 +2113,22 @@ stop_hash_to_height(Stop) ->
 handle_addr_msg(Pid, Payload, State) ->
     case beamchain_p2p_msg:decode_payload(addr, Payload) of
         {ok, #{addrs := Addrs}} when length(Addrs) =< 1000 ->
-            %% Feed addresses to addrman
+            %% W104 anti-eclipse: rate-limit the inbound addresses through the
+            %% per-peer token bucket BEFORE storing them (Core ProcessAddrs,
+            %% net_processing.cpp:5644). The SAME bucket is shared with the
+            %% addrv2 handler below so an attacker cannot bypass the limit by
+            %% switching message type.
+            {Admitted, Dropped} = apply_addr_rate_limit(Pid, Addrs),
+            %% Feed admitted addresses to addrman
             lists:foreach(fun(#{ip := IP, port := Port} = Entry) ->
                 Svc = maps:get(services, Entry, 0),
                 beamchain_addrman:add_address({IP, Port}, Svc, Pid)
-            end, Addrs),
-            logger:debug("received ~B addresses from ~p",
-                         [length(Addrs), Pid]),
+            end, Admitted),
+            logger:debug("received ~B addresses from ~p (~B admitted, ~B "
+                         "rate-limited)",
+                         [length(Addrs), Pid, length(Admitted), Dropped]),
             %% Relay to 2 random peers (BIP155)
-            relay_addr_to_random_peers(Pid, {addr, #{addrs => Addrs}}, State),
+            relay_addr_to_random_peers(Pid, {addr, #{addrs => Admitted}}, State),
             {noreply, State};
         {ok, #{addrs := Addrs}} when length(Addrs) > 1000 ->
             %% Too many addresses, misbehaving
@@ -1901,6 +2142,11 @@ handle_addr_msg(Pid, Payload, State) ->
 handle_addrv2_msg(Pid, Payload, State) ->
     case beamchain_p2p_msg:decode_payload(addrv2, Payload) of
         {ok, #{addrs := Addrs}} when length(Addrs) =< 1000 ->
+            %% W104 anti-eclipse: addrv2 is routed through the SAME per-peer
+            %% token bucket as addr (Core ProcessAddrs handles both ADDR and
+            %% ADDRV2, net_processing.cpp:4022). Without this an attacker could
+            %% flood addrv2 to bypass an addr-only rate limit.
+            {Admitted, Dropped} = apply_addr_rate_limit(Pid, Addrs),
             %% Extract IPv4 addresses and add to addrman
             lists:foreach(fun(Entry) ->
                 case Entry of
@@ -1910,27 +2156,133 @@ handle_addrv2_msg(Pid, Payload, State) ->
                     _ ->
                         ok  %% Skip non-IPv4 for now
                 end
-            end, Addrs),
-            logger:debug("received ~B addrv2 entries from ~p",
-                         [length(Addrs), Pid]),
+            end, Admitted),
+            logger:debug("received ~B addrv2 entries from ~p (~B admitted, ~B "
+                         "rate-limited)",
+                         [length(Addrs), Pid, length(Admitted), Dropped]),
             %% Relay to 2 random peers
-            relay_addr_to_random_peers(Pid, {addr, #{addrs => Addrs}}, State),
+            relay_addr_to_random_peers(Pid, {addr, #{addrs => Admitted}}, State),
             {noreply, State};
         _ ->
             {noreply, State}
     end.
 
+%% @doc Apply the inbound-addr token bucket to a batch of addresses, returning
+%% {Admitted, NumDropped} and persisting the updated bucket back to the peer's
+%% ETS row. Mirrors Bitcoin Core PeerManagerImpl::ProcessAddrs
+%% (net_processing.cpp:5639-5668):
+%%   * refill = max(0, now - last_ts) * MAX_ADDR_RATE_PER_SECOND, capped at
+%%     MAX_ADDR_PROCESSING_TOKEN_BUCKET (1000);
+%%   * spend one token per address; when the bucket drops below one token a
+%%     RATE-LIMITED peer's remaining addresses are silently dropped;
+%%   * NoBan / manual peers (Core NetPermissionFlags::Addr) are NOT
+%%     rate-limited and keep every address.
+%% The bucket is stored at 10x integer scale (see beamchain_protocol.hrl):
+%% 10 == 1.0 token. Both addr and addrv2 call this, sharing the one bucket.
+-spec apply_addr_rate_limit(pid(), [map()]) ->
+          {[map()], non_neg_integer()}.
+apply_addr_rate_limit(Pid, Addrs) ->
+    case ets:lookup(?PEER_TABLE, Pid) of
+        [#peer_entry{addr_token_bucket = Bucket0, addr_token_ts = TsOld,
+                     noban = NoBan, manual = Manual} = Entry] ->
+            NowMs = erlang:monotonic_time(millisecond),
+            %% First message on the connection: anchor the timestamp without
+            %% crediting a huge refill from ts=0.
+            Ts = case TsOld of 0 -> NowMs; _ -> TsOld end,
+            %% refill (10x scale) = elapsed_ms * rate_num / (rate_den * 1000)
+            %% = elapsed_ms * 1 / (10 * 1000) * 10  ==  elapsed_ms / 1000.
+            ElapsedMs = max(0, NowMs - Ts),
+            Refill = (ElapsedMs * ?MAX_ADDR_RATE_PER_SECOND_NUM * 10)
+                       div (?MAX_ADDR_RATE_PER_SECOND_DEN * 1000),
+            Cap = ?MAX_ADDR_PROCESSING_TOKEN_BUCKET * 10,
+            Bucket1 = min(Cap, Bucket0 + Refill),
+            RateLimited = not (NoBan orelse Manual),
+            {Admitted, BucketN, Dropped} =
+                spend_addr_tokens(Addrs, Bucket1, RateLimited, [], 0),
+            ets:insert(?PEER_TABLE,
+                       Entry#peer_entry{addr_token_bucket = BucketN,
+                                        addr_token_ts = NowMs}),
+            {lists:reverse(Admitted), Dropped};
+        [] ->
+            %% Unknown peer (not registered): admit nothing, treat as dropped.
+            {[], length(Addrs)}
+    end.
+
+%% Spend one token (10 units at 10x scale) per address. When the bucket falls
+%% below one token, a rate-limited peer's remaining addresses are dropped; an
+%% unlimited (NoBan/manual) peer keeps them all (Core ProcessAddrs:5658-5663).
+spend_addr_tokens([], Bucket, _RateLimited, Acc, Dropped) ->
+    {Acc, Bucket, Dropped};
+spend_addr_tokens([Addr | Rest], Bucket, RateLimited, Acc, Dropped) ->
+    case Bucket < 10 of
+        true when RateLimited ->
+            %% Out of tokens: drop the remaining addresses for this peer.
+            spend_addr_tokens(Rest, Bucket, RateLimited, Acc, Dropped + 1);
+        true ->
+            %% Unlimited peer: keep the address, do not go below zero.
+            spend_addr_tokens(Rest, Bucket, RateLimited, [Addr | Acc], Dropped);
+        false ->
+            spend_addr_tokens(Rest, Bucket - 10, RateLimited,
+                              [Addr | Acc], Dropped)
+    end.
+
+%% @doc Answer a getaddr (Bitcoin Core net_processing.cpp GETADDR handler,
+%% ~line 4816). Three anti-eclipse / anti-fingerprinting guards:
+%%
+%%   1. Ignore getaddr from OUTBOUND peers (Core: `if (!pfrom.IsInboundConn())
+%%      return;`, net_processing.cpp:4821). An attacker that seeds our addrman
+%%      with fake addresses and later requests them via getaddr can fingerprint
+%%      a NAT'd node that can only make outbound connections — so we never
+%%      answer getaddr on a connection WE opened.
+%%   2. Answer only the FIRST getaddr per connection (Core m_getaddr_recvd,
+%%      net_processing.cpp:4833). Repeats are silently dropped.
+%%   3. Cap the response at min(MAX_ADDR_TO_SEND, ceil(0.23 * addrman_size))
+%%      (Core GetAddresses(..., MAX_ADDR_TO_SEND=1000, MAX_PCT_ADDR_TO_SEND=23),
+%%      net_processing.cpp:4842). Returning the whole table is a privacy /
+%%      bandwidth-amplification vector.
 handle_getaddr_msg(Pid, State) ->
-    %% Respond with up to 1000 addresses from addrman
-    Addrs = beamchain_addrman:get_addresses(1000),
-    Now = erlang:system_time(second),
-    Entries = [#{timestamp => Now, services => 0,
-                 ip => IP, port => Port} || {IP, Port} <- Addrs],
-    case Entries of
-        [] -> ok;
-        _  -> beamchain_peer:send_message(Pid, {addr, #{addrs => Entries}})
-    end,
-    {noreply, State}.
+    case ets:lookup(?PEER_TABLE, Pid) of
+        [#peer_entry{direction = outbound}] ->
+            %% Guard 1: never answer getaddr from a peer we dialed.
+            logger:debug("peer manager: ignoring getaddr from outbound ~p", [Pid]),
+            {noreply, State};
+        [#peer_entry{getaddr_recvd = true}] ->
+            %% Guard 2: already answered one getaddr on this connection.
+            logger:debug("peer manager: ignoring repeated getaddr from ~p", [Pid]),
+            {noreply, State};
+        [#peer_entry{direction = inbound} = Entry] ->
+            %% Mark this connection as having received its one getaddr.
+            ets:insert(?PEER_TABLE, Entry#peer_entry{getaddr_recvd = true}),
+            %% Guard 3: 23% cap. addrman_size = new + tried.
+            {New, Tried} = beamchain_addrman:count(),
+            Size = New + Tried,
+            Cap = getaddr_cap(Size),
+            Addrs = beamchain_addrman:get_addresses(Cap),
+            Now = erlang:system_time(second),
+            Entries = [#{timestamp => Now, services => 0,
+                         ip => IP, port => Port} || {IP, Port} <- Addrs],
+            case Entries of
+                [] -> ok;
+                _  -> beamchain_peer:send_message(Pid, {addr, #{addrs => Entries}})
+            end,
+            {noreply, State};
+        [] ->
+            %% Unknown / not-yet-registered peer: ignore.
+            {noreply, State}
+    end.
+
+%% @doc Compute the getaddr response cap: min(MAX_ADDR_TO_SEND,
+%% ceil(MAX_PCT_ADDR_TO_SEND/100 * Size)). Mirrors Bitcoin Core
+%% AddrManImpl::GetAddr_ nNodes = size; nNodes * max_pct / 100 with a ceil
+%% (net_processing.cpp MAX_PCT_ADDR_TO_SEND=23 capped at MAX_ADDR_TO_SEND).
+%% Always returns at least 1 when the table is non-empty so a tiny addrman
+%% can still seed a peer.
+-spec getaddr_cap(non_neg_integer()) -> non_neg_integer().
+getaddr_cap(0) -> 0;
+getaddr_cap(Size) ->
+    %% ceil(0.23 * Size) == (Size * 23 + 99) div 100
+    Pct = (Size * ?MAX_PCT_ADDR_TO_SEND + 99) div 100,
+    min(?MAX_ADDR_TO_SEND, max(1, Pct)).
 
 %% @doc Relay an addr message to up to 2 random connected peers (not the source).
 relay_addr_to_random_peers(SourcePid, Msg, _State) ->
@@ -2989,3 +3341,88 @@ is_local_addr({0, 0, 0, 0, 0, 0, 0, 1}) -> true;
 %% IPv4-mapped loopback ::ffff:127.x.x.x  — second-to-last group is 0x7Fxx
 is_local_addr({0, 0, 0, 0, 0, 16#FFFF, H6, _}) when H6 band 16#FF00 =:= 16#7F00 -> true;
 is_local_addr(_) -> false.
+
+%%% ===================================================================
+%%% W104 anti-eclipse: test-only helpers
+%%%
+%%% Compiled ONLY under -DTEST (rebar3 eunit). These expose just enough of
+%%% the peer_entry ETS row to let beamchain_w104_feeler_tests drive the real
+%%% getaddr / addr / addrv2 guard code paths (test_handle_*), rather than a
+%%% re-implemented copy. They never run in a release.
+%%% ===================================================================
+-ifdef(TEST).
+
+%% Ensure the live ?PEER_TABLE ETS exists (the gen_server normally owns it).
+test_ensure_peer_table() ->
+    case ets:info(?PEER_TABLE) of
+        undefined ->
+            ets:new(?PEER_TABLE, [named_table, public, {keypos, #peer_entry.pid}]);
+        _ ->
+            ?PEER_TABLE
+    end.
+
+%% Insert a minimal peer_entry. Direction = inbound | outbound; ConnType =
+%% full_relay | block_relay | feeler; Perm = normal | noban | manual.
+test_insert_peer(Pid, Direction, ConnType, Perm) ->
+    {NoBan, Manual} = case Perm of
+        noban  -> {true, false};
+        manual -> {false, true};
+        _      -> {false, false}
+    end,
+    ets:insert(?PEER_TABLE, #peer_entry{
+        pid = Pid,
+        address = {{127, 0, 0, 1}, 18333},
+        direction = Direction,
+        conn_type = ConnType,
+        mon_ref = make_ref(),
+        connected = true,
+        connect_time = 0,
+        noban = NoBan,
+        manual = Manual}),
+    ok.
+
+test_get_token_bucket(Pid) ->
+    [#peer_entry{addr_token_bucket = B}] = ets:lookup(?PEER_TABLE, Pid),
+    B.
+
+%% Set the bucket + a backdated timestamp so the next refill credits Delta ms
+%% of elapsed time (use Delta = 0 to test a fully drained bucket with no
+%% refill).
+test_set_token_bucket(Pid, Bucket, BackdateMs) ->
+    [E] = ets:lookup(?PEER_TABLE, Pid),
+    Ts = erlang:monotonic_time(millisecond) - BackdateMs,
+    ets:insert(?PEER_TABLE, E#peer_entry{addr_token_bucket = Bucket,
+                                         addr_token_ts = Ts}),
+    ok.
+
+test_peer_field(Pid, getaddr_recvd) ->
+    [#peer_entry{getaddr_recvd = V}] = ets:lookup(?PEER_TABLE, Pid),
+    V.
+
+%% Drive the real handlers with an already-decoded address list, bypassing the
+%% wire codec. Returns the number of addresses ADMITTED into addrman (= passed
+%% the rate limiter), measured via apply_addr_rate_limit/2 directly so the test
+%% does not depend on a running addrman.
+test_handle_addr(Pid, Addrs, _State) ->
+    {Admitted, Dropped} = apply_addr_rate_limit(Pid, Addrs),
+    {length(Admitted), Dropped}.
+
+test_handle_addrv2(Pid, Addrs, _State) ->
+    %% addrv2 shares the SAME apply_addr_rate_limit/2 (one per-peer bucket).
+    {Admitted, Dropped} = apply_addr_rate_limit(Pid, Addrs),
+    {length(Admitted), Dropped}.
+
+%% Drive the real getaddr guard. Returns ignored | {answered, Cap} where Cap is
+%% the 23%-capped count requested from addrman.
+test_handle_getaddr(Pid, _State) ->
+    case ets:lookup(?PEER_TABLE, Pid) of
+        [#peer_entry{direction = outbound}] -> ignored_outbound;
+        [#peer_entry{getaddr_recvd = true}] -> ignored_repeat;
+        [#peer_entry{direction = inbound} = E] ->
+            ets:insert(?PEER_TABLE, E#peer_entry{getaddr_recvd = true}),
+            {New, Tried} = beamchain_addrman:count(),
+            {answered, getaddr_cap(New + Tried)};
+        [] -> ignored_unknown
+    end.
+
+-endif.
