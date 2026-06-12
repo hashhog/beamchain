@@ -24,6 +24,7 @@
          node_bloom_enabled/0,
          blockfilterindex_enabled/0,
          coinstatsindex_enabled/0,
+         txospenderindex_enabled/0,
          rest_enabled/0,
          %% ASMap
          asmap_path/0,
@@ -290,6 +291,33 @@ coinstatsindex_enabled() ->
         "false" -> false;
         false ->
             case get(coinstatsindex, "0") of
+                "1" -> true;
+                "true" -> true;
+                1 -> true;
+                true -> true;
+                _ -> false
+            end;
+        _ -> true
+    end.
+
+%% @doc Check if the txospenderindex is enabled.
+%% Reads from the env var (BEAMCHAIN_TXOSPENDERINDEX=1) first, then the
+%% config file (txospenderindex=1). Defaults to false (disabled), matching
+%% Bitcoin Core's DEFAULT_TXOSPENDERINDEX = false
+%% (index/txospenderindex.h:24, init.cpp). When enabled, beamchain
+%% maintains an outpoint -> spending-tx index on every block
+%% connect/disconnect, persisted in its own RocksDB at
+%% <datadir>/indexes/txospender, so the gettxspendingprevout RPC can answer
+%% the CONFIRMED-spend path. When OFF the index gen_server is NOT started
+%% (no RocksDB, every add/remove a no-op) so normal validation/sync is
+%% unchanged and gettxspendingprevout falls back to the mempool-only path.
+-spec txospenderindex_enabled() -> boolean().
+txospenderindex_enabled() ->
+    case os:getenv("BEAMCHAIN_TXOSPENDERINDEX") of
+        "0" -> false;
+        "false" -> false;
+        false ->
+            case get(txospenderindex, "0") of
                 "1" -> true;
                 "true" -> true;
                 1 -> true;

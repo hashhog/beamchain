@@ -74,6 +74,18 @@ init([]) ->
             true -> [child_spec(beamchain_coinstatsindex, worker)];
             false -> []
         end,
+    %% Optional txospenderindex (default off, matches Core -txospenderindex).
+    %% Like coinstatsindex, must be mounted AFTER beamchain_chainstate_sup so
+    %% its startup reconcile can read the chainstate tip. When disabled the
+    %% gen_server is NOT started, keeping default fleet behaviour identical
+    %% (no extra RocksDB instance, no maintenance overhead on the
+    %% connect/disconnect path). Backs the gettxspendingprevout RPC's
+    %% confirmed-spend path.
+    TxoSpenderChildren =
+        case beamchain_config:txospenderindex_enabled() of
+            true -> [child_spec(beamchain_txospenderindex, worker)];
+            false -> []
+        end,
     %% Optional Tor control-port client for v3 hidden-service inbound.
     %% Only started when listenonion=1 in beamchain.conf or
     %% BEAMCHAIN_LISTENONION=1 in the environment.  The client connects
@@ -89,6 +101,7 @@ init([]) ->
         end,
     Children = CoreChildren ++ RestChildren ++ ZmqChildren
                ++ BlockFilterChildren ++ CoinStatsChildren
+               ++ TxoSpenderChildren
                ++ TorControlChildren,
     {ok, {SupFlags, Children}}.
 
