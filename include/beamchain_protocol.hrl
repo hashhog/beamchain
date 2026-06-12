@@ -88,6 +88,11 @@
 %% blockfilterindex is enabled.
 -define(NODE_COMPACT_FILTERS, (1 bsl 6)).        %% 0x40 = 64
 -define(NODE_NETWORK_LIMITED, 1024).
+%% BIP-324: peer supports the v2 (BIP-324) encrypted transport protocol.
+%% Core protocol.h:329-330 — NODE_P2P_V2 = (1 << 11) = 0x800. Advertised
+%% only when the v2 transport is genuinely enabled (gated on
+%% beamchain_peer:bip324_v2_outbound_enabled/0) — never claimed off-wire.
+-define(NODE_P2P_V2, (1 bsl 11)).                %% 0x800 = 2048
 
 %%% -------------------------------------------------------------------
 %%% Sighash types
