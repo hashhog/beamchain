@@ -79,6 +79,44 @@
 -define(MAX_INBOUND, 117).
 -define(DEFAULT_MAX_PEERS, 125).
 
+%% Anti-eclipse: feeler connections (Bitcoin Core net.h / net.cpp v31.99).
+%%   FEELER_INTERVAL        — minimum time between feeler attempts. Core net.h:61
+%%                            `FEELER_INTERVAL = 2min`; we express it in ms for
+%%                            erlang:send_after. A feeler opens ONE short-lived
+%%                            probe to a NEW-table address, promotes it
+%%                            NEW->TRIED on handshake success (addrman.Good()),
+%%                            then disconnects. Core net.cpp ThreadOpenConnections
+%%                            FEELER branch (~2752) + net.h:75
+%%                            `MAX_FEELER_CONNECTIONS = 1`.
+-define(FEELER_INTERVAL_MS, 120000).   %% 2 min (Core net.h:61 FEELER_INTERVAL)
+-define(MAX_FEELER_CONNECTIONS, 1).    %% Core net.h:75 MAX_FEELER_CONNECTIONS
+
+%% Anti-eclipse: getaddr response cap. Core net_processing.cpp:188
+%%   `MAX_PCT_ADDR_TO_SEND = 23` — a getaddr answer is capped at min(1000,
+%%   ceil(0.23 * addrman_size)). Returning the whole table is a privacy /
+%%   bandwidth-amplification vector (addr stamping). Core GETADDR handler
+%%   ~net_processing.cpp:4842 GetAddresses(..., MAX_ADDR_TO_SEND,
+%%   MAX_PCT_ADDR_TO_SEND).
+-define(MAX_PCT_ADDR_TO_SEND, 23).
+
+%% Anti-eclipse: inbound addr/addrv2 rate-limit token bucket. Core
+%% net_processing.cpp:193/197.
+%%   MAX_ADDR_RATE_PER_SECOND          — bucket refill rate (Core:193 = 0.1/s).
+%%   MAX_ADDR_PROCESSING_TOKEN_BUCKET  — bucket cap (Core:197 = MAX_ADDR_TO_SEND
+%%                                       = 1000). One token is spent per
+%%                                       processed address; rate-limited peers
+%%                                       have their excess silently dropped. The
+%%                                       bucket is shared between the addr and
+%%                                       addrv2 handlers (Core routes both through
+%%                                       ProcessAddrs, net_processing.cpp:4022) so
+%%                                       addrv2 cannot bypass the limit.
+%% Expressed at 10x scale for integer arithmetic: 1 token/10s = +1 per 10s of
+%% elapsed wall-clock. We keep a millisecond timestamp and compute the refill as
+%% elapsed_ms * MAX_ADDR_RATE_PER_SECOND / 1000.
+-define(MAX_ADDR_RATE_PER_SECOND_NUM, 1).    %% 0.1 addr/s as 1/10 (num)
+-define(MAX_ADDR_RATE_PER_SECOND_DEN, 10).   %% 0.1 addr/s as 1/10 (den)
+-define(MAX_ADDR_PROCESSING_TOKEN_BUCKET, 1000). %% Core:197 == MAX_ADDR_TO_SEND
+
 %% Service flags
 -define(NODE_NETWORK, 1).
 -define(NODE_BLOOM, 4).
