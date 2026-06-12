@@ -20,6 +20,7 @@
          prune_target/0,
          prune_manual_mode/0,
          mempool_full_rbf/0,
+         txreconciliation/0,
          zmq_enabled/0,
          node_bloom_enabled/0,
          blockfilterindex_enabled/0,
@@ -195,6 +196,30 @@ mempool_full_rbf() ->
                 _ -> true  %% Default to enabled (Bitcoin Core 28.0+)
             end;
         _ -> true
+    end.
+
+%% @doc Whether BIP-330 transaction reconciliation (Erlay) is enabled.
+%% Mirrors Bitcoin Core `-txreconciliation` (init.cpp:574), which defaults
+%% to DEFAULT_TXRECONCILIATION_ENABLE == false (net_processing.h:40). Core
+%% constructs its TxReconciliationTracker — and thus only sends SENDTXRCNCL
+%% during the handshake — when this is explicitly enabled. We therefore
+%% default OFF and only send sendtxrcncl when the operator opts in via
+%% `txreconciliation=1` in the config file or BEAMCHAIN_TXRECONCILIATION=1.
+-spec txreconciliation() -> boolean().
+txreconciliation() ->
+    case os:getenv("BEAMCHAIN_TXRECONCILIATION") of
+        "1" -> true;
+        "true" -> true;
+        false ->
+            %% No env var; check config file. Default OFF (Core default).
+            case get(txreconciliation, "0") of
+                "1" -> true;
+                "true" -> true;
+                1 -> true;
+                true -> true;
+                _ -> false
+            end;
+        _ -> false
     end.
 
 %% @doc Check if any ZMQ notification topic is configured.

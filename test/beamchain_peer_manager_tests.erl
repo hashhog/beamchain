@@ -950,3 +950,62 @@ announce_branch_test_() ->
          ?assertNotEqual(CmdYes, CmdNo)
      end}
     ].
+
+%%% ===================================================================
+%%% getaddr response cap — Bitcoin Core GetAddr_ FLOOR semantics
+%%%
+%%% Core AddrManImpl::GetAddr_ (addrman.cpp:800):
+%%%   nNodes = max_pct * nNodes / 100;          %% INTEGER FLOOR
+%%%   nNodes = std::min(nNodes, max_addresses); %% MAX_ADDR_TO_SEND=1000
+%%% max_pct == MAX_PCT_ADDR_TO_SEND == 23 (net_processing.cpp:188).
+%%% Core does NOT clamp the floor up to 1 — a tiny addrman where
+%%% 23*N < 100 yields 0. beamchain previously used ceil + max(1,_),
+%%% over-disclosing addresses Core withholds; this test pins FLOOR.
+%%% ===================================================================
+getaddr_cap_floor_test_() ->
+    [
+     %% Empty table -> 0.
+     {"empty table caps at 0", fun() ->
+         ?assertEqual(0, beamchain_peer_manager:getaddr_cap(0))
+     end},
+
+     %% DISTINGUISHING: N=10 -> floor(2.3) = 2, NOT ceil 3.
+     {"N=10 -> 2 (floor), not 3 (ceil)", fun() ->
+         ?assertEqual(2, beamchain_peer_manager:getaddr_cap(10))
+     end},
+
+     %% DISTINGUISHING: N=50 -> floor(11.5) = 11, NOT ceil 12.
+     {"N=50 -> 11 (floor), not 12 (ceil)", fun() ->
+         ?assertEqual(11, beamchain_peer_manager:getaddr_cap(50))
+     end},
+
+     %% DISTINGUISHING: N=100 -> 23*100/100 = 23 exactly (floor==ceil here,
+     %% but confirms the 23% factor is intact).
+     {"N=100 -> 23 exactly", fun() ->
+         ?assertEqual(23, beamchain_peer_manager:getaddr_cap(100))
+     end},
+
+     %% Core does NOT floor-up to 1: tiny tables where 23*N < 100 yield 0.
+     {"N=1 -> 0 (Core withholds; no max(1,_))", fun() ->
+         ?assertEqual(0, beamchain_peer_manager:getaddr_cap(1))
+     end},
+     {"N=4 -> 0 (23*4=92 < 100)", fun() ->
+         ?assertEqual(0, beamchain_peer_manager:getaddr_cap(4))
+     end},
+     {"N=5 -> 1 (23*5=115 -> floor 1)", fun() ->
+         ?assertEqual(1, beamchain_peer_manager:getaddr_cap(5))
+     end},
+
+     %% Upper clamp at MAX_ADDR_TO_SEND=1000: floor(23% of 100000)=23000 -> 1000.
+     {"large table clamps at MAX_ADDR_TO_SEND=1000", fun() ->
+         ?assertEqual(1000, beamchain_peer_manager:getaddr_cap(100000))
+     end},
+     %% Boundary: 23*4347/100 = 999.81 -> floor 999; 23*4348/100 = 1000.04
+     %% -> floor 1000. 4349 stays clamped at 1000.
+     {"N=4349 -> 1000 (clamp boundary)", fun() ->
+         ?assertEqual(1000, beamchain_peer_manager:getaddr_cap(4349))
+     end},
+     {"N=4347 -> 999 (just below clamp)", fun() ->
+         ?assertEqual(999, beamchain_peer_manager:getaddr_cap(4347))
+     end}
+    ].

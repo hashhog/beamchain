@@ -200,19 +200,37 @@ gate04_tap_tree_drops_on_reencode_test() ->
 
 %%% ===================================================================
 %%% Gate 5 — PSBT_HIGHEST_VERSION ceiling check on parse.
-%%% PARTIAL: version field read but no ceiling check — BUG-22.
+%%% FIXED: version field is now ceiling-checked on parse — BUG-22.
+%%% Bitcoin Core psbt.h:1322-1323 throws "Unsupported version number"
+%%% for any global version > PSBT_HIGHEST_VERSION (0); decodepsbt
+%%% surfaces it as RPC_DESERIALIZATION_ERROR (-22).
 %%% ===================================================================
 
-gate05_version_ceiling_not_enforced_test() ->
+gate05_version_ceiling_enforced_test() ->
     TxBin = unsigned_tx_bytes(),
     %% Pretend to be PSBT v=42 (well above PSBT_HIGHEST_VERSION = 0).
     Blob = build_handcrafted_psbt(
              [{<<16#00>>, TxBin}, {<<16#fb>>, <<42:32/little>>}],
              [], []),
-    %% AUDIT-FLIP: today decode succeeds and reports version=42.
-    %% When the fix lands, decode will reject. BUG-22.
-    {ok, Dec} = beamchain_psbt:decode(Blob),
-    ?assertEqual(42, beamchain_psbt:get_version(Dec)).
+    %% FLIPPED (was AUDIT-FLIP): decode now REJECTS the unsupported version
+    %% instead of accepting version=42. BUG-22 closed.
+    ?assertEqual({error, unsupported_psbt_version},
+                 beamchain_psbt:decode(Blob)).
+
+%% Boundary: a global version of exactly 1 is still > PSBT_HIGHEST_VERSION
+%% (0) and must be rejected; version 0 (or no version key) is accepted.
+gate05_version_ceiling_boundary_test() ->
+    TxBin = unsigned_tx_bytes(),
+    BlobV1 = build_handcrafted_psbt(
+               [{<<16#00>>, TxBin}, {<<16#fb>>, <<1:32/little>>}],
+               [], []),
+    ?assertEqual({error, unsupported_psbt_version},
+                 beamchain_psbt:decode(BlobV1)),
+    BlobV0 = build_handcrafted_psbt(
+               [{<<16#00>>, TxBin}, {<<16#fb>>, <<0:32/little>>}],
+               [], []),
+    {ok, Dec0} = beamchain_psbt:decode(BlobV0),
+    ?assertEqual(0, beamchain_psbt:get_version(Dec0)).
 
 %%% ===================================================================
 %%% Gate 6 — Duplicate-key detection per BIP-174.

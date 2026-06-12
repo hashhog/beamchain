@@ -41,6 +41,12 @@
 -define(PSBT_GLOBAL_VERSION,     16#fb).
 -define(PSBT_GLOBAL_PROPRIETARY, 16#fc).
 
+%% Highest PSBT version this deserializer supports. Bitcoin Core
+%% psbt.h:80 `PSBT_HIGHEST_VERSION = 0`; the deserializer throws
+%% std::ios_base::failure("Unsupported version number") for anything
+%% above it (psbt.h:1322-1323). PSBTv2 (version 2) is therefore rejected.
+-define(PSBT_HIGHEST_VERSION, 0).
+
 %% Input key types
 -define(PSBT_IN_NON_WITNESS_UTXO,    16#00).
 -define(PSBT_IN_WITNESS_UTXO,        16#01).
@@ -344,7 +350,14 @@ parse_global([{<<?PSBT_GLOBAL_XPUB, XPub/binary>>, Value} | Rest], Tx, XPubs, Ve
     {Fingerprint, Path} = decode_bip32_path(Value),
     parse_global(Rest, Tx, XPubs#{XPub => {Fingerprint, Path}}, Ver, Unk);
 parse_global([{<<?PSBT_GLOBAL_VERSION>>, <<V:32/little>>} | Rest], Tx, XPubs, _, Unk) ->
-    parse_global(Rest, Tx, XPubs, V, Unk);
+    %% Bitcoin Core psbt.h:1322-1323: reject any PSBT whose global version
+    %% exceeds PSBT_HIGHEST_VERSION (0). The deserializer throws
+    %% "Unsupported version number", which decodepsbt surfaces as
+    %% RPC_DESERIALIZATION_ERROR (-22). PSBTv2 (version 2) is unsupported.
+    case V > ?PSBT_HIGHEST_VERSION of
+        true  -> throw({decode_error, unsupported_psbt_version});
+        false -> parse_global(Rest, Tx, XPubs, V, Unk)
+    end;
 parse_global([{Key, Value} | Rest], Tx, XPubs, Ver, Unk) ->
     %% Unknown key type
     parse_global(Rest, Tx, XPubs, Ver, Unk#{Key => Value}).
