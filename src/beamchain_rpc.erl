@@ -4746,10 +4746,11 @@ networkinfo_proplist(Connections, ConnIn, ConnOut, LocalAddrs) ->
     %% localservices reflects the REAL advertised service bitset — the same
     %% source the wire version message uses (beamchain_peer:advertised_services/0)
     %% — exactly like Core getnetworkinfo -> connman.GetLocalServices(). A full
-    %% non-pruned node advertises NODE_NETWORK|NODE_WITNESS|NODE_NETWORK_LIMITED
-    %% = 0x409. The remaining byte-diff vs Core regtest (0xc09) is the single
-    %% honest NODE_P2P_V2 (0x800) bit, which the beamchain-v2 campaign closes
-    %% once v2 transport is default-on — NEVER faked here.
+    %% non-pruned node with the v2 transport on advertises NODE_NETWORK |
+    %% NODE_WITNESS | NODE_NETWORK_LIMITED | NODE_P2P_V2 = 0xc09, matching Core
+    %% regtest. The NODE_P2P_V2 (0x800) bit is gated on the SAME predicate that
+    %% enables the v2 transport (bip324_v2_outbound_enabled/0) — NEVER faked; an
+    %% explicit opt-out drops it back to 0x409.
     LocalServices = beamchain_peer:advertised_services(),
     LocalServicesHex0 = string:to_lower(integer_to_list(LocalServices, 16)),
     LocalServicesHex = list_to_binary(
@@ -6790,12 +6791,16 @@ resolve_host(Host, Port) ->
 %% Convert service flags to names. Ordered by ascending bit value to match
 %% Core serviceFlagsToStr (net.cpp), which iterates bit positions 0..63.
 services_to_names(Services) ->
+    %% Order ascending by bit position to match Core's serviceFlagToStr
+    %% iteration (protocol.cpp:91-117): NETWORK(0), BLOOM(2), WITNESS(3),
+    %% COMPACT_FILTERS(6), NETWORK_LIMITED(10), P2P_V2(11).
     Flags = [
         {?NODE_NETWORK, <<"NETWORK">>},
         {?NODE_BLOOM, <<"BLOOM">>},
         {?NODE_WITNESS, <<"WITNESS">>},
         {?NODE_COMPACT_FILTERS, <<"COMPACT_FILTERS">>},
-        {?NODE_NETWORK_LIMITED, <<"NETWORK_LIMITED">>}
+        {?NODE_NETWORK_LIMITED, <<"NETWORK_LIMITED">>},
+        {?NODE_P2P_V2, <<"P2P_V2">>}
     ],
     [Name || {Flag, Name} <- Flags, (Services band Flag) =/= 0].
 

@@ -250,28 +250,32 @@ queue_tx_inv(Pid, Txid) when is_binary(Txid), byte_size(Txid) =:= 32 ->
 %%% BIP-324 v2 outbound: feature gate + per-address v1-only cache
 %%% -------------------------------------------------------------------
 
-%% @doc Returns true iff outbound BIP-324 v2 is enabled.  Default OFF
-%% (conservative: v2 inbound responder landed in 72732d5; outbound is
-%% wired by this commit but still gated until soak time accumulates).
-%% Operators flip on with `BEAMCHAIN_BIP324_V2_OUTBOUND=1` (or "true")
-%% in the environment, or `{bip324_v2_outbound, true}` in the
-%% application config.  Mirrors clearbit's `bip324V2Enabled/0`
-%% (peer.zig:653) modulo default polarity.
+%% @doc Returns true iff outbound BIP-324 v2 is enabled.  Default ON
+%% (the v2 transport is PROVEN — A-init/A-resp/B1/B2 GREEN vs Core
+%% v31.99 -v2transport; the v1-fallback path is wired so an explicit
+%% opt-out or a v1-only peer downgrades cleanly).  Operators turn it OFF
+%% with `BEAMCHAIN_BIP324_V2_OUTBOUND=0` (or "false"/"off"/"no") in the
+%% environment, or `{bip324_v2_outbound, false}` in the application
+%% config.  Mirrors haskoin 6963b93 / camlcoin bb4894f / hotbuns
+%% 9c446e0 (env unset → on, explicit opt-out → off).
 -spec bip324_v2_outbound_enabled() -> boolean().
 bip324_v2_outbound_enabled() ->
     case os:getenv("BEAMCHAIN_BIP324_V2_OUTBOUND") of
         false ->
+            %% Env unset: honor the application config, default ON.
             case application:get_env(beamchain, bip324_v2_outbound) of
-                {ok, true}  -> true;
-                _           -> false
+                {ok, false} -> false;
+                _           -> true
             end;
         Val ->
+            %% Env set: explicit opt-out values turn it off, anything
+            %% else (including the empty string) leaves it on.
             case string:lowercase(Val) of
-                "1"      -> true;
-                "true"   -> true;
-                "on"     -> true;
-                "yes"    -> true;
-                _        -> false
+                "0"     -> false;
+                "false" -> false;
+                "off"   -> false;
+                "no"    -> false;
+                _       -> true
             end
     end.
 
@@ -1382,9 +1386,12 @@ do_send_version(#peer_data{address = {IP, Port}, our_nonce = Nonce} = Data) ->
 %% NODE_NETWORK_LIMITED | NODE_WITNESS unconditionally, init.cpp:1949-1950
 %% ORs in NODE_NETWORK in non-prune mode), giving 0x409. We additionally
 %% advertise NODE_BLOOM / NODE_COMPACT_FILTERS when those subsystems are
-%% enabled. NODE_P2P_V2 is NOT advertised: BIP-324 v2 transport is
-%% default-off here, so advertising the bit would claim an off-wire
-%% capability.
+%% enabled, and NODE_P2P_V2 (0x800) when the BIP-324 v2 transport is
+%% genuinely enabled (gated on bip324_v2_outbound_enabled/0 — the SAME
+%% predicate that enables the transport, so the wire claim cannot lie).
+%% With v2 default-on this gives 0xc09; an explicit opt-out drops back to
+%% 0x409. Core protocol.h:329-330 / net_processing advertise the bit the
+%% same way (only when -v2transport is active).
 -spec advertised_services() -> non_neg_integer().
 advertised_services() ->
     BaseServices = ?NODE_NETWORK bor ?NODE_WITNESS,
@@ -1413,7 +1420,15 @@ advertised_services() ->
     %% earlier prune-only gate was a Core-parity error. We keep NODE_NETWORK
     %% set (non-pruned full node), giving NODE_NETWORK | NODE_WITNESS |
     %% NODE_NETWORK_LIMITED = 0x409.
-    Services1 bor ?NODE_NETWORK_LIMITED.
+    Services2 = Services1 bor ?NODE_NETWORK_LIMITED,
+    %% BIP-324: advertise NODE_P2P_V2 only when the v2 transport is
+    %% genuinely enabled. Gated on the SAME predicate that enables the
+    %% outbound transport so the advertised bit can never claim a
+    %% capability the wire does not actually offer. v2 default-on → 0xc09.
+    case bip324_v2_outbound_enabled() of
+        true  -> Services2 bor ?NODE_P2P_V2;
+        false -> Services2
+    end.
 
 handle_version_msg(_Payload, #peer_data{version_recv = true} = Data) ->
     logger:warning("peer ~p duplicate version", [Data#peer_data.address]),
