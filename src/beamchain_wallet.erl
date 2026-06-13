@@ -73,6 +73,7 @@
 %% Transaction signing
 -export([sign_transaction/3,
          sign_transaction/4,
+         sign_input/7,
          build_transaction/3]).
 
 %% PSBT (BIP 174/370)
