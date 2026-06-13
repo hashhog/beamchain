@@ -82,6 +82,7 @@
 %% assumeUTXO support
 -export([load_snapshot/1, compute_utxo_hash/0, compute_utxo_muhash/0]).
 -export([is_snapshot_chainstate/0, get_snapshot_base_height/0]).
+-export([get_chainstate_meta/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -386,6 +387,19 @@ is_snapshot_chainstate() ->
 -spec get_snapshot_base_height() -> {ok, non_neg_integer()} | not_snapshot.
 get_snapshot_base_height() ->
     gen_server:call(?SERVER, get_snapshot_base_height).
+
+%% @doc Snapshot of chainstate metadata for the getchainstates RPC.
+%% Returns the chainstate role, the from-snapshot base hash (undefined when
+%% this is the normal fully-validated main chainstate), and the configured
+%% coins-tip (UTXO) cache budget in bytes (Core's
+%% Chainstate::m_coinstip_cache_size_bytes — the in-memory coins cache flush
+%% threshold). No live ETS work, so it is a cheap synchronous call.
+-spec get_chainstate_meta() ->
+    #{role := main | snapshot | background,
+      snapshot_base_hash := binary() | undefined,
+      coins_tip_cache_bytes := non_neg_integer()}.
+get_chainstate_meta() ->
+    gen_server:call(?SERVER, get_chainstate_meta).
 
 %%% ===================================================================
 %%% UTXO cache (public ETS, called from any process)
@@ -841,6 +855,14 @@ handle_call(get_snapshot_base_height, _From,
         undefined -> {reply, not_snapshot, State};
         H -> {reply, {ok, H}, State}
     end;
+
+handle_call(get_chainstate_meta, _From,
+            #state{chainstate_role = Role,
+                   snapshot_base_hash = SnapHash,
+                   max_cache_bytes = MaxCacheBytes} = State) ->
+    {reply, #{role => Role,
+              snapshot_base_hash => SnapHash,
+              coins_tip_cache_bytes => MaxCacheBytes}, State};
 
 handle_call(get_tip_height, _From, #state{tip_height = Height} = State) ->
     {reply, {ok, Height}, State};

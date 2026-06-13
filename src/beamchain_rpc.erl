@@ -61,6 +61,10 @@
 %% handler directly (error codes + result shape) without cowboy.
 -export([rpc_gettxspendingprevout/1]).
 
+%% Exported for EUnit so tests can drive the getchainstates RPC handler
+%% directly (Core field shape + types) without cowboy.
+-export([rpc_getchainstates/0]).
+
 %% Test-only exports — confirmations helpers (Pattern C1 regression tests).
 -ifdef(TEST).
 -export([confirmations/1, confirmations/2, is_block_in_active_chain/1]).
@@ -747,6 +751,7 @@ handle_method(<<"getblock">>, P, _W) -> rpc_getblock(P);
 handle_method(<<"getblockheader">>, P, _W) -> rpc_getblockheader(P);
 handle_method(<<"getdifficulty">>, _, _W) -> rpc_getdifficulty();
 handle_method(<<"getchaintips">>, _, _W) -> rpc_getchaintips();
+handle_method(<<"getchainstates">>, _, _W) -> rpc_getchainstates();
 handle_method(<<"getblockstats">>, P, _W) -> rpc_getblockstats(P);
 handle_method(<<"getchaintxstats">>, P, _W) -> rpc_getchaintxstats(P);
 handle_method(<<"verifychain">>, P, _W) -> rpc_verifychain(P);
@@ -906,6 +911,7 @@ rpc_help_list() ->
         <<"getblockheader \"blockhash\" ( verbose )">>,
         <<"getblockstats \"hash_or_height\" ( stats )">>,
         <<"getchaintips">>,
+        <<"getchainstates">>,
         <<"getchaintxstats ( nblocks \"blockhash\" )">>,
         <<"getdifficulty">>,
         <<"gettxoutsetinfo ( \"hash_type\" )">>,
@@ -1598,6 +1604,109 @@ rpc_getchaintips() ->
         not_found ->
             {ok, []}
     end.
+
+%% @doc getchainstates — information about this node's chainstate(s).
+%%
+%% Mirrors bitcoin-core/src/rpc/blockchain.cpp::getchainstates (and its
+%% per-chainstate make_chain_data / RPCHelpForChainstate, :3448-3519). Result:
+%%   { "headers": <int>,                   % best-header height, -1 if none seen
+%%     "chainstates": [ {                   % ordered by work; active LAST
+%%        "blocks": <int>,                  % height of this chainstate's tip
+%%        "bestblockhash": <hex>,
+%%        "bits": <hex>,                    % nBits, %08x (Core pushes it)
+%%        "target": <hex>,                  % zero-padded uint256 target
+%%        "difficulty": <num>,              % %.16g, GetDifficulty(tip)
+%%        "verificationprogress": <num>,    % [0..1]
+%%        ("snapshot_blockhash": <hex>),    % ONLY for a from-snapshot chainstate
+%%        "coins_db_cache_bytes": <int>,    % m_coinsdb_cache_size_bytes
+%%        "coins_tip_cache_bytes": <int>,   % m_coinstip_cache_size_bytes
+%%        "validated": <bool> } ] }
+%%
+%% beamchain runs a single, fully-validated main chainstate (no active
+%% AssumeUTXO snapshot in steady state), so chainstates is a 1-element array
+%% with validated=true and snapshot_blockhash OMITTED. When the node is
+%% currently a snapshot chainstate (assumeutxo-loaded, not yet background-
+%% validated), snapshot_blockhash is emitted and validated=false, matching
+%% Core's `cs.m_assumeutxo == Assumeutxo::VALIDATED`.
+%%
+%% ORDERED proplists throughout so jsx emits Core's pushKV key order. The
+%% difficulty value goes through the __DIFF__ sentinel + replace_all_sentinels
+%% so it is a raw %.16g JSON number byte-identical to Core's GetDifficulty,
+%% not jsx's full-precision float. Hence the {ok_raw_json, ...} return shape.
+rpc_getchainstates() ->
+    %% headers: Core's chainman.m_best_header->nHeight (-1 if no header seen).
+    %% beamchain tracks the best-header tip in beamchain_db. Fall back to the
+    %% active-chain tip height (best header is always >= chain tip), then -1.
+    Headers = case beamchain_db:get_header_tip() of
+        {ok, #{height := HHeight}} -> HHeight;
+        _ ->
+            case beamchain_chainstate:get_tip() of
+                {ok, {_, TH}} -> TH;
+                not_found -> -1
+            end
+    end,
+    Chainstates = build_chainstates_array(),
+    Result = [
+        {<<"headers">>, Headers},
+        {<<"chainstates">>, Chainstates}
+    ],
+    {ok_raw_json, replace_all_sentinels(jsx:encode(Result))}.
+
+%% build_chainstates_array/0 — the "chainstates" list. beamchain has exactly
+%% ONE chainstate (most-work / active), so a 1-element list is trivially in
+%% Core's work order (active LAST). An empty list when no tip exists yet.
+build_chainstates_array() ->
+    case beamchain_chainstate:get_tip() of
+        {ok, {TipHash, TipHeight}} ->
+            [make_chainstate_data(TipHash, TipHeight)];
+        not_found ->
+            []
+    end.
+
+%% make_chainstate_data/2 — per-chainstate object, ORDERED to Core's pushKV
+%% sequence in make_chain_data: blocks, bestblockhash, bits, target,
+%% difficulty, verificationprogress, [snapshot_blockhash], coins_db_cache_bytes,
+%% coins_tip_cache_bytes, validated.
+make_chainstate_data(TipHash, TipHeight) ->
+    Bits = case beamchain_db:get_block_index(TipHeight) of
+        {ok, #{header := Hdr}} -> Hdr#block_header.bits;
+        _ -> 16#1d00ffff
+    end,
+    VerProgress = case beamchain_chainstate:is_synced() of
+        true  -> 1.0;
+        false -> 0.999
+    end,
+    Meta = beamchain_chainstate:get_chainstate_meta(),
+    Role = maps:get(role, Meta, main),
+    SnapHash = maps:get(snapshot_base_hash, Meta, undefined),
+    CoinsTipCacheBytes = maps:get(coins_tip_cache_bytes, Meta, 0),
+    CoinsDbCacheBytes = beamchain_db:coins_db_cache_bytes(),
+    %% validated = (m_assumeutxo == VALIDATED). The normal main chainstate is
+    %% always fully validated; a still-unvalidated snapshot chainstate is not.
+    Validated = (Role =/= snapshot),
+    Head = [
+        {<<"blocks">>, TipHeight},
+        {<<"bestblockhash">>, hash_to_hex(TipHash)},
+        {<<"bits">>, beamchain_serialize:hex_encode(<<Bits:32/big>>)},
+        {<<"target">>, bits_to_target_hex(Bits)},
+        {<<"difficulty">>, format_diff_sentinel(Bits)},
+        {<<"verificationprogress">>, VerProgress}
+    ],
+    %% snapshot_blockhash is OPTIONAL: emitted ONLY when this chainstate is
+    %% based on a snapshot (Core's `if (cs.m_from_snapshot_blockhash)`), in
+    %% Core's key position (after verificationprogress, before the cache sizes).
+    SnapField = case {Role, SnapHash} of
+        {snapshot, H} when is_binary(H), byte_size(H) =:= 32 ->
+            [{<<"snapshot_blockhash">>, hash_to_hex(H)}];
+        _ ->
+            []
+    end,
+    Tail = [
+        {<<"coins_db_cache_bytes">>, CoinsDbCacheBytes},
+        {<<"coins_tip_cache_bytes">>, CoinsTipCacheBytes},
+        {<<"validated">>, Validated}
+    ],
+    Head ++ SnapField ++ Tail.
 
 %% @doc verifychain — actually walk the chain.
 %%
