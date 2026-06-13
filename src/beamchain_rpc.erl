@@ -132,6 +132,12 @@
 %% machinery). Previously only the dispatcher reached this fun.
 -export([rpc_sendrawtransaction/1]).
 
+%% signrawtransactionwithkey (no-wallet raw-tx signer) — exported so the
+%% focused eunit suite (beamchain_signrawtxwithkey_tests) can drive the
+%% handler directly. The dispatcher
+%% `handle_method(<<"signrawtransactionwithkey">>, ...)` calls this same fun.
+-export([rpc_signrawtransactionwithkey/1]).
+
 %% Single-pipeline anchor: payjoin call sites of
 %% lookup_privkeys_for_inputs are referenced here so the
 %% beamchain_fix66_payjoin_sender_tests anchor test counts ≥ the
@@ -856,6 +862,8 @@ handle_method(<<"encryptwallet">>, P, W) -> rpc_encryptwallet(P, W);
 handle_method(<<"walletpassphrase">>, P, W) -> rpc_walletpassphrase(P, W);
 handle_method(<<"walletlock">>, _, W) -> rpc_walletlock(W);
 handle_method(<<"signrawtransactionwithwallet">>, P, W) -> rpc_signrawtransactionwithwallet(P, W);
+%% signrawtransactionwithkey: NO wallet needed (Core: rawtransaction.cpp).
+handle_method(<<"signrawtransactionwithkey">>, P, _W) -> rpc_signrawtransactionwithkey(P);
 handle_method(<<"importdescriptors">>, P, W) -> rpc_importdescriptors(P, W);
 handle_method(<<"importprivkey">>, P, W) -> rpc_importprivkey(P, W);
 handle_method(<<"rescanblockchain">>, P, W) -> rpc_rescanblockchain(P, W);
@@ -1014,6 +1022,7 @@ rpc_help_list() ->
         <<"importprivkey \"privkey\" ( \"label\" rescan )">>,
         <<"rescanblockchain ( start_height stop_height )">>,
         <<"sendtoaddress \"address\" amount ( \"comment\" )">>,
+        <<"signrawtransactionwithkey \"hexstring\" [\"privatekey\",...] ( [{\"txid\":\"hex\",\"vout\":n,\"scriptPubKey\":\"hex\",\"redeemScript\":\"hex\",\"witnessScript\":\"hex\",\"amount\":n},...] \"sighashtype\" )">>,
         <<"signrawtransactionwithwallet \"hexstring\" ( [{\"txid\":\"hex\",\"vout\":n,\"scriptPubKey\":\"hex\"},...] )">>,
         <<"unloadwallet ( \"name\" )">>,
         <<"walletcreatefundedpsbt [{\"txid\":\"hex\",\"vout\":n},...] [{\"address\":amount},...] ( locktime options bip32derivs )">>,
@@ -9719,6 +9728,214 @@ collect_script_info(Map) ->
             Acc1#{redeem_script => beamchain_serialize:hex_decode(RSHex)}
     end,
     Acc2.
+
+%%% ===================================================================
+%%% signrawtransactionwithkey — sign a raw tx with EXPLICIT WIF keys
+%%% (no wallet). Mirrors bitcoin-core/src/rpc/rawtransaction.cpp
+%%% signrawtransactionwithkey (line 672) + rawtransaction_util.cpp
+%%% SignTransaction/SignTransactionResultToJSON (line 311/325).
+%%%
+%%% Difference from signrawtransactionwithwallet: the keystore is built
+%%% from the caller-supplied WIF private keys + prevtxs array, NOT the
+%%% wallet. The signing engine itself is the SAME one the wallet path
+%%% uses — `beamchain_wallet:sign_input/7` (correct BIP-143/BIP-341
+%%% sighash + ECDSA/Schnorr). No sighash/signing is reimplemented here.
+%%%
+%%% Result (Core SignTransactionResultToJSON shape):
+%%%   #{<<"hex">> => SignedHex,
+%%%     <<"complete">> => Bool,            %% true iff every input signed
+%%%     <<"errors">> => [ ... ]}           %% OPTIONAL — present only when
+%%%                                        %% >=1 input remains unsigned
+%%% Each errors[] entry (Core TxInErrorToJSON):
+%%%   #{<<"txid">>, <<"vout">>, <<"witness">> => [Hex...],
+%%%     <<"scriptSig">> => Hex, <<"sequence">>, <<"error">>}
+%%% ===================================================================
+
+%% @doc signrawtransactionwithkey: register WITHOUT a wallet (Core: this
+%% RPC lives in rawtransaction.cpp, not the wallet RPC table).
+rpc_signrawtransactionwithkey([HexStr, WifKeys]) when is_binary(HexStr) ->
+    rpc_signrawtransactionwithkey([HexStr, WifKeys, []]);
+rpc_signrawtransactionwithkey([HexStr, WifKeys, PrevTxs])
+        when is_binary(HexStr), is_list(WifKeys) ->
+    %% NOTE: the optional 4th positional arg ("sighashtype") is accepted
+    %% via the /1 clause below; signing here uses SIGHASH_ALL (the Core
+    %% default) through the wallet engine's per-script signers.
+    try
+        TxBin = beamchain_serialize:hex_decode(HexStr),
+        {Tx, _} = beamchain_serialize:decode_transaction(TxBin),
+        %% --- build the temporary keystore from the WIF keys ---
+        %% Each entry: {PrivKey, PubKey(33), Hash160(PubKey)(20), XOnly(32)}.
+        %% Mirrors Core FillableSigningProvider populated from the WIF list.
+        KeyStore = build_wif_keystore(WifKeys),
+        %% --- resolve each input's prevout (prevtxs first, then chain,
+        %%     then mempool) — same lookup the wallet path uses ---
+        Inputs = Tx#transaction.inputs,
+        InputUtxoInfos = lists:map(
+            fun(#tx_in{prev_out = #outpoint{hash = H, index = I}}) ->
+                case find_prevtx(PrevTxs, H, I) of
+                    {ok, Utxo, Info} -> {ok, Utxo, Info};
+                    not_found ->
+                        case beamchain_chainstate:get_utxo(H, I) of
+                            {ok, Utxo} -> {ok, Utxo, #{}};
+                            not_found ->
+                                case beamchain_mempool:get_mempool_utxo(H, I) of
+                                    {ok, Utxo} -> {ok, Utxo, #{}};
+                                    not_found  -> {missing, H, I}
+                                end
+                        end
+                end
+            end, Inputs),
+        %% PrevOuts for taproot sighash: needs ALL inputs' value+scriptPubKey.
+        %% Unknown prevouts contribute a {0, <<>>} placeholder (Core uses an
+        %% empty Coin); only matters for the inputs we actually sign.
+        PrevOuts = [case Info of
+                        {ok, U, _} -> {U#utxo.value, U#utxo.script_pubkey};
+                        _          -> {0, <<>>}
+                    end || Info <- InputUtxoInfos],
+        %% --- sign each signable input (engine REUSE: sign_input/7) ---
+        Indexed = lists:zip3(lists:seq(0, length(Inputs) - 1),
+                             Inputs, InputUtxoInfos),
+        Signed = lists:map(
+            fun({Idx, Input, UtxoInfo}) ->
+                sign_one_with_key(Tx, Idx, Input, UtxoInfo, KeyStore, PrevOuts)
+            end, Indexed),
+        %% Split into the new inputs + the per-input error (if any).
+        NewInputs = [In || {In, _Err} <- Signed],
+        Errors = [Err || {_In, {error, Err}} <- Signed],
+        Complete = (Errors =:= []),
+        SignedTx = Tx#transaction{inputs = NewInputs},
+        SignedHex = beamchain_serialize:hex_encode(
+            beamchain_serialize:encode_transaction(SignedTx)),
+        Base = #{<<"hex">> => SignedHex,
+                 <<"complete">> => Complete},
+        Result = case Errors of
+            [] -> Base;
+            _  -> Base#{<<"errors">> => Errors}
+        end,
+        {ok, Result}
+    catch
+        _:Err ->
+            {error, ?RPC_DESERIALIZATION_ERROR,
+             iolist_to_binary(io_lib:format("TX decode failed: ~p", [Err]))}
+    end;
+%% 4-arg form: trailing "sighashtype" (accepted; default-ALL semantics).
+rpc_signrawtransactionwithkey([HexStr, WifKeys, PrevTxs, _SigHashType])
+        when is_binary(HexStr), is_list(WifKeys) ->
+    rpc_signrawtransactionwithkey([HexStr, WifKeys, PrevTxs]);
+rpc_signrawtransactionwithkey(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"signrawtransactionwithkey \"hexstring\" [\"privatekey\",...] "
+       "( [{\"txid\":\"hex\",\"vout\":n,\"scriptPubKey\":\"hex\",...},...] "
+       "\"sighashtype\" )">>}.
+
+%% Decode the WIF list into a keystore of derived key material. Invalid
+%% WIFs are silently skipped (Core: ParseWIFs ignores entries it can't
+%% decode and the input simply stays unsigned -> an errors[] entry).
+build_wif_keystore(WifKeys) ->
+    lists:filtermap(
+        fun(Wif) when is_binary(Wif) ->
+                case wif_to_privkey(Wif) of
+                    {ok, {Priv, _Compressed}} ->
+                        try
+                            {ok, PubKey} =
+                                beamchain_crypto:pubkey_from_privkey(Priv),
+                            Pkh = beamchain_crypto:hash160(PubKey),
+                            <<_Prefix:8, XOnly:32/binary>> = PubKey,
+                            {true, {Priv, PubKey, Pkh, XOnly}}
+                        catch
+                            _:_ -> false
+                        end;
+                    _ -> false
+                end;
+           (_) -> false
+        end, WifKeys).
+
+%% Sign a single input with a matching key from the temporary keystore.
+%% Reuses the SAME signer the wallet path uses (beamchain_wallet:sign_input/7)
+%% — correct BIP-143/BIP-341 sighash + ECDSA/Schnorr. Returns
+%% {NewInput, ok} on success or {OriginalInput, {error, ErrMap}} when the
+%% input cannot be signed (no prevout, no matching key, or unsupported
+%% script type) — never a fabricated signature.
+sign_one_with_key(_Tx, _Idx, Input, {missing, _H, _I}, _KeyStore, _PrevOuts) ->
+    {Input, {error, txin_error(Input,
+        <<"Input not found or already spent">>)}};
+sign_one_with_key(Tx, Idx, Input, {ok, Utxo, Info}, KeyStore, PrevOuts) ->
+    ScriptPubKey = Utxo#utxo.script_pubkey,
+    case match_key_for_script(ScriptPubKey, KeyStore) of
+        {ok, PrivKey} ->
+            try beamchain_wallet:sign_input(
+                   Tx, Idx, Input, Utxo, PrivKey, PrevOuts, Info) of
+                #tx_in{} = SignedIn ->
+                    {SignedIn, ok}
+            catch
+                throw:{sign_error, Reason} ->
+                    {Input, {error, txin_error(Input, iolist_to_binary(
+                        io_lib:format("Signing failed: ~p", [Reason])))}};
+                _:Reason ->
+                    {Input, {error, txin_error(Input, iolist_to_binary(
+                        io_lib:format("Signing failed: ~p", [Reason])))}}
+            end;
+        no_key ->
+            {Input, {error, txin_error(Input,
+                <<"Unable to sign input, invalid stack size (possibly "
+                  "missing key)">>)}}
+    end.
+
+%% Find the WIF key whose derived key material matches this scriptPubKey.
+%% Handles P2WPKH / P2PKH (hash160 match), P2TR (x-only match), and
+%% P2SH-P2WPKH (hash160 of the OP_0<pkh> redeemScript). Mirrors the
+%% camlcoin sibling's matching_key dispatch.
+match_key_for_script(ScriptPubKey, KeyStore) ->
+    case beamchain_address:classify_script(ScriptPubKey) of
+        p2wpkh ->
+            <<16#00, 16#14, Hash:20/binary>> = ScriptPubKey,
+            find_by_pkh(Hash, KeyStore);
+        p2pkh ->
+            <<16#76, 16#a9, 16#14, Hash:20/binary, 16#88, 16#ac>> =
+                ScriptPubKey,
+            find_by_pkh(Hash, KeyStore);
+        p2tr ->
+            <<16#51, 16#20, XOnly:32/binary>> = ScriptPubKey,
+            find_by_xonly(XOnly, KeyStore);
+        p2sh ->
+            %% P2SH-P2WPKH: redeemScript = OP_0 <hash160(pubkey)>; the
+            %% P2SH hash commits to hash160(redeemScript).
+            <<16#a9, 16#14, ScriptHash:20/binary, 16#87>> = ScriptPubKey,
+            find_by_p2sh_p2wpkh(ScriptHash, KeyStore);
+        _ ->
+            no_key
+    end.
+
+find_by_pkh(_Hash, []) -> no_key;
+find_by_pkh(Hash, [{Priv, _Pub, Pkh, _XOnly} | _]) when Pkh =:= Hash ->
+    {ok, Priv};
+find_by_pkh(Hash, [_ | Rest]) -> find_by_pkh(Hash, Rest).
+
+find_by_xonly(_XO, []) -> no_key;
+find_by_xonly(XO, [{Priv, _Pub, _Pkh, XOnly} | _]) when XOnly =:= XO ->
+    {ok, Priv};
+find_by_xonly(XO, [_ | Rest]) -> find_by_xonly(XO, Rest).
+
+find_by_p2sh_p2wpkh(_SH, []) -> no_key;
+find_by_p2sh_p2wpkh(ScriptHash, [{Priv, _Pub, Pkh, _XOnly} | Rest]) ->
+    RedeemScript = <<16#00, 16#14, Pkh/binary>>,
+    case beamchain_crypto:hash160(RedeemScript) of
+        ScriptHash -> {ok, Priv};
+        _ -> find_by_p2sh_p2wpkh(ScriptHash, Rest)
+    end.
+
+%% Build a Core-shaped errors[] entry for an unsigned input
+%% (rawtransaction_util.cpp TxInErrorToJSON). txid is rendered in DISPLAY
+%% order (reversed) like every other RPC; witness/scriptSig are hex.
+txin_error(#tx_in{prev_out = #outpoint{hash = H, index = I},
+                  script_sig = ScriptSig, sequence = Seq,
+                  witness = Witness}, Msg) ->
+    #{<<"txid">>      => hash_to_hex(H),
+      <<"vout">>      => I,
+      <<"witness">>   => [beamchain_serialize:hex_encode(W) || W <- Witness],
+      <<"scriptSig">> => beamchain_serialize:hex_encode(ScriptSig),
+      <<"sequence">>  => Seq,
+      <<"error">>     => Msg}.
 
 %% @doc importdescriptors: Import descriptors into the wallet — REAL
 %% registration + rescan (replaces the import_address/5 stub path).
