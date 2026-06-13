@@ -14,6 +14,7 @@
          update/2,
          sign/2,
          combine/1,
+         join/1,
          finalize/1,
          extract/1]).
 
@@ -173,6 +174,124 @@ combine([First | Rest]) ->
         false ->
             {error, transaction_mismatch}
     end.
+
+%% @doc Join multiple DISTINCT PSBTs (different inputs/outputs) into one
+%% carrying the union of all inputs and outputs.
+%%
+%% Reference: bitcoin-core/src/rpc/rawtransaction.cpp joinpsbts() +
+%% src/psbt.cpp PartiallySignedTransaction::AddInput.
+%%
+%%   - best version  = max over tx.version (start 1, unsigned uint32).
+%%   - best locktime = min over tx.nLockTime (start 0xffffffff).
+%%   - AddInput rejects a duplicate only when the FULL CTxIn matches
+%%     (prevout AND scriptSig AND nSequence — Core CTxIn::operator==);
+%%     two inputs sharing an outpoint but differing in nSequence are BOTH
+%%     kept. On a duplicate it returns {error, {duplicate_input, TxidHex, N}}.
+%%   - AddInput UNCONDITIONALLY clears partial_sigs / final_script_sig /
+%%     final_script_witness on every added input map.
+%%   - Outputs are added with NO dedup. Global xpubs/unknown are unioned.
+%%   - Input+output order is SHUFFLED (Core std::shuffle privacy step);
+%%     byte-exactness vs Core is impossible regardless (Core's order is
+%%     random too), so callers/tests must compare SETS.
+-spec join([#psbt{}]) -> {ok, #psbt{}} | {error, term()}.
+join(Psbts) ->
+    BestVersion = lists:foldl(fun(P, Acc) ->
+        V = (P#psbt.unsigned_tx)#transaction.version band 16#ffffffff,
+        max(V, Acc)
+    end, 1, Psbts),
+    BestLocktime = lists:foldl(fun(P, Acc) ->
+        LT = (P#psbt.unsigned_tx)#transaction.locktime band 16#ffffffff,
+        min(LT, Acc)
+    end, 16#ffffffff, Psbts),
+    try
+        %% Accumulator: {RevVins, RevInputMaps, RevVouts, RevOutputMaps,
+        %%               XPubs, GlobalUnknown}.
+        Acc0 = {[], [], [], [], #{}, #{}},
+        {RevVins, RevInMaps, RevVouts, RevOutMaps, XPubs, GUnknown} =
+            lists:foldl(fun merge_join_psbt/2, Acc0, Psbts),
+        MergedTx = #transaction{
+            version  = BestVersion,
+            inputs   = lists:reverse(RevVins),
+            outputs  = lists:reverse(RevVouts),
+            locktime = BestLocktime
+        },
+        Merged = #psbt{
+            unsigned_tx    = MergedTx,
+            xpubs          = XPubs,
+            version        = 0,
+            global_unknown = GUnknown,
+            inputs         = lists:reverse(RevInMaps),
+            outputs        = lists:reverse(RevOutMaps)
+        },
+        {ok, shuffle_joined_psbt(Merged)}
+    catch
+        throw:{join_dup_input, TxidHex, N} ->
+            {error, {duplicate_input, TxidHex, N}}
+    end.
+
+%% Merge one PSBT's inputs/outputs/globals into the accumulator,
+%% enforcing the full-TxIn duplicate check and clearing the three
+%% signature fields on each added input map (Core AddInput, psbt.cpp:52).
+merge_join_psbt(P, {RevVins, RevInMaps, RevVouts, RevOutMaps, XPubs, GUnknown}) ->
+    Tx = P#psbt.unsigned_tx,
+    TxVins = Tx#transaction.inputs,
+    TxVouts = Tx#transaction.outputs,
+    InMaps = P#psbt.inputs,
+    OutMaps = P#psbt.outputs,
+    %% Inputs: duplicate-full-TxIn rejection + sig-field clearing.
+    {RevVins1, RevInMaps1} = lists:foldl(
+        fun({Vin, InMap}, {VAcc, MAcc}) ->
+            case lists:any(fun(Existing) -> txin_eq(Existing, Vin) end, VAcc) of
+                true ->
+                    #outpoint{hash = H, index = N} = Vin#tx_in.prev_out,
+                    throw({join_dup_input, txid_display_hex(H), N});
+                false ->
+                    ClearedMap = maps:without(
+                        [partial_sigs, final_script_sig, final_script_witness],
+                        InMap),
+                    {[Vin | VAcc], [ClearedMap | MAcc]}
+            end
+        end, {RevVins, RevInMaps}, lists:zip(TxVins, InMaps)),
+    %% Outputs: no dedup.
+    {RevVouts1, RevOutMaps1} = lists:foldl(
+        fun({Vout, OutMap}, {VAcc, MAcc}) ->
+            {[Vout | VAcc], [OutMap | MAcc]}
+        end, {RevVouts, RevOutMaps}, lists:zip(TxVouts, OutMaps)),
+    %% Globals: xpubs union (first-wins) + unknown union.
+    XPubs1 = maps:merge(P#psbt.xpubs, XPubs),
+    GUnknown1 = maps:merge(GUnknown, P#psbt.global_unknown),
+    {RevVins1, RevInMaps1, RevVouts1, RevOutMaps1, XPubs1, GUnknown1}.
+
+%% Core CTxIn::operator== : prevout AND scriptSig AND nSequence
+%% (witness is NOT part of CTxIn).
+txin_eq(#tx_in{prev_out = PA, script_sig = SA, sequence = QA},
+        #tx_in{prev_out = PB, script_sig = SB, sequence = QB}) ->
+    PA =:= PB andalso SA =:= SB andalso QA =:= QB.
+
+%% Display-order (big-endian) hex of an internal 32-byte txid.
+txid_display_hex(Hash) when byte_size(Hash) =:= 32 ->
+    beamchain_serialize:hex_encode(beamchain_serialize:reverse_bytes(Hash)).
+
+%% Shuffle the merged PSBT's inputs and outputs in lockstep (each vin
+%% rides with its input map, each vout with its output map), mirroring
+%% Core's std::shuffle privacy step. Uses rand:uniform/0 sort keys.
+shuffle_joined_psbt(#psbt{unsigned_tx = Tx, inputs = InMaps,
+                          outputs = OutMaps} = Psbt) ->
+    Vins = Tx#transaction.inputs,
+    Vouts = Tx#transaction.outputs,
+    {ShufVins, ShufInMaps} = unzip_pairs(shuffle_list(lists:zip(Vins, InMaps))),
+    {ShufVouts, ShufOutMaps} = unzip_pairs(shuffle_list(lists:zip(Vouts, OutMaps))),
+    Psbt#psbt{
+        unsigned_tx = Tx#transaction{inputs = ShufVins, outputs = ShufVouts},
+        inputs = ShufInMaps,
+        outputs = ShufOutMaps
+    }.
+
+unzip_pairs(Pairs) ->
+    {[A || {A, _} <- Pairs], [B || {_, B} <- Pairs]}.
+
+shuffle_list(L) ->
+    [X || {_, X} <- lists:sort([{rand:uniform(), Item} || Item <- L])].
 
 %% @doc Finalize a PSBT by assembling scriptSig and witness from partial data.
 %% Returns the finalized PSBT (with final_script_sig and final_script_witness set).
@@ -344,7 +463,13 @@ parse_global([], Tx, XPubs, Version, Unknown) ->
             {Tx, XPubs, Version, Unknown}
     end;
 parse_global([{<<?PSBT_GLOBAL_UNSIGNED_TX>>, Value} | Rest], _, XPubs, Ver, Unk) ->
-    {Tx, <<>>} = beamchain_serialize:decode_transaction(Value),
+    %% The PSBT global unsigned tx is ALWAYS the no-witness network
+    %% serialization (BIP-174; Core psbt.h:1272 deserializes it with
+    %% TX_NO_WITNESS). The auto-detecting decode_transaction/1 would
+    %% mis-read a 0-input tx's leading 0x00 0x01 (input-count 0,
+    %% output-count 1) as a segwit marker+flag and fail to round-trip a
+    %% blank PSBT produced by converttopsbt/createpsbt with no inputs.
+    {Tx, <<>>} = beamchain_serialize:decode_transaction_no_witness(Value),
     parse_global(Rest, Tx, XPubs, Ver, Unk);
 parse_global([{<<?PSBT_GLOBAL_XPUB, XPub/binary>>, Value} | Rest], Tx, XPubs, Ver, Unk) ->
     {Fingerprint, Path} = decode_bip32_path(Value),
