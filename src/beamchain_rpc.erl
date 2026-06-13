@@ -94,6 +94,11 @@
 -export([rpc_analyzepsbt/1, rpc_lockunspent/2, rpc_listlockunspent/1,
          rpc_walletcreatefundedpsbt/2,
          analyze_psbt/1]).
+%% Test-only exports — fundrawtransaction. `fund_raw_tx/5` is the pure
+%% funding helper (no live wallet / chainstate needed) a unit test can drive
+%% directly with fixture UTXOs + a fixture change script; `rpc_fundrawtransaction/2`
+%% is exported so eunit can drive the dispatcher path.
+-export([rpc_fundrawtransaction/2, fund_raw_tx/5]).
 %% Test-only exports — bumpfee / psbtbumpfee (W118 BUG-2/BUG-3, FIX-61).
 %% bumpfee_ceil_num/1 + bumpfee_replace_change/3 are pure helpers a unit
 %% test can exercise without needing a running mempool / wallet.
@@ -855,6 +860,7 @@ handle_method(<<"importdescriptors">>, P, W) -> rpc_importdescriptors(P, W);
 handle_method(<<"importprivkey">>, P, W) -> rpc_importprivkey(P, W);
 handle_method(<<"rescanblockchain">>, P, W) -> rpc_rescanblockchain(P, W);
 handle_method(<<"walletcreatefundedpsbt">>, P, W) -> rpc_walletcreatefundedpsbt(P, W);
+handle_method(<<"fundrawtransaction">>, P, W) -> rpc_fundrawtransaction(P, W);
 %% W118 BUG-2 / BUG-3 closure: BIP-125 RBF fee bumping.
 handle_method(<<"bumpfee">>, P, W) -> rpc_bumpfee(P, W);
 handle_method(<<"psbtbumpfee">>, P, W) -> rpc_psbtbumpfee(P, W);
@@ -10885,6 +10891,308 @@ insert_at(N, X, L) when N >= length(L) -> L ++ [X];
 insert_at(N, X, L) ->
     {Before, After} = lists:split(N, L),
     Before ++ [X | After].
+
+%% @doc fundrawtransaction "hexstring" ( options iswitness )
+%%
+%% Mirrors `bitcoin-core/src/wallet/rpc/spend.cpp::fundrawtransaction` →
+%% `FundTransaction` (spend.cpp:470).  fundrawtransaction is the raw-tx
+%% sibling of walletcreatefundedpsbt: both call the SAME Core FundTransaction
+%% coin-selection engine.  Here we decode the caller's raw tx, add inputs from
+%% the wallet UTXO set (via the existing `beamchain_wallet:select_coins/3`
+%% engine — the same selector walletcreatefundedpsbt drives through
+%% `wcfp_select_coins`) plus at most one change output, and serialize the
+%% funded tx back to hex.  Existing inputs and outputs are preserved.
+%%
+%% Result object: {"hex": <hex of funded raw tx>, "fee": <BTC>,
+%%                 "changepos": <int | -1>}.
+%%
+%% Options supported: changeAddress, changePosition, feeRate (BTC/kvB) /
+%% fee_rate (sat/vB), subtractFeeFromOutputs, change_type, lockUnspents,
+%% add_inputs.  The no-options default path adds inputs + change to fund the
+%% existing outputs + fee.
+rpc_fundrawtransaction([HexStr], WalletName) ->
+    rpc_fundrawtransaction([HexStr, #{}], WalletName);
+rpc_fundrawtransaction([HexStr, Options], WalletName) ->
+    rpc_fundrawtransaction([HexStr, Options, undefined], WalletName);
+rpc_fundrawtransaction([HexStr, Options, _IsWitness], WalletName)
+        when is_binary(HexStr), is_map(Options) ->
+    case resolve_wallet(WalletName) of
+        {ok, Pid} ->
+            try
+                do_fundrawtransaction(Pid, HexStr, Options)
+            catch
+                throw:{frt_error, Code, Msg} ->
+                    {error, Code, Msg};
+                _:_ ->
+                    {error, ?RPC_MISC_ERROR, <<"Error funding transaction">>}
+            end;
+        {error, _} ->
+            wallet_not_found_error(WalletName)
+    end;
+%% Backward-compat: Core accepts a bool in the options slot (does nothing).
+rpc_fundrawtransaction([HexStr, Options | Rest], WalletName)
+        when is_binary(HexStr), is_boolean(Options) ->
+    rpc_fundrawtransaction([HexStr, #{} | Rest], WalletName);
+rpc_fundrawtransaction(_, _) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"fundrawtransaction \"hexstring\" ( options iswitness )">>}.
+
+do_fundrawtransaction(Pid, HexStr, Options) ->
+    Network = beamchain_config:network(),
+    %% 1. Decode the raw tx.  Keep its existing inputs and outputs verbatim.
+    Tx = case (catch decode_raw_tx_for_funding(HexStr)) of
+        {ok, T} -> T;
+        _ ->
+            throw({frt_error, ?RPC_DESERIALIZATION_ERROR, <<"TX decode failed">>})
+    end,
+    ExistingIns = Tx#transaction.inputs,
+    ExistingOuts = Tx#transaction.outputs,
+    %% 2. Fee rate (sat/vB).  Reuse the walletcreatefundedpsbt resolver so
+    %% feeRate/fee_rate parse identically.
+    FeeRate = wcfp_fee_rate(Options),
+    %% 3. subtractFeeFromOutputs: zero-based output indices the fee is split
+    %% across (Core's InterpretSubtractFeeFromOutputInstructions).
+    SffoIdx = frt_subtract_fee_outputs(Options, length(ExistingOuts)),
+    %% 4. Available wallet UTXOs minus any caller-supplied (manual) inputs and
+    %% locked coins — the same availability filter wcfp_select_coins uses.
+    AllUtxos = beamchain_wallet:get_wallet_utxos(),
+    ManualKeys = [{O#outpoint.hash, O#outpoint.index}
+                  || #tx_in{prev_out = O} <- ExistingIns],
+    Locked = sets:from_list(beamchain_wallet:list_locked_coins(Pid)),
+    Available = lists:filter(fun({Txid, Vout, _U}) ->
+        Key = {Txid, Vout},
+        not lists:member(Key, ManualKeys)
+            andalso not sets:is_element(Key, Locked)
+    end, AllUtxos),
+    %% 5. Change script: explicit changeAddress, else a wallet-derived change
+    %% address of the requested change_type (default p2wpkh).
+    ChangeScript = frt_change_script(Pid, Options, Network),
+    %% 6. add_inputs: defaults true (Core sets m_allow_other_inputs = true for
+    %% fundrawtransaction, overridable by options.add_inputs).
+    AddInputs = maps:get(<<"add_inputs">>, Options, true),
+    %% 7. Run the shared funding engine.
+    {FundedTx, Fee, ChangePos} =
+        fund_raw_tx(#{existing_inputs => ExistingIns,
+                      existing_outputs => ExistingOuts,
+                      add_inputs => AddInputs,
+                      sffo => SffoIdx,
+                      change_script => ChangeScript,
+                      change_position =>
+                          maps:get(<<"changePosition">>, Options, undefined),
+                      locktime => Tx#transaction.locktime},
+                    Available, FeeRate, ChangeScript, ExistingIns),
+    %% 8. lockUnspents: lock the newly-selected (non-manual) inputs.
+    case maps:get(<<"lockUnspents">>, Options, false) of
+        true ->
+            ManualSet = sets:from_list(ManualKeys),
+            lists:foreach(fun(#tx_in{prev_out = O}) ->
+                Key = {O#outpoint.hash, O#outpoint.index},
+                case sets:is_element(Key, ManualSet) of
+                    true -> ok;
+                    false ->
+                        ok = beamchain_wallet:lock_coin(
+                               Pid, O#outpoint.hash, O#outpoint.index)
+                end
+            end, FundedTx#transaction.inputs);
+        _ -> ok
+    end,
+    %% 9. Serialize the funded tx to hex (witness-aware encoder; an unsigned
+    %% funded tx has no witnesses so this is the non-witness serialization).
+    HexOut = beamchain_serialize:hex_encode(
+               beamchain_serialize:encode_transaction(FundedTx)),
+    Map = #{<<"hex">>       => HexOut,
+            <<"fee">>       => format_amount_sentinel(Fee),
+            <<"changepos">> => ChangePos},
+    {ok_raw_json, replace_btc_sentinels(jsx:encode(Map))}.
+
+decode_raw_tx_for_funding(HexStr) ->
+    Bin = beamchain_serialize:hex_decode(HexStr),
+    {Tx, _Rest} = beamchain_serialize:decode_transaction(Bin),
+    {ok, Tx}.
+
+%% Resolve the change-output script.  Explicit changeAddress wins; otherwise
+%% derive a fresh wallet change address of the requested change_type.  Mirrors
+%% wcfp_append_change's address selection.
+frt_change_script(Pid, Options, Network) ->
+    case maps:get(<<"changeAddress">>, Options, undefined) of
+        Addr when is_binary(Addr) ->
+            case beamchain_address:address_to_script(
+                   binary_to_list(Addr), Network) of
+                {ok, Script} -> Script;
+                _ ->
+                    throw({frt_error, ?RPC_INVALID_ADDRESS_OR_KEY,
+                           <<"Change address must be a valid bitcoin address">>})
+            end;
+        _ ->
+            ChangeType = case maps:get(<<"change_type">>, Options, undefined) of
+                <<"bech32">>      -> p2wpkh;
+                <<"bech32m">>     -> p2tr;
+                <<"legacy">>      -> p2pkh;
+                <<"p2sh-segwit">> -> p2wpkh;
+                _                 -> p2wpkh
+            end,
+            case beamchain_wallet:get_change_address(Pid, ChangeType) of
+                {ok, A} ->
+                    case beamchain_address:address_to_script(A, Network) of
+                        {ok, Script} -> Script;
+                        _ ->
+                            throw({frt_error, ?RPC_MISC_ERROR,
+                                   <<"Failed to derive change address">>})
+                    end;
+                _ ->
+                    throw({frt_error, ?RPC_MISC_ERROR,
+                           <<"Failed to derive change address">>})
+            end
+    end.
+
+%% subtractFeeFromOutputs option → sorted, deduped list of valid output
+%% indices.  Core's InterpretSubtractFeeFromOutputInstructions.
+frt_subtract_fee_outputs(Options, NumOutputs) ->
+    case maps:get(<<"subtractFeeFromOutputs">>, Options,
+                  maps:get(<<"subtract_fee_from_outputs">>, Options, [])) of
+        L when is_list(L) ->
+            Idx = lists:usort([I || I <- L, is_integer(I)]),
+            lists:foreach(fun(I) ->
+                case I >= 0 andalso I < NumOutputs of
+                    true -> ok;
+                    false ->
+                        throw({frt_error, ?RPC_INVALID_PARAMETER,
+                               iolist_to_binary(io_lib:format(
+                                   "subtractFeeFromOutputs index out of bounds: ~B",
+                                   [I]))})
+                end
+            end, Idx),
+            Idx;
+        _ -> []
+    end.
+
+%% @doc fund_raw_tx/5 — the pure funding engine (no live wallet / chainstate).
+%%
+%% Given the decoded tx's existing inputs/outputs (kept verbatim), the
+%% available wallet UTXOs, a fee rate (sat/vB) and a change script, it:
+%%   1. runs the existing coin selector `beamchain_wallet:select_coins/3` over
+%%      `Available` for (sum(outputs) + estimated fee), unless add_inputs=false;
+%%   2. appends at most one change output (at changePosition or the end);
+%%   3. applies subtractFeeFromOutputs if requested;
+%% and returns `{FundedTx, Fee, ChangePos}` with GENUINE values:
+%%   Fee        = sum(selected inputs) - sum(all outputs incl. change)
+%%   ChangePos  = index of the change output, or -1 if none was added.
+%% The invariant sum(inputs) == sum(outputs) + Fee holds by construction.
+%%
+%% This is the function a unit test drives directly with fixture UTXOs.
+fund_raw_tx(Spec, Available, FeeRate, ChangeScript, _ExistingIns)
+        when is_map(Spec) ->
+    ExistingIns  = maps:get(existing_inputs, Spec),
+    ExistingOuts = maps:get(existing_outputs, Spec),
+    AddInputs    = maps:get(add_inputs, Spec, true),
+    Sffo         = maps:get(sffo, Spec, []),
+    ChangePosOpt = maps:get(change_position, Spec, undefined),
+    Locktime     = maps:get(locktime, Spec, 0),
+    OutputTotal  = lists:sum([O#tx_out.value || O <- ExistingOuts]),
+    %% --- coin selection over the wallet UTXO set ---
+    %% select_coins/3 sizes for outputs + per-input + change-output fee and
+    %% returns {Selected, Change} where Change already nets out the estimated
+    %% fee.  This is the exact engine walletcreatefundedpsbt uses.
+    {SelectedTriples, Change} =
+        case AddInputs of
+            true ->
+                case beamchain_wallet:select_coins(OutputTotal, FeeRate,
+                                                    Available) of
+                    {ok, Sel, Chg} -> {Sel, Chg};
+                    {error, insufficient_funds} ->
+                        throw({frt_error, ?RPC_WALLET_ERROR,
+                               <<"Insufficient funds">>})
+                end;
+            false ->
+                throw({frt_error, ?RPC_INVALID_PARAMETER,
+                       <<"add_inputs is false but the transaction has no "
+                         "inputs to fund the outputs">>})
+        end,
+    %% New inputs from coin selection (existing inputs are preserved separately).
+    NewIns = [#tx_in{prev_out = #outpoint{hash = Txid, index = Vout},
+                     script_sig = <<>>,
+                     sequence = 16#fffffffd,
+                     witness = []}
+              || {Txid, Vout, _U} <- SelectedTriples],
+    AllIns = ExistingIns ++ NewIns,
+    InputTotal = lists:sum([U#utxo.value || {_, _, U} <- SelectedTriples]),
+    %% The actual fee is inputs - outputs(incl change); Change from the selector
+    %% is what's left after the outputs + estimated fee, i.e. the change amount.
+    ChangeAmt = Change,
+    %% --- build outputs, applying subtractFeeFromOutputs if requested ---
+    %% Fee = InputTotal - OutputTotal - ChangeAmt (the genuine paid fee).
+    Fee0 = InputTotal - OutputTotal - ChangeAmt,
+    {OutsAfterSffo, Fee} =
+        case Sffo of
+            [] -> {ExistingOuts, Fee0};
+            _  -> apply_sffo(ExistingOuts, Sffo, Fee0)
+        end,
+    %% --- append change output (at most one), honoring changePosition ---
+    DustThreshold = 546,
+    {FinalOuts, ChangePos} =
+        case ChangeAmt > DustThreshold of
+            true ->
+                ChangeOut = #tx_out{value = ChangeAmt,
+                                    script_pubkey = ChangeScript},
+                Pos = case ChangePosOpt of
+                          P when is_integer(P), P >= 0,
+                                 P =< length(OutsAfterSffo) -> P;
+                          _ -> length(OutsAfterSffo)
+                      end,
+                {insert_at(Pos, ChangeOut, OutsAfterSffo), Pos};
+            false ->
+                %% No change output — change (if any) folds into the fee.
+                {OutsAfterSffo, -1}
+        end,
+    %% The genuine paid fee = sum(real inputs) - sum(real outputs incl change).
+    %% (When change folds into the fee, this absorbs the dropped change amount;
+    %% with subtractFeeFromOutputs, Fee was already adjusted above and this
+    %% recomputation yields the same value by construction.)
+    _ = Fee,
+    FinalOutTotal = lists:sum([O#tx_out.value || O <- FinalOuts]),
+    FinalFee = InputTotal - FinalOutTotal,
+    FundedTx = #transaction{version = 2,
+                            inputs = AllIns,
+                            outputs = FinalOuts,
+                            locktime = Locktime},
+    {FundedTx, FinalFee, ChangePos};
+%% Convenience clause used by callers that pass the explicit shape directly.
+fund_raw_tx(ExistingIns, ExistingOuts, Available, FeeRate, ChangeScript) ->
+    fund_raw_tx(#{existing_inputs => ExistingIns,
+                  existing_outputs => ExistingOuts,
+                  add_inputs => true, sffo => [],
+                  change_script => ChangeScript,
+                  change_position => undefined, locktime => 0},
+                Available, FeeRate, ChangeScript, ExistingIns).
+
+%% Distribute Fee equally across the Sffo output indices, reducing each by its
+%% share (last index absorbs the rounding remainder, Core's behaviour).  The
+%% caller pays no extra on top — fee comes out of the recipients.
+apply_sffo(Outputs, SffoIdx, Fee) ->
+    N = length(SffoIdx),
+    Share = Fee div N,
+    Remainder = Fee rem N,
+    %% Index → reduction amount (the last targeted output absorbs the rounding
+    %% remainder, matching Core's CreateTransaction fee-split behaviour).
+    LastIdx = lists:last(SffoIdx),
+    Reductions = maps:from_list(
+        [{I, Share + (if I =:= LastIdx -> Remainder; true -> 0 end)}
+         || I <- SffoIdx]),
+    NewOuts = [ case maps:get(Idx, Reductions, 0) of
+                    0 -> O;
+                    Red ->
+                        NewVal = O#tx_out.value - Red,
+                        case NewVal < 0 of
+                            true ->
+                                throw({frt_error, ?RPC_WALLET_ERROR,
+                                       <<"The fee exceeds the amount of the "
+                                         "subtractFeeFromOutputs output">>});
+                            false -> O#tx_out{value = NewVal}
+                        end
+                end
+                || {O, Idx} <- lists:zip(Outputs,
+                                          lists:seq(0, length(Outputs) - 1)) ],
+    {NewOuts, Fee}.
 
 %% ── W52 decodepsbt JSON shape helpers ──────────────────────────────────────
 %% Reference: bitcoin-core/src/core_io.cpp ScriptToAsmStr / ScriptToUniv /
