@@ -874,6 +874,7 @@ handle_method(<<"signrawtransactionwithwallet">>, P, W) -> rpc_signrawtransactio
 %% signrawtransactionwithkey: NO wallet needed (Core: rawtransaction.cpp).
 handle_method(<<"signrawtransactionwithkey">>, P, _W) -> rpc_signrawtransactionwithkey(P);
 handle_method(<<"importdescriptors">>, P, W) -> rpc_importdescriptors(P, W);
+handle_method(<<"listdescriptors">>, P, W) -> rpc_listdescriptors(P, W);
 handle_method(<<"importprivkey">>, P, W) -> rpc_importprivkey(P, W);
 handle_method(<<"rescanblockchain">>, P, W) -> rpc_rescanblockchain(P, W);
 handle_method(<<"walletcreatefundedpsbt">>, P, W) -> rpc_walletcreatefundedpsbt(P, W);
@@ -1032,6 +1033,7 @@ rpc_help_list() ->
         <<"loadwallet \"name\"">>,
         <<"lockunspent unlock ( [{\"txid\":\"hex\",\"vout\":n},...] persistent )">>,
         <<"importdescriptors \"requests\"">>,
+        <<"listdescriptors ( private )">>,
         <<"importprivkey \"privkey\" ( \"label\" rescan )">>,
         <<"rescanblockchain ( start_height stop_height )">>,
         <<"sendtoaddress \"address\" amount ( \"comment\" )">>,
@@ -10004,6 +10006,181 @@ rpc_importdescriptors([Requests], WalletName) when is_list(Requests) ->
 rpc_importdescriptors(_, _) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"Usage: importdescriptors \"requests\"">>}.
+
+%% @doc listdescriptors ( private ) — list all descriptors present in the
+%% wallet, in Bitcoin Core's shape.
+%% Mirrors bitcoin-core/src/wallet/rpc/backup.cpp:464-572 (listdescriptors).
+%%
+%% Response (private=false default):
+%%   { wallet_name, descriptors: [
+%%       { desc (WITH trailing #checksum), timestamp, active,
+%%         internal (active only),
+%%         range [begin,end] + next + next_index (ranged only) } ] }
+%%   sorted by descriptor string (backup.cpp:541-543).
+%%
+%% beamchain's descriptor store is the set of WATCH-ONLY descriptors
+%% registered via importdescriptors (state.addresses entries carrying a
+%% <<"desc">> field; import_register_scripts/6).  Those imports are never
+%% wired as active address-generating ScriptPubKeyMans, so `active` is
+%% false for every one (Core's active_spk_mans.contains() is likewise
+%% false; Core's importdescriptors default is active=false,
+%% backup.cpp:152).  `internal` is therefore OMITTED for all (Core emits it
+%% only for active descriptors — IsInternalScriptPubKeyMan is
+%% std::optional<bool> with a value only for active managers,
+%% backup.cpp:551-553).
+%%
+%% Ranged descriptors: Core gates `range`/`next`/`next_index` on
+%% is_range (backup.cpp:554-561), NOT on active.  beamchain's importer
+%% EXPANDS a ranged descriptor into one store entry per derived script,
+%% all sharing the same <<"desc">> string and using Core's default
+%% range_start=0 (import_parse_range/1: int N -> [0,N]).  We re-derive
+%% is_range by parsing the stored descriptor body (no fabrication) and,
+%% when ranged, report range=[0, count-1] (count = number of derived
+%% scripts the import persisted, i.e. range_end-1 inclusive,
+%% backup.cpp:557) and next=next_index=range_start=0 (the next index for an
+%% un-driven imported descriptor, backup.cpp:185/559-560).
+%%
+%% private=true: Core throws RPC_WALLET_ERROR (-4) for a watch-only /
+%% private-keys-disabled wallet ("Can't get private descriptor string for
+%% watch-only wallets", backup.cpp:500-502).  beamchain's store only ever
+%% holds the public watch-only form, so we mirror that throw rather than
+%% fabricate an xprv.  A non-boolean `private` param -> -3 (RPC_TYPE_ERROR).
+rpc_listdescriptors(Params, WalletName) ->
+    PrivField = listdescriptors_priv_param(Params),
+    case PrivField of
+        {error, Code, Msg} ->
+            {error, Code, Msg};
+        Priv when is_boolean(Priv) ->
+            case resolve_wallet(WalletName) of
+                {ok, Pid} ->
+                    PrivEnabled = wallet_priv_keys_enabled(Pid),
+                    %% Watch-only wallets cannot produce a private
+                    %% descriptor string (backup.cpp:500-502).
+                    case Priv andalso not PrivEnabled of
+                        true ->
+                            {error, ?RPC_WALLET_ERROR,
+                             <<"Can't get private descriptor string for "
+                               "watch-only wallets">>};
+                        false ->
+                            {ok, listdescriptors_result(Pid)}
+                    end;
+                {error, _} ->
+                    wallet_not_found_error(WalletName)
+            end
+    end.
+
+%% Parse the optional `private` parameter (positional list or named map).
+%% null/absent -> false; non-bool -> Core -3 (RPC_TYPE_ERROR), the type
+%% check Core's request.params[0].get_bool() would raise.
+listdescriptors_priv_param([]) -> false;
+listdescriptors_priv_param([null | _]) -> false;
+listdescriptors_priv_param([B | _]) when is_boolean(B) -> B;
+listdescriptors_priv_param([_ | _]) ->
+    {error, ?RPC_TYPE_ERROR,
+     <<"JSON value of type string is not of expected type bool">>};
+listdescriptors_priv_param(Map) when is_map(Map) ->
+    case maps:get(<<"private">>, Map, null) of
+        null -> false;
+        B when is_boolean(B) -> B;
+        _ ->
+            {error, ?RPC_TYPE_ERROR,
+             <<"JSON value of type string is not of expected type bool">>}
+    end;
+listdescriptors_priv_param(_) -> false.
+
+%% Build the { wallet_name, descriptors } object from the wallet's stored
+%% watch-only descriptor entries.
+listdescriptors_result(Pid) ->
+    WalletName = listdescriptors_wallet_name(Pid),
+    Entries = case beamchain_wallet:list_addresses(Pid) of
+        {ok, Addrs} when is_list(Addrs) -> Addrs;
+        _ -> []
+    end,
+    %% Group entries by their <<"desc">> string (a ranged import produces
+    %% one entry per derived script, all sharing the same descriptor).
+    Grouped = lists:foldl(fun(E, Acc) when is_map(E) ->
+        case maps:get(<<"desc">>, E, undefined) of
+            Desc when is_binary(Desc), Desc =/= <<>> ->
+                {Ts, Cnt} = maps:get(Desc, Acc, {undefined, 0}),
+                Ts1 = case {Ts, maps:get(<<"timestamp">>, E, undefined)} of
+                    {undefined, T} when is_integer(T) -> T;
+                    {undefined, _}                    -> Ts;
+                    %% lowest timestamp across the group (Core stores one
+                    %% creation_time per descriptor; the import wrote the
+                    %% same Ts to every derived entry).
+                    {T0, T} when is_integer(T), T < T0 -> T;
+                    _                                  -> Ts
+                end,
+                maps:put(Desc, {Ts1, Cnt + 1}, Acc);
+            _ ->
+                Acc
+        end;
+       (_, Acc) -> Acc
+    end, #{}, Entries),
+    DescObjs = maps:fold(fun(Desc, {Ts, Cnt}, Acc) ->
+        [listdescriptors_entry(Desc, Ts, Cnt) | Acc]
+    end, [], Grouped),
+    %% Sort by descriptor string (backup.cpp:541-543).
+    Sorted = lists:sort(fun(A, B) ->
+        maps:get(<<"desc">>, A) =< maps:get(<<"desc">>, B)
+    end, DescObjs),
+    #{<<"wallet_name">> => WalletName,
+      <<"descriptors">> => Sorted}.
+
+%% One descriptor object.  Cnt = number of derived scripts the import
+%% persisted for this descriptor string.
+listdescriptors_entry(Desc, Ts, Cnt) ->
+    Timestamp = case Ts of
+        T when is_integer(T) -> T;
+        _                    -> 0
+    end,
+    Base = #{<<"desc">>      => Desc,
+             <<"timestamp">> => Timestamp,
+             %% Watch-only imports are never active SPKMs.
+             <<"active">>    => false},
+    %% Re-derive is_range from the stored descriptor body (no fabrication).
+    case listdescriptors_is_range(Desc) of
+        true ->
+            %% range_end-1 inclusive = (count-1) when range_start=0
+            %% (import default; import_parse_range int N -> [0,N]).
+            RangeEnd = case Cnt > 0 of
+                true  -> Cnt - 1;
+                false -> 0
+            end,
+            Base#{<<"range">>      => [0, RangeEnd],
+                  <<"next">>       => 0,
+                  <<"next_index">> => 0};
+        false ->
+            Base
+    end.
+
+%% Determine whether the stored descriptor is ranged by parsing its body
+%% (checksum stripped).  Any parse failure -> treat as non-ranged (emit
+%% no fabricated range/next fields).
+listdescriptors_is_range(Desc) when is_binary(Desc) ->
+    Body = case binary:split(Desc, <<"#">>) of
+        [B | _] -> B;
+        _       -> Desc
+    end,
+    try beamchain_descriptor:parse(binary_to_list(Body)) of
+        {ok, D}    -> beamchain_descriptor:is_range(D);
+        {error, _} -> false
+    catch
+        _:_ -> false
+    end.
+
+%% Wallet name for the wallet_name field — same lookup chain as
+%% getwalletinfo (empty -> "default").
+listdescriptors_wallet_name(Pid) ->
+    case beamchain_wallet:get_wallet_info(Pid) of
+        {ok, Info} ->
+            case maps:get(wallet_name, Info, <<>>) of
+                <<>> -> <<"default">>;
+                N    -> N
+            end;
+        _ ->
+            <<"default">>
+    end.
 
 %% Per-element error result in Core's shape (backup.cpp:295-296).
 imp_err(Code, Msg) ->
