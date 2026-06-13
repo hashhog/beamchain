@@ -69,6 +69,15 @@
 %% two formerly-stripped fields are present, in Core's pushKV order, with
 %% confirmations = tip_height - coin_height + 1 (0 for mempool coins).
 -export([format_utxo_result/4]).
+%% Test-only exports — ParseHashV txid/blockhash parse-boundary guard
+%% (Core rpc/util.cpp ParseHashV: malformed hash -> -8 at the parse boundary,
+%% well-formed-but-absent -> the handler's -5/null). The eunit suite drives the
+%% guard directly (no live db needed; the throw fires before any lookup) and
+%% confirms each in-scope handler routes a malformed arg to -8 while a
+%% well-formed 64-zero hash still passes the guard (decodes, no -8 throw).
+-export([parse_hash_v/2,
+         rpc_getblock/1, rpc_getblockheader/1, rpc_getrawtransaction/1,
+         rpc_gettxout/1, rpc_getmempoolentry/1]).
 %% Test-only exports — submitpackage helpers (mempool wave 2026-05-06).
 -export([rpc_submitpackage/1, decode_package_tx/1]).
 %% Test-only export — getorphantxs handler (Core v28 RPC-completeness gap).
@@ -1419,7 +1428,17 @@ rpc_getblockhash(_) ->
 rpc_getblock([HashHex]) ->
     rpc_getblock([HashHex, 1]);
 rpc_getblock([HashHex, Verbosity]) when is_binary(HashHex) ->
-    Hash = hex_to_internal_hash(HashHex),
+    %% No `of` clause: the catch must protect the lookup body too (a later
+    %% ParseHashV guard may throw from inside the lookup, e.g. an optional
+    %% blockhash argument on a sibling RPC).
+    try rpc_getblock_lookup(parse_hash_v(HashHex, <<"blockhash">>), Verbosity)
+    catch
+        throw:{rpc_error, Code, Msg} -> {error, Code, Msg}
+    end;
+rpc_getblock(_) ->
+    {error, ?RPC_INVALID_PARAMS, <<"Usage: getblock \"hash\" ( verbosity )">>}.
+
+rpc_getblock_lookup(Hash, Verbosity) ->
     case beamchain_db:get_block(Hash) of
         {ok, Block} ->
             case Verbosity of
@@ -1446,14 +1465,21 @@ rpc_getblock([HashHex, Verbosity]) when is_binary(HashHex) ->
             end;
         not_found ->
             {error, ?RPC_INVALID_ADDRESS_OR_KEY, <<"Block not found">>}
-    end;
-rpc_getblock(_) ->
-    {error, ?RPC_INVALID_PARAMS, <<"Usage: getblock \"hash\" ( verbosity )">>}.
+    end.
 
 rpc_getblockheader([HashHex]) ->
     rpc_getblockheader([HashHex, true]);
 rpc_getblockheader([HashHex, Verbose]) when is_binary(HashHex) ->
-    Hash = hex_to_internal_hash(HashHex),
+    try rpc_getblockheader_lookup(parse_hash_v(HashHex, <<"hash">>),
+                                  HashHex, Verbose)
+    catch
+        throw:{rpc_error, Code, Msg} -> {error, Code, Msg}
+    end;
+rpc_getblockheader(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: getblockheader \"hash\" ( verbose )">>}.
+
+rpc_getblockheader_lookup(Hash, HashHex, Verbose) ->
     case beamchain_db:get_block_index_by_hash(Hash) of
         {ok, #{height := Height, header := Header, chainwork := Chainwork, n_tx := RawNTx}} ->
             case Verbose of
@@ -1538,10 +1564,7 @@ rpc_getblockheader([HashHex, Verbose]) when is_binary(HashHex) ->
             end;
         not_found ->
             {error, ?RPC_INVALID_ADDRESS_OR_KEY, <<"Block not found">>}
-    end;
-rpc_getblockheader(_) ->
-    {error, ?RPC_INVALID_PARAMS,
-     <<"Usage: getblockheader \"hash\" ( verbose )">>}.
+    end.
 
 rpc_getdifficulty() ->
     %% Core rpc/blockchain.cpp:505 returns GetDifficulty(tip) as a bare number,
@@ -2776,7 +2799,19 @@ rpc_getrawtransaction([TxidHex]) ->
 rpc_getrawtransaction([TxidHex, Verbose]) ->
     rpc_getrawtransaction([TxidHex, Verbose, null]);
 rpc_getrawtransaction([TxidHex, Verbose, BlockHashParam]) when is_binary(TxidHex) ->
-    Txid = hex_to_internal_hash(TxidHex),
+    %% No `of` clause: the optional blockhash (param 3) is parsed via ParseHashV
+    %% deeper in the lookup (rpc_getrawtransaction_lookup); its -8 throw must be
+    %% caught here too.
+    try rpc_getrawtransaction_dispatch(
+          parse_hash_v(TxidHex, <<"parameter 1">>), Verbose, BlockHashParam)
+    catch
+        throw:{rpc_error, Code, Msg} -> {error, Code, Msg}
+    end;
+rpc_getrawtransaction(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: getrawtransaction \"txid\" ( verbose \"blockhash\" )">>}.
+
+rpc_getrawtransaction_dispatch(Txid, Verbose, BlockHashParam) ->
     %% Special exception for the genesis block coinbase transaction, mirroring
     %% bitcoin-core/src/rpc/rawtransaction.cpp getrawtransaction():
     %%   if (txid == GenesisBlock().hashMerkleRoot) throw RPC_INVALID_ADDRESS_OR_KEY.
@@ -2789,10 +2824,7 @@ rpc_getrawtransaction([TxidHex, Verbose, BlockHashParam]) when is_binary(TxidHex
                "transaction and cannot be retrieved">>};
         false ->
             rpc_getrawtransaction_lookup(Txid, Verbose, BlockHashParam)
-    end;
-rpc_getrawtransaction(_) ->
-    {error, ?RPC_INVALID_PARAMS,
-     <<"Usage: getrawtransaction \"txid\" ( verbose \"blockhash\" )">>}.
+    end.
 
 %% True when the txid equals the active network's genesis-block merkle root
 %% (i.e. the genesis coinbase txid).  Both are in internal byte order.
@@ -2815,8 +2847,9 @@ rpc_getrawtransaction_lookup(Txid, Verbose, BlockHashParam) ->
             %% No blockhash provided - search mempool then txindex
             find_and_format_tx(Txid, Verbosity, undefined);
         BlockHashHex when is_binary(BlockHashHex) ->
-            %% Blockhash provided - only search that specific block
-            BlockHash = hex_to_internal_hash(BlockHashHex),
+            %% Blockhash provided - only search that specific block. Core names
+            %% this argument "parameter 3" in ParseHashV (rawtransaction.cpp:300).
+            BlockHash = parse_hash_v(BlockHashHex, <<"parameter 3">>),
             case beamchain_db:get_block(BlockHash) of
                 {ok, Block} ->
                     find_tx_in_block_and_format(Txid, Block, BlockHash, Verbosity);
@@ -3638,7 +3671,15 @@ rpc_gettxout([TxidHex, N]) ->
     rpc_gettxout([TxidHex, N, true]);
 rpc_gettxout([TxidHex, N, IncludeMempool]) when is_binary(TxidHex),
                                                   is_integer(N) ->
-    Txid = hex_to_internal_hash(TxidHex),
+    try rpc_gettxout_lookup(parse_hash_v(TxidHex, <<"txid">>), N, IncludeMempool)
+    catch
+        throw:{rpc_error, Code, Msg} -> {error, Code, Msg}
+    end;
+rpc_gettxout(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: gettxout \"txid\" n ( include_mempool )">>}.
+
+rpc_gettxout_lookup(Txid, N, IncludeMempool) ->
     %% Check mempool first if requested
     MempoolResult = case IncludeMempool of
         true ->
@@ -3660,10 +3701,7 @@ rpc_gettxout([TxidHex, N, IncludeMempool]) when is_binary(TxidHex),
                 not_found ->
                     {ok, null}
             end
-    end;
-rpc_gettxout(_) ->
-    {error, ?RPC_INVALID_PARAMS,
-     <<"Usage: gettxout \"txid\" n ( include_mempool )">>}.
+    end.
 
 %% @doc gettxspendingprevout — scan the mempool (and the txospenderindex, if
 %% available) to find transactions spending any of the given outputs.
@@ -4655,14 +4693,18 @@ rpc_getrawmempool(_) ->
     {ok, [hash_to_hex(T) || T <- Txids]}.
 
 rpc_getmempoolentry([TxidHex]) when is_binary(TxidHex) ->
-    Txid = hex_to_internal_hash(TxidHex),
-    case beamchain_mempool:get_entry(Txid) of
-        {ok, Entry} ->
-            Map = format_mempool_entry(Entry),
-            {ok_raw_json, replace_btc_sentinels(jsx:encode(Map))};
-        not_found ->
-            {error, ?RPC_INVALID_ADDRESS_OR_KEY,
-             <<"Transaction not in mempool">>}
+    try parse_hash_v(TxidHex, <<"txid">>) of
+        Txid ->
+            case beamchain_mempool:get_entry(Txid) of
+                {ok, Entry} ->
+                    Map = format_mempool_entry(Entry),
+                    {ok_raw_json, replace_btc_sentinels(jsx:encode(Map))};
+                not_found ->
+                    {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+                     <<"Transaction not in mempool">>}
+            end
+    catch
+        throw:{rpc_error, Code, Msg} -> {error, Code, Msg}
     end;
 rpc_getmempoolentry(_) ->
     {error, ?RPC_INVALID_PARAMS,
@@ -6367,6 +6409,52 @@ hash_to_hex(_) ->
 hex_to_internal_hash(HexStr) ->
     beamchain_serialize:reverse_bytes(
         beamchain_serialize:hex_decode(HexStr)).
+
+%% ParseHashV — validate a txid/blockhash argument exactly like Core's
+%% rpc/util.cpp ParseHashV (line 117). A uint256 hash is a 64-char hex string.
+%% If the argument is NOT a valid 64-char hex string this throws
+%% {rpc_error, RPC_INVALID_PARAMETER (-8), Msg} at the PARSE boundary, BEFORE any
+%% lookup — matching Core's behaviour that a malformed hash is -8 while a
+%% well-formed-but-absent hash is the handler's -5 / null. Message format mirrors
+%% Core strprintf():
+%%   wrong length      -> "<name> must be of length 64 (not N, for '<hex>')"
+%%   right length, bad -> "<name> must be hexadecimal string (not '<hex>')"
+%% Returns the hash in INTERNAL byte order (reversed), same as hex_to_internal_hash.
+parse_hash_v(HexStr, Name) when is_binary(HexStr) ->
+    case byte_size(HexStr) of
+        64 ->
+            case is_hex_string(HexStr) of
+                true ->
+                    hex_to_internal_hash(HexStr);
+                false ->
+                    throw({rpc_error, ?RPC_INVALID_PARAMETER,
+                           <<Name/binary, " must be hexadecimal string (not '",
+                             HexStr/binary, "')">>})
+            end;
+        Len ->
+            throw({rpc_error, ?RPC_INVALID_PARAMETER,
+                   <<Name/binary, " must be of length 64 (not ",
+                     (integer_to_binary(Len))/binary, ", for '",
+                     HexStr/binary, "')">>})
+    end;
+parse_hash_v(_NotBinary, Name) ->
+    %% Non-string JSON value (e.g. a number/object). Core's get_str() throws a
+    %% type error here; ParseHashV then reports a -8 parse failure. Report the
+    %% same -8 with the right-length-style message is not meaningful, so use the
+    %% hexadecimal-string variant against an empty render.
+    throw({rpc_error, ?RPC_INVALID_PARAMETER,
+           <<Name/binary, " must be hexadecimal string (not '')">>}).
+
+%% True iff every byte of Bin is an ASCII hex digit (0-9, a-f, A-F). Mirrors the
+%% character set uint256::FromHex accepts.
+is_hex_string(<<>>) -> true;
+is_hex_string(<<C, Rest/binary>>)
+  when (C >= $0 andalso C =< $9);
+       (C >= $a andalso C =< $f);
+       (C >= $A andalso C =< $F) ->
+    is_hex_string(Rest);
+is_hex_string(_) ->
+    false.
 
 network_name(mainnet)  -> <<"main">>;
 network_name(testnet)  -> <<"test">>;
