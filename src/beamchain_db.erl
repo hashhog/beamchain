@@ -86,6 +86,7 @@
 
 %% Generic metadata and stats
 -export([get_meta/1, put_meta/2, get_db_stats/0]).
+-export([coins_db_cache_bytes/0]).
 
 %% Pruning
 -export([prune_block_files/0, prune_block_files_manual/1,
@@ -120,6 +121,13 @@
 %% Flat file constants
 -define(MAX_BLOCKFILE_SIZE, 134217728).  %% 128 MB
 -define(BLOCK_INDEX_ETS, beamchain_block_index).
+
+%% Coins-DB (on-disk chainstate) block-cache budget. This is the RocksDB
+%% block_cache_size applied to the chaindata DB in init/1 below — the
+%% equivalent of Bitcoin Core's Chainstate::m_coinsdb_cache_size_bytes
+%% (the LevelDB/CCoinsViewDB read cache). 256 MiB. Surfaced read-only via
+%% coins_db_cache_bytes/0 for the getchainstates RPC.
+-define(COINS_DB_CACHE_BYTES, 256 * 1024 * 1024).
 
 %% Block index ETS tables
 -define(HEIGHT_TO_HASH_ETS, beamchain_height_to_hash).
@@ -701,6 +709,12 @@ direct_cf_handle(tx_index) -> persistent_term:get(beamchain_cf_tx_index);
 direct_cf_handle(meta) -> persistent_term:get(beamchain_cf_meta);
 direct_cf_handle(undo) -> persistent_term:get(beamchain_cf_undo).
 
+%% @doc Configured on-disk coins-DB (RocksDB block) cache budget, in bytes.
+%% Mirrors Bitcoin Core's Chainstate::m_coinsdb_cache_size_bytes. Read-only
+%% accessor for the getchainstates RPC — pure, no gen_server hop.
+-spec coins_db_cache_bytes() -> non_neg_integer().
+coins_db_cache_bytes() -> ?COINS_DB_CACHE_BYTES.
+
 %%% ===================================================================
 %%% gen_server callbacks
 %%% ===================================================================
@@ -721,7 +735,7 @@ init([]) ->
         {target_file_size_base, 64 * 1024 * 1024},
         {max_bytes_for_level_base, 256 * 1024 * 1024},
         {block_based_table_options, [
-            {block_cache_size, 256 * 1024 * 1024}  %% 256MB RocksDB block cache
+            {block_cache_size, ?COINS_DB_CACHE_BYTES}  %% 256MB RocksDB block cache
         ]}
     ],
     CFOpts = [],
