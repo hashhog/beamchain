@@ -116,6 +116,15 @@
 %% `handle_method(<<"walletprocesspsbt">>, ...)` calls this same fun.
 -export([rpc_walletprocesspsbt/2, parse_sighash_string/1]).
 
+%% converttopsbt / joinpsbts (W137 BUG-19 closure) — exported
+%% unconditionally so the W137 audit gate
+%% `gate29_joinpsbts_not_implemented_test` (which inspects
+%% `beamchain_rpc:module_info(exports)`) flips to PASS-meaning-present
+%% when the closure lands, and so eunit harnesses can drive the handlers
+%% directly (offline, no node). The dispatcher
+%% `handle_method(<<"converttopsbt"|"joinpsbts">>, ...)` calls these.
+-export([rpc_converttopsbt/1, rpc_joinpsbts/1]).
+
 %% PayJoin RPCs (W119 BUG-1+BUG-2, FIX-66) — exported unconditionally
 %% so the W119 G26/G27 audit gates
 %% (`expect_rpc_method_missing(<<"getpayjoinrequest">>)` and
@@ -880,6 +889,8 @@ handle_method(<<"sendpayjoinrequest">>, P, W) -> rpc_sendpayjoinrequest(P, W);
 
 %% -- PSBT --
 handle_method(<<"createpsbt">>, P, _W) -> rpc_createpsbt(P);
+handle_method(<<"converttopsbt">>, P, _W) -> rpc_converttopsbt(P);
+handle_method(<<"joinpsbts">>, P, _W) -> rpc_joinpsbts(P);
 handle_method(<<"decodepsbt">>, P, _W) -> rpc_decodepsbt(P);
 handle_method(<<"combinepsbt">>, P, _W) -> rpc_combinepsbt(P);
 handle_method(<<"finalizepsbt">>, P, _W) -> rpc_finalizepsbt(P);
@@ -980,11 +991,13 @@ rpc_help_list() ->
         <<"combinepsbt [\"psbt\",...]">>,
         <<"createpsbt [{\"txid\":\"hex\",\"vout\":n},...] [{\"address\":amount},...] ( locktime )">>,
         <<"createrawtransaction [{\"txid\":\"hex\",\"vout\":n},...] [{\"address\":amount},...] ( locktime replaceable )">>,
+        <<"converttopsbt \"hexstring\" ( permitsigdata iswitness )">>,
         <<"decoderawtransaction \"hexstring\"">>,
         <<"decodepsbt \"psbt\"">>,
         <<"decodescript \"hexstring\"">>,
         <<"finalizepsbt \"psbt\" ( extract )">>,
         <<"getrawtransaction \"txid\" ( verbose \"blockhash\" )">>,
+        <<"joinpsbts [\"psbt\",...]">>,
         <<"sendrawtransaction \"hexstring\"">>,
         <<"submitpackage [\"rawtx\",...] ( maxfeerate maxburnamount )">>,
         <<"testmempoolaccept [\"rawtx\"]">>,
@@ -10468,6 +10481,181 @@ rpc_createpsbt([Inputs, Outputs, Locktime]) when is_list(Inputs),
 rpc_createpsbt(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"createpsbt [{\"txid\":\"hex\",\"vout\":n},...] [{\"address\":amount},...] (locktime)">>}.
+
+%% converttopsbt "hexstring" ( permitsigdata iswitness )
+%%
+%% Converts a network-serialized transaction to a (blank) PSBT.
+%% Reference: bitcoin-core/src/rpc/rawtransaction.cpp converttopsbt()
+%% (witness-aware decode via core_io.cpp DecodeTx — the candidate is
+%% accepted ONLY when the whole binary is consumed; on a tie prefer the
+%% witness/extended decode).
+rpc_converttopsbt([Hex]) when is_binary(Hex) ->
+    rpc_converttopsbt([Hex, false]);
+rpc_converttopsbt([Hex, PermitSigData]) when is_binary(Hex) ->
+    %% iswitness omitted -> heuristic (try both serializations).
+    do_converttopsbt(Hex, to_bool(PermitSigData), heuristic);
+rpc_converttopsbt([Hex, PermitSigData, IsWitness]) when is_binary(Hex) ->
+    %% iswitness present -> try ONLY the selected serialization.
+    Which = case to_bool(IsWitness) of
+        true  -> witness_only;
+        false -> no_witness_only
+    end,
+    do_converttopsbt(Hex, to_bool(PermitSigData), Which);
+rpc_converttopsbt(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"converttopsbt \"hexstring\" ( permitsigdata iswitness )">>}.
+
+%% Coerce a JSON-decoded RPC boolean argument. jsx delivers booleans as
+%% the atoms true/false; be lenient about the common stringy/integer
+%% encodings a caller might pass.
+to_bool(true) -> true;
+to_bool(false) -> false;
+to_bool(1) -> true;
+to_bool(0) -> false;
+to_bool(<<"true">>) -> true;
+to_bool(<<"false">>) -> false;
+to_bool(undefined) -> false;
+to_bool(null) -> false;
+to_bool(_) -> true.
+
+do_converttopsbt(Hex, PermitSigData, Which) ->
+    TxResult =
+        try
+            Bin = beamchain_serialize:hex_decode(Hex),
+            decode_tx_with_consumption(Bin, Which)
+        catch
+            _:_ -> error
+        end,
+    case TxResult of
+        error ->
+            %% Core: RPC_DESERIALIZATION_ERROR, "TX decode failed".
+            {error, ?RPC_DESERIALIZATION_ERROR, <<"TX decode failed">>};
+        {ok, Tx} ->
+            %% Remove all scriptSigs/scriptWitnesses from inputs; reject
+            %% any sig data unless permitsigdata is set (Core
+            %% rawtransaction.cpp:1704-1710).
+            Inputs0 = Tx#transaction.inputs,
+            HasSigData = lists:any(fun(#tx_in{script_sig = SS, witness = W}) ->
+                SS =/= <<>> orelse (W =/= [] andalso W =/= undefined)
+            end, Inputs0),
+            case HasSigData andalso (not PermitSigData) of
+                true ->
+                    {error, ?RPC_DESERIALIZATION_ERROR,
+                     <<"Inputs must not have scriptSigs and scriptWitnesses">>};
+                false ->
+                    Cleared = [I#tx_in{script_sig = <<>>, witness = []}
+                               || I <- Inputs0],
+                    BlankTx = Tx#transaction{inputs = Cleared},
+                    case beamchain_psbt:create(BlankTx) of
+                        {ok, Psbt} ->
+                            {ok, base64:encode(beamchain_psbt:encode(Psbt))};
+                        {error, R} ->
+                            {error, ?RPC_DESERIALIZATION_ERROR,
+                             iolist_to_binary(
+                               io_lib:format("TX decode failed ~p", [R]))}
+                    end
+            end
+    end.
+
+%% Decode a raw tx binary, mirroring Core core_io.cpp DecodeTx:
+%%   - witness_only:    try ONLY extended (witness) serialization.
+%%   - no_witness_only: try ONLY legacy (no-witness) serialization.
+%%   - heuristic:       try both; a serialization is a candidate ONLY if
+%%                      it consumes the whole binary; on a tie prefer the
+%%                      witness/extended decode.
+%% Returns {ok, #transaction{}} | error.  The empty-remainder gate is the
+%% W137 trap: an empty-vin tx whose leading 0x00 is mis-read as a segwit
+%% marker leaves trailing bytes and MUST be rejected as a witness decode.
+decode_tx_with_consumption(Bin, witness_only) ->
+    case try_witness_full(Bin) of
+        {ok, _} = Ok -> Ok;
+        error -> error
+    end;
+decode_tx_with_consumption(Bin, no_witness_only) ->
+    case try_legacy_full(Bin) of
+        {ok, _} = Ok -> Ok;
+        error -> error
+    end;
+decode_tx_with_consumption(Bin, heuristic) ->
+    case try_witness_full(Bin) of
+        {ok, _} = Ok ->
+            %% Witness decode consumed everything -> prefer it (Core tie
+            %% returns the extended one).
+            Ok;
+        error ->
+            try_legacy_full(Bin)
+    end.
+
+%% Witness (extended) decode, accepted only on full consumption.
+try_witness_full(Bin) ->
+    try beamchain_serialize:decode_transaction_witness(Bin) of
+        {Tx, <<>>} -> {ok, Tx};
+        {_Tx, _Rest} -> error
+    catch
+        _:_ -> error
+    end.
+
+%% Legacy (no-witness) decode, accepted only on full consumption.
+try_legacy_full(Bin) ->
+    try beamchain_serialize:decode_transaction_no_witness(Bin) of
+        {Tx, <<>>} -> {ok, Tx};
+        {_Tx, _Rest} -> error
+    catch
+        _:_ -> error
+    end.
+
+%% joinpsbts [\"psbt\",...]
+%%
+%% Joins >= 2 distinct PSBTs into one carrying all of their inputs and
+%% outputs. Reference: bitcoin-core/src/rpc/rawtransaction.cpp
+%% joinpsbts() + psbt.cpp PartiallySignedTransaction::AddInput (which
+%% UNCONDITIONALLY clears partial_sigs / final_script_sig /
+%% final_script_witness on every added input, and rejects a duplicate
+%% only when the FULL CTxIn matches — prevout AND scriptSig AND
+%% nSequence).
+rpc_joinpsbts([Psbts]) when is_list(Psbts) ->
+    case length(Psbts) >= 2 of
+        false ->
+            {error, ?RPC_INVALID_PARAMETER,
+             <<"At least two PSBTs are required to join PSBTs.">>};
+        true ->
+            try
+                Decoded = lists:map(fun(B64) ->
+                    PsbtBin = base64:decode(B64),
+                    case beamchain_psbt:decode(PsbtBin) of
+                        {ok, P} -> P;
+                        {error, R} -> throw({join_decode_error, R})
+                    end
+                end, Psbts),
+                %% All #psbt{} record handling lives in beamchain_psbt
+                %% (where the record is in scope); the RPC layer only
+                %% maps the result to JSON-RPC error shapes (Core
+                %% rawtransaction.cpp joinpsbts()).
+                case beamchain_psbt:join(Decoded) of
+                    {ok, Merged} ->
+                        {ok, base64:encode(beamchain_psbt:encode(Merged))};
+                    {error, {duplicate_input, TxidHex, N}} ->
+                        {error, ?RPC_INVALID_PARAMETER,
+                         iolist_to_binary(
+                           io_lib:format("Input ~s:~p exists in multiple PSBTs",
+                                         [TxidHex, N]))};
+                    {error, JoinErr} ->
+                        {error, ?RPC_DESERIALIZATION_ERROR,
+                         iolist_to_binary(
+                           io_lib:format("TX decode failed ~p", [JoinErr]))}
+                end
+            catch
+                throw:{join_decode_error, Reason} ->
+                    {error, ?RPC_DESERIALIZATION_ERROR,
+                     iolist_to_binary(
+                       io_lib:format("TX decode failed ~p", [Reason]))};
+                error:badarg ->
+                    {error, ?RPC_DESERIALIZATION_ERROR,
+                     <<"TX decode failed invalid base64">>}
+            end
+    end;
+rpc_joinpsbts(_) ->
+    {error, ?RPC_INVALID_PARAMS, <<"joinpsbts [\"psbt\",...]">>}.
 
 %% @doc Decode a PSBT and return its structure.
 rpc_decodepsbt([PsbtB64]) when is_binary(PsbtB64) ->
