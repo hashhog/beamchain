@@ -18,7 +18,9 @@
 
 %% Transaction
 -export([encode_transaction/1, encode_transaction/2,
-         decode_transaction/1]).
+         decode_transaction/1,
+         decode_transaction_witness/1,
+         decode_transaction_no_witness/1]).
 
 %% Tx inputs/outputs
 -export([encode_tx_in/1, decode_tx_in/1,
@@ -314,6 +316,25 @@ decode_transaction(<<Version:32/little, Rest/binary>>) ->
             %% legacy format
             decode_transaction_legacy(Version, Rest)
     end.
+
+%% Force-witness decode of a full tx binary (Core TX_WITH_WITNESS).
+%% Unlike decode_transaction/1, the segwit marker+flag (0x00 0x01) is
+%% REQUIRED — a tx without it is not a valid extended (witness)
+%% serialization and raises (caught by callers that gate on this).
+%% Used by converttopsbt's witness-decode branch, which must accept a
+%% candidate ONLY when the whole binary is consumed (Core core_io.cpp
+%% DecodeTx try_witness path).
+-spec decode_transaction_witness(binary()) -> {#transaction{}, binary()}.
+decode_transaction_witness(<<Version:32/little, 16#00:8, 16#01:8, Rest/binary>>) ->
+    decode_transaction_witness(Version, Rest).
+
+%% Force-legacy (no-witness) decode of a full tx binary
+%% (Core TX_NO_WITNESS). The leading 0x00 is always read as the input
+%% count varint, never as a segwit marker. Used by converttopsbt's
+%% legacy-decode branch (Core core_io.cpp DecodeTx try_no_witness path).
+-spec decode_transaction_no_witness(binary()) -> {#transaction{}, binary()}.
+decode_transaction_no_witness(<<Version:32/little, Rest/binary>>) ->
+    decode_transaction_legacy(Version, Rest).
 
 decode_transaction_legacy(Version, Bin) ->
     {Inputs, Rest} = decode_list(Bin, fun decode_tx_in/1),

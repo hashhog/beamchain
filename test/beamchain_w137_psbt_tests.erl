@@ -707,14 +707,24 @@ gate28_walletprocesspsbt_no_sighash_compat_check_test() ->
 
 %%% ===================================================================
 %%% Gate 29 — joinpsbts RPC.
-%%% MISSING: not implemented — BUG-19.
+%%% FIXED: implemented — BUG-19 closed (W137 converttopsbt/joinpsbts wave).
+%%% Core rawtransaction.cpp joinpsbts() + psbt.cpp AddInput. The handler
+%%% `rpc_joinpsbts/1` is exported (mirroring walletprocesspsbt's audit-
+%%% gate export convention) and dispatched by handle_method.
 %%% ===================================================================
 
-gate29_joinpsbts_not_implemented_test() ->
-    %% No rpc_joinpsbts export today.
+gate29_joinpsbts_implemented_test() ->
+    %% FLIPPED (was gate29_joinpsbts_not_implemented_test / AUDIT-FLIP):
+    %% rpc_joinpsbts/1 is now exported. BUG-19 closed.
     Exports = beamchain_rpc:module_info(exports),
-    ?assertNot(lists:member({rpc_joinpsbts, 1}, Exports)),
-    ?assertNot(lists:member({rpc_joinpsbts, 2}, Exports)).
+    ?assert(lists:member({rpc_joinpsbts, 1}, Exports)),
+    %% And the dispatcher routes the method (a bad-arity call returns the
+    %% usage error tuple, proving the clause exists rather than crashing
+    %% with method-not-found).
+    ?assertMatch({error, _, _}, beamchain_rpc:rpc_joinpsbts([])),
+    %% < 2 PSBTs -> RPC_INVALID_PARAMETER (-8), Core parity.
+    ?assertMatch({error, -8, _},
+                 beamchain_rpc:rpc_joinpsbts([[<<"only-one">>]])).
 
 %%% ===================================================================
 %%% Gate 30 — utxoupdatepsbt RPC.
