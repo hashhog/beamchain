@@ -1709,11 +1709,19 @@ make_chainstate_data(TipHash, TipHeight) ->
     Meta = beamchain_chainstate:get_chainstate_meta(),
     Role = maps:get(role, Meta, main),
     SnapHash = maps:get(snapshot_base_hash, Meta, undefined),
+    SnapValidation = maps:get(snapshot_validation, Meta, undefined),
     CoinsTipCacheBytes = maps:get(coins_tip_cache_bytes, Meta, 0),
     CoinsDbCacheBytes = beamchain_db:coins_db_cache_bytes(),
-    %% validated = (m_assumeutxo == VALIDATED). The normal main chainstate is
-    %% always fully validated; a still-unvalidated snapshot chainstate is not.
-    Validated = (Role =/= snapshot),
+    %% validated = (m_assumeutxo == VALIDATED). A normal main chainstate is
+    %% always fully validated. A snapshot chainstate is validated ONLY once
+    %% the REAL background re-derivation (beamchain_bg_validation, a separate
+    %% genesis->base coins store) recomputes the HASH_SERIALIZED commitment
+    %% and it matches au_data. A pending or invalid verdict reports false,
+    %% mirroring Core's `cs.m_assumeutxo == Assumeutxo::VALIDATED`.
+    Validated = case Role of
+        snapshot -> SnapValidation =:= validated;
+        _        -> true
+    end,
     Head = [
         {<<"blocks">>, TipHeight},
         {<<"bestblockhash">>, hash_to_hex(TipHash)},
