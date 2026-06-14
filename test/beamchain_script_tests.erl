@@ -2973,3 +2973,85 @@ w95_sighash_single_in_range_branches_test() ->
     ?assert(beamchain_script:sighash_single_in_range(Tx, 1, 16#02)),
     ?assert(beamchain_script:sighash_single_in_range(Tx, 1, 16#81)),
     ?assert(beamchain_script:sighash_single_in_range(Tx, 1, 16#82)).
+
+%%% -------------------------------------------------------------------
+%%% WITNESS_MALLEATED_P2SH byte-exact scriptSig check
+%%%
+%%% Core interpreter.cpp:2082-2086: for a P2SH-wrapped witness program
+%%% the scriptSig MUST be byte-for-byte equal to the minimal canonical
+%%% push of the redeemScript.  A non-canonical encoding such as
+%%% OP_PUSHDATA1 (0x4c 0x16 <W>) for a 22-byte redeemScript is
+%%% push-only and evaluates identically on the stack, so a
+%%% "push-only" or "stack has one element" check would MISS it.
+%%% MINIMALDATA is policy-only (not in GetBlockScriptFlags), making
+%%% this byte-exact comparison the only consensus guard.
+%%%
+%%% Test vector:
+%%%   redeemScript W = OP_0 <20-byte pubkey-hash>  (P2WPKH, 22 bytes)
+%%%   P2SH scriptPubKey = OP_HASH160 <hash160(W)> OP_EQUAL
+%%%   canonical scriptSig  = 0x16 <W>           (direct push, 22 < 76)
+%%%   malleated scriptSig  = 0x4c 0x16 <W>      (OP_PUSHDATA1 form)
+%%% -------------------------------------------------------------------
+
+%% Helper: build a minimal SigChecker mock that accepts any ECDSA sig.
+%% Used here because P2WPKH eval runs OP_CHECKSIG internally; with no
+%% DERSIG/LOW_S/STRICTENC in the block flags the encoding check is
+%% bypassed, but we still need the sig vector to be non-empty.
+p2sh_p2wpkh_sig_checker() ->
+    #{check_ecdsa_sig => fun(_Sig, _PubKey, _SigHash) -> true end,
+      compute_sighash   => fun(_HashType, _CodeSepPos) -> <<0:256>> end}.
+
+%% Build the shared P2SH-P2WPKH fixture (redeemScript, scriptPubKey,
+%% canonical scriptSig, malleated scriptSig, witness).
+p2sh_p2wpkh_fixture() ->
+    %% A fixed fake compressed pubkey (prefix 0x02, 32 zero bytes).
+    %% We compute its hash160 so that OP_EQUALVERIFY inside the P2WPKH
+    %% eval path matches — no real secp256k1 needed.
+    PubKey     = <<16#02, 0:256>>,  %% 33 bytes, compressed form
+    PubKeyHash = beamchain_crypto:hash160(PubKey),
+
+    %% redeemScript W: OP_0 <20-byte pubkey-hash>  (P2WPKH, 22 bytes)
+    W          = <<16#00, 20, PubKeyHash/binary>>,
+    ScriptHash = beamchain_crypto:hash160(W),
+    %% P2SH scriptPubKey: OP_HASH160 <20-byte> OP_EQUAL
+    ScriptPubKey = <<16#a9, 16#14, ScriptHash/binary, 16#87>>,
+
+    %% Canonical scriptSig: direct-push opcode (22 = 0x16) + W.
+    %% Core: CScript() << vector(W.begin(), W.end()) for 22-byte W.
+    CanonicalSig = <<22, W/binary>>,
+
+    %% Malleated scriptSig: OP_PUSHDATA1 (0x4c) + length-byte (0x16) + W.
+    %% push-only, evaluates to [W] on the stack — identical residual to
+    %% the canonical form — but differs in raw bytes, so Core rejects it.
+    MalleatedSig = <<16#4c, 22, W/binary>>,
+
+    %% P2WPKH witness: [<sig+hashtype>, <compressed-pubkey>].
+    %% Sig body can be anything when DERSIG is not in flags; append
+    %% SIGHASH_ALL (0x01) as the mandatory hash-type byte.
+    FakeSigBody = <<16#30, 6, 2, 1, 1, 2, 1, 1>>,  %% 8-byte fake DER body
+    FakeSig     = <<FakeSigBody/binary, 16#01>>,     %% + SIGHASH_ALL
+    Witness     = [FakeSig, PubKey],
+
+    {ScriptPubKey, CanonicalSig, MalleatedSig, Witness}.
+
+%% A non-canonical (OP_PUSHDATA1) scriptSig for a P2SH-wrapped P2WPKH
+%% output MUST be rejected under block validation flags (P2SH + WITNESS,
+%% no MINIMALDATA).  The residual stack would be identical to the
+%% canonical form, so a stack-only check would MISS this.
+witness_malleated_p2sh_noncanonical_rejected_test() ->
+    {ScriptPubKey, _CanonicalSig, MalleatedSig, Witness} = p2sh_p2wpkh_fixture(),
+    Flags = ?SCRIPT_VERIFY_P2SH bor ?SCRIPT_VERIFY_WITNESS,
+    SigChecker = p2sh_p2wpkh_sig_checker(),
+    ?assertEqual(false,
+        beamchain_script:verify_script(
+            MalleatedSig, ScriptPubKey, Witness, Flags, SigChecker)).
+
+%% The canonical (minimal direct-push) scriptSig for the same output
+%% MUST be accepted with the same block flags.
+witness_malleated_p2sh_canonical_accepted_test() ->
+    {ScriptPubKey, CanonicalSig, _MalleatedSig, Witness} = p2sh_p2wpkh_fixture(),
+    Flags = ?SCRIPT_VERIFY_P2SH bor ?SCRIPT_VERIFY_WITNESS,
+    SigChecker = p2sh_p2wpkh_sig_checker(),
+    ?assertEqual(true,
+        beamchain_script:verify_script(
+            CanonicalSig, ScriptPubKey, Witness, Flags, SigChecker)).
