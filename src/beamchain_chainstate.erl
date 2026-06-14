@@ -164,6 +164,16 @@
     snapshot_base_height :: non_neg_integer() | undefined,
     snapshot_base_hash :: binary() | undefined,
 
+    %% Background-validation verdict for an active AssumeUTXO snapshot.
+    %% Mirrors Core's Chainstate::m_assumeutxo (validation.h Assumeutxo
+    %% enum): undefined = no snapshot loaded; pending = bg re-derivation
+    %% in flight; validated = the separate genesis->base store recomputed
+    %% the HASH_SERIALIZED commitment and it matched au_data; {invalid,
+    %% Computed, Expected} = it did not (never silent). Set by
+    %% beamchain_bg_validation via {set_snapshot_validation, _}.
+    snapshot_validation :: undefined | pending |
+                           validated | {invalid, binary(), binary()},
+
     %% Multi-block atomicity (Pattern D, beamchain
     %% CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md).
     %%
@@ -683,6 +693,7 @@ init_chainstate(Role, SnapshotData) ->
         chainstate_role = Role,
         snapshot_base_height = SnapshotBaseHeight,
         snapshot_base_hash = SnapshotBaseHash,
+        snapshot_validation = undefined,
         reorg_in_progress = false,
         pending_undo_deletes = []
     },
@@ -859,10 +870,26 @@ handle_call(get_snapshot_base_height, _From,
 handle_call(get_chainstate_meta, _From,
             #state{chainstate_role = Role,
                    snapshot_base_hash = SnapHash,
+                   snapshot_base_height = SnapHeight,
+                   snapshot_validation = SnapValidation,
                    max_cache_bytes = MaxCacheBytes} = State) ->
     {reply, #{role => Role,
               snapshot_base_hash => SnapHash,
+              snapshot_base_height => SnapHeight,
+              snapshot_validation => SnapValidation,
               coins_tip_cache_bytes => MaxCacheBytes}, State};
+
+%% Record the background-validation verdict for the active snapshot.
+%% Mirrors the m_assumeutxo state transition in Core
+%% MaybeCompleteSnapshotValidation (validation.cpp:6072/6010).
+handle_call({set_snapshot_validation, Result}, _From, State) ->
+    Verdict = case Result of
+        {validated, _Hash}          -> validated;
+        {invalid, Computed, Expected} -> {invalid, Computed, Expected};
+        {error, _Reason}            -> State#state.snapshot_validation;
+        Other                       -> Other
+    end,
+    {reply, ok, State#state{snapshot_validation = Verdict}};
 
 handle_call(get_tip_height, _From, #state{tip_height = Height} = State) ->
     {reply, {ok, Height}, State};
@@ -2497,20 +2524,28 @@ do_load_snapshot_parse(Path, State, Network, NetworkMagic, BaseHash, BaseHeight)
                     %% Populate the UTXO cache
                     populate_utxo_cache_from_snapshot(Coins),
 
-                    %% Update state
+                    %% Update state. The snapshot chainstate is now active
+                    %% but UNVALIDATED (Core Assumeutxo::UNVALIDATED) until
+                    %% the background re-derivation completes.
                     State2 = State#state{
                         tip_hash = BaseHash,
                         tip_height = BaseHeight,
                         chainstate_role = snapshot,
                         snapshot_base_height = BaseHeight,
-                        snapshot_base_hash = BaseHash
+                        snapshot_base_hash = BaseHash,
+                        snapshot_validation = pending
                     },
 
                     %% Update ETS chain meta
                     ets:insert(?CHAIN_META, {tip, BaseHash, BaseHeight}),
 
-                    %% Start background validation
-                    spawn(fun() -> start_background_validation() end),
+                    %% Stage 2: start the REAL background validation — a
+                    %% separate genesis->base coins store whose recomputed
+                    %% HASH_SERIALIZED is compared to au_data
+                    %% (beamchain_bg_validation). The load gate above only
+                    %% authenticated the file against its own claimed hash;
+                    %% this re-derivation is the non-circular check.
+                    spawn(fun() -> start_background_validation(BaseHeight) end),
 
                     {ok, State2, BaseHeight};
                 {error, BinMsg} when is_binary(BinMsg) ->
@@ -2606,22 +2641,43 @@ do_scan_utxos(ScriptSet) ->
         end,
     CacheMatches ++ DiskMatches.
 
-%% Start background validation chainstate
-start_background_validation() ->
-    %% Wait a bit for the main chainstate to be fully initialized
+%% @doc Run the REAL AssumeUTXO background validation for a loaded
+%% snapshot at BaseHeight. This rebuilds the UTXO set from genesis to the
+%% base in a SEPARATE coins store (beamchain_bg_validation, with its own
+%% private ETS table + aliasing guard), recomputes the HASH_SERIALIZED
+%% commitment, and compares it to the hard-coded au_data hash_serialized.
+%% The verdict (validated | {invalid, _, _} | {error, _}) is reported back
+%% to the chainstate gen_server so getchainstates surfaces it.
+%%
+%% Mirrors Core ChainstateManager::MaybeCompleteSnapshotValidation
+%% (validation.cpp:5967) running over the background chainstate's OWN coins
+%% db (validation.cpp:6020 validated_cs.CoinsDB()).
+start_background_validation(BaseHeight) ->
+    %% Wait briefly for the main chainstate to be fully initialized.
     timer:sleep(1000),
-
-    %% Start the background chainstate via supervisor
-    case beamchain_chainstate_sup:start_background_chainstate() of
-        {ok, _Pid} ->
-            logger:info("chainstate: started background validation"),
+    Network = beamchain_config:network(),
+    logger:info("chainstate: starting REAL background validation "
+                "(genesis->~B re-derivation in a separate store)",
+                [BaseHeight]),
+    Result = beamchain_bg_validation:run(Network, BaseHeight),
+    %% Report the verdict to the snapshot chainstate gen_server. Core
+    %% never leaves this silent: a mismatch is a fatal, observable event.
+    catch gen_server:call(?SERVER, {set_snapshot_validation, Result}, 60000),
+    case Result of
+        {validated, _Hash} ->
+            logger:info("chainstate: background validation VALIDATED "
+                        "snapshot at height ~B", [BaseHeight]),
             ok;
-        {error, {already_started, _}} ->
-            logger:info("chainstate: background validation already running"),
-            ok;
+        {invalid, Computed, Expected} ->
+            logger:error("chainstate: background validation found the "
+                         "snapshot INVALID at height ~B "
+                         "(computed=~p expected=~p) — the active chain is "
+                         "built on an unvalidated snapshot",
+                         [BaseHeight, Computed, Expected]),
+            {error, {snapshot_invalid, BaseHeight}};
         {error, Reason} ->
-            logger:warning("chainstate: failed to start background validation: ~p",
-                           [Reason]),
+            logger:warning("chainstate: background validation could not "
+                           "complete for height ~B: ~p", [BaseHeight, Reason]),
             {error, Reason}
     end.
 

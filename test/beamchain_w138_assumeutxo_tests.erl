@@ -616,24 +616,37 @@ gate21_services_downgrade_helper_missing_test() ->
     ?assertNot(lists:member({add_local_services, 1}, PMExports)).
 
 %%% ===================================================================
-%%% Gate 22 — m_assumeutxo Assumeutxo enum state machine (MISSING, BUG-6).
+%%% Gate 22 — m_assumeutxo Assumeutxo enum state machine (FIXED).
 %%% Core: validation.h:630 — Assumeutxo UNVALIDATED/VALIDATED/INVALID enum.
 %%% Transitions:
 %%%   validation.cpp:6072 — UNVALIDATED -> VALIDATED on background catch-up.
 %%%   validation.cpp:6010 — UNVALIDATED -> INVALID on hash mismatch.
-%%% beamchain: chainstate_role atom (main | snapshot | background) set
-%%% once at init, never transitions on background completion.
+%%%
+%%% FLIPPED (was "MISSING, BUG-6"): the snapshot validation state machine is
+%%% now real. #state carries a `snapshot_validation` field (undefined |
+%%% pending | validated | {invalid, Computed, Expected}); a loaded snapshot
+%%% sets it to `pending`, and the REAL background re-derivation
+%%% (beamchain_bg_validation, a SEPARATE genesis->base coins store)
+%%% transitions it to `validated` or `{invalid, _, _}` via the
+%%% {set_snapshot_validation, _} handle_call. It is surfaced through
+%%% get_chainstate_meta -> getchainstates `validated`. This is the
+%%% Assumeutxo UNVALIDATED->VALIDATED/INVALID transition.
 %%% ===================================================================
 
-gate22_assumeutxo_state_machine_missing_test() ->
-    %% No setter for transitioning role at runtime. The role is
-    %% read by is_snapshot_chainstate/0 and get_snapshot_base_height/0
-    %% but never mutated by any handle_call clause.
-    %% Forward-regression: when BUG-6 is fixed, there should be a
-    %% `mark_snapshot_validated/0` handle_call or similar.
-    Exports = beamchain_chainstate:module_info(exports),
-    ?assertNot(lists:member({mark_snapshot_validated, 0}, Exports)),
-    ?assertNot(lists:member({mark_snapshot_invalid, 0}, Exports)).
+gate22_assumeutxo_state_machine_present_test() ->
+    %% The chainstate now exposes its meta (incl. snapshot_validation) via
+    %% get_chainstate_meta/0, and accepts the verdict via the
+    %% {set_snapshot_validation, _} handle_call. The runtime transition is
+    %% driven by beamchain_bg_validation, whose verdict shape is
+    %% validated | {invalid, _, _} | {error, _}.
+    CSExports = beamchain_chainstate:module_info(exports),
+    ?assert(lists:member({get_chainstate_meta, 0}, CSExports)),
+    BgExports = beamchain_bg_validation:module_info(exports),
+    %% The separate-store re-derivation + aliasing guard are exported and
+    %% callable (the engine that produces the VALIDATED/INVALID verdict).
+    ?assert(lists:member({run, 3}, BgExports)),
+    ?assert(lists:member({assert_separate_store, 1}, BgExports)),
+    ?assert(lists:member({recompute_hash_serialized, 1}, BgExports)).
 
 %%% ===================================================================
 %%% Gate 23 — dumptxoutset path-already-exists refusal (PRESENT).
@@ -797,20 +810,21 @@ gate28_loadtxoutset_hex_byte_order_internal_test() ->
     ?assertNotEqual(Internal, Reversed).
 
 %%% ===================================================================
-%%% Gate 29 — getchainstates RPC (MISSING, BUG-5).
+%%% Gate 29 — getchainstates RPC (FIXED).
 %%% Core: rpc/blockchain.cpp:3462-3522.
-%%% beamchain: no handler at beamchain_rpc.erl:767-770 (dispatch
-%%% table for snapshot RPCs only includes loadtxoutset + dumptxoutset).
+%%%
+%%% FLIPPED (was "MISSING, BUG-5"): the getchainstates handler is now
+%%% wired. handle_method(<<"getchainstates">>, ...) dispatches to
+%%% rpc_getchainstates/0 (exported for EUnit), which builds the
+%%% chainstates array. The per-chainstate `validated` flag now reflects
+%%% the REAL AssumeUTXO background-validation verdict (snapshot_validation
+%%% == validated) rather than the role atom alone, and snapshot_blockhash
+%%% is emitted for a from-snapshot chainstate.
 %%% ===================================================================
 
-gate29_getchainstates_handler_absent_test() ->
-    %% handle_method/3 is not exported; we audit by checking that no
-    %% rpc_getchainstates helper is exported. Forward-regression:
-    %% when BUG-5 is fixed, a `rpc_getchainstates/1` (and the matching
-    %% handle_method clause) will be added.
+gate29_getchainstates_handler_present_test() ->
     Exports = beamchain_rpc:module_info(exports),
-    ?assertNot(lists:member({rpc_getchainstates, 0}, Exports)),
-    ?assertNot(lists:member({rpc_getchainstates, 1}, Exports)).
+    ?assert(lists:member({rpc_getchainstates, 0}, Exports)).
 
 %%% ===================================================================
 %%% Gate 30 — getblockchaininfo verificationprogress accounts for

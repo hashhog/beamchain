@@ -9,6 +9,8 @@
 -export([get_last_checkpoint/2, get_checkpoint/2]).
 -export([get_assumeutxo/2, get_assumeutxo_by_hash/2,
          list_assumeutxo_heights/1]).
+-export([register_regtest_assumeutxo/4, register_regtest_assumeutxo/2,
+         clear_regtest_assumeutxo/0, regtest_assumeutxo_registry/0]).
 
 %% @doc Returns comprehensive chain parameters for the given network.
 -spec params(mainnet | testnet | testnet4 | regtest | signet) -> map().
@@ -449,7 +451,7 @@ get_checkpoint(Height, Network) ->
     {ok, #{block_hash => binary(), utxo_hash => binary(),
            chain_tx_count => non_neg_integer()}} | not_found.
 get_assumeutxo(Height, Network) ->
-    #{assumeutxo := AssumeUtxo} = params(Network),
+    AssumeUtxo = effective_assumeutxo(Network),
     case maps:find(Height, AssumeUtxo) of
         {ok, Data} -> {ok, Data};
         error -> not_found
@@ -464,7 +466,7 @@ get_assumeutxo(Height, Network) ->
                                chain_tx_count => non_neg_integer()}} |
     not_found.
 get_assumeutxo_by_hash(BlockHash, Network) ->
-    #{assumeutxo := AssumeUtxo} = params(Network),
+    AssumeUtxo = effective_assumeutxo(Network),
     %% Search through all entries for matching block hash
     Result = maps:fold(fun(Height, #{block_hash := Hash} = Data, Acc) ->
         case Hash =:= BlockHash of
@@ -484,8 +486,82 @@ get_assumeutxo_by_hash(BlockHash, Network) ->
 %% latest snapshot ≤ tip.
 -spec list_assumeutxo_heights(atom()) -> [non_neg_integer()].
 list_assumeutxo_heights(Network) ->
-    #{assumeutxo := AssumeUtxo} = params(Network),
+    AssumeUtxo = effective_assumeutxo(Network),
     lists:sort(maps:keys(AssumeUtxo)).
+
+%%% -------------------------------------------------------------------
+%%% Runtime-registerable regtest AssumeUTXO whitelist.
+%%%
+%%% mainnet / testnet4 m_assumeutxo_data are hard-coded and UNTOUCHED by
+%%% this registry (effective_assumeutxo/1 only consults it for regtest).
+%%% Regtest snapshots have no canonical published base hash / commitment,
+%%% so an operator (or a test) registers the {height, block_hash,
+%%% utxo_hash, chain_tx_count} entry at runtime. Stored in a process-wide
+%%% ETS table keyed by height. Mirrors how Core lets the regtest chain
+%%% carry an m_assumeutxo_data that is populated for the test at hand.
+%%% -------------------------------------------------------------------
+
+-define(REGTEST_AU_TABLE, beamchain_regtest_assumeutxo).
+
+%% @doc Register (or overwrite) a regtest AssumeUTXO entry at `Height`.
+-spec register_regtest_assumeutxo(non_neg_integer(), binary(), binary(),
+                                  non_neg_integer()) -> ok.
+register_regtest_assumeutxo(Height, BlockHash, UtxoHash, ChainTxCount)
+        when is_integer(Height), Height >= 0,
+             is_binary(BlockHash), byte_size(BlockHash) =:= 32,
+             is_binary(UtxoHash), byte_size(UtxoHash) =:= 32,
+             is_integer(ChainTxCount), ChainTxCount >= 0 ->
+    ensure_regtest_au_table(),
+    ets:insert(?REGTEST_AU_TABLE,
+               {Height, #{block_hash => BlockHash,
+                          utxo_hash => UtxoHash,
+                          chain_tx_count => ChainTxCount}}),
+    ok.
+
+%% @doc Register a regtest AssumeUTXO entry from a data map.
+-spec register_regtest_assumeutxo(non_neg_integer(), map()) -> ok.
+register_regtest_assumeutxo(Height, #{block_hash := BH, utxo_hash := UH} = Data) ->
+    register_regtest_assumeutxo(Height, BH, UH,
+                                maps:get(chain_tx_count, Data, Height)).
+
+%% @doc Remove all runtime regtest AssumeUTXO registrations.
+-spec clear_regtest_assumeutxo() -> ok.
+clear_regtest_assumeutxo() ->
+    case ets:whereis(?REGTEST_AU_TABLE) of
+        undefined -> ok;
+        _ -> ets:delete_all_objects(?REGTEST_AU_TABLE), ok
+    end.
+
+%% @doc Snapshot of the current regtest registry as a height-keyed map.
+-spec regtest_assumeutxo_registry() -> map().
+regtest_assumeutxo_registry() ->
+    case ets:whereis(?REGTEST_AU_TABLE) of
+        undefined -> #{};
+        _ -> maps:from_list(ets:tab2list(?REGTEST_AU_TABLE))
+    end.
+
+ensure_regtest_au_table() ->
+    case ets:whereis(?REGTEST_AU_TABLE) of
+        undefined ->
+            %% public + named so any process can register/read; heir-less
+            %% (lives as long as the creating process). Guarded against the
+            %% race where two callers create concurrently.
+            try ets:new(?REGTEST_AU_TABLE,
+                        [set, public, named_table, {keypos, 1}])
+            catch error:badarg -> ?REGTEST_AU_TABLE end;
+        _ ->
+            ?REGTEST_AU_TABLE
+    end.
+
+%% Effective AssumeUTXO map for a network: hard-coded chainparams for
+%% mainnet/testnet4 (UNTOUCHED), overlaid with the runtime registry for
+%% regtest only. Registry entries take precedence on key collision.
+effective_assumeutxo(regtest) ->
+    #{assumeutxo := Base} = params(regtest),
+    maps:merge(Base, regtest_assumeutxo_registry());
+effective_assumeutxo(Network) ->
+    #{assumeutxo := AssumeUtxo} = params(Network),
+    AssumeUtxo.
 
 %%% -------------------------------------------------------------------
 %%% assumeUTXO snapshot parameters

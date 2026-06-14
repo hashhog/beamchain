@@ -42,19 +42,17 @@ start_snapshot_chainstate(SnapshotData) ->
     },
     supervisor:start_child(?SERVER, ChildSpec).
 
-%% @doc Start the background chainstate for historical validation.
-%% This chainstate validates from genesis to the snapshot height.
--spec start_background_chainstate() -> {ok, pid()} | {error, term()}.
+%% @doc DEPRECATED. The historical (genesis->base) re-derivation no longer
+%% runs as a `beamchain_chainstate` gen_server: that design registered
+%% under the same name and reused the active chainstate's UTXO ETS tables
+%% (a hash-of-self). The real background validation now lives in
+%% beamchain_bg_validation, which owns a SEPARATE private coins store with
+%% an aliasing guard (see beamchain_chainstate:start_background_validation/1).
+%% Kept exported for API stability; it is a no-op and MUST NOT be used to
+%% spin up a coins-aliasing chainstate.
+-spec start_background_chainstate() -> {error, term()}.
 start_background_chainstate() ->
-    ChildSpec = #{
-        id => beamchain_chainstate_background,
-        start => {beamchain_chainstate, start_link, [background]},
-        restart => transient,
-        shutdown => 30000,
-        type => worker,
-        modules => [beamchain_chainstate]
-    },
-    supervisor:start_child(?SERVER, ChildSpec).
+    {error, deprecated_use_beamchain_bg_validation}.
 
 %% @doc Stop the background validation chainstate.
 %% Called when background validation completes or is no longer needed.
@@ -87,27 +85,28 @@ get_active_chainstate() ->
 get_background_chainstate() ->
     get_child_pid(beamchain_chainstate_background).
 
-%% @doc Merge snapshot and background chainstates after validation.
-%% Called when background chainstate reaches the snapshot height
-%% and its UTXO hash matches the expected value.
+%% @doc Complete background validation for the active snapshot. Mirrors
+%% Core MaybeCompleteSnapshotValidation (validation.cpp:5967): at the
+%% snapshot base, the SEPARATE background coins store's HASH_SERIALIZED is
+%% compared to au_data. On match the background chainstate is retired.
+%%
+%% This now delegates to the REAL engine (beamchain_bg_validation), which
+%% re-derives genesis->base in its own private coins store and compares the
+%% recomputed commitment to au_data.hash_serialized. The previous
+%% implementation hashed a background "chainstate" that aliased the active
+%% UTXO ETS tables (a hash-of-self) and never actually replayed any block;
+%% that path is gone.
 -spec merge_chainstates() -> ok | {error, term()}.
 merge_chainstates() ->
-    case get_background_chainstate() of
-        undefined ->
-            {error, no_background_chainstate};
-        _BgPid ->
-            %% Verify the background chainstate has caught up
-            %% and its UTXO hash matches
-            case verify_background_complete() of
-                ok ->
-                    %% Stop the background chainstate
-                    ok = stop_background_chainstate(),
-                    logger:info("chainstate_sup: background validation complete, "
-                                "merged chainstates"),
-                    ok;
-                {error, Reason} ->
-                    {error, Reason}
-            end
+    case verify_background_complete() of
+        ok ->
+            %% Retire the (now-validated) background chainstate, if any.
+            _ = stop_background_chainstate(),
+            logger:info("chainstate_sup: background validation complete, "
+                        "snapshot VALIDATED"),
+            ok;
+        {error, Reason} ->
+            {error, Reason}
     end.
 
 %%% ===================================================================
@@ -152,28 +151,22 @@ get_child_pid(ChildId) ->
             undefined
     end.
 
+%% Run the REAL background validation for the active snapshot height and
+%% return ok on a HASH_SERIALIZED match, {error, _} otherwise. The
+%% re-derivation happens in beamchain_bg_validation's SEPARATE store (with
+%% its aliasing guard), so this is never a hash-of-self.
 verify_background_complete() ->
-    %% Get the snapshot parameters
     Network = beamchain_config:network(),
-
-    %% Get background chainstate tip
-    BgPid = get_background_chainstate(),
-    case gen_server:call(BgPid, get_tip_height) of
-        {ok, BgHeight} ->
-            %% Check if we have snapshot parameters for this height
-            case beamchain_chain_params:get_assumeutxo(BgHeight, Network) of
-                {ok, #{utxo_hash := ExpectedHash}} ->
-                    %% Compute UTXO hash from background chainstate
-                    ComputedHash = gen_server:call(BgPid, compute_utxo_hash, 300000),
-                    case ComputedHash =:= ExpectedHash of
-                        true ->
-                            ok;
-                        false ->
-                            {error, {utxo_hash_mismatch, BgHeight}}
-                    end;
-                not_found ->
-                    {error, {no_snapshot_at_height, BgHeight}}
+    case beamchain_chainstate:get_snapshot_base_height() of
+        {ok, BaseHeight} ->
+            case beamchain_bg_validation:run(Network, BaseHeight) of
+                {validated, _Hash} ->
+                    ok;
+                {invalid, Computed, Expected} ->
+                    {error, {utxo_hash_mismatch, BaseHeight, Computed, Expected}};
+                {error, Reason} ->
+                    {error, Reason}
             end;
-        {error, Reason} ->
-            {error, Reason}
+        not_snapshot ->
+            {error, no_active_snapshot}
     end.
