@@ -352,6 +352,17 @@ decode_transaction_witness(Version, Bin) ->
     {Inputs, Rest} = decode_list(Bin, fun decode_tx_in/1),
     {Outputs, Rest2} = decode_list(Rest, fun decode_tx_out/1),
     {InputsWithWitness, Rest3} = decode_witness_data(Inputs, Rest2),
+    %% BIP144 / Core primitives/transaction.h:228-231: it is illegal to
+    %% encode a witness section when all witness stacks are empty.  Core
+    %% throws std::ios_base::failure("Superfluous witness record") in that
+    %% case; we mirror it with an equivalent Erlang error so callers
+    %% (P2P tx handler, block decoder) reject such transactions at parse
+    %% time, preventing the consensus split where beamchain would accept
+    %% the extended encoding while Core rejects it.
+    case lists:any(fun(#tx_in{witness = W}) -> W =/= [] end, InputsWithWitness) of
+        false -> error(superfluous_witness_record);
+        true  -> ok
+    end,
     <<Locktime:32/little, Rest4/binary>> = Rest3,
     Tx = #transaction{
         version = Version,
