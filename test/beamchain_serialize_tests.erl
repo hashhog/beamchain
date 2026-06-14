@@ -488,3 +488,29 @@ varint_boundary_exact_test() ->
     %% 2^32-1 -> 5 bytes, 2^32 -> 9 bytes
     ?assertEqual(5, byte_size(beamchain_serialize:encode_varint(4294967295))),
     ?assertEqual(9, byte_size(beamchain_serialize:encode_varint(4294967296))).
+
+%%% ===================================================================
+%%% Superfluous witness record rejection (BIP144 / Core consensus)
+%%% ===================================================================
+
+%% @doc A 63-byte tx with the segwit marker+flag (0x00 0x01) set but
+%% ALL witness stacks empty.  Bitcoin Core throws
+%% std::ios_base::failure("Superfluous witness record") at
+%% primitives/transaction.h:228-231; we must do the same so both nodes
+%% reject the tx at deserialize time and compute the same validation
+%% outcome.  This test FAILS before the fix (decode succeeds) and PASSES
+%% after it (error/1 fires superfluous_witness_record).
+superfluous_witness_record_test() ->
+    %% Segwit-encoded tx: version=1, marker=0x00, flag=0x01,
+    %% 1 input (all-zeros outpoint, empty scriptSig, 0xFFFFFFFF sequence),
+    %% 1 output (50 BTC, empty scriptPubKey),
+    %% witness section: 1 stack with 0 items (empty),
+    %% locktime=0.
+    %% The extended encoding is syntactically valid but semantically
+    %% illegal: no input carries actual witness data.
+    TxHex = "0100000000010100000000000000000000000000000000000000"
+            "000000000000000000000000000000000000ffffffff"
+            "0100f2052a01000000000000000000",
+    TxBin = beamchain_serialize:hex_decode(TxHex),
+    ?assertError(superfluous_witness_record,
+                 beamchain_serialize:decode_transaction(TxBin)).
