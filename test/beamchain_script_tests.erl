@@ -3055,3 +3055,84 @@ witness_malleated_p2sh_canonical_accepted_test() ->
     ?assertEqual(true,
         beamchain_script:verify_script(
             CanonicalSig, ScriptPubKey, Witness, Flags, SigChecker)).
+
+%%% -------------------------------------------------------------------
+%%% 6A: Taproot script-path control-block parity-bit check
+%%%
+%%% BIP-341 / Core ref: pubkey.cpp:257-263 (CheckTapTweak), and
+%%% interpreter.cpp:1914 (VerifyTaprootCommitment passes control[0]&1).
+%%%
+%%% The tweaked output point Q = P + hash*G has a definite y-parity.
+%%% control[0]&1 encodes that parity; CheckTapTweak checks BOTH the
+%%% x-coordinate match AND the parity.  Pre-fix beamchain bound the
+%%% parity to _Parity and never compared it — a CB with the low bit of
+%%% byte-0 flipped was silently accepted (consensus split).
+%%%
+%%% Non-vacuous construction:
+%%%   1. Derive the real OutputKey (and its Parity) from InternalKey via
+%%%      xonly_pubkey_tweak_add so the x-coordinate matches.
+%%%   2. Build ControlBlock with LeafVerByte = 0xC0 | Parity (correct).
+%%%   3. Verify the script-path spend SUCCEEDS (correct-parity case).
+%%%   4. Flip the low bit: LeafVerByte' = LeafVerByte xor 1.
+%%%   5. Verify the same spend FAILS with taproot_commitment_mismatch
+%%%      (wrong-parity case).
+%%% The SigChecker is a plain map (#{}); because the leaf script is
+%%% OP_1 (always true, no sigs needed) the map form is sufficient and
+%%% the schnorr path is never reached — making the accept/reject
+%%% distinction purely the parity check.
+%%% -------------------------------------------------------------------
+
+%% Helper: build a minimal P2TR script-path witness and output key for
+%% the script OP_1, with InternalKey = <<1:256>>.
+%% Returns {OutputKey, CorrectCB, FlippedCB} or skips if the key is
+%% not on the curve.
+taproot_parity_fixture() ->
+    Script      = <<16#51>>,              %% OP_1 — always succeeds
+    InternalKey = <<1:256>>,             %% arbitrary valid-ish xonly key
+    %% Leaf hash for this script at version 0xC0.
+    LeafHash  = beamchain_crypto:tagged_hash(
+                  <<"TapLeaf">>,
+                  <<16#c0, 1, 16#51>>),  %% leaf_ver || compact_size(1) || script
+    TweakHash = beamchain_crypto:tagged_hash(
+                  <<"TapTweak">>,
+                  <<InternalKey/binary, LeafHash/binary>>),
+    case beamchain_crypto:xonly_pubkey_tweak_add(InternalKey, TweakHash) of
+        {ok, OutputKey, Parity} ->
+            %% Correct control block: leaf version with parity bit set.
+            CorrectCB = <<(16#c0 bor Parity), InternalKey/binary>>,
+            %% Flipped control block: low bit of byte-0 inverted.
+            FlippedCB = <<(16#c0 bor (Parity bxor 1)), InternalKey/binary>>,
+            {ok, OutputKey, Script, CorrectCB, FlippedCB};
+        {error, _} ->
+            skip
+    end.
+
+%% Correct-parity control block: spend succeeds (reaches OP_1 eval).
+%% Witness is [Script, ControlBlock] with no script args so the initial
+%% stack is empty; OP_1 leaves exactly <<1>> — clean-stack satisfied.
+fix6a_taproot_correct_parity_accepted_test() ->
+    case taproot_parity_fixture() of
+        skip ->
+            ok;  %% curve reject on the test key; can't test
+        {ok, OutputKey, Script, CorrectCB, _FlippedCB} ->
+            Witness = [Script, CorrectCB],
+            Result  = beamchain_script:verify_taproot(
+                        OutputKey, Witness, ?SCRIPT_VERIFY_TAPROOT, #{}),
+            %% OP_1 leaves <<1>> on the stack (unexported script_true() = <<1>>).
+            ?assertMatch({ok, [<<1>>]}, Result)
+    end.
+
+%% Flipped-parity control block: spend MUST be rejected even though
+%% the x-coordinate of the tweaked key matches.
+%% Pre-fix: would return {ok, _} (false-accept) because _Parity was ignored.
+%% Post-fix: returns {error, taproot_commitment_mismatch}.
+fix6a_taproot_flipped_parity_rejected_test() ->
+    case taproot_parity_fixture() of
+        skip ->
+            ok;
+        {ok, OutputKey, Script, _CorrectCB, FlippedCB} ->
+            Witness = [Script, FlippedCB],
+            Result  = beamchain_script:verify_taproot(
+                        OutputKey, Witness, ?SCRIPT_VERIFY_TAPROOT, #{}),
+            ?assertEqual({error, taproot_commitment_mismatch}, Result)
+    end.

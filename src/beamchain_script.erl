@@ -2905,10 +2905,17 @@ verify_taproot_script_path(OutputKey, Script, ControlBlock,
             TweakHash = beamchain_crypto:tagged_hash(
                 <<"TapTweak">>,
                 <<InternalKey/binary, MerkleRoot/binary>>),
-            %% Verify tweaked key matches output key
+            %% Verify tweaked key matches output key AND that the tweaked
+            %% point's y-parity matches control[0]&1.
+            %% Core ref: pubkey.cpp:257-263 XOnlyPubKey::CheckTapTweak calls
+            %% secp256k1_xonly_pubkey_tweak_add_check with `parity` =
+            %% control[0] & 1; interpreter.cpp:1914 passes control[0]&1.
+            %% Binding _Parity (ignoring it) was the pre-fix divergence:
+            %% a spend with CB byte-0 low bit flipped was wrongly accepted.
+            ExpectedParity = LeafVersionByte band 1,
             case beamchain_crypto:xonly_pubkey_tweak_add(InternalKey, TweakHash) of
-                {ok, TweakedKey, _Parity} ->
-                    case TweakedKey =:= OutputKey of
+                {ok, TweakedKey, Parity} ->
+                    case TweakedKey =:= OutputKey andalso Parity =:= ExpectedParity of
                         true ->
                             %% Execute script in tapscript mode
                             TapLeafVer = LeafVersion,
