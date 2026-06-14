@@ -2566,7 +2566,7 @@ do_verify_script(ScriptSig, ScriptPubKey, Witness, Flags, SigChecker) ->
                                     %% Check if P2SH redeem script is witness program
                                     P2SHWitResult = check_p2sh_witness(
                                         IsP2SH, StackCopy,
-                                        Witness, Flags, SigChecker, Stack3),
+                                        Witness, Flags, SigChecker, Stack3, ScriptSig),
                                     case P2SHWitResult of
                                         {ok, FS} ->
                                             %% BIP 141: If WITNESS flag is set and
@@ -3077,18 +3077,59 @@ extract_witness_program(_) ->
 is_p2sh(<<16#a9, 16#14, _:20/binary, 16#87>>) -> true;
 is_p2sh(_) -> false.
 
-check_p2sh_witness(true, [RS | _], Witness, Flags, SigChecker, _Stack3) ->
+%% canonical_push_script/1 — mirrors CScript() << vector<unsigned char> from Core
+%% (script/script.h AppendDataSize): builds the minimal-encoding push of Bytes.
+%% Used to reconstruct the expected P2SH-wrapped-witness scriptSig for byte-exact
+%% comparison (interpreter.cpp:2082-2086).
+canonical_push_script(Bytes) ->
+    N = byte_size(Bytes),
+    if
+        N =:= 0 ->
+            %% OP_0 (0x00)
+            <<16#00>>;
+        N =< 75 ->
+            %% Direct push: one-byte length prefix (1-75 fits in opcode byte)
+            <<N, Bytes/binary>>;
+        N =< 255 ->
+            %% OP_PUSHDATA1 (0x4c): one-byte length follows
+            <<16#4c, N, Bytes/binary>>;
+        N =< 65535 ->
+            %% OP_PUSHDATA2 (0x4d): two-byte little-endian length follows
+            Lo = N band 16#ff,
+            Hi = (N bsr 8) band 16#ff,
+            <<16#4d, Lo, Hi, Bytes/binary>>;
+        true ->
+            %% OP_PUSHDATA4 (0x4e): four-byte little-endian length follows
+            B0 = N band 16#ff,
+            B1 = (N bsr 8) band 16#ff,
+            B2 = (N bsr 16) band 16#ff,
+            B3 = (N bsr 24) band 16#ff,
+            <<16#4e, B0, B1, B2, B3, Bytes/binary>>
+    end.
+
+check_p2sh_witness(true, [RS | _], Witness, Flags, SigChecker, _Stack3, ScriptSig) ->
     case extract_witness_program(RS) of
         {ok, WV, WP} when (Flags band ?SCRIPT_VERIFY_WITNESS) =/= 0 ->
-            %% IsP2SH = true: gates the Taproot path off (BIP-341 forbids
-            %% v1+32 inside P2SH; it must succeed as upgradable-witness).
-            verify_witness_program(WV, WP, Witness, Flags, SigChecker, true);
+            %% BIP-141 / Core interpreter.cpp:2082-2086: the scriptSig MUST be
+            %% EXACTLY the minimal canonical push of the redeemScript bytes.
+            %% Any non-canonical encoding (e.g. OP_PUSHDATA1 for a <=75-byte RS)
+            %% reintroduces scriptSig malleability that BIP-141 is designed to
+            %% prevent.  MINIMALDATA is policy-only and NOT in GetBlockScriptFlags,
+            %% so this byte-exact check is the ONLY guard at consensus validation.
+            case ScriptSig =:= canonical_push_script(RS) of
+                false ->
+                    {error, witness_malleated_p2sh};
+                true ->
+                    %% IsP2SH = true: gates the Taproot path off (BIP-341 forbids
+                    %% v1+32 inside P2SH; it must succeed as upgradable-witness).
+                    verify_witness_program(WV, WP, Witness, Flags, SigChecker, true)
+            end;
         _ ->
             {ok, _Stack3}
     end;
-check_p2sh_witness(true, [], _Witness, _Flags, _SigChecker, Stack3) ->
+check_p2sh_witness(true, [], _Witness, _Flags, _SigChecker, Stack3, _ScriptSig) ->
     {ok, Stack3};
-check_p2sh_witness(_, _, _, _, _, Stack3) ->
+check_p2sh_witness(_, _, _, _, _, Stack3, _ScriptSig) ->
     {ok, Stack3}.
 
 %% Check if the P2SH redeem script is a witness program (without executing it).
