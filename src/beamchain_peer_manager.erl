@@ -103,7 +103,8 @@
          test_handle_addr/3,
          test_handle_addrv2/3,
          test_handle_getaddr/2,
-         test_peer_field/2]).
+         test_peer_field/2,
+         clamp_addr_timestamp/2]).
 -endif.
 
 -define(SERVER, ?MODULE).
@@ -2119,16 +2120,23 @@ handle_addr_msg(Pid, Payload, State) ->
             %% addrv2 handler below so an attacker cannot bypass the limit by
             %% switching message type.
             {Admitted, Dropped} = apply_addr_rate_limit(Pid, Addrs),
-            %% Feed admitted addresses to addrman
+            %% Core net_processing.cpp:5678-5680: clamp timestamps that are
+            %% pre-2001 (nTime <= 100000000) OR more than 10 minutes in the
+            %% future before storing or relaying. Both conditions replace nTime
+            %% with (now - 5 days). Applied AFTER rate-limiting so the clamped
+            %% value is what reaches addrman and any relay recipients.
+            Now = erlang:system_time(second),
+            Clamped = [clamp_addr_timestamp(E, Now) || E <- Admitted],
+            %% Feed clamped addresses to addrman
             lists:foreach(fun(#{ip := IP, port := Port} = Entry) ->
                 Svc = maps:get(services, Entry, 0),
                 beamchain_addrman:add_address({IP, Port}, Svc, Pid)
-            end, Admitted),
+            end, Clamped),
             logger:debug("received ~B addresses from ~p (~B admitted, ~B "
                          "rate-limited)",
-                         [length(Addrs), Pid, length(Admitted), Dropped]),
+                         [length(Addrs), Pid, length(Clamped), Dropped]),
             %% Relay to 2 random peers (BIP155)
-            relay_addr_to_random_peers(Pid, {addr, #{addrs => Admitted}}, State),
+            relay_addr_to_random_peers(Pid, {addr, #{addrs => Clamped}}, State),
             {noreply, State};
         {ok, #{addrs := Addrs}} when length(Addrs) > 1000 ->
             %% Too many addresses, misbehaving
@@ -2147,6 +2155,10 @@ handle_addrv2_msg(Pid, Payload, State) ->
             %% ADDRV2, net_processing.cpp:4022). Without this an attacker could
             %% flood addrv2 to bypass an addr-only rate limit.
             {Admitted, Dropped} = apply_addr_rate_limit(Pid, Addrs),
+            %% Core net_processing.cpp:5678-5680: clamp timestamps (same rule
+            %% as addr handler above — shared ProcessAddrs path in Core).
+            Now = erlang:system_time(second),
+            Clamped = [clamp_addr_timestamp(E, Now) || E <- Admitted],
             %% Extract IPv4 addresses and add to addrman
             lists:foreach(fun(Entry) ->
                 case Entry of
@@ -2156,12 +2168,12 @@ handle_addrv2_msg(Pid, Payload, State) ->
                     _ ->
                         ok  %% Skip non-IPv4 for now
                 end
-            end, Admitted),
+            end, Clamped),
             logger:debug("received ~B addrv2 entries from ~p (~B admitted, ~B "
                          "rate-limited)",
-                         [length(Addrs), Pid, length(Admitted), Dropped]),
+                         [length(Addrs), Pid, length(Clamped), Dropped]),
             %% Relay to 2 random peers
-            relay_addr_to_random_peers(Pid, {addr, #{addrs => Admitted}}, State),
+            relay_addr_to_random_peers(Pid, {addr, #{addrs => Clamped}}, State),
             {noreply, State};
         _ ->
             {noreply, State}
@@ -2225,6 +2237,35 @@ spend_addr_tokens([Addr | Rest], Bucket, RateLimited, Acc, Dropped) ->
             spend_addr_tokens(Rest, Bucket - 10, RateLimited,
                               [Addr | Acc], Dropped)
     end.
+
+%% @doc Clamp a peer-supplied addr/addrv2 timestamp to a sane range.
+%%
+%% Mirrors Bitcoin Core net_processing.cpp ProcessAddrs:5678-5680:
+%%   if (addr.nTime <= NodeSeconds{100000000s} || addr.nTime > current_time + 10min)
+%%       addr.nTime = current_time - 5*24h;
+%%
+%% Two conditions that trigger a clamp to (now - 5 days):
+%%   1. Timestamp is pre-2001 (<=100000000 seconds since epoch) — clearly
+%%      bogus or unset; Core treats anything this old as stale.
+%%   2. Timestamp is more than 10 minutes in the future — the peer's clock is
+%%      wrong or it is lying; accept the address but use a conservative age.
+%%
+%% The clamped value (now - 432000) ensures addrman ages out the entry
+%% naturally while not rejecting the address outright. This prevents a peer
+%% from poisoning addrman with either ancient garbage or far-future timestamps
+%% that would suppress normal eviction.
+-spec clamp_addr_timestamp(map(), non_neg_integer()) -> map().
+clamp_addr_timestamp(#{timestamp := T} = Entry, Now) ->
+    %% 100_000_000 s = 2001-09-08T21:46:40Z (Core's pre-2001 guard)
+    %% 600 s = 10 minutes (Core's future guard)
+    %% 432000 s = 5 * 24 * 3600 (Core's fallback age: current_time - 5*24h)
+    case T =< 100000000 orelse T > Now + 600 of
+        true  -> Entry#{timestamp => Now - 432000};
+        false -> Entry
+    end;
+clamp_addr_timestamp(Entry, _Now) ->
+    %% No timestamp field — leave the entry untouched.
+    Entry.
 
 %% @doc Answer a getaddr (Bitcoin Core net_processing.cpp GETADDR handler,
 %% ~line 4816). Three anti-eclipse / anti-fingerprinting guards:
