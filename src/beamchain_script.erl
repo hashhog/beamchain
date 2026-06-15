@@ -24,6 +24,7 @@
 %% Sighash computation
 -export([sighash_legacy/4, sighash_witness_v0/5, sighash_taproot/7]).
 -export([find_and_delete/2]).  %% Exported for testing
+-export([remove_codeseparator/1]). %% Exported for testing (bug-hunt 8A)
 -export([verify_taproot/4]).   %% Exported for testing
 -export([parse_schnorr_sig/1]). %% Exported for testing
 -export([sighash_single_in_range/3, valid_taproot_hash_type/1]). %% W95: exported for testing
@@ -3289,6 +3290,18 @@ remove_codesep(<<?OP_PUSHDATA2, Len:16/little, Rest/binary>>, Acc) ->
             remove_codesep(Rest2, <<Acc/binary, ?OP_PUSHDATA2, Len:16/little, Data/binary>>);
         _ ->
             <<Acc/binary, ?OP_PUSHDATA2, Len:16/little, Rest/binary>>
+    end;
+remove_codesep(<<?OP_PUSHDATA4, Len:32/little, Rest/binary>>, Acc) ->
+    %% bug-hunt 8A: without this clause a 0x4e fell to the catch-all and the
+    %% 4-byte length prefix + payload were mis-parsed as opcodes, so a 0xab
+    %% (OP_CODESEPARATOR) byte INSIDE the push was wrongly stripped -> a
+    %% different legacy sighash than Core (SerializeScriptCode via GetOp skips
+    %% the full OP_PUSHDATA4 payload, interpreter.cpp:1271-1291).
+    case Rest of
+        <<Data:Len/binary, Rest2/binary>> ->
+            remove_codesep(Rest2, <<Acc/binary, ?OP_PUSHDATA4, Len:32/little, Data/binary>>);
+        _ ->
+            <<Acc/binary, ?OP_PUSHDATA4, Len:32/little, Rest/binary>>
     end;
 remove_codesep(<<B, Rest/binary>>, Acc) ->
     remove_codesep(Rest, <<Acc/binary, B>>).
