@@ -1725,6 +1725,20 @@ remove_codeseparator_test() ->
     %% The test is that it doesn't crash; actual hash verification is via vectors
     ok.
 
+remove_codeseparator_pushdata4_preserves_inner_codesep_test() ->
+    %% bug-hunt 8A: a 0xab (OP_CODESEPARATOR) byte INSIDE an OP_PUSHDATA4 push
+    %% must be PRESERVED. Core's SerializeScriptCode walks the script with GetOp,
+    %% which skips the entire OP_PUSHDATA4 payload, so only a STANDALONE
+    %% OP_CODESEPARATOR opcode is removed. Before the OP_PUSHDATA4 clause was
+    %% added, remove_codesep fell to the catch-all on 0x4e, mis-parsed the 4-byte
+    %% length prefix + payload as opcodes, and wrongly stripped the inner 0xab.
+    %% OP_PUSHDATA4 (0x4e), len=2 (LE: 02 00 00 00), data = <<0xab, 0xac>>
+    Input = <<16#4e, 2, 0, 0, 0, 16#ab, 16#ac>>,
+    ?assertEqual(Input, beamchain_script:remove_codeseparator(Input)),
+    %% A STANDALONE OP_CODESEPARATOR is still stripped (regression guard):
+    ?assertEqual(<<16#51, 16#52>>,
+                 beamchain_script:remove_codeseparator(<<16#51, 16#ab, 16#52>>)).
+
 %%% -------------------------------------------------------------------
 %%% SIGHASH_NONE tests
 %%% -------------------------------------------------------------------
