@@ -61,6 +61,9 @@
 %% (drive a synthetic active chain without the full chainstate + db tree).
 -export([reconcile_index/3]).
 
+%% Exported for unit testing only.
+-export([is_bip30_unspendable/2]).
+
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
@@ -384,7 +387,8 @@ apply_block(#block{transactions = Txs}, Height, BlockHash, SpentCoins, Prev) ->
                 };
             _ ->
                 Spents = resolve_spent_coins(Txs, SpentCoins, BlockHash),
-                {Acc1, Acc} = apply_txs2(Txs, Height, Spents, Acc0, Base),
+                {Acc1, Acc} = apply_txs2(Txs, Height, BlockHash, Subsidy,
+                                         Spents, Acc0, Base),
                 Acc#dbval{muhash = beamchain_muhash:serialize(Acc1)}
         end,
     %% Unclaimed rewards (every block; CustomAppend:181-188):
@@ -404,21 +408,64 @@ apply_block(#block{transactions = Txs}, Height, BlockHash, SpentCoins, Prev) ->
 %% coinbase-excluded {Txid,Vout,#utxo} coins in forward (tx,input) order,
 %% consumed left to right). Returns {FinalAcc, FinalDBVal}.
 %% Core CustomAppend:121-174.
-apply_txs2([], _Height, _Spents, Acc, DBVal) ->
+%%
+%% BlockHash and Subsidy are threaded for the BIP30 duplicate-coinbase skip
+%% (Core:128-131): at mainnet heights 91722 and 91812 the coinbase txids
+%% duplicate an earlier coinbase whose outputs became unspendable, so the
+%% entire coinbase must be skipped from the muhash / txouts / total_amount /
+%% total_coinbase and its value charged to uns_bip30 instead.
+apply_txs2([], _Height, _BlockHash, _Subsidy, _Spents, Acc, DBVal) ->
     {Acc, DBVal};
-apply_txs2([Tx | Rest], Height, Spents, Acc, DBVal) ->
+apply_txs2([Tx | Rest], Height, BlockHash, Subsidy, Spents, Acc, DBVal) ->
     Txid = beamchain_serialize:tx_hash(Tx),
     IsCoinbase = beamchain_validation:is_coinbase_tx(Tx),
-    {Acc1, DV1} = add_outputs(Tx, Txid, Height, IsCoinbase, Acc, DBVal),
-    case IsCoinbase of
+    case IsCoinbase andalso is_bip30_unspendable(Height, BlockHash) of
         true ->
-            apply_txs2(Rest, Height, Spents, Acc1, DV1);
+            %% Skip duplicate-coinbase outputs (BIP30): they overwrote the
+            %% prior coinbase, so those earlier outputs are unspendable.
+            %% Charge the block subsidy to uns_bip30 and continue.
+            %% (Core index/coinstatsindex.cpp:128-131)
+            DV1 = DBVal#dbval{uns_bip30 = DBVal#dbval.uns_bip30 + Subsidy},
+            apply_txs2(Rest, Height, BlockHash, Subsidy, Spents, Acc, DV1);
         false ->
-            NInputs = length(Tx#transaction.inputs),
-            {TxSpents, RestSpents} = take_n(NInputs, Spents),
-            {Acc2, DV2} = remove_prevouts(TxSpents, Acc1, DV1),
-            apply_txs2(Rest, Height, RestSpents, Acc2, DV2)
+            {Acc1, DV1} = add_outputs(Tx, Txid, Height, IsCoinbase, Acc, DBVal),
+            case IsCoinbase of
+                true ->
+                    apply_txs2(Rest, Height, BlockHash, Subsidy,
+                               Spents, Acc1, DV1);
+                false ->
+                    NInputs = length(Tx#transaction.inputs),
+                    {TxSpents, RestSpents} = take_n(NInputs, Spents),
+                    {Acc2, DV2} = remove_prevouts(TxSpents, Acc1, DV1),
+                    apply_txs2(Rest, Height, BlockHash, Subsidy,
+                               RestSpents, Acc2, DV2)
+            end
     end.
+
+%% @doc True iff this block contains a duplicate coinbase whose outputs
+%% overwrote (and made unspendable) the earlier coinbase at the same txid.
+%% These are the two mainnet blocks identified by Core's IsBIP30Unspendable()
+%% (validation.cpp:6195-6199). Block hashes are in INTERNAL byte order
+%% (little-endian / reversed from the display hex), matching block_hash_internal/1.
+%% Display-hex to internal-order (bytes.fromhex(h)[::-1]):
+%%   91722 display: "00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e"
+%%   91722 internal: 8e d0 4d 57 f2 f3 cd c6 a6 e5 55 69 dc 16 54 e1
+%%                   f2 19 84 7f 66 e7 26 dc a2 71 02 00 00 00 00 00
+%%   91812 display: "00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f"
+%%   91812 internal: 2f 6f 30 f9 d6 83 de b8 5d 93 14 ef 5d cf 36 af
+%%                   66 d9 e3 ce 1a 2b 79 d4 ae f0 0a 00 00 00 00 00
+-spec is_bip30_unspendable(non_neg_integer(), binary()) -> boolean().
+is_bip30_unspendable(91722,
+        <<16#8e, 16#d0, 16#4d, 16#57, 16#f2, 16#f3, 16#cd, 16#c6,
+          16#a6, 16#e5, 16#55, 16#69, 16#dc, 16#16, 16#54, 16#e1,
+          16#f2, 16#19, 16#84, 16#7f, 16#66, 16#e7, 16#26, 16#dc,
+          16#a2, 16#71, 16#02, 16#00, 16#00, 16#00, 16#00, 16#00>>) -> true;
+is_bip30_unspendable(91812,
+        <<16#2f, 16#6f, 16#30, 16#f9, 16#d6, 16#83, 16#de, 16#b8,
+          16#5d, 16#93, 16#14, 16#ef, 16#5d, 16#cf, 16#36, 16#af,
+          16#66, 16#d9, 16#e3, 16#ce, 16#1a, 16#2b, 16#79, 16#d4,
+          16#ae, 16#f0, 16#0a, 16#00, 16#00, 16#00, 16#00, 16#00>>) -> true;
+is_bip30_unspendable(_, _) -> false.
 
 %% Add a tx's created outputs to the accumulator + counters.
 add_outputs(#transaction{outputs = Outs}, Txid, Height, IsCoinbase, Acc, DV) ->
