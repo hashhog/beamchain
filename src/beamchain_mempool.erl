@@ -5130,14 +5130,41 @@ classify_remainder(<<16#6a, _/binary>>)            -> op_return;
 classify_remainder(_)                              -> nonstandard.
 
 %% Crude bare-multisig tail check.  M was already extracted; expect:
-%%   N * 33-byte (or 65-byte) pubkey pushes, OP_N (16#50+N), OP_CHECKMULTISIG (16#ae)
-%% with N >= M and N =< 3.
+%%   N * pubkey pushes, OP_N (16#50+N), OP_CHECKMULTISIG (16#ae) with N >= M, N =< 3.
+%%
+%% Each pubkey is read with a PUSHDATA-aware decoder, mirroring Bitcoin Core's
+%% MatchMultisig (script/solver.cpp:85-105), which walks keys via
+%% script.GetOp(it, opcode, data) (GetScriptOp decodes direct + OP_PUSHDATA1/2/4)
+%% and accepts each iff CPubKey::ValidSize(data) — i.e. the *decoded* payload is
+%% 33 (compressed) or 65 (uncompressed) bytes (pubkey.h ValidSize).  Matching only
+%% the direct-push opcodes (0x21 / 0x41) over-rejected PUSHDATA-prefixed bare
+%% multisig that Core relays as standard MULTISIG.  Core's MatchMultisig does NOT
+%% require a minimal push for the keys, so a 33-byte key pushed via OP_PUSHDATA1 is
+%% just as standard as the direct 0x21 push.  Relay standardness only — never
+%% consensus (this path is reached solely from validate_inputs_standardness,
+%% i.e. mempool AreInputsStandard).
 classify_multisig_tail(Bin, M) ->
     classify_multisig_tail(Bin, M, 0).
 
+%% Direct pushes of 33 / 65 bytes (0x21 / 0x41).
 classify_multisig_tail(<<16#21, _:33/binary, Rest/binary>>, M, Acc) ->
     classify_multisig_tail(Rest, M, Acc + 1);
 classify_multisig_tail(<<16#41, _:65/binary, Rest/binary>>, M, Acc) ->
+    classify_multisig_tail(Rest, M, Acc + 1);
+%% OP_PUSHDATA1 (0x4c) + 1-byte length, payload a valid pubkey size (33 / 65).
+classify_multisig_tail(<<16#4c, 33, _:33/binary, Rest/binary>>, M, Acc) ->
+    classify_multisig_tail(Rest, M, Acc + 1);
+classify_multisig_tail(<<16#4c, 65, _:65/binary, Rest/binary>>, M, Acc) ->
+    classify_multisig_tail(Rest, M, Acc + 1);
+%% OP_PUSHDATA2 (0x4d) + 2-byte LE length, payload a valid pubkey size (33 / 65).
+classify_multisig_tail(<<16#4d, 33, 0, _:33/binary, Rest/binary>>, M, Acc) ->
+    classify_multisig_tail(Rest, M, Acc + 1);
+classify_multisig_tail(<<16#4d, 65, 0, _:65/binary, Rest/binary>>, M, Acc) ->
+    classify_multisig_tail(Rest, M, Acc + 1);
+%% OP_PUSHDATA4 (0x4e) + 4-byte LE length, payload a valid pubkey size (33 / 65).
+classify_multisig_tail(<<16#4e, 33, 0, 0, 0, _:33/binary, Rest/binary>>, M, Acc) ->
+    classify_multisig_tail(Rest, M, Acc + 1);
+classify_multisig_tail(<<16#4e, 65, 0, 0, 0, _:65/binary, Rest/binary>>, M, Acc) ->
     classify_multisig_tail(Rest, M, Acc + 1);
 classify_multisig_tail(<<N, 16#ae>>, M, Acc)
   when N >= 16#51, N =< 16#60 ->
