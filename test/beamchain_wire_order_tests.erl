@@ -193,10 +193,13 @@ getpeerinfo_order_test() ->
     PL = beamchain_rpc:peerinfo_obj_proplist(F),
     Json = encode_wire(PL),
     %% Spot-check the Core-critical leading order: mapped_as MUST be right after
-    %% network and BEFORE services (the prior bug emitted it dead last).
+    %% network and BEFORE services (the prior bug emitted it dead last). Also
+    %% pins Core v31.99: last_inv_sequence + inv_to_send right after relaytxes
+    %% and before lastsend; startingheight DROPPED.
     assert_order(Json, [
         <<"id">>, <<"addr">>, <<"addrbind">>, <<"network">>, <<"mapped_as">>,
-        <<"services">>, <<"servicesnames">>, <<"relaytxes">>, <<"lastsend">>,
+        <<"services">>, <<"servicesnames">>, <<"relaytxes">>,
+        <<"last_inv_sequence">>, <<"inv_to_send">>, <<"lastsend">>,
         <<"lastrecv">>, <<"last_transaction">>, <<"last_block">>,
         <<"bytessent">>, <<"bytesrecv">>, <<"conntime">>, <<"timeoffset">>,
         <<"pingtime">>, <<"minping">>, <<"version">>, <<"subver">>,
@@ -205,7 +208,9 @@ getpeerinfo_order_test() ->
         <<"inflight">>, <<"addr_relay_enabled">>, <<"addr_processed">>,
         <<"addr_rate_limited">>, <<"permissions">>, <<"minfeefilter">>,
         <<"connection_type">>, <<"transport_protocol_type">>, <<"session_id">>
-    ]).
+    ]),
+    %% Core v31.99 removed startingheight from getpeerinfo — assert it is absent.
+    ?assertEqual(nomatch, binary:match(Json, <<"\"startingheight\":">>)).
 
 getpeerinfo_mapped_as_not_last_test() ->
     F = #{
