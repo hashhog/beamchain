@@ -2561,38 +2561,44 @@ check_p2a_policy(Outputs) ->
     P2aCount =< 1 orelse throw(multiple_p2a_outputs),
     ok.
 
-%% dust = (output_size + spend_input_size) * dust_relay_fee / 1000
+%% @doc Dust threshold (satoshis) for an output's scriptPubKey, faithful to
+%% Core GetDustThreshold (policy/policy.cpp:27-63).
+%%
+%%   nSize = GetSerializeSize(txout) + spend_input_cost
+%%         = (8 + CompactSize(scriptlen) + scriptlen) + spend_input_cost
+%% where the spend input cost is a fixed estimate of the CTxIn needed to
+%% spend the output:
+%%   * witness program (Core IsWitnessProgram): 32 + 4 + 1 + (107 div 4) + 4 = 67
+%%   * non-witness:                             32 + 4 + 1 + 107         + 4 = 148
+%%
+%% The witness-vs-non-witness branch is Core's IsWitnessProgram test — UNIFORM
+%% across every witness version/size (P2WPKH, P2WSH, P2TR, and unknown witness
+%% programs all take the 75%%-discounted 67), NOT a per-script-type table.  The
+%% threshold is dustRelayFee.GetFee(nSize) = CeilDiv(nSize * fee, 1000) (Core
+%% CFeeRate::GetFee -> FeePerVSize::EvaluateFeeUp -> CeilDiv, util/feefrac.h).
+%%
+%% Canonical thresholds at the default 3000 sat/kvB dust_relay_fee:
+%%   P2PKH 546, P2SH 540, P2WPKH 294, P2WSH 330, P2TR 330.
 dust_threshold(SPK) ->
-    OutputSize = 8 + 1 + byte_size(SPK),
-    SpendSize = spend_input_size(SPK),
-    (OutputSize + SpendSize) * ?DUST_RELAY_TX_FEE div 1000.
+    OutputSize = 8 + compact_size_len(byte_size(SPK)) + byte_size(SPK),
+    SpendSize = spend_input_cost(SPK),
+    NSize = OutputSize + SpendSize,
+    %% CeilDiv: ceil(NSize * fee / 1000), matching Core EvaluateFeeUp.
+    (NSize * ?DUST_RELAY_TX_FEE + 999) div 1000.
 
-spend_input_size(SPK) ->
-    case classify_output(SPK) of
-        p2pkh     -> 148;
-        p2sh      -> 148;
-        p2wpkh    -> 68;
-        p2wsh     -> 68;
-        p2tr      -> 58;
-        p2a       -> 67;   %% P2A uses standard witness input size (67 bytes)
-                           %% Dust = (13 + 67) * 3000 / 1000 = 240 satoshis
-        _unknown  -> 148
+%% CompactSize length prefix on the scriptPubKey, part of GetSerializeSize(txout).
+compact_size_len(N) when N < 16#fd      -> 1;
+compact_size_len(N) when N =< 16#ffff   -> 3;
+compact_size_len(N) when N =< 16#ffffffff -> 5;
+compact_size_len(_)                     -> 9.
+
+%% Estimated CTxIn cost to spend the output: 67 for any witness program
+%% (Core's 75%%-segwit-discounted estimate), 148 otherwise.
+spend_input_cost(SPK) ->
+    case beamchain_script:extract_witness_program(SPK) of
+        {ok, _Ver, _Prog} -> 32 + 4 + 1 + (107 div 4) + 4;  %% = 67
+        none              -> 32 + 4 + 1 + 107 + 4           %% = 148
     end.
-
-classify_output(<<16#76, 16#a9, 16#14, _:20/binary, 16#88, 16#ac>>) ->
-    p2pkh;
-classify_output(<<16#a9, 16#14, _:20/binary, 16#87>>) ->
-    p2sh;
-classify_output(<<16#00, 16#14, _:20/binary>>) ->
-    p2wpkh;
-classify_output(<<16#00, 16#20, _:32/binary>>) ->
-    p2wsh;
-classify_output(<<16#51, 16#20, _:32/binary>>) ->
-    p2tr;
-classify_output(<<16#51, 16#02, 16#4e, 16#73>>) ->
-    p2a;  %% Pay-to-Anchor: OP_1 OP_PUSHBYTES_2 0x4e73
-classify_output(_) ->
-    unknown.
 
 %%% ===================================================================
 %%% Internal: script verification
