@@ -32,6 +32,7 @@
 %% Pay-to-Anchor (P2A) detection
 -export([is_pay_to_anchor/1]).
 -export([is_push_only/1]).   %% Exported for mempool scriptsig standardness check
+-export([extract_witness_program/1]).  %% Exported for mempool dust threshold (Core IsWitnessProgram)
 
 %%% -------------------------------------------------------------------
 %%% Script execution state

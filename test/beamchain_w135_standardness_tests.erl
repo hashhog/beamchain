@@ -486,42 +486,55 @@ g18_bug4_max_datacarrier_config_missing_test_() ->
 %%% ===================================================================
 
 g19_bug7_bug8_dust_formula_drift_test_() ->
-    {"G19: BUG-7/BUG-8 (MEDIUM) — Spend-input-size constants for "
-     "p2wpkh/p2wsh/p2tr drift from Core. Core formula: any witness "
-     "program SPK uses 67 (32+4+1+(107/4)+4); non-witness uses 148. "
-     "beamchain uses p2wpkh=68, p2wsh=68, p2tr=58. Output-size varint "
-     "is hardcoded as 1 byte regardless of SPK size > 252.",
+    {"G19: BUG-7/BUG-8 FIXED — dust threshold now matches Core "
+     "GetDustThreshold (policy.cpp:27-63). Spend-input cost is UNIFORM "
+     "67 (32+4+1+(107 div 4)+4) for any witness program and 148 for "
+     "non-witness, NOT a per-type 68/68/58 table. Output size includes "
+     "GetSerializeSize(txout) with a proper CompactSize varint. Canonical "
+     "thresholds: P2PKH 546, P2SH 540, P2WPKH 294, P2WSH 330, P2TR 330.",
      [
       ?_test(begin
-         %% Probe via is_dust_output. For each output type, compute the
-         %% beamchain threshold and assert it diverges from Core's 67 path.
+         %% Pin the exact Core thresholds for all five canonical shapes.
+         P2PKH  = <<16#76, 16#a9, 16#14, 0:160, 16#88, 16#ac>>,  % 25 bytes
+         P2SH   = <<16#a9, 16#14, 0:160, 16#87>>,                 % 23 bytes
+         P2WPKH = <<16#00, 16#14, 0:160>>,                        % 22 bytes
+         P2WSH  = <<16#00, 16#20, 0:256>>,                        % 34 bytes
+         P2TR   = <<16#51, 16#20, 0:256>>,                        % 34 bytes
 
-         %% P2WPKH (22-byte SPK):
-         %% beamchain: (8+1+22+68) * 3000 / 1000 = 99*3 = 297 sat
-         %% Core:      (8+1+22+67) * 3000 / 1000 = 98*3 = 294 sat
-         P2WPKH = <<16#00, 16#14, 0:160>>,
-         %% A value of 296 sats is dust in beamchain (< 297) but not in
-         %% Core (296 >= 294). So beamchain rejects what Core accepts.
-         IsDust296 = beamchain_mempool:is_dust_output(
-             #tx_out{value = 296, script_pubkey = P2WPKH}),
-         ?assertEqual(true, IsDust296),
-         %% 297+ is fine in both
-         ?assertEqual(false, beamchain_mempool:is_dust_output(
-             #tx_out{value = 297, script_pubkey = P2WPKH})),
+         %% P2PKH: (8+1+25+148) = 182 -> 182*3 = 546 sat
+         pin_threshold(P2PKH, 546),
+         %% P2SH: (8+1+23+148) = 180 -> 180*3 = 540 sat
+         pin_threshold(P2SH, 540),
+         %% P2WPKH: (8+1+22+67) = 98 -> 98*3 = 294 sat
+         pin_threshold(P2WPKH, 294),
+         %% P2WSH: (8+1+34+67) = 110 -> 110*3 = 330 sat
+         pin_threshold(P2WSH, 330),
+         %% P2TR: (8+1+34+67) = 110 -> 110*3 = 330 sat
+         pin_threshold(P2TR, 330),
 
-         %% P2TR (34-byte SPK):
-         %% beamchain: (8+1+34+58) * 3000 / 1000 = 101*3 = 303 sat
-         %% Core:      (8+1+34+67) * 3000 / 1000 = 110*3 = 330 sat
-         %% beamchain has a LOWER threshold — more permissive than Core.
-         P2TR = <<16#51, 16#20, 0:256>>,
-         %% A value of 310 sats: dust in Core (< 330) but NOT in beamchain (>= 303).
+         %% Regression vs the OLD buggy thresholds (297/333/303):
+         %% 296-sat P2WPKH was dust at 297 but is NOT at the Core 294.
          ?assertEqual(false, beamchain_mempool:is_dust_output(
-             #tx_out{value = 310, script_pubkey = P2TR})),
-         %% 302 is dust in both
+             #tx_out{value = 296, script_pubkey = P2WPKH})),
+         %% 310-sat P2TR was NOT dust at the old 303 but IS at the Core 330
+         %% (beamchain used to under-reject taproot dust).
          ?assertEqual(true, beamchain_mempool:is_dust_output(
-             #tx_out{value = 302, script_pubkey = P2TR}))
+             #tx_out{value = 310, script_pubkey = P2TR})),
+
+         %% Unknown/future witness program (v1, 40-byte program) also takes the
+         %% UNIFORM 67 spend cost (Core IsWitnessProgram), NOT the 148 fallback.
+         %% (8+1+42+67) = 118 -> 118*3 = 354 sat.
+         UnkWit = <<16#51, 40, 0:320>>,  % OP_1 OP_PUSHBYTES_40 <40 bytes>
+         pin_threshold(UnkWit, 354)
        end)
      ]}.
+
+%% is_dust_output(value=T-1) must be dust; is_dust_output(value=T) must NOT be.
+pin_threshold(SPK, T) ->
+    ?assertEqual(true, beamchain_mempool:is_dust_output(
+        #tx_out{value = T - 1, script_pubkey = SPK})),
+    ?assertEqual(false, beamchain_mempool:is_dust_output(
+        #tx_out{value = T, script_pubkey = SPK})).
 
 %%% ===================================================================
 %%% G20 — BUG-13/BUG-14: dust threshold uses IsUnspendable carve-out

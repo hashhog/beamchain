@@ -5316,7 +5316,7 @@ rpc_getpeerinfo() ->
             pingtime      => PingTime,
             version       => maps:get(version, Info, 0),
             subver        => maps:get(user_agent, Info, <<"/unknown/">>),
-            startingheight => maps:get(start_height, Info, 0),
+            %% startingheight dropped from getpeerinfo (Core v31.99).
             inbound       => Dir =:= inbound,
             connection_type => ConnType
         })
@@ -5334,9 +5334,10 @@ rpc_getpeerinfo() ->
 %% addr_relay_enabled, addr_processed, addr_rate_limited, permissions,
 %% minfeefilter, bytessent_per_msg, bytesrecv_per_msg, connection_type,
 %% transport_protocol_type, session_id.  The key prior bug was mapped_as
-%% emitted LAST; Core emits it right after `network`. `startingheight` is a
-%% beamchain legacy extra (Core dropped it) — kept adjacent to the version
-%% fields where old Core placed it.
+%% emitted LAST; Core emits it right after `network`. `startingheight` was a
+%% beamchain legacy extra that Core v31.99 dropped — REMOVED here to match.
+%% `last_inv_sequence`/`inv_to_send` (Core v31.99 rpc/net.cpp:243-244) are
+%% emitted right after `relaytxes`; beamchain does not track them, so 0.
 peerinfo_obj_proplist(F) ->
     [
         {<<"id">>, maps:get(id, F)},
@@ -5349,6 +5350,13 @@ peerinfo_obj_proplist(F) ->
         {<<"services">>, maps:get(services, F)},
         {<<"servicesnames">>, maps:get(servicesnames, F)},
         {<<"relaytxes">>, maps:get(relaytxes, F)},
+        %% Core rpc/net.cpp:243-244 (v31.99): last_inv_sequence + inv_to_send
+        %% immediately after relaytxes and before lastsend. beamchain does not
+        %% track per-peer mempool inv sequence / queued-inv count at the manager
+        %% layer, so emit 0 (Core-acceptable, mirrors addr_processed/0 and how
+        %% rustoshi 077eb2f handles these untracked NUM fields).
+        {<<"last_inv_sequence">>, maps:get(last_inv_sequence, F, 0)},
+        {<<"inv_to_send">>, maps:get(inv_to_send, F, 0)},
         {<<"lastsend">>, maps:get(lastsend, F)},
         {<<"lastrecv">>, maps:get(lastrecv, F)},
         {<<"last_transaction">>, 0},
@@ -5361,7 +5369,10 @@ peerinfo_obj_proplist(F) ->
         {<<"minping">>, maps:get(pingtime, F)},
         {<<"version">>, maps:get(version, F)},
         {<<"subver">>, maps:get(subver, F)},
-        {<<"startingheight">>, maps:get(startingheight, F)},
+        %% startingheight removed: Core v31.99 dropped it from getpeerinfo
+        %% (rpc/net.cpp emits subver -> inbound with nothing between). The peer
+        %% start_height is still parsed/stored at the version-handshake layer;
+        %% only the RPC response field is removed.
         {<<"inbound">>, maps:get(inbound, F)},
         {<<"bip152_hb_to">>, false},
         {<<"bip152_hb_from">>, false},
