@@ -74,6 +74,32 @@ bech32_invalid_test_() ->
         ?assertMatch({error, _}, Result)
     end || V <- Vectors].
 
+%% BIP-173/BIP-350 cap bech32/bech32m strings at 90 characters; Bitcoin Core's
+%% bech32::Decode rejects anything longer (CharLimit::BECH32 = 90,
+%% bech32.h:38-40) before verifying the checksum (bech32.cpp:378:
+%% `if (str.size() > limit) return {};`). Beyond 89 chars the BCH code's
+%% 4-error-detection guarantee no longer holds, so over-long strings must be
+%% rejected regardless of whether the checksum happens to verify. This test
+%% builds a string with a *valid* checksum so that length is the ONLY reason to
+%% reject, mutation-proving the length guard in bech32_decode_internal/2.
+bech32_reject_overlong_test() ->
+    %% Total length = hrp("bc")=2 + sep("1")=1 + data + checksum(6).
+    %% data=82 -> 2 + 1 + 82 + 6 = 91 chars (one over the limit).
+    Data = [N rem 32 || N <- lists:seq(0, 81)],
+    Overlong = beamchain_address:bech32m_encode("bc", Data),
+    ?assertEqual(91, length(Overlong)),
+    %% Checksum is valid by construction, so length is the only failure reason.
+    ?assertEqual({error, too_long}, beamchain_address:bech32_decode(Overlong)),
+    ?assertEqual({error, too_long}, beamchain_address:bech32m_decode(Overlong)).
+
+%% Boundary: a 90-char string (exactly at the limit) with a valid checksum must
+%% still decode (no off-by-one in the > comparison). data=81 -> 2+1+81+6 = 90.
+bech32_accept_exactly_90_test() ->
+    Data = [N rem 32 || N <- lists:seq(0, 80)],
+    Exact = beamchain_address:bech32m_encode("bc", Data),
+    ?assertEqual(90, length(Exact)),
+    ?assertMatch({ok, {"bc", _}}, beamchain_address:bech32m_decode(Exact)).
+
 %%% -------------------------------------------------------------------
 %%% Bech32m encoding tests (BIP 350 valid checksum vectors)
 %%% -------------------------------------------------------------------
