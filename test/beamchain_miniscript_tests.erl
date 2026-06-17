@@ -109,6 +109,62 @@ parse_timelock_test_() ->
          end}
     ].
 
+%% BIP-65/BIP-68 + miniscript bound: older(n)/after(n) are only valid for
+%% `1 <= n < 2^31`. Bitcoin Core's miniscript parser rejects any value with bit
+%% 31 set (`*num >= 0x80000000L`, miniscript.h:2027 after / :2034 older). For
+%% older() bit 31 collides with the BIP-68 disable flag. The largest in-range
+%% value (2^31 - 1) must still parse; the first out-of-range value (2^31) and
+%% the u32 max must both be rejected (cleanly, not via a function_clause crash)
+%% for BOTH fragments. Mutation-proving the upper-bound guard in
+%% parse_single_num/3.
+parse_timelock_bound_test_() ->
+    MaxValid = 16#7fffffff,        %% 2^31 - 1, the largest valid timelock
+    OutOfRange = 16#80000000,      %% 2^31, bit 31 set -> Core rejects
+    U32Max = 16#ffffffff,
+    [
+        {"older(2^31 - 1) is in range and parses",
+         fun() ->
+             {ok, AST} = beamchain_miniscript:from_string(
+                           "older(" ++ integer_to_list(MaxValid) ++ ")"),
+             ?assertEqual({older, MaxValid}, AST)
+         end},
+        {"after(2^31 - 1) is in range and parses",
+         fun() ->
+             {ok, AST} = beamchain_miniscript:from_string(
+                           "after(" ++ integer_to_list(MaxValid) ++ ")"),
+             ?assertEqual({after_, MaxValid}, AST)
+         end},
+        {"older(2^31) is rejected (bit 31 set)",
+         fun() ->
+             ?assertMatch({error, {invalid_args, "older"}},
+                          beamchain_miniscript:from_string(
+                            "older(" ++ integer_to_list(OutOfRange) ++ ")"))
+         end},
+        {"after(2^31) is rejected (bit 31 set)",
+         fun() ->
+             ?assertMatch({error, {invalid_args, "after"}},
+                          beamchain_miniscript:from_string(
+                            "after(" ++ integer_to_list(OutOfRange) ++ ")"))
+         end},
+        {"older(u32::MAX) is rejected",
+         fun() ->
+             ?assertMatch({error, {invalid_args, "older"}},
+                          beamchain_miniscript:from_string(
+                            "older(" ++ integer_to_list(U32Max) ++ ")"))
+         end},
+        {"after(u32::MAX) is rejected",
+         fun() ->
+             ?assertMatch({error, {invalid_args, "after"}},
+                          beamchain_miniscript:from_string(
+                            "after(" ++ integer_to_list(U32Max) ++ ")"))
+         end},
+        {"older(0) is rejected (below lower bound)",
+         fun() ->
+             ?assertMatch({error, {invalid_args, "older"}},
+                          beamchain_miniscript:from_string("older(0)"))
+         end}
+    ].
+
 parse_wrapper_test_() ->
     [
         {"parse and_v with v wrapper",
