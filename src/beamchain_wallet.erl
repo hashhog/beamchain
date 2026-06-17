@@ -2735,6 +2735,18 @@ derive_child(Parent, Index) ->
 %% to enforce the hardened/unhardened range boundary; CurIndex advances on
 %% retry. Crossing 2^31 boundary in either direction raises. The upper
 %% bound 2^32 is also enforced (BIP-32 child indices are u32).
+%%
+%% Core CExtKey::Derive (key.cpp:483) / CExtPubKey::Derive (pubkey.cpp:416):
+%% `if (nDepth == std::numeric_limits<unsigned char>::max()) return false;` —
+%% refuse to derive once the PARENT is already at the maximum depth, because the
+%% serialized BIP-32 depth byte (1 byte) would overflow. Without this guard the
+%% `Parent#hd_key.depth + 1` below would silently emit a never-Core-emitted
+%% depth-256 child whose xprv/xpub depth byte no longer reflects tree position.
+%% This is the very first clause so it covers BOTH the private and public-only
+%% derivation paths.
+derive_child_retry(#hd_key{depth = ParentDepth}, StartIndex, CurIndex)
+  when ParentDepth >= 16#FF ->
+    error({extkey_depth_overflow, ParentDepth, StartIndex, CurIndex});
 derive_child_retry(_Parent, StartIndex, CurIndex)
   when StartIndex <  ?HARDENED, CurIndex >= ?HARDENED ->
     %% Unhardened range exhausted (would cross into hardened); raise.

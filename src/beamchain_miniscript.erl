@@ -1035,9 +1035,18 @@ parse_single_hash(Name, ExpectedLen, Str) ->
             {error, {invalid_args, Name}}
     end.
 
+%% parse_single_num/3 backs older()/after(). Bitcoin Core's miniscript parser
+%% bounds both fragments to `1 <= n < 2^31`: miniscript.h:2027 (after) and
+%% :2034 (older) reject `*num < 1 || *num >= 0x80000000L`. For older() bit 31
+%% (0x80000000) collides with the BIP-68 disable flag; for after() it is outside
+%% the expressible locktime range. take_number/1 parses arbitrary-size Erlang
+%% bignums, so without the upper-bound guard an out-of-range value (e.g.
+%% older(2147483648)) would parse into the AST and then crash compute_type/1 with
+%% a function_clause (its older/after clauses guard `N < 16#80000000`); enforcing
+%% the bound here rejects it cleanly, exactly where Core does.
 parse_single_num(Name, Str, Constructor) ->
     case take_number(Str) of
-        {N, ")" ++ Remaining} when N >= 1 ->
+        {N, ")" ++ Remaining} when N >= 1, N < 16#80000000 ->
             {ok, Constructor(N), Remaining};
         _ ->
             {error, {invalid_args, Name}}

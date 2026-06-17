@@ -53,6 +53,37 @@ bip32_derive_path_test() ->
     ?assertEqual(ExpPriv, element(2, Final)),
     ?assertEqual(5, element(5, Final)).  % depth = 5
 
+%% BIP-32 depth-byte overflow guard. Bitcoin Core's CExtKey::Derive
+%% (key.cpp:483) and CExtPubKey::Derive (pubkey.cpp:416) both
+%% `if (nDepth == std::numeric_limits<unsigned char>::max()) return false;` —
+%% refuse to derive once the PARENT is already at depth 255, because the
+%% serialized BIP-32 depth byte (1 byte) cannot hold 256. Without the guard,
+%% derive_child/2 would silently emit a never-Core-emitted depth-256 child.
+%% This test walks a real chain to depth 255 (so depth-254 still derives to 255,
+%% no off-by-one), then asserts a 256th derive raises extkey_depth_overflow on
+%% BOTH the private and the public-only (neutered) parent. Mutation-proving the
+%% `ParentDepth >= 16#FF` guard in derive_child_retry/3.
+bip32_depth_overflow_test() ->
+    Seed = hex_to_bin("000102030405060708090a0b0c0d0e0f"),
+    Master = beamchain_wallet:master_from_seed(Seed),
+    %% Walk unhardened index 0 down to depth 254 (254 derives from depth 0).
+    Depth254 = lists:foldl(
+                 fun(_, K) -> beamchain_wallet:derive_child(K, 0) end,
+                 Master, lists:seq(1, 254)),
+    ?assertEqual(254, element(5, Depth254)),  % depth field
+    %% Depth-254 parent still derives cleanly to exactly depth 255.
+    Depth255 = beamchain_wallet:derive_child(Depth254, 0),
+    ?assertEqual(255, element(5, Depth255)),
+    %% Deriving from a depth-255 parent (private) must be refused.
+    ?assertError({extkey_depth_overflow, 255, _, _},
+                 beamchain_wallet:derive_child(Depth255, 0)),
+    %% And from a depth-255 public-only (neutered) parent: drop the private key
+    %% so the public-only clause is taken; the guard fires first regardless.
+    PubOnly255 = setelement(2, Depth255, undefined),
+    ?assertEqual(undefined, element(2, PubOnly255)),
+    ?assertError({extkey_depth_overflow, 255, _, _},
+                 beamchain_wallet:derive_child(PubOnly255, 0)).
+
 %% Test Vector 2: seed = 64 bytes (512 bits)
 bip32_test_vector_2_test() ->
     Seed = hex_to_bin(
