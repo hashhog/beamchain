@@ -846,3 +846,140 @@ g30_bug16_bug17_multisig_matcher_test_() ->
              binary:match(Src, <<"Acc =< 3">>))
        end)
      ]}.
+
+%%% ===================================================================
+%%% G31 — WITNESS_UNKNOWN: v1 witness program with a non-32-byte program
+%%%        (not P2TR, not P2A) is standard to CREATE (WITNESS_UNKNOWN) but
+%%%        non-standard to SPEND.  (rustoshi 269681b parity.)
+%%% ===================================================================
+
+g31_v1_witness_unknown_test_() ->
+    {"G31: WITNESS_UNKNOWN — Bitcoin Core's Solver (script/solver.cpp:172-176; "
+     "IsWitnessProgram script.cpp:249-263) classifies ANY valid witness program "
+     "with witnessversion != 0 as WITNESS_UNKNOWN once the canonical types "
+     "(P2WPKH/P2WSH v0, P2TR v1+32, P2A) are ruled out — this INCLUDES v1 "
+     "programs whose size is not 32. Such an output is STANDARD to create "
+     "(relay-forward-compat) but NON-standard to spend. A v0 program with a "
+     "non-{20,32} size is NONSTANDARD (Core solver.cpp:177).",
+     [
+      ?_test(begin
+         %% (a) OUTPUT (create) side: v1 16-byte program -> WITNESS_UNKNOWN.
+         %%     beamchain encodes WITNESS_UNKNOWN as {witness, Version}; the
+         %%     generic witness clause must cover OP_1 (0x51), not only
+         %%     OP_2..OP_16 — a v1/16 program is {witness, 1}, NOT nonstandard.
+         ?assertEqual({witness, 1},
+             beamchain_mempool:classify_output_standard(<<16#51, 16#10, 0:128>>)),
+         %% v1 33-byte program is also WITNESS_UNKNOWN (not P2TR's 32 bytes).
+         ?assertEqual({witness, 1},
+             beamchain_mempool:classify_output_standard(<<16#51, 16#21, 0:264>>)),
+         %% Control: v1/32 is P2TR, not witness-unknown.
+         ?assertEqual(p2tr,
+             beamchain_mempool:classify_output_standard(<<16#51, 16#20, 0:256>>)),
+         %% Control: a v0 program with a non-{20,32} size is NONSTANDARD
+         %% (Core does NOT promote v0-non-canonical to WITNESS_UNKNOWN).
+         ?assertEqual(nonstandard,
+             beamchain_mempool:classify_output_standard(<<16#00, 16#10, 0:128>>)),
+
+         %% End-to-end (create): a tx whose sole output is a v1 16-byte witness
+         %% program must be admitted as standard (WITNESS_UNKNOWN), NOT rejected
+         %% with `scriptpubkey`.
+         V1Unknown = <<16#51, 16#10, 0:128>>,  %% OP_1 OP_PUSHBYTES_16 <16 bytes>
+         ?assertEqual(18, byte_size(V1Unknown)),
+         TxOut = make_tx_with_output(2, V1Unknown, 100000),
+         ?assertEqual(ok, beamchain_mempool:check_standard(TxOut)),
+
+         %% (b) INPUT (spend) side: the same v1 16-byte prevout is NON-standard
+         %%     to spend -> bad-txns-nonstandard-inputs (Core ValidateInputs).
+         TxSpend = #transaction{
+             version = 2,
+             inputs = [#tx_in{prev_out = #outpoint{hash = <<1:256>>, index = 0},
+                              script_sig = <<>>,
+                              sequence = 16#ffffffff,
+                              witness = []}],
+             outputs = [#tx_out{value = 100000,
+                                script_pubkey = <<16#76, 16#a9, 16#14, 0:160,
+                                                   16#88, 16#ac>>}],
+             locktime = 0,
+             txid = undefined,
+             wtxid = undefined},
+         Coin = #utxo{value = 200000, script_pubkey = V1Unknown,
+                      is_coinbase = false, height = 1},
+         ?assertEqual({error, 'bad-txns-nonstandard-inputs'},
+             beamchain_mempool:validate_inputs_standardness(TxSpend, [Coin]))
+       end)
+     ]}.
+
+%%% ===================================================================
+%%% G32 — bare-multisig matcher decodes PUSHDATA1/2/4-prefixed pubkey pushes
+%%%        (Core MatchMultisig via GetScriptOp + CPubKey::ValidSize).
+%%%        (rustoshi a11cdd4 parity.)
+%%% ===================================================================
+
+g32_multisig_pushdata_pubkeys_test_() ->
+    {"G32: bare-multisig matcher — Bitcoin Core's MatchMultisig "
+     "(script/solver.cpp:85-105) reads each key with script.GetOp(it, opcode, "
+     "data) (PUSHDATA-aware GetScriptOp) and accepts it iff CPubKey::ValidSize "
+     "(decoded payload 33 or 65 bytes). beamchain's input-side multisig tail "
+     "matcher must therefore accept OP_PUSHDATA1/2/4-prefixed pubkey pushes, not "
+     "only the direct 0x21 / 0x41 push opcodes. Relay standardness only.",
+     [
+      ?_test(begin
+         Tx = #transaction{
+             version = 2,
+             inputs = [#tx_in{prev_out = #outpoint{hash = <<1:256>>, index = 0},
+                              script_sig = <<>>,
+                              sequence = 16#ffffffff,
+                              witness = []}],
+             outputs = [#tx_out{value = 100000,
+                                script_pubkey = <<16#76, 16#a9, 16#14, 0:160,
+                                                   16#88, 16#ac>>}],
+             locktime = 0,
+             txid = undefined,
+             wtxid = undefined},
+         Pk1 = binary:copy(<<16#aa>>, 33),
+         Pk2 = binary:copy(<<16#bb>>, 33),
+
+         %% (a) 1-of-1 with an OP_PUSHDATA1-prefixed 33-byte pubkey:
+         %%     OP_1 OP_PUSHDATA1 0x21 <33B> OP_1 OP_CHECKMULTISIG.
+         %%     Core relays this as standard MULTISIG -> spend is standard.
+         %%     PRE-FIX this fell through to bad-txns-nonstandard-inputs.
+         MS_pd1 = <<16#51, 16#4c, 16#21, Pk1/binary, 16#51, 16#ae>>,
+         Coin1 = #utxo{value = 200000, script_pubkey = MS_pd1,
+                       is_coinbase = false, height = 1},
+         ?assertEqual(ok,
+             beamchain_mempool:validate_inputs_standardness(Tx, [Coin1])),
+
+         %% (b) 1-of-2 with both pubkeys OP_PUSHDATA1-prefixed (33B + 65B mix).
+         Pk65 = binary:copy(<<16#cc>>, 65),
+         MS_pd_mix = <<16#51,
+                       16#4c, 16#21, Pk1/binary,    %% PUSHDATA1 33-byte compressed
+                       16#4c, 16#41, Pk65/binary,   %% PUSHDATA1 65-byte uncompressed
+                       16#52,
+                       16#ae>>,
+         Coin2 = #utxo{value = 200000, script_pubkey = MS_pd_mix,
+                       is_coinbase = false, height = 1},
+         ?assertEqual(ok,
+             beamchain_mempool:validate_inputs_standardness(Tx, [Coin2])),
+
+         %% (c) Parity control: the equivalent direct-push form is (and was)
+         %%     accepted — the fix did not change direct-push behaviour.
+         MS_direct = <<16#51, 16#21, Pk1/binary, 16#51, 16#ae>>,
+         CoinD = #utxo{value = 200000, script_pubkey = MS_direct,
+                       is_coinbase = false, height = 1},
+         ?assertEqual(ok,
+             beamchain_mempool:validate_inputs_standardness(Tx, [CoinD])),
+
+         %% (d) ValidSize control: an OP_PUSHDATA1 push of a NON-pubkey-size
+         %%     payload (32 bytes) is NOT a pubkey -> the whole script is not a
+         %%     bare multisig -> nonstandard. Proves the matcher keys on the
+         %%     33/65 ValidSize gate, not "accept any PUSHDATA push".
+         Bad32 = binary:copy(<<16#dd>>, 32),
+         MS_bad = <<16#51, 16#4c, 16#20, Bad32/binary, 16#51, 16#ae>>,
+         CoinBad = #utxo{value = 200000, script_pubkey = MS_bad,
+                         is_coinbase = false, height = 1},
+         ?assertEqual({error, 'bad-txns-nonstandard-inputs'},
+             beamchain_mempool:validate_inputs_standardness(Tx, [CoinBad])),
+         _ = Pk2,
+         ok
+       end)
+     ]}.
