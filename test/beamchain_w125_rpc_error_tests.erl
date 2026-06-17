@@ -67,6 +67,57 @@
 -include_lib("eunit/include/eunit.hrl").
 
 %%% ===================================================================
+%%% Net-RPC error-code parity fixtures (gates 8-11 below).
+%%%
+%%% These drive the real handlers via beamchain_rpc:handle_method/3 and
+%%% assert the EXACT Core JSON-RPC error code for each bad-input case.
+%%% They were ported from the rustoshi verified fixes:
+%%%   addnode add-dup / remove-not-added -> -23 / -24 (rustoshi 7b94ef1)
+%%%   setban invalid IP/subnet           -> -30       (rustoshi 980a31d)
+%%%   disconnectnode not-connected       -> -29       (rustoshi 845f7e4)
+%%% Reference: bitcoin-core/src/rpc/net.cpp + protocol.h:60-63.
+%%% ===================================================================
+
+%% Bring up beamchain_config (needed by parse_node_addr -> network_params)
+%% and create the peer-registry + added-node ETS tables the net handlers
+%% read. We deliberately do NOT start the beamchain_peer_manager gen_server:
+%% every bad-input path under test returns its error BEFORE any gen_server
+%% round-trip (dedup hit / empty added-list / empty peer table / parse fail).
+net_setup() ->
+    TestDir = "/tmp/beamchain_w125_test_" ++
+              integer_to_list(erlang:unique_integer([positive])),
+    os:putenv("BEAMCHAIN_NETWORK", "testnet4"),
+    os:putenv("BEAMCHAIN_DATADIR", TestDir),
+    {ok, ConfigPid} = beamchain_config:start_link(),
+    %% Live-peer registry (read by get_peers/0); empty => "not connected".
+    case ets:info(beamchain_peers) of
+        undefined ->
+            ets:new(beamchain_peers, [named_table, set, public,
+                                      {keypos, 2},
+                                      {read_concurrency, true}]);
+        _ -> ets:delete_all_objects(beamchain_peers)
+    end,
+    %% Added-node list (Core m_added_nodes); empty => "not added".
+    case ets:info(beamchain_added_nodes) of
+        undefined ->
+            ets:new(beamchain_added_nodes, [named_table, set, public,
+                                            {read_concurrency, true}]);
+        _ -> ets:delete_all_objects(beamchain_added_nodes)
+    end,
+    {ConfigPid, TestDir}.
+
+net_cleanup({ConfigPid, TestDir}) ->
+    catch ets:delete_all_objects(beamchain_peers),
+    catch ets:delete_all_objects(beamchain_added_nodes),
+    catch gen_server:stop(ConfigPid),
+    catch ets:delete(beamchain_config_ets),
+    os:cmd("rm -rf " ++ TestDir),
+    ok.
+
+rpc(Method, Params) ->
+    beamchain_rpc:handle_method(Method, Params, undefined).
+
+%%% ===================================================================
 %%% Gate 1 — Standard JSON-RPC core codes are PRESENT (5 codes).
 %%%
 %%% These five are the ones every conformant JSON-RPC 2.0 server MUST
@@ -259,41 +310,111 @@ sendrawtransaction_already_in_mempool_returns_minus27_test() ->
     ?assertNotEqual(CoreExpected, ExpectedCurrent).
 
 %%% ===================================================================
-%%% Gate 8 — addnode `add` failure emits -1 instead of -23.
+%%% Gate 8 — addnode `add` of an already-added node emits -23.
+%%%
+%%% PORTED FIX (rustoshi 7b94ef1): Core rpc/net.cpp:362 throws
+%%% RPC_CLIENT_NODE_ALREADY_ADDED (-23) "Error: Node already added" on a
+%%% duplicate add. We pre-seed the added-node list so the dedup fires on
+%%% the first call (before any connect/gen_server round-trip).
 %%% ===================================================================
 
-addnode_add_failure_emits_misc_error_test() ->
-    %% beamchain_rpc.erl:3540-3543: {error, Reason} -> RPC_MISC_ERROR.
-    %% Core: RPC_CLIENT_NODE_ALREADY_ADDED (-23).
-    ?assertNotEqual(-23, -1).
+addnode_add_already_added_emits_minus23_test_() ->
+    {setup, fun net_setup/0, fun net_cleanup/1,
+     fun(_) ->
+        [
+         {"duplicate addnode add -> -23 + Core message", fun() ->
+             Node = <<"1.2.3.4:48333">>,
+             %% Simulate the node already being on the added-node list.
+             true = ets:insert(beamchain_added_nodes, {Node}),
+             Res = rpc(<<"addnode">>, [Node, <<"add">>]),
+             ?assertMatch({error, -23, _}, Res),
+             {error, _, Msg} = Res,
+             ?assertEqual(<<"Error: Node already added">>, Msg)
+         end}
+        ]
+     end}.
 
 %%% ===================================================================
-%%% Gate 9 — addnode `remove` not-found emits -1 instead of -24.
+%%% Gate 9 — addnode `remove` of an un-added node emits -24.
+%%%
+%%% PORTED FIX (rustoshi 7b94ef1): Core rpc/net.cpp:368 throws
+%%% RPC_CLIENT_NODE_NOT_ADDED (-24) when the node was never added.
 %%% ===================================================================
 
-addnode_remove_not_found_emits_misc_error_test() ->
-    %% beamchain_rpc.erl:3559: "Node not found" -> RPC_MISC_ERROR.
-    %% Core: RPC_CLIENT_NODE_NOT_ADDED (-24).
-    ?assertNotEqual(-24, -1).
+addnode_remove_not_added_emits_minus24_test_() ->
+    {setup, fun net_setup/0, fun net_cleanup/1,
+     fun(_) ->
+        [
+         {"addnode remove of un-added node -> -24 + Core message", fun() ->
+             %% Empty added-node list (fresh fixture) => not added.
+             Res = rpc(<<"addnode">>, [<<"5.6.7.8:48333">>, <<"remove">>]),
+             ?assertMatch({error, -24, _}, Res),
+             {error, _, Msg} = Res,
+             ?assertEqual(<<"Error: Node could not be removed. "
+                            "It has not been added previously.">>, Msg)
+         end}
+        ]
+     end}.
 
 %%% ===================================================================
-%%% Gate 10 — disconnectnode not-connected emits -1 instead of -29.
+%%% Gate 10 — disconnectnode of a not-connected peer emits -29.
+%%%
+%%% PORTED FIX (rustoshi 845f7e4): Core rpc/net.cpp:478 throws
+%%% RPC_CLIENT_NODE_NOT_CONNECTED (-29) "Node not found in connected
+%%% nodes". The fresh fixture has an empty live-peer registry.
 %%% ===================================================================
 
-disconnectnode_not_connected_emits_misc_error_test() ->
-    %% beamchain_rpc.erl:3591: "Node not connected" -> RPC_MISC_ERROR.
-    %% Core: RPC_CLIENT_NODE_NOT_CONNECTED (-29).
-    ?assertNotEqual(-29, -1).
+disconnectnode_not_connected_emits_minus29_test_() ->
+    {setup, fun net_setup/0, fun net_cleanup/1,
+     fun(_) ->
+        [
+         {"disconnectnode of unconnected peer -> -29 + Core message", fun() ->
+             Res = rpc(<<"disconnectnode">>, [<<"9.9.9.9:48333">>]),
+             ?assertMatch({error, -29, _}, Res),
+             {error, _, Msg} = Res,
+             ?assertEqual(<<"Node not found in connected nodes">>, Msg)
+         end}
+        ]
+     end}.
 
 %%% ===================================================================
-%%% Gate 11 — setban invalid subnet emits -8 instead of -30.
+%%% Gate 11 — setban with an invalid IP/subnet emits -30.
+%%%
+%%% PORTED FIX (rustoshi 980a31d): Core rpc/net.cpp:780 throws
+%%% RPC_CLIENT_INVALID_IP_OR_SUBNET (-30) "Error: Invalid IP/Subnet" when
+%%% the subnet/IP cannot be parsed. (No config/peer-manager needed for
+%%% this path, but we reuse the fixture for symmetry.)
 %%% ===================================================================
 
-setban_invalid_subnet_emits_invalid_parameter_test() ->
-    %% beamchain_rpc.erl:3631, 3642: {error, Msg} from parse_subnet
-    %% -> RPC_INVALID_PARAMETER.  Core uses RPC_CLIENT_INVALID_IP_OR
-    %% _SUBNET (-30) for this specific failure mode.
-    ?assertNotEqual(-30, -8).
+setban_invalid_subnet_emits_minus30_test_() ->
+    {setup, fun net_setup/0, fun net_cleanup/1,
+     fun(_) ->
+        [
+         {"setban add with bad subnet -> -30 + Core message", fun() ->
+             Res = rpc(<<"setban">>,
+                       [<<"not-an-ip-address">>, <<"add">>]),
+             ?assertMatch({error, -30, _}, Res),
+             {error, _, Msg} = Res,
+             ?assertEqual(<<"Error: Invalid IP/Subnet">>, Msg)
+         end},
+         {"setban remove with bad subnet -> -30", fun() ->
+             Res = rpc(<<"setban">>,
+                       [<<"999.999.999.999">>, <<"remove">>]),
+             ?assertMatch({error, -30, _}, Res)
+         end},
+         {"WELL-FORMED IP parses (no -30) — bad COMMAND falls through to -8",
+          fun() ->
+             %% Guard against a fix that returns -30 unconditionally: with a
+             %% VALID IP the subnet-parse path is not taken, so an unknown
+             %% command reaches the command-validation clause (-8), never -30.
+             %% (Uses an unknown command so the handler never round-trips to
+             %% the peer-manager gen_server, which isn't running here.)
+             Res = rpc(<<"setban">>,
+                       [<<"203.0.113.7">>, <<"bogus-command">>]),
+             ?assertMatch({error, -8, _}, Res)
+         end}
+        ]
+     end}.
 
 %%% ===================================================================
 %%% Gate 12 — setban unban-failed emits -1 instead of -30.

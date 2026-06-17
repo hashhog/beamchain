@@ -221,6 +221,13 @@
 -define(RPC_VERIFY_REJECTED, -26).
 -define(RPC_VERIFY_ALREADY_IN_CHAIN, -27).
 -define(RPC_IN_WARMUP, -28).
+%% P2P client errors (bitcoin-core/src/rpc/protocol.h:60-63). Emitted by the
+%% net-management RPCs (addnode / disconnectnode / setban) for specific
+%% client-side failure modes Core distinguishes from the generic -1/-8.
+-define(RPC_CLIENT_NODE_ALREADY_ADDED, -23). %% Node is already added
+-define(RPC_CLIENT_NODE_NOT_ADDED, -24).     %% Node has not been added before
+-define(RPC_CLIENT_NODE_NOT_CONNECTED, -29). %% disconnect target not connected
+-define(RPC_CLIENT_INVALID_IP_OR_SUBNET, -30). %% Invalid IP/Subnet
 -define(RPC_WALLET_ALREADY_LOADED, -35).
 -define(RPC_WALLET_ALREADY_EXISTS, -36).
 
@@ -5613,28 +5620,54 @@ rpc_addnode([NodeStr, CommandStr]) when is_binary(NodeStr),
         <<"add">> ->
             case parse_node_addr(NodeStr) of
                 {ok, IP, Port} ->
-                    case beamchain_peer_manager:connect_to(IP, Port) of
-                        {ok, _Pid} -> {ok, null};
-                        {error, Reason} ->
-                            {error, ?RPC_MISC_ERROR,
-                             iolist_to_binary(io_lib:format("~p", [Reason]))}
+                    %% Core rpc/net.cpp:358-363: AddNode dedups on the added-node
+                    %% list and throws RPC_CLIENT_NODE_ALREADY_ADDED (-23) on a
+                    %% duplicate BEFORE opening any connection.
+                    case beamchain_peer_manager:add_added_node(NodeStr) of
+                        false ->
+                            {error, ?RPC_CLIENT_NODE_ALREADY_ADDED,
+                             <<"Error: Node already added">>};
+                        true ->
+                            %% Newly added: attempt the connection (preserves
+                            %% beamchain's existing eager-connect behavior).
+                            case beamchain_peer_manager:connect_to(IP, Port) of
+                                {ok, _Pid} -> {ok, null};
+                                {error, _Reason} ->
+                                    %% Core's AddNode succeeds even if the
+                                    %% connection can't be opened immediately
+                                    %% (the connect is retried in the bg). The
+                                    %% node stays on the added list -> still null.
+                                    {ok, null}
+                            end
                     end;
                 {error, Msg} ->
                     {error, ?RPC_INVALID_PARAMETER, Msg}
             end;
         <<"remove">> ->
-            %% Find and disconnect
             case parse_node_addr(NodeStr) of
                 {ok, IP, Port} ->
-                    Peers = beamchain_peer_manager:get_peers(),
-                    case lists:filter(fun(#{address := {PIP, PPort}}) ->
-                        PIP =:= IP andalso PPort =:= Port
-                    end, Peers) of
-                        [#{pid := Pid} | _] ->
-                            beamchain_peer_manager:disconnect_peer(Pid),
-                            {ok, null};
-                        [] ->
-                            {error, ?RPC_MISC_ERROR, <<"Node not found">>}
+                    %% Core rpc/net.cpp:365-369: RemoveAddedNode keys on the
+                    %% added-node list and throws RPC_CLIENT_NODE_NOT_ADDED (-24)
+                    %% when the node was never added.
+                    case beamchain_peer_manager:remove_added_node(NodeStr) of
+                        false ->
+                            {error, ?RPC_CLIENT_NODE_NOT_ADDED,
+                             <<"Error: Node could not be removed. "
+                               "It has not been added previously.">>};
+                        true ->
+                            %% Removed from the added list. Also drop any live
+                            %% connection to this address (preserves the prior
+                            %% disconnect-on-remove side effect).
+                            Peers = beamchain_peer_manager:get_peers(),
+                            lists:foreach(fun(#{address := {PIP, PPort},
+                                                pid := Pid}) ->
+                                case PIP =:= IP andalso PPort =:= Port of
+                                    true ->
+                                        beamchain_peer_manager:disconnect_peer(Pid);
+                                    false -> ok
+                                end
+                            end, Peers),
+                            {ok, null}
                     end;
                 {error, Msg} ->
                     {error, ?RPC_INVALID_PARAMETER, Msg}
@@ -5666,7 +5699,11 @@ rpc_disconnectnode([Address]) when is_binary(Address) ->
                     beamchain_peer_manager:disconnect_peer(Pid),
                     {ok, null};
                 [] ->
-                    {error, ?RPC_MISC_ERROR, <<"Node not connected">>}
+                    %% Core rpc/net.cpp:478 throws RPC_CLIENT_NODE_NOT_CONNECTED
+                    %% (-29, protocol.h:62) with this exact message when the
+                    %% disconnect target matches no connected node.
+                    {error, ?RPC_CLIENT_NODE_NOT_CONNECTED,
+                     <<"Node not found in connected nodes">>}
             end;
         {error, Msg} ->
             {error, ?RPC_INVALID_PARAMETER, Msg}
@@ -5705,8 +5742,12 @@ rpc_setban([Subnet, Command, BanTime]) when is_binary(Subnet),
                     end,
                     beamchain_peer_manager:set_ban(IP, Duration, <<"manual">>),
                     {ok, null};
-                {error, Msg} ->
-                    {error, ?RPC_INVALID_PARAMETER, Msg}
+                {error, _Msg} ->
+                    %% Core rpc/net.cpp:780 throws RPC_CLIENT_INVALID_IP_OR_SUBNET
+                    %% (-30, protocol.h:63) with this exact message when the
+                    %% subnet/IP fails to parse (before the add/remove branch).
+                    {error, ?RPC_CLIENT_INVALID_IP_OR_SUBNET,
+                     <<"Error: Invalid IP/Subnet">>}
             end;
         <<"remove">> ->
             case parse_subnet(Subnet) of
@@ -5716,8 +5757,9 @@ rpc_setban([Subnet, Command, BanTime]) when is_binary(Subnet),
                         {error, not_found} ->
                             {error, ?RPC_MISC_ERROR, <<"Error: Unban failed">>}
                     end;
-                {error, Msg} ->
-                    {error, ?RPC_INVALID_PARAMETER, Msg}
+                {error, _Msg} ->
+                    {error, ?RPC_CLIENT_INVALID_IP_OR_SUBNET,
+                     <<"Error: Invalid IP/Subnet">>}
             end;
         _ ->
             {error, ?RPC_INVALID_PARAMETER,

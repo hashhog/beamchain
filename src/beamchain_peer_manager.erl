@@ -60,6 +60,10 @@
          broadcast/3,
          announce_block/2,
          request_addresses/1,
+         %% addnode added-node list (Core m_added_nodes parity)
+         add_added_node/1,
+         remove_added_node/1,
+         get_added_nodes/0,
          %% Misbehavior and banning
          misbehaving/3,
          get_ban_list/0,
@@ -110,6 +114,14 @@
 -define(SERVER, ?MODULE).
 -define(PEER_TABLE, beamchain_peers).
 -define(BANNED_PEERS_TABLE, banned_peers).
+%% addnode added-node list (Bitcoin Core CConnman::m_added_nodes /
+%% m_added_node_params, net.cpp). The persistent operator INTENT to keep a
+%% peer connected, distinct from the live ?PEER_TABLE of currently-connected
+%% peers. `addnode add` records the normalized "host:port" string here and
+%% `addnode remove` deletes it; the dedup / absent checks back the -23 / -24
+%% RPC error codes. Public + owned by the manager so it survives peer churn,
+%% mirroring ?BANNED_PEERS_TABLE.
+-define(ADDED_NODES_TABLE, beamchain_added_nodes).
 -define(MISBEHAVIOR_TABLE, peer_misbehavior).
 
 %% Misbehavior scoring thresholds
@@ -472,6 +484,68 @@ set_ban(IP, Duration, Reason) ->
 clear_ban(IP) ->
     gen_server:call(?SERVER, {clear_ban, IP}).
 
+%% @doc Record a node string in the added-node list (addnode "add").
+%% Returns `true` if newly added, `false` if it was already present —
+%% mirroring Bitcoin Core CConnman::AddNode, which dedups on the node
+%% address and returns false on a duplicate (net.cpp). The RPC layer
+%% maps `false` to RPC_CLIENT_NODE_ALREADY_ADDED (-23).
+%%
+%% Pure ETS op on the public ?ADDED_NODES_TABLE; ets:insert_new/2 makes the
+%% dedup atomic without a gen_server round-trip.
+-spec add_added_node(binary() | string()) -> boolean().
+add_added_node(NodeStr) ->
+    ensure_added_nodes_table(),
+    Key = added_node_key(NodeStr),
+    ets:insert_new(?ADDED_NODES_TABLE, {Key}).
+
+%% @doc Remove a node string from the added-node list (addnode "remove").
+%% Returns `true` if it was present and removed, `false` if it was not in
+%% the list — mirroring Bitcoin Core CConnman::RemoveAddedNode, which
+%% returns false when the node was never added (net.cpp). The RPC layer
+%% maps `false` to RPC_CLIENT_NODE_NOT_ADDED (-24).
+-spec remove_added_node(binary() | string()) -> boolean().
+remove_added_node(NodeStr) ->
+    ensure_added_nodes_table(),
+    Key = added_node_key(NodeStr),
+    case ets:lookup(?ADDED_NODES_TABLE, Key) of
+        [{Key}] ->
+            ets:delete(?ADDED_NODES_TABLE, Key),
+            true;
+        [] ->
+            false
+    end.
+
+%% @doc Return the current added-node list as a list of node strings.
+-spec get_added_nodes() -> [binary()].
+get_added_nodes() ->
+    ensure_added_nodes_table(),
+    [K || {K} <- ets:tab2list(?ADDED_NODES_TABLE)].
+
+%% Normalize a node string to a stable binary key. The added-node list is
+%% keyed on the literal node string (Core keys on the AddedNodeParams
+%% address string), so we only normalize the Erlang term type to binary.
+added_node_key(NodeStr) when is_list(NodeStr) ->
+    list_to_binary(NodeStr);
+added_node_key(NodeStr) when is_binary(NodeStr) ->
+    NodeStr.
+
+%% Lazily create the public added-node ETS table if the owning manager
+%% hasn't started yet (mirrors the ?BANNED_PEERS_TABLE "already exists"
+%% guard in init/1, and lets the eunit suite drive the helpers offline).
+ensure_added_nodes_table() ->
+    case ets:info(?ADDED_NODES_TABLE) of
+        undefined ->
+            try
+                ets:new(?ADDED_NODES_TABLE,
+                        [named_table, set, public,
+                         {read_concurrency, true}])
+            catch
+                error:badarg -> ?ADDED_NODES_TABLE  %% lost a create race
+            end;
+        _ ->
+            ?ADDED_NODES_TABLE
+    end.
+
 %% @doc Update a peer's best known block height.
 %% Called when we receive headers or block announcements from a peer.
 -spec update_peer_height(pid(), non_neg_integer()) -> ok.
@@ -676,6 +750,9 @@ init([]) ->
         _ ->
             ok  %% table already exists (e.g., from tests)
     end,
+    %% Create the addnode added-node list table (Core m_added_nodes). Owned by
+    %% the manager so the operator's keep-connected intent survives peer churn.
+    ensure_added_nodes_table(),
     %% Seed the BIP-324 v2 per-address v1-only fallback cache here so the
     %% long-lived manager OWNS it.  ETS tables die with their owning
     %% process; if a short-lived dialing peer created it, a v1-only mark
