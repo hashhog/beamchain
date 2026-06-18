@@ -491,14 +491,98 @@ terminate(_Reason, State) ->
 %%% ===================================================================
 
 %% Find the height to start downloading from.
-%% Use the chainstate tip (last connected block) as the authoritative source.
+%%
+%% Normally this is the connected chainstate tip + 1 (linear IBD: the
+%% active header chain extends the connected tip). But when the active
+%% header chain has reorganised to a heavier fork that diverges from the
+%% connected chainstate BELOW the tip (Core: ActivateBestChain must
+%% disconnect to the fork point and connect the heavier branch), the
+%% connected tip is no longer an ancestor of the header tip. Downloading
+%% from connected-tip+1 then fetches header-chain blocks whose prev_hash
+%% is the fork's block, not the connected tip → bad_prevblk halt.
+%%
+%% In that case start from fork_point + 1 so the queue re-downloads the
+%% header-chain blocks across the fork; submit_block/1 (the side-branch +
+%% reorg dispatcher) flips the tip via reorganize/1 once the heavier
+%% branch is connected.
 find_start_height() ->
     case beamchain_chainstate:get_tip() of
-        {ok, {_Hash, TipHeight}} when TipHeight >= 0 ->
-            TipHeight + 1;
+        {ok, {TipHash, TipHeight}} when TipHeight >= 0 ->
+            ForkHeight = find_download_fork_height(TipHash, TipHeight),
+            case ForkHeight < TipHeight of
+                true ->
+                    logger:info("block_sync: active header chain diverges "
+                                "from connected tip ~B at fork ~B — "
+                                "starting fork-aware download from ~B",
+                                [TipHeight, ForkHeight, ForkHeight + 1]),
+                    ForkHeight + 1;
+                false ->
+                    %% Linear IBD: header chain extends the connected tip.
+                    TipHeight + 1
+            end;
         _ ->
             0
     end.
+
+%% Compute the fork point between the CONNECTED chainstate (TipHash at
+%% TipHeight) and the ACTIVE HEADER chain. Walk the connected chain
+%% backward by block-body prev_hash, decrementing the height counter; the
+%% highest height whose connected-chain hash is also the active-header-
+%% chain hash at that height is the fork point.
+%%
+%% In linear IBD the connected tip IS the active-header hash at TipHeight,
+%% so this returns TipHeight immediately (no walk) → callers treat it as
+%% "no fork" and behaviour is byte-identical to the old tip+1 path.
+%%
+%% NOTE: the walk MUST use get_block/1 (hash-keyed block bodies, never
+%% overwritten) and an explicit decrementing height — NOT
+%% get_block_index_by_hash/1. After a header reorg the hash→height reverse
+%% index still maps a stale chain's hash to its old height, but that
+%% height-keyed slot now holds the NEW active chain's block, so a
+%% by-hash lookup of a disconnected-chain block returns the wrong header.
+find_download_fork_height(TipHash, TipHeight) ->
+    case is_on_active_header_chain(TipHash, TipHeight) of
+        true ->
+            %% Connected tip is on the active header chain — no divergence.
+            TipHeight;
+        false ->
+            walk_connected_to_fork(TipHash, TipHeight)
+    end.
+
+%% Walk back along the connected chain (by block-body prev_hash) until we
+%% reach a block that is on the active header chain at its height. That
+%% height is the fork point. Returns -1 if the chain cannot be resolved
+%% (defensive; the caller then floors StartHeight at 0).
+walk_connected_to_fork(_Hash, H) when H < 0 ->
+    %% Walked below genesis without finding common ground (shouldn't
+    %% happen — genesis is shared by every chain). Fork at genesis.
+    0;
+walk_connected_to_fork(Hash, H) ->
+    case is_on_active_header_chain(Hash, H) of
+        true ->
+            H;
+        false ->
+            case beamchain_db:get_block(Hash) of
+                {ok, #block{header = #block_header{prev_hash = Prev}}} ->
+                    walk_connected_to_fork(Prev, H - 1);
+                not_found ->
+                    %% Connected-chain block body missing — cannot resolve
+                    %% the fork; signal "no usable fork point" so the
+                    %% caller floors StartHeight at 0.
+                    -1
+            end
+    end.
+
+%% True iff Hash is the active HEADER chain's hash at Height
+%% (beamchain_db:get_block_index/1 returns the active-chain header by
+%% height; after a header reorg it follows the heavier chain).
+is_on_active_header_chain(Hash, Height) when Height >= 0 ->
+    case beamchain_db:get_block_index(Height) of
+        {ok, #{hash := ActiveHash}} -> ActiveHash =:= Hash;
+        _ -> false
+    end;
+is_on_active_header_chain(_Hash, _Height) ->
+    false.
 
 %% Gather currently connected peers from peer_manager.
 gather_connected_peers() ->
@@ -922,21 +1006,42 @@ validate_sequential(State, 0) ->
 validate_sequential(#state{next_to_validate = NextH,
                             downloaded = Downloaded} = State, Remaining) ->
     %% Fast-forward: if next_to_validate is behind the chainstate tip,
-    %% skip directly to tip+1 (avoids re-downloading already-connected blocks)
+    %% skip directly to tip+1 (avoids re-downloading already-connected
+    %% blocks). But only over heights where the connected chainstate
+    %% AGREES with the active header chain — when the header chain has
+    %% reorganised to a heavier fork below the connected tip, the blocks
+    %% from fork_point+1 must be re-downloaded and reconnected via the
+    %% reorg path, so we must not fast-forward past the fork point.
     case beamchain_chainstate:get_tip() of
-        {ok, {_, TipH}} when TipH >= NextH ->
-            logger:info("block_sync: fast-forward next_to_validate "
-                        "from ~B to ~B (chainstate tip ahead)",
-                        [NextH, TipH + 1]),
-            StaleKeys = [K || K <- maps:keys(Downloaded), K =< TipH],
-            Downloaded2 = lists:foldl(fun maps:remove/2, Downloaded, StaleKeys),
-            Queue2 = [H || H <- State#state.download_queue, H > TipH],
-            State2 = State#state{
-                next_to_validate = TipH + 1,
-                downloaded = Downloaded2,
-                download_queue = Queue2
-            },
-            validate_sequential_inner(State2, Remaining);
+        {ok, {TipHash, TipH}} when TipH >= NextH ->
+            %% Highest height the connected chain still agrees with the
+            %% active header chain. == TipH in linear IBD (byte-identical
+            %% to the old behaviour); < TipH only on a divergent reorg.
+            ForkH = find_download_fork_height(TipHash, TipH),
+            FFTarget = min(TipH, ForkH),
+            case FFTarget >= NextH of
+                true ->
+                    logger:info("block_sync: fast-forward next_to_validate "
+                                "from ~B to ~B (chainstate tip ahead)",
+                                [NextH, FFTarget + 1]),
+                    StaleKeys = [K || K <- maps:keys(Downloaded),
+                                      K =< FFTarget],
+                    Downloaded2 = lists:foldl(fun maps:remove/2,
+                                              Downloaded, StaleKeys),
+                    Queue2 = [H || H <- State#state.download_queue,
+                                   H > FFTarget],
+                    State2 = State#state{
+                        next_to_validate = FFTarget + 1,
+                        downloaded = Downloaded2,
+                        download_queue = Queue2
+                    },
+                    validate_sequential_inner(State2, Remaining);
+                false ->
+                    %% next_to_validate is already at or past the fork
+                    %% point (fork-aware re-download in progress) — do
+                    %% not fast-forward over the divergent region.
+                    validate_sequential_inner(State, Remaining)
+            end;
         _ ->
             validate_sequential_inner(State, Remaining)
     end.
@@ -946,7 +1051,37 @@ validate_sequential_inner(#state{next_to_validate = NextH,
     case maps:find(NextH, Downloaded) of
         {ok, Block} ->
             case validate_and_connect(NextH, Block, State) of
-                {ok, State2} ->
+                {ok, Outcome, State2} ->
+                    %% All three success outcomes advance the sequential
+                    %% cursor (the block was durably accepted at NextH);
+                    %% Outcome only controls logging + whether the active-
+                    %% chain post-steps ran inside validate_and_connect:
+                    %%   active      — extended the active tip (linear IBD or
+                    %%                 a direct extension accepted by submit).
+                    %%   reorg       — this block's branch overtook the active
+                    %%                 chain; the tip flipped to the heavier
+                    %%                 fork (Core ActivateBestChain). Advance
+                    %%                 and continue connecting its descendants.
+                    %%   side_branch — the fork is still building up BELOW the
+                    %%                 active tip (not yet heavier). The block
+                    %%                 is stored on the side-branch index; we
+                    %%                 advance WITHOUT requiring it to connect
+                    %%                 to the active tip, so the next fork block
+                    %%                 can be fetched and submitted until one
+                    %%                 tips the work balance and triggers the
+                    %%                 reorg above.
+                    case Outcome of
+                        active ->
+                            ok;
+                        reorg ->
+                            logger:info("block_sync: reorg at height ~B — "
+                                        "active tip flipped to the heavier "
+                                        "branch", [NextH]);
+                        side_branch ->
+                            logger:info("block_sync: height ~B accepted on a "
+                                        "side branch below the active tip "
+                                        "(fork still building)", [NextH])
+                    end,
                     %% Remove from downloaded, advance counter
                     Downloaded2 = maps:remove(NextH, State2#state.downloaded),
                     State3 = State2#state{
@@ -1017,15 +1152,30 @@ validate_and_connect(Height, Block,
                      #state{params = Params,
                             assume_valid = AssumeValid,
                             assume_valid_height = AVHeight} = State) ->
+    PrevHash = (Block#block.header)#block_header.prev_hash,
     try
         %% 0. Guard against replaying a block that was already connected
         %%    (e.g. after a gen_server call timeout where the chainstate
         %%    processed the block but the caller didn't see the reply).
-        case beamchain_chainstate:get_tip() of
-            {ok, {_, TipH}} when TipH >= Height ->
-                logger:info("block_sync: height ~B already connected "
-                            "(tip=~B), skipping ahead", [Height, TipH]),
-                throw(already_connected);
+        %%    Only fires when the connected tip is itself on the active
+        %%    header chain — in a divergent reorg (the connected tip is a
+        %%    stale fork below the active header tip) the height-based
+        %%    "already connected" shortcut is wrong: the fork-chain blocks
+        %%    being re-downloaded from fork_point+1 genuinely need to be
+        %%    connected via the reorg path even though their heights are
+        %%    <= the (stale) connected tip height.
+        TipInfo = beamchain_chainstate:get_tip(),
+        case TipInfo of
+            {ok, {TipHash0, TipH}} when TipH >= Height ->
+                case is_on_active_header_chain(TipHash0, TipH) of
+                    true ->
+                        logger:info("block_sync: height ~B already "
+                                    "connected (tip=~B), skipping ahead",
+                                    [Height, TipH]),
+                        throw(already_connected);
+                    false ->
+                        ok
+                end;
             _ -> ok
         end,
 
@@ -1035,29 +1185,76 @@ validate_and_connect(Height, Block,
             {error, E1} -> throw(E1)
         end,
 
-        %% 2. Connect block via chainstate (validation + UTXO update + tip)
-        case beamchain_chainstate:connect_block(Block) of
-            ok -> ok;
-            {error, E2} -> throw(E2)
+        %% 2. Connect block. If it extends the connected tip (linear IBD,
+        %%    the common case) use connect_block/1 — the fast path, exactly
+        %%    as before. Otherwise the block is on a heavier fork that
+        %%    diverges below the connected tip; route through submit_block/1,
+        %%    the side-branch + reorg dispatcher (Core ActivateBestChain:
+        %%    disconnect to the fork point, connect the heavier branch).
+        %%
+        %%    Outcome (an atom) records which active-chain post-processing is
+        %%    required and is surfaced to validate_sequential_inner:
+        %%      active      — block is now the active tip at this height
+        %%                    (linear connect_block, or submit_block accepted
+        %%                    it as a direct extension of the active tip)
+        %%      reorg       — a side branch overtook the active chain and the
+        %%                    tip flipped to it (Core ActivateBestChain)
+        %%      side_branch — stored on a (not-yet-heavier) side branch; the
+        %%                    body + side-branch index are durably persisted
+        %%                    by submit_block, but the block is NOT on the
+        %%                    active chain at this height, so the active-chain
+        %%                    post-steps (3-5 below) must be SKIPPED — running
+        %%                    them would index this fork block's txs and rewrite
+        %%                    the height-keyed status of the *active* chain's
+        %%                    block at this height, corrupting both.
+        ConnectedTipHash = case TipInfo of
+            {ok, {THash, _}} -> THash;
+            _ -> undefined
+        end,
+        Outcome = case PrevHash =:= ConnectedTipHash of
+            true ->
+                case beamchain_chainstate:connect_block(Block) of
+                    ok -> active;
+                    {error, E2} -> throw(E2)
+                end;
+            false ->
+                %% Non-extending block — dispatch to the reorg-aware path.
+                case beamchain_chainstate:submit_block(Block) of
+                    {ok, active}      -> active;
+                    {ok, reorg}       -> reorg;
+                    {ok, side_branch} -> side_branch;
+                    {error, E2}       -> throw(E2)
+                end
         end,
 
-        %% 3. Store the block
-        ok = beamchain_db:store_block(Block, Height),
+        %% 3-5. Active-chain post-processing. Only valid when the block is
+        %% now on the active chain at Height (active / reorg). For a
+        %% side_branch the block is durably stored by submit_block but lives
+        %% below the active tip on a fork, so we must not touch the active
+        %% height-keyed index / tx-index slots.
+        case Outcome of
+            side_branch ->
+                ok;
+            _ ->
+                %% 3. Store the block
+                ok = beamchain_db:store_block(Block, Height),
 
-        %% 4. Store tx index entries
-        store_tx_index(Block, Height),
+                %% 4. Store tx index entries
+                store_tx_index(Block, Height),
 
-        %% 5. Update block_index status to fully validated (status=2).
-        %% direct_atomic_connect_writes already stored the entry with the
-        %% correct NTx count; re-read and preserve it so we don't clobber
-        %% it with the default-zero written by store_block_index/5.
-        case beamchain_db:get_block_index(Height) of
-            {ok, #{hash := BH, header := Hdr, chainwork := CW, n_tx := NTx}} ->
-                beamchain_db:store_block_index(Height, BH, Hdr, CW, 2, NTx);
-            {ok, #{hash := BH, header := Hdr, chainwork := CW}} ->
-                beamchain_db:store_block_index(Height, BH, Hdr, CW, 2);
-            not_found ->
-                ok
+                %% 5. Update block_index status to fully validated (status=2).
+                %% direct_atomic_connect_writes already stored the entry with
+                %% the correct NTx count; re-read and preserve it so we don't
+                %% clobber it with the default-zero written by
+                %% store_block_index/5.
+                case beamchain_db:get_block_index(Height) of
+                    {ok, #{hash := BH, header := Hdr, chainwork := CW, n_tx := NTx}} ->
+                        beamchain_db:store_block_index(Height, BH, Hdr, CW, 2, NTx);
+                    {ok, #{hash := BH, header := Hdr, chainwork := CW}} ->
+                        beamchain_db:store_block_index(Height, BH, Hdr, CW, 2);
+                    not_found ->
+                        ok
+                end
         end,
 
         %% 6. Log checkpoint every UTXO_FLUSH_INTERVAL blocks
@@ -1076,7 +1273,7 @@ validate_and_connect(Height, Block,
                 ok
         end,
 
-        {ok, State}
+        {ok, Outcome, State}
     catch
         throw:already_connected ->
             %% Re-query tip to find skip target (catch vars are unsafe)
