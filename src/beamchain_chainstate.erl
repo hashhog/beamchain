@@ -1426,12 +1426,23 @@ do_side_branch_accept_with_parent(#block{header = Header} = Block,
                                    ParentEntry,
                                    #state{params = Params} = State) ->
     BlockHash = beamchain_serialize:block_hash(Header),
-    %% Idempotency: if the block is already in the active or side-branch
-    %% index, it's a no-op.  Mirrors Core's "AlreadyHaveBlock" check.
-    case is_block_known(BlockHash) of
+    %% Idempotency: skip ONLY when the block's BODY is already stored
+    %% (BLOCK_HAVE_DATA) — i.e. it was actually connected/activated.
+    %% Mirrors Core's AlreadyHaveBlock (validation.cpp), which gates on
+    %% BLOCK_HAVE_DATA, NOT header presence.  Header-first P2P sync
+    %% pre-populates the active height-keyed index with the HEADERS of a
+    %% heavier competing chain (status=BLOCK_VALID_HEADER, body absent)
+    %% BEFORE its bodies arrive over P2P; the old header-presence check
+    %% (any index hit) then short-circuited every fork block to
+    %% {ok, side_branch} and never reached maybe_reorg_to_side_branch's
+    %% work comparison, so a P2P-delivered heavier chain whose headers
+    %% were already synced could never flip the tip (the reorg-drop
+    %% blocker).  Checking HAVE_DATA lets the body-arrival run the reorg
+    %% evaluation while still being idempotent for genuinely-connected
+    %% blocks.
+    case block_already_has_body(BlockHash) of
         true ->
-            %% Block was already accepted; no reorg evaluation needed —
-            %% if it was going to flip the tip, that already happened.
+            %% Body already stored + connected — genuinely a no-op.
             {ok, side_branch, State};
         false ->
             ParentHeight = maps:get(height, ParentEntry),
@@ -1479,14 +1490,18 @@ lookup_block_index_anywhere(Hash) ->
             end
     end.
 
-is_block_known(Hash) ->
-    case beamchain_db:get_block_index_by_hash(Hash) of
-        {ok, _} -> true;
+%% True only when the block's BODY is already stored (BLOCK_HAVE_DATA set),
+%% as opposed to merely having its HEADER in some index.  Header-first sync
+%% writes headers with status=BLOCK_VALID_HEADER (no HAVE_DATA); a connected
+%% block carries BLOCK_VALID_SCRIPTS|HAVE_DATA|HAVE_UNDO.  Gating idempotency
+%% on the body (Core AlreadyHaveBlock, validation.cpp) lets a body arriving
+%% for an already-known header still run the work comparison + reorg.
+block_already_has_body(Hash) ->
+    case lookup_block_index_anywhere(Hash) of
+        {ok, Entry} ->
+            (maps:get(status, Entry, 0) band ?BLOCK_HAVE_DATA) =/= 0;
         not_found ->
-            case beamchain_db:get_side_branch_index(Hash) of
-                {ok, _} -> true;
-                not_found -> false
-            end
+            false
     end.
 
 %% Pad/encode a chainwork bignum to a 32-byte big-endian binary,
