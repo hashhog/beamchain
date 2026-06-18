@@ -1576,7 +1576,7 @@ active_tip_chainwork(TipHash) ->
 %% (in do_connect_block_inner), so the side-branch index entries for
 %% the now-active blocks are stale and should be removed.
 do_promote_side_branch(NewTipHash, State) ->
-    case build_side_branch_chain_to_active(NewTipHash) of
+    case build_side_branch_chain_to_active(NewTipHash, State#state.tip_hash) of
         {ok, []} ->
             %% Already on the active chain.  Shouldn't happen given
             %% the chainwork comparison above, but defend anyway.
@@ -1632,14 +1632,22 @@ do_promote_side_branch(NewTipHash, State) ->
 %% until we find a hash that's on the active chain (i.e. its hash
 %% matches the active block_index entry at its height).  Returns the
 %% blocks in fork→tip order, loaded from cf_blocks.
-build_side_branch_chain_to_active(StartHash) ->
-    build_side_branch_chain_to_active(StartHash, []).
+build_side_branch_chain_to_active(StartHash, ConnTipHash) ->
+    build_side_branch_chain_to_active(StartHash, ConnTipHash, []).
 
-build_side_branch_chain_to_active(Hash, Acc) ->
+build_side_branch_chain_to_active(Hash, ConnTipHash, Acc) ->
     case beamchain_db:get_block(Hash) of
         {ok, Block} ->
             PrevHash = (Block#block.header)#block_header.prev_hash,
-            case is_on_active_chain(PrevHash) of
+            %% Fork point = the first ancestor on the CONNECTED chain.  We must
+            %% navigate the connected chain (reachable from the chainstate tip
+            %% via block bodies), NOT the height-keyed active block index:
+            %% header-first sync overwrites that index with a heavier
+            %% not-yet-connected competing chain BEFORE the chainstate switches,
+            %% so is_on_active_chain/1 (which reads it) would report the
+            %% unconnected fork itself as "active" and stop the walk at a bogus
+            %% fork point (the reorg_walk_failed / ForkPointNotInIndex bug).
+            case is_on_connected_chain(PrevHash, ConnTipHash) of
                 true ->
                     %% Found fork point — PrevHash is the last common
                     %% ancestor.  Acc was prepended on each recursion
@@ -1653,7 +1661,7 @@ build_side_branch_chain_to_active(Hash, Acc) ->
                     case lookup_block_index_anywhere(PrevHash) of
                         {ok, _} ->
                             build_side_branch_chain_to_active(
-                              PrevHash, [Block | Acc]);
+                              PrevHash, ConnTipHash, [Block | Acc]);
                         not_found ->
                             %% Broken chain — parent gone.
                             {error, {broken_chain, PrevHash}}
@@ -1661,6 +1669,37 @@ build_side_branch_chain_to_active(Hash, Acc) ->
             end;
         not_found ->
             {error, {block_data_missing, Hash}}
+    end.
+
+%% True iff Hash is on the CONNECTED chain — reachable from the chainstate tip
+%% ConnTipHash by walking block bodies' prev_hash (bounded by MAX_REORG_DEPTH).
+%% Block bodies (get_block, hash-keyed in CF_BLOCKS) are never overwritten by
+%% header acceptance, so unlike is_on_active_chain/1 (height-keyed active
+%% index) this stays correct after header-first sync has repointed the active
+%% header chain at a heavier not-yet-connected competing chain.  Genesis is
+%% recognised as the prev_hash of the deepest walkable connected block (its
+%% body may be absent from CF_BLOCKS) and via the all-zero pre-genesis sentinel.
+is_on_connected_chain(<<0:256>>, _ConnTipHash) ->
+    true;
+is_on_connected_chain(Hash, ConnTipHash) ->
+    walk_connected_chain(ConnTipHash, Hash, 0).
+
+walk_connected_chain(_Cur, _Target, Depth) when Depth > ?MAX_REORG_DEPTH + 1 ->
+    false;
+walk_connected_chain(Cur, Target, _Depth) when Cur =:= Target ->
+    true;
+walk_connected_chain(Cur, Target, Depth) ->
+    case beamchain_db:get_block(Cur) of
+        {ok, Block} ->
+            Prev = (Block#block.header)#block_header.prev_hash,
+            %% Catch genesis here: the deepest connected block's prev is the
+            %% genesis hash, whose body may be absent from CF_BLOCKS (so the
+            %% next get_block would fail) — recognise it as on-chain.
+            if Prev =:= Target -> true;
+               true -> walk_connected_chain(Prev, Target, Depth + 1)
+            end;
+        not_found ->
+            false
     end.
 
 %% A hash is on the active chain iff the height-indexed entry for its
@@ -1892,12 +1931,20 @@ count_disconnect_depth(_ForkHash, _Hash, Depth) when Depth > ?MAX_REORG_DEPTH ->
     {ok, Depth};
 count_disconnect_depth(_ForkHash, undefined, _Depth) ->
     {error, fork_point_not_found_in_active_chain};
+count_disconnect_depth(_ForkHash, <<0:256>>, _Depth) ->
+    {error, fork_point_not_found_in_active_chain};
 count_disconnect_depth(ForkHash, Hash, Depth) ->
-    case beamchain_db:get_block_index_by_hash(Hash) of
-        {ok, #{header := #block_header{prev_hash = Prev}}} ->
+    %% Walk the CONNECTED chain from the chainstate tip via block bodies
+    %% (get_block, hash-keyed), NOT the height-keyed active index which
+    %% header-first sync may have repointed at the competing chain.  The
+    %% ForkHash match (clause 1) fires before we ever get_block the fork point
+    %% itself, so a genesis fork point (whose body may be absent) is fine.
+    case beamchain_db:get_block(Hash) of
+        {ok, Block} ->
+            Prev = (Block#block.header)#block_header.prev_hash,
             count_disconnect_depth(ForkHash, Prev, Depth + 1);
         not_found ->
-            {error, {missing_block_index, Hash}}
+            {error, {missing_block, Hash}}
     end.
 
 %% Run the multi-block disconnect+reconnect under a single atomic
