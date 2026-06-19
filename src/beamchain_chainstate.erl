@@ -712,10 +712,57 @@ init_chainstate(Role, SnapshotData) ->
                                    [Reason]),
                     State0
             end;
+        {main, _} ->
+            %% Crash recovery (roll-forward). beamchain persists the chain_tip +
+            %% UTXO to rocksdb only on the periodic do_flush cadence (every
+            %% ~5000 blocks / 450MB pressure) — the UTXO working set lives in
+            %% volatile ETS and set_chain_tip has no per-block caller. So an
+            %% unclean exit (SIGKILL/OOM/power loss) leaves the durable chain_tip
+            %% BEHIND the block bodies + block_index, which ARE WAL-backed and
+            %% reach the crash height. Without this, the node boots to the last
+            %% flush (near genesis) and re-downloads the gap from peers. Replay
+            %% the persisted blocks forward through the normal validation path —
+            %% UTXO reads fall through to rocksdb on the cleared ETS cache
+            %% (beamchain_chainstate:get_utxo/2). Mirrors Bitcoin Core
+            %% ReplayBlocks/RollforwardBlock in LoadChainTip (node/chainstate.cpp).
+            Recovered = roll_forward_from_disk(State0),
+            case Recovered#state.tip_height > State0#state.tip_height of
+                true ->
+                    logger:info("chainstate: crash recovery rolled forward ~B "
+                                "block(s) from disk; tip now at height ~B",
+                                [Recovered#state.tip_height - State0#state.tip_height,
+                                 Recovered#state.tip_height]),
+                    %% Make the recovered tip + UTXO durable now so a second
+                    %% crash does not repeat the replay.
+                    do_flush(Recovered);
+                false ->
+                    Recovered
+            end;
         _ ->
             State0
     end,
     {ok, State1}.
+
+%% roll_forward_from_disk/1 — re-connect block bodies persisted ahead of the
+%% loaded (flushed) chain tip, one height at a time, through do_connect_block.
+%% do_connect_block gates on prev_hash =:= tip, so it naturally stops at a gap
+%% or a side-branch; per-block disk writes are overwrite-by-key, so re-applying
+%% the partially-written tail is idempotent. Stops when no contiguous block
+%% remains or a connect fails to advance the tip.
+roll_forward_from_disk(State) ->
+    Next = State#state.tip_height + 1,
+    case beamchain_db:get_block_by_height(Next) of
+        {ok, Block} ->
+            case do_connect_block(Block, State) of
+                {ok, State2}
+                  when State2#state.tip_height > State#state.tip_height ->
+                    roll_forward_from_disk(State2);
+                _ ->
+                    State
+            end;
+        not_found ->
+            State
+    end.
 
 handle_call(get_mtp, _From, #state{mtp_timestamps = Ts} = State) ->
     {reply, compute_mtp(Ts), State};
