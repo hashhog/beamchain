@@ -675,8 +675,11 @@ init_chainstate(Role, SnapshotData) ->
         _ -> load_mtp_timestamps(TipHeight)
     end,
 
-    %% Start with large cache for IBD, shrink when caught up
-    MaxCacheMB = ?IBD_MAX_CACHE_MB,
+    %% Start with large cache for IBD, shrink when caught up. The IBD ETS
+    %% byte budget is the dbcache total minus the RocksDB coins-block-cache
+    %% portion; with --dbcache unset it reproduces the historical literal
+    %% (?IBD_MAX_CACHE_MB). PERF-ONLY (see _classB-beamchain-plan §6).
+    MaxCacheMB = ibd_ets_budget_mb(),
     logger:info("chainstate (~p): initialized at height ~B (cache ~BMB)",
                 [Role, TipHeight, MaxCacheMB]),
 
@@ -687,7 +690,7 @@ init_chainstate(Role, SnapshotData) ->
         params = Params,
         blocks_since_flush = 0,
         max_cache_bytes = MaxCacheMB * 1024 * 1024,
-        max_cache_entries = ?DEFAULT_MAX_CACHE_ENTRIES,
+        max_cache_entries = ibd_max_cache_entries(MaxCacheMB),
         cache_usage_bytes = 0,
         ibd = true,
         chainstate_role = Role,
@@ -2144,6 +2147,42 @@ hash_hex(_) -> "???".
 %%% ===================================================================
 %%% Internal: UTXO cache flush
 %%% ===================================================================
+
+%% PERF-ONLY dbcache sizing (CORE-PARITY-AUDIT/_classB-beamchain-plan-2026-06-22.md).
+%% These derive the IBD ETS budget from the operator's --dbcache total, or
+%% fall back to the historical compile-time literals when --dbcache is unset.
+%% None of this affects validation results — only flush cadence / RSS.
+
+%% RocksDB coins block-cache portion of the dbcache budget, in MiB.
+%% Kept in sync with beamchain_db:effective_coins_db_cache_bytes/0 (same formula).
+-define(DBCACHE_ROCKSDB_DEFAULT_MB, 256).   %% == legacy COINS_DB_CACHE_BYTES
+
+dbcache_rocksdb_mb() ->
+    case beamchain_config:dbcache_mb() of
+        undefined -> ?DBCACHE_ROCKSDB_DEFAULT_MB;
+        N ->
+            Quarter = N div 4,
+            min(1024, max(64, Quarter))
+    end.
+
+%% IBD ETS flush byte budget, in MiB = dbcache total minus the RocksDB
+%% portion. Unset --dbcache reproduces ?IBD_MAX_CACHE_MB (4096).
+ibd_ets_budget_mb() ->
+    case beamchain_config:dbcache_mb() of
+        undefined -> ?IBD_MAX_CACHE_MB;
+        N ->
+            Ets = N - dbcache_rocksdb_mb(),
+            max(64, Ets)   %% never let the ETS budget collapse below 64 MiB
+    end.
+
+%% Entry-count flush trigger scaled to the ETS byte budget (~150 B/entry,
+%% per the DEFAULT_MAX_CACHE_ENTRIES comment at line 106). Unset --dbcache
+%% reproduces ?DEFAULT_MAX_CACHE_ENTRIES (10M).
+ibd_max_cache_entries(EtsBudgetMB) ->
+    case beamchain_config:dbcache_mb() of
+        undefined -> ?DEFAULT_MAX_CACHE_ENTRIES;
+        _ -> (EtsBudgetMB * 1024 * 1024) div 150
+    end.
 
 %% Decide whether to flush based on IBD interval, entry count, or memory size.
 maybe_flush(#state{ibd = true, blocks_since_flush = N,

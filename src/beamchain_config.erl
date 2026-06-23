@@ -19,6 +19,7 @@
          prune_enabled/0,
          prune_target/0,
          prune_manual_mode/0,
+         dbcache_mb/0,
          mempool_full_rbf/0,
          txreconciliation/0,
          zmq_enabled/0,
@@ -176,6 +177,33 @@ prune_target_raw() ->
                 N when is_integer(N), N >= 0 -> N;
                 _ -> 0
             end
+    end.
+
+%% @doc Operator-requested total UTXO dbcache budget in MiB, or `undefined`
+%% when unset (caller then keeps its compile-time default). Mirrors Bitcoin
+%% Core's -dbcache. Precedence: BEAMCHAIN_DBCACHE env var (set by --dbcache via
+%% beamchain_cli:apply_opts/1) > config-file `dbcache=<mb>` > undefined.
+%% PERF-ONLY: sizes caches in front of the authoritative RocksDB coins store;
+%% does not change any validation result (see
+%% CORE-PARITY-AUDIT/_classB-beamchain-plan-2026-06-22.md §6).
+-spec dbcache_mb() -> non_neg_integer() | undefined.
+dbcache_mb() ->
+    Parse = fun(S) ->
+        case catch list_to_integer(S) of
+            N when is_integer(N), N > 0 -> N;
+            _ -> undefined
+        end
+    end,
+    case os:getenv("BEAMCHAIN_DBCACHE") of
+        false ->
+            case get(dbcache, undefined) of
+                undefined -> undefined;
+                S when is_list(S) -> Parse(S);
+                N when is_integer(N), N > 0 -> N;
+                _ -> undefined
+            end;
+        S ->
+            Parse(S)
     end.
 
 %% @doc Check if full RBF is enabled.
