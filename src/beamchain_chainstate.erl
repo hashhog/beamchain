@@ -2146,9 +2146,33 @@ hash_hex(_) -> "???".
 %%% ===================================================================
 
 %% Decide whether to flush based on IBD interval, entry count, or memory size.
-maybe_flush(#state{ibd = true, blocks_since_flush = N} = State)
-  when N >= ?IBD_FLUSH_INTERVAL ->
-    do_flush(State);
+maybe_flush(#state{ibd = true, blocks_since_flush = N,
+                   max_cache_bytes = MaxBytes,
+                   max_cache_entries = MaxEntries} = State) ->
+    %% Flush when EITHER the block-count interval is reached OR the in-memory
+    %% coins cache exceeds its size budget. The size trigger mirrors Bitcoin
+    %% Core's CoinsCacheSizeState (validation.cpp), where a flush is forced once
+    %% CoinsTip().DynamicMemoryUsage() crosses LARGE/CRITICAL — Core's flush gate
+    %% is size-driven, not purely periodic. Without this, eviction (which only
+    %% runs inside do_flush) never fires between 5000-block IBD flushes, so the
+    %% ETS cache grows unbounded within a window and blows past EVICT_HIGH_WATER
+    %% (RSS/GC bloat + working set spills to disk). The entry-count check is the
+    %% cheap O(1) primary gate (ets:info size is a counter read); cache_memory_usage
+    %% (ets:info memory, comparatively expensive) is evaluated LAST so the common
+    %% per-block path stays O(1). Read path and persisted chainstate are unchanged
+    %% — only the flush cadence (hence cache residency / disk-read frequency).
+    CacheEntries = ets:info(?UTXO_CACHE, size),
+    NeedFlush =
+        N >= ?IBD_FLUSH_INTERVAL
+        orelse CacheEntries >= ?EVICT_HIGH_WATER
+        orelse CacheEntries > MaxEntries
+        orelse cache_memory_usage() > MaxBytes,
+    case NeedFlush of
+        true ->
+            do_flush(State);
+        false ->
+            State
+    end;
 maybe_flush(#state{ibd = false, max_cache_bytes = MaxBytes,
                     max_cache_entries = MaxEntries} = State) ->
     %% In normal operation, flush if cache exceeds limits
