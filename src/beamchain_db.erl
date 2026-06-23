@@ -711,9 +711,23 @@ direct_cf_handle(undo) -> persistent_term:get(beamchain_cf_undo).
 
 %% @doc Configured on-disk coins-DB (RocksDB block) cache budget, in bytes.
 %% Mirrors Bitcoin Core's Chainstate::m_coinsdb_cache_size_bytes. Read-only
-%% accessor for the getchainstates RPC — pure, no gen_server hop.
+%% accessor for the getchainstates RPC — pure, no gen_server hop. Reflects the
+%% --dbcache override when set; ?COINS_DB_CACHE_BYTES (256 MiB) otherwise.
 -spec coins_db_cache_bytes() -> non_neg_integer().
-coins_db_cache_bytes() -> ?COINS_DB_CACHE_BYTES.
+coins_db_cache_bytes() -> effective_coins_db_cache_bytes().
+
+%% PERF-ONLY: derive the coins block-cache budget in bytes from --dbcache.
+%% Unset --dbcache reproduces ?COINS_DB_CACHE_BYTES (256 MiB) exactly. Formula
+%% kept in sync with beamchain_chainstate:dbcache_rocksdb_mb/0.
+-spec effective_coins_db_cache_bytes() -> non_neg_integer().
+effective_coins_db_cache_bytes() ->
+    case beamchain_config:dbcache_mb() of
+        undefined -> ?COINS_DB_CACHE_BYTES;
+        N ->
+            Quarter = N div 4,
+            MiB = min(1024, max(64, Quarter)),
+            MiB * 1024 * 1024
+    end.
 
 %%% ===================================================================
 %%% gen_server callbacks
@@ -726,6 +740,12 @@ init([]) ->
     ok = filelib:ensure_dir(filename:join(DbPath, "dummy")),
     ok = filelib:ensure_dir(filename:join(BlocksDir, "dummy")),
 
+    %% PERF-ONLY: RocksDB coins block-cache size. With --dbcache unset this is
+    %% ?COINS_DB_CACHE_BYTES (256 MiB), preserving current behavior; with
+    %% --dbcache set it is the coins portion of the total (see
+    %% beamchain_config:dbcache_mb/0 and _classB-beamchain-plan §4.1). Does not
+    %% affect validation — it only accelerates SST reads.
+    CoinsBlockCacheBytes = effective_coins_db_cache_bytes(),
     DbOpts = [
         {create_if_missing, true},
         {create_missing_column_families, true},
@@ -735,7 +755,7 @@ init([]) ->
         {target_file_size_base, 64 * 1024 * 1024},
         {max_bytes_for_level_base, 256 * 1024 * 1024},
         {block_based_table_options, [
-            {block_cache_size, ?COINS_DB_CACHE_BYTES}  %% 256MB RocksDB block cache
+            {block_cache_size, CoinsBlockCacheBytes}
         ]}
     ],
     CFOpts = [],

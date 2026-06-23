@@ -289,6 +289,16 @@ parse_args(["--coinstatsindex=0" | Rest], Cmd, Opts) ->
 parse_args(["--coinstatsindex=1" | Rest], Cmd, Opts) ->
     parse_args(Rest, Cmd, Opts#{coinstatsindex => 1});
 
+%% --dbcache=<MiB>: total UTXO cache budget (Core -dbcache). PERF-ONLY: sizes
+%% the in-memory ETS flush budget + the RocksDB coins block cache; does not
+%% change validation results. Routed through BEAMCHAIN_DBCACHE so the
+%% beamchain_config:dbcache_mb/0 accessor (read during early chainstate/db
+%% init, before the config ETS table is populated) picks it up.
+parse_args(["--dbcache", Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{dbcache => parse_dbcache_arg(Value)});
+parse_args(["--dbcache=" ++ Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{dbcache => parse_dbcache_arg(Value)});
+
 %% Commands
 parse_args(["start" | Rest], undefined, Opts) ->
     parse_args(Rest, start, Opts);
@@ -365,6 +375,8 @@ print_usage() ->
         "  --coinstatsindex[=n] per-height UTXO-set commitment index for~n"
         "                    gettxoutsetinfo at historical heights~n"
         "                    (0=off default, 1=on; mirrors Core -coinstatsindex)~n"
+        "  --dbcache=<MiB>   Total UTXO cache budget in MiB (default 4096 IBD /~n"
+        "                    256 RocksDB block cache). Performance only.~n"
         "  --listenonion=<n> 1 = register v3 hidden service via Tor control~n"
         "                    port (default 0; mirrors Core -listenonion)~n"
         "  --torcontrol=h:p  Tor control-port address~n"
@@ -855,6 +867,14 @@ apply_opts(Opts) ->
         0 -> os:putenv("BEAMCHAIN_COINSTATSINDEX", "0");
         1 -> os:putenv("BEAMCHAIN_COINSTATSINDEX", "1")
     end,
+    %% --dbcache: route through BEAMCHAIN_DBCACHE so dbcache_mb/0 (read during
+    %% chainstate/db init, before init_table/0 populates the config ETS) sees
+    %% it. PERF-ONLY (see _classB-beamchain-plan §6).
+    case maps:get(dbcache, Opts, undefined) of
+        undefined -> ok;
+        N when is_integer(N), N > 0 ->
+            os:putenv("BEAMCHAIN_DBCACHE", integer_to_list(N))
+    end,
     %% --listenonion / --torcontrol / --torpassword: route through the
     %% same BEAMCHAIN_* env vars that beamchain_config consults so the
     %% config gate functions pick them up before init_table/0.
@@ -890,6 +910,18 @@ parse_cfilter_arg(Str) ->
             io:format(standard_error,
                       "warning: --cfilter=~s not an integer; ignoring~n",
                       [Str]),
+            undefined
+    end.
+
+%% Parse a --dbcache MiB value; soft-warn + ignore on a non-positive / garbage
+%% value (falls back to the compile-time default, default-preserving).
+parse_dbcache_arg(Value) ->
+    case catch list_to_integer(Value) of
+        N when is_integer(N), N > 0 -> N;
+        _ ->
+            io:format(standard_error,
+                      "warning: --dbcache=~s ignored (expected a positive "
+                      "integer MiB)~n", [Value]),
             undefined
     end.
 
