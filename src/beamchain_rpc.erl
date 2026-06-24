@@ -823,6 +823,7 @@ handle_method(<<"getpeerinfo">>, _, _W) -> rpc_getpeerinfo();
 handle_method(<<"getconnectioncount">>, _, _W) -> rpc_getconnectioncount();
 handle_method(<<"getblockfrompeer">>, P, _W) -> rpc_getblockfrompeer(P);
 handle_method(<<"getnodeaddresses">>, P, _W) -> rpc_getnodeaddresses(P);
+handle_method(<<"getaddrmaninfo">>, _, _W) -> rpc_getaddrmaninfo();
 handle_method(<<"addpeeraddress">>, P, _W) -> rpc_addpeeraddress(P);
 handle_method(<<"addnode">>, P, _W) -> rpc_addnode(P);
 handle_method(<<"disconnectnode">>, P, _W) -> rpc_disconnectnode(P);
@@ -992,6 +993,7 @@ rpc_help_list() ->
         <<"addpeeraddress \"address\" port ( tried )">>,
         <<"clearbanned">>,
         <<"disconnectnode ( \"address\" nodeid )">>,
+        <<"getaddrmaninfo">>,
         <<"getconnectioncount">>,
         <<"getnetworkinfo">>,
         <<"getnodeaddresses ( count \"network\" )">>,
@@ -5606,6 +5608,53 @@ rpc_getnodeaddresses(Params) ->
                     end
             end
     end.
+
+%% getaddrmaninfo
+%%
+%% Provides information about the node's address manager: per-network counts
+%% of addresses in the `new` and `tried` tables and their sum.
+%% Mirrors Bitcoin Core rpc/net.cpp getaddrmaninfo (:1080-1117) +
+%% AddrMan::Size(network, in_new).
+%%
+%% Params: NONE (pure read-only snapshot — no side effects).
+%%
+%% Output: a JSON OBJECT keyed by network name. The key set is FIXED and always
+%% present, in Core enum order:
+%%   ipv4, ipv6, onion, i2p, cjdns, all_networks
+%% (NET_UNROUTABLE/NET_INTERNAL never emitted.) Each value is an object with
+%% exactly three integer keys in order: {new, tried, total}, where
+%% total == new + tried. all_networks is the global sum across networks.
+%%
+%% jsx alphabetises MAP keys but preserves PROPLIST order, so each object is
+%% built as an ordered proplist to keep Core's pushKV order (ipv4,...,
+%% all_networks and new,tried,total) byte-faithful — same convention as
+%% rpc_getnodeaddresses.
+%%
+%% Invariants (oracle-free, hold by construction):
+%%   per network:  total == new + tried
+%%   all_networks.new   == Σ networks.new
+%%   all_networks.tried == Σ networks.tried
+%%   all_networks.total == Σ networks.total == all_networks.new + .tried
+rpc_getaddrmaninfo() ->
+    Counts = beamchain_addrman:getaddrmaninfo(),
+    %% Fixed routable-network key order (Core enum NET_IPV4..NET_CJDNS).
+    Order = [<<"ipv4">>, <<"ipv6">>, <<"onion">>, <<"i2p">>, <<"cjdns">>],
+    {Entries, TotNew, TotTried} =
+        lists:foldl(
+            fun(Name, {Acc, SumNew, SumTried}) ->
+                NetMap = maps:get(Name, Counts, #{new => 0, tried => 0}),
+                New = maps:get(new, NetMap, 0),
+                Tried = maps:get(tried, NetMap, 0),
+                Obj = [{<<"new">>, New},
+                       {<<"tried">>, Tried},
+                       {<<"total">>, New + Tried}],
+                {[{Name, Obj} | Acc], SumNew + New, SumTried + Tried}
+            end, {[], 0, 0}, Order),
+    AllNetworks = [{<<"new">>, TotNew},
+                   {<<"tried">>, TotTried},
+                   {<<"total">>, TotNew + TotTried}],
+    Result = lists:reverse(Entries) ++ [{<<"all_networks">>, AllNetworks}],
+    {ok, Result}.
 
 %% Resolve the optional positional `count` arg for getnodeaddresses, matching
 %% Core's `request.params[0].isNull() ? 1 : params[0].getInt<int>()`:
