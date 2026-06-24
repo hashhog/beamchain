@@ -824,6 +824,7 @@ handle_method(<<"getnetworkinfo">>, _, _W) -> rpc_getnetworkinfo();
 handle_method(<<"setnetworkactive">>, P, _W) -> rpc_setnetworkactive(P);
 handle_method(<<"getpeerinfo">>, _, _W) -> rpc_getpeerinfo();
 handle_method(<<"getconnectioncount">>, _, _W) -> rpc_getconnectioncount();
+handle_method(<<"ping">>, _, _W) -> rpc_ping();
 handle_method(<<"getblockfrompeer">>, P, _W) -> rpc_getblockfrompeer(P);
 handle_method(<<"getnodeaddresses">>, P, _W) -> rpc_getnodeaddresses(P);
 handle_method(<<"getaddrmaninfo">>, _, _W) -> rpc_getaddrmaninfo();
@@ -1005,6 +1006,7 @@ rpc_help_list() ->
         <<"getnodeaddresses ( count \"network\" )">>,
         <<"getpeerinfo">>,
         <<"listbanned">>,
+        <<"ping">>,
         <<"setban \"subnet\" \"command\" ( bantime )">>,
         <<"setnetworkactive state">>,
         <<"">>,
@@ -5183,6 +5185,61 @@ rpc_getnetworkinfo() ->
                               beamchain_peer_manager:inbound_count(),
                               beamchain_peer_manager:outbound_count(),
                               LocalAddrs)}.
+
+%% ping
+%%
+%% Requests that a P2P PING be sent to every connected peer, to measure ping
+%% time. Mirrors Bitcoin Core rpc/net.cpp ping (:84-107):
+%%
+%%   NodeContext& node = EnsureAnyNodeContext(request.context);
+%%   PeerManager& peerman = EnsurePeerman(node);
+%%   peerman.SendPings();          % set m_ping_queued on every connected peer
+%%   return UniValue::VNULL;       % -> JSON null, immediately
+%%
+%% SEMANTICS (faithful):
+%%   * NO params. Any positional arg is a dispatcher arity error.
+%%   * Side-effect-only control method. It QUEUES a BIP-31 PING (fresh nonce)
+%%     to each connected peer and returns IMMEDIATELY. It does NOT measure
+%%     latency synchronously and does NOT wait for the PONGs. The round-trip
+%%     results surface LATER via getpeerinfo's `pingtime` (and `minping`), not
+%%     here. Help text notes it measures the single RPC/message-processing
+%%     backlog, not raw network latency.
+%%   * With ZERO peers it is a successful no-op (loops over an empty set) and
+%%     still returns null.
+%%   * A missing peer manager is RPC_CLIENT_P2P_DISABLED (-31, Core
+%%     EnsurePeerman / protocol.h:64), NOT an empty success.
+%%   * Returns JSON null (Core UniValue::VNULL).
+%%
+%% beamchain mapping of SendPings(): each peer is a gen_statem with a real
+%% BIP-31 ping/pong keepalive (do_send_ping/1, handle_pong_msg/1 records
+%% latency_ms). We model Core's per-peer m_ping_queued flag as an async
+%% `request_ping` cast (beamchain_peer:request_ping/1) — fire-and-forget, the
+%% peer emits the PING on its next message pass and never blocks the RPC. Only
+%% peers past the handshake (`connected => true`, the same set getpeerinfo
+%% reports) are pinged, matching Core iterating the post-version peer map.
+rpc_ping() ->
+    %% EnsurePeerman parity: the peer-manager gen_server is beamchain's
+    %% PeerManager/connman; if it is not running, P2P is disabled -> -31.
+    case whereis(beamchain_peer_manager) of
+        undefined ->
+            {error, ?RPC_CLIENT_P2P_DISABLED,
+             <<"Error: Peer-to-peer functionality missing or disabled">>};
+        _Pid ->
+            %% SendPings(): queue a PING on every connected peer. Fire each cast
+            %% and do not block on the PONGs. A cast to a since-dropped peer is
+            %% harmless (cast to a dead pid is a silent no-op), so one bad peer
+            %% never fails the RPC — matching Core's loop-over-the-map-and-return.
+            Peers = beamchain_peer_manager:get_peers(),
+            lists:foreach(
+                fun(#{pid := PeerPid, connected := true}) ->
+                        beamchain_peer:request_ping(PeerPid);
+                   (_NotConnected) ->
+                        ok
+                end, Peers),
+            %% Core returns UniValue::VNULL -> JSON null. result_obj/2 sets
+            %% "result": null in the JSON-RPC envelope.
+            {ok, null}
+    end.
 
 %% setnetworkactive state
 %%

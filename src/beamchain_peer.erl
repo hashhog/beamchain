@@ -16,7 +16,7 @@
 -export([connect/3, accept/3,
          send_message/2, add_misbehavior/2,
          disconnect/1, info/1,
-         queue_tx_inv/2]).
+         queue_tx_inv/2, request_ping/1]).
 
 %% BIP-324 v2 outbound: per-address v1-only cache + env-var gate.
 -export([bip324_v2_outbound_enabled/0,
@@ -245,6 +245,20 @@ info(Pid) ->
 -spec queue_tx_inv(pid(), binary()) -> ok.
 queue_tx_inv(Pid, Txid) when is_binary(Txid), byte_size(Txid) =:= 32 ->
     gen_statem:cast(Pid, {queue_tx_inv, Txid}).
+
+%% @doc Request that a P2P PING (BIP-31, fresh nonce) be sent to this peer on
+%% its next message-processing pass. Fire-and-forget: this is the per-peer leg
+%% of the `ping` RPC, mirroring Bitcoin Core PeerManagerImpl::SendPings, which
+%% sets `m_ping_queued = true` on every connected peer (net_processing.cpp) so
+%% the regular send pass emits the PING. We model the "queued" flag as an
+%% asynchronous cast: it does NOT block on a PONG and never measures RTT
+%% synchronously. The round-trip lands later in the peer's `latency_ms`, which
+%% getpeerinfo surfaces as `pingtime`. A cast to a peer still in
+%% connecting/handshaking (pre-`ready`) is silently dropped by that state's
+%% catch-all, exactly like Core only pinging fully connected nodes.
+-spec request_ping(pid()) -> ok.
+request_ping(Pid) ->
+    gen_statem:cast(Pid, request_ping).
 
 %%% -------------------------------------------------------------------
 %%% BIP-324 v2 outbound: feature gate + per-address v1-only cache
@@ -576,6 +590,19 @@ ready(enter, handshaking, Data) ->
       {{timeout, inactivity}, ?INACTIVITY_TIMEOUT, inactive}]};
 
 ready({timeout, ping}, send_ping, Data) ->
+    Data2 = do_send_ping(Data),
+    {keep_state, Data2,
+     [{{timeout, ping}, ?PING_INTERVAL, send_ping},
+      {{timeout, pong}, ?PONG_TIMEOUT, pong_timeout}]};
+
+%% On-demand PING triggered by the `ping` RPC (Core SendPings -> per-peer
+%% m_ping_queued). Emit a fresh-nonce BIP-31 PING now and arm the same PONG
+%% timeout the periodic keepalive uses, then reset the keepalive timer so the
+%% next scheduled ping is a full ?PING_INTERVAL out (an explicit ping resets the
+%% clock, matching Core's single send-pass model). Fire-and-forget: we do not
+%% block on the PONG; the RTT lands in `latency_ms` (getpeerinfo `pingtime`)
+%% when the matching PONG arrives.
+ready(cast, request_ping, Data) ->
     Data2 = do_send_ping(Data),
     {keep_state, Data2,
      [{{timeout, ping}, ?PING_INTERVAL, send_ping},
