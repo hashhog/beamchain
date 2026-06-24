@@ -775,6 +775,9 @@ handle_method(<<"logging">>, P, _W) -> rpc_logging(P);
 %% -- Blockchain --
 handle_method(<<"getblockcount">>, _, _W) -> rpc_getblockcount();
 handle_method(<<"getbestblockhash">>, _, _W) -> rpc_getbestblockhash();
+handle_method(<<"waitfornewblock">>, P, _W) -> rpc_waitfornewblock(P);
+handle_method(<<"waitforblock">>, P, _W) -> rpc_waitforblock(P);
+handle_method(<<"waitforblockheight">>, P, _W) -> rpc_waitforblockheight(P);
 handle_method(<<"getsyncstate">>, _, _W) -> rpc_getsyncstate();
 handle_method(<<"getblockchaininfo">>, _, _W) -> rpc_getblockchaininfo();
 handle_method(<<"getdeploymentinfo">>, P, _W) -> rpc_getdeploymentinfo(P);
@@ -968,6 +971,9 @@ rpc_help_list() ->
         <<"flushchainstate">>,
         <<"scrubunspendable">>,
         <<"pruneblockchain height">>,
+        <<"waitfornewblock ( timeout current_tip )">>,
+        <<"waitforblock \"blockhash\" ( timeout )">>,
+        <<"waitforblockheight height ( timeout )">>,
         <<"">>,
         <<"== Control ==">>,
         <<"getmemoryinfo ( \"mode\" )">>,
@@ -1112,6 +1118,225 @@ rpc_getbestblockhash() ->
         not_found ->
             {error, ?RPC_MISC_ERROR, <<"No blocks yet">>}
     end.
+
+%%% ===================================================================
+%%% Wait-family RPCs (waitfornewblock / waitforblock / waitforblockheight)
+%%%
+%%% Faithful port of Bitcoin Core rpc/blockchain.cpp:290-471.  Each call
+%%% blocks the cowboy request process (NOT the chainstate / notifier
+%%% process) on beamchain_tip_notifier, re-reading the AUTHORITATIVE
+%%% chainstate tip after every wake, and returns the current tip
+%%% {"hash", "height"} once its predicate holds OR the timeout elapses
+%%% (Core returns the current block in both cases).
+%%%
+%%% `timeout` is in MILLISECONDS; 0 = no timeout (wait indefinitely).
+%%% Error codes (byte-match Core):
+%%%   * malformed blockhash / current_tip -> -8 (ParseHashV)
+%%%   * negative timeout -> -1 "Negative timeout" (RPC_MISC_ERROR)
+%%%   * non-integer timeout / non-integer height -> -3 (RPC_TYPE_ERROR)
+%%% ===================================================================
+
+%% waitfornewblock ( timeout current_tip )
+%% Wait until the tip hash differs from `current_tip` (if given, parsed as
+%% a 64-hex uint256) or, if omitted, from the tip observed at call entry.
+rpc_waitfornewblock(Params) when is_list(Params) ->
+    try
+        TimeoutMs = parse_wait_timeout(wait_param(Params, 1)),
+        RefHashHex =
+            case wait_param(Params, 2) of
+                undefined ->
+                    %% No current_tip: snapshot the live tip's hash.
+                    {RefHex, _RefHt} = current_tip_or_null(),
+                    RefHex;
+                CurrentTip ->
+                    %% Core ParseHashV("current_tip"): -8 on malformed.
+                    %% Re-render to canonical display hex via the parsed
+                    %% internal bytes so the comparison is well-formed.
+                    Internal = parse_hash_v(CurrentTip, <<"current_tip">>),
+                    hash_to_hex(Internal)
+            end,
+        Pred = fun(Hex, _Ht) -> Hex =/= RefHashHex end,
+        {ok, wait_for_tip(Pred, TimeoutMs)}
+    catch
+        throw:{rpc_error, Code, Msg} -> {error, Code, Msg}
+    end;
+rpc_waitfornewblock(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: waitfornewblock ( timeout current_tip )">>}.
+
+%% waitforblock "blockhash" ( timeout )
+%% Wait until the tip hash equals `blockhash`.  Core parses blockhash
+%% FIRST (before reading timeout), so a malformed blockhash errors -8
+%% even when a negative timeout is also supplied.
+rpc_waitforblock([]) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: waitforblock \"blockhash\" ( timeout )">>};
+rpc_waitforblock(Params) when is_list(Params) ->
+    try
+        BlockHashParam = wait_param(Params, 1),
+        Internal = parse_hash_v(BlockHashParam, <<"blockhash">>),
+        TargetHex = hash_to_hex(Internal),
+        TimeoutMs = parse_wait_timeout(wait_param(Params, 2)),
+        Pred = fun(Hex, _Ht) -> Hex =:= TargetHex end,
+        {ok, wait_for_tip(Pred, TimeoutMs)}
+    catch
+        throw:{rpc_error, Code, Msg} -> {error, Code, Msg}
+    end;
+rpc_waitforblock(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: waitforblock \"blockhash\" ( timeout )">>}.
+
+%% waitforblockheight height ( timeout )
+%% Wait until the tip height >= `height`.
+rpc_waitforblockheight([]) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: waitforblockheight height ( timeout )">>};
+rpc_waitforblockheight(Params) when is_list(Params) ->
+    try
+        Height = parse_wait_int(wait_param(Params, 1), <<"height">>),
+        TimeoutMs = parse_wait_timeout(wait_param(Params, 2)),
+        Pred = fun(_Hex, Ht) -> Ht >= Height end,
+        {ok, wait_for_tip(Pred, TimeoutMs)}
+    catch
+        throw:{rpc_error, Code, Msg} -> {error, Code, Msg}
+    end;
+rpc_waitforblockheight(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: waitforblockheight height ( timeout )">>}.
+
+%% wait_param/2 — 1-based positional access for the wait-family handlers;
+%% `undefined` for an absent or explicit-JSON-null positional (Core treats
+%% both as "not provided" / use the default).  Built on the existing
+%% 0-based nth_param/2 (which returns `null` for absent).
+wait_param(Params, N) when is_list(Params), N >= 1 ->
+    case nth_param(Params, N - 1) of
+        null  -> undefined;
+        Value -> Value
+    end.
+
+%% parse_wait_timeout/1 — Core: `timeout = request.params[i].getInt<int>()`
+%% (0 when null), then `if (timeout < 0) throw RPC_MISC_ERROR "Negative
+%% timeout"`.  A non-integral JSON value is a type error (-3).  Returns a
+%% timeout in milliseconds, or `infinity` for 0 (no timeout).
+parse_wait_timeout(undefined) ->
+    infinity;
+parse_wait_timeout(V) when is_integer(V) ->
+    case V < 0 of
+        true  -> throw({rpc_error, ?RPC_MISC_ERROR, <<"Negative timeout">>});
+        false when V =:= 0 -> infinity;
+        false -> V
+    end;
+parse_wait_timeout(V) ->
+    %% Float, string, bool, object, ... — Core getInt<int>() type error.
+    throw({rpc_error, ?RPC_TYPE_ERROR, type_error_msg(V)}).
+
+%% parse_wait_int/2 — Core `request.params[i].getInt<int>()` for a
+%% required integer (height).  Non-integral -> type error (-3).
+parse_wait_int(undefined, Name) ->
+    throw({rpc_error, ?RPC_TYPE_ERROR,
+           <<"Missing required parameter: ", Name/binary>>});
+parse_wait_int(V, _Name) when is_integer(V) ->
+    V;
+parse_wait_int(V, _Name) ->
+    throw({rpc_error, ?RPC_TYPE_ERROR, type_error_msg(V)}).
+
+%% type_error_msg/1 — mirror Core UniValue::getInt's
+%% "JSON value of type X is not of expected type number".
+type_error_msg(V) ->
+    TypeName = univalue_type_name(V),
+    <<"JSON value of type ", TypeName/binary,
+      " is not of expected type number">>.
+
+univalue_type_name(V) when is_boolean(V) -> <<"bool">>;
+univalue_type_name(V) when is_number(V)  -> <<"number">>;
+univalue_type_name(V) when is_binary(V)  -> <<"string">>;
+univalue_type_name(V) when is_list(V)    -> <<"array">>;
+univalue_type_name(V) when is_map(V)     -> <<"object">>;
+univalue_type_name(null)                 -> <<"null">>;
+univalue_type_name(_)                    -> <<"null">>.
+
+%% current_tip_or_null/0 — the authoritative chainstate tip as
+%% {DisplayHex, Height}.  Before genesis the tip is the all-zero hash at
+%% height -1 (mirrors Core's BlockRef before any block; no tip-changed
+%% RPC can match it, which is correct — waiters block until a real block).
+current_tip_or_null() ->
+    case beamchain_chainstate:get_tip() of
+        {ok, {Hash, Height}} -> {hash_to_hex(Hash), Height};
+        not_found ->
+            {<<"0000000000000000000000000000000000000000000000000000000000000000">>,
+             -1}
+    end.
+
+%% wait_for_tip/2 — Core's WaitTipChanged loop shared by all three
+%% handlers.  `Pred(DisplayHex, Height) -> boolean()`.  Blocks on
+%% beamchain_tip_notifier, re-reading the authoritative tip after every
+%% wake, and returns the current tip map once Pred holds OR the deadline
+%% elapses.  TimeoutMs is an integer in ms or `infinity`.
+wait_for_tip(Pred, TimeoutMs) ->
+    {Hex0, Ht0} = current_tip_or_null(),
+    case Pred(Hex0, Ht0) of
+        true ->
+            tip_result(Hex0, Ht0);
+        false ->
+            %% Subscribe BEFORE the loop's first predicate re-check so a
+            %% notify racing in after the check lands in our mailbox.
+            _ = beamchain_tip_notifier:subscribe(),
+            Deadline =
+                case TimeoutMs of
+                    infinity -> infinity;
+                    Ms       -> erlang:monotonic_time(millisecond) + Ms
+                end,
+            try
+                wait_for_tip_loop(Pred, Deadline)
+            after
+                beamchain_tip_notifier:unsubscribe()
+            end
+    end.
+
+wait_for_tip_loop(Pred, Deadline) ->
+    %% Snapshot the generation BEFORE checking the predicate (lost-wakeup
+    %% guard): any notify after this snapshot is observed by the wait/2
+    %% selective receive below.
+    Gen = beamchain_tip_notifier:generation(),
+    {Hex, Ht} = current_tip_or_null(),
+    case Pred(Hex, Ht) of
+        true ->
+            tip_result(Hex, Ht);
+        false ->
+            case remaining_timeout(Deadline) of
+                expired ->
+                    %% Timed out — return the current tip (Core behaviour).
+                    tip_result(Hex, Ht);
+                Remaining ->
+                    case beamchain_tip_notifier:wait(Gen, Remaining) of
+                        tip_changed ->
+                            wait_for_tip_loop(Pred, Deadline);
+                        timeout ->
+                            %% Re-read once more on the timeout edge so a
+                            %% block that connected exactly at the deadline
+                            %% is reported with the freshest tip.  Core
+                            %% returns the current block on timeout whether
+                            %% or not the predicate now holds, so the value
+                            %% is the same either way.
+                            {HexF, HtF} = current_tip_or_null(),
+                            tip_result(HexF, HtF)
+                    end
+            end
+    end.
+
+%% remaining_timeout/1 — `infinity`, `expired`, or the ms left until the
+%% absolute deadline.
+remaining_timeout(infinity) ->
+    infinity;
+remaining_timeout(Deadline) ->
+    Remaining = Deadline - erlang:monotonic_time(millisecond),
+    case Remaining =< 0 of
+        true  -> expired;
+        false -> Remaining
+    end.
+
+tip_result(Hex, Height) ->
+    #{<<"hash">> => Hex, <<"height">> => Height}.
 
 %% hashhog W70: uniform fleet-wide sync-state report.
 %% Spec: meta-repo `spec/getsyncstate.md`.
