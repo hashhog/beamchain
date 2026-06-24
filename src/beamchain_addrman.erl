@@ -32,6 +32,7 @@
          get_node_addresses/2,
          add_peer_address/4,
          count/0,
+         getaddrmaninfo/0,
          netgroup/1,
          netgroup/2,
          get_secret/0,
@@ -197,6 +198,26 @@ add_peer_address(Address, Services, Tried, NetworkId) ->
 -spec count() -> {non_neg_integer(), non_neg_integer()}.
 count() ->
     gen_server:call(?SERVER, count).
+
+%% @doc Per-network {new, tried} address-manager counts for the
+%% getaddrmaninfo RPC.
+%%
+%% Mirrors Bitcoin Core rpc/net.cpp getaddrmaninfo (:1080-1117) +
+%% AddrMan::Size(network, in_new). Returns a map keyed by Core network name
+%% (binary) → #{new => N, tried => T}. The key set is FIXED and always present
+%% in Core enum order (ipv4, ipv6, onion, i2p, cjdns), every network emitted
+%% even at zero. NET_UNROUTABLE (not_publicly_routable) / NET_INTERNAL are
+%% never keys — entries that map to those are skipped, mirroring Core's loop
+%% that skips NET_UNROUTABLE/NET_INTERNAL.
+%%
+%% Pure read-only snapshot of the addrman: no params, no side effects, no
+%% peers/sockets/disk touched. Each addr_info carries an `in_tried` boolean
+%% (true => tried table, false => new table) and a `network_id`, so the
+%% per-(network, table) split is exact — there is no lumping.
+-spec getaddrmaninfo() ->
+    #{binary() => #{new => non_neg_integer(), tried => non_neg_integer()}}.
+getaddrmaninfo() ->
+    gen_server:call(?SERVER, getaddrmaninfo).
 
 %% @doc Get the netgroup for an address (exported for peer_manager).
 %% IPv4: /16 prefix; IPv6: /32 prefix
@@ -365,6 +386,9 @@ handle_call({add_peer_address, Address, Services, Tried, NetworkId}, _From,
 
 handle_call(count, _From, #state{new_count = New, tried_count = Tried} = State) ->
     {reply, {New, Tried}, State};
+
+handle_call(getaddrmaninfo, _From, State) ->
+    {reply, do_getaddrmaninfo(State), State};
 
 handle_call(get_secret, _From, #state{secret = Secret} = State) ->
     {reply, Secret, State};
@@ -957,6 +981,41 @@ network_id_to_name(4) -> <<"onion">>;
 network_id_to_name(5) -> <<"i2p">>;
 network_id_to_name(6) -> <<"cjdns">>;
 network_id_to_name(_) -> <<"not_publicly_routable">>.
+
+%% @doc Build the getaddrmaninfo per-network {new, tried} counts.
+%%
+%% Mirrors Core's loop (rpc/net.cpp:1100-1108): for each routable network in
+%% enum order, `Size(net, in_new)` / `Size(net, !in_new)`. We pre-seed the
+%% five routable networks at zero (so the key set is always complete — an
+%% IPv4-only node still reports onion/i2p/cjdns at 0), then fold the addr
+%% table once, bumping the matching (network, table) counter. The split is
+%% exact: each entry's `in_tried` boolean is Core's tried/new table membership.
+%%
+%% Network mapping is GetNetClass-faithful: network_id_to_name maps the BIP155
+%% id to the Core name, and is_routable re-checks IPv4/IPv6 routability so a
+%% non-routable entry maps to NET_UNROUTABLE and is skipped (never a key),
+%% exactly like Core's loop skips NET_UNROUTABLE/NET_INTERNAL. (Stored entries
+%% are already routable — do_add_address rejects non-routable addrs — so this
+%% is defensive; it keeps the count identical to Core's GetNetClass.)
+do_getaddrmaninfo(#state{addr_table = AddrTab}) ->
+    Zero = #{new => 0, tried => 0},
+    Seed = #{<<"ipv4">> => Zero, <<"ipv6">> => Zero, <<"onion">> => Zero,
+             <<"i2p">> => Zero, <<"cjdns">> => Zero},
+    ets:foldl(
+        fun(#addr_info{address = Address, in_tried = InTried,
+                       network_id = NetId}, Acc) ->
+            Name = network_id_to_name(NetId),
+            case maps:is_key(Name, Acc) andalso is_routable(Address, NetId) of
+                false ->
+                    %% not_publicly_routable / internal / non-routable IPv4/IPv6
+                    %% — skipped, never a key (Core's GetNetClass parity).
+                    Acc;
+                true ->
+                    Field = case InTried of true -> tried; false -> new end,
+                    Cur = maps:get(Name, Acc),
+                    maps:put(Name, maps:update_with(Field, fun(V) -> V + 1 end, Cur), Acc)
+            end
+        end, Seed, AddrTab).
 
 %%% ===================================================================
 %%% Internal: persistence (DETS)
