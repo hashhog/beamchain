@@ -5,7 +5,8 @@
 -include("beamchain.hrl").
 
 -export([main/1, parse_args/1, apply_debug_categories/1,
-         remove_pidfile/0, pidfile_path/1]).
+         remove_pidfile/0, pidfile_path/1,
+         debug_categories/0, category_modules/1]).
 
 %% Dialyzer suppressions for false positives:
 %% import_utxo/1 calls halt/1 (diverges) on one path; dialyzer treats it as
@@ -1276,6 +1277,20 @@ apply_debug_category(Cat) ->
               fun(M) -> _ = logger:set_module_level(M, debug) end,
               Mods)
     end.
+
+%% @doc The canonical set of beamchain debug-logging categories, in ascending
+%% alphabetical order (Core emits its category map alphabetically — std::map —
+%% so a sorted source list makes the `logging` RPC output byte-stable).
+%%
+%% These are the REAL categories beamchain has: each maps (via
+%% category_modules/1) to a non-empty list of actual modules whose
+%% `logger:debug/2` output the category gates.  The "all"/"none" tokens and any
+%% string outside this list are NOT members of this set (the `logging` RPC
+%% treats anything else as an unknown category -> -8).  This list is the single
+%% source of truth shared by the startup `-debug=<cat>` plumbing
+%% (apply_debug_categories/1) and the runtime `logging` RPC.
+debug_categories() ->
+    [db, mempool, miner, net, rpc, sync, validation, wallet, zmq].
 
 %% Map a category atom to the modules it covers.  Add new categories
 %% here as the codebase grows; modules listed here MUST exist (we resolve

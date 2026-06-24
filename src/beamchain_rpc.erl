@@ -770,6 +770,7 @@ error_obj(Id, Code, Message) ->
 handle_method(<<"help">>, Params, _W) -> rpc_help(Params);
 handle_method(<<"stop">>, _, _W) -> rpc_stop();
 handle_method(<<"uptime">>, _, _W) -> rpc_uptime();
+handle_method(<<"logging">>, P, _W) -> rpc_logging(P);
 
 %% -- Blockchain --
 handle_method(<<"getblockcount">>, _, _W) -> rpc_getblockcount();
@@ -5761,6 +5762,170 @@ rpc_getmemoryinfo_stats() ->
               {<<"chunks_used">>, 0},
               {<<"chunks_free">>, 0}],
     {ok, [{<<"locked">>, Locked}]}.
+
+%% logging
+%%
+%% Gets and sets the debug-logging category configuration.
+%%
+%% Reference: Bitcoin Core rpc/node.cpp `logging` (:218-275) +
+%% `EnableOrDisableLogCategories` (:200-216); logging.cpp `LogCategoriesList`
+%% / `EnableCategory` / `DisableCategory`. Sibling impl: ouroboros f11846a
+%% (rpc_logging + logging_config.py).
+%%
+%% beamchain has a REAL category-based debug-logging system: the canonical set
+%% beamchain_cli:debug_categories() ([db, mempool, miner, net, rpc, sync,
+%% validation, wallet, zmq]) maps (beamchain_cli:category_modules/1) to actual
+%% modules whose `logger:debug/2` output the category gates. This is the
+%% parity for Core's per-category bitmask (BCLog::CategoryMask): a category is
+%% "active" when its modules are enabled at debug level, and toggling it here
+%% mutates the LIVE OTP `logger` per-module config (logger:set_module_level/2
+%% / logger:unset_module_level/1). The standard logger consults that config on
+%% EVERY record, so a category enabled by this RPC makes its debug logs start
+%% flowing immediately with no restart — exactly like Core mutating in-memory
+%% m_categories. There is no construction-time snapshot to go stale (the trap
+%% the ouroboros fix called out).
+%%
+%% Params (both OPTIONAL, positional, Core order: include THEN exclude):
+%%   - include (array of category strings): categories to ENABLE.
+%%   - exclude (array of category strings): categories to DISABLE.
+%% A param is acted on ONLY if it is a JSON array (Core isArray() guard);
+%% omitted/null is a no-op for that slot, so `logging` with no args is a pure
+%% read-and-report. include is applied first, THEN exclude, so a category named
+%% in both ends up DISABLED ("exclude wins").
+%%
+%% Special input-only tokens (never emitted as output keys): "all" / "1" / ""
+%% expand to the whole category set; in the exclude slot they clear it (Core's
+%% DisableCategory("all"/"1"/"") clears every bit — `logging [], ["all"]`
+%% disables everything).
+%%
+%% Returns: a JSON object mapping every real category name -> bool (whether it
+%% is currently being debug logged), in ascending alphabetical key order (Core
+%% iterates a std::map; debug_categories() is pre-sorted).
+%%
+%% Errors:
+%%   - Unknown category in either array -> RPC_INVALID_PARAMETER (-8), message
+%%     "unknown logging category <cat>" (Core node.cpp:213), thrown as soon as
+%%     the bad name is hit. include is scanned fully, then exclude; categories
+%%     BEFORE the bad one in the same call have ALREADY been applied (partial
+%%     application, no rollback — Core parity).
+%%   - Non-string array element -> RPC_TYPE_ERROR (-3) (Core get_str()).
+%%
+%% Scope: mutates the running node's live logger config immediately; NOT
+%% persisted — resets on restart to the `-debug=` startup flags.
+rpc_logging(Params) ->
+    Include = nth_param(Params, 0),
+    Exclude = nth_param(Params, 1),
+    try
+        %% Core order: include first (enable), then exclude (disable). Each
+        %% slot is processed ONLY when it is a JSON array (Core isArray());
+        %% null/omitted is a no-op. Partial-apply-before-throw is intrinsic:
+        %% we mutate the live logger as we scan, and an unknown name raises
+        %% mid-scan with no rollback.
+        apply_log_categories(Include, true),
+        apply_log_categories(Exclude, false),
+        {ok, logging_status_map()}
+    catch
+        throw:{rpc_error, Code, Msg} -> {error, Code, Msg}
+    end.
+
+%% Pull the Nth (0-based) positional param, defaulting to `null` (treated as
+%% "omitted" by the isArray guard below) when absent.
+nth_param(Params, N) when is_list(Params) ->
+    case length(Params) > N of
+        true  -> lists:nth(N + 1, Params);
+        false -> null
+    end;
+nth_param(_, _) ->
+    null.
+
+%% Core EnableOrDisableLogCategories: act on the param ONLY when it is an array;
+%% anything else (null / omitted) is silently ignored at the call site.
+apply_log_categories(Cats, Enable) when is_list(Cats) ->
+    lists:foreach(fun(Item) -> apply_one_category(Item, Enable) end, Cats);
+apply_log_categories(_NotArray, _Enable) ->
+    ok.
+
+apply_one_category(Item, Enable) when is_binary(Item) ->
+    %% Core's special input-only tokens (logging.cpp GetLogCategory): "all" /
+    %% "1" / "" expand to the whole category mask. enable -> turn every
+    %% category on; disable -> turn every category off. Never an output key.
+    case Item of
+        <<"all">> -> set_all_categories(Enable);
+        <<"1">>   -> set_all_categories(Enable);
+        <<"">>    -> set_all_categories(Enable);
+        Cat ->
+            case category_atom(Cat) of
+                {ok, CatAtom} ->
+                    set_category(CatAtom, Enable);
+                error ->
+                    %% Core node.cpp:213 — EnableCategory/DisableCategory
+                    %% return false for an unknown name -> -8 with this exact
+                    %% message ("unknown logging category " + cat).
+                    throw({rpc_error, ?RPC_INVALID_PARAMETER,
+                           <<"unknown logging category ", Cat/binary>>})
+            end
+    end;
+apply_one_category(Item, _Enable) ->
+    %% Non-string array element -> Core get_str() type error (-3).
+    throw({rpc_error, ?RPC_TYPE_ERROR,
+           iolist_to_binary([<<"JSON value of type ">>, uvtype(Item),
+                             <<" is not of expected type string">>])}).
+
+%% Resolve a category name binary to its atom IFF it is a real beamchain
+%% category. Never creates an atom for an unknown name (no list_to_atom on
+%% untrusted input — avoids atom-table exhaustion and is what makes an
+%% unknown category an error rather than a silently-ignored no-op).
+category_atom(Bin) ->
+    Names = [{atom_to_binary(C, utf8), C} || C <- beamchain_cli:debug_categories()],
+    case lists:keyfind(Bin, 1, Names) of
+        {_, CatAtom} -> {ok, CatAtom};
+        false        -> error
+    end.
+
+%% Enable/disable a single category by mutating the live per-module logger
+%% level for every module the category covers. enable -> debug (the category's
+%% debug prints flow); disable -> unset the override (revert to the primary
+%% level, so debug is suppressed while info+ still flows — parity with Core,
+%% whose category bit gates only the category's debug-level prints).
+set_category(Cat, true) ->
+    lists:foreach(
+      fun(M) -> _ = logger:set_module_level(M, debug) end,
+      beamchain_cli:category_modules(Cat));
+set_category(Cat, false) ->
+    lists:foreach(
+      fun(M) -> _ = logger:unset_module_level(M) end,
+      beamchain_cli:category_modules(Cat)).
+
+set_all_categories(Enable) ->
+    lists:foreach(fun(Cat) -> set_category(Cat, Enable) end,
+                  beamchain_cli:debug_categories()).
+
+%% Build the {category => bool} status object for every real category, in the
+%% alphabetical order of debug_categories() (jsx encodes this proplist as a
+%% JSON object preserving order; Core emits its std::map alphabetically).
+logging_status_map() ->
+    ModuleLevels = maps:from_list(logger:get_module_level()),
+    PrimaryLevel = maps:get(level, logger:get_primary_config()),
+    [ {atom_to_binary(Cat, utf8), category_active(Cat, ModuleLevels, PrimaryLevel)}
+      || Cat <- beamchain_cli:debug_categories() ].
+
+%% A category is "active" (its debug logs flow) when EVERY module it covers
+%% will emit at debug level: i.e. the module's effective level (its explicit
+%% override if present, else the primary level) is <= debug.
+category_active(Cat, ModuleLevels, PrimaryLevel) ->
+    Mods = beamchain_cli:category_modules(Cat),
+    lists:all(
+      fun(M) ->
+          Eff = maps:get(M, ModuleLevels, PrimaryLevel),
+          level_includes_debug(Eff)
+      end, Mods).
+
+%% OTP logger levels, most→least severe: emergency, alert, critical, error,
+%% warning, notice, info, debug, all. A level "includes debug" when debug
+%% records pass it — i.e. it is debug or the all sentinel.
+level_includes_debug(debug) -> true;
+level_includes_debug(all)   -> true;
+level_includes_debug(_)     -> false.
 
 %% getaddrmaninfo
 %%
