@@ -816,6 +816,9 @@ handle_method(<<"savemempool">>, _, _W) -> rpc_dumpmempool();
 handle_method(<<"dumpmempool">>, _, _W) -> rpc_dumpmempool();
 handle_method(<<"loadmempool">>, _, _W) -> rpc_loadmempool();
 
+%% -- Control --
+handle_method(<<"getmemoryinfo">>, P, _W) -> rpc_getmemoryinfo(P);
+
 %% -- Network --
 handle_method(<<"getnetworkinfo">>, _, _W) -> rpc_getnetworkinfo();
 handle_method(<<"setnetworkactive">>, P, _W) -> rpc_setnetworkactive(P);
@@ -963,6 +966,7 @@ rpc_help_list() ->
         <<"pruneblockchain height">>,
         <<"">>,
         <<"== Control ==">>,
+        <<"getmemoryinfo ( \"mode\" )">>,
         <<"help ( \"command\" )">>,
         <<"stop">>,
         <<"uptime">>,
@@ -5608,6 +5612,96 @@ rpc_getnodeaddresses(Params) ->
                     end
             end
     end.
+
+%% getmemoryinfo ( "mode" )
+%%
+%% Returns an object containing information about memory usage. Mirrors Bitcoin
+%% Core rpc/node.cpp getmemoryinfo (:145-198) + RPCLockedMemoryInfo (:113-124) +
+%% RPCMallocInfo (:126-143).
+%%
+%% IMPORTANT SEMANTICS: this RPC reports Core's SECURE LOCKED-MEMORY POOL
+%% (LockedPoolManager — the mlock()-backed allocator that keeps sensitive data
+%% such as wallet private keys OFF swap), NOT general process/heap memory. Do
+%% not confuse "locked" memory here with the transaction "memory pool" (mempool).
+%%
+%% Param: mode (STR, OPTIONAL, default "stats") — what kind of information is
+%% returned:
+%%   - "stats":      general statistics about memory usage in the daemon.
+%%   - "mallocinfo": an XML string describing low-level heap state (Core: only
+%%                   available when compiled with glibc).
+%%
+%% Output (mode-dependent, matching Core exactly):
+%%   - mode == "stats" -> OBJECT:
+%%         {"locked": {"used": int, "free": int, "total": int, "locked": int,
+%%                     "chunks_used": int, "chunks_free": int}}
+%%     All six inner values are non-negative integers (Core size_t), in this
+%%     exact pushKV order. beamchain is a from-scratch Erlang/OTP port with NO
+%%     Core-style mlock()-backed secure pool (verified: no mlock / sodium_mlock /
+%%     LockedPool / VirtualLock / enacl in the source tree), so the honest answer
+%%     is all zeros — but the keys/structure are ALWAYS present and identical to
+%%     Core (a node with an empty/absent locked pool legitimately reports zeros;
+%%     shape-match parity holds). We do NOT fabricate nonzero values.
+%%
+%%   - mode == "mallocinfo" -> Core returns a glibc malloc_info(3) XML string
+%%     ONLY when built with glibc (HAVE_MALLOC_INFO); on every other build it
+%%     raises -8 "mallocinfo mode not available". beamchain runs on the BEAM and
+%%     has no glibc malloc_info equivalent it can call, so we faithfully take
+%%     Core's non-glibc path: the exact -8 error (we do NOT return a stub XML
+%%     string Core never emits).
+%%
+%% Errors:
+%%   - Unknown mode  -> RPC_INVALID_PARAMETER (-8), "unknown mode <mode>"
+%%                      (Core node.cpp:194, tfm::format("unknown mode %s", mode)).
+%%   - Non-string mode -> RPC_TYPE_ERROR (-3), standard JSON type check BEFORE
+%%                      the handler logic, matching Core's Arg<std::string_view>.
+%%
+%% Ordered proplists (not maps) so jsx emits Core's pushKV order — same
+%% convention as rpc_getaddrmaninfo / rpc_getnetworkinfo. Pure read-only
+%% introspection; no side effects, no chain/mempool/peer locks. Safe at any
+%% lifecycle stage.
+rpc_getmemoryinfo([]) ->
+    %% No param -> default mode "stats".
+    rpc_getmemoryinfo_stats();
+rpc_getmemoryinfo([null | _]) ->
+    %% Explicit JSON null -> Core's RPCArg::Default{"stats"} applies (omitted /
+    %% null both resolve to the default), matching Arg<std::string_view>("mode").
+    rpc_getmemoryinfo_stats();
+rpc_getmemoryinfo([Mode | _]) when is_binary(Mode) ->
+    case Mode of
+        <<"stats">> ->
+            rpc_getmemoryinfo_stats();
+        <<"mallocinfo">> ->
+            %% Core returns glibc malloc_info(3) XML ONLY under HAVE_MALLOC_INFO;
+            %% on every other build it raises -8 "mallocinfo mode not available"
+            %% (node.cpp:191). The BEAM has no glibc malloc_info equivalent, so we
+            %% faithfully take Core's non-glibc path rather than fabricate a stub.
+            {error, ?RPC_INVALID_PARAMETER, <<"mallocinfo mode not available">>};
+        _ ->
+            %% Core node.cpp:194 tfm::format("unknown mode %s", mode).
+            {error, ?RPC_INVALID_PARAMETER,
+             <<"unknown mode ", Mode/binary>>}
+    end;
+rpc_getmemoryinfo([Mode | _]) ->
+    %% mode present but not a JSON string (number/bool/array/object) ->
+    %% RPC_TYPE_ERROR (-3). Core reads mode via Arg<std::string_view>, which type-
+    %% checks the param before any handler logic runs.
+    {error, ?RPC_TYPE_ERROR,
+     iolist_to_binary([<<"JSON value of type ">>, uvtype(Mode),
+                       <<" is not of expected type string">>])}.
+
+%% mode == "stats": Core RPCLockedMemoryInfo() reads
+%% LockedPoolManager::Instance().stats() and emits the six counters under
+%% "locked" in this exact pushKV order. beamchain has no mlock'd secure
+%% allocator (verified: no LockedPool/mlock/sodium_mlock/VirtualLock in the
+%% source), so every counter is an honest 0; the keys are ALWAYS present.
+rpc_getmemoryinfo_stats() ->
+    Locked = [{<<"used">>, 0},
+              {<<"free">>, 0},
+              {<<"total">>, 0},
+              {<<"locked">>, 0},
+              {<<"chunks_used">>, 0},
+              {<<"chunks_free">>, 0}],
+    {ok, [{<<"locked">>, Locked}]}.
 
 %% getaddrmaninfo
 %%
