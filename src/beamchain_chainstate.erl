@@ -1190,6 +1190,14 @@ do_connect_block_inner(#block{header = Header} = Block,
                 %% ZMQ notification for block connect
                 beamchain_zmq:notify_block(Block, connect),
 
+                %% Wake the wait-family RPCs on this tip advance (Core
+                %% KernelNotifications blockTip / WaitTipChanged).  This is
+                %% the single canonical connect site reached by IBD,
+                %% post-IBD, submitblock/generate AND the reorg
+                %% connect-new-branch half (do_reorganize_atomic reuses
+                %% do_connect_block).  Best-effort: notify/0 never raises.
+                beamchain_tip_notifier:notify(),
+
                 %% BIP-157/158: extend the compact-block-filter chain.
                 %% Best-effort — failure does not roll back the block.
                 %% Default-off (no-op when the index isn't running).
@@ -1802,6 +1810,12 @@ do_disconnect_block(#state{tip_hash = TipHash, tip_height = TipHeight,
 
                     %% ZMQ notification for block disconnect
                     beamchain_zmq:notify_block(Block, disconnect),
+
+                    %% Wake the wait-family RPCs on this tip change (the
+                    %% reorg disconnect-to-fork half, also invalidateblock).
+                    %% A disconnect changes the tip hash, so a waitfornewblock
+                    %% / waitforblock waiter must re-evaluate.  Best-effort.
+                    beamchain_tip_notifier:notify(),
 
                     %% BIP-157/158: roll back the filter index entry for
                     %% the disconnected block.  Best-effort, default-off.

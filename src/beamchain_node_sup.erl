@@ -19,6 +19,12 @@ init([]) ->
     CoreChildren = [
         child_spec(beamchain_db, worker),
         child_spec(beamchain_sig_cache, worker),
+        %% Tip-change notifier for the wait-family RPCs
+        %% (waitfornewblock / waitforblock / waitforblockheight).  Must
+        %% precede beamchain_chainstate_sup so the connect/reorg tip-advance
+        %% chokepoints always find it registered, and precede beamchain_rpc
+        %% so a waiter can subscribe.  No dependencies of its own.
+        child_spec(beamchain_tip_notifier, worker),
         child_spec(beamchain_chainstate_sup, supervisor),
         %% Mempool gets an extended shutdown timeout so its terminate/2
         %% has time to dump mempool.dat on graceful shutdown. The default
