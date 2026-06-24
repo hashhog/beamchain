@@ -800,6 +800,7 @@ handle_method(<<"getrawtransaction">>, P, _W) -> rpc_getrawtransaction(P);
 handle_method(<<"decoderawtransaction">>, P, _W) -> rpc_decoderawtransaction(P);
 handle_method(<<"sendrawtransaction">>, P, _W) -> rpc_sendrawtransaction(P);
 handle_method(<<"createrawtransaction">>, P, _W) -> rpc_createrawtransaction(P);
+handle_method(<<"combinerawtransaction">>, P, _W) -> rpc_combinerawtransaction(P);
 handle_method(<<"testmempoolaccept">>, P, _W) -> rpc_testmempoolaccept(P);
 handle_method(<<"submitpackage">>, P, _W) -> rpc_submitpackage(P);
 handle_method(<<"gettxout">>, P, _W) -> rpc_gettxout(P);
@@ -3414,6 +3415,189 @@ rpc_createrawtransaction([Inputs, Outputs, Locktime, Replaceable])
 rpc_createrawtransaction(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"Usage: createrawtransaction [{\"txid\":\"hex\",\"vout\":n},...] [{\"address\":amount},...] ( locktime replaceable )">>}.
+
+%% @doc combinerawtransaction: combine multiple partially-signed versions of
+%% the SAME transaction into one carrying the union of their signature data.
+%%
+%% Reference: bitcoin-core/src/rpc/rawtransaction.cpp combinerawtransaction()
+%% (impl body :605-668), cross-checked against the canonical ouroboros port
+%% (commit f4c98ee, src/ouroboros/rpc.py rpc_combinerawtransaction) which
+%% defines the agreed SCOPE + error strings. Each element of the txs array is a
+%% hex-encoded raw tx with the SAME inputs/outputs/version/locktime but DIFFERENT
+%% partial signatures. The first variant is the structural template; per input we
+%% merge the scriptSig + witness across all variants and write the combined
+%% result back. Returns the witness-serialized hex.
+%%
+%% MERGE SCOPE (single-sig parity, the dominant case): for the common/realistic
+%% case where each variant carries a COMPLETE single-key signature for a
+%% DIFFERENT subset of inputs (or one variant is unsigned), we take, per input,
+%% the non-empty (signed) scriptSig + witness. This is BYTE-IDENTICAL to Core for
+%% single-sig inputs (P2PKH / P2WPKH / P2SH-P2WPKH), because Core's
+%% DataFromTransaction returns the variant's scriptSig + scriptWitness verbatim
+%% once VerifyScript marks the input complete, and MergeSignatureData adopts that
+%% complete sigdata wholesale.
+%%
+%% KNOWN LIMITATION (flagged, NOT faked): the FULL Core behavior also merges
+%% PARTIAL multisig signatures WITHIN a single input — two variants each holding
+%% one of M sigs for a bare/P2SH/P2WSH M-of-N — via SignatureData::Merge over the
+%% extracted (pubkey -> sig) map. That needs Solver / VerifyScript-with-a-
+%% signature-extracting-checker / sighash validation, which this handler does NOT
+%% implement. For an input partially signed in BOTH variants (neither alone
+%% complete), we keep the longer (more sig-data) of the two scriptSigs rather
+%% than splicing the two sig sets together; that input's output is therefore NOT
+%% guaranteed byte-identical to Core. The per-input single-sig pick — the
+%% dominant case — IS byte-identical and is what is verified.
+%%
+%% DEVIATION (flagged): Core resolves every input's prevout from its own UTXO +
+%% mempool CCoinsViewCache and throws RPC_VERIFY_ERROR (-25) "Input not found or
+%% already spent" when a coin is missing/spent. This handler does NOT consult
+%% chainstate — combine is a pure function of the provided variants here — so it
+%% does NOT raise -25 for unresolvable prevouts. The -22 empty / -22 decode-
+%% failure error paths DO match Core byte-for-byte.
+rpc_combinerawtransaction([Txs]) when is_list(Txs) ->
+    %% 1. Decode every variant (witness-aware). Core: DecodeHexTx per idx; on
+    %%    failure -> -22 "TX decode failed for tx %d. ..." (0-based idx). The
+    %%    decode is delegated to the node's existing witness-aware codec
+    %%    (beamchain_serialize:decode_transaction/1), which preserves per-input
+    %%    scriptSig + witness stack.  We require the WHOLE binary to be consumed
+    %%    (no trailing bytes) and at least one input, mirroring DecodeHexTx +
+    %%    Core's "Make sure the tx has at least one input." hint.
+    case decode_variants(Txs, 0, []) of
+        {error, _, _} = Err ->
+            Err;
+        Variants ->
+            %% 2. Empty array -> -22 "Missing transactions". (Core guards an
+            %%    empty [] after the per-element decode loop.)
+            case Variants of
+                [] ->
+                    {error, ?RPC_DESERIALIZATION_ERROR,
+                     <<"Missing transactions">>};
+                [Template | _] ->
+                    Merged = combine_variants(Template, Variants),
+                    %% Core re-encodes WITH witness (TX_WITH_WITNESS)
+                    %% unconditionally; the encoder only emits the segwit
+                    %% marker/flag when any input carries a non-empty witness
+                    %% (== Core CTransaction::HasWitness). encode_transaction/1
+                    %% picks witness vs no_witness via has_witness/1, so the
+                    %% marker is emitted iff any merged input has a witness.
+                    Hex = beamchain_serialize:hex_encode(
+                            beamchain_serialize:encode_transaction(Merged)),
+                    {ok, Hex}
+            end
+    end;
+rpc_combinerawtransaction([NonArray | _]) ->
+    %% Present but not a JSON array (Core: request.params[0].get_array()).
+    {error, ?RPC_TYPE_ERROR,
+     iolist_to_binary([<<"JSON value of type ">>, uvtype(NonArray),
+                       <<" is not of expected type array">>])};
+rpc_combinerawtransaction(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: combinerawtransaction [\"hexstring\",...]">>}.
+
+%% Decode every variant hex into a #transaction{}, accumulating in order.
+%% Returns the list of decoded #transaction{} (in input order) or an
+%% {error, Code, Msg} the first time an element fails. The 0-based index is
+%% threaded so the decode-failure message names the right tx.
+decode_variants([], _Idx, Acc) ->
+    lists:reverse(Acc);
+decode_variants([Item | Rest], Idx, Acc) when is_binary(Item) ->
+    %% Core reads each element with .get_str() (here a jsx string => binary),
+    %% then DecodeHexTx. A decode failure (bad hex, truncated, structurally
+    %% invalid, trailing bytes, or zero inputs) -> -22 with the 0-based idx.
+    case (catch decode_one_variant(Item)) of
+        {ok, Tx} ->
+            decode_variants(Rest, Idx + 1, [Tx | Acc]);
+        _ ->
+            {error, ?RPC_DESERIALIZATION_ERROR,
+             iolist_to_binary(
+               io_lib:format(
+                 "TX decode failed for tx ~B. Make sure the tx has at "
+                 "least one input.", [Idx]))}
+    end;
+decode_variants([Item | _Rest], _Idx, _Acc) ->
+    %% Element is not a JSON string (Core reads it with .get_str()).
+    {error, ?RPC_TYPE_ERROR,
+     iolist_to_binary([<<"JSON value of type ">>, uvtype(Item),
+                       <<" is not of expected type string">>])}.
+
+%% Decode one variant: hex -> bytes -> witness-aware tx. The whole binary must
+%% be consumed and the tx must have >= 1 input (Core's DecodeHexTx semantics +
+%% the "at least one input" hint). Returns {ok, Tx} or raises (caught above).
+decode_one_variant(Hex) ->
+    Bin = beamchain_serialize:hex_decode(Hex),
+    {Tx, Rest} = beamchain_serialize:decode_transaction(Bin),
+    case {Rest, Tx#transaction.inputs} of
+        {<<>>, [_ | _]} -> {ok, Tx};
+        _ -> error(tx_decode_failed)
+    end.
+
+%% Build the merged transaction: clone the template's structure (version /
+%% locktime / vin prevouts+sequences / vout), and for EACH input pick — across
+%% all variants — the scriptSig + witness carrying signature data (Core
+%% DataFromTransaction + MergeSignatureData for the complete single-sig case).
+combine_variants(Template, Variants) ->
+    TemplateInputs = Template#transaction.inputs,
+    MergedInputs = combine_inputs(TemplateInputs, 0, Variants, []),
+    Template#transaction{
+        inputs = MergedInputs,
+        %% txid/wtxid are cached fields; clear so any later hashing recomputes.
+        txid = undefined,
+        wtxid = undefined
+    }.
+
+combine_inputs([], _I, _Variants, Acc) ->
+    lists:reverse(Acc);
+combine_inputs([Base | Rest], I, Variants, Acc) ->
+    %% For input index I, scan every variant that HAS an input at index I and
+    %% pick the one carrying the most signature data. Score: 0 = no sig data
+    %% (empty scriptSig AND empty/absent witness), else a large base plus the
+    %% total sig-data byte length (scriptSig length + sum of witness item
+    %% lengths). The base ensures any signed candidate beats every unsigned one;
+    %% the length tie-break deterministically prefers the more-complete variant
+    %% (matching the partial-multisig fallback note). Equal scores keep the
+    %% earliest variant (Core's merge is order-stable for the complete single-
+    %% sig case) — achieved by using a strict `>` when comparing.
+    {BestScriptSig, BestWitness} =
+        pick_best_input(Variants, I, -1, <<>>, []),
+    Merged = Base#tx_in{
+        script_sig = BestScriptSig,
+        witness = BestWitness
+    },
+    combine_inputs(Rest, I + 1, Variants, [Merged | Acc]).
+
+pick_best_input([], _I, _BestScore, BestSS, BestWit) ->
+    {BestSS, BestWit};
+pick_best_input([Variant | Rest], I, BestScore, BestSS, BestWit) ->
+    VInputs = Variant#transaction.inputs,
+    case nth_input(VInputs, I) of
+        undefined ->
+            %% This variant has fewer inputs than index I (Core: skip variants
+            %% with vin.size() <= i). Keep the current best.
+            pick_best_input(Rest, I, BestScore, BestSS, BestWit);
+        #tx_in{script_sig = SS0, witness = Wit0} ->
+            SS = case SS0 of undefined -> <<>>; _ -> SS0 end,
+            Wit = case Wit0 of undefined -> []; _ -> Wit0 end,
+            WitNonEmpty = lists:any(fun(X) -> byte_size(X) > 0 end, Wit),
+            SSNonEmpty = byte_size(SS) > 0,
+            Score = case SSNonEmpty orelse WitNonEmpty of
+                false -> 0;
+                true ->
+                    WitLen = lists:foldl(fun(X, A) -> A + byte_size(X) end,
+                                         0, Wit),
+                    1000000 + byte_size(SS) + WitLen
+            end,
+            case Score > BestScore of
+                true  -> pick_best_input(Rest, I, Score, SS, Wit);
+                false -> pick_best_input(Rest, I, BestScore, BestSS, BestWit)
+            end
+    end.
+
+%% 0-based nth element of a list, or undefined if out of range.
+nth_input(List, I) ->
+    case I < length(List) of
+        true  -> lists:nth(I + 1, List);
+        false -> undefined
+    end.
 
 %% Check if transaction fee rate exceeds the maximum allowed.
 %% Throws {max_fee_exceeded, ActualFeeRate} if exceeded.
