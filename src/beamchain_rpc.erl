@@ -228,6 +228,10 @@
 -define(RPC_CLIENT_NODE_NOT_ADDED, -24).     %% Node has not been added before
 -define(RPC_CLIENT_NODE_NOT_CONNECTED, -29). %% disconnect target not connected
 -define(RPC_CLIENT_INVALID_IP_OR_SUBNET, -30). %% Invalid IP/Subnet
+%% P2P/connman functionality missing or disabled (bitcoin-core/src/rpc/protocol.h:64,
+%% RPC_CLIENT_P2P_DISABLED). EnsureConnman raises this when the connection
+%% manager is unavailable — used by setnetworkactive (NOT -1).
+-define(RPC_CLIENT_P2P_DISABLED, -31).
 -define(RPC_WALLET_ALREADY_LOADED, -35).
 -define(RPC_WALLET_ALREADY_EXISTS, -36).
 
@@ -814,6 +818,7 @@ handle_method(<<"loadmempool">>, _, _W) -> rpc_loadmempool();
 
 %% -- Network --
 handle_method(<<"getnetworkinfo">>, _, _W) -> rpc_getnetworkinfo();
+handle_method(<<"setnetworkactive">>, P, _W) -> rpc_setnetworkactive(P);
 handle_method(<<"getpeerinfo">>, _, _W) -> rpc_getpeerinfo();
 handle_method(<<"getconnectioncount">>, _, _W) -> rpc_getconnectioncount();
 handle_method(<<"getblockfrompeer">>, P, _W) -> rpc_getblockfrompeer(P);
@@ -993,6 +998,7 @@ rpc_help_list() ->
         <<"getpeerinfo">>,
         <<"listbanned">>,
         <<"setban \"subnet\" \"command\" ( bantime )">>,
+        <<"setnetworkactive state">>,
         <<"">>,
         <<"== Rawtransactions ==">>,
         <<"analyzepsbt \"psbt\"">>,
@@ -5170,6 +5176,65 @@ rpc_getnetworkinfo() ->
                               beamchain_peer_manager:outbound_count(),
                               LocalAddrs)}.
 
+%% setnetworkactive state
+%%
+%% Disable/enable all p2p network activity. Mirrors Bitcoin Core
+%% rpc/net.cpp setnetworkactive (:889) + CConnman::SetNetworkActive
+%% (net.cpp:3361):
+%%
+%%   1. Resolve the connection manager (here: the peer-manager gen_server).
+%%      Core's EnsureConnman raises RPC_CLIENT_P2P_DISABLED (-31, protocol.h:64)
+%%      when the connman is unavailable — NOT a -1 misc error.
+%%   2. connman.SetNetworkActive(state): idempotent (no-op + no notification when
+%%      the flag already equals `state`); otherwise flips the node-global flag.
+%%   3. Return connman.GetNetworkActive() — a bare JSON boolean, the value read
+%%      back after the toggle (absent a race == `state`).
+%%
+%% Param: state (BOOL, REQUIRED). true to enable networking, false to disable.
+%% Setting false suppresses NEW connection establishment ONLY — existing peers
+%% are NOT disconnected. getnetworkinfo.networkactive mirrors this flag.
+%%
+%% Core reads request.params[0].get_bool(); a missing arg is an arity error and
+%% a non-bool a JSON type error. jsx decodes JSON true/false to the atoms
+%% true/false, so a JSON integer/float/string arrives as a non-atom and is
+%% rejected with RPC_TYPE_ERROR (-3) to match get_bool()'s strictness (Erlang,
+%% unlike Python, has no bool/int conflation, but we reject non-atoms explicitly
+%% for symmetry with the cross-impl reference and Core).
+rpc_setnetworkactive([]) ->
+    %% Missing required positional arg.
+    {error, ?RPC_INVALID_PARAMETER, <<"Missing required argument: state">>};
+rpc_setnetworkactive([State | _]) when is_boolean(State) ->
+    %% EnsureConnman parity: a missing connection manager is
+    %% RPC_CLIENT_P2P_DISABLED (-31), NOT an empty success. The peer-manager
+    %% gen_server is beamchain's connman; if it is not running, surface -31.
+    case whereis(beamchain_peer_manager) of
+        undefined ->
+            {error, ?RPC_CLIENT_P2P_DISABLED,
+             <<"Error: Peer-to-peer functionality missing or disabled">>};
+        _Pid ->
+            %% SetNetworkActive then return the read-back value (Core net.cpp:904-906).
+            {ok, beamchain_peer_manager:set_network_active(State)}
+    end;
+rpc_setnetworkactive([State | _]) ->
+    %% Present but not a JSON boolean (integer/float/string/object/null) ->
+    %% RPC_TYPE_ERROR (-3), matching Core get_bool() on a non-bool value.
+    {error, ?RPC_TYPE_ERROR,
+     iolist_to_binary([<<"JSON value of type ">>, uvtype(State),
+                       <<" is not of expected type bool">>])}.
+
+%% Map a jsx-decoded JSON value to Bitcoin Core's UniValue type name, as used in
+%% the get_bool()/get_int() type-error message "JSON value of type <type> is not
+%% of expected type ...". Core UniValue types: null, bool, number, string,
+%% array, object (univalue.h). jsx booleans/null arrive as atoms; numbers as
+%% integer/float; strings as binaries; arrays as lists; objects as maps.
+uvtype(null)                      -> <<"null">>;
+uvtype(B) when is_boolean(B)      -> <<"bool">>;
+uvtype(N) when is_number(N)       -> <<"number">>;
+uvtype(S) when is_binary(S)       -> <<"string">>;
+uvtype(L) when is_list(L)         -> <<"array">>;
+uvtype(M) when is_map(M)          -> <<"object">>;
+uvtype(_)                         -> <<"string">>.
+
 %% Pure result-shape builder for getnetworkinfo — exported for the wire-order
 %% eunit suite. ORDERED proplists (not maps) so jsx emits Core's pushKV order.
 %% Core rpc/net.cpp getnetworkinfo: version, subversion, protocolversion,
@@ -5213,7 +5278,12 @@ networkinfo_proplist(Connections, ConnIn, ConnOut, LocalAddrs) ->
         {<<"localservicesnames">>, services_to_names(LocalServices)},
         {<<"localrelay">>, true},
         {<<"timeoffset">>, 0},
-        {<<"networkactive">>, true},
+        %% Core rpc/net.cpp getnetworkinfo (:709): networkactive mirrors
+        %% connman.GetNetworkActive() — the node-global P2P-active flag toggled
+        %% by the setnetworkactive RPC. Reads the live flag (degrades to the
+        %% default `true` when the peer-manager gen_server is not running, e.g.
+        %% in the wire-order eunit suite).
+        {<<"networkactive">>, beamchain_peer_manager:get_network_active()},
         {<<"connections">>, Connections},
         {<<"connections_in">>, ConnIn},
         {<<"connections_out">>, ConnOut},
