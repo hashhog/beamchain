@@ -828,6 +828,7 @@ handle_method(<<"getblockfrompeer">>, P, _W) -> rpc_getblockfrompeer(P);
 handle_method(<<"getnodeaddresses">>, P, _W) -> rpc_getnodeaddresses(P);
 handle_method(<<"getaddrmaninfo">>, _, _W) -> rpc_getaddrmaninfo();
 handle_method(<<"addpeeraddress">>, P, _W) -> rpc_addpeeraddress(P);
+handle_method(<<"getaddednodeinfo">>, P, _W) -> rpc_getaddednodeinfo(P);
 handle_method(<<"addnode">>, P, _W) -> rpc_addnode(P);
 handle_method(<<"disconnectnode">>, P, _W) -> rpc_disconnectnode(P);
 handle_method(<<"listbanned">>, _, _W) -> rpc_listbanned();
@@ -997,6 +998,7 @@ rpc_help_list() ->
         <<"addpeeraddress \"address\" port ( tried )">>,
         <<"clearbanned">>,
         <<"disconnectnode ( \"address\" nodeid )">>,
+        <<"getaddednodeinfo ( \"node\" )">>,
         <<"getaddrmaninfo">>,
         <<"getconnectioncount">>,
         <<"getnetworkinfo">>,
@@ -5837,6 +5839,108 @@ rpc_addpeeraddress([AddrArg, PortArg, TriedArg | _]) when is_binary(AddrArg) ->
 rpc_addpeeraddress(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"Usage: addpeeraddress \"address\" port ( tried )">>}.
+
+%% getaddednodeinfo ( "node" )
+%%
+%% Return information about the persistent added-node list (Bitcoin Core
+%% rpc/net.cpp getaddednodeinfo :486-558 + CConnman::GetAddedNodeInfo
+%% net.cpp:2914). Result is an ARRAY of objects, each:
+%%
+%%   { "addednode" : <str>,                  % node exactly as given to addnode
+%%     "connected" : <bool>,                 % a current peer matches
+%%     "addresses" : [                       % ALWAYS present; [] when not connected
+%%        { "address"  : <str ip:port>,
+%%          "connected": "inbound" | "outbound" } ] }   % at most ONE entry
+%%
+%% The OUTER `connected` is a bool; the INNER `connected` is the bare peer
+%% direction string "inbound"/"outbound" (net.cpp:548 — NOT "manual"/"feeler").
+%% `addresses` is [] when the node is not currently connected, otherwise a
+%% single entry. With no added nodes the result is [].
+%%
+%% Optional `node` (STR): if supplied, only the matching added node is returned;
+%% matching is exact-string equality against the value originally passed to
+%% addnode (Core: m_params.m_added_node == node). A `node` not on the added
+%% list raises RPC_CLIENT_NODE_NOT_ADDED (-24) "Error: Node has not been added."
+%% `onetry` adds are NOT on the added list (beamchain's addnode "onetry" does
+%% not call add_added_node), so they are never listed and never match — Core
+%% parity (onetry adds are excluded from m_added_node_params).
+%%
+%% beamchain keeps the added-node registry in the public ETS table backing
+%% beamchain_peer_manager:get_added_nodes/0 (Core CConnman::m_added_nodes),
+%% populated by addnode "add"/"remove". Pure read — no side effects.
+rpc_getaddednodeinfo(Params) ->
+    %% Snapshot the persistent added-node list (binaries, the literal strings
+    %% passed to addnode). Core preserves insertion order; the ETS set has no
+    %% defined order, so sort for deterministic output.
+    Added0 = beamchain_peer_manager:get_added_nodes(),
+    Added = lists:sort(Added0),
+    %% Build a lookup of currently-connected peers keyed by {IP, Port} ->
+    %% direction (inbound|outbound). get_peers/0 aggregates every live peer
+    %% bucket the manager tracks.
+    Peers = beamchain_peer_manager:get_peers(),
+    ConnMap = lists:foldl(
+        fun(#{address := {IP, Port}, direction := Dir}, Acc) ->
+                maps:put({IP, Port}, Dir, Acc);
+           (_, Acc) -> Acc
+        end, #{}, Peers),
+    case Params of
+        %% No argument (omitted / null / empty list) -> all added nodes.
+        [] ->
+            {ok, [added_node_info_obj(N, ConnMap) || N <- Added]};
+        null ->
+            {ok, [added_node_info_obj(N, ConnMap) || N <- Added]};
+        [Node | _] when is_binary(Node) ->
+            %% Optional `node` filter: exact-string match against the added
+            %% list (Core net.cpp:530-535). Miss -> -24.
+            case lists:member(Node, Added) of
+                true ->
+                    {ok, [added_node_info_obj(Node, ConnMap)]};
+                false ->
+                    {error, ?RPC_CLIENT_NODE_NOT_ADDED,
+                     <<"Error: Node has not been added.">>}
+            end;
+        [Node | _] ->
+            %% Present but not a JSON string -> RPC_TYPE_ERROR (-3), matching
+            %% Core get_str() on a non-string value.
+            {error, ?RPC_TYPE_ERROR,
+             iolist_to_binary([<<"JSON value of type ">>, uvtype(Node),
+                               <<" is not of expected type string">>])}
+    end.
+
+%% Build one getaddednodeinfo array element for an added-node string.
+%% AddedNode is the literal string as given to addnode (reported verbatim in
+%% `addednode`, Core m_params.m_added_node). Connectivity is decided by parsing
+%% the string to {IP, Port} and looking it up in the live-peer ConnMap.
+added_node_info_obj(AddedNode, ConnMap) ->
+    Match = case parse_node_addr(AddedNode) of
+        {ok, IP, Port} ->
+            case maps:find({IP, Port}, ConnMap) of
+                {ok, Dir} -> {IP, Port, Dir};
+                error     -> none
+            end;
+        {error, _} ->
+            %% Unparseable/unresolvable added string can't match a live peer.
+            none
+    end,
+    %% ORDERED proplists (not maps): jsx preserves proplist order, and Core
+    %% rpc/net.cpp pushKV order is addednode -> connected -> addresses (inner:
+    %% address -> connected). Maps would sort the keys and break that order.
+    case Match of
+        {MIP, MPort, MDir} ->
+            DirStr = case MDir of
+                inbound -> <<"inbound">>;
+                _       -> <<"outbound">>
+            end,
+            [{<<"addednode">>, AddedNode},
+             {<<"connected">>, true},
+             {<<"addresses">>,
+              [[{<<"address">>, format_addr(MIP, MPort)},
+                {<<"connected">>, DirStr}]]}];
+        none ->
+            [{<<"addednode">>, AddedNode},
+             {<<"connected">>, false},
+             {<<"addresses">>, []}]
+    end.
 
 rpc_addnode([NodeStr, CommandStr]) when is_binary(NodeStr),
                                         is_binary(CommandStr) ->
