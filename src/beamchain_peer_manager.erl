@@ -56,6 +56,10 @@
          is_banned/1,
          is_whitelisted/1,
          check_inbound/1,
+         %% Node-global P2P-active flag (Core CConnman fNetworkActive /
+         %% setnetworkactive RPC). Surfaced read-only as getnetworkinfo.networkactive.
+         set_network_active/1,
+         get_network_active/0,
          broadcast/2,
          broadcast/3,
          announce_block/2,
@@ -329,7 +333,21 @@
     %%                      (Core net.h:75): we never open a second feeler
     %%                      while one is outstanding.
     feeler_timer :: reference() | undefined,
-    feeler_in_flight = undefined :: pid() | undefined
+    feeler_in_flight = undefined :: pid() | undefined,
+    %% Node-global "P2P network active" flag (Bitcoin Core CConnman.fNetworkActive,
+    %% net.h:1164 / SetNetworkActive net.cpp:3361, DEFAULT TRUE). Toggled by the
+    %% `setnetworkactive` RPC and surfaced read-only as `networkactive` in
+    %% getnetworkinfo. When FALSE we suppress establishing NEW connections ONLY —
+    %% existing/established peers are NOT force-dropped (Core's contract;
+    %% health/stale/disconnect sweeps keep running): (a) inbound accepts are
+    %% refused (handle_call check_inbound, Core net.cpp:1786), (b) the outbound
+    %% auto-dial refill AND the -connect pinned reconnect are skipped
+    %% (maybe_open_connection, Core net.cpp:2351/3022/3219), (c) DNS-seed
+    %% resolution and the fixed-seed fallback are held off (resolve_dns_seeds /
+    %% maybe_add_fixed_seeds, Core net.cpp:2351). When TRUE (the default) every
+    %% gate is a no-op and behavior is byte-identical to before. Not persisted;
+    %% resets to enabled on restart.
+    network_active = true :: boolean()
 }).
 
 %%% ===================================================================
@@ -405,6 +423,29 @@ is_whitelisted(IP) ->
     {ok, accept} | {reject, banned | too_many_inbound | already_connected}.
 check_inbound(Address) ->
     gen_server:call(?SERVER, {check_inbound, Address}).
+
+%% @doc Enable/disable all NEW P2P network activity (Bitcoin Core
+%% CConnman::SetNetworkActive, net.cpp:3361). Idempotent: if the flag already
+%% equals `State` it logs + early-returns the current value with no further
+%% effect (Core's `if (fNetworkActive == active) return;`). Otherwise flips the
+%% node-global flag. Does NOT disconnect existing/established peers — only
+%% suppresses NEW connection establishment (inbound accept, outbound auto-dial
+%% refill + -connect pinned reconnect, DNS/fixed-seed re-seeding). Returns the
+%% read-back value (Core returns GetNetworkActive(), which absent a race equals
+%% `State`). Not persisted; resets to enabled on restart.
+-spec set_network_active(boolean()) -> boolean().
+set_network_active(State) when is_boolean(State) ->
+    gen_server:call(?SERVER, {set_network_active, State}).
+
+%% @doc Read the node-global P2P-active flag (Core CConnman::GetNetworkActive,
+%% net.h:1164). Surfaced read-only as getnetworkinfo.networkactive. Degrades to
+%% the default `true` if the peer-manager gen_server is not running (unit-test
+%% mode / pre-init), mirroring the defensive accessors elsewhere in this module.
+-spec get_network_active() -> boolean().
+get_network_active() ->
+    try gen_server:call(?SERVER, get_network_active)
+    catch _:_ -> true
+    end.
 
 %% @doc Broadcast a message to all ready peers.
 -spec broadcast(atom(), map()) -> ok.
@@ -857,6 +898,14 @@ handle_call({connect_to, IP, Port}, _From, State) ->
 handle_call({is_banned, Address}, _From, State) ->
     {reply, is_banned_internal(Address, State), State};
 
+handle_call({check_inbound, {_IP, _Port}}, _From,
+            #state{network_active = false} = State) ->
+    %% Network-active gate (Bitcoin Core net.cpp:1786): while networking is
+    %% disabled (`setnetworkactive false`) refuse NEW inbound connections.
+    %% Existing peers are untouched — only new establishment is suppressed.
+    %% Reuse the `banned` reject reason so the acceptor closes the socket via
+    %% its existing rejection path (no new code path needed downstream).
+    {reply, {reject, banned}, State};
 handle_call({check_inbound, {IP, _Port} = Address}, _From, State) ->
     %% Pre-handshake rejection check following Bitcoin Core AcceptConnection logic:
     %% 1. Check if banned (unless whitelisted)
@@ -876,6 +925,24 @@ handle_call({check_inbound, {IP, _Port} = Address}, _From, State) ->
             end
     end,
     {reply, Result, State};
+
+%% setnetworkactive setter (Core CConnman::SetNetworkActive, net.cpp:3361).
+%% Idempotent no-op when the flag is already `Active` (logs + early-return,
+%% no notification); otherwise flips the node-global flag. Returns the
+%% read-back value (Core GetNetworkActive()). NEVER disconnects existing
+%% peers — the downstream gates only suppress NEW establishment.
+handle_call({set_network_active, Active}, _From,
+            #state{network_active = Active} = State) ->
+    logger:info("peer manager: SetNetworkActive: ~p (unchanged)", [Active]),
+    {reply, Active, State};
+handle_call({set_network_active, Active}, _From, State) ->
+    logger:info("peer manager: SetNetworkActive: ~p", [Active]),
+    {reply, Active, State#state{network_active = Active}};
+
+%% getnetworkinfo.networkactive read (Core CConnman::GetNetworkActive, net.h:1164).
+handle_call(get_network_active, _From,
+            #state{network_active = Active} = State) ->
+    {reply, Active, State};
 
 handle_call(get_ban_list, _From, State) ->
     BanList = get_ban_list_internal(),
@@ -913,6 +980,11 @@ handle_cast({disconnect_peer, Pid}, State) ->
     end,
     {noreply, State};
 
+handle_cast(resolve_dns_seeds, #state{network_active = false} = State) ->
+    %% Network-active gate (Bitcoin Core net.cpp:2351): while networking is
+    %% disabled (`setnetworkactive false`) hold off DNS-seed re-seeding until
+    %% reactivated. Existing peers are untouched.
+    {noreply, State};
 handle_cast(resolve_dns_seeds, #state{no_dns_seed = true} = State) ->
     %% DNS seeds suppressed by -nodnsseed / -connect. Defense-in-depth: any
     %% caller (bootstrap, connect_tick fallback, low-peers re-trigger) is a
@@ -1483,6 +1555,15 @@ calculate_keyed_netgroup(Address, #state{netgroup_secret = Secret}) ->
 %%% Internal: outbound connection logic
 %%% ===================================================================
 
+%% Network-active gate (Bitcoin Core net.cpp:2351/3022/3219): while networking
+%% is disabled (`setnetworkactive false`) the outbound connect loop holds off
+%% establishing ANY new connection — the -connect pinned reconnect AND the
+%% addrman auto-outbound refill alike. Existing peers stay up (the stale/health
+%% sweeps run unconditionally elsewhere); only NEW establishment is suppressed.
+%% This clause precedes the -connect clause below so pinned reconnects are
+%% suppressed too.
+maybe_open_connection(#state{network_active = false} = State) ->
+    State;
 %% -connect mode: never fill outbound slots from addrman/DNS. Only
 %% re-dial pinned peers that are not currently connected. Mirrors
 %% clearbit gating maintainOutbound() on connect_address==null
@@ -1515,6 +1596,11 @@ maybe_open_connection(State) ->
 %%   * a feeler is already in flight (MAX_FEELER_CONNECTIONS=1, Core net.h:75);
 %%   * the addrman NEW table is empty (Core's addrman.Select(newOnly=true)
 %%     returns an invalid address and the attempt is skipped).
+maybe_open_feeler(#state{network_active = false} = State) ->
+    %% Network-active gate: a feeler is NEW outbound establishment, so while
+    %% networking is disabled (`setnetworkactive false`) no feeler is opened
+    %% (Core ThreadOpenConnections is the same loop gated on fNetworkActive).
+    State;
 maybe_open_feeler(#state{connect_addrs = [_ | _]} = State) ->
     %% -connect mode: feeler scheduling disabled (Core -connect).
     State;
@@ -3012,6 +3098,12 @@ resolve_one_seed(Seed, Port) ->
 %% (possibly updated) state with `discovered` merged and the one-shot
 %% guard set.
 -spec maybe_add_fixed_seeds(#state{}) -> #state{}.
+maybe_add_fixed_seeds(#state{network_active = false} = State) ->
+    %% Network-active gate (Bitcoin Core net.cpp:2351): while networking is
+    %% disabled (`setnetworkactive false`) the fixed-seed fallback is held off
+    %% (do not inject seeds, do not arm the one-shot guard) so it can still fire
+    %% normally once networking is reactivated. Existing peers are untouched.
+    State;
 maybe_add_fixed_seeds(State) ->
     Now = erlang:system_time(second),
     Start = case State#state.start_time of
