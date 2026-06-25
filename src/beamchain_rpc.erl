@@ -845,6 +845,7 @@ handle_method(<<"clearbanned">>, _, _W) -> rpc_clearbanned();
 handle_method(<<"getmininginfo">>, _, _W) -> rpc_getmininginfo();
 handle_method(<<"getblocktemplate">>, P, _W) -> rpc_getblocktemplate(P);
 handle_method(<<"submitblock">>, P, _W) -> rpc_submitblock(P);
+handle_method(<<"submitheader">>, P, _W) -> rpc_submitheader(P);
 handle_method(<<"prioritisetransaction">>, P, _W) -> rpc_prioritisetransaction(P);
 handle_method(<<"getprioritisedtransactions">>, _, _W) -> rpc_getprioritisedtransactions();
 
@@ -990,6 +991,7 @@ rpc_help_list() ->
         <<"getprioritisedtransactions">>,
         <<"prioritisetransaction \"txid\" ( dummy ) fee_delta">>,
         <<"submitblock \"hexdata\"">>,
+        <<"submitheader \"hexdata\"">>,
         <<"">>,
         <<"== Mempool ==">>,
         <<"dumpmempool">>,
@@ -6932,6 +6934,87 @@ rpc_submitblock([HexData]) when is_binary(HexData) ->
 rpc_submitblock(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"Usage: submitblock \"hexdata\"">>}.
+
+%% submitheader "hexdata"
+%%
+%% Decode the given hexdata as a block header and submit it as a candidate
+%% chain tip if valid.  Mirrors Bitcoin Core rpc/mining.cpp::submitheader:
+%%
+%%   * Bad hex / wrong length / undecodable header
+%%       -> RPC_DESERIALIZATION_ERROR (-22) "Block header decode failed"
+%%   * Parent (prev block) unknown to this node
+%%       -> RPC_VERIFY_ERROR (-25)
+%%          "Must submit previous header (<prevhash>) first"
+%%          where <prevhash> is the BIG-ENDIAN DISPLAY hex of hashPrevBlock
+%%          (Core's h.hashPrevBlock.GetHex()).
+%%   * PoW / contextual validation failure
+%%       -> RPC_VERIFY_ERROR (-25) with the reject-reason string
+%%          (BIP-22 canonical string, same mapping submitblock uses).
+%%   * Success / already-known header
+%%       -> JSON null.
+%%
+%% The header is run through the SAME validation + store path the production
+%% header-first sync and submitblock side-branch use
+%% (beamchain_chainstate:submit_header/1 -> CheckBlockHeader +
+%% ContextualCheckBlockHeader + store_block_index) — no parallel validator.
+rpc_submitheader([HexData]) when is_binary(HexData) ->
+    %% Step 1: decode the hex as an 80-byte header.  Any failure
+    %% (non-hex chars, odd length, wrong byte count, undecodable) ->
+    %% RPC_DESERIALIZATION_ERROR -22, byte-identical to Core's
+    %% DecodeHexBlockHeader failure path.
+    case decode_header_hex(HexData) of
+        {error, decode_failed} ->
+            {error, ?RPC_DESERIALIZATION_ERROR,
+             <<"Block header decode failed">>};
+        {ok, Header} ->
+            %% Step 2 + 3: parent-known check + validation + store, all in
+            %% the chainstate gen_server (Core ProcessNewBlockHeaders).
+            case beamchain_chainstate:submit_header(Header) of
+                {ok, accepted} ->
+                    %% Success or already-known -> JSON null.
+                    {ok, null};
+                {error, unknown_prev} ->
+                    %% prevhash in big-endian DISPLAY order, matching Core's
+                    %% h.hashPrevBlock.GetHex().  prev_hash is stored
+                    %% internal (little-endian); reverse for display.
+                    PrevDisplay = beamchain_serialize:hex_encode(
+                        beamchain_serialize:reverse_bytes(
+                            Header#block_header.prev_hash)),
+                    Msg = <<"Must submit previous header (",
+                            PrevDisplay/binary, ") first">>,
+                    {error, ?RPC_VERIFY_ERROR, Msg};
+                {error, Reason} ->
+                    %% PoW / contextual reject.  Map the validation atom to
+                    %% the canonical BIP-22 reject string (same mapping
+                    %% submitblock uses), surfaced as the -25 error message
+                    %% (Core: state.GetRejectReason()).
+                    {error, ?RPC_VERIFY_ERROR, bip22_result(Reason)}
+            end
+    end;
+rpc_submitheader(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: submitheader \"hexdata\"">>}.
+
+%% Decode a hex-encoded 80-byte block header.  Returns {ok, #block_header{}}
+%% or {error, decode_failed} for any malformed input (Core
+%% DecodeHexBlockHeader: bad hex OR a payload that does not deserialise to
+%% exactly one header with no trailing bytes).
+decode_header_hex(HexData) ->
+    try beamchain_serialize:hex_decode(HexData) of
+        Bin when byte_size(Bin) =:= 80 ->
+            %% Exactly 80 bytes: decode_block_header/1 consumes all 80 and
+            %% leaves an empty remainder.
+            case beamchain_serialize:decode_block_header(Bin) of
+                {#block_header{} = Header, <<>>} -> {ok, Header};
+                _ -> {error, decode_failed}
+            end;
+        _ ->
+            %% Wrong length (Core: stream has leftover/short bytes -> throw).
+            {error, decode_failed}
+    catch
+        %% binary:decode_hex raises on odd-length or non-hex input.
+        _:_ -> {error, decode_failed}
+    end.
 
 %%% ===================================================================
 %%% Generating methods (regtest only)
