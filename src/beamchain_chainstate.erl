@@ -51,6 +51,18 @@
 %% point closes both gaps.
 -export([submit_block/1, refill_mempool_after_reorg/1]).
 
+%% submit_header/1 is the header-only acceptance entry point used by the
+%% submitheader RPC.  It mirrors Bitcoin Core's
+%% ChainstateManager::ProcessNewBlockHeaders -> AcceptBlockHeader
+%% (validation.cpp): PoW + contextual header checks + a header-only
+%% block-index insert, with NO body/UTXO connect.  It REUSES the same
+%% validators (beamchain_validation:check_block_header/2 +
+%% contextual_check_block_header/3) and the same store
+%% (beamchain_db:store_block_index, status=1 header-only) that the
+%% header-first P2P sync path (beamchain_header_sync) and the
+%% submitblock side-branch path use — no parallel validator.
+-export([submit_header/1]).
+
 %% G8 (W97): exported for EUnit white-box testing only.
 %% check_min_pow_work_int/3 is the pure inner predicate of the per-submit
 %% min_chainwork gate (Core validation.cpp:4229-4232).
@@ -284,6 +296,31 @@ submit_block(Block) ->
         Other ->
             Other
     end.
+
+%% @doc Header-only acceptance entry point for the submitheader RPC.
+%%
+%% Mirrors Bitcoin Core ChainstateManager::ProcessNewBlockHeaders ->
+%% AcceptBlockHeader (validation.cpp): validate the header's proof-of-work
+%% and contextual rules against its parent's block-index entry, then insert
+%% a header-only block-index entry (no transactions, no UTXO mutation).
+%%
+%% This routes through the chainstate gen_server so it observes a consistent
+%% tip/MTP snapshot and serialises against connect/reorg, exactly as
+%% submit_block does.  It does NOT run any body-level checks (no merkle root,
+%% no script verification) because a header carries no transactions — that is
+%% Core's split between AcceptBlockHeader (header) and AcceptBlock (body).
+%%
+%% Returns:
+%%   {ok, accepted}        — header newly validated + stored, OR already known
+%%   {error, unknown_prev} — parent (prev block) not in the block index
+%%   {error, Reason}       — header failed a PoW / contextual check;
+%%                           Reason is the same atom the side-branch /
+%%                           header-sync paths raise (mapped to a BIP-22
+%%                           reject string at the RPC layer).
+-spec submit_header(#block_header{}) ->
+    {ok, accepted} | {error, unknown_prev | atom()}.
+submit_header(Header) ->
+    gen_server:call(?SERVER, {submit_header, Header}, 60000).
 
 %% Re-feed the non-coinbase txs of the disconnected blocks to the
 %% mempool.  Mirrors Bitcoin Core's MaybeUpdateMempoolForReorg
@@ -800,6 +837,13 @@ handle_call({submit_block, Block}, _From, State) ->
         {error, Reason} ->
             {reply, {error, Reason}, State}
     end;
+
+handle_call({submit_header, Header}, _From, State) ->
+    %% Header-only acceptance (submitheader RPC).  No state mutation other
+    %% than the header-only block-index write, which lives in beamchain_db;
+    %% the chainstate #state{} (tip/UTXO) is unchanged because a header does
+    %% not connect a body.  See do_submit_header/2.
+    {reply, do_submit_header(Header, State), State};
 
 handle_call(disconnect_block, _From, State) ->
     case do_disconnect_block(State) of
@@ -1409,6 +1453,75 @@ do_submit_block(#block{header = Header} = Block,
             end;
         {error, _} = Err ->
             Err
+    end.
+
+%% Header-only acceptance, mirroring Bitcoin Core AcceptBlockHeader
+%% (validation.cpp).  Used by the submitheader RPC.  No body, no UTXO
+%% mutation — just PoW + contextual header validation against the parent's
+%% index entry, then a header-only block-index insert (status=1, BLOCK_VALID
+%% _HEADER).  Every step reuses an existing function used by the production
+%% header-first (beamchain_header_sync) and submitblock side-branch paths.
+%%
+%% Order of checks matches Core ProcessNewBlockHeaders + AcceptBlockHeader:
+%%   1. idempotency  — header already in the index  -> {ok, accepted}
+%%   2. parent known — LookupBlockIndex(hashPrevBlock); missing -> unknown_prev
+%%   3. CheckBlockHeader  (context-free PoW + bits-in-powlimit)
+%%   4. ContextualCheckBlockHeader (difficulty match, MTP, BIP94, versions)
+%%   5. AddToBlockIndex   (header-only store via store_block_index/5)
+do_submit_header(#block_header{prev_hash = PrevHash} = Header,
+                 #state{params = Params}) ->
+    BlockHash = beamchain_serialize:block_hash(Header),
+    %% (1) Idempotency.  Core's AcceptBlockHeader returns the existing index
+    %% entry (success) when the header is already known.  Any index hit
+    %% (active or side-branch, header-only or with body) counts as known.
+    case lookup_block_index_anywhere(BlockHash) of
+        {ok, _Existing} ->
+            {ok, accepted};
+        not_found ->
+            %% (2) Parent must be in the block index (Core LookupBlockIndex).
+            case lookup_block_index_anywhere(PrevHash) of
+                not_found ->
+                    {error, unknown_prev};
+                {ok, ParentEntry} ->
+                    do_accept_new_header(Header, BlockHash, ParentEntry, Params)
+            end
+    end.
+
+%% Validate a not-yet-known header whose parent IS in the index, then store
+%% it header-only.  Same validators + same store as the side-branch path
+%% (do_side_branch_accept_with_parent) and beamchain_header_sync.
+do_accept_new_header(Header, BlockHash, ParentEntry, Params) ->
+    %% (3) Context-free header check: proof-of-work + bits within pow_limit.
+    %% Core CheckBlockHeader (validation.cpp), fCheckPOW=true.
+    case beamchain_validation:check_block_header(Header, Params) of
+        {error, Reason} ->
+            {error, Reason};
+        ok ->
+            ParentHeight = maps:get(height, ParentEntry),
+            ParentCW = maps:get(chainwork, ParentEntry, <<0:256>>),
+            ParentIndex = ParentEntry#{height => ParentHeight,
+                                       chainwork => ParentCW},
+            %% (4) Contextual header check against the parent's index entry.
+            %% Core ContextualCheckBlockHeader: expected difficulty, timestamp
+            %% > MTP, BIP94 timewarp, BIP34/66/65 version gates.  Exactly the
+            %% predicate the submitblock side-branch path runs.
+            case beamchain_validation:contextual_check_block_header(
+                   Header, ParentIndex, Params) of
+                {error, Reason} ->
+                    {error, Reason};
+                ok ->
+                    Height = ParentHeight + 1,
+                    ParentCWInt = binary:decode_unsigned(ParentCW, big),
+                    BlockWork = beamchain_pow:compute_work(
+                                  Header#block_header.bits),
+                    NewCW = encode_chainwork(ParentCWInt + BlockWork),
+                    %% (5) AddToBlockIndex — header-only entry.  Status 1 =
+                    %% BLOCK_VALID_HEADER (no HAVE_DATA), identical to what
+                    %% beamchain_header_sync writes for a synced header.
+                    ok = beamchain_db:store_block_index(
+                           Height, BlockHash, Header, NewCW, 1),
+                    {ok, accepted}
+            end
     end.
 
 %% G8 outer wrapper: look up the parent chainwork from the DB and delegate
