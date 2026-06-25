@@ -3592,22 +3592,58 @@ rpc_sendrawtransaction(_) ->
 
 %% @doc createrawtransaction: Create a raw transaction from inputs and outputs.
 %% Returns hex-encoded unsigned transaction.
-rpc_createrawtransaction([Inputs, Outputs]) when is_list(Inputs), is_list(Outputs) ->
-    rpc_createrawtransaction([Inputs, Outputs, 0, false]);
-rpc_createrawtransaction([Inputs, Outputs, Locktime]) when is_list(Inputs), is_list(Outputs) ->
-    rpc_createrawtransaction([Inputs, Outputs, Locktime, false]);
-rpc_createrawtransaction([Inputs, Outputs, Locktime, Replaceable])
-  when is_list(Inputs), is_list(Outputs) ->
+%%
+%% Reference: bitcoin-core/src/rpc/rawtransaction.cpp createrawtransaction() ->
+%%   ConstructTransaction (rawtransaction_util.cpp:147), AddInputs (:25),
+%%   NormalizeOutputs (:74), ParseOutputs (:101), AddOutputs (:133).
+%%
+%% Two Core-faithfulness fixes vs the prior body:
+%%  (1) Default nSequence. Core ConstructTransaction takes rbf as
+%%      std::optional<bool>; createrawtransaction passes std::nullopt when the
+%%      `replaceable` arg is ABSENT (rawtransaction.cpp:398-401). AddInputs then
+%%      (rawtransaction_util.cpp:49-55) uses, for an input with NO explicit
+%%      "sequence":
+%%        rbf.value_or(true)        -> MAX_BIP125_RBF_SEQUENCE 0xFFFFFFFD
+%%        else if nLockTime != 0    -> MAX_SEQUENCE_NONFINAL   0xFFFFFFFE
+%%        else                      -> SEQUENCE_FINAL          0xFFFFFFFF
+%%      value_or(true) => "arg absent" AND "replaceable=true" both default to
+%%      the RBF sequence. The prior body defaulted the arg to `false` and never
+%%      handled the locktime!=0 case (always 0xFFFFFFFF) — both wrong.
+%%  (2) Outputs accept BOTH the JSON object form {addr:amt,"data":hex,...} AND
+%%      the array form [{addr:amt},{"data":hex},...] (Core NormalizeOutputs).
+%%      The prior body guarded is_list(Outputs) and rejected the object form.
+%%
+%% REUSE: existing hex_to_internal_hash/1 (txid), beamchain_address:
+%% address_to_script/2 (addr->spk), btc_to_satoshi/1 (amount), and
+%% beamchain_serialize:encode_transaction/1 (the node's tx serializer — no
+%% witness on the all-empty-scriptSig unsigned tx, so no segwit marker, matching
+%% Core's EncodeHexTx).
+rpc_createrawtransaction([Inputs, Outputs]) when is_list(Inputs) ->
+    rpc_createrawtransaction([Inputs, Outputs, 0, undefined]);
+rpc_createrawtransaction([Inputs, Outputs, Locktime]) when is_list(Inputs) ->
+    rpc_createrawtransaction([Inputs, Outputs, Locktime, undefined]);
+rpc_createrawtransaction([Inputs, Outputs, Locktime, Replaceable0])
+  when is_list(Inputs), (is_list(Outputs) orelse is_map(Outputs)) ->
     try
-        %% Parse inputs
+        %% Core: rbf is std::optional<bool>, value_or(true) => absent defaults
+        %% to TRUE. `undefined` here is the "arg absent" sentinel.
+        Replaceable = case Replaceable0 of
+            undefined -> true;
+            true      -> true;
+            false     -> false;
+            _         -> true   %% non-bool passthrough -> Core get_bool default true
+        end,
+        %% Default nSequence (Core AddInputs three-way, rawtransaction_util.cpp:49-55).
+        DefaultSequence =
+            if Replaceable        -> 16#FFFFFFFD;  %% MAX_BIP125_RBF_SEQUENCE
+               Locktime =/= 0     -> 16#FFFFFFFE;  %% MAX_SEQUENCE_NONFINAL
+               true               -> 16#FFFFFFFF   %% SEQUENCE_FINAL
+            end,
+        %% Parse inputs (explicit per-input "sequence" wins over the default).
         TxInputs = lists:map(fun(#{<<"txid">> := TxidHex, <<"vout">> := Vout} = InMap) ->
             Txid = hex_to_internal_hash(TxidHex),
             Sequence = case maps:get(<<"sequence">>, InMap, undefined) of
-                undefined ->
-                    case Replaceable of
-                        true -> 16#FFFFFFFD;  %% BIP125 replaceable
-                        _ -> 16#FFFFFFFF
-                    end;
+                undefined -> DefaultSequence;
                 Seq -> Seq
             end,
             #tx_in{prev_out = #outpoint{hash = Txid, index = Vout},
@@ -3615,19 +3651,22 @@ rpc_createrawtransaction([Inputs, Outputs, Locktime, Replaceable])
                    sequence = Sequence,
                    witness = []}
         end, Inputs),
-        %% Parse outputs (list of maps, each with address:amount or data:hex)
-        TxOutputs = lists:flatmap(fun(OutMap) ->
-            maps:fold(fun
-                (<<"data">>, HexData, Acc) ->
-                    Script = <<16#6a, (beamchain_serialize:hex_decode(HexData))/binary>>,
-                    [#tx_out{value = 0, script_pubkey = Script} | Acc];
-                (Address, Amount, Acc) ->
-                    Satoshis = btc_to_satoshi(Amount),
-                    {ok, Script} = beamchain_address:address_to_script(
-                        binary_to_list(Address), beamchain_config:network()),
-                    [#tx_out{value = Satoshis, script_pubkey = Script} | Acc]
-            end, [], OutMap)
-        end, Outputs),
+        %% Outputs: NormalizeOutputs -> ordered list of {Key, Value} pairs.
+        %% Object form -> maps:to_list; array form -> each element is a
+        %% single-key object, flattened in order (preserves duplicate addresses
+        %% and ordering, Core rawtransaction_util.cpp:83-97).
+        OutputPairs = normalize_createraw_outputs(Outputs),
+        TxOutputs = lists:map(fun
+            ({<<"data">>, HexData}) ->
+                Data = beamchain_serialize:hex_decode(HexData),
+                Script = build_op_return_script(Data),
+                #tx_out{value = 0, script_pubkey = Script};
+            ({Address, Amount}) ->
+                Satoshis = btc_to_satoshi(Amount),
+                {ok, Script} = beamchain_address:address_to_script(
+                    binary_to_list(Address), beamchain_config:network()),
+                #tx_out{value = Satoshis, script_pubkey = Script}
+        end, OutputPairs),
         Tx = #transaction{
             version = 2,
             inputs = TxInputs,
@@ -3644,6 +3683,40 @@ rpc_createrawtransaction([Inputs, Outputs, Locktime, Replaceable])
 rpc_createrawtransaction(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"Usage: createrawtransaction [{\"txid\":\"hex\",\"vout\":n},...] [{\"address\":amount},...] ( locktime replaceable )">>}.
+
+%% Core NormalizeOutputs (rawtransaction_util.cpp:74-99): accept either a JSON
+%% object {addr:amt,...} (jsx return_maps -> Erlang map) or an array of
+%% single-key objects [{addr:amt},...] (jsx -> list of maps). Returns an ordered
+%% list of {Key, Value} pairs. Each array element must be a one-key object.
+normalize_createraw_outputs(Outputs) when is_map(Outputs) ->
+    maps:to_list(Outputs);
+normalize_createraw_outputs(Outputs) when is_list(Outputs) ->
+    lists:map(fun(Entry) when is_map(Entry) ->
+                      case maps:to_list(Entry) of
+                          [KV] -> KV;
+                          _ -> throw({invalid_parameter,
+                                      <<"key-value pair must contain exactly one key">>})
+                      end;
+                 (_) ->
+                      throw({invalid_parameter,
+                             <<"key-value pair not an object as expected">>})
+              end, Outputs).
+
+%% OP_RETURN <data> built with canonical push opcodes, mirroring Core's
+%% CScript() << OP_RETURN << data (rawtransaction_util.cpp:114). The prior body
+%% emitted 0x6a ++ data with NO push-length byte (e.g. 6adeadbeef), which is not
+%% Core-faithful; Core pushes the data with a direct push for len<76 (here 04 for
+%% 4 bytes -> 6a04deadbeef), OP_PUSHDATA1 for <=255, OP_PUSHDATA2 otherwise.
+build_op_return_script(Data) ->
+    N = byte_size(Data),
+    if
+        N < 16#4c ->
+            <<16#6a, N:8, Data/binary>>;
+        N =< 16#ff ->
+            <<16#6a, 16#4c, N:8, Data/binary>>;
+        true ->
+            <<16#6a, 16#4d, N:16/little, Data/binary>>
+    end.
 
 %% @doc combinerawtransaction: combine multiple partially-signed versions of
 %% the SAME transaction into one carrying the union of their signature data.
