@@ -826,6 +826,7 @@ handle_method(<<"getmemoryinfo">>, P, _W) -> rpc_getmemoryinfo(P);
 
 %% -- Network --
 handle_method(<<"getnetworkinfo">>, _, _W) -> rpc_getnetworkinfo();
+handle_method(<<"getnettotals">>, _, _W) -> rpc_getnettotals();
 handle_method(<<"setnetworkactive">>, P, _W) -> rpc_setnetworkactive(P);
 handle_method(<<"getpeerinfo">>, _, _W) -> rpc_getpeerinfo();
 handle_method(<<"getconnectioncount">>, _, _W) -> rpc_getconnectioncount();
@@ -1013,6 +1014,7 @@ rpc_help_list() ->
         <<"getaddrmaninfo">>,
         <<"getconnectioncount">>,
         <<"getnetworkinfo">>,
+        <<"getnettotals">>,
         <<"getnodeaddresses ( count \"network\" )">>,
         <<"getpeerinfo">>,
         <<"listbanned">>,
@@ -5597,6 +5599,85 @@ rpc_getnetworkinfo() ->
                               beamchain_peer_manager:inbound_count(),
                               beamchain_peer_manager:outbound_count(),
                               LocalAddrs)}.
+
+%% getnettotals
+%%
+%% Returns network traffic statistics. Mirrors Bitcoin Core rpc/net.cpp
+%% getnettotals (:560-606):
+%%
+%%   obj.pushKV("totalbytesrecv", connman.GetTotalBytesRecv());
+%%   obj.pushKV("totalbytessent", connman.GetTotalBytesSent());
+%%   obj.pushKV("timemillis", <system clock ms>);
+%%   uploadtarget: { timeframe, target, target_reached,
+%%                   serve_historical_blocks, bytes_left_in_cycle,
+%%                   time_left_in_cycle }
+%%
+%% BYTE COUNTERS: Core's CConnman keeps GLOBAL cumulative recv/sent totals
+%% that survive peer disconnect (nTotalBytesRecv/Sent). beamchain has no such
+%% node-global accumulator — each beamchain_peer gen_statem tracks its OWN
+%% bytes_sent/bytes_recv (peer.erl #peer_data, surfaced by the same `info`
+%% call getpeerinfo uses). So we SUM the CURRENTLY-CONNECTED peers, exactly as
+%% rustoshi's get_net_totals does. This is an APPROXIMATION: bytes exchanged
+%% with peers that have since disconnected are NOT included (a true global
+%% counter would carry them). Documented as such — not fabricated.
+%%
+%% UPLOADTARGET: beamchain has no -maxuploadtarget, so Core returns the
+%% disabled/zero shape (rpc/net.cpp via CConnman with nMaxOutboundLimit=0):
+%% timeframe = the measuring window (Core default 60*60*24 = 86400s, returned
+%% even when the limit is off), target = 0, target_reached = false,
+%% serve_historical_blocks = true (= !OutboundTargetReached(true), and with no
+%% limit OutboundTargetReached is always false), bytes_left_in_cycle = 0
+%% (GetOutboundTargetBytesLeft returns 0 when nMaxOutboundLimit==0),
+%% time_left_in_cycle = 0 (GetMaxOutboundTimeLeftInCycle returns 0 when the
+%% limit is off). Core-faithful zero shape, NOT a fabricated value.
+%%
+%% Returns an ORDERED proplist (NOT a map) so jsx emits Core's pushKV order:
+%% totalbytesrecv, totalbytessent, timemillis, uploadtarget. (jsx preserves
+%% proplist order but alphabetises map keys.)
+rpc_getnettotals() ->
+    {ok, getnettotals_proplist()}.
+
+%% Pure result-shape builder for getnettotals — exported-shape mirrors Core's
+%% pushKV order. Sums bytes across currently-connected peers (approximation;
+%% see rpc_getnettotals comment) and emits the Core-faithful disabled
+%% uploadtarget zero shape.
+getnettotals_proplist() ->
+    {BytesRecv, BytesSent} = sum_peer_bytes(),
+    %% Core: TicksSinceEpoch<milliseconds>(SystemClock::now()).
+    TimeMillis = erlang:system_time(millisecond),
+    [
+        {<<"totalbytesrecv">>, BytesRecv},
+        {<<"totalbytessent">>, BytesSent},
+        {<<"timemillis">>, TimeMillis},
+        %% ORDERED nested proplist: Core uploadtarget pushKV order is
+        %% timeframe, target, target_reached, serve_historical_blocks,
+        %% bytes_left_in_cycle, time_left_in_cycle.
+        {<<"uploadtarget">>, [
+            %% Core MAX_UPLOAD_TIMEFRAME default = 60*60*24 = 86400s
+            %% (net.h kMaxOutboundTimeframe), reported regardless of the limit.
+            {<<"timeframe">>, 86400},
+            {<<"target">>, 0},
+            {<<"target_reached">>, false},
+            {<<"serve_historical_blocks">>, true},
+            {<<"bytes_left_in_cycle">>, 0},
+            {<<"time_left_in_cycle">>, 0}
+        ]}
+    ].
+
+%% Sum bytes_sent / bytes_recv across the currently-connected peers, pulling
+%% the LIVE counters from each peer gen_statem (the same `info` call
+%% getpeerinfo uses), falling back to the manager's stored Info on timeout so
+%% the RPC never blocks behind a slow peer. Returns {BytesRecv, BytesSent}.
+sum_peer_bytes() ->
+    Peers = beamchain_peer_manager:get_peers(),
+    lists:foldl(fun(#{pid := Pid, info := StaleInfo}, {AccR, AccS}) ->
+        Info = case catch gen_statem:call(Pid, info, 500) of
+            {ok, Live} when is_map(Live) -> Live;
+            _ -> StaleInfo
+        end,
+        {AccR + maps:get(bytes_recv, Info, 0),
+         AccS + maps:get(bytes_sent, Info, 0)}
+    end, {0, 0}, Peers).
 
 %% ping
 %%
