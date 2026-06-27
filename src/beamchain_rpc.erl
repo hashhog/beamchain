@@ -794,6 +794,7 @@ handle_method(<<"getblockfilter">>, P, _W) -> rpc_getblockfilter(P);
 handle_method(<<"getindexinfo">>, P, _W) -> rpc_getindexinfo(P);
 handle_method(<<"invalidateblock">>, P, _W) -> rpc_invalidateblock(P);
 handle_method(<<"reconsiderblock">>, P, _W) -> rpc_reconsiderblock(P);
+handle_method(<<"preciousblock">>, P, _W) -> rpc_preciousblock(P);
 handle_method(<<"flushchainstate">>, _, _W) -> rpc_flushchainstate();
 handle_method(<<"scrubunspendable">>, _, _W) -> rpc_scrubunspendable();
 handle_method(<<"pruneblockchain">>, P, _W) -> rpc_pruneblockchain(P);
@@ -968,6 +969,7 @@ rpc_help_list() ->
         <<"gettxoutsetinfo ( \"hash_type\" )">>,
         <<"invalidateblock \"blockhash\"">>,
         <<"reconsiderblock \"blockhash\"">>,
+        <<"preciousblock \"blockhash\"">>,
         <<"verifychain ( checklevel nblocks )">>,
         <<"getblockfilter \"blockhash\" ( \"filtertype\" )">>,
         <<"flushchainstate">>,
@@ -2628,6 +2630,34 @@ rpc_reconsiderblock([HashHex]) when is_binary(HashHex) ->
 rpc_reconsiderblock(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"Usage: reconsiderblock \"blockhash\"">>}.
+
+%% @doc preciousblock - treat a block as if it were received before others
+%% with the same work. Gives the block a more-favorable sequence id so it wins
+%% equal-work chain-selection ties, then re-activates the best chain (reorging
+%% onto it if it is a valid equal-or-greater-work competitor). Returns null on
+%% success; errors with -5 (RPC_INVALID_ADDRESS_OR_KEY) if the block is unknown.
+%% Mirrors Bitcoin Core's preciousblock RPC + Chainstate::PreciousBlock.
+rpc_preciousblock([HashHex]) when is_binary(HashHex) ->
+    try
+        Hash = hex_to_internal_hash(HashHex),
+        case beamchain_chainstate:precious_block(Hash) of
+            ok ->
+                {ok, null};
+            {error, block_not_found} ->
+                {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+                 <<"Block not found">>};
+            {error, Reason} ->
+                {error, ?RPC_DATABASE_ERROR,
+                 iolist_to_binary(io_lib:format("Failed to mark block precious: ~p", [Reason]))}
+        end
+    catch
+        _:_ ->
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+             <<"Invalid block hash">>}
+    end;
+rpc_preciousblock(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: preciousblock \"blockhash\"">>}.
 
 %% @doc getblockstats - compute per-block statistics
 rpc_getblockstats([HashOrHeight]) ->
