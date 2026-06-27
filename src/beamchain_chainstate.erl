@@ -72,6 +72,9 @@
 %% Block invalidation / reconsideration
 -export([invalidate_block/1, reconsider_block/1]).
 
+%% Block preciousness (preciousblock RPC)
+-export([precious_block/1]).
+
 %% Block status constants (from beamchain_db)
 -define(BLOCK_VALID_SCRIPTS, 5).
 -define(BLOCK_HAVE_DATA, 8).
@@ -145,6 +148,12 @@
 %% CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md.
 -define(MAX_REORG_DEPTH, 100).
 
+%% Lower bound for the precious reverse-sequence counter, mirroring Bitcoin
+%% Core's std::numeric_limits<int32_t>::min() guard in
+%% Chainstate::PreciousBlock (validation.cpp): the counter stops decrementing
+%% here so repeated preciousblock calls can never wrap.
+-define(INT32_MIN, -2147483648).
+
 -record(state, {
     %% Current chain tip
     tip_hash          :: binary() | undefined,
@@ -205,7 +214,24 @@
     %% in progress (or any future caller that wants to defer the undo
     %% delete into the chainstate flush batch). Consumed and cleared by
     %% do_flush/1.
-    pending_undo_deletes :: [binary()]
+    pending_undo_deletes :: [binary()],
+
+    %% preciousblock tiebreak state — mirrors Bitcoin Core's ChainstateManager
+    %% members nLastPreciousChainwork / nBlockReverseSequenceId plus the
+    %% per-block nSequenceId override that CBlockIndexWorkComparator uses to
+    %% break equal-work ties (validation.cpp Chainstate::PreciousBlock).
+    %%
+    %% precious_seqids maps a block hash -> the (negative, decreasing) reverse
+    %% sequence id assigned by a preciousblock call. A block with a precious
+    %% seqid beats any non-precious block of equal work (treated as +infinity),
+    %% and a later preciousblock call (more-negative seqid) beats an earlier
+    %% one — exactly Core's "lower nSequenceId wins" rule. The map is in-memory
+    %% only (not persisted), matching Core's "effects are not retained across
+    %% restarts". Default-valued so all other #state{} constructors are
+    %% unaffected.
+    last_precious_chainwork = 0 :: non_neg_integer(),
+    block_reverse_sequence_id = -1 :: integer(),
+    precious_seqids = #{} :: #{binary() => integer()}
 }).
 
 %%% ===================================================================
@@ -385,6 +411,27 @@ invalidate_block(Hash) when byte_size(Hash) =:= 32 ->
 -spec reconsider_block(binary()) -> ok | {error, term()}.
 reconsider_block(Hash) when byte_size(Hash) =:= 32 ->
     gen_server:call(?SERVER, {reconsider_block, Hash}, 300000).
+
+%% @doc Mark a block as "precious" (preciousblock RPC).
+%% Gives the block a more-favorable reverse sequence id so it wins
+%% chain-selection ties against equal-work blocks seen earlier, then
+%% re-activates the best chain — triggering a reorg onto the precious block
+%% if it is a valid equal-or-greater-work competitor. A no-op if the block
+%% has less work than the current tip, is already on the active chain, or is
+%% invalid. Mirrors Bitcoin Core's Chainstate::PreciousBlock (validation.cpp).
+%%
+%% On a reorg the disconnected non-coinbase txs are re-fed to the mempool in
+%% the caller's process (as submit_block does) to avoid a chainstate->mempool
+%% deadlock; the gen_server returns them rather than refilling synchronously.
+-spec precious_block(binary()) -> ok | {error, term()}.
+precious_block(Hash) when byte_size(Hash) =:= 32 ->
+    case gen_server:call(?SERVER, {precious_block, Hash}, 300000) of
+        {ok, reorg, DisconnectedTxs} ->
+            refill_mempool_after_reorg(DisconnectedTxs),
+            ok;
+        Other ->
+            Other
+    end.
 
 %%% ===================================================================
 %%% assumeUTXO API
@@ -1000,6 +1047,17 @@ handle_call({invalidate_block, Hash}, _From, State) ->
 %% Block reconsideration
 handle_call({reconsider_block, Hash}, _From, State) ->
     case do_reconsider_block(Hash, State) of
+        {ok, State2} ->
+            {reply, ok, State2};
+        {error, Reason} ->
+            {reply, {error, Reason}, State}
+    end;
+
+%% Block preciousness (preciousblock RPC)
+handle_call({precious_block, Hash}, _From, State) ->
+    case do_precious_block(Hash, State) of
+        {ok, reorg, DisconnectedTxs, State2} ->
+            {reply, {ok, reorg, DisconnectedTxs}, State2};
         {ok, State2} ->
             {reply, ok, State2};
         {error, Reason} ->
@@ -3127,8 +3185,15 @@ is_descendant_of(#block_header{prev_hash = PrevHash}, AncestorHash, AllBlocks) -
             false
     end.
 
-%% Find the best valid chain (most cumulative work among non-invalid blocks)
-find_best_valid_chain(#state{tip_hash = TipHash}) ->
+%% Find the best valid chain (most cumulative work among non-invalid blocks).
+%% Carries the active precious-seqid tiebreak map so that equal-work ties are
+%% broken in favour of any block marked precious (preciousblock), matching
+%% Core's CBlockIndexWorkComparator nSequenceId rule. With an empty map this
+%% is identical to the prior chainwork-only selection.
+find_best_valid_chain(#state{precious_seqids = Precious} = State) ->
+    find_best_valid_chain(State, Precious).
+
+find_best_valid_chain(#state{tip_hash = TipHash}, Precious) ->
     case beamchain_db:get_all_block_indexes() of
         {ok, AllBlocks} ->
             %% Filter to valid blocks that also have block data on disk.
@@ -3149,7 +3214,7 @@ find_best_valid_chain(#state{tip_hash = TipHash}) ->
                     {ok, []};
                 _ ->
                     BestBlock = lists:foldl(fun(B, Acc) ->
-                        case compare_work(B, Acc) of
+                        case compare_work_precious(B, Acc, Precious) of
                             greater -> B;
                             _ -> Acc
                         end
@@ -3178,6 +3243,36 @@ compare_work(#{chainwork := W1}, #{chainwork := W2}) ->
         W1Int < W2Int -> less;
         true -> equal
     end.
+
+%% Compare two block-index entries the way Core's CBlockIndexWorkComparator
+%% does: more cumulative work wins; on an exact tie the block with the LOWER
+%% sequence id wins. Normally-received blocks carry no precious seqid and are
+%% treated as +infinity (the atom `infinity`, which sorts after every integer
+%% in Erlang term order), while a precious block carries a negative reverse
+%% seqid — so a precious block always beats an equal-work non-precious one, and
+%% a later preciousblock call (a more-negative seqid) beats an earlier one.
+%% Returns greater when B1 is preferred over B2.
+compare_work_precious(B1, B2, Precious) ->
+    case compare_work(B1, B2) of
+        greater -> greater;
+        less    -> less;
+        equal   ->
+            S1 = precious_seqid(B1, Precious),
+            S2 = precious_seqid(B2, Precious),
+            if
+                S1 < S2 -> greater;   %% lower seqid is preferred
+                S1 > S2 -> less;
+                true    -> equal
+            end
+    end.
+
+%% Effective sequence id of a block-index entry for tiebreaking. A block that
+%% has been marked precious returns its (negative) reverse seqid; any other
+%% block returns the atom `infinity`, which is greater than every integer in
+%% Erlang's standard term ordering (number < atom), so non-precious blocks
+%% always lose equal-work ties to precious ones.
+precious_seqid(#{hash := H}, Precious) ->
+    maps:get(H, Precious, infinity).
 
 %% Build a list of blocks from fork point to target block
 build_chain_to_block(TargetBlock, AllBlocks, CurrentTipHash) ->
@@ -3360,4 +3455,130 @@ is_ancestor_of(BlockHash, DescendantHash, AllBlocks) ->
             is_ancestor_of(BlockHash, PrevHash, AllBlocks);
         undefined ->
             false
+    end.
+
+%%% ===================================================================
+%%% Internal: preciousblock
+%%% ===================================================================
+
+%% @doc Mark a block as precious and re-activate the best chain.
+%% Faithful port of Bitcoin Core's Chainstate::PreciousBlock
+%% (validation.cpp):
+%%
+%%   if (pindex->nChainWork < m_chain.Tip()->nChainWork) return true; // no-op
+%%   if (tip work > nLastPreciousChainwork) nBlockReverseSequenceId = -1;
+%%   nLastPreciousChainwork = tip work;
+%%   pindex->nSequenceId = nBlockReverseSequenceId;
+%%   if (nBlockReverseSequenceId > INT32_MIN) nBlockReverseSequenceId--;
+%%   ... add to setBlockIndexCandidates ...
+%%   return ActivateBestChain();
+%%
+%% ActivateBestChain is modelled by force-promoting the precious block's branch
+%% through do_promote_side_branch (the same side-branch-overtake machinery the
+%% live block-arrival path uses), but allowing an EQUAL-work win — see
+%% do_precious_block_impl/3.  The nSequenceId / precious_seqids bookkeeping is
+%% retained for Core parity and visibility but is secondary to that forced
+%% promotion; it is NOT consulted via find_best_valid_chain, whose height-keyed
+%% candidate set cannot see a side-branch competitor in the first place.
+do_precious_block(Hash, State) ->
+    case lookup_block_index_anywhere(Hash) of
+        {ok, Entry} ->
+            BlockWork = binary:decode_unsigned(
+                          maps:get(chainwork, Entry, <<0:256>>)),
+            TipWork = tip_chainwork(State),
+            case BlockWork < TipWork of
+                true ->
+                    %% Core early return: the block has strictly less work
+                    %% than the tip, so it cannot be at the tip — nothing to
+                    %% do, and (matching Core) the sequence-id counter is left
+                    %% untouched. preciousblock returns success (null).
+                    {ok, State};
+                false ->
+                    do_precious_block_impl(Hash, TipWork, State)
+            end;
+        not_found ->
+            {error, block_not_found}
+    end.
+
+do_precious_block_impl(Hash, TipWork,
+                       #state{last_precious_chainwork = LastPrecCW,
+                              block_reverse_sequence_id = RevSeq0,
+                              precious_seqids = Precious0} = State) ->
+    %% Reset the reverse-sequence counter when the chain has been extended
+    %% since the last precious call (Core: tip work > nLastPreciousChainwork).
+    RevSeqBase = case TipWork > LastPrecCW of
+        true  -> -1;
+        false -> RevSeq0
+    end,
+    %% Assign this block the current (most-favorable) reverse seqid.
+    Precious1 = maps:put(Hash, RevSeqBase, Precious0),
+    %% Decrement so a *later* preciousblock call (more-negative seqid) wins
+    %% over this one, with the INT32_MIN floor (Core's wrap guard).
+    RevSeqNext = case RevSeqBase > ?INT32_MIN of
+        true  -> RevSeqBase - 1;
+        false -> RevSeqBase
+    end,
+    State1 = State#state{last_precious_chainwork = TipWork,
+                         block_reverse_sequence_id = RevSeqNext,
+                         precious_seqids = Precious1},
+    %% ActivateBestChain (Core PreciousBlock tail): make the precious block win.
+    %%
+    %% find_best_valid_chain CANNOT be used here: its candidate set is the
+    %% height-keyed active index (one block per height = the active chain), so a
+    %% side-branch competitor — the exact block preciousblock exists to promote
+    %% — is invisible to it and the call would silently no-op.  Instead route the
+    %% promotion through the SAME machinery the live block-arrival path uses for a
+    %% side-branch overtake (do_promote_side_branch -> build_side_branch_chain_to_
+    %% active -> do_reorganize), but WITHOUT maybe_reorg_to_side_branch's strict
+    %% '>' chainwork gate, so an EQUAL-work precious branch wins (Core's
+    %% PreciousBlock + ActivateBestChain reorg onto an equal-work competitor).
+    %% Because each call force-promotes its named branch, a later preciousblock
+    %% call naturally overrides an earlier one (the previously-precious tip is now
+    %% the side branch and is reorged away) — matching Core's "a later
+    %% preciousblock call can override the effect of an earlier one".  The
+    %% precious_seqids bookkeeping (set in State1 above) is retained for parity
+    %% and visibility but is secondary to this forced promotion (cf. the
+    %% committed haskoin/ouroboros ports, which likewise force the reorg).
+    case is_on_connected_chain(Hash, State1#state.tip_hash) of
+        true ->
+            %% Already on the active chain.  Given the work>=tip gate in
+            %% do_precious_block/2, the only on-chain block with work >= tip work
+            %% is the active tip itself, so ActivateBestChain is a no-op (Core).
+            {ok, State1};
+        false ->
+            case do_promote_side_branch(Hash, State1) of
+                {ok, {reorg, DisconnectedTxs}, State2} ->
+                    {ok, reorg, DisconnectedTxs, State2};
+                {ok, side_branch, State2} ->
+                    %% build_side_branch_chain_to_active found nothing to connect
+                    %% (block already effectively active) — no tip change.
+                    {ok, State2};
+                {error, Reason, RolledBack} ->
+                    %% Atomic reorg failed and rolled back to the pre-reorg tip;
+                    %% keep the seqid mark (precious persists for a retry).  The
+                    %% RPC still returns success, as Core only errors on an
+                    %% invalid validation state.
+                    logger:warning("chainstate: preciousblock reorg failed: "
+                                   "~p (rolled back)", [Reason]),
+                    {ok, RolledBack#state{
+                        last_precious_chainwork = TipWork,
+                        block_reverse_sequence_id = RevSeqNext,
+                        precious_seqids = Precious1}};
+                {error, Reason} ->
+                    logger:error("chainstate: preciousblock reorg failed: ~p",
+                                 [Reason]),
+                    {ok, State1}
+            end
+    end.
+
+%% Cumulative work (as an integer) of the current active tip; 0 when there is
+%% no tip yet. Used to decide whether the precious block is at/above the tip.
+tip_chainwork(#state{tip_hash = undefined}) ->
+    0;
+tip_chainwork(#state{tip_hash = TipHash}) ->
+    case lookup_block_index_anywhere(TipHash) of
+        {ok, Entry} ->
+            binary:decode_unsigned(maps:get(chainwork, Entry, <<0:256>>));
+        not_found ->
+            0
     end.
