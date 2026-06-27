@@ -2584,7 +2584,10 @@ index_summary_entry(Name, BestHeight, ChainTipHeight) ->
 %% to the next-best valid chain.
 rpc_invalidateblock([HashHex]) when is_binary(HashHex) ->
     try
-        Hash = hex_to_internal_hash(HashHex),
+        %% parse_hash_v rejects a malformed (non-hex / wrong-length) hash at the
+        %% parse boundary with -8 RPC_INVALID_PARAMETER (Core ParseHashV); an
+        %% unknown-but-well-formed hash stays -5 below.
+        Hash = parse_hash_v(HashHex, <<"blockhash">>),
         case beamchain_chainstate:invalidate_block(Hash) of
             ok ->
                 {ok, null};
@@ -2599,6 +2602,8 @@ rpc_invalidateblock([HashHex]) when is_binary(HashHex) ->
                  iolist_to_binary(io_lib:format("Failed to invalidate block: ~p", [Reason]))}
         end
     catch
+        throw:{rpc_error, Code, Msg} ->
+            {error, Code, Msg};
         _:_ ->
             {error, ?RPC_INVALID_ADDRESS_OR_KEY,
              <<"Invalid block hash">>}
@@ -2611,7 +2616,9 @@ rpc_invalidateblock(_) ->
 %% Clears the invalid flag and switches to the reconsidered chain if it has more work.
 rpc_reconsiderblock([HashHex]) when is_binary(HashHex) ->
     try
-        Hash = hex_to_internal_hash(HashHex),
+        %% Malformed hash -> -8 at the parse boundary (Core ParseHashV);
+        %% unknown-but-well-formed -> -5 below.
+        Hash = parse_hash_v(HashHex, <<"blockhash">>),
         case beamchain_chainstate:reconsider_block(Hash) of
             ok ->
                 {ok, null};
@@ -2623,6 +2630,8 @@ rpc_reconsiderblock([HashHex]) when is_binary(HashHex) ->
                  iolist_to_binary(io_lib:format("Failed to reconsider block: ~p", [Reason]))}
         end
     catch
+        throw:{rpc_error, Code, Msg} ->
+            {error, Code, Msg};
         _:_ ->
             {error, ?RPC_INVALID_ADDRESS_OR_KEY,
              <<"Invalid block hash">>}
@@ -2639,7 +2648,9 @@ rpc_reconsiderblock(_) ->
 %% Mirrors Bitcoin Core's preciousblock RPC + Chainstate::PreciousBlock.
 rpc_preciousblock([HashHex]) when is_binary(HashHex) ->
     try
-        Hash = hex_to_internal_hash(HashHex),
+        %% Malformed hash -> -8 at the parse boundary (Core ParseHashV);
+        %% unknown-but-well-formed -> -5 below.
+        Hash = parse_hash_v(HashHex, <<"blockhash">>),
         case beamchain_chainstate:precious_block(Hash) of
             ok ->
                 {ok, null};
@@ -2651,6 +2662,8 @@ rpc_preciousblock([HashHex]) when is_binary(HashHex) ->
                  iolist_to_binary(io_lib:format("Failed to mark block precious: ~p", [Reason]))}
         end
     catch
+        throw:{rpc_error, Code, Msg} ->
+            {error, Code, Msg};
         _:_ ->
             {error, ?RPC_INVALID_ADDRESS_OR_KEY,
              <<"Invalid block hash">>}
@@ -2723,12 +2736,20 @@ resolve_block_hash_or_height(Height) when is_integer(Height), Height >= 0 ->
             {error, ?RPC_INVALID_PARAMETER, <<"Block height out of range">>}
     end;
 resolve_block_hash_or_height(HashHex) when is_binary(HashHex) ->
-    Hash = hex_to_internal_hash(HashHex),
-    case beamchain_db:get_block_index_by_hash(Hash) of
-        {ok, #{height := Height}} ->
-            {ok, Hash, Height};
-        not_found ->
-            {error, ?RPC_INVALID_ADDRESS_OR_KEY, <<"Block not found">>}
+    %% Malformed hash -> -8 at the parse boundary (Core ParseHashV via
+    %% ParseHashOrHeight); caught here so getblockstats returns -8 rather than
+    %% letting the badarg propagate to the dispatch catch-all (-32603).
+    try parse_hash_v(HashHex, <<"hash_or_height">>) of
+        Hash ->
+            case beamchain_db:get_block_index_by_hash(Hash) of
+                {ok, #{height := Height}} ->
+                    {ok, Hash, Height};
+                not_found ->
+                    {error, ?RPC_INVALID_ADDRESS_OR_KEY, <<"Block not found">>}
+            end
+    catch
+        throw:{rpc_error, Code, Msg} ->
+            {error, Code, Msg}
     end;
 resolve_block_hash_or_height(_) ->
     {error, ?RPC_INVALID_PARAMETER, <<"Invalid hash or height">>}.
