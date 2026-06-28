@@ -13,7 +13,7 @@
 %%
 %% These tests drive the PRODUCTION pure result-shape builders exported from
 %% beamchain_rpc (mempoolinfo_proplist/4, networkinfo_proplist/4,
-%% mininginfo_proplist/6, peerinfo_obj_proplist/1, build_deployment_proplist/3,
+%% mininginfo_proplist/7, peerinfo_obj_proplist/1, build_deployment_proplist/3,
 %% blockchaininfo_assemble/4) and encode them through the SAME jsx path
 %% production uses. They assert the ACTUAL EMITTED BYTE ORDER in the encoded
 %% wire bytes (binary:match start positions strictly increasing), NOT an
@@ -156,7 +156,7 @@ getmininginfo_order_test() ->
     %% currentblocksize.
     PL = beamchain_rpc:mininginfo_proplist(800000, <<"170331db">>, 16#170331db,
                                            <<"00000000000000000000">>, 5,
-                                           <<"main">>),
+                                           <<"main">>, 12345),
     Json = encode_wire(PL),
     assert_order(Json, [
         <<"blocks">>, <<"currentblockweight">>,
@@ -168,7 +168,7 @@ getmininginfo_order_test() ->
 getmininginfo_nested_next_order_test() ->
     PL = beamchain_rpc:mininginfo_proplist(800000, <<"170331db">>, 16#170331db,
                                            <<"00000000000000000000">>, 5,
-                                           <<"main">>),
+                                           <<"main">>, 12345),
     Json = encode_wire(PL),
     NextFrom = key_pos(Json, <<"next">>),
     %% Nested next object Core order: height, bits, difficulty, target.
