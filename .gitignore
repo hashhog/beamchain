@@ -32,3 +32,7 @@ c_src/secp256k1/
 erl_crash.dump
 
 .claude/skills/
+
+# Project-meta audit artifacts live in the meta-repo (audit-archive/).
+audit/
+CORE-PARITY-AUDIT/
