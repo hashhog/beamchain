@@ -721,6 +721,12 @@ dispatch(Request, WalletName) ->
                 end
         end
     catch
+        throw:{rpc_error, ECode, EMsg} ->
+            %% ParseHashV-style typed RPC error thrown from a handler that lacks
+            %% its own catch (e.g. getblockfrompeer / gettxoutproof) — surface
+            %% the intended code (e.g. -8 for a malformed blockhash) instead of
+            %% collapsing it to the -32603 internal-error default below.
+            error_obj(Id, ECode, EMsg);
         Class:Err:Stack ->
             logger:warning("rpc dispatch error: ~p:~p~n~p", [Class, Err, Stack]),
             error_obj(Id, ?RPC_INTERNAL_ERROR, format_internal_error(Class, Err))
@@ -1714,6 +1720,11 @@ rpc_getblockhash([Height]) when is_integer(Height), Height >= 0 ->
             {error, ?RPC_INVALID_PARAMETER,
              <<"Block height out of range">>}
     end;
+rpc_getblockhash([Height]) when is_integer(Height) ->
+    %% Core getblockhash: a negative (i.e. out-of-range) height ->
+    %% -8 RPC_INVALID_PARAMETER "Block height out of range" (the Height >= 0
+    %% clause above handles all valid heights; this only matches negatives).
+    {error, ?RPC_INVALID_PARAMETER, <<"Block height out of range">>};
 rpc_getblockhash(_) ->
     {error, ?RPC_INVALID_PARAMS, <<"Usage: getblockhash height">>}.
 
@@ -6168,7 +6179,10 @@ rpc_getconnectioncount() ->
 %%      block arrives asynchronously over P2P.
 rpc_getblockfrompeer([HashHex, PeerId]) when is_binary(HashHex),
                                              is_integer(PeerId) ->
-    Hash = hex_to_internal_hash(HashHex),
+    %% Core ParseHashV: a malformed blockhash -> -8 RPC_INVALID_PARAMETER before
+    %% lookup (throws {rpc_error,-8,_}, caught by the dispatcher). Other failures
+    %% below stay -1 RPC_MISC_ERROR (header missing / already downloaded / no peer).
+    Hash = parse_hash_v(HashHex, <<"blockhash">>),
     %% (1) Header must be known. get_block_index_by_hash returns {ok, _} for
     %%     any block whose header we have (header-sync or full), not_found
     %%     otherwise — exactly Core's LookupBlockIndex semantics.
@@ -14773,7 +14787,9 @@ rpc_gettxoutproof([TxidList, null]) ->
             {error, ?RPC_INVALID_PARAMETER, <<"No txids provided">>}
     end;
 rpc_gettxoutproof([TxidList, BlockHashHex]) when is_binary(BlockHashHex) ->
-    BH = hex_to_internal_hash(BlockHashHex),
+    %% Core ParseHashV: a malformed blockhash -> -8 RPC_INVALID_PARAMETER before
+    %% lookup (throws, caught by the dispatcher).
+    BH = parse_hash_v(BlockHashHex, <<"blockhash">>),
     rpc_gettxoutproof_with_block(TxidList, BH);
 rpc_gettxoutproof(_) ->
     {error, ?RPC_INVALID_PARAMETER, <<"Invalid parameters">>}.
@@ -14781,7 +14797,9 @@ rpc_gettxoutproof(_) ->
 rpc_gettxoutproof_with_block(TxidHexList, BlockHash) ->
     case beamchain_db:get_block(BlockHash) of
         not_found ->
-            {error, ?RPC_MISC_ERROR, <<"Block not found">>};
+            %% Core gettxoutproof: an unknown block -> -5 RPC_INVALID_ADDRESS_OR_KEY
+            %% "Block not found" (was -1 RPC_MISC_ERROR).
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY, <<"Block not found">>};
         {ok, #block{header = Header, transactions = Txs}} ->
             AllTxids = [beamchain_serialize:tx_hash(Tx) || Tx <- Txs],
             NTx = length(AllTxids),
