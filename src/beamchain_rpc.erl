@@ -194,7 +194,7 @@
 %% chainstate / mempool / peer gen_servers. No behavioural change.
 -export([mempoolinfo_proplist/4,
          networkinfo_proplist/4,
-         mininginfo_proplist/6,
+         mininginfo_proplist/7,
          peerinfo_obj_proplist/1,
          build_deployment_proplist/3,
          blockchaininfo_assemble/2]).
@@ -7000,8 +7000,15 @@ rpc_getmininginfo() ->
     %% JSON NUMBER formatted with C++ %.16g semantics (matching Core
     %% setprecision(16)), not jsx's full-precision float. Encode then run
     %% replace_all_sentinels and bypass jsx re-encoding via ok_raw_json.
+    %% networkhashps: Core (rpc/mining.cpp) emits
+    %% getnetworkhashps().HandleRequest(request) — the estimate over the default
+    %% 120-block window — not a hardcoded 0. Delegate to our own estimator.
+    NetHashPS = case rpc_getnetworkhashps([120]) of
+        {ok, V} -> V;
+        _ -> 0
+    end,
     Proplist = mininginfo_proplist(Blocks, BitsHex, TipBits, TargetHex, PooledTx,
-                                   network_name(Network)),
+                                   network_name(Network), NetHashPS),
     {ok_raw_json, replace_all_sentinels(jsx:encode(Proplist))}.
 
 %% Pure result-shape builder for getmininginfo — exported for the wire-order
@@ -7013,7 +7020,7 @@ rpc_getmininginfo() ->
 %% difficulty (tip + next) is a __DIFF__ sentinel: replace_all_sentinels turns
 %% it into a %.16g JSON number. On regtest pow_no_retargeting holds, so the
 %% next block's bits/difficulty/target equal the tip's.
-mininginfo_proplist(Blocks, BitsHex, TipBits, TargetHex, PooledTx, Chain) ->
+mininginfo_proplist(Blocks, BitsHex, TipBits, TargetHex, PooledTx, Chain, NetHashPS) ->
     DiffSentinel = format_diff_sentinel(TipBits),
     Next = [
         {<<"height">>, Blocks + 1},
@@ -7028,7 +7035,7 @@ mininginfo_proplist(Blocks, BitsHex, TipBits, TargetHex, PooledTx, Chain) ->
         {<<"bits">>, BitsHex},
         {<<"difficulty">>, DiffSentinel},
         {<<"target">>, TargetHex},
-        {<<"networkhashps">>, 0},
+        {<<"networkhashps">>, NetHashPS},
         {<<"pooledtx">>, PooledTx},
         %% Core ValueFromAmount(blockMinFeeRate.GetFeePerK()):
         %% ?DEFAULT_BLOCK_MIN_TX_FEE (=1) / 1e8 = 1e-08. Was hardcoded 1e-05.

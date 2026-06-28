@@ -493,9 +493,11 @@ gbt_getmininginfo_currentblocksize_always_zero_test() ->
     ?assert(FieldPresentButAlwaysZero).
 
 gbt_getmininginfo_networkhashps_always_zero_test() ->
-    %% Core computes GetNetworkHashPS(120, -1, ...).  beamchain hardcodes 0.
-    NetworkHashPsAlwaysZero = true,
-    ?assert(NetworkHashPsAlwaysZero).
+    %% FIXED 2026-06-28: Core computes GetNetworkHashPS(120, -1, ...).
+    %% beamchain getmininginfo now delegates to rpc_getnetworkhashps([120])
+    %% (mininginfo_proplist/7) instead of hardcoding 0.
+    NetworkHashPsAlwaysZero = false,
+    ?assertNot(NetworkHashPsAlwaysZero).
 
 gbt_getmininginfo_next_bits_uses_stale_tip_test() ->
     %% The "next" sub-object bits/difficulty/target should reflect

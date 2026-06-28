@@ -425,22 +425,20 @@ g28_getmininginfo_next_uses_tip_bits_test() ->
     NextBlockBitsRecomputed = false,  %% PARTIAL
     ?assertNot(NextBlockBitsRecomputed).
 
-%% G29 [P1] getmininginfo networkhashps real computation — MISSING.
-%% rpc_getnetworkhashps exists (beamchain_rpc.erl:9249-9276) and
-%% computes correctly, but rpc_getmininginfo HARDCODES
-%% <<"networkhashps">> => 0 (beamchain_rpc.erl:3708) and never invokes
-%% getnetworkhashps.  Classic dead-helper-at-call-site.
+%% G29 [P1] getmininginfo networkhashps real computation — FIXED 2026-06-28.
+%% rpc_getnetworkhashps exists and computes correctly; rpc_getmininginfo now
+%% delegates to rpc_getnetworkhashps([120]) (Core's defaults) and threads the
+%% result through mininginfo_proplist/7, instead of hardcoding
+%% <<"networkhashps">> => 0.  The dead-helper call site is now live.
 g29_getmininginfo_networkhashps_dead_helper_test() ->
     %% getnetworkhashps DOES exist in the module exports.
     RpcExports = beamchain_rpc:module_info(exports),
     GetNetHashPsExists = lists:member({rpc_getnetworkhashps, 1}, RpcExports)
                   orelse lists:member({rpc_getnetworkhashps, 0}, RpcExports),
-    %% (it's exported as rpc_getnetworkhashps/1 internally; expose check)
-    %% Doesn't matter exactly: the function is present in source.
     _ = GetNetHashPsExists,
-    %% But getmininginfo hardcodes 0 — the call site is dead.
-    GetMiningInfoInvokesGetNetHashPs = false,  %% MISSING (dead-helper)
-    ?assertNot(GetMiningInfoInvokesGetNetHashPs).
+    %% getmininginfo now invokes the estimator (no longer a dead helper).
+    GetMiningInfoInvokesGetNetHashPs = true,
+    ?assert(GetMiningInfoInvokesGetNetHashPs).
 
 %% G30 [P2] getmininginfo currentblock* fields — PARTIAL.
 %% Core only emits currentblockweight + currentblocktx when a template
