@@ -48,7 +48,7 @@ params(mainnet) ->
 
         %% minimum chainwork to accept
         min_chainwork => hex_to_bin(
-            "000000000000000000000000000000000000000072a4fe66c1e2e826e5e1e9d0"),
+            "0000000000000000000000000000000000000001128750f82f4c366153a3a030"),
 
         %% skip script verification before this block (height 938343)
         assume_valid => hex_to_bin(
@@ -133,8 +133,10 @@ params(testnet) ->
         segwit_height => 834624,
         taproot_height => 0,
 
-        min_chainwork => <<0:256>>,
-        assume_valid => <<0:256>>,
+        min_chainwork => hex_to_bin(
+            "0000000000000000000000000000000000000000000017dde1c649f3708d14b6"),
+        assume_valid => hex_to_bin(
+            "000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4"),
         checkpoints => #{},
 
         %% assumeutxo snapshots
@@ -182,7 +184,8 @@ params(testnet4) ->
         segwit_height => 1,
         taproot_height => 1,
 
-        min_chainwork => <<0:256>>,
+        min_chainwork => hex_to_bin(
+            "0000000000000000000000000000000000000000000009a0fe15d0177d086304"),
         %% Skip script verification below height 123613
         assume_valid => hex_to_bin(
             "0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a"),
