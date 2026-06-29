@@ -140,13 +140,14 @@
 %% rocksdb:write call overhead low.
 -define(SNAPSHOT_FLUSH_CHUNK, 50000).
 
-%% Maximum reorg depth — matches Bitcoin Core's m_chainman.MaxReorgDepth()
-%% behaviour. A reorg deeper than this many blocks is rejected outright;
-%% the node operator is expected to investigate (it indicates a major
-%% chain split or attack) rather than silently flip the tip across a
-%% large gap. Pattern D atomicity hardening per
-%% CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md.
--define(MAX_REORG_DEPTH, 100).
+%% Maximum reorg depth — impl-specific memory-safety bound. Bitcoin Core
+%% has NO reorg depth cap; it follows most-work bounded only by prune/undo
+%% retention (MIN_BLOCKS_TO_KEEP=288). This cap exists because beamchain
+%% stages the entire reorg into one in-memory batch (Pattern D atomicity
+%% hardening, CORE-PARITY-AUDIT/_post-reorg-consistency-fleet-result-2026-05-05.md).
+%% 288 aligns with Core's MIN_BLOCKS_TO_KEEP so any reorg a pruned peer
+%% can service is accepted here too.
+-define(MAX_REORG_DEPTH, 288).
 
 %% Lower bound for the precious reverse-sequence counter, mirroring Bitcoin
 %% Core's std::numeric_limits<int32_t>::min() guard in
@@ -2124,10 +2125,9 @@ update_mtp_disconnect(NewTipHeight, Timestamps) ->
 %%     from disk on next start.
 %%
 %% MAX_REORG_DEPTH cap: a reorg deeper than ?MAX_REORG_DEPTH blocks is
-%% rejected to mirror Core's safety guard. This is the depth of the
-%% disconnect side; the new-chain side is bounded indirectly by the
-%% chainwork comparison in `maybe_reorg_to_side_branch` plus the same
-%% cap below.
+%% rejected as an impl-specific memory-safety bound (Core has no such
+%% cap). This is the depth of the connect side; the disconnect side is
+%% bounded separately in count_disconnect_depth below via the same macro.
 do_reorganize([], State) ->
     {ok, State, []};
 do_reorganize(NewBlocks, _State) when length(NewBlocks) > ?MAX_REORG_DEPTH ->
