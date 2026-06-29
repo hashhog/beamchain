@@ -182,7 +182,8 @@ getmininginfo_nested_next_order_test() ->
 
 getpeerinfo_order_test() ->
     F = #{
-        id => 12345, addr => <<"1.2.3.4:8333">>, mapped_as => 7,
+        id => 12345, addr => <<"1.2.3.4:8333">>, network => <<"ipv4">>,
+        mapped_as => 7,
         services => <<"0000000000000409">>, servicesnames => [<<"NETWORK">>],
         relaytxes => true, lastsend => 100, lastrecv => 101,
         bytessent => 200, bytesrecv => 300, conntime => 50, timeoffset => 0,
@@ -214,7 +215,7 @@ getpeerinfo_order_test() ->
 
 getpeerinfo_mapped_as_not_last_test() ->
     F = #{
-        id => 1, addr => <<"a">>, mapped_as => 9,
+        id => 1, addr => <<"a">>, network => <<"ipv4">>, mapped_as => 9,
         services => <<"00">>, servicesnames => [], relaytxes => true,
         lastsend => 0, lastrecv => 0, bytessent => 0, bytesrecv => 0,
         conntime => 0, timeoffset => 0, pingtime => 0.0, version => 0,
