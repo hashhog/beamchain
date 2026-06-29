@@ -6065,6 +6065,9 @@ rpc_getpeerinfo() ->
         peerinfo_obj_proplist(#{
             id            => erlang:phash2({IP, Port}),
             addr          => format_addr(IP, Port),
+            %% Derive network from the peer's IP tuple — matches Core
+            %% GetNetworkName(stats.m_network) in rpc/net.cpp:235.
+            network       => classify_peer_network(IP),
             mapped_as     => beamchain_peer_manager:get_mapped_as(IP),
             services      => beamchain_serialize:hex_encode(
                                  <<(maps:get(services, Info, 0)):64/big>>),
@@ -6106,7 +6109,7 @@ peerinfo_obj_proplist(F) ->
         {<<"id">>, maps:get(id, F)},
         {<<"addr">>, maps:get(addr, F)},
         {<<"addrbind">>, <<>>},
-        {<<"network">>, <<"ipv4">>},
+        {<<"network">>, maps:get(network, F, <<"not_publicly_routable">>)},
         %% ASMap: mapped_as (BUG-12 fix, W115 FIX-50)
         %% Core: rpc/net.cpp obj.pushKV("mapped_as", ...) right after network.
         {<<"mapped_as">>, maps:get(mapped_as, F)},
@@ -8550,6 +8553,21 @@ format_utxo_result(Value, Script, IsCoinbase, CoinHeight) ->
         {<<"coinbase">>,      IsCoinbase}
     ].
 
+%% Derive the network label for getpeerinfo from the peer's IP address tuple.
+%% Mirrors Bitcoin Core rpc/net.cpp:235 obj.pushKV("network", GetNetworkName(...)):
+%%   IPv4 4-tuple                                    -> "ipv4"
+%%   IPv6 8-tuple with high byte of first group 0xFC -> "cjdns"  (fc00::/8)
+%%   IPv6 8-tuple (all other)                        -> "ipv6"
+%%   Anything else (future Tor/I2P)                  -> "not_publicly_routable"
+classify_peer_network({_A, _B, _C, _D}) ->
+    <<"ipv4">>;
+classify_peer_network({A, _B, _C, _D, _E, _F, _G, _H}) when (A bsr 8) =:= 16#FC ->
+    <<"cjdns">>;
+classify_peer_network({_A, _B, _C, _D, _E, _F, _G, _H}) ->
+    <<"ipv6">>;
+classify_peer_network(_) ->
+    <<"not_publicly_routable">>.
+
 %% Format IP:Port as binary string.
 format_addr({A, B, C, D}, Port) ->
     iolist_to_binary(io_lib:format("~B.~B.~B.~B:~B", [A, B, C, D, Port]));
@@ -8604,7 +8622,8 @@ services_to_names(Services) ->
     [Name || {Flag, Name} <- Flags, (Services band Flag) =/= 0].
 
 %% Format a mempool entry for getrawmempool verbose / getmempoolentry.
-format_mempool_entry(#mempool_entry{fee = Fee, vsize = Vsize,
+format_mempool_entry(#mempool_entry{txid = Txid, wtxid = Wtxid,
+        fee = Fee, vsize = Vsize,
         weight = Weight, time_added = TimeAdded,
         height_added = HeightAdded,
         ancestor_count = AncCount, ancestor_size = AncSize,
@@ -8615,28 +8634,38 @@ format_mempool_entry(#mempool_entry{fee = Fee, vsize = Vsize,
     %% via replace_btc_sentinels and get Core-exact 8-decimal formatting.
     %% Core's entryToJSON (rpc/mempool.cpp:528-532) uses ValueFromAmount for
     %% every fee scalar — plain floats produce wrong formatting (e.g. 1.0e-4).
+    %%
+    %% Core entryToJSON field order (rpc/mempool.cpp:515-568):
+    %%   vsize, weight, time, height, descendantcount, descendantsize,
+    %%   ancestorcount, ancestorsize, wtxid, fees{base,modified,ancestor,
+    %%   descendant}, depends, spentby, bip125-replaceable, unbroadcast.
+    %%
+    %% Flat top-level fee/modifiedfee/descendantfees/ancestorfees fields
+    %% removed — Core does NOT emit them. Only the nested fees{} object.
+    ModFee = max(0, Fee + beamchain_mempool:get_fee_delta(Txid)),
     #{
         <<"vsize">> => Vsize,
         <<"weight">> => Weight,
-        <<"fee">> => format_amount_sentinel(Fee),
-        <<"modifiedfee">> => format_amount_sentinel(Fee),
         <<"time">> => TimeAdded,
         <<"height">> => HeightAdded,
         <<"descendantcount">> => DescCount,
         <<"descendantsize">> => DescSize,
-        <<"descendantfees">> => DescFee,
         <<"ancestorcount">> => AncCount,
         <<"ancestorsize">> => AncSize,
-        <<"ancestorfees">> => AncFee,
+        <<"wtxid">> => hash_to_hex(Wtxid),
+        <<"fees">> => #{
+            <<"base">> => format_amount_sentinel(Fee),
+            <<"modified">> => format_amount_sentinel(ModFee),
+            <<"ancestor">> => format_amount_sentinel(AncFee),
+            <<"descendant">> => format_amount_sentinel(DescFee)
+        },
         <<"depends">> => [],
         <<"spentby">> => [],
         <<"bip125-replaceable">> => Bip125,
-        <<"fees">> => #{
-            <<"base">> => format_amount_sentinel(Fee),
-            <<"modified">> => format_amount_sentinel(Fee),
-            <<"ancestor">> => format_amount_sentinel(AncFee),
-            <<"descendant">> => format_amount_sentinel(DescFee)
-        }
+        %% TODO: track unbroadcast set (Core CTxMemPool::m_unbroadcast_txids)
+        %% and return pool.IsUnbroadcastTx(tx.GetHash()) here. Until then,
+        %% emit false (matches the common case for relayed txs).
+        <<"unbroadcast">> => false
     };
 format_mempool_entry(_) ->
     #{<<"error">> => <<"failed to format entry">>}.
