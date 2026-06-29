@@ -15,7 +15,7 @@
 -export([verify_script/5, eval_script/5]).
 -export([decode_script_num/2, decode_script_num/3, encode_script_num/1, script_bool/1]).
 -export([check_minimal_encoding/1]).
--export([flags_for_height/2]).
+-export([flags_for_height/2, flags_for_block/3]).
 %% Exported for testing the BIP-342 tapscript validation-weight budget
 %% gate. Not part of the stable API.
 -export([eval_tapscript/5, eval_tapscript/6, compact_size_len/1,
@@ -3710,3 +3710,66 @@ flags_for_height(_Height, _Network) ->
     bor ?SCRIPT_VERIFY_WITNESS
     bor ?SCRIPT_VERIFY_NULLDUMMY
     bor ?SCRIPT_VERIFY_TAPROOT.
+
+%%% -------------------------------------------------------------------
+%%% Script-flag exceptions (Core consensus.script_flag_exceptions)
+%%% -------------------------------------------------------------------
+%%% Bitcoin Core (kernel/chainparams.cpp) grandfathers a few historical blocks
+%%% that violate P2SH/Taproot. In GetBlockScriptFlags (validation.cpp:2250-2266)
+%%% the base trio P2SH|WITNESS|TAPROOT is REPLACED by the exception value for
+%%% those exact blocks, while the height-gated deployment flags (DERSIG|CLTV|
+%%% CSV|NULLDUMMY) are still OR'd in afterward. flags_for_block/3 layers this on
+%%% top of flags_for_height/2 so the violator blocks validate under the same
+%%% reduced flags Core uses (otherwise beamchain would false-reject them on a
+%%% -noassumevalid sync / reorg through those heights).
+%%%
+%%% Keys are Core's DISPLAY hex; block_hash/1 (raw double-SHA256) is INTERNAL
+%%% byte order, so reverse before comparing. A byte-order slip fails SAFE: the
+%%% key simply never matches and today's (height-only) behavior is reproduced.
+-define(BIP16_EXCEPTION_MAINNET,
+        "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22").
+-define(TAPROOT_EXCEPTION_MAINNET,
+        "0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad").
+-define(BIP16_EXCEPTION_TESTNET,
+        "00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105").
+
+%% Core display-hex hash -> internal byte order (matches block_hash/1).
+-spec internal_hash(string()) -> binary().
+internal_hash(DisplayHex) ->
+    beamchain_serialize:reverse_bytes(beamchain_serialize:hex_decode(DisplayHex)).
+
+%% Core script_flag_exceptions lookup. {ok, Flags} REPLACES the base trio.
+-spec script_flag_exception(atom(), binary()) -> {ok, non_neg_integer()} | none.
+script_flag_exception(mainnet, BlockHash) ->
+    Bip16   = internal_hash(?BIP16_EXCEPTION_MAINNET),
+    Taproot = internal_hash(?TAPROOT_EXCEPTION_MAINNET),
+    if
+        BlockHash =:= Bip16   -> {ok, ?SCRIPT_VERIFY_NONE};
+        BlockHash =:= Taproot -> {ok, ?SCRIPT_VERIFY_P2SH bor ?SCRIPT_VERIFY_WITNESS};
+        true                  -> none
+    end;
+script_flag_exception(Net, BlockHash) when Net =:= testnet; Net =:= testnet3 ->
+    Bip16 = internal_hash(?BIP16_EXCEPTION_TESTNET),
+    if
+        BlockHash =:= Bip16 -> {ok, ?SCRIPT_VERIFY_NONE};
+        true                -> none
+    end;
+script_flag_exception(_Network, _BlockHash) ->
+    none.
+
+%% Per-block script-verify flags: flags_for_height/2 plus Core's hash-keyed
+%% script_flag_exceptions override for the grandfathered violator blocks.
+-spec flags_for_block(non_neg_integer(), atom(), binary()) -> non_neg_integer().
+flags_for_block(Height, Network, BlockHash) ->
+    Base = flags_for_height(Height, Network),
+    case script_flag_exception(Network, BlockHash) of
+        {ok, ExceptionFlags} ->
+            %% Core: ExceptionFlags REPLACES P2SH|WITNESS|TAPROOT; keep the
+            %% height-gated deployment flags flags_for_height already applied.
+            BaseTrio = ?SCRIPT_VERIFY_P2SH
+                       bor ?SCRIPT_VERIFY_WITNESS
+                       bor ?SCRIPT_VERIFY_TAPROOT,
+            ExceptionFlags bor (Base band (bnot BaseTrio));
+        none ->
+            Base
+    end.
