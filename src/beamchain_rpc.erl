@@ -2214,7 +2214,7 @@ level4_check_scripts(#block{transactions = Txs}, Hash, Height, Network) ->
         {ok, UndoBin} ->
             try
                 Coins = beamchain_validation:decode_undo_data(UndoBin),
-                Flags = beamchain_script:flags_for_height(Height, Network),
+                Flags = beamchain_script:flags_for_block(Height, Network, Hash),
                 [_Coinbase | RestTxs] = Txs,
                 level4_verify_txs(RestTxs, Coins, Flags),
                 ok

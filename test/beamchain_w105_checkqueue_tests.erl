@@ -198,6 +198,8 @@ w105_checkqueue_test_() ->
            fun g20_flags_nulldummy_with_witness/0},
           {"G21: flags_for_height testnet/regtest returns all consensus flags",
            fun g21_flags_regtest_all_consensus/0},
+          {"G21b: script_flag_exceptions override flags for BIP16/Taproot violator blocks",
+           fun g21b_script_flag_exceptions/0},
           {"G22: verify_tx_scripts accumulates folds over all inputs",
            fun g22_verify_tx_scripts_all_inputs/0},
           {"G23: script_verify_failed error propagated through spawn_monitor EXIT",
@@ -801,6 +803,33 @@ g21_flags_regtest_all_consensus() ->
     ?assertNotEqual(0, Flags band Witness),
     ?assertNotEqual(0, Flags band NullDummy),
     ?assertNotEqual(0, Flags band Taproot).
+
+%%% ===================================================================
+%%% G21b: script_flag_exceptions (Core consensus.script_flag_exceptions)
+%%% ===================================================================
+
+g21b_script_flag_exceptions() ->
+    %% Core grandfathers two mainnet violator blocks: flags_for_block must
+    %% override flags_for_height for those exact block hashes (keyed in INTERNAL
+    %% byte order = reverse of Core's display hex), and leave all other blocks
+    %% unchanged.
+    Ih = fun(Hex) ->
+        beamchain_serialize:reverse_bytes(beamchain_serialize:hex_decode(Hex))
+    end,
+    Bip16   = Ih("00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22"),
+    Taproot = Ih("0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad"),
+    TaprootFlag = 1 bsl 17,
+    %% BIP16 block (height 173818): height-only computes P2SH; exception -> NONE.
+    ?assertNotEqual(0, beamchain_script:flags_for_height(173818, mainnet)),
+    ?assertEqual(0, beamchain_script:flags_for_block(173818, mainnet, Bip16)),
+    %% Taproot block (height 709632): height-only includes TAPROOT; exception
+    %% strips it (keeps P2SH|WITNESS + the deployment flags).
+    ?assertNotEqual(0, beamchain_script:flags_for_height(709632, mainnet) band TaprootFlag),
+    ?assertEqual(0, beamchain_script:flags_for_block(709632, mainnet, Taproot) band TaprootFlag),
+    %% Non-exception block: flags_for_block == flags_for_height (no change).
+    Rand = crypto:strong_rand_bytes(32),
+    ?assertEqual(beamchain_script:flags_for_height(709632, mainnet),
+                 beamchain_script:flags_for_block(709632, mainnet, Rand)).
 
 %%% ===================================================================
 %%% G22: verify_tx_scripts iterates all inputs
