@@ -105,12 +105,12 @@ teardown({TmpDir, _ConfigPid, _DbPid, _ChainstatePid, _Params, _Genesis}) ->
 %% we only need the length-check path, which fires before any block
 %% inspection.
 test_max_reorg_depth() ->
-    %% 101 dummy blocks (cap is 100). A real block isn't required for
+    %% 289 dummy blocks (cap is 288). A real block isn't required for
     %% the length guard — the guard runs in do_reorganize/2 before
     %% touching the blocks. We use a minimal #block{} so the length()
     %% call works and the destructure for the first block (used after
     %% the guard) wouldn't run because the guard fails first.
-    DummyBlocks = lists:duplicate(101, #block{
+    DummyBlocks = lists:duplicate(289, #block{
         header = #block_header{
             version = 1, prev_hash = <<0:256>>, merkle_root = <<0:256>>,
             timestamp = 0, bits = 0, nonce = 0
@@ -119,7 +119,7 @@ test_max_reorg_depth() ->
         hash = <<0:256>>
     }),
     Result = beamchain_chainstate:reorganize(DummyBlocks),
-    ?assertMatch({error, {reorg_too_deep, 101}}, Result).
+    ?assertMatch({error, {reorg_too_deep, 289}}, Result).
 
 %% ===================================================================
 %% Test 2: validation:disconnect_block contract change
