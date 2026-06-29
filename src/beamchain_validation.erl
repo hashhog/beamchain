@@ -1259,9 +1259,10 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
             false -> ok
         end,
 
-        %% get script flags for this height
+        %% get script flags for this block (height-gated + Core's hash-keyed
+        %% script_flag_exceptions override for the grandfathered violator blocks)
         Network = maps:get(network, Params, mainnet),
-        Flags = beamchain_script:flags_for_height(Height, Network),
+        Flags = beamchain_script:flags_for_block(Height, Network, BlockHash),
 
         %% BIP-68 / CSV activation gate.
         %% Bitcoin Core: SequenceLocks only enforced when the LOCKTIME_VERIFY_SEQUENCE
