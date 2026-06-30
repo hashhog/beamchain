@@ -374,11 +374,20 @@ accurate_sigops_16_multisig_test() ->
     Script = <<16#60, 16#ae>>,
     ?assertEqual(16, beamchain_validation:count_sigops_accurate(Script)).
 
-%% OP_CHECKMULTISIG with OP_0 preceding counts as 0
+%% OP_CHECKMULTISIG with OP_0 preceding counts as 20 (MAX_PUBKEYS_PER_MULTISIG).
+%% Core (script.cpp:172): accurate key count uses DecodeOP_N only when the
+%% preceding opcode is in [OP_1..OP_16] (0x51..0x60).  OP_0 (0x00) is NOT in
+%% that range so it falls to MAX_PUBKEYS_PER_MULTISIG=20, not 0.
 accurate_sigops_0_multisig_test() ->
-    %% OP_0 OP_CHECKMULTISIG (0-of-0 multisig, edge case)
+    %% OP_0 OP_CHECKMULTISIG
     Script = <<16#00, 16#ae>>,
-    ?assertEqual(0, beamchain_validation:count_sigops_accurate(Script)).
+    ?assertEqual(20, beamchain_validation:count_sigops_accurate(Script)).
+
+%% Ditto for OP_CHECKMULTISIGVERIFY with OP_0 preceding.
+accurate_sigops_0_multisigverify_test() ->
+    %% OP_0 OP_CHECKMULTISIGVERIFY
+    Script = <<16#00, 16#af>>,
+    ?assertEqual(20, beamchain_validation:count_sigops_accurate(Script)).
 
 %% OP_CHECKMULTISIG without valid preceding OP_N uses max (20)
 accurate_sigops_invalid_preceding_test() ->

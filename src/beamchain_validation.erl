@@ -846,25 +846,25 @@ count_sigops_accurate(<<16#ac:8, Rest/binary>>, _LastOp, Count) ->
     count_sigops_accurate(Rest, 16#ac, Count + 1);
 count_sigops_accurate(<<16#ad:8, Rest/binary>>, _LastOp, Count) ->
     count_sigops_accurate(Rest, 16#ad, Count + 1);
-%% OP_CHECKMULTISIG, OP_CHECKMULTISIGVERIFY: decode pubkey count from LastOp
+%% OP_CHECKMULTISIG, OP_CHECKMULTISIGVERIFY: count pubkeys using Core's gate.
+%% Core (script.cpp:172): fAccurate counts use DecodeOP_N(lastOpcode) ONLY when
+%% lastOpcode is in [OP_1..OP_16] (0x51..0x60); every other value — including
+%% OP_0 (0x00) — falls to MAX_PUBKEYS_PER_MULTISIG=20.  decode_op_n/1 returns 0
+%% for OP_0 which would be wrong here, so we apply the Core gate inline.
 count_sigops_accurate(<<16#ae:8, Rest/binary>>, LastOp, Count) ->
-    N = decode_op_n(LastOp),
+    N = if LastOp >= 16#51, LastOp =< 16#60 -> LastOp - 16#50;
+           true -> ?MAX_PUBKEYS_PER_MULTISIG
+        end,
     count_sigops_accurate(Rest, 16#ae, Count + N);
 count_sigops_accurate(<<16#af:8, Rest/binary>>, LastOp, Count) ->
-    N = decode_op_n(LastOp),
+    N = if LastOp >= 16#51, LastOp =< 16#60 -> LastOp - 16#50;
+           true -> ?MAX_PUBKEYS_PER_MULTISIG
+        end,
     count_sigops_accurate(Rest, 16#af, Count + N);
 %% any other opcode
 count_sigops_accurate(<<Op:8, Rest/binary>>, _LastOp, Count) ->
     count_sigops_accurate(Rest, Op, Count).
 
-%% @doc Decode OP_N (OP_1 through OP_16) to integer.
-%% Returns MAX_PUBKEYS_PER_MULTISIG (20) for invalid/non-number opcodes.
-%% OP_0 (0x00) decodes to 0, OP_1..OP_16 (0x51..0x60) decode to 1..16.
-%% Reference: Bitcoin Core script.h DecodeOP_N
--spec decode_op_n(integer() | none) -> non_neg_integer().
-decode_op_n(16#00) -> 0;  %% OP_0
-decode_op_n(Op) when Op >= 16#51, Op =< 16#60 -> Op - 16#50;  %% OP_1..OP_16
-decode_op_n(_) -> ?MAX_PUBKEYS_PER_MULTISIG.  %% invalid: use max
 
 %% @doc Check for merkle tree malleation (CVE-2012-2459).
 %% At each level of the merkle tree, if the count is odd and the last
