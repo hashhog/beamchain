@@ -123,6 +123,52 @@ block_header_80_bytes_test() ->
     ?assertEqual(80, byte_size(Encoded)).
 
 %%% ===================================================================
+%%% Wave-3: nVersion signed int32_t decode (EFFECTIVE test)
+%%%
+%%% Bitcoin's CBlockHeader.nVersion is int32_t.  A header with the high
+%%% bit set (e.g. 0x80000004) must decode to a NEGATIVE integer so that
+%%% the BIP34/66/65 version gates (`version >= 2/3/4`) correctly reject it.
+%%%
+%%% Pre-fix: Version:32/little (unsigned) → 2147483652, passes version >= 4.
+%%% Post-fix: Version:32/little-signed → -2147483644, fails version >= 4
+%%%           → contextual_check_block_header returns {error, bad_version}.
+%%% ===================================================================
+
+%% Decoding a header with nVersion = 0x80000004 (LE wire bytes: 04 00 00 80)
+%% must yield a negative version field after the fix.
+nversion_high_bit_decodes_signed_test() ->
+    %% Wire encoding: nVersion 0x80000004 in little-endian = <<4, 0, 0, 128>>
+    RawBin = <<16#04, 16#00, 16#00, 16#80,  %% nVersion LE
+               0:256,                          %% prev_hash (32 bytes)
+               0:256,                          %% merkle_root (32 bytes)
+               0:32/little,                    %% timestamp
+               16#1d00ffff:32/little,          %% bits
+               0:32/little>>,                  %% nonce
+    {Header, <<>>} = beamchain_serialize:decode_block_header(RawBin),
+    %% Post-fix: decoded as signed int32 → negative
+    ?assert(Header#block_header.version < 0),
+    ?assertEqual(-2147483644, Header#block_header.version).
+
+%% Roundtrip: encoding a negative version must produce the original LE bytes.
+nversion_high_bit_roundtrip_test() ->
+    NegVersion = -2147483644,     %% 0x80000004 as int32
+    Header = #block_header{
+        version    = NegVersion,
+        prev_hash  = <<0:256>>,
+        merkle_root= <<0:256>>,
+        timestamp  = 0,
+        bits       = 16#1d00ffff,
+        nonce      = 0
+    },
+    Encoded = beamchain_serialize:encode_block_header(Header),
+    %% First 4 bytes must be 04 00 00 80 (0x80000004 LE)
+    <<VersionLE:4/binary, _/binary>> = Encoded,
+    ?assertEqual(<<16#04, 16#00, 16#00, 16#80>>, VersionLE),
+    %% Decode back must recover the same signed value
+    {Header2, <<>>} = beamchain_serialize:decode_block_header(Encoded),
+    ?assertEqual(NegVersion, Header2#block_header.version).
+
+%%% ===================================================================
 %%% Transaction tests
 %%% ===================================================================
 

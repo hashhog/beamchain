@@ -436,6 +436,145 @@ chainparams_signet_enforce_bip94_test() ->
     ?assertEqual(false, maps:get(enforce_bip94, Params)).
 
 %%% ===================================================================
+%%% Wave-3: ancestry-walk fix for find_last_non_special_block /
+%%%         get_ancestor (EFFECTIVE test — DB-backed)
+%%%
+%%% Pre-fix: both calculate_retarget and find_last_non_special_block
+%%% resolve the period first-block / walk-back target via
+%%% get_block_index(Height), an ACTIVE-CHAIN height-keyed lookup that
+%%% ignores the validated block's own ancestry on a side branch.
+%%%
+%%% Post-fix: both functions walk prev_hash links (hash-linked, same as
+%%% Core's CBlockIndex::GetAncestor / pprev walk) so a fork-tip uses ITS
+%%% OWN period first-block, not the active-chain block at the same height.
+%%%
+%%% EFFECTIVE scenario for find_last_non_special_block:
+%%%   Active chain: Genesis(h=0,bits=PowLimit) — A1(h=1,bits=PowLimit)
+%%%   Side branch:  Genesis — F1(h=1,bits=RealDiff) — F2(h=2,bits=PowLimit)
+%%%
+%%%   get_next_work_required(F2_index, NewHeader, testnet_params) calls
+%%%   find_last_non_special_block(F2_index, params) because no new
+%%%   min-diff block is triggered (timestamp within spacing*2).
+%%%
+%%%   Pre-fix:  get_block_index(1) = A1(bits=PowLimit)
+%%%             → get_block_index(0) = Genesis(h=0,ret=PowLimit) → PowLimit
+%%%   Post-fix: prev_hash(F2)=F1_hash → F1(bits=RealDiff) ≠ PowLimit
+%%%             → returns RealDiff (0x1c0fffff)
+%%% ===================================================================
+
+retarget_ancestry_test_() ->
+    {setup,
+     fun setup_pow_db/0,
+     fun teardown_pow_db/1,
+     fun(_) ->
+         [
+          {"find_last_non_special_block walks prev_hash ancestry, not active-chain",
+           fun find_last_non_special_follows_ancestry/0}
+         ]
+     end}.
+
+setup_pow_db() ->
+    TmpDir = filename:join(["/tmp", "beamchain_pow_ancestry_test_" ++
+                            integer_to_list(erlang:unique_integer([positive]))]),
+    ok = filelib:ensure_dir(filename:join(TmpDir, "dummy")),
+    application:ensure_all_started(rocksdb),
+    application:set_env(beamchain, datadir, TmpDir),
+    application:set_env(beamchain, network, testnet4),
+    {ok, _ConfigPid} = beamchain_config:start_link(),
+    {ok, _DbPid}     = beamchain_db:start_link(),
+    TmpDir.
+
+teardown_pow_db(TmpDir) ->
+    catch beamchain_db:stop(),
+    catch gen_server:stop(beamchain_config),
+    os:cmd("rm -rf " ++ TmpDir),
+    ok.
+
+find_last_non_special_follows_ancestry() ->
+    %% testnet4 pow_limit = 0x1d00ffff in compact form
+    Params = #{
+        pow_no_retargeting   => false,
+        pow_allow_min_difficulty => true,
+        enforce_bip94        => false,
+        pow_limit            => beamchain_serialize:hex_decode(
+            "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
+        pow_target_timespan  => ?POW_TARGET_TIMESPAN,
+        pow_target_spacing   => ?POW_TARGET_SPACING
+    },
+    PowLimitBits = 16#1d00ffff,
+    RealDiffBits = 16#1c0fffff,    %% a real (non-min) difficulty
+
+    %% --- build synthetic block headers ---
+
+    %% Genesis: height 0, bits = PowLimit
+    GenesisHeader = #block_header{
+        version = 1, prev_hash = <<0:256>>, merkle_root = <<0:256>>,
+        timestamp = 1714777860, bits = PowLimitBits, nonce = 0
+    },
+    GenesisHash = beamchain_serialize:block_hash(GenesisHeader),
+
+    %% A1: ACTIVE-CHAIN block at height 1, bits = PowLimit (min-diff)
+    A1Header = #block_header{
+        version = 1, prev_hash = GenesisHash, merkle_root = <<1:256>>,
+        timestamp = 1714778460, bits = PowLimitBits, nonce = 1
+    },
+    A1Hash = beamchain_serialize:block_hash(A1Header),
+
+    %% F1: SIDE-BRANCH block at height 1, bits = RealDiff (not min-diff)
+    F1Header = #block_header{
+        version = 1, prev_hash = GenesisHash, merkle_root = <<2:256>>,
+        timestamp = 1714778460, bits = RealDiffBits, nonce = 2
+    },
+    F1Hash = beamchain_serialize:block_hash(F1Header),
+
+    %% F2: SIDE-BRANCH block at height 2, bits = PowLimit, parent = F1
+    F2Header = #block_header{
+        version = 1, prev_hash = F1Hash, merkle_root = <<3:256>>,
+        timestamp = 1714779060, bits = PowLimitBits, nonce = 3
+    },
+
+    %% --- populate DB ---
+
+    %% Genesis in active chain (height 0)
+    ok = beamchain_db:store_block_index(0, GenesisHash, GenesisHeader,
+                                        <<0,0,0,1>>, 3),
+
+    %% A1 in active chain at height 1 (this is the block the BUG reads)
+    ok = beamchain_db:store_block_index(1, A1Hash, A1Header,
+                                        <<0,0,0,2>>, 3),
+
+    %% F1 in SIDE-BRANCH index only (NOT at height 1 in active chain)
+    ok = beamchain_db:store_side_branch_index(F1Hash, #{
+        height    => 1,
+        header    => F1Header,
+        chainwork => <<0,0,0,2>>,
+        status    => 3,
+        n_tx      => 1
+    }),
+
+    %% --- run the function under test ---
+
+    %% F2_index: what would be passed as PrevIndex when validating block at h=3
+    F2Index = #{height => 2, header => F2Header},
+
+    %% NewHeader: normal-timestamp block (NOT triggering new min-diff)
+    %% Timestamp must be <= F2Header.timestamp + spacing*2 so the code
+    %% enters find_last_non_special_block, not the new-min-diff branch.
+    NewHeader = #block_header{
+        version = 1, prev_hash = <<0:256>>, merkle_root = <<0:256>>,
+        timestamp = F2Header#block_header.timestamp + ?POW_TARGET_SPACING,
+        bits = 0, nonce = 0
+    },
+
+    Result = beamchain_pow:get_next_work_required(F2Index, NewHeader, Params),
+
+    %% Post-fix: F2 → F1 (via prev_hash) → F1.bits = RealDiffBits ≠ PowLimit
+    %% → returned as the last non-min-diff bits.
+    %% Pre-fix: F2 → A1 (via height index height=1) → PowLimit
+    %%        → Genesis (h=0, rem 2016=0) → returned PowLimitBits.
+    ?assertEqual(RealDiffBits, Result).
+
+%%% ===================================================================
 %%% W83: BIP94 testnet4 retarget uses first-block bits, not last-block bits
 %%% ===================================================================
 

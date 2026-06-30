@@ -159,8 +159,13 @@ calculate_retarget(PrevIndex, Params) ->
     PowLimitInt = binary:decode_unsigned(PowLimit, big),
 
     %% find the block at the start of this retarget period
+    %% FIX: walk PrevIndex's own ancestry via prev_hash links, not the
+    %% active-chain height index.  Mirrors Core pow.cpp:44
+    %%   pindexFirst = pindexLast->GetAncestor(nHeightFirst)
+    %% so a fork-tip's period first-block is taken from its own lineage
+    %% even when the active-chain height index points elsewhere.
     FirstHeight = PrevHeight - (?DIFFICULTY_ADJUSTMENT_INTERVAL - 1),
-    FirstIndex = get_block_index(FirstHeight),
+    FirstIndex = get_ancestor(PrevIndex, FirstHeight),
     FirstHeader = maps:get(header, FirstIndex),
 
     %% calculate actual timespan
@@ -189,6 +194,13 @@ calculate_retarget(PrevIndex, Params) ->
 
 %% On testnet, walk back to find the last block that wasn't mined at
 %% minimum difficulty. This handles the testnet difficulty reset rule.
+%%
+%% FIX: follow prev_hash ancestry (hash-linked) instead of
+%% get_block_index(Height-1) (active-chain height index).
+%% Mirrors Core pow.cpp:32-34:
+%%   while (pindex->pprev && pindex->nHeight % interval != 0
+%%          && pindex->nBits == nProofOfWorkLimit)
+%%       pindex = pindex->pprev;
 find_last_non_special_block(Index, Params) ->
     Height = maps:get(height, Index),
     Header = maps:get(header, Index),
@@ -199,18 +211,49 @@ find_last_non_special_block(Index, Params) ->
         false ->
             case Header#block_header.bits =:= PowLimitBits of
                 true when Height > 0 ->
-                    PrevIndex = get_block_index(Height - 1),
-                    find_last_non_special_block(PrevIndex, Params);
+                    %% Follow the block's actual prev_hash, not active-chain[Height-1].
+                    PrevHash = Header#block_header.prev_hash,
+                    case lookup_block_index_by_hash(PrevHash) of
+                        {ok, PrevIndex} ->
+                            find_last_non_special_block(PrevIndex, Params);
+                        not_found ->
+                            %% No ancestor in DB; treat like a period boundary.
+                            Header#block_header.bits
+                    end;
                 _ ->
                     Header#block_header.bits
             end
     end.
 
-%% Look up a block index entry by height. This calls the db module.
-get_block_index(Height) ->
-    case beamchain_db:get_block_index(Height) of
-        {ok, Entry} -> Entry;
-        not_found -> error({block_index_not_found, Height})
+%% Walk backward from StartIndex to TargetHeight using prev_hash links.
+%% Mirrors CBlockIndex::GetAncestor (chain.cpp) — walks the block's OWN
+%% ancestry rather than the active-chain height index, so fork-tip
+%% difficulty calculations use the correct lineage.
+get_ancestor(Index, TargetHeight) ->
+    Height = maps:get(height, Index),
+    if
+        Height =:= TargetHeight ->
+            Index;
+        Height > TargetHeight ->
+            Header = maps:get(header, Index),
+            PrevHash = Header#block_header.prev_hash,
+            case lookup_block_index_by_hash(PrevHash) of
+                {ok, PrevIndex} ->
+                    get_ancestor(PrevIndex, TargetHeight);
+                not_found ->
+                    error({ancestor_not_found, PrevHash, TargetHeight})
+            end;
+        true ->
+            error({get_ancestor_overshot, Height, TargetHeight})
+    end.
+
+%% Look up a block index entry by hash, checking the active-chain
+%% reverse-hash index first, then the side-branch (hash-keyed) index.
+%% Same logic as beamchain_validation:lookup_block_index_by_hash/1.
+lookup_block_index_by_hash(Hash) ->
+    case beamchain_db:get_block_index_by_hash(Hash) of
+        {ok, _} = R -> R;
+        not_found   -> beamchain_db:get_side_branch_index(Hash)
     end.
 
 %% Calculate the pow_limit in compact bits form

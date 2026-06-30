@@ -3193,6 +3193,36 @@ w85_version4_satisfies_all_version_gates_test() ->
     ?assertEqual(ok,
         beamchain_validation:contextual_check_block_header(Header, PrevIndex, Params)).
 
+%% Wave-3 EFFECTIVE test: nVersion=0x80000004 (high-bit-set, int32 negative)
+%% must be rejected as bad_version when BIP65 is active.
+%%
+%% Pre-fix (Version:32/little unsigned): decoded as 2147483652 >= 4 → ACCEPTED
+%%                                       (false-accept, wrong).
+%% Post-fix (Version:32/little-signed):  decoded as -2147483644 < 4 → REJECTED
+%%                                       {error, bad_version} (correct).
+%%
+%% Reference: Bitcoin Core validation.cpp:4112-4118 uses int32_t nVersion.
+w85_nversion_high_bit_false_accept_test() ->
+    PrevHeader = make_w85_header(1000),
+    MTP = 500,
+    PrevIndex = make_w85_prev_index(0, PrevHeader, lists:duplicate(11, MTP)),
+    %% Build header from wire bytes: nVersion = 0x80000004 (LE = <<4,0,0,128>>)
+    %% This is a 32-bit value with high bit set; int32_t = -2147483644.
+    RawBin = <<16#04, 16#00, 16#00, 16#80,  %% nVersion LE
+               0:256,                          %% prev_hash
+               0:256,                          %% merkle_root
+               (MTP + 1):32/little,            %% timestamp > MTP
+               16#207fffff:32/little,          %% bits (matches regtest pow_no_retargeting)
+               0:32/little>>,                  %% nonce
+    {Header, <<>>} = beamchain_serialize:decode_block_header(RawBin),
+    %% Confirm decode is now signed
+    ?assert(Header#block_header.version < 0),
+    Params = (make_w85_regtest_params())#{bip34_height => 1, bip66_height => 1,
+                                          bip65_height => 1},
+    %% Post-fix: signed version < 4 → bad_version
+    ?assertEqual({error, bad_version},
+        beamchain_validation:contextual_check_block_header(Header, PrevIndex, Params)).
+
 %% Version checks do not fire before activation height.
 w85_version_check_skipped_before_activation_test() ->
     PrevHeader = make_w85_header(1000),

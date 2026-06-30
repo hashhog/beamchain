@@ -147,7 +147,10 @@ encode_block_header(#block_header{version = Version,
                                   timestamp = Timestamp,
                                   bits = Bits,
                                   nonce = Nonce}) ->
-    <<Version:32/little,
+    %% nVersion is int32_t in the Bitcoin wire protocol (signed little-endian).
+    %% Using little-signed preserves high-bit versions (e.g. 0x80000004) as
+    %% negative integers on decode, matching Core's CBlockHeader.nVersion.
+    <<Version:32/little-signed,
       PrevHash:32/binary,
       MerkleRoot:32/binary,
       Timestamp:32/little,
@@ -155,7 +158,7 @@ encode_block_header(#block_header{version = Version,
       Nonce:32/little>>.
 
 -spec decode_block_header(binary()) -> {#block_header{}, binary()}.
-decode_block_header(<<Version:32/little,
+decode_block_header(<<Version:32/little-signed,
                       PrevHash:32/binary,
                       MerkleRoot:32/binary,
                       Timestamp:32/little,
