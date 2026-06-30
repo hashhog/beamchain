@@ -6,7 +6,7 @@
 %%% -------------------------------------------------------------------
 
 -record(block_header, {
-    version       :: non_neg_integer(),
+    version       :: integer(),           %% int32_t in Bitcoin wire protocol (may be negative)
     prev_hash     :: binary(),       %% 32 bytes
     merkle_root   :: binary(),       %% 32 bytes
     timestamp     :: non_neg_integer(),
