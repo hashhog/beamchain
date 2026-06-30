@@ -2684,24 +2684,20 @@ w94_sighash_single_out_of_range_key_path_test() ->
     Result = beamchain_script:verify_taproot(OutputKey, Witness, 0, SigChecker),
     ?assertEqual({error, schnorr_sig_hashtype}, Result).
 
-%% Bug fix #5: tapscript initial stack with element > 520 bytes must
-%% be rejected (Core interpreter.cpp:1858-1861).  Initial stack
-%% element size check now runs BEFORE EvalScript.
+%% Bug fix #5: tapscript initial stack with element > 520 bytes must be
+%% rejected.  After the Finding-20 reorder, eval_tapscript applies the
+%% MAX_SCRIPT_ELEMENT_SIZE gate AFTER the OP_SUCCESS prescan (Core
+%% interpreter.cpp:1836-1861), so eval_tapscript itself now enforces it.
 w94_tapscript_initial_stack_element_too_big_test() ->
     %% 521-byte initial-stack element exceeds MAX_SCRIPT_ELEMENT_SIZE.
     BigElem = binary:copy(<<0>>, 521),
-    Script = <<16#51>>,        %% OP_1 - succeeds if reached
-    Stack = [BigElem],         %% pre-loaded oversized element
+    Script = <<16#51>>,        %% OP_1 — no OP_SUCCESS, so gates apply
+    Stack = [BigElem],
     %% 5-arity wrapper passes annex_hash=undefined.
     Result = beamchain_script:eval_tapscript(
                 Script, Stack, 1000, 0, #{}),
-    %% eval_tapscript does NOT enforce the initial-stack-element-size
-    %% check itself (Core's enforcement lives in ExecuteWitnessScript
-    %% BEFORE EvalScript runs). The fix in verify_taproot_script_path
-    %% adds that gate. Here we just confirm eval_tapscript still runs
-    %% OK with a small element to anchor the API.
-    %% (For the real gate, see w94_taproot_big_stack_element_rejected.)
-    ?assertMatch({_, _}, Result).
+    %% Gate now lives inside eval_tapscript (after OP_SUCCESS check).
+    ?assertEqual({error, push_size_exceeded}, Result).
 
 %% Bug fix #5 (script path): verify_taproot_script_path rejects an
 %% initial witness stack containing an element larger than 520 bytes.
@@ -2862,6 +2858,88 @@ w94_parse_schnorr_sig_wrong_size_test() ->
     ?assertMatch({invalid, _}, beamchain_script:parse_schnorr_sig(<<>>)),
     ?assertMatch({invalid, _}, beamchain_script:parse_schnorr_sig(<<0:8>>)),
     ?assertMatch({invalid, _}, beamchain_script:parse_schnorr_sig(<<0:520>>)).
+
+%%% ===================================================================
+%%% Finding-20: OP_SUCCESS prescan must run BEFORE stack/element gates
+%%%
+%%% Core (interpreter.cpp:1836-1861): in TAPSCRIPT mode the OP_SUCCESS
+%%% scan fires first and, if an OP_SUCCESSx is found, returns success
+%%% immediately -- overriding MAX_STACK_SIZE AND per-element 520B limits.
+%%% Only when NO OP_SUCCESS is present does the script apply those gates.
+%%%
+%%% Pre-fix beamchain applied both gates in verify_taproot_script_path
+%%% BEFORE calling eval_tapscript, which itself contained the OP_SUCCESS
+%%% check.  A script-path spend with OP_SUCCESS + >520B element or
+%%% >1000 stack items was therefore wrongly rejected.
+%%%
+%%% Fix: gates moved inside eval_tapscript, after check_op_success.
+%%% The secondary fix: scan_for_op_success returns {error,bad_opcode}
+%%% instead of false when a push overruns the script end (Core
+%%% interpreter.cpp:1841-1843).
+%%% ===================================================================
+
+%% OP_SUCCESS overrides the 520B per-element gate.
+%% With a 521-byte element on the initial stack and OP_SUCCESS (0xbb)
+%% in the script, eval_tapscript must return success WITHOUT checking
+%% element size first.
+f20_op_success_overrides_element_size_gate_test() ->
+    BigElem = binary:copy(<<0>>, 521),   %% > MAX_SCRIPT_ELEMENT_SIZE (520)
+    Script  = <<16#bb>>,                 %% OP_SUCCESS (0xbb)
+    Stack   = [BigElem],
+    Result  = beamchain_script:eval_tapscript(Script, Stack, 1000, 0, #{}),
+    ?assertEqual({ok, [<<1>>]}, Result).
+
+%% OP_SUCCESS overrides the MAX_STACK_SIZE (1000) gate.
+f20_op_success_overrides_stack_size_gate_test() ->
+    %% 1001 empty elements — one above MAX_STACK_SIZE
+    Stack  = [<<>> || _ <- lists:seq(1, 1001)],
+    Script = <<16#bb>>,                  %% OP_SUCCESS (0xbb)
+    Result = beamchain_script:eval_tapscript(Script, Stack, 1000, 0, #{}),
+    ?assertEqual({ok, [<<1>>]}, Result).
+
+%% DISCOURAGE_OP_SUCCESS is still returned even when the stack would
+%% violate the element-size gate — the OP_SUCCESS scan fires first.
+f20_discourage_op_success_overrides_element_gate_test() ->
+    BigElem = binary:copy(<<0>>, 521),
+    Script  = <<16#bb>>,
+    Stack   = [BigElem],
+    Result  = beamchain_script:eval_tapscript(
+                Script, Stack, 1000,
+                ?SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS, #{}),
+    ?assertEqual({error, discourage_op_success}, Result).
+
+%% Without OP_SUCCESS, the element-size gate still fires (gate is not
+%% removed, just moved after the scan).
+f20_no_op_success_element_gate_still_fires_test() ->
+    BigElem = binary:copy(<<0>>, 521),
+    Script  = <<16#51>>,                 %% OP_1 — no OP_SUCCESS
+    Stack   = [BigElem],
+    Result  = beamchain_script:eval_tapscript(Script, Stack, 1000, 0, #{}),
+    ?assertEqual({error, push_size_exceeded}, Result).
+
+%% Without OP_SUCCESS, the stack-size gate still fires.
+f20_no_op_success_stack_gate_still_fires_test() ->
+    Stack  = [<<>> || _ <- lists:seq(1, 1001)],
+    Script = <<16#51>>,                  %% OP_1 — no OP_SUCCESS
+    Result = beamchain_script:eval_tapscript(Script, Stack, 1000, 0, #{}),
+    ?assertEqual({error, stack_size}, Result).
+
+%% Secondary fix: scan_for_op_success returns {error,bad_opcode} when
+%% a push data extends past the end of the script (no OP_SUCCESS seen).
+%% Core (interpreter.cpp:1841-1843): GetOp failure -> BAD_OPCODE.
+f20_scan_truncated_push_returns_bad_opcode_test() ->
+    %% 1-byte push opcode (0x05) declaring 5 bytes, but only 2 follow.
+    TruncScript = <<16#05, 16#aa, 16#bb>>,
+    %% check_op_success calls scan internally; eval_tapscript surfaces it.
+    Result = beamchain_script:eval_tapscript(TruncScript, [], 1000, 0, #{}),
+    ?assertEqual({error, bad_opcode}, Result).
+
+%% OP_SUCCESS before a truncated push is found first -> success.
+f20_op_success_before_truncated_push_wins_test() ->
+    %% OP_SUCCESS (0xbb) followed by a truncated push — OP_SUCCESS seen first.
+    Script = <<16#bb, 16#05, 16#aa>>,
+    Result = beamchain_script:eval_tapscript(Script, [], 1000, 0, #{}),
+    ?assertEqual({ok, [<<1>>]}, Result).
 
 %%% ===================================================================
 %%% W95: BIP-340 Schnorr + tagged-hash audit
