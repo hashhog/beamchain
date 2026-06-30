@@ -523,7 +523,12 @@ check_op_success(Script, Flags) ->
                 _ -> {error, discourage_op_success}
             end;
         false ->
-            ok
+            ok;
+        {error, _} = Err ->
+            %% Core (interpreter.cpp:1841-1843): truncated push in the OP_SUCCESS
+            %% prescan returns SCRIPT_ERR_BAD_OPCODE when no OP_SUCCESS was seen
+            %% before the truncation point.
+            Err
     end.
 
 scan_for_op_success(<<>>) ->
@@ -546,13 +551,13 @@ scan_for_op_success(<<Op, _Rest/binary>>) ->
 skip_push(N, Bin) ->
     case Bin of
         <<_:N/binary, Rest/binary>> -> scan_for_op_success(Rest);
-        _ -> false
+        _ -> {error, bad_opcode}  %% push extends past script end
     end.
 
 skip_data(Len, Bin) ->
     case Bin of
         <<_:Len/binary, Rest/binary>> -> scan_for_op_success(Rest);
-        _ -> false
+        _ -> {error, bad_opcode}  %% push extends past script end
     end.
 
 %%% -------------------------------------------------------------------
@@ -2939,34 +2944,15 @@ verify_taproot_script_path(OutputKey, Script, ControlBlock,
                                     %% Reverse: wire order is bottom-to-top,
                                     %% our list HEAD = top of stack
                                     InitialStack = lists:reverse(ScriptArgs),
-                                    %% Core (interpreter.cpp:1854-1856) gate:
-                                    %% tapscript enforces MAX_STACK_SIZE on the
-                                    %% initial stack BEFORE EvalScript.  Altstack
-                                    %% is empty here so the comparison is just
-                                    %% the initial stack length.
-                                    case length(InitialStack) > ?MAX_STACK_SIZE of
-                                        true ->
-                                            {error, stack_size};
-                                        false ->
-                                            %% Core (interpreter.cpp:1858-1861)
-                                            %% gate: every initial-stack element
-                                            %% must be <= MAX_SCRIPT_ELEMENT_SIZE
-                                            %% (520 bytes).  W94: was missing —
-                                            %% witness-supplied 521+ byte stack
-                                            %% elements bypassed the gate via
-                                            %% the script_path entry point.
-                                            case lists:any(
-                                                   fun(E) ->
-                                                       byte_size(E) > ?MAX_SCRIPT_ELEMENT_SIZE
-                                                   end, InitialStack) of
-                                                true ->
-                                                    {error, push_size_exceeded};
-                                                false ->
-                                                    eval_tapscript(
-                                                      Script, InitialStack, Budget,
-                                                      AnnexHash, Flags, SigChecker)
-                                            end
-                                    end;
+                                    %% Core (interpreter.cpp:1836-1861): OP_SUCCESS
+                                    %% scan runs FIRST inside eval_tapscript and
+                                    %% overrides everything including stack/element
+                                    %% size limits; gates are applied only when no
+                                    %% OP_SUCCESS is present.  Do not pre-gate here
+                                    %% — eval_tapscript enforces the correct order.
+                                    eval_tapscript(
+                                      Script, InitialStack, Budget,
+                                      AnnexHash, Flags, SigChecker);
                                 _ ->
                                     case (Flags band ?SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION) =/= 0 of
                                         true ->
@@ -2999,25 +2985,44 @@ eval_tapscript(Script, Stack, SigopsBudget, AnnexHash, Flags, SigChecker) ->
         sigops_budget = SigopsBudget,
         annex_hash = AnnexHash
     },
-    %% check for OP_SUCCESS first
+    %% Core (interpreter.cpp:1836-1861): OP_SUCCESS scan runs FIRST and
+    %% overrides everything — including MAX_STACK_SIZE and per-element 520B
+    %% gates.  Only when no OP_SUCCESS is present do we apply those gates
+    %% and then execute the script.
     case check_op_success(Script, Flags) of
         {success, true} ->
             {ok, [script_true()]};
         {error, _} = E ->
             E;
         ok ->
-            case execute(Script, 0, State0) of
-                {ok, [Top]} ->
-                    case script_bool(Top) of
-                        true -> {ok, [Top]};
-                        false -> {error, tapscript_failed}
-                    end;
-                {ok, []} ->
-                    {error, tapscript_empty_stack};
-                {ok, _} ->
-                    {error, tapscript_cleanstack};
-                {error, _} = E ->
-                    E
+            %% Gate 1 (interpreter.cpp:1854-1856): tapscript enforces
+            %% MAX_STACK_SIZE on the initial stack; altstack is empty here.
+            case length(Stack) > ?MAX_STACK_SIZE of
+                true ->
+                    {error, stack_size};
+                false ->
+                    %% Gate 2 (interpreter.cpp:1858-1861): every initial-stack
+                    %% element must be <= MAX_SCRIPT_ELEMENT_SIZE (520 bytes).
+                    case lists:any(
+                           fun(E) -> byte_size(E) > ?MAX_SCRIPT_ELEMENT_SIZE end,
+                           Stack) of
+                        true ->
+                            {error, push_size_exceeded};
+                        false ->
+                            case execute(Script, 0, State0) of
+                                {ok, [Top]} ->
+                                    case script_bool(Top) of
+                                        true -> {ok, [Top]};
+                                        false -> {error, tapscript_failed}
+                                    end;
+                                {ok, []} ->
+                                    {error, tapscript_empty_stack};
+                                {ok, _} ->
+                                    {error, tapscript_cleanstack};
+                                {error, _} = Err ->
+                                    Err
+                            end
+                    end
             end
     end.
 
