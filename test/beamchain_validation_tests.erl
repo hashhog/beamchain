@@ -4086,3 +4086,101 @@ w93_b3_remove_for_block_async_empty_returns_ok_test() ->
     %% short-circuit.
     ?assertEqual(ok,
         beamchain_mempool:remove_for_block_async([])).
+
+%%% ===================================================================
+%%% W2_MHASH: median_time_past hash-linked walk for side-branch parents
+%%% ===================================================================
+%%
+%% Core chain.h:233-245 GetMedianTimePast walks pindex->pprev (hash-linked
+%% parent pointers), not a height-indexed active-chain lookup.  The fallback
+%% collect_timestamps/3 path must do the same so that contextual_check_block_
+%% header correctly computes MTP (time-too-old, BIP-113 lock_time_cutoff)
+%% for side-branch blocks whose ancestors are NOT in the active-chain
+%% height-keyed index.
+%%
+%% Scenario (side branch diverging 2 blocks deep):
+%%   A0 (height=0, ts=1000) — genesis — stored in ACTIVE-CHAIN index
+%%   A1 (height=1, ts=2000) — active-chain block — stored in ACTIVE-CHAIN index
+%%   SB1 (height=1, ts=3000, prev=A0) — stored in SIDE-BRANCH index ONLY
+%%   SB2 (height=2, ts=4000, prev=SB1) — stored in SIDE-BRANCH index ONLY
+%%
+%% PrevIndex for a header at height=3 = SB2's entry (no mtp_timestamps cache,
+%% as produced by do_side_branch_accept_with_parent / do_accept_new_header).
+%%
+%% EFFECTIVE check: median_time_past(PrevIndex_SB2) must return 3000 (median
+%% of [A0.ts=1000, SB1.ts=3000, SB2.ts=4000] = nth(2,[1000,3000,4000]) = 3000).
+%%
+%% PRE-FIX (height-indexed walk): at SB2 (height=2), get_block_index(1) returns
+%% A1 (ts=2000, WRONG ancestor).  Then A1 → A0 (ts=1000).  Result = median of
+%% [1000, 2000, 4000] = 2000 — a silently wrong MTP.
+%%
+%% POST-FIX (hash-linked walk): SB2 → SB1 (side-branch) → A0 (active) → stop.
+%% Result = median of [1000, 3000, 4000] = 3000 — correct.
+
+mtp_hash_linked_side_branch_test_() ->
+    {setup,
+     fun mtp_sb_setup/0,
+     fun mtp_sb_teardown/1,
+     fun(#{prev_sb2 := PrevSB2}) ->
+         [
+          {"hash-linked MTP walk returns correct median over side-branch ancestors",
+           fun() ->
+               %% Post-fix: SB2 → SB1 (side-branch) → A0 (active) → stop.
+               %% Timestamps [4000, 3000, 1000]; sorted [1000, 3000, 4000]; MTP = 3000.
+               ?assertEqual(3000,
+                   beamchain_validation:median_time_past(PrevSB2))
+           end}
+         ]
+     end}.
+
+mtp_sb_setup() ->
+    TmpDir = filename:join(["/tmp", "bc_mtp_sb_" ++
+                            integer_to_list(erlang:unique_integer([positive]))]),
+    ok = filelib:ensure_dir(filename:join(TmpDir, "dummy")),
+    application:ensure_all_started(rocksdb),
+    application:set_env(beamchain, datadir, TmpDir),
+    application:set_env(beamchain, network, regtest),
+    {ok, ConfigPid} = beamchain_config:start_link(),
+    {ok, DbPid} = beamchain_db:start_link(),
+
+    HashA0  = <<16#A0:8, 0:248>>,
+    HashA1  = <<16#A1:8, 0:248>>,
+    HashSB1 = <<16#B1:8, 0:248>>,
+    HashSB2 = <<16#B2:8, 0:248>>,
+
+    HdrA0  = mtp_sb_mk_header(<<0:256>>, 1000),   %% genesis prev = all-zeros
+    HdrA1  = mtp_sb_mk_header(HashA0,   2000),
+    HdrSB1 = mtp_sb_mk_header(HashA0,   3000),    %% diverges from A0
+    HdrSB2 = mtp_sb_mk_header(HashSB1,  4000),
+
+    %% Active-chain: A0 at height 0, A1 at height 1.
+    ok = beamchain_db:store_block_index(0, HashA0, HdrA0, <<0:256>>, 8, 1),
+    ok = beamchain_db:store_block_index(1, HashA1, HdrA1, <<1:256>>, 8, 1),
+
+    %% Side-branch: SB1 and SB2 are NOT in the active-chain index.
+    ok = beamchain_db:store_side_branch_index(HashSB1,
+        #{height => 1, header => HdrSB1, chainwork => <<2:256>>,
+          status => 2, n_tx => 1}),
+    ok = beamchain_db:store_side_branch_index(HashSB2,
+        #{height => 2, header => HdrSB2, chainwork => <<3:256>>,
+          status => 2, n_tx => 1}),
+
+    %% PrevIndex for a new header at height=3: SB2's entry, no mtp_timestamps.
+    %% Mirrors what do_side_branch_accept_with_parent passes to
+    %% contextual_check_block_header (beamchain_chainstate.erl:1691-1692).
+    PrevSB2 = #{height => 2, header => HdrSB2, chainwork => <<3:256>>},
+
+    #{tmpdir => TmpDir, config_pid => ConfigPid, db_pid => DbPid,
+      prev_sb2 => PrevSB2}.
+
+mtp_sb_teardown(#{tmpdir := TmpDir}) ->
+    catch beamchain_db:stop(),
+    catch gen_server:stop(beamchain_config),
+    os:cmd("rm -rf " ++ TmpDir),
+    ok.
+
+mtp_sb_mk_header(PrevHash, Timestamp) ->
+    #block_header{version = 4, prev_hash = PrevHash,
+                  merkle_root = <<0:256>>,
+                  timestamp = Timestamp,
+                  bits = 16#207fffff, nonce = 0}.
