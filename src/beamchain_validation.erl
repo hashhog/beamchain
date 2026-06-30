@@ -390,20 +390,38 @@ median_time_past(PrevIndex) ->
     Sorted = lists:sort(Timestamps),
     lists:nth((length(Sorted) div 2) + 1, Sorted).
 
-%% Collect up to N timestamps walking backwards through the chain
+%% Collect up to N timestamps walking backwards through the chain via
+%% hash-linked parent pointers (Header#block_header.prev_hash), mirroring
+%% Core's GetMedianTimePast (chain.h:233-245, `pindex = pindex->pprev`).
+%% This correctly handles side-branch ancestors that live in the side-branch
+%% (hash-keyed) index rather than the active-chain height-keyed index.
+%% Previously this walked by Height-1 via get_block_index/1 which returned
+%% the wrong ancestor (an unrelated active-chain block at the same height)
+%% or crashed with block_index_not_found when no active-chain block
+%% existed at that height.
 collect_timestamps(_Index, 0, Acc) -> Acc;
 collect_timestamps(Index, N, Acc) ->
     Header = maps:get(header, Index),
-    Height = maps:get(height, Index),
     Ts = Header#block_header.timestamp,
-    case Height of
-        0 -> [Ts | Acc];
-        _ ->
-            PrevIndex = case beamchain_db:get_block_index(Height - 1) of
-                {ok, PI} -> PI;
-                not_found -> error({block_index_not_found, Height - 1})
-            end,
-            collect_timestamps(PrevIndex, N - 1, [Ts | Acc])
+    PrevHash = Header#block_header.prev_hash,
+    case lookup_block_index_by_hash(PrevHash) of
+        {ok, PrevIndex} ->
+            collect_timestamps(PrevIndex, N - 1, [Ts | Acc]);
+        not_found ->
+            %% Genesis: prev_hash is all-zeros and has no DB entry.
+            %% Also stops gracefully if an ancestor is not yet indexed.
+            [Ts | Acc]
+    end.
+
+%% Look up a block index entry by hash, checking the active-chain
+%% reverse-hash index first, then the side-branch (hash-keyed) index.
+%% Mirrors beamchain_chainstate:lookup_block_index_anywhere/1 for use
+%% in the fallback MTP walk where chainstate is not the caller.
+-spec lookup_block_index_by_hash(binary()) -> {ok, map()} | not_found.
+lookup_block_index_by_hash(Hash) ->
+    case beamchain_db:get_block_index_by_hash(Hash) of
+        {ok, _} = R -> R;
+        not_found   -> beamchain_db:get_side_branch_index(Hash)
     end.
 
 %%% -------------------------------------------------------------------
