@@ -243,32 +243,47 @@ route_message(Peer, inv, Payload, State) ->
                 [] ->
                     State;
                 _ ->
-                    %% Directly request the announced blocks via getdata
-                    %% so we don't depend on a getheaders round-trip.
-                    %% Core protocol.h:482 — MAX_GETDATA_SZ=1000: an outgoing
-                    %% getdata must not exceed 1000 items; chunk larger requests.
-                    GetDataItems = [#{type => ?MSG_WITNESS_BLOCK,
-                                      hash => Hash}
-                                    || #{hash := Hash} <- BlockItems],
-                    Chunks = beamchain_peer_manager:chunk_inv_items(
-                                 GetDataItems, ?MAX_GETDATA_SZ),
-                    lists:foreach(fun(Chunk) ->
-                        beamchain_peer:send_message(Peer,
-                            {getdata, #{items => Chunk}})
-                    end, Chunks),
-                    logger:info("sync: received block inv from ~p, "
-                                "requesting ~B blocks via getdata (~B msg(s))",
-                                [Peer, length(GetDataItems), length(Chunks)]),
-                    %% Also kick off header sync if we think we're done,
-                    %% so the header chain catches up too
-                    case State#state.phase =:= complete of
-                        true ->
-                            beamchain_header_sync:start_sync(#{}),
+                    %% Headers-first announcement handling — Bitcoin Core
+                    %% net_processing.cpp ProcessMessage(INV) "best_block"
+                    %% path (src/net_processing.cpp:4065-4123): a peer that
+                    %% announces a block by inv may be relaying a new tip OR
+                    %% signalling a reorg. Core NEVER issues a direct getdata
+                    %% for the announced hash — instead it records block
+                    %% availability and sends a single getheaders to the
+                    %% announcing peer, then fetches the blocks in order via
+                    %% the block-download pipeline once the headers connect.
+                    %%
+                    %% The previous code getdata'd the announced hash directly.
+                    %% On a reorg the announced tip's parent is unknown (its
+                    %% ancestors arrive later), so the fetched block hit the
+                    %% unsolicited-block path, connect_block failed bad-prevblk,
+                    %% and the peer was scored +100 -> banned -> the connection
+                    %% dropped mid-reorg (harness: "fetches 2 chain-B blocks
+                    %% then drops, never reorgs"). Going headers-first fixes
+                    %% that: header_sync discovers + reorgs the header chain,
+                    %% then block_sync downloads the competing branch in order
+                    %% and activates the heavier chain, exactly like Core.
+                    %%
+                    %% probe_peer/1 sends GETHEADERS to *this* peer regardless
+                    %% of its advertised start_height (Core MaybeSendGetHeaders
+                    %% to pfrom) — required here because a reorg announcer's
+                    %% advertised height equals ours, so the height-gated
+                    %% start_sync peer-selection would never pick it.
+                    logger:info("sync: received block inv from ~p (~B new) — "
+                                "sending getheaders (headers-first)",
+                                [Peer, length(BlockItems)]),
+                    beamchain_header_sync:probe_peer(Peer),
+                    %% Arm the header-sync completion poll so we transition to
+                    %% block download once the header chain connects. Only arm
+                    %% when we're not already tracking header sync, to avoid
+                    %% stacking timers.
+                    case State#state.phase of
+                        Phase when Phase =:= complete; Phase =:= idle ->
                             Timer = erlang:send_after(?HEADER_CHECK_INTERVAL,
                                                       self(), check_header_sync),
                             State#state{phase = headers,
                                         header_check_timer = Timer};
-                        false ->
+                        _ ->
                             State
                     end
             end;

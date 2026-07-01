@@ -259,8 +259,14 @@ handle_cast({start_sync, Opts}, #state{status = idle,
     logger:info("block_sync: starting IBD from ~B to ~B",
                 [StartHeight, TargetHeight]),
 
-    %% Build the download queue
-    Queue = case TargetHeight > StartHeight of
+    %% Build the download queue. Inclusive of both ends: StartHeight is the
+    %% first block we still need (chainstate tip + 1, or fork+1 on a reorg) and
+    %% TargetHeight is the header tip we are catching up to. A single-block
+    %% extension (StartHeight == TargetHeight, e.g. connecting the one block
+    %% that advances the tip by 1) MUST still enqueue that block, so the gate is
+    %% `>=`, not `>`. With `>` a +1 advance silently downloaded nothing — the
+    %% post-reorg follow-up block (tip 107 -> 108) never connected.
+    Queue = case TargetHeight >= StartHeight of
         true -> lists:seq(StartHeight, TargetHeight);
         false -> []
     end,
@@ -318,7 +324,11 @@ handle_cast({start_sync, Opts}, #state{status = idle,
 handle_cast({start_sync, Opts}, #state{status = complete} = State) ->
     StartHeight = find_start_height(),
     TargetHeight = maps:get(target_height, Opts, State#state.target_height),
-    case TargetHeight > StartHeight of
+    %% `>=`, not `>`: re-arm even for a single-block advance (StartHeight ==
+    %% TargetHeight), otherwise the block that extends the tip by exactly one
+    %% (the common post-reorg follow-up case, tip 107 -> announced 108) is
+    %% never downloaded and the node latches one block behind the header tip.
+    case TargetHeight >= StartHeight of
         true ->
             logger:info("block_sync: re-arming from complete — "
                         "new target ~B (was ~B), tip ~B",
