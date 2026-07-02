@@ -190,6 +190,20 @@ parse_args(["--fixedseeds=" ++ Value | Rest], Cmd, Opts) ->
 parse_args(["--fixedseeds", Value | Rest], Cmd, Opts) ->
     parse_args(Rest, Cmd, Opts#{nofixedseeds => not parse_bool(Value)});
 
+%% --noassumevalid / --assumevalid=0: disable the assumevalid script-skip so
+%% the node performs FULL script verification of all history (the
+%% mainnet-replay harness, assumevalid=0). Routed through
+%% BEAMCHAIN_ASSUMEVALID=0, which beamchain_chain_params:params/1 consults to
+%% zero the `assume_valid` field (skip_scripts condition 1 = disabled).
+%% Mirrors nimrod --assumevalid=0. `--assumevalid=1` (or any non-zero) leaves
+%% the network default in place. Strictly MORE verification, never less.
+parse_args(["--noassumevalid" | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{noassumevalid => true});
+parse_args(["--assumevalid=" ++ Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{noassumevalid => assumevalid_is_off(Value)});
+parse_args(["--assumevalid", Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{noassumevalid => assumevalid_is_off(Value)});
+
 parse_args(["--rpc-port", Value | Rest], Cmd, Opts) ->
     parse_args(Rest, Cmd, Opts#{rpc_port => list_to_integer(Value)});
 parse_args(["--rpc-port=" ++ Value | Rest], Cmd, Opts) ->
@@ -378,6 +392,8 @@ print_usage() ->
         "                    (0=off default, 1=on; mirrors Core -coinstatsindex)~n"
         "  --dbcache=<MiB>   Total UTXO cache budget in MiB (default 4096 IBD /~n"
         "                    256 RocksDB block cache). Performance only.~n"
+        "  --noassumevalid   verify scripts for ALL history (disable the~n"
+        "                    assumevalid skip; alias --assumevalid=0)~n"
         "  --listenonion=<n> 1 = register v3 hidden service via Tor control~n"
         "                    port (default 0; mirrors Core -listenonion)~n"
         "  --torcontrol=h:p  Tor control-port address~n"
@@ -892,6 +908,14 @@ apply_opts(Opts) ->
         undefined -> ok;
         TP when is_list(TP) -> os:putenv("BEAMCHAIN_TORPASSWORD", TP)
     end,
+    %% --noassumevalid / --assumevalid=0: route through BEAMCHAIN_ASSUMEVALID so
+    %% beamchain_chain_params:params/1 zeroes the assume_valid field (the
+    %% skip_scripts gate then always verifies). Only the disable direction is
+    %% wired; a non-zero value simply leaves the built-in default untouched.
+    case maps:get(noassumevalid, Opts, undefined) of
+        true -> os:putenv("BEAMCHAIN_ASSUMEVALID", "0");
+        _    -> ok
+    end,
     ok.
 
 %% Accumulate a --connect=<ip:port> value into the opts map. Repeatable:
@@ -900,6 +924,19 @@ apply_opts(Opts) ->
 append_connect(Value, Opts) ->
     Existing = maps:get(connect, Opts, []),
     Opts#{connect => Existing ++ [Value]}.
+
+%% Interpret a --assumevalid=<value> argument as "assumevalid off?".
+%% "0" / "false" / "none" (case-insensitive) disable the skip; a block hash
+%% or any other value leaves the network default in place. beamchain only
+%% wires the disable direction (the harness needs assumevalid=0), so a
+%% non-zero value is treated as "keep default".
+assumevalid_is_off(Value) ->
+    case string:lowercase(string:trim(Value)) of
+        "0"     -> true;
+        "false" -> true;
+        "none"  -> true;
+        _       -> false
+    end.
 
 %% Parse the --cfilter=<N> argument.  Accepts integer-as-string only;
 %% defers to apply_opts/1 for range validation so we surface a single

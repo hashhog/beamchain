@@ -13,8 +13,43 @@
          clear_regtest_assumeutxo/0, regtest_assumeutxo_registry/0]).
 
 %% @doc Returns comprehensive chain parameters for the given network.
+%%
+%% assumevalid disable knob: when the operator passes `--noassumevalid`
+%% (or `--assumevalid=0`), beamchain_cli routes it through the
+%% BEAMCHAIN_ASSUMEVALID=0 environment variable. This wrapper then zeroes
+%% the `assume_valid` field of whatever network params it returns, so the
+%% skip_scripts gate (beamchain_validation:skip_scripts/3, condition 1) and
+%% the block_sync assume_valid_height cache both see <<0:256>> = disabled,
+%% forcing FULL script verification of all history. Used by the
+%% mainnet-replay harness (assumevalid=0). Strictly MORE verification, never
+%% less — non-consensus in the reject direction.
 -spec params(mainnet | testnet | testnet4 | regtest | signet) -> map().
-params(mainnet) ->
+params(Network) ->
+    maybe_disable_assume_valid(params_raw(Network)).
+
+%% @doc Zero the assume_valid field when the disable knob is set.
+-spec maybe_disable_assume_valid(map()) -> map().
+maybe_disable_assume_valid(Params) ->
+    case assume_valid_disabled() of
+        true  -> Params#{assume_valid => <<0:256>>};
+        false -> Params
+    end.
+
+%% @doc True iff BEAMCHAIN_ASSUMEVALID selects the disabled sentinel.
+%% "0" / "false" / "none" all disable; anything else (incl. unset) leaves
+%% the network's built-in assume_valid untouched.
+-spec assume_valid_disabled() -> boolean().
+assume_valid_disabled() ->
+    case os:getenv("BEAMCHAIN_ASSUMEVALID") of
+        "0"     -> true;
+        "false" -> true;
+        "none"  -> true;
+        _       -> false
+    end.
+
+%% @doc Network params as declared in-source (before the assumevalid knob).
+-spec params_raw(mainnet | testnet | testnet4 | regtest | signet) -> map().
+params_raw(mainnet) ->
     #{
         network => mainnet,
         magic => <<16#F9, 16#BE, 16#B4, 16#D9>>,
@@ -105,7 +140,7 @@ params(mainnet) ->
         bech32_hrp => "bc"
     };
 
-params(testnet) ->
+params_raw(testnet) ->
     #{
         network => testnet,
         magic => <<16#0B, 16#11, 16#09, 16#07>>,
@@ -155,7 +190,7 @@ params(testnet) ->
         bech32_hrp => "tb"
     };
 
-params(testnet4) ->
+params_raw(testnet4) ->
     #{
         network => testnet4,
         magic => <<16#1C, 16#16, 16#3F, 16#28>>,
@@ -205,7 +240,7 @@ params(testnet4) ->
         bech32_hrp => "tb"
     };
 
-params(regtest) ->
+params_raw(regtest) ->
     #{
         network => regtest,
         magic => <<16#FA, 16#BF, 16#B5, 16#DA>>,
@@ -248,7 +283,7 @@ params(regtest) ->
         bech32_hrp => "bcrt"
     };
 
-params(signet) ->
+params_raw(signet) ->
     #{
         network => signet,
         magic => <<16#0A, 16#03, 16#CF, 16#40>>,
