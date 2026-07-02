@@ -792,6 +792,9 @@ count_legacy_sigops(<<16#4c:8, Len:8, Rest/binary>>, Count) ->
             count_legacy_sigops(Rest2, Count);
         _ -> Count
     end;
+%% OP_PUSHDATA1 with truncated length field (no length byte): Core GetOp returns
+%% false and GetSigOpCount breaks -> stop counting (do not re-scan as opcodes).
+count_legacy_sigops(<<16#4c:8, _/binary>>, Count) -> Count;
 %% OP_PUSHDATA2
 count_legacy_sigops(<<16#4d:8, Len:16/little, Rest/binary>>, Count) ->
     case Rest of
@@ -799,6 +802,8 @@ count_legacy_sigops(<<16#4d:8, Len:16/little, Rest/binary>>, Count) ->
             count_legacy_sigops(Rest2, Count);
         _ -> Count
     end;
+%% OP_PUSHDATA2 with truncated length field (<2 bytes): stop counting like Core.
+count_legacy_sigops(<<16#4d:8, _/binary>>, Count) -> Count;
 %% OP_PUSHDATA4
 count_legacy_sigops(<<16#4e:8, Len:32/little, Rest/binary>>, Count) ->
     case Rest of
@@ -806,6 +811,8 @@ count_legacy_sigops(<<16#4e:8, Len:32/little, Rest/binary>>, Count) ->
             count_legacy_sigops(Rest2, Count);
         _ -> Count
     end;
+%% OP_PUSHDATA4 with truncated length field (<4 bytes): stop counting like Core.
+count_legacy_sigops(<<16#4e:8, _/binary>>, Count) -> Count;
 %% OP_CHECKSIG, OP_CHECKSIGVERIFY
 count_legacy_sigops(<<16#ac:8, Rest/binary>>, Count) ->
     count_legacy_sigops(Rest, Count + 1);
@@ -845,6 +852,9 @@ count_sigops_accurate(<<16#4c:8, Len:8, Rest/binary>>, _LastOp, Count) ->
             count_sigops_accurate(Rest2, 16#4c, Count);
         _ -> Count
     end;
+%% OP_PUSHDATA1 with truncated length field (no length byte): stop counting
+%% like Core (GetOp returns false -> break), do not re-scan bytes as opcodes.
+count_sigops_accurate(<<16#4c:8, _/binary>>, _LastOp, Count) -> Count;
 %% OP_PUSHDATA2
 count_sigops_accurate(<<16#4d:8, Len:16/little, Rest/binary>>, _LastOp, Count) ->
     case Rest of
@@ -852,6 +862,8 @@ count_sigops_accurate(<<16#4d:8, Len:16/little, Rest/binary>>, _LastOp, Count) -
             count_sigops_accurate(Rest2, 16#4d, Count);
         _ -> Count
     end;
+%% OP_PUSHDATA2 with truncated length field (<2 bytes): stop counting like Core.
+count_sigops_accurate(<<16#4d:8, _/binary>>, _LastOp, Count) -> Count;
 %% OP_PUSHDATA4
 count_sigops_accurate(<<16#4e:8, Len:32/little, Rest/binary>>, _LastOp, Count) ->
     case Rest of
@@ -859,6 +871,8 @@ count_sigops_accurate(<<16#4e:8, Len:32/little, Rest/binary>>, _LastOp, Count) -
             count_sigops_accurate(Rest2, 16#4e, Count);
         _ -> Count
     end;
+%% OP_PUSHDATA4 with truncated length field (<4 bytes): stop counting like Core.
+count_sigops_accurate(<<16#4e:8, _/binary>>, _LastOp, Count) -> Count;
 %% OP_CHECKSIG, OP_CHECKSIGVERIFY
 count_sigops_accurate(<<16#ac:8, Rest/binary>>, _LastOp, Count) ->
     count_sigops_accurate(Rest, 16#ac, Count + 1);

@@ -189,6 +189,33 @@ legacy_sigops_with_push_test() ->
     Script = <<3, 1, 2, 3, 16#ac>>,
     ?assertEqual(1, beamchain_validation:count_legacy_sigops(Script)).
 
+%% Glass-box wave 2 (HIGH): truncated OP_PUSHDATA4 length field.
+%% scriptPubKey = 4e ae ae ae — OP_PUSHDATA4 followed by only 3 of the required
+%% 4 length bytes. Core (script.cpp GetSigOpCount) calls GetOp, which returns
+%% false on the truncated length field and BREAKS the scan -> 0 sigops.
+%% Pre-fix beamchain fell through to the catch-all, consuming only 0x4e and
+%% re-scanning <<ae,ae,ae>> as three OP_CHECKMULTISIG opcodes -> 60. Must be 0.
+legacy_sigops_truncated_pushdata4_test() ->
+    Script = <<16#4e, 16#ae, 16#ae, 16#ae>>,
+    ?assertEqual(0, beamchain_validation:count_legacy_sigops(Script)).
+
+%% Glass-box wave 2 (HIGH): truncated OP_PUSHDATA2 length field.
+%% scriptPubKey = 4d ac — OP_PUSHDATA2 followed by only 1 of the required 2
+%% length bytes. Core breaks -> 0 sigops. Pre-fix beamchain consumed 0x4d and
+%% counted the trailing 0xAC (OP_CHECKSIG) -> 1. Must be 0.
+legacy_sigops_truncated_pushdata2_test() ->
+    Script = <<16#4d, 16#ac>>,
+    ?assertEqual(0, beamchain_validation:count_legacy_sigops(Script)).
+
+%% Same divergence in the accurate counter (drives connect_block sigop cost).
+accurate_sigops_truncated_pushdata4_test() ->
+    Script = <<16#4e, 16#ae, 16#ae, 16#ae>>,
+    ?assertEqual(0, beamchain_validation:count_sigops_accurate(Script)).
+
+accurate_sigops_truncated_pushdata2_test() ->
+    Script = <<16#4d, 16#ac>>,
+    ?assertEqual(0, beamchain_validation:count_sigops_accurate(Script)).
+
 %%% ===================================================================
 %%% is_coinbase_tx tests
 %%% ===================================================================
