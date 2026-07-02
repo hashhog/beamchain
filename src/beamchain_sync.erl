@@ -287,7 +287,22 @@ route_message(Peer, inv, Payload, State) ->
                             State
                     end
             end;
+        {error, {oversized, inv, Count, Max}} ->
+            %% Bitcoin Core net_processing.cpp:4040 — an inv carrying more than
+            %% MAX_INV_SZ (50000) entries is peer misbehavior:
+            %%   Misbehaving(peer, "inv message size = ...") + return.
+            %% decode_inv_payload already caps at MAX_INV_SIZE and surfaces the
+            %% oversized count here; discourage the peer (score >= BAN_SCORE so
+            %% it is banned + disconnected immediately, single-event discourage)
+            %% instead of silently dropping the message unpenalised.
+            logger:warning("sync: oversize inv from ~p (~B > ~B) — "
+                           "discouraging + disconnecting", [Peer, Count, Max]),
+            beamchain_peer:add_misbehavior(Peer, 100),
+            State;
         _Error ->
+            %% Any other inv decode failure is malformed input from the peer;
+            %% score it like the sibling handlers (headers/block/tx) do.
+            beamchain_peer:add_misbehavior(Peer, 20),
             State
     end;
 

@@ -813,9 +813,17 @@ process_buffer_v1(#peer_data{buffer = Buffer} = Data) ->
         incomplete ->
             {ok, Data};
         {error, Reason} ->
-            logger:warning("peer ~p frame error: ~p",
+            %% A framing / protocol violation surfaced from decode_msg
+            %% (message_too_large, bad_checksum, bad_compact_size, ...).
+            %% Bitcoin Core drops such a peer cleanly (net.cpp GetMessage
+            %% failure -> mark for disconnect); terminate the gen_statem
+            %% GRACEFULLY so we do NOT emit a crash report + force a
+            %% supervisor restart.  Notify the handler so the peer is
+            %% finalized on the same path as every other disconnect.
+            logger:warning("peer ~p frame error: ~p — disconnecting gracefully",
                            [Data#peer_data.address, Reason]),
-            {stop, Reason}
+            Data#peer_data.handler ! {peer_disconnected, self(), {frame_error, Reason}},
+            {stop, {shutdown, {frame_error, Reason}}}
     end.
 
 
@@ -1092,7 +1100,10 @@ extract_v2_packet(#peer_data{buffer = Buffer,
                     %% W98 G24: reject oversize messages before allocating the
                     %% receive buffer.  Core: MAX_PROTOCOL_MESSAGE_LENGTH = 4 MB.
                     if ContentsLen > ?MAX_PROTOCOL_MESSAGE_LENGTH ->
-                        {stop, oversize_message};
+                        %% Core rejects the frame before allocating and drops
+                        %% the peer cleanly; stop GRACEFULLY ({shutdown, _}) so
+                        %% no gen_statem crash report is emitted.
+                        {stop, {shutdown, oversize_message}};
                     true ->
                     Data1 = Data#peer_data{
                         v2_cipher = Cipher1,
@@ -1786,7 +1797,11 @@ check_ban(#peer_data{misbehavior = Score, address = Addr} = Data)
         when Score >= ?BAN_SCORE ->
     logger:info("peer ~p banned (score=~B)", [Addr, Score]),
     Data#peer_data.handler ! {peer_banned, self(), Addr},
-    {stop, banned};
+    %% Discourage + disconnect is a GRACEFUL teardown (Core
+    %% MaybeDiscourageAndDisconnect just marks fDisconnect), NOT a crash:
+    %% use a {shutdown, _} reason so the supervisor + logger treat it as a
+    %% clean stop and no gen_statem crash report is emitted.
+    {stop, {shutdown, banned}};
 check_ban(Data) ->
     {keep_state, Data}.
 
