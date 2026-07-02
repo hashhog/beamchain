@@ -1334,15 +1334,45 @@ finish_v2_initiator_send(TheirPubKey, Data) ->
 %%% Internal: Message dispatch
 %%% ===================================================================
 
-dispatch_message(version, Payload, Data) ->
+%% Bitcoin Core gates every non-negotiation message behind the completed
+%% version/verack handshake.  In net_processing.cpp::ProcessMessage the only
+%% message types handled before the `if (!pfrom.fSuccessfullyConnected)`
+%% guard (":4010 — Unsupported message \"%s\" prior to verack") are VERSION,
+%% VERACK, SENDHEADERS, SENDCMPCT, WTXIDRELAY, SENDADDRV2 and SENDTXRCNCL —
+%% the handshake + BIP feature-negotiation set.  Anything else received
+%% before the handshake completes is ignored and NOT acted on; in particular
+%% a pre-verack `ping` is NOT ponged.  Without this gate we ponged pre-verack
+%% pings (an adversarial-P2P state-machine parity gap).  The normal
+%% post-verack ping->pong path is unaffected.
+dispatch_message(Command, Payload, Data) ->
+    case handshake_complete(Data) orelse allowed_before_handshake(Command) of
+        true ->
+            do_dispatch_message(Command, Payload, Data);
+        false ->
+            logger:debug("peer ~p ignoring '~p' prior to verack",
+                         [Data#peer_data.address, Command]),
+            {ok, Data}
+    end.
+
+%% Core's allowed-before-verack set (see dispatch_message/3).
+allowed_before_handshake(version)     -> true;
+allowed_before_handshake(verack)      -> true;
+allowed_before_handshake(sendheaders) -> true;
+allowed_before_handshake(sendcmpct)   -> true;
+allowed_before_handshake(wtxidrelay)  -> true;
+allowed_before_handshake(sendaddrv2)  -> true;
+allowed_before_handshake(sendtxrcncl) -> true;
+allowed_before_handshake(_)           -> false.
+
+do_dispatch_message(version, Payload, Data) ->
     handle_version_msg(Payload, Data);
-dispatch_message(verack, _Payload, Data) ->
+do_dispatch_message(verack, _Payload, Data) ->
     handle_verack_msg(Data);
-dispatch_message(ping, Payload, Data) ->
+do_dispatch_message(ping, Payload, Data) ->
     handle_ping_msg(Payload, Data);
-dispatch_message(pong, Payload, Data) ->
+do_dispatch_message(pong, Payload, Data) ->
     handle_pong_msg(Payload, Data);
-dispatch_message(sendheaders, _Payload, Data) ->
+do_dispatch_message(sendheaders, _Payload, Data) ->
     %% BIP-130: peer prefers `headers` announces over `inv`. Surface the flag
     %% to the handler (peer_manager) so future block announces branch
     %% accordingly. Without this notification, peer_manager keeps spamming
@@ -1350,26 +1380,26 @@ dispatch_message(sendheaders, _Payload, Data) ->
     %% the header-sync DoS amplifier this wave is closing.
     Data#peer_data.handler ! {peer_sendheaders, self()},
     {ok, Data#peer_data{wants_headers = true}};
-dispatch_message(sendcmpct, Payload, Data) ->
+do_dispatch_message(sendcmpct, Payload, Data) ->
     handle_sendcmpct_msg(Payload, Data);
-dispatch_message(sendaddrv2, _Payload, Data) ->
+do_dispatch_message(sendaddrv2, _Payload, Data) ->
     %% BIP 155: only valid before handshake complete
     case handshake_complete(Data) of
         false -> {ok, Data#peer_data{wants_addrv2 = true}};
         true  -> {ok, Data}
     end;
-dispatch_message(wtxidrelay, _Payload, Data) ->
+do_dispatch_message(wtxidrelay, _Payload, Data) ->
     %% BIP 339: only valid before handshake complete
     case handshake_complete(Data) of
         false -> {ok, Data#peer_data{wtxidrelay = true}};
         true  -> {ok, Data}
     end;
-dispatch_message(sendtxrcncl, Payload, Data) ->
+do_dispatch_message(sendtxrcncl, Payload, Data) ->
     %% BIP 330: Erlay reconciliation handshake
     handle_sendtxrcncl_msg(Payload, Data);
-dispatch_message(feefilter, Payload, Data) ->
+do_dispatch_message(feefilter, Payload, Data) ->
     handle_feefilter_msg(Payload, Data);
-dispatch_message(Command, Payload, Data) ->
+do_dispatch_message(Command, Payload, Data) ->
     %% Forward everything else to handler
     Data#peer_data.handler ! {peer_message, self(), Command, Payload},
     {ok, Data}.
