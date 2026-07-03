@@ -105,21 +105,39 @@ teardown({TmpDir, _ConfigPid, _DbPid, _ChainstatePid, _Params, _Genesis}) ->
 %% we only need the length-check path, which fires before any block
 %% inspection.
 test_max_reorg_depth() ->
-    %% 289 dummy blocks (cap is 288). A real block isn't required for
-    %% the length guard — the guard runs in do_reorganize/2 before
-    %% touching the blocks. We use a minimal #block{} so the length()
-    %% call works and the destructure for the first block (used after
-    %% the guard) wouldn't run because the guard fails first.
+    %% 289 dummy blocks (cap is 288). prev_hash is a NON-existent hash so the
+    %% archive path (below) fails fast in the disconnect walk with
+    %% reorg_walk_failed rather than running a real atomic reorg against the
+    %% shared test db. The length guard (SITE B) runs before any block
+    %% inspection when pruning, so a minimal #block{} suffices there.
     DummyBlocks = lists:duplicate(289, #block{
         header = #block_header{
-            version = 1, prev_hash = <<0:256>>, merkle_root = <<0:256>>,
+            version = 1, prev_hash = <<1:256>>, merkle_root = <<0:256>>,
             timestamp = 0, bits = 0, nonce = 0
         },
         transactions = [],
         hash = <<0:256>>
     }),
-    Result = beamchain_chainstate:reorganize(DummyBlocks),
-    ?assertMatch({error, {reorg_too_deep, 289}}, Result).
+    %% PRUNED node: the 288-block cap still applies as controlled protection
+    %% against reorging past the retained (MIN_BLOCKS_TO_KEEP=288) undo window
+    %% -> {reorg_too_deep, 289}. Enable pruning via the config ETS for the
+    %% duration of this assertion only.
+    ets:insert(beamchain_config_ets, {prune, "550"}),
+    try
+        ?assertMatch({error, {reorg_too_deep, 289}},
+                     beamchain_chainstate:reorganize(DummyBlocks))
+    after
+        ets:delete(beamchain_config_ets, prune)
+    end,
+    %% ARCHIVE node (pruning off, the default): NO reorg-depth cap. Like
+    %% Bitcoin Core (ActivateBestChainStep is unbounded; MIN_BLOCKS_TO_KEEP
+    %% governs pruned undo retention only) beamchain follows the most-work
+    %% valid chain to ANY depth, so the 289-length guard does NOT fire (the
+    %% reorg instead fails downstream on the fabricated fork point). The full
+    %% archive-follows deep reorg is proven end-to-end by
+    %% tools/reorg-beamchain-deep-proof.sh (300/305-deep genesis fork).
+    ?assertNotMatch({error, {reorg_too_deep, _}},
+                    beamchain_chainstate:reorganize(DummyBlocks)).
 
 %% ===================================================================
 %% Test 2: validation:disconnect_block contract change

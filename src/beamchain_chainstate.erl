@@ -1912,13 +1912,24 @@ build_side_branch_chain_to_active(Hash, ConnTipHash, Acc) ->
 is_on_connected_chain(<<0:256>>, _ConnTipHash) ->
     true;
 is_on_connected_chain(Hash, ConnTipHash) ->
-    walk_connected_chain(ConnTipHash, Hash, 0).
+    %% Reorg-cap SITE A. The walk is bounded ONLY when pruning (see
+    %% reorg_depth_limit/0): on an archive node it must reach the true fork
+    %% point at ANY depth, otherwise a >?MAX_REORG_DEPTH-deep fork point is
+    %% mis-classified as "not on the connected chain" and the side-branch
+    %% builder walks past it (into genesis / the wrong fork point), which is
+    %% exactly why gating only do_reorganize/2 was necessary-but-not-sufficient.
+    Limit = case reorg_depth_limit() of
+                infinity -> infinity;
+                N        -> N + 1   %% preserve the historical +1 pruned bound
+            end,
+    walk_connected_chain(ConnTipHash, Hash, 0, Limit).
 
-walk_connected_chain(_Cur, _Target, Depth) when Depth > ?MAX_REORG_DEPTH + 1 ->
+walk_connected_chain(_Cur, _Target, Depth, Limit)
+  when is_integer(Limit), Depth > Limit ->
     false;
-walk_connected_chain(Cur, Target, _Depth) when Cur =:= Target ->
+walk_connected_chain(Cur, Target, _Depth, _Limit) when Cur =:= Target ->
     true;
-walk_connected_chain(Cur, Target, Depth) ->
+walk_connected_chain(Cur, Target, Depth, Limit) ->
     case beamchain_db:get_block(Cur) of
         {ok, Block} ->
             Prev = (Block#block.header)#block_header.prev_hash,
@@ -1926,7 +1937,7 @@ walk_connected_chain(Cur, Target, Depth) ->
             %% genesis hash, whose body may be absent from CF_BLOCKS (so the
             %% next get_block would fail) — recognise it as on-chain.
             if Prev =:= Target -> true;
-               true -> walk_connected_chain(Prev, Target, Depth + 1)
+               true -> walk_connected_chain(Prev, Target, Depth + 1, Limit)
             end;
         not_found ->
             false
@@ -2124,51 +2135,88 @@ update_mtp_disconnect(NewTipHeight, Timestamps) ->
 %%   - Crash after the final flush → post-reorg state. ETS is rebuilt
 %%     from disk on next start.
 %%
-%% MAX_REORG_DEPTH cap: a reorg deeper than ?MAX_REORG_DEPTH blocks is
-%% rejected as an impl-specific memory-safety bound (Core has no such
-%% cap). This is the depth of the connect side; the disconnect side is
-%% bounded separately in count_disconnect_depth below via the same macro.
+%% MAX_REORG_DEPTH cap (reorg-cap SITES B + C): a reorg deeper than
+%% ?MAX_REORG_DEPTH blocks is refused — but ONLY when pruning (see
+%% reorg_depth_limit/0). Bitcoin Core has NO reorg-depth cap
+%% (validation.cpp ActivateBestChainStep loops to the fork point unbounded;
+%% MIN_BLOCKS_TO_KEEP=288 governs PRUNED undo retention only), so an archive
+%% node (pruning off = default) follows the most-work valid chain to ANY
+%% depth. Refusing a deep reorg on an archive node — which retains every undo
+%% record — was a Class-A consensus divergence (beamchain would stay on a
+%% lower-work minority chain that Core abandons). A pruned node keeps the cap:
+%% reorging past the retained undo window is unreplayable, so ReorgTo returns
+%% {reorg_too_deep, _} as controlled protection. SITE B is the connect side;
+%% SITE C (the disconnect side) is bounded via count_disconnect_depth below.
 do_reorganize([], State) ->
     {ok, State, []};
-do_reorganize(NewBlocks, _State) when length(NewBlocks) > ?MAX_REORG_DEPTH ->
-    logger:error("chainstate: refusing reorg of ~B blocks (max=~B)",
-                 [length(NewBlocks), ?MAX_REORG_DEPTH]),
-    {error, {reorg_too_deep, length(NewBlocks)}};
 do_reorganize(NewBlocks, State) ->
-    %% The first new block's prev_hash is our fork point
-    [FirstBlock | _] = NewBlocks,
-    ForkHash = FirstBlock#block.header#block_header.prev_hash,
+    Limit = reorg_depth_limit(),
+    ConnDepth = length(NewBlocks),
+    if
+        is_integer(Limit), ConnDepth > Limit ->
+            %% SITE B — pruned node, connect side deeper than the retained
+            %% undo window.
+            logger:error("chainstate: refusing reorg of ~B blocks (max=~B; "
+                         "pruned node — undo beyond the retained window is gone)",
+                         [ConnDepth, Limit]),
+            {error, {reorg_too_deep, ConnDepth}};
+        true ->
+            %% The first new block's prev_hash is our fork point
+            [FirstBlock | _] = NewBlocks,
+            ForkHash = FirstBlock#block.header#block_header.prev_hash,
 
-    %% Verify the disconnect side will not exceed MAX_REORG_DEPTH either.
-    %% Walk the active chain from current tip back to ForkHash and count.
-    case count_disconnect_depth(ForkHash, State#state.tip_hash, 0) of
-        {ok, DiscDepth} when DiscDepth > ?MAX_REORG_DEPTH ->
-            logger:error("chainstate: refusing reorg with ~B-block "
-                         "disconnect (max=~B)",
-                         [DiscDepth, ?MAX_REORG_DEPTH]),
-            {error, {reorg_too_deep, DiscDepth}};
-        {ok, DiscDepth} ->
-            logger:info("chainstate: reorganizing to fork point ~s "
-                        "(disconnect=~B, connect=~B; atomic-batch mode)",
-                        [hash_hex(ForkHash), DiscDepth, length(NewBlocks)]),
-            do_reorganize_atomic(NewBlocks, State);
-        {error, Reason} ->
-            {error, {reorg_walk_failed, Reason}}
+            %% Walk the active chain from current tip back to ForkHash and count
+            %% the disconnect side (bounded only when pruning — see SITE D).
+            case count_disconnect_depth(ForkHash, State#state.tip_hash, 0, Limit) of
+                {ok, DiscDepth} when is_integer(Limit), DiscDepth > Limit ->
+                    %% SITE C — pruned node, disconnect side too deep.
+                    logger:error("chainstate: refusing reorg with ~B-block "
+                                 "disconnect (max=~B; pruned node)",
+                                 [DiscDepth, Limit]),
+                    {error, {reorg_too_deep, DiscDepth}};
+                {ok, DiscDepth} ->
+                    logger:info("chainstate: reorganizing to fork point ~s "
+                                "(disconnect=~B, connect=~B; atomic-batch mode)",
+                                [hash_hex(ForkHash), DiscDepth, ConnDepth]),
+                    do_reorganize_atomic(NewBlocks, State);
+                {error, Reason} ->
+                    {error, {reorg_walk_failed, Reason}}
+            end
+    end.
+
+%% Effective reorg-depth cap. On a PRUNED node the retained undo window is only
+%% MIN_BLOCKS_TO_KEEP (?MAX_REORG_DEPTH=288) deep, so reorgs deeper than that
+%% cannot be replayed (the undo is gone) and are refused. On an ARCHIVE node
+%% (pruning off, the default) every undo record is on disk, so — like Bitcoin
+%% Core, which has no reorg-depth cap — we follow the most-work valid chain to
+%% ANY depth: `infinity` disables the cap (in Erlang term order every integer <
+%% every atom, and every guard site pairs the comparison with an is_integer/1
+%% test, so an `infinity` limit never fires). Read live from beamchain_config so
+%% the same flag that governs on-disk pruning (prune_enabled/0, used at the
+%% block-connect prune trigger) governs the reorg cap — no separate wiring.
+reorg_depth_limit() ->
+    case beamchain_config:prune_enabled() of
+        true  -> ?MAX_REORG_DEPTH;
+        false -> infinity
     end.
 
 %% Walk the active chain from CurrentTipHash back until we hit ForkHash,
 %% counting steps. Returns {ok, Depth} or {error, Reason}.
-%% Bounded at ?MAX_REORG_DEPTH+1 so a wildly-mis-targeted reorg fails
-%% fast rather than scanning the entire chain.
-count_disconnect_depth(ForkHash, ForkHash, Depth) ->
+%% Reorg-cap SITE D: when pruning (Limit is an integer) the walk short-circuits
+%% at Limit+ so a too-deep reorg fails fast and SITE C then refuses it. When
+%% archive (Limit = infinity) the walk is UNBOUNDED so it reaches the true fork
+%% point and reports the real disconnect depth — otherwise a
+%% >?MAX_REORG_DEPTH-deep archive reorg would stop early with a bogus depth.
+count_disconnect_depth(ForkHash, ForkHash, Depth, _Limit) ->
     {ok, Depth};
-count_disconnect_depth(_ForkHash, _Hash, Depth) when Depth > ?MAX_REORG_DEPTH ->
+count_disconnect_depth(_ForkHash, _Hash, Depth, Limit)
+  when is_integer(Limit), Depth > Limit ->
     {ok, Depth};
-count_disconnect_depth(_ForkHash, undefined, _Depth) ->
+count_disconnect_depth(_ForkHash, undefined, _Depth, _Limit) ->
     {error, fork_point_not_found_in_active_chain};
-count_disconnect_depth(_ForkHash, <<0:256>>, _Depth) ->
+count_disconnect_depth(_ForkHash, <<0:256>>, _Depth, _Limit) ->
     {error, fork_point_not_found_in_active_chain};
-count_disconnect_depth(ForkHash, Hash, Depth) ->
+count_disconnect_depth(ForkHash, Hash, Depth, Limit) ->
     %% Walk the CONNECTED chain from the chainstate tip via block bodies
     %% (get_block, hash-keyed), NOT the height-keyed active index which
     %% header-first sync may have repointed at the competing chain.  The
@@ -2177,7 +2225,7 @@ count_disconnect_depth(ForkHash, Hash, Depth) ->
     case beamchain_db:get_block(Hash) of
         {ok, Block} ->
             Prev = (Block#block.header)#block_header.prev_hash,
-            count_disconnect_depth(ForkHash, Prev, Depth + 1);
+            count_disconnect_depth(ForkHash, Prev, Depth + 1, Limit);
         not_found ->
             {error, {missing_block, Hash}}
     end.
