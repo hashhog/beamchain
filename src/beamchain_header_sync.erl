@@ -34,6 +34,11 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2]).
 
+%% Test-only exports: pure internal decision functions.
+-ifdef(TEST).
+-export([classify_deep_fork/4]).
+-endif.
+
 -define(SERVER, ?MODULE).
 
 %% Timeout for a getheaders request before trying a different peer
@@ -782,32 +787,49 @@ check_deep_fork(FirstHeader, #state{tip_height = TipHeight,
     case find_fork_point(FirstHeader#block_header.prev_hash) of
         {ok, ForkHeight, _ForkChainwork} ->
             Depth = TipHeight - ForkHeight,
-            case Depth > ?MIN_FORK_DEPTH_FOR_WORK_CHECK of
-                true ->
-                    %% Deep fork - would need to check if incoming chain has more work
-                    %% Since we don't have all headers yet, we can't know the work
-                    %% For now, we allow it if we haven't passed min_chainwork
-                    MinChainwork = maps:get(min_chainwork, Params, <<0:256>>),
-                    TipCWInt = binary:decode_unsigned(TipCW, big),
-                    MinCWInt = binary:decode_unsigned(MinChainwork, big),
-                    case TipCWInt < MinCWInt of
-                        true ->
-                            %% Still in IBD, allow deep forks
-                            ok;
-                        false ->
-                            %% Past minimum chainwork - reject deep forks without proof
-                            %% Note: In a full implementation, we'd track the fork's
-                            %% claimed work and verify it exceeds ours
-                            {error, deep_fork_insufficient_work}
-                    end;
-                false ->
-                    %% Shallow fork, allow
-                    ok
-            end;
+            MinChainwork = maps:get(min_chainwork, Params, <<0:256>>),
+            TipCWInt = binary:decode_unsigned(TipCW, big),
+            MinCWInt = binary:decode_unsigned(MinChainwork, big),
+            classify_deep_fork(Depth, TipCWInt, MinCWInt,
+                               beamchain_config:prune_enabled());
         not_found ->
             %% Can't find fork point - this is an unconnecting header
             %% Allow it for now, the getheaders will try to connect
             ok
+    end.
+
+%% Pure decision for whether a competing fork at the given depth may proceed.
+%%
+%% Bitcoin Core has NO fork-DEPTH ceiling: headers-first sync keeps requesting a
+%% competing branch's headers and follows it whenever its HEADERS demonstrate
+%% more work than our tip, at ANY fork depth. The anti-DoS is WORK-based (the
+%% GetAntiDoSWorkThreshold / PRESYNC-commitment pipeline), never "reject a fork
+%% deeper than N". (net_processing.cpp / headerssync.cpp.)
+-spec classify_deep_fork(integer(), integer(), integer(), boolean()) ->
+    ok | {error, deep_fork_insufficient_work}.
+classify_deep_fork(Depth, _TipCWInt, _MinCWInt, _PruneEnabled)
+  when Depth =< ?MIN_FORK_DEPTH_FOR_WORK_CHECK ->
+    %% Shallow fork — always allow.
+    ok;
+classify_deep_fork(_Depth, TipCWInt, MinCWInt, _PruneEnabled)
+  when TipCWInt < MinCWInt ->
+    %% Still in IBD (tip below the network minimum chainwork) — allow deep forks
+    %% so we can catch up to the honest chain.
+    ok;
+classify_deep_fork(_Depth, _TipCWInt, _MinCWInt, PruneEnabled) ->
+    %% Deep fork past the minimum chainwork.  The reorg decision itself is
+    %% WORK-based in check_reorg (incoming ForkCW + header work vs tip work), so
+    %% rejecting here purely on DEPTH would BAN an honest peer offering a
+    %% higher-work branch that forks >288 back — stranding us on the lower-work
+    %% minority chain (a consensus-liveness divergence). On an ARCHIVE node (all
+    %% undo retained, reorgs to any depth like Core) we ALLOW the deep fork and
+    %% let check_reorg judge it on work. Only a PRUNED node keeps the depth
+    %% rejection: a reorg deeper than its retained undo window (288 =
+    %% MIN_BLOCKS_TO_KEEP) is physically un-appliable — the same pruning-gated
+    %% model as beamchain_chainstate's MAX_REORG_DEPTH cap.
+    case PruneEnabled of
+        true -> {error, deep_fork_insufficient_work};
+        false -> ok
     end.
 
 %% Find the fork point for a given previous hash

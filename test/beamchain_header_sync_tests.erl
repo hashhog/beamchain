@@ -236,6 +236,49 @@ max_unconnecting_headers_constant_test() ->
     ?assertEqual(10, max_unconnecting_headers()).
 
 %%% ===================================================================
+%%% P2P fork-DEPTH-cap Core-parity: classify_deep_fork/4 (the gate that
+%%% decides whether a competing fork of a given depth may proceed).
+%%%
+%%% Bitcoin Core has NO fork-depth ceiling; it follows any higher-work branch
+%%% at any depth (work-based anti-DoS). The pre-fix gate rejected a deep (>288)
+%%% fork past the minimum chainwork UNCONDITIONALLY, banning honest deep-fork
+%%% peers and stranding the node on the minority chain. The gate is now keyed on
+%%% pruning: ARCHIVE allows the deep fork (check_reorg judges it on work), PRUNED
+%%% keeps the depth rejection (a reorg past the retained undo window is
+%%% un-appliable).
+%%% ===================================================================
+
+%% Shallow fork (<= MIN_FORK_DEPTH_FOR_WORK_CHECK=288) is always allowed,
+%% regardless of chainwork or prune mode.
+classify_deep_fork_shallow_test() ->
+    ?assertEqual(ok, beamchain_header_sync:classify_deep_fork(288, 100, 50, false)),
+    ?assertEqual(ok, beamchain_header_sync:classify_deep_fork(288, 100, 50, true)),
+    ?assertEqual(ok, beamchain_header_sync:classify_deep_fork(10, 100, 50, false)).
+
+%% Deep fork while still in IBD (tip chainwork < minimum chainwork) is allowed
+%% so the node can catch up to the honest chain — on archive AND pruned nodes.
+classify_deep_fork_ibd_allowed_test() ->
+    ?assertEqual(ok, beamchain_header_sync:classify_deep_fork(500, 40, 50, false)),
+    ?assertEqual(ok, beamchain_header_sync:classify_deep_fork(500, 40, 50, true)).
+
+%% THE FIX: a deep fork past the minimum chainwork on an ARCHIVE node (prune
+%% disabled) is ALLOWED — Core follows the higher-work branch at any depth, and
+%% check_reorg judges it on work. Pre-fix this returned
+%% {error, deep_fork_insufficient_work} (banned the peer, stranded the node).
+classify_deep_fork_archive_follows_deep_fork_test() ->
+    ?assertEqual(ok, beamchain_header_sync:classify_deep_fork(289, 100, 50, false)),
+    ?assertEqual(ok, beamchain_header_sync:classify_deep_fork(5000, 100, 50, false)).
+
+%% Pruning gate: the SAME deep fork past the minimum chainwork on a PRUNED node
+%% keeps the depth rejection — a reorg deeper than the retained 288-block undo
+%% window is un-appliable. Proves the gate keys on pruning, not depth.
+classify_deep_fork_pruned_rejects_deep_fork_test() ->
+    ?assertEqual({error, deep_fork_insufficient_work},
+                 beamchain_header_sync:classify_deep_fork(289, 100, 50, true)),
+    ?assertEqual({error, deep_fork_insufficient_work},
+                 beamchain_header_sync:classify_deep_fork(5000, 100, 50, true)).
+
+%%% ===================================================================
 %%% Internal helpers (duplicated from module for testing)
 %%% ===================================================================
 
