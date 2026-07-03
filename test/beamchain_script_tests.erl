@@ -892,6 +892,73 @@ op_success_discourage_test() ->
         <<16#bb>>, [], ?SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS, #{}, tapscript).
 
 %%% -------------------------------------------------------------------
+%%% BIP342 tapscript OP_CHECKSIG unknown/upgradable pubkey type
+%%% (regression for the consensus fork found by the differential fuzz)
+%%% -------------------------------------------------------------------
+%%
+%% Core EvalChecksigTapscript (interpreter.cpp:357,373-382): the initial
+%% `success = !sig.empty()`; the unknown-pubkey (not 0, not 32 bytes)
+%% branch does NOT modify `success`.  OP_CHECKSIG then pushes success as
+%% vchTrue / vchFalse.  So under CONSENSUS (block) tapscript flags
+%% (DISCOURAGE_UPGRADABLE_PUBKEYTYPE OFF):
+%%   * EMPTY sig    -> success=false -> push FALSE -> script ends false
+%%                     -> EVAL_FALSE reject  (BIP342: "the script execution
+%%                     fails when using empty signature with invalid public
+%%                     key").
+%%   * NON-empty sig -> success=true -> push TRUE -> accept (upgradability
+%%                      placeholder for a future pubkey-version softfork).
+%% Under STANDARD flags (DISCOURAGE set) -> reject outright.
+%%
+%% The previous beamchain code pushed script_true() UNCONDITIONALLY for the
+%% unknown-pubkey branch, so it ACCEPTED an empty-sig spend that Core
+%% REJECTS — a real taproot consensus fork.  eval_tapscript/5 maps a false
+%% final top to {error, tapscript_failed} (EVAL_FALSE) and a true top to
+%% {ok, [Top]} (accept), so these assertions read directly as REJECT/ACCEPT.
+
+%% A 33-byte (unknown/upgradable) pubkey: not 0, not 32 bytes.
+tapscript_unknown_pubkey() -> <<16#02, 0:256>>.  %% 1 + 32 = 33 bytes
+
+%% Leaf script: <33-byte unknown pubkey> OP_CHECKSIG.  0x21 = 33-byte push,
+%% 0xac = OP_CHECKSIG.
+tapscript_unknown_pubkey_checksig_script() ->
+    PubKey = tapscript_unknown_pubkey(),
+    <<16#21, PubKey/binary, 16#ac>>.
+
+%% Consensus (block) tapscript flags: TAPROOT active, DISCOURAGE OFF.
+tapscript_consensus_flags() -> ?SCRIPT_VERIFY_TAPROOT.
+
+%% THE BUG VECTOR: empty witness signature + unknown pubkey, consensus flags.
+%% Must REJECT (matches Core EVAL_FALSE).  Pre-fix this returned {ok,[<<1>>]}.
+tapscript_checksig_unknown_pubkey_empty_sig_rejects_test() ->
+    Script = tapscript_unknown_pubkey_checksig_script(),
+    Stack = [<<>>],  %% empty signature from the witness
+    Result = beamchain_script:eval_tapscript(
+        Script, Stack, 100, tapscript_consensus_flags(), #{}),
+    ?assertEqual({error, tapscript_failed}, Result).
+
+%% Upgradability preserved: non-empty (garbage) sig + unknown pubkey,
+%% consensus flags -> ACCEPT (matches Core; success stays !sig.empty()).
+tapscript_checksig_unknown_pubkey_nonempty_sig_accepts_test() ->
+    Script = tapscript_unknown_pubkey_checksig_script(),
+    Sig = binary:copy(<<16#01>>, 64),  %% non-empty, never verified
+    Stack = [Sig],
+    Result = beamchain_script:eval_tapscript(
+        Script, Stack, 100, tapscript_consensus_flags(), #{}),
+    ?assertMatch({ok, [_]}, Result),
+    {ok, [Top]} = Result,
+    ?assertEqual(true, beamchain_script:script_bool(Top)).
+
+%% Standard flags (DISCOURAGE_UPGRADABLE_PUBKEYTYPE set): empty sig +
+%% unknown pubkey -> reject with the discourage error (unchanged behavior).
+tapscript_checksig_unknown_pubkey_empty_sig_discourage_rejects_test() ->
+    Script = tapscript_unknown_pubkey_checksig_script(),
+    Stack = [<<>>],
+    Flags = ?SCRIPT_VERIFY_TAPROOT bor
+            ?SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE,
+    Result = beamchain_script:eval_tapscript(Script, Stack, 100, Flags, #{}),
+    ?assertEqual({error, discourage_upgradable_pubkeytype}, Result).
+
+%%% -------------------------------------------------------------------
 %%% Witness cleanstack enforcement tests (BIP 141/342)
 %%% -------------------------------------------------------------------
 %%
