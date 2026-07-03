@@ -2015,6 +2015,19 @@ classify_output_standard(<<16#51, 16#02, 16#4e, 16#73>>)                      ->
 classify_output_standard(<<WitVer:8, Len:8, _:Len/binary>>)
   when (WitVer >= 16#51 andalso WitVer =< 16#60), (Len >= 2 andalso Len =< 40) ->
     {witness, WitVer - 16#50};
+%% Bare pubkey (P2PK): 0x21 <33B> 0xac or 0x41 <65B> 0xac — standard per Core
+%% (Solver → TX_PUBKEY; IsStandard accepts, policy.cpp:80-97). Solver checks the
+%% witness-program shape first, so these arms sit after the witness arm above.
+classify_output_standard(<<16#21, _:33/binary, 16#ac>>) -> pubkey;
+classify_output_standard(<<16#41, _:65/binary, 16#ac>>) -> pubkey;
+%% Bare multisig OP_M <pk1>..<pkN> OP_N OP_CHECKMULTISIG — standard up to x-of-3
+%% (Core IsStandard MULTISIG n<=3, m<=n; default -permitbaremultisig=true accepts
+%% bare multisig, policy.cpp:82-95 + 151-153). Reuses the input-side tail decoder.
+classify_output_standard(<<M, Rest/binary>>) when M >= 16#51, M =< 16#60 ->
+    case classify_multisig_tail(Rest, M - 16#50) of
+        true  -> multisig;
+        false -> nonstandard
+    end;
 classify_output_standard(_) -> nonstandard.
 
 %%% ===================================================================
@@ -2519,36 +2532,42 @@ check_dust(#transaction{outputs = Outputs} = Tx, Fee) ->
     end, Outputs),
     EphemeralInfo.
 
-%% @doc Check if this output is an allowed ephemeral anchor.
+%% @doc Check if this output is the single allowed ephemeral dust output.
+%% Core 28+ generalized ephemeral dust (policy.cpp IsStandardTx +
+%% ephemeral_policy.cpp PreCheckEphemeralTx) permits up to
+%% MAX_DUST_OUTPUTS_PER_TX (=1) dust output of ANY script type, iff the tx pays
+%% zero fee — not only the zero-value P2A. find_ephemeral_anchor has already
+%% guaranteed there is exactly one dust output in ephemeral mode, so exempting
+%% any below-threshold output here is equivalent to exempting that one.
 is_ephemeral_anchor_output(SPK, Value, {has_ephemeral, _}) ->
-    %% In ephemeral anchor mode, only the zero-value P2A is exempt
-    Value =:= 0 andalso beamchain_script:is_pay_to_anchor(SPK);
+    Value < dust_threshold(SPK);
 is_ephemeral_anchor_output(_, _, none) ->
     false.
 
-%% @doc Find ephemeral anchor in transaction.
-%% Returns {has_ephemeral, Index} if tx has zero fee and exactly one zero-value P2A,
-%% or 'none' otherwise.
+%% @doc Find the single ephemeral dust output in a transaction.
+%% Returns {has_ephemeral, Index} if the tx pays zero fee and has exactly one
+%% dust output (of any spendable script type — Core's generalized ephemeral
+%% dust, MAX_DUST_OUTPUTS_PER_TX=1), or 'none' otherwise. OP_RETURN outputs are
+%% unspendable (dust threshold 0) so are never dust.
 find_ephemeral_anchor(#transaction{outputs = Outputs}, Fee) when Fee =:= 0 ->
-    %% Find all zero-value P2A outputs
-    ZeroP2A = [{Idx, O} || {Idx, #tx_out{value = 0, script_pubkey = SPK} = O}
-                          <- lists:zip(lists:seq(0, length(Outputs) - 1), Outputs),
-                          beamchain_script:is_pay_to_anchor(SPK)],
-    case ZeroP2A of
-        [{AnchorIdx, _}] -> {has_ephemeral, AnchorIdx};
+    DustOuts = lists:filtermap(
+        fun({Idx, #tx_out{value = V, script_pubkey = SPK}}) ->
+            IsOpReturn = case SPK of <<16#6a, _/binary>> -> true; _ -> false end,
+            case (not IsOpReturn) andalso (V < dust_threshold(SPK)) of
+                true  -> {true, Idx};
+                false -> false
+            end
+        end,
+        lists:zip(lists:seq(0, length(Outputs) - 1), Outputs)),
+    case DustOuts of
+        [DustIdx] -> {has_ephemeral, DustIdx};
         [] -> none;
-        _ -> throw(multiple_ephemeral_anchors)  %% only 1 allowed
+        _ -> throw(dust)  %% > MAX_DUST_OUTPUTS_PER_TX (1)
     end;
-find_ephemeral_anchor(#transaction{outputs = Outputs}, Fee) when Fee =/= undefined ->
-    %% Non-zero fee: reject any zero-value P2A outputs (they must be dust)
-    HasZeroP2A = lists:any(fun(#tx_out{value = 0, script_pubkey = SPK}) ->
-        beamchain_script:is_pay_to_anchor(SPK);
-    (_) -> false
-    end, Outputs),
-    case HasZeroP2A of
-        true -> throw(ephemeral_dust_requires_zero_fee);
-        false -> none
-    end;
+find_ephemeral_anchor(#transaction{}, Fee) when Fee =/= undefined ->
+    %% Non-zero fee: any dust output is rejected by the per-output dust loop
+    %% (Core PreCheckEphemeralTx: "tx with dust output must be 0-fee").
+    none;
 find_ephemeral_anchor(_, undefined) ->
     %% Fee not yet computed, skip ephemeral check
     none.
