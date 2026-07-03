@@ -2758,10 +2758,21 @@ verify_witness_program(1, Program, _Witness, _Flags, _SigChecker, _IsP2SH)
     %% taproot not active yet, succeed
     {ok, [script_true()]};
 
-verify_witness_program(1, <<16#4e, 16#73>>, _Witness, _Flags, _SigChecker, _IsP2SH) ->
+verify_witness_program(1, <<16#4e, 16#73>>, _Witness, _Flags, _SigChecker, false) ->
     %% Pay-to-Anchor (P2A): witness v1 with 2-byte program 0x4e73.
     %% P2A outputs are anyone-can-spend and succeed unconditionally.
     %% This is NOT gated by DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM per BIP (policy exception).
+    %%
+    %% Core (interpreter.cpp:1990) gates the P2A branch on `!is_p2sh`:
+    %%   } else if (!is_p2sh && CScript::IsPayToAnchor(witversion, program)) {
+    %%       return true;
+    %% A P2SH-WRAPPED 0x4e73 program (IsP2SH=true) does NOT take this branch;
+    %% it must fall through to the generic upgradable-witness handling
+    %% (the byte_size =/= 32 clause below), which returns
+    %% SCRIPT_ERR_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM when the DISCOURAGE
+    %% flag is set (mempool/standard flags) and succeeds otherwise.
+    %% Requiring IsP2SH=false here (rather than wildcarding it) is what keeps
+    %% the P2SH-wrapped case out of this unconditional-accept clause.
     {ok, [script_true()]};
 
 verify_witness_program(1, Program, _Witness, Flags, _SigChecker, _IsP2SH)

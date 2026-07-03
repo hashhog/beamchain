@@ -506,6 +506,62 @@ non_p2sh_with_op_dup_test() ->
         beamchain_script:verify_script(ScriptSig, ScriptPubKey, [], Flags, SigChecker)).
 
 %%% -------------------------------------------------------------------
+%%% P2SH-wrapped Pay-to-Anchor (P2A) — Core parity regression
+%%%
+%%% Glass-box finding (2026-07-01): the P2A clause in
+%%% verify_witness_program/6 wildcarded IsP2SH, so a P2SH-WRAPPED witness
+%%% v1 program 0x4e73 was accepted unconditionally. Core
+%%% (interpreter.cpp:1990) gates the P2A branch on `!is_p2sh`; a
+%%% P2SH-wrapped 0x4e73 must fall through to the upgradable-witness branch
+%%% and, under the DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM (standard/mempool)
+%%% flags, be REJECTED. Fix requires IsP2SH=false on the P2A clause.
+%%% -------------------------------------------------------------------
+
+%% Exact failing input from the finding: P2SH(OP_1 PUSH2 0x4e73), scriptSig
+%% = canonical push of the redeem script, empty witness, standard flags
+%% (P2SH|WITNESS|DISCOURAGE). Core REJECTS (discourage) -> beamchain must
+%% also reject. PRE-fix this returned true (node-accepts-core-rejects).
+p2sh_wrapped_p2a_discouraged_rejects_test() ->
+    %% Redeem script R = OP_1 PUSHBYTES_2 0x4e73 (a witness v1, 2-byte program)
+    RedeemScript = <<16#51, 16#02, 16#4e, 16#73>>,
+    ScriptHash = beamchain_crypto:hash160(RedeemScript),
+    P2SHScript = <<16#a9, 16#14, ScriptHash/binary, 16#87>>,
+    %% scriptSig = minimal canonical push of the 4-byte redeem script
+    ScriptSig = <<16#04, RedeemScript/binary>>,
+    Flags = ?SCRIPT_VERIFY_P2SH bor ?SCRIPT_VERIFY_WITNESS bor
+            ?SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM,
+    %% Core: VerifyWitnessProgram(is_p2sh=true) -> P2A branch NOT taken ->
+    %% else branch -> SCRIPT_ERR_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM -> reject
+    ?assertEqual(false,
+        beamchain_script:verify_script(ScriptSig, P2SHScript, [], Flags, #{})).
+
+%% Same P2SH-wrapped 0x4e73 with CONSENSUS-ONLY flags (no DISCOURAGE):
+%% Core falls through to the else branch and returns true (upgradable
+%% witness accepted at consensus). beamchain must match (accept).
+p2sh_wrapped_p2a_consensus_accepts_test() ->
+    RedeemScript = <<16#51, 16#02, 16#4e, 16#73>>,
+    ScriptHash = beamchain_crypto:hash160(RedeemScript),
+    P2SHScript = <<16#a9, 16#14, ScriptHash/binary, 16#87>>,
+    ScriptSig = <<16#04, RedeemScript/binary>>,
+    %% No DISCOURAGE flag -> consensus flags only
+    Flags = ?SCRIPT_VERIFY_P2SH bor ?SCRIPT_VERIFY_WITNESS,
+    ?assertEqual(true,
+        beamchain_script:verify_script(ScriptSig, P2SHScript, [], Flags, #{})).
+
+%% Regression guard: NATIVE (bare, not P2SH) P2A must still succeed
+%% unconditionally even under the DISCOURAGE flag — Core interpreter.cpp:1990
+%% `!is_p2sh && IsPayToAnchor` returns true. The fix must not break this.
+native_p2a_accepts_under_discourage_test() ->
+    %% Bare P2A scriptPubKey = OP_1 PUSHBYTES_2 0x4e73
+    ScriptPubKey = <<16#51, 16#02, 16#4e, 16#73>>,
+    Flags = ?SCRIPT_VERIFY_P2SH bor ?SCRIPT_VERIFY_WITNESS bor
+            ?SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM,
+    %% Native witness program: scriptSig must be empty; witness is
+    %% anyone-can-spend for P2A so any witness (incl. empty) succeeds.
+    ?assertEqual(true,
+        beamchain_script:verify_script(<<>>, ScriptPubKey, [], Flags, #{})).
+
+%%% -------------------------------------------------------------------
 %%% Witness program extraction test
 %%% -------------------------------------------------------------------
 
