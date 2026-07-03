@@ -1754,16 +1754,18 @@ ephemeral_dust_nonzero_fee_test_() ->
                  [{0, p2a_script()}, {5000, p2pkh_script()}]
              ),
              %% Fee is non-zero (we have 5000 output from 5100 input = 100 fee)
-             %% This should be rejected because ephemeral anchors need 0 fee
-             %% We call the internal check_dust function
-             %% Fee > 0 means zero-value P2A is dust
+             %% This should be rejected because a dust output (the zero-value
+             %% P2A) requires a zero fee. Core's PreCheckEphemeralTx rejects a
+             %% nonzero-fee tx carrying dust with reason "dust"
+             %% (ephemeral_policy.cpp:23-30) — generalized ephemeral dust no
+             %% longer uses a P2A-specific error atom.
              Fee = 100,
              try
-                 %% This should throw ephemeral_dust_requires_zero_fee
+                 %% This should throw dust (Core: "tx with dust output must be 0-fee")
                  beamchain_mempool:check_dust(Tx, Fee),
                  ?assert(false)  %% Should not reach here
              catch
-                 throw:ephemeral_dust_requires_zero_fee ->
+                 throw:dust ->
                      ok  %% Expected
              end
          end]
@@ -1806,7 +1808,12 @@ multiple_ephemeral_anchors_test_() ->
          end]
      end}.
 
-%% Test that regular dust (non-P2A) is still rejected with zero fee
+%% Test that regular dust (non-P2A) is rejected when the tx pays a fee.
+%% Core 28+ generalized ephemeral dust (policy.cpp MAX_DUST_OUTPUTS_PER_TX=1 +
+%% ephemeral_policy.cpp PreCheckEphemeralTx) permits ONE dust output of any
+%% script type iff base_fee == 0. So a single non-P2A dust output is only
+%% rejected when the fee is non-zero; at zero fee it becomes the ephemeral
+%% anchor (covered by generalized_ephemeral_dust_nonp2a_zero_fee_test_).
 regular_dust_still_rejected_test_() ->
     {setup, fun setup/0, fun cleanup/1,
      fun(_) ->
@@ -1816,14 +1823,30 @@ regular_dust_still_rejected_test_() ->
                  [{<<100:256>>, 0}],
                  [{10, p2pkh_script()}]  %% 10 sats is below dust threshold
              ),
-             Fee = 0,
+             Fee = 1000,  %% non-zero fee -> dust output not permitted
              try
                  beamchain_mempool:check_dust(Tx, Fee),
                  ?assert(false)
              catch
                  throw:dust ->
-                     ok  %% Expected - non-P2A dust is rejected
+                     ok  %% Expected - dust with a non-zero fee is rejected
              end
+         end]
+     end}.
+
+%% Core parity: a single non-P2A dust output at ZERO fee is now allowed as the
+%% generalized ephemeral dust output (Core accepts; the child must spend it via
+%% CheckEphemeralSpends in package relay). Previously beamchain over-rejected it.
+generalized_ephemeral_dust_nonp2a_zero_fee_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun(_) ->
+        [fun() ->
+             Tx = make_tx_with_outputs(
+                 [{<<100:256>>, 0}],
+                 [{10, p2pkh_script()}]  %% single dust output, any script type
+             ),
+             ?assertEqual({has_ephemeral, 0},
+                          beamchain_mempool:check_dust(Tx, 0))
          end]
      end}.
 
