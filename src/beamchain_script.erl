@@ -1690,13 +1690,29 @@ do_checksig_tapscript(Rest, Pos, State) ->
                             Flags = State2#script_state.flags,
                             case Flags band ?SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE of
                                 0 ->
-                                    %% unknown pubkey type succeeds.
-                                    %% NB: per Core, "success" is not
-                                    %% modified by upgradable types, so
-                                    %% the truthy value pushed onto the
-                                    %% stack is the same as a successful
-                                    %% sig verification.
-                                    execute(Rest, Pos, push(script_true(), State2));
+                                    %% Unknown pubkey type: per Core
+                                    %% EvalChecksigTapscript (interpreter.cpp
+                                    %% :357,373-382), the upgradable-pubkey
+                                    %% branch does NOT modify `success`; it
+                                    %% stays `success = !sig.empty()` set at
+                                    %% the top.  OP_CHECKSIG then pushes that
+                                    %% success as vchTrue/vchFalse.  So an
+                                    %% EMPTY sig must push FALSE (script ends
+                                    %% false -> EVAL_FALSE reject), and a
+                                    %% NON-empty sig pushes TRUE (upgradability
+                                    %% softfork placeholder).  Previously we
+                                    %% pushed script_true() unconditionally,
+                                    %% which ACCEPTED an empty-sig spend that
+                                    %% Core REJECTS — a consensus fork (BIP342:
+                                    %% "the script execution fails when using
+                                    %% empty signature with invalid public
+                                    %% key").  Mirror the CHECKSIGVERIFY /
+                                    %% CHECKSIGADD tapscript paths which
+                                    %% already thread SigNonEmpty here.
+                                    case SigNonEmpty of
+                                        true  -> execute(Rest, Pos, push(script_true(), State2));
+                                        false -> execute(Rest, Pos, push(script_false(), State2))
+                                    end;
                                 _ ->
                                     {error, discourage_upgradable_pubkeytype}
                             end
