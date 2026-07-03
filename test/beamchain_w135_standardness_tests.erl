@@ -193,43 +193,35 @@ g5_bug5_is_push_only_rejects_op_reserved_test_() ->
 %%% G6 — BUG-1: bare P2PK output is nonstandard in beamchain
 %%% ===================================================================
 
-g6_bug1_bare_p2pk_output_nonstandard_test_() ->
-    {"G6: BUG-1 (HIGH) — bare P2PK output `<33-byte-pubkey> OP_CHECKSIG` "
-     "is classified `nonstandard` by beamchain even though Core's Solver "
-     "returns TxoutType::PUBKEY and IsStandard accepts it. The INPUT-side "
-     "classifier DOES have a `pubkey` arm — so spending P2PK is allowed "
-     "but creating P2PK is rejected.",
+g6_bug1_bare_p2pk_output_standard_test_() ->
+    {"G6: FIXED (glass-box 2026-07-01) — bare P2PK output "
+     "`<33/65-byte-pubkey> OP_CHECKSIG` is now classified `pubkey` and "
+     "accepted, matching Core's Solver (TxoutType::PUBKEY) + IsStandard "
+     "(policy.cpp:80-97). Previously beamchain rejected it as `nonstandard`.",
      [
       ?_test(begin
          %% Compressed-key P2PK: 0x21 <33 bytes> OP_CHECKSIG (35 bytes)
          P2PK33 = <<16#21, 0:264, 16#ac>>,
          ?assertEqual(35, byte_size(P2PK33)),
-         ?assertEqual(nonstandard,
+         ?assertEqual(pubkey,
                       beamchain_mempool:classify_output_standard(P2PK33)),
 
          %% Uncompressed-key P2PK: 0x41 <65 bytes> OP_CHECKSIG (67 bytes)
          P2PK65 = <<16#41, 0:520, 16#ac>>,
          ?assertEqual(67, byte_size(P2PK65)),
-         ?assertEqual(nonstandard,
+         ?assertEqual(pubkey,
                       beamchain_mempool:classify_output_standard(P2PK65)),
 
-         %% End-to-end: check_standard rejects with `scriptpubkey`.
+         %% End-to-end: check_standard now ACCEPTS a bare-P2PK output.
          Tx = make_tx_with_output(2, P2PK33, 100000),
-         ?assertThrow(scriptpubkey, beamchain_mempool:check_standard(Tx)),
+         ?assertEqual(ok, beamchain_mempool:check_standard(Tx)),
 
-         %% Audit-flip: the source must NOT have a pubkey arm in
-         %% classify_output_standard until the fix lands.
+         %% Source now HAS the P2PK arms.
          Src = read_src(beamchain_mempool_src()),
-         %% Confirm classify_output_standard exists
          ?assertNotEqual(nomatch,
-                         binary:match(Src,
-                             <<"classify_output_standard(<<16#76">>)),
-         %% No 0x21 ... 0xac (P2PK33) arm
-         ?assertEqual(nomatch,
                       binary:match(Src,
                           <<"classify_output_standard(<<16#21,">>)),
-         %% No 0x41 ... 0xac (P2PK65) arm
-         ?assertEqual(nomatch,
+         ?assertNotEqual(nomatch,
                       binary:match(Src,
                           <<"classify_output_standard(<<16#41,">>))
        end)
@@ -269,12 +261,12 @@ g8_p2sh_output_standard_test_() ->
 %%% G9 — BUG-2 / BUG-3: bare multisig output is nonstandard
 %%% ===================================================================
 
-g9_bug2_bug3_bare_multisig_nonstandard_test_() ->
-    {"G9: BUG-2/BUG-3 (HIGH) — bare multisig `OP_M <pk1>..<pkN> OP_N "
-     "OP_CHECKMULTISIG` is unconditionally `nonstandard` in beamchain. "
-     "Core's Solver returns TxoutType::MULTISIG and IsStandard accepts "
-     "n=1..3, m=1..n. Plus there's no permit_bare_multisig config flag "
-     "(Core default true, beamchain has no flag).",
+g9_bug2_bug3_bare_multisig_standard_test_() ->
+    {"G9: FIXED (glass-box 2026-07-01) — bare multisig `OP_M <pk1>..<pkN> "
+     "OP_N OP_CHECKMULTISIG` up to x-of-3 is now classified `multisig` and "
+     "accepted by default, matching Core's Solver (TxoutType::MULTISIG) + "
+     "IsStandard (n=1..3, m=1..n) with default -permitbaremultisig=true "
+     "(policy.cpp:82-95, 151-153). >3 keys stays nonstandard.",
      [
       ?_test(begin
          %% 1-of-2 multisig with two 33-byte pubkeys:
@@ -286,20 +278,67 @@ g9_bug2_bug3_bare_multisig_nonstandard_test_() ->
                 16#21, Pk2/binary, %% push 33-byte pk2
                 16#52,            %% OP_2
                 16#ae>>,          %% OP_CHECKMULTISIG
-         ?assertEqual(nonstandard,
+         ?assertEqual(multisig,
                       beamchain_mempool:classify_output_standard(MS)),
 
-         %% End-to-end: check_standard rejects with `scriptpubkey`
-         %% (NOT with the Core-canonical `bare-multisig` token — BUG-21).
+         %% End-to-end: check_standard now ACCEPTS a bare 1-of-2 multisig.
          Tx = make_tx_with_output(2, MS, 100000),
-         ?assertThrow(scriptpubkey, beamchain_mempool:check_standard(Tx)),
+         ?assertEqual(ok, beamchain_mempool:check_standard(Tx)),
 
-         %% No permit_bare_multisig config flag exists.
-         Src = read_src(beamchain_mempool_src()),
-         ?assertEqual(nomatch,
-                      binary:match(Src, <<"permit_bare_multisig">>)),
-         ?assertEqual(nomatch,
-                      binary:match(Src, <<"DEFAULT_PERMIT_BAREMULTISIG">>))
+         %% 1-of-4 (n=4 > 3) is still nonstandard, matching Core IsStandard.
+         Pk3 = binary:copy(<<16#cc>>, 33),
+         Pk4 = binary:copy(<<16#dd>>, 33),
+         MS4 = <<16#51,
+                 16#21, Pk1/binary, 16#21, Pk2/binary,
+                 16#21, Pk3/binary, 16#21, Pk4/binary,
+                 16#54,            %% OP_4
+                 16#ae>>,
+         ?assertEqual(nonstandard,
+                      beamchain_mempool:classify_output_standard(MS4))
+       end)
+     ]}.
+
+%%% ===================================================================
+%%% G9b — generalized ephemeral dust (glass-box 2026-07-01 fix)
+%%% ===================================================================
+
+g9b_generalized_ephemeral_dust_test_() ->
+    {"G9b: FIXED (glass-box 2026-07-01) — a zero-fee tx carrying exactly "
+     "one dust output of ANY script type (not only zero-value P2A) is now "
+     "exempted from the dust gate, matching Core's generalized ephemeral "
+     "dust (policy.cpp MAX_DUST_OUTPUTS_PER_TX=1 + ephemeral_policy.cpp "
+     "PreCheckEphemeralTx: dust permitted iff base_fee==0). Non-zero fee "
+     "still rejects; >1 dust still rejects.",
+     [
+      ?_test(begin
+         %% Dust P2WPKH: value 293 < 294 threshold.
+         P2WPKH = <<16#00, 16#14, 0:160>>,
+         DustTx = make_tx_with_output(2, P2WPKH, 293),
+
+         %% Zero fee: the single dust output is the ephemeral anchor -> allowed.
+         ?assertEqual({has_ephemeral, 0},
+                      beamchain_mempool:find_ephemeral_anchor(DustTx, 0)),
+         ?assertEqual({has_ephemeral, 0},
+                      beamchain_mempool:check_dust(DustTx, 0)),
+
+         %% Non-zero fee: dust output must be 0-fee -> reject `dust`.
+         ?assertThrow(dust, beamchain_mempool:check_dust(DustTx, 1000)),
+
+         %% > MAX_DUST_OUTPUTS_PER_TX (two dust outputs) -> reject even at 0-fee.
+         TwoDust = #transaction{
+             version = 2,
+             inputs  = [#tx_in{prev_out = #outpoint{hash = <<1:256>>, index = 0},
+                               script_sig = <<>>, sequence = 16#ffffffff,
+                               witness = []}],
+             outputs = [#tx_out{value = 293, script_pubkey = P2WPKH},
+                        #tx_out{value = 293, script_pubkey = P2WPKH}],
+             locktime = 0, txid = undefined, wtxid = undefined},
+         ?assertThrow(dust, beamchain_mempool:check_dust(TwoDust, 0)),
+
+         %% A non-dust output at zero fee is not an anchor and passes fine.
+         BigTx = make_tx_with_output(2, P2WPKH, 100000),
+         ?assertEqual(none, beamchain_mempool:find_ephemeral_anchor(BigTx, 0)),
+         ?assertEqual(none, beamchain_mempool:check_dust(BigTx, 0))
        end)
      ]}.
 
@@ -450,18 +489,18 @@ g16_bug4_max_op_return_relay_hardcoded_test_() ->
 %%% G17 — BUG-3: permit_bare_multisig config missing
 %%% ===================================================================
 
-g17_bug3_permit_bare_multisig_missing_test_() ->
-    {"G17: BUG-3 (HIGH) — Core has -permitbaremultisig (default true). "
-     "beamchain has no equivalent config. The output classifier rejects "
-     "all bare multisig as nonstandard regardless of operator preference.",
+g17_bug3_permit_bare_multisig_default_accept_test_() ->
+    {"G17: FIXED (glass-box 2026-07-01) — Core has -permitbaremultisig "
+     "(default true). beamchain has no operator-configurable flag, but now "
+     "matches Core's DEFAULT behavior: bare multisig (up to x-of-3) is "
+     "accepted. The output classifier no longer rejects it as nonstandard.",
      [
       ?_test(begin
-         Src = read_src(beamchain_mempool_src()),
-         ?assertEqual(nomatch, binary:match(Src, <<"permit_bare_multisig">>)),
-         ?assertEqual(nomatch, binary:match(Src, <<"permitbaremultisig">>)),
-         ProtoHrl = read_src(beamchain_protocol_hrl()),
-         ?assertEqual(nomatch, binary:match(ProtoHrl, <<"DEFAULT_PERMIT_BAREMULTISIG">>)),
-         ?assertEqual(nomatch, binary:match(ProtoHrl, <<"PERMIT_BAREMULTISIG">>))
+         %% Behavioral parity with Core's default (permitbaremultisig=true):
+         %% a bare 1-of-1 multisig output is standard.
+         Pk = binary:copy(<<16#aa>>, 33),
+         MS = <<16#51, 16#21, Pk/binary, 16#51, 16#ae>>,  %% OP_1 <pk> OP_1 CHECKMULTISIG
+         ?assertEqual(multisig, beamchain_mempool:classify_output_standard(MS))
        end)
      ]}.
 
@@ -587,27 +626,29 @@ g21_is_dust_output_test_() ->
 %%% G22 — BUG-6: MAX_DUST_OUTPUTS_PER_TX count gate missing
 %%% ===================================================================
 
-g22_bug6_max_dust_outputs_per_tx_missing_test_() ->
-    {"G22: BUG-6 (MEDIUM) — Core's policy.cpp:159-162 checks "
-     "`GetDust(tx).size() > MAX_DUST_OUTPUTS_PER_TX (=1)`. beamchain "
-     "has no count-based gate; pre_check_ephemeral_tx is fee-gated and "
-     "rejects ANY dust output if fee > 0.",
+g22_bug6_max_dust_outputs_per_tx_test_() ->
+    {"G22: FIXED (glass-box 2026-07-01) — Core's policy.cpp:159-162 checks "
+     "`GetDust(tx).size() > MAX_DUST_OUTPUTS_PER_TX (=1)`. beamchain now "
+     "enforces the count gate on the zero-fee ephemeral-dust path (>1 dust "
+     "output rejected as `dust`), and permits exactly one dust output of "
+     "any type iff the tx is zero-fee (generalized ephemeral dust).",
      [
       ?_test(begin
-         Src = read_src(beamchain_mempool_src()),
-         ProtoHrl = read_src(beamchain_protocol_hrl()),
-         %% No constant
-         ?assertEqual(nomatch,
-             binary:match(ProtoHrl, <<"MAX_DUST_OUTPUTS_PER_TX">>)),
-         ?assertEqual(nomatch,
-             binary:match(Src, <<"MAX_DUST_OUTPUTS_PER_TX">>)),
-         %% No GetDust list-of-dust-outputs helper FUNCTION
-         %% (Comment mentions "GetDustThreshold" but no Erlang function
-         %% named get_dust/N exists; assert the symbol-table contains no
-         %% such export.)
-         ?assertEqual(nomatch, binary:match(Src, <<"get_dust(">>)),
-         Exports = beamchain_mempool:module_info(exports),
-         ?assertNot(lists:keymember(get_dust, 1, Exports))
+         P2WPKH = <<16#00, 16#14, 0:160>>,
+         %% One dust output at zero fee -> accepted (the ephemeral anchor).
+         One = make_tx_with_output(2, P2WPKH, 293),
+         ?assertEqual({has_ephemeral, 0},
+             beamchain_mempool:check_dust(One, 0)),
+         %% Two dust outputs -> exceeds MAX_DUST_OUTPUTS_PER_TX -> reject.
+         Two = #transaction{
+             version = 2,
+             inputs  = [#tx_in{prev_out = #outpoint{hash = <<1:256>>, index = 0},
+                               script_sig = <<>>, sequence = 16#ffffffff,
+                               witness = []}],
+             outputs = [#tx_out{value = 293, script_pubkey = P2WPKH},
+                        #tx_out{value = 293, script_pubkey = P2WPKH}],
+             locktime = 0, txid = undefined, wtxid = undefined},
+         ?assertThrow(dust, beamchain_mempool:check_dust(Two, 0))
        end)
      ]}.
 
