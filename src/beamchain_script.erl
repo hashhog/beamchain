@@ -627,7 +627,10 @@ execute(<<?OP_1NEGATE, Rest/binary>>, Pos, State) ->
     case executing(State0) of
         true ->
             State1 = push(encode_script_num(-1), State0),
-            execute(Rest, Pos + 1, State1);
+            case check_stack_size(State1) of
+                true -> execute(Rest, Pos + 1, State1);
+                false -> {error, stack_overflow}
+            end;
         false ->
             execute(Rest, Pos + 1, State0)
     end;
@@ -648,7 +651,10 @@ execute(<<Op, Rest/binary>>, Pos, State)
         true ->
             N = Op - ?OP_1 + 1,
             State1 = push(encode_script_num(N), State0),
-            execute(Rest, Pos + 1, State1);
+            case check_stack_size(State1) of
+                true -> execute(Rest, Pos + 1, State1);
+                false -> {error, stack_overflow}
+            end;
         false ->
             execute(Rest, Pos + 1, State0)
     end;
