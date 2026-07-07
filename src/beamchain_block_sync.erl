@@ -958,8 +958,15 @@ handle_unsolicited_block(Peer, Block, State) ->
                             case beamchain_chainstate:connect_block(Block) of
                                 ok ->
                                     {ok, {_, Height}} = beamchain_chainstate:get_tip(),
-                                    %% 3. Store tx index entries (not done by chainstate)
-                                    store_tx_index(Block, Height),
+                                    %% Tx index entries are written atomically
+                                    %% inside connect_block (via
+                                    %% direct_atomic_connect_writes), in the same
+                                    %% WriteBatch as the block/index. No separate
+                                    %% per-tx store_tx_index pass here — it is
+                                    %% redundant and its N synchronous gen_server
+                                    %% calls saturate beamchain_db (W-replay wedge
+                                    %% at h491872: store_tx_index gen_server:call
+                                    %% timeout).
                                     logger:info("block_sync: connected unsolicited "
                                                 "block ~s at height ~B from ~p",
                                                 [hash_hex(BlockHash), Height, Peer]),
@@ -1249,8 +1256,16 @@ validate_and_connect(Height, Block,
                 %% 3. Store the block
                 ok = beamchain_db:store_block(Block, Height),
 
-                %% 4. Store tx index entries
-                store_tx_index(Block, Height),
+                %% 4. Tx index entries are already persisted atomically by
+                %% connect_block (direct_atomic_connect_writes) in the SAME
+                %% WriteBatch as the block index and reverse index. The former
+                %% separate per-tx store_tx_index/2 pass here re-wrote every
+                %% entry via N synchronous gen_server:call round-trips through
+                %% the single beamchain_db process; under the windowed-replay
+                %% gap-fill flood that saturated the db mailbox and made one
+                %% store_tx_index call exceed its 30s timeout, crashing and
+                %% re-wedging block_sync at h491872 (zero forward progress).
+                %% Removed: the atomic write already durably holds the index.
 
                 %% 5. Update block_index status to fully validated (status=2).
                 %% direct_atomic_connect_writes already stored the entry with
@@ -1333,20 +1348,16 @@ lookup_assume_valid_height(Hash) ->
         not_found -> -1  %% headers not yet synced, will update later
     end.
 
-%% Store transaction index entries for all txs in a block.
-%% Only stores if txindex is enabled in config.
-store_tx_index(#block{header = Header, transactions = Txs}, Height) ->
-    case beamchain_config:txindex_enabled() of
-        true ->
-            BlockHash = beamchain_serialize:block_hash(Header),
-            lists:foldl(fun(Tx, Pos) ->
-                Txid = beamchain_serialize:tx_hash(Tx),
-                beamchain_db:store_tx_index(Txid, BlockHash, Height, Pos),
-                Pos + 1
-            end, 0, Txs);
-        false ->
-            ok
-    end.
+%% NOTE: the former store_tx_index/2 helper was removed. The tx index is now
+%% written exclusively (and atomically) by beamchain_chainstate:connect_block
+%% via beamchain_db:direct_atomic_connect_writes/5, which puts every tx-index
+%% entry into the same rocksdb WriteBatch as the block and block index. The
+%% old post-connect per-tx pass here issued one synchronous gen_server:call
+%% per transaction to the single beamchain_db process; during the windowed
+%% modern-replay gap-fill it saturated that mailbox and a single call exceeded
+%% its 30s timeout, wedging block_sync at height 491872 with no forward
+%% progress. Note direct_atomic_connect_writes writes the tx index
+%% unconditionally, so getindexinfo/gettxlocation remain fully populated.
 
 %% Reset in-flight request timestamps so validation time isn't counted
 %% as network stall time. Called after a batch of validation completes.
