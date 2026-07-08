@@ -1028,8 +1028,20 @@ do_add_transaction(Tx, PeerId, State) ->
                 {RollingMin, St1} = get_min_fee(State),
                 StaticMinRelay = ?DEFAULT_MIN_RELAY_TX_FEE / 1000.0,
                 EffectiveMin = max(RollingMin, StaticMinRelay),
-                FeeRate >= EffectiveMin orelse throw('mempool min fee not met'),
-                St1
+                %% Core CheckFeeRate (validation.cpp) reports two distinct
+                %% reject reasons: the rolling mempool-min-fee floor is
+                %% checked first ("mempool min fee not met"), then the static
+                %% -minrelaytxfee floor ("min relay fee not met").  Split the
+                %% single throw to surface the same token Core does.  The
+                %% DECISION is unchanged: reject iff FeeRate < max(rolling,
+                %% static) == EffectiveMin.
+                case FeeRate >= EffectiveMin of
+                    true -> St1;
+                    false when FeeRate < RollingMin ->
+                        throw('mempool min fee not met');
+                    false ->
+                        throw('min relay fee not met')
+                end
         end,
         %% Use the post-decay State1 going forward.
 
@@ -1284,7 +1296,16 @@ do_add_transaction_dry_run(Tx, State) ->
                 {RollingMin, _St1} = get_min_fee(State),
                 StaticMinRelay = ?DEFAULT_MIN_RELAY_TX_FEE / 1000.0,
                 EffectiveMin = max(RollingMin, StaticMinRelay),
-                FeeRate >= EffectiveMin orelse throw('mempool min fee not met')
+                %% See CheckFeeRate note in do_add_transaction/2: the rolling
+                %% floor is "mempool min fee not met"; the static -minrelaytxfee
+                %% floor is "min relay fee not met".  Decision unchanged.
+                case FeeRate >= EffectiveMin of
+                    true -> ok;
+                    false when FeeRate < RollingMin ->
+                        throw('mempool min fee not met');
+                    false ->
+                        throw('min relay fee not met')
+                end
         end,
 
         %% GATE 15: TRUC policy (read-only check; sibling eviction not performed)
@@ -1968,7 +1989,10 @@ check_standard(#transaction{version = V, inputs = Inputs, outputs = Outputs} = T
     %% allowing an attacker to fake SPV proofs. Bitcoin Core policy.h:
     %% MIN_STANDARD_TX_NONWITNESS_SIZE = 65.
     NonWitnessSize = byte_size(beamchain_serialize:encode_transaction(Tx, no_witness)),
-    NonWitnessSize >= ?MIN_STANDARD_TX_NONWITNESS_SIZE orelse throw(tx_size),
+    %% Distinct Core token: the <65-byte nonwitness case is "tx-size-small"
+    %% (validation.cpp PreChecks), NOT "tx-size" (the >MAX_STANDARD_TX_WEIGHT
+    %% policy reason).  Same reject decision, different reason string.
+    NonWitnessSize >= ?MIN_STANDARD_TX_NONWITNESS_SIZE orelse throw(tx_size_small),
     %% input scriptSig checks — mirrors Bitcoin Core IsStandardTx input loop:
     %%   (1) scriptSig size <= MAX_STANDARD_SCRIPTSIG_SIZE (1650 bytes)
     %%   (2) scriptSig must be push-only

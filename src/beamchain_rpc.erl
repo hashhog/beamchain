@@ -84,6 +84,11 @@
          rpc_gettxout/1, rpc_getmempoolentry/1]).
 %% Test-only exports — submitpackage helpers (mempool wave 2026-05-06).
 -export([rpc_submitpackage/1, decode_package_tx/1]).
+%% Test-only exports — mempool RPC reject-reason mapping (reason-code parity).
+%% format_mempool_error/2 is the sendrawtransaction surface; mempool_reject_reason/2
+%% is the testmempoolaccept reject-reason surface.  Exercised by
+%% beamchain_reason_token_tests to assert Core-token parity per rejection class.
+-export([format_mempool_error/2, mempool_reject_reason/2]).
 %% Test-only export — getorphantxs handler (Core v28 RPC-completeness gap).
 -export([rpc_getorphantxs/1]).
 %% Test-only exports — getblockfrompeer handler + peer-id reverse lookup
@@ -4044,6 +4049,10 @@ format_mempool_error(mempool_min_fee_not_met, _Txid) ->
     {error, ?RPC_VERIFY_REJECTED, <<"mempool min fee not met">>};
 format_mempool_error('mempool min fee not met', _Txid) ->
     {error, ?RPC_VERIFY_REJECTED, <<"mempool min fee not met">>};
+%% Static -minrelaytxfee floor (Core validation.cpp CheckFeeRate second gate).
+%% Distinct from the rolling "mempool min fee not met" reason above.
+format_mempool_error('min relay fee not met', _Txid) ->
+    {error, ?RPC_VERIFY_REJECTED, <<"min relay fee not met">>};
 format_mempool_error(dust, _Txid) ->
     {error, ?RPC_VERIFY_REJECTED, <<"dust">>};
 format_mempool_error(too_long_mempool_chain, _Txid) ->
@@ -4072,12 +4081,63 @@ format_mempool_error(rbf_spends_conflicting_tx, _Txid) ->
 format_mempool_error({script_verify_failed, Idx}, _Txid) ->
     {error, ?RPC_VERIFY_ERROR,
      iolist_to_binary(io_lib:format("mandatory-script-verify-flag-failed (input ~B)", [Idx]))};
+%% --- Standardness tokens (Core policy/policy.cpp IsStandardTx) ---
+%% beamchain_mempool:check_standard/1 throws these bare atoms; Core surfaces
+%% the hyphenated form as state.GetRejectReason().  `version`, `scriptpubkey`
+%% and `datacarrier` already match Core's spelling verbatim (the current Core
+%% reference uses the datacarrier_bytes_left model, reason "datacarrier") and
+%% are re-emitted explicitly so the mapping is auditable and does not fall
+%% through to the ~p catch-all.
+format_mempool_error(version, _Txid) ->
+    {error, ?RPC_VERIFY_REJECTED, <<"version">>};
+format_mempool_error(tx_size, _Txid) ->
+    {error, ?RPC_VERIFY_REJECTED, <<"tx-size">>};
+format_mempool_error(tx_size_small, _Txid) ->
+    {error, ?RPC_VERIFY_REJECTED, <<"tx-size-small">>};
+format_mempool_error(scriptsig_size, _Txid) ->
+    {error, ?RPC_VERIFY_REJECTED, <<"scriptsig-size">>};
+format_mempool_error(scriptsig_not_pushonly, _Txid) ->
+    {error, ?RPC_VERIFY_REJECTED, <<"scriptsig-not-pushonly">>};
+format_mempool_error(scriptpubkey, _Txid) ->
+    {error, ?RPC_VERIFY_REJECTED, <<"scriptpubkey">>};
+format_mempool_error(datacarrier, _Txid) ->
+    {error, ?RPC_VERIFY_REJECTED, <<"datacarrier">>};
+%% CheckTransaction family (Core consensus/tx_check.cpp).  sendrawtransaction
+%% throws these wrapped as {validation, Atom}; the dry-run (testmempoolaccept)
+%% catch unwraps to the bare Atom.  Both routes are mapped to the canonical
+%% Core token via check_transaction_token/1.
 format_mempool_error({validation, Reason}, _Txid) ->
-    {error, ?RPC_VERIFY_ERROR,
-     iolist_to_binary(io_lib:format("~p", [Reason]))};
+    case check_transaction_token(Reason) of
+        undefined ->
+            {error, ?RPC_VERIFY_ERROR,
+             iolist_to_binary(io_lib:format("~p", [Reason]))};
+        Token ->
+            {error, ?RPC_VERIFY_REJECTED, Token}
+    end;
 format_mempool_error(Reason, _Txid) ->
-    {error, ?RPC_VERIFY_REJECTED,
-     iolist_to_binary(io_lib:format("~p", [Reason]))}.
+    case check_transaction_token(Reason) of
+        undefined ->
+            {error, ?RPC_VERIFY_REJECTED,
+             iolist_to_binary(io_lib:format("~p", [Reason]))};
+        Token ->
+            {error, ?RPC_VERIFY_REJECTED, Token}
+    end.
+
+%% @doc Map a CheckTransaction (consensus/tx_check.cpp) failure atom thrown by
+%% beamchain_validation:check_transaction/1 to Core's canonical hyphenated
+%% reject token.  Returns `undefined` for atoms with no CheckTransaction
+%% equivalent (e.g. tx_underweight — beamchain's MIN_TRANSACTION_WEIGHT gate
+%% has no Core CheckTransaction counterpart), so the caller falls back to ~p.
+-spec check_transaction_token(atom()) -> binary() | undefined.
+check_transaction_token(no_inputs)             -> <<"bad-txns-vin-empty">>;
+check_transaction_token(no_outputs)            -> <<"bad-txns-vout-empty">>;
+check_transaction_token(negative_output)       -> <<"bad-txns-vout-negative">>;
+check_transaction_token(output_too_large)      -> <<"bad-txns-vout-toolarge">>;
+check_transaction_token(total_output_overflow) -> <<"bad-txns-txouttotal-toolarge">>;
+check_transaction_token(duplicate_inputs)      -> <<"bad-txns-inputs-duplicate">>;
+check_transaction_token(null_input)            -> <<"bad-txns-prevout-null">>;
+check_transaction_token(bad_coinbase_length)   -> <<"bad-cb-length">>;
+check_transaction_token(_)                     -> undefined.
 
 %% @doc Map a mempool error atom to the Core-equivalent `reject-reason` string
 %% used by testmempoolaccept.  Reuses format_mempool_error/2 (the same mapping
@@ -4089,6 +4149,17 @@ format_mempool_error(Reason, _Txid) ->
 %% state.GetRejectReason(), the SAME string sendrawtransaction throws — so both
 %% must agree.  See policy/rbf.cpp PaysForRBF (Rules 3/4 → "insufficient fee")
 %% and the non-signaling conflict path ("txn-mempool-conflict").
+%% Core remaps ONLY TX_MISSING_INPUTS → "missing-inputs" at the
+%% testmempoolaccept RPC layer (rpc/mempool.cpp), while everything else uses
+%% state.GetRejectReason().  sendrawtransaction keeps its own error prose
+%% ("Missing inputs") via format_mempool_error/2 — this remap is scoped to the
+%% testmempoolaccept reject-reason field only.
+mempool_reject_reason(orphan, _Txid) ->
+    <<"missing-inputs">>;
+mempool_reject_reason('bad-txns-inputs-missingorspent', _Txid) ->
+    <<"missing-inputs">>;
+mempool_reject_reason(missing_inputs, _Txid) ->
+    <<"missing-inputs">>;
 mempool_reject_reason(Reason, Txid) ->
     case format_mempool_error(Reason, Txid) of
         {error, _Code, Msg} when is_binary(Msg) -> Msg;

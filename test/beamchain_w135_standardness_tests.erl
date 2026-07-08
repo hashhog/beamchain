@@ -130,21 +130,22 @@ g2_max_standard_tx_weight_test_() ->
 %%% ===================================================================
 
 g3_bug9_tx_size_small_reason_atom_collides_test_() ->
-    {"G3: BUG-9 (MEDIUM) — Core distinguishes `tx-size` (weight cap) "
-     "from `tx-size-small` (65-byte minimum); beamchain throws the same "
-     "`tx_size` atom for both gates. testmempoolaccept cannot tell them "
-     "apart.",
+    {"G3: FIXED — Core distinguishes `tx-size` (weight cap) from "
+     "`tx-size-small` (65-byte minimum); beamchain now throws a distinct "
+     "`tx_size_small` atom for the <65B gate, mapped to the Core token "
+     "`tx-size-small` (vs `tx-size` for the weight cap).",
      [
       ?_test(begin
          Src = read_src(beamchain_mempool_src()),
-         %% Both throw sites use the same `tx_size` atom in check_standard.
-         %% Count occurrences of throw(tx_size) in check_standard region.
-         %% The audit-flip: assert there is no `tx_size_small` atom in
-         %% mempool source today.
-         ?assertEqual(nomatch, binary:match(Src, <<"tx_size_small">>)),
-         ?assertEqual(nomatch, binary:match(Src, <<"'tx-size-small'">>)),
-         %% And the bundled-atom is still in use:
-         ?assertNotEqual(nomatch, binary:match(Src, <<"throw(tx_size)">>))
+         %% Audit-flip landed: the two gates now use distinct atoms.
+         ?assertNotEqual(nomatch, binary:match(Src, <<"throw(tx_size)">>)),
+         ?assertNotEqual(nomatch, binary:match(Src, <<"throw(tx_size_small)">>)),
+         %% RPC reject-reason layer maps them to the two distinct Core tokens.
+         Txid = <<0:256>>,
+         {error, _C1, <<"tx-size">>} =
+             beamchain_rpc:format_mempool_error(tx_size, Txid),
+         {error, _C2, <<"tx-size-small">>} =
+             beamchain_rpc:format_mempool_error(tx_size_small, Txid)
        end)
      ]}.
 
