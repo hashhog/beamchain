@@ -25,6 +25,12 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2]).
 
+%% Test-only exports: drive the inv routing / tx-request decision without a
+%% full sync gen_server (see beamchain_tx_inv_request_tests).
+-ifdef(TEST).
+-export([route_message/4, maybe_request_tx_invs/2, test_initial_state/0]).
+-endif.
+
 -define(SERVER, ?MODULE).
 
 %% How often to poll header sync status when waiting for completion
@@ -233,6 +239,17 @@ route_message(Peer, notfound, Payload, State) ->
 route_message(Peer, inv, Payload, State) ->
     case beamchain_p2p_msg:decode_payload(inv, Payload) of
         {ok, #{items := Items}} ->
+            %% Tx-relay ingest — the REQUEST leg. Bitcoin Core
+            %% net_processing.cpp ProcessMessage(INV) IsGenTxMsg branch
+            %% (src/net_processing.cpp:4079-4091): for every tx announced by
+            %% inv that we don't already have, Core hands it to the tx-download
+            %% tracker which later issues a getdata (GetRequestsToSend,
+            %% net_processing.cpp:6206). beamchain already ANNOUNCES and SERVES
+            %% txs (handle_getdata_msg) but previously dropped tx invs, so it
+            %% could never ingest a peer-advertised mempool tx. This closes
+            %% that gap. The resulting `tx` reply is handled by the tx clause
+            %% below (accept_to_memory_pool).
+            maybe_request_tx_invs(Peer, Items),
             %% Collect block inv items we don't already have
             BlockItems = lists:filter(fun(#{type := Type, hash := Hash}) ->
                 (Type =:= ?MSG_BLOCK orelse Type =:= ?MSG_WITNESS_BLOCK)
@@ -404,6 +421,85 @@ route_message(Peer, tx, Payload, State) ->
 
 route_message(_Peer, _Command, _Payload, State) ->
     State.
+
+%%% ===================================================================
+%%% Internal: mempool tx-relay ingest (inv -> getdata REQUEST leg)
+%%% ===================================================================
+
+%% @doc For each transaction announced via inv that we do not already have,
+%% issue a getdata to fetch it. Mirrors Bitcoin Core
+%% net_processing.cpp ProcessMessage(INV) (src/net_processing.cpp:4079-4091)
+%% plus the getdata type selection at GetRequestsToSend (:6206):
+%%
+%%   - Requested only OUTSIDE initial block download
+%%     (Core: `if (!m_chainman.IsInitialBlockDownload())`).
+%%   - Never requested from block-relay-only or feeler peers
+%%     (Core RejectIncomingTxs, net_processing.cpp:5598).
+%%   - getdata type mirrors net_processing.cpp:6206
+%%     `gtxid.IsWtxid() ? MSG_WTX : (MSG_TX | fetch_flags)`:
+%%       * a wtxid announcement (MSG_WTX, only sent by a wtxidrelay peer) is
+%%         re-requested as MSG_WTX carrying the wtxid;
+%%       * a txid announcement (MSG_TX) is requested as MSG_WITNESS_TX so the
+%%         peer serialises the witness (beamchain is a NODE_WITNESS node).
+%%     This is exactly "per the peer's wtxidrelay negotiation flag" — the
+%%     inv type a peer uses is governed by that negotiation.
+%%   - Dedup: transactions already in the mempool are skipped (txid via
+%%     has_tx/1, wtxid via lookup_entry_by_wtxid/1). No separate in-flight
+%%     tracker is kept: mempool membership deduplicates re-announcements once
+%%     a tx lands, and we deliberately avoid introducing an unbounded set.
+maybe_request_tx_invs(Peer, Items) ->
+    case tx_relay_permitted(Peer) of
+        false ->
+            ok;
+        true ->
+            case lists:filtermap(fun tx_inv_to_getdata_item/1, Items) of
+                []       -> ok;
+                GetItems -> beamchain_peer:send_message(
+                              Peer, {getdata, #{items => GetItems}})
+            end
+    end.
+
+%% Tx relay is permitted only once we are past IBD and only for peers that
+%% are allowed to send us transactions (i.e. not block-relay-only or feeler).
+tx_relay_permitted(Peer) ->
+    (not in_ibd()) andalso peer_accepts_tx_relay(Peer).
+
+in_ibd() ->
+    %% is_synced/0 is true once we have left initial block download.
+    not beamchain_chainstate:is_synced().
+
+peer_accepts_tx_relay(Peer) ->
+    case beamchain_peer_manager:get_peer(Peer) of
+        {ok, #{conn_type := block_relay}} -> false;
+        {ok, #{conn_type := feeler}}      -> false;
+        {ok, _}                           -> true;
+        %% Unknown/racing peer (disconnected between recv and lookup): be safe.
+        {error, _}                        -> false
+    end.
+
+%% Map a single inv item to a getdata request item, or drop it. Only tx-type
+%% inv items for transactions not already in the mempool produce a request;
+%% block-type and already-known items yield `false` (filtered out).
+tx_inv_to_getdata_item(#{type := ?MSG_WTX, hash := Wtxid}) ->
+    case beamchain_mempool:lookup_entry_by_wtxid(Wtxid) of
+        not_found -> {true, #{type => ?MSG_WTX, hash => Wtxid}};
+        {ok, _}   -> false
+    end;
+tx_inv_to_getdata_item(#{type := Type, hash := Txid})
+  when Type =:= ?MSG_TX; Type =:= ?MSG_WITNESS_TX ->
+    case beamchain_mempool:has_tx(Txid) of
+        false -> {true, #{type => ?MSG_WITNESS_TX, hash => Txid}};
+        true  -> false
+    end;
+tx_inv_to_getdata_item(_Other) ->
+    false.
+
+-ifdef(TEST).
+%% A minimal post-IBD state for exercising route_message/4 in tests. `complete`
+%% ensures the block-inv path (when present) does not arm header-sync timers.
+test_initial_state() ->
+    #state{phase = complete}.
+-endif.
 
 %%% ===================================================================
 %%% Internal: sync lifecycle
