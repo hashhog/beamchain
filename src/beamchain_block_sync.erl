@@ -43,6 +43,14 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2]).
 
+-ifdef(TEST).
+%% Test-only: expose the internal cmpctblock handler + a default #state{}
+%% so the BIP152 reconstruction-failure behaviour (collision -> full-block
+%% request, no ban) can be exercised without standing up the gen_server.
+%% test_new_state/0 is defined after the #state{} record below.
+-export([do_handle_cmpctblock/5, test_new_state/0]).
+-endif.
+
 -define(SERVER, ?MODULE).
 
 %% Download limits
@@ -159,6 +167,10 @@
     %% silently dropped a block request (no notfound, no block, no timeout).
     stuck_ticks = 0        :: non_neg_integer()
 }).
+
+-ifdef(TEST).
+test_new_state() -> #state{}.
+-endif.
 
 %%% ===================================================================
 %%% API
@@ -1614,11 +1626,25 @@ do_handle_cmpctblock(Peer, CmpctBlock, BlockHash, Height, State) ->
                     %% Fall back to full block request
                     request_full_block(Peer, BlockHash, State)
             end;
+        {error, short_id_collision} ->
+            %% Core (blockencodings.cpp:115) returns READ_STATUS_FAILED, NOT
+            %% READ_STATUS_INVALID, for a short-id collision — the cmpctblock is
+            %% not invalid, reconstruction just cannot proceed. net_processing.cpp
+            %% :4592-4596 bans (Misbehaving 100) only on READ_STATUS_INVALID;
+            %% READ_STATUS_FAILED re-requests the full block with NO ban. Banning
+            %% here (the prior BUG-9 behaviour) unfairly bans the announcing peer
+            %% on an adversarially-inducible collision and drops the block with no
+            %% fallback. Request the full witness block instead.
+            logger:debug("block_sync: cmpctblock short-id collision; requesting "
+                         "full block (Core READ_STATUS_FAILED, no ban)"),
+            request_full_block(Peer, BlockHash, State);
         {error, Reason} ->
             logger:warning("block_sync: invalid compact block: ~p", [Reason]),
             %% BUG-9 fix: Core assigns 100 (ban) for READ_STATUS_INVALID
-            %% (net_processing.cpp ProcessMessage/cmpctblock path).
-            %% A malformed cmpctblock that fails init is READ_STATUS_INVALID.
+            %% (net_processing.cpp ProcessMessage/cmpctblock path). A malformed
+            %% cmpctblock (null/empty header, too many txns, prefilled overflow /
+            %% invalid index) fails init as READ_STATUS_INVALID -> ban. A short-id
+            %% collision is handled above as READ_STATUS_FAILED (no ban).
             beamchain_peer:add_misbehavior(Peer, 100),
             State
     end
