@@ -1693,13 +1693,32 @@ do_side_branch_accept_with_parent(#block{header = Header} = Block,
             case beamchain_validation:contextual_check_block_header(
                    Header, ParentIndex, Params) of
                 ok ->
-                    case persist_side_branch_block(
-                           Block, BlockHash, Height, NewCW) of
+                    %% BIP-141 witness commitment / malleation gate.
+                    %% check_block (run by beamchain_miner:do_submit_block
+                    %% before this) covers PoW/merkle/sigops/weight but NOT
+                    %% the witness commitment, which lives in
+                    %% contextual_check_block — and the side-branch store
+                    %% path never runs contextual_check_block. Core's
+                    %% CheckBlock (via IsBlockMutated on submitblock) rejects
+                    %% a corrupted witness commitment before storing ANY
+                    %% block, including a non-tip-extending sibling, so run
+                    %% the same gate here before persisting. Reuses the
+                    %% validator contextual_check_block uses on the connect
+                    %% path — no second engine.
+                    %% See CORE-PARITY-AUDIT/submitblock-path-differential-2026-07-11.md.
+                    case beamchain_validation:check_witness_malleation(
+                           Block, Height, Params) of
                         ok ->
-                            maybe_reorg_to_side_branch(
-                              BlockHash, NewCWInt, State);
-                        {error, _} = Err ->
-                            Err
+                            case persist_side_branch_block(
+                                   Block, BlockHash, Height, NewCW) of
+                                ok ->
+                                    maybe_reorg_to_side_branch(
+                                      BlockHash, NewCWInt, State);
+                                {error, _} = Err ->
+                                    Err
+                            end;
+                        {error, Reason} ->
+                            {error, Reason}
                     end;
                 {error, Reason} ->
                     {error, Reason}
