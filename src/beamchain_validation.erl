@@ -1421,10 +1421,22 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
                         %% flatten at the end to avoid O(n^2) list append.
                         NewUndoAcc = [SpentCoins | UndoAcc],
                         NewTxsAcc = [Tx | TxsAcc],
-                        %% Flatten for process dict (needed for mid-fold rollback)
-                        put(connect_block_undo,
-                            {lists:reverse(NewTxsAcc),
-                             lists:append(lists:reverse(NewUndoAcc))}),
+                        %% Track processed txs + spent coins so a mid-fold
+                        %% throw can still roll back the UTXO changes already
+                        %% applied. Store the cheap reversed accumulators
+                        %% (O(1) prepend) instead of eagerly reversing +
+                        %% flattening the whole undo list on EVERY transaction.
+                        %% The previous per-tx `lists:reverse/1` +
+                        %% `lists:append(lists:reverse/1)` made this fold
+                        %% O(txs^2) + O(inputs^2): ~155ms of pure list churn
+                        %% (~15M throwaway cons cells) on a full mainnet block,
+                        %% capping connect at ~6 blk/s regardless of I/O.
+                        %% Order is irrelevant to rollback_block_utxos/2 (both
+                        %% of its loops operate on independent ETS keys), so we
+                        %% defer flattening to the rare rollback path. NewUndoAcc
+                        %% is a reversed list of SpentCoins chunks (a list of
+                        %% lists); rollback_block_utxos/2 normalizes it.
+                        put(connect_block_undo, {NewTxsAcc, NewUndoAcc}),
 
                         {NewFeesAcc, NewUndoAcc, NewSigops,
                          NewJobs, NewTxsAcc}
@@ -1519,7 +1531,18 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
 
 %% Roll back UTXO changes from a failed block validation.
 %% Removes outputs added by non-coinbase txs and restores spent inputs.
-rollback_block_utxos(Txs, UndoCoins) ->
+rollback_block_utxos(Txs, UndoCoins0) ->
+    %% UndoCoins may arrive in either of two shapes describing the SAME set:
+    %%   - flat: a list of {outpoint, coin} pairs (post-fold put at the end of
+    %%     connect_block/4, the initial [] put, and every historical reader), or
+    %%   - nested: a reversed list of SpentCoins chunks (list of lists) — the
+    %%     mid-fold accumulator the connect fold now stores directly to avoid a
+    %%     per-transaction re-flatten (see connect_block/4).
+    %% Normalize to a flat list here, in this rare error-only path.
+    UndoCoins = case UndoCoins0 of
+        [Chunk | _] when is_list(Chunk) -> lists:append(UndoCoins0);
+        _ -> UndoCoins0
+    end,
     %% Collect txids of transactions in this block (for intra-block filtering)
     BlockTxids = sets:from_list(
         [beamchain_serialize:tx_hash(Tx) || Tx <- Txs]),
