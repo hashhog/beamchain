@@ -39,6 +39,10 @@
 
 %% Contextual block checks
 -export([contextual_check_block/4]).
+%% BIP-141 witness malleation gate — reused by the submitblock side-branch
+%% store path (beamchain_chainstate) so a non-tip-extending sibling gets the
+%% same witness-commitment check Core runs in CheckBlock before storage.
+-export([check_witness_malleation/3]).
 
 %% Connect / disconnect
 -export([connect_block/4, disconnect_block/3]).
@@ -510,39 +514,12 @@ contextual_check_block(#block{header = Header, transactions = Txs},
         %%
         %% Bug-fix W77: case B was missing — pre-segwit blocks with witness data
         %% were silently accepted instead of rejected.
-        SegwitHeight = maps:get(segwit_height, Params, 0),
-        WitnessCommitmentPrefix = <<16#6a, 16#24, 16#aa, 16#21, 16#a9, 16#ed>>,
-        HasCommitmentOutput = lists:any(
-            fun(#tx_out{script_pubkey = SPK}) ->
-                byte_size(SPK) >= 38 andalso
-                binary:part(SPK, 0, 6) =:= WitnessCommitmentPrefix
-            end, CoinbaseTx#transaction.outputs),
-        case Height >= SegwitHeight of
-            true ->
-                %% Case A: segwit active.
-                case HasCommitmentOutput of
-                    true ->
-                        %% Commitment is present — always recompute and verify
-                        %% (matches Core: commitpos != NO_WITNESS_COMMITMENT)
-                        check_witness_commitment(CoinbaseTx, Txs);
-                    false ->
-                        %% No commitment output. Reject if any tx has witness data.
-                        HasWitnessTx = lists:any(fun has_witness/1, Txs),
-                        case HasWitnessTx of
-                            true -> throw(unexpected_witness);
-                            false -> ok
-                        end
-                end;
-            false ->
-                %% Case B: segwit not yet active.
-                %% Reject if any tx (including coinbase) carries witness data.
-                %% Core validation.cpp:3905-3913.
-                HasWitnessTxPreSegwit = lists:any(fun has_witness/1, Txs),
-                case HasWitnessTxPreSegwit of
-                    true -> throw(unexpected_witness);
-                    false -> ok
-                end
-        end,
+        %% Extracted into do_check_witness_malleation/4 so the submitblock
+        %% side-branch store path (beamchain_chainstate:do_side_branch_accept
+        %% _with_parent) can enforce the SAME gate before persisting a
+        %% non-tip-extending sibling — it does not run contextual_check_block.
+        %% See CORE-PARITY-AUDIT/submitblock-path-differential-2026-07-11.md.
+        do_check_witness_malleation(CoinbaseTx, Txs, Height, Params),
 
         ok
     catch
@@ -602,6 +579,65 @@ encode_le_magnitude(H) ->
 encode_le_bytes(0, Acc) -> Acc;
 encode_le_bytes(H, Acc) ->
     encode_le_bytes(H bsr 8, <<Acc/binary, (H band 16#ff)>>).
+
+%% @doc BIP 141 witness commitment / malleation gate, wrapped for callers
+%% outside the contextual_check_block try (the submitblock side-branch store
+%% path in beamchain_chainstate). Mirrors Bitcoin Core CheckWitnessMalleation
+%% (validation.cpp:3870-3916). Core runs CheckBlock (which subsumes this via
+%% IsBlockMutated on submitblock) BEFORE storing ANY block, including a
+%% non-tip-extending sibling; the side-branch handler previously skipped it,
+%% admitting a corrupted witness commitment (bad-witness-merkle-match) as a
+%% stored side-branch. Reuses the exact logic contextual_check_block runs on
+%% the connect path — no second engine.
+%% See CORE-PARITY-AUDIT/submitblock-path-differential-2026-07-11.md.
+-spec check_witness_malleation(#block{}, non_neg_integer(), map()) ->
+    ok | {error, atom()}.
+check_witness_malleation(#block{transactions = [CoinbaseTx | _] = Txs},
+                         Height, Params) ->
+    try
+        do_check_witness_malleation(CoinbaseTx, Txs, Height, Params),
+        ok
+    catch
+        throw:Reason -> {error, Reason}
+    end.
+
+%% Throwing helper carrying the BIP 141 witness commitment / malleation logic,
+%% shared by contextual_check_block (connect path) and check_witness_malleation
+%% (submitblock side-branch path). Behavior-preserving extraction.
+do_check_witness_malleation(CoinbaseTx, Txs, Height, Params) ->
+    SegwitHeight = maps:get(segwit_height, Params, 0),
+    WitnessCommitmentPrefix = <<16#6a, 16#24, 16#aa, 16#21, 16#a9, 16#ed>>,
+    HasCommitmentOutput = lists:any(
+        fun(#tx_out{script_pubkey = SPK}) ->
+            byte_size(SPK) >= 38 andalso
+            binary:part(SPK, 0, 6) =:= WitnessCommitmentPrefix
+        end, CoinbaseTx#transaction.outputs),
+    case Height >= SegwitHeight of
+        true ->
+            %% Case A: segwit active.
+            case HasCommitmentOutput of
+                true ->
+                    %% Commitment is present — always recompute and verify
+                    %% (matches Core: commitpos != NO_WITNESS_COMMITMENT)
+                    check_witness_commitment(CoinbaseTx, Txs);
+                false ->
+                    %% No commitment output. Reject if any tx has witness data.
+                    HasWitnessTx = lists:any(fun has_witness/1, Txs),
+                    case HasWitnessTx of
+                        true -> throw(unexpected_witness);
+                        false -> ok
+                    end
+            end;
+        false ->
+            %% Case B: segwit not yet active.
+            %% Reject if any tx (including coinbase) carries witness data.
+            %% Core validation.cpp:3905-3913.
+            HasWitnessTxPreSegwit = lists:any(fun has_witness/1, Txs),
+            case HasWitnessTxPreSegwit of
+                true -> throw(unexpected_witness);
+                false -> ok
+            end
+    end.
 
 %% @doc Check BIP 141 witness commitment in coinbase.
 %% The coinbase must contain an output whose scriptPubKey starts with:
