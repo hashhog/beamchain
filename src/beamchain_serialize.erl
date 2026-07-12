@@ -39,7 +39,7 @@
 %% Weight/vsize/size
 -export([tx_weight/1, tx_vsize/1, tx_sigop_vsize/2, tx_size/1]).
 %% Block weight (includes header + varint tx count + transactions)
--export([block_weight/1]).
+-export([block_weight/1, block_base_size/1]).
 
 %% Utility
 -export([reverse_bytes/1, hex_encode/1, hex_decode/1]).
@@ -443,6 +443,21 @@ block_weight(Txs) ->
         Acc + tx_weight(Tx)
     end, 0, Txs),
     HeaderWeight + TxCountWeight + TxWeight.
+
+%% @doc Compute the NON-WITNESS serialized block size in bytes.
+%% Mirrors Bitcoin Core ::GetSerializeSize(TX_NO_WITNESS(block)) used in
+%% CheckBlock's size-limit test (validation.cpp:3947): the 80-byte header,
+%% the varint-encoded transaction count, plus each transaction serialized
+%% WITHOUT its witness data. Used by beamchain_validation to emit Core's
+%% canonical "bad-blk-length" reason for base-oversize blocks.
+-spec block_base_size([#transaction{}]) -> non_neg_integer().
+block_base_size(Txs) ->
+    HeaderSize = 80,
+    TxCountVarintSize = byte_size(encode_varint(length(Txs))),
+    TxBaseSize = lists:foldl(fun(Tx, Acc) ->
+        Acc + byte_size(encode_transaction(Tx, no_witness))
+    end, 0, Txs),
+    HeaderSize + TxCountVarintSize + TxBaseSize.
 
 %% @doc Get the serialized size of a transaction in bytes
 -spec tx_size(#transaction{}) -> non_neg_integer().
