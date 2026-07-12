@@ -282,7 +282,22 @@ check_block(#block{header = Header, transactions = Txs}, Params, CheckPow, Check
         %% leaves which is the simplest form of this attack.
         check_merkle_malleation(TxHashes),
 
-        %% 8. verify block weight <= MAX_BLOCK_WEIGHT
+        %% 8. size limits (Core CheckBlock, validation.cpp:3947) — the
+        %%    NON-WITNESS serialized block size scaled by WITNESS_SCALE_FACTOR
+        %%    must not exceed MAX_BLOCK_WEIGHT.  This is the exact predicate
+        %%    Core rejects as "bad-blk-length".  Because base_size*4 =<
+        %%    GetBlockWeight (weight = 4*base + witness_bytes), this check is
+        %%    STRICTLY WEAKER than the witness-inclusive weight check in step
+        %%    8b, so it never changes the accept/reject decision — it only
+        %%    refines the reject reason from the generic weight failure to
+        %%    Core's canonical "bad-blk-length" for blocks whose base data
+        %%    alone blows the limit (corpus: block-weight-too-large).
+        BaseBlockSize = beamchain_serialize:block_base_size(Txs),
+        BaseBlockSize * ?WITNESS_SCALE_FACTOR =< ?MAX_BLOCK_WEIGHT
+            orelse throw(bad_blk_length),
+
+        %% 8b. verify witness-inclusive block weight <= MAX_BLOCK_WEIGHT
+        %%     (Core ContextualCheckBlock, validation.cpp:4179 → "bad-blk-weight").
         BlockWeight = compute_block_weight(Txs),
         BlockWeight =< ?MAX_BLOCK_WEIGHT orelse throw(bad_blk_weight),
 
