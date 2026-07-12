@@ -1479,12 +1479,36 @@ blockchaininfo_assemble(BaseInfo, PruneFields) ->
     Tail = [{<<"warnings">>, []}],
     BaseInfo ++ PruneFields ++ Tail.
 
-%% size_on_disk — estimated block+undo file usage. Masked by the byte-diff
-%% harness (state/wall-clock derived, never byte-comparable) but must be PRESENT
-%% in Core key order (between chainwork and pruned). We surface a stable 0 here:
-%% the field is informational and beamchain does not track a Core-comparable
-%% CalculateCurrentUsage value at the RPC layer.
-blockchain_size_on_disk() -> 0.
+%% size_on_disk — on-disk block/chain storage usage in bytes, Core's
+%% getblockchaininfo `size_on_disk` (CalculateCurrentUsage(), rpc/blockchain.cpp).
+%% Core sums its blk*.dat + rev*.dat files; beamchain keeps blocks + undo in a
+%% single RocksDB store under <datadir>/chaindata, so we sum that directory's
+%% file sizes — the closest structural analog. Informational and masked by the
+%% byte-diff harness (state-derived, never byte-comparable), but populated with
+%% a real value so completeness probes see non-zero. Defensive: any datadir /
+%% filesystem error falls back to 0 rather than crashing the RPC.
+blockchain_size_on_disk() ->
+    try
+        DataDir = beamchain_config:datadir(),
+        ChainDataDir = filename:join(DataDir, "chaindata"),
+        case file:list_dir(ChainDataDir) of
+            {ok, Files} ->
+                lists:sum([size_on_disk_file(filename:join(ChainDataDir, F))
+                           || F <- Files]);
+            _ ->
+                0
+        end
+    catch
+        _:_ -> 0
+    end.
+
+%% Size in bytes of a single regular file; 0 for anything unreadable
+%% (directories, vanished files, permission errors).
+size_on_disk_file(Path) ->
+    case file:read_file_info(Path) of
+        {ok, Info} -> element(2, Info);  %% #file_info.size
+        _          -> 0
+    end.
 
 %% Build the pruning subset of the getblockchaininfo response.
 %% Mirrors Bitcoin Core's blockchain.cpp::getblockchaininfo:
@@ -7159,6 +7183,32 @@ bip22_result(dup_txid)                   -> <<"bad-txns-inputs-missingorspent">>
 bip22_result(bad_witness_commitment)     -> <<"bad-witness-merkle-match">>;
 bip22_result(missing_witness_commitment) -> <<"bad-witness-merkle-match">>;
 bip22_result(bad_witness_nonce)          -> <<"bad-witness-merkle-match">>;
+%% Coinbase witness reserved-value / nonce is not exactly one 32-byte stack
+%% item.  beamchain_validation:do_check_witness_malleation throws
+%% bad_witness_nonce_size.  Core validation.cpp:3883 CheckWitnessMalleation:
+%%   state.Invalid(BLOCK_MUTATED, "bad-witness-nonce-size", ...).
+bip22_result(bad_witness_nonce_size)     -> <<"bad-witness-nonce-size">>;
+%% A block with witness data but no (or a truncated/undersized) witness
+%% commitment output.  beamchain_validation:do_check_witness_malleation throws
+%% unexpected_witness.  Core validation.cpp:3910 CheckWitnessMalleation:
+%%   state.Invalid(BLOCK_MUTATED, "unexpected-witness", ...).
+bip22_result(unexpected_witness)         -> <<"unexpected-witness">>;
+%% Block size limits: empty block (no_transactions) or a block whose
+%% NON-WITNESS serialized size * WITNESS_SCALE_FACTOR exceeds MAX_BLOCK_WEIGHT
+%% (bad_blk_length).  Core validation.cpp:3948 CheckBlock:
+%%   state.Invalid(BLOCK_CONSENSUS, "bad-blk-length", "size limits failed").
+bip22_result(no_transactions)           -> <<"bad-blk-length">>;
+bip22_result(bad_blk_length)            -> <<"bad-blk-length">>;
+%% Witness-inclusive block weight over MAX_BLOCK_WEIGHT.  Core
+%% validation.cpp:4180 ContextualCheckBlock:
+%%   state.Invalid(BLOCK_CONSENSUS, "bad-blk-weight", "... weight limit failed").
+bip22_result(bad_blk_weight)            -> <<"bad-blk-weight">>;
+%% First tx not coinbase / no coinbase.  Core validation.cpp:3952 CheckBlock:
+%%   state.Invalid(BLOCK_CONSENSUS, "bad-cb-missing", "first tx is not coinbase").
+bip22_result(first_tx_not_coinbase)     -> <<"bad-cb-missing">>;
+%% More than one coinbase transaction.  Core validation.cpp:3955 CheckBlock:
+%%   state.Invalid(BLOCK_CONSENSUS, "bad-cb-multiple", "more than one coinbase").
+bip22_result(extra_coinbase)            -> <<"bad-cb-multiple">>;
 bip22_result(bad_cb_amount)             -> <<"bad-cb-amount">>;
 %% Non-coinbase tx where sum(inputs) < sum(outputs).
 %% Core consensus/tx_verify.cpp::CheckTxInputs:
