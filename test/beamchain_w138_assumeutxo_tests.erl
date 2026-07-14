@@ -741,20 +741,21 @@ gate25_resolve_dump_target_modes_test() ->
 %%%
 %%% BUG-20: no canary test exists today that exercises
 %%% dump -> assumeutxo-table-lookup -> hash-equality (the regtest
-%%% entry's utxo_hash is <<0:256>> per BUG-1, which would make such
-%%% a test trivially fail anyway).
+%%% entry's utxo_hash used to be <<0:256>> per BUG-1, which would have
+%%% made such a test trivially fail anyway — BUG-1 is now fixed, see
+%%% below, but the dump+canary roundtrip test itself is still absent).
 %%% ===================================================================
 
 gate26_canary_test_absent_test() ->
-    %% Mainnet entries have non-zero utxo_hash. The regtest entry has
-    %% zero (BUG-1). The dump+canary test does not exist; we audit
-    %% the canary's absence by checking no `dump_load_roundtrip_test`
-    %% exists in any test module.
-    %% At least confirm the entries layout via a get_assumeutxo call.
+    %% BUG-1 fixed (porter wave, Change-1): the regtest entry now carries
+    %% the real Core-parity utxo_hash, not a placeholder zero. The
+    %% dump+canary roundtrip test (dump_load_roundtrip_test) still does
+    %% not exist anywhere in the suite; that gap is unaffected by the
+    %% BUG-1 fix and remains open.
     %% (Verifies the parts of W138 that overlap with W102's regtest_placeholder_test.)
     case beamchain_chain_params:get_assumeutxo(110, regtest) of
         {ok, #{utxo_hash := UtxoHash}} ->
-            ?assertEqual(<<0:256>>, UtxoHash);    %% BUG-1 placeholder.
+            ?assertNotEqual(<<0:256>>, UtxoHash);    %% BUG-1 fixed.
         not_found ->
             ?assert(false)
     end.
@@ -848,13 +849,17 @@ gate30_getblockchaininfo_no_background_validation_field_test() ->
 %%% Supplementary regression tests
 %%% ===================================================================
 
-%% BUG-1 (CDIV) — Regtest entry has placeholder zero hashes.
+%% BUG-1 (CDIV) FIXED (porter wave, Change-1) — regtest entries now mirror
+%% bitcoin-core/src/kernel/chainparams.cpp CRegTestParams m_assumeutxo_data
+%% (heights 110/200/299) verbatim instead of placeholder zero hashes.
+%% Audit-flip: this test used to assert the placeholder zeros; it now
+%% asserts the corrected Core-parity values.
 bug1_regtest_assumeutxo_placeholder_test() ->
     #{assumeutxo := M} = beamchain_chain_params:params(regtest),
     ?assert(maps:is_key(110, M)),
     #{block_hash := BH, utxo_hash := UH} = maps:get(110, M),
-    ?assertEqual(<<0:256>>, BH),
-    ?assertEqual(<<0:256>>, UH).
+    ?assertNotEqual(<<0:256>>, BH),
+    ?assertNotEqual(<<0:256>>, UH).
 
 %% Positive: mainnet entries are all non-zero.
 mainnet_assumeutxo_entries_non_zero_test() ->
