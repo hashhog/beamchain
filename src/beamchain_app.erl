@@ -9,14 +9,26 @@
          terminate/2, code_change/3]).
 
 start(_StartType, _StartArgs) ->
-    %% Initialize the versionbits ETS cache before any RPC can query
-    %% deployment state.  Without this, build_deployment_map/3 (used by
-    %% getblockchaininfo and getdeploymentinfo) crashes with badarg on
-    %% networks that have live BIP9 deployments (mainnet, testnet,
-    %% testnet4) because ets:lookup/2 is called on a missing table.
-    beamchain_versionbits:init_cache(),
-    install_signal_handlers(),
-    beamchain_sup:start_link().
+    %% HASHHOG_CAMPAIGN_ASSUMEUTXO: read exactly once, before anything
+    %% else starts. Unset/empty -> single getenv, ok, no other code runs
+    %% (see beamchain_chain_params' campaign-registry doc comment for the
+    %% bit-identical-when-unset contract). Set + invalid/colliding ->
+    %% {error, _} here, which application:ensure_all_started(beamchain)
+    %% propagates to the caller, so the node refuses to start rather than
+    %% silently shadowing a production assumeutxo hash.
+    case beamchain_chain_params:load_campaign_assumeutxo() of
+        {error, Reason} ->
+            {error, Reason};
+        ok ->
+            %% Initialize the versionbits ETS cache before any RPC can query
+            %% deployment state.  Without this, build_deployment_map/3 (used by
+            %% getblockchaininfo and getdeploymentinfo) crashes with badarg on
+            %% networks that have live BIP9 deployments (mainnet, testnet,
+            %% testnet4) because ets:lookup/2 is called on a missing table.
+            beamchain_versionbits:init_cache(),
+            install_signal_handlers(),
+            beamchain_sup:start_link()
+    end.
 
 stop(_State) ->
     ok.

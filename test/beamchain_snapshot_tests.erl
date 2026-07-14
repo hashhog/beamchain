@@ -653,19 +653,29 @@ test_verify_snapshot_hash_serialized_match() ->
 
 %% Mismatch must produce the exact Core wording from validation.cpp:5913.
 %% Display hex is uint256::ToString order (reverse of internal byte order).
+%%
+%% Regtest's height-110 base_hash used to be a placeholder <<0:256>>
+%% (BUG-1, fixed in the porter wave, Change-1: regtest now mirrors Core's
+%% CRegTestParams m_assumeutxo_data verbatim). Uses the real height-110
+%% block_hash so this test still exercises the "hash_serialized MISMATCH"
+%% wording path (as opposed to "unknown_snapshot_base", which is what an
+%% all-zero/unrecognized base_hash now correctly produces post-fix).
 test_verify_snapshot_hash_serialized_mismatch_wording() ->
     Coins = [
         {<<7:256>>, 0, #utxo{value = 1, script_pubkey = <<16#51>>,
                              is_coinbase = false, height = 1}}
     ],
     Computed = beamchain_snapshot:compute_utxo_hash_from_list(Coins),
-    ExpectedRegtestPlaceholder = <<0:256>>,
-    Snapshot = #{base_hash => <<0:256>>,  %% regtest placeholder block_hash
+    RegtestHeight110BlockHash = display_hex_to_bin(
+        "6affe030b7965ab538f820a56ef56c8149b7dc1d1c144af57113be080db7c397"),
+    ExpectedUtxoHash = display_hex_to_bin(
+        "b952555c8ab81fec46f3d4253b7af256d766ceb39fb7752b9d18cdf4a0141327"),
+    Snapshot = #{base_hash => RegtestHeight110BlockHash,
                  num_coins => length(Coins),
                  coins => Coins},
     case beamchain_snapshot:verify_snapshot(Snapshot, regtest) of
         {error, Msg} when is_binary(Msg) ->
-            ExpectedHex = bin_to_display_hex(ExpectedRegtestPlaceholder),
+            ExpectedHex = bin_to_display_hex(ExpectedUtxoHash),
             ComputedHex = bin_to_display_hex(Computed),
             Want = iolist_to_binary(
                      io_lib:format("Bad snapshot content hash: expected ~s, got ~s",
