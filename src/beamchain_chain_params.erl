@@ -11,6 +11,8 @@
          list_assumeutxo_heights/1]).
 -export([register_regtest_assumeutxo/4, register_regtest_assumeutxo/2,
          clear_regtest_assumeutxo/0, regtest_assumeutxo_registry/0]).
+-export([load_campaign_assumeutxo/0, campaign_assumeutxo_registry/0,
+         clear_campaign_assumeutxo/0]).
 
 %% @doc Returns comprehensive chain parameters for the given network.
 %%
@@ -593,13 +595,224 @@ ensure_regtest_au_table() ->
 
 %% Effective AssumeUTXO map for a network: hard-coded chainparams for
 %% mainnet/testnet4 (UNTOUCHED), overlaid with the runtime registry for
-%% regtest only. Registry entries take precedence on key collision.
+%% regtest only, then overlaid with the campaign registry (any network —
+%% see the campaign section below). Later maps:merge/2 args win on key
+%% collision.
 effective_assumeutxo(regtest) ->
     #{assumeutxo := Base} = params(regtest),
-    maps:merge(Base, regtest_assumeutxo_registry());
+    WithRegtestRegistry = maps:merge(Base, regtest_assumeutxo_registry()),
+    maps:merge(WithRegtestRegistry, campaign_assumeutxo_registry());
 effective_assumeutxo(Network) ->
     #{assumeutxo := AssumeUtxo} = params(Network),
-    AssumeUtxo.
+    maps:merge(AssumeUtxo, campaign_assumeutxo_registry()).
+
+%%% -------------------------------------------------------------------
+%%% Campaign-only AssumeUTXO allowlist (HASHHOG_CAMPAIGN_ASSUMEUTXO).
+%%%
+%%% Design spec: receipts/CAMPAIGN-SNAPSHOT-TABLE-SPEC.md. Lets the M2
+%%% boundary campaign fast-forward a scratch node to `H-W-1` via a UTXO
+%%% snapshot whose base isn't (yet) one of the hard-coded production
+%%% entries above, WITHOUT ever touching those production tables.
+%%%
+%%% Read exactly once at startup (beamchain_app:start/2, before the
+%%% supervision tree comes up) via load_campaign_assumeutxo/0. When the
+%%% env var is unset or empty, that call is a single os:getenv/1 and
+%%% nothing else executes — no ETS table is created, so
+%%% campaign_assumeutxo_registry/0 returns #{} and effective_assumeutxo/1
+%%% is BYTE-FOR-BYTE identical to the pre-campaign-flag code path. This
+%%% is the production-safety invariant: real mainnet/testnet4 boots never
+%%% set this var, so they never execute anything beyond the getenv.
+%%%
+%%% When set: the file is parsed, validated (well-formed 32-byte hex
+%%% hashes, height > 0, no duplicate heights/hashes within the file), and
+%%% checked for collision against the built-in table of EVERY network
+%%% (mainnet, testnet4, regtest) — not just whichever one ends up running
+%%% — since campaign data may never shadow a production hash on any
+%%% network. On any validation failure OR a height/blockhash collision
+%%% with a built-in entry, load_campaign_assumeutxo/0 returns {error, _};
+%%% beamchain_app:start/2 propagates that as the application start
+%%% failure, so the node refuses to start rather than silently shadowing
+%%% a production hash.
+%%% -------------------------------------------------------------------
+
+-define(CAMPAIGN_ASSUMEUTXO_ENV, "HASHHOG_CAMPAIGN_ASSUMEUTXO").
+-define(CAMPAIGN_AU_TABLE, beamchain_campaign_assumeutxo).
+
+%% @doc Load campaign AssumeUTXO entries from the file named by
+%% HASHHOG_CAMPAIGN_ASSUMEUTXO, if set. See the module-doc comment above
+%% for the full contract. Call exactly once, early in application start.
+-spec load_campaign_assumeutxo() -> ok | {error, term()}.
+load_campaign_assumeutxo() ->
+    case os:getenv(?CAMPAIGN_ASSUMEUTXO_ENV) of
+        false -> ok;
+        ""    -> ok;
+        Path  -> do_load_campaign_assumeutxo(Path)
+    end.
+
+do_load_campaign_assumeutxo(Path) ->
+    case file:read_file(Path) of
+        {error, Reason} ->
+            {error, {campaign_assumeutxo_read_failed, Path, Reason}};
+        {ok, Bin} ->
+            try jsx:decode(Bin, [return_maps]) of
+                List when is_list(List) ->
+                    validate_and_load_campaign(Path, List);
+                Other ->
+                    {error, {campaign_assumeutxo_not_a_list, Path, Other}}
+            catch
+                Class:Reason ->
+                    {error, {campaign_assumeutxo_bad_json, Path,
+                             {Class, Reason}}}
+            end
+    end.
+
+validate_and_load_campaign(Path, RawEntries) ->
+    case parse_campaign_entries(RawEntries) of
+        {error, _} = Err ->
+            Err;
+        {ok, Parsed} ->
+            case check_no_internal_duplicates(Parsed) of
+                {error, _} = Err ->
+                    Err;
+                ok ->
+                    case check_no_builtin_collision(Parsed) of
+                        {error, _} = Err ->
+                            Err;
+                        ok ->
+                            install_campaign_entries(Parsed),
+                            Heights = lists:sort([H || {H, _} <- Parsed]),
+                            logger:notice(
+                                "[CAMPAIGN-ASSUMEUTXO] loaded ~B entries "
+                                "from ~s heights=~p",
+                                [length(Parsed), Path, Heights]),
+                            ok
+                    end
+            end
+    end.
+
+parse_campaign_entries(RawEntries) ->
+    parse_campaign_entries(RawEntries, []).
+
+parse_campaign_entries([], Acc) ->
+    {ok, lists:reverse(Acc)};
+parse_campaign_entries([Raw | Rest], Acc) ->
+    case parse_campaign_entry(Raw) of
+        {ok, Height, Data} -> parse_campaign_entries(Rest, [{Height, Data} | Acc]);
+        {error, _} = Err -> Err
+    end.
+
+%% First four keys required (prompt schema); base_mtp/base_header/
+%% chainwork are accepted but currently unused by beamchain's chokepoint
+%% (mirrors the shape of mainnet_assumeutxo/0's entries above, which
+%% likewise carry only these three fields) — parsed-and-ignored rather
+%% than rejected, so a shared fixture built for other impls still loads.
+parse_campaign_entry(#{<<"height">> := Height,
+                        <<"blockhash">> := BlockHashHex,
+                        <<"hash_serialized">> := HashSerHex,
+                        <<"m_chain_tx_count">> := ChainTxCount} = Entry)
+        when is_integer(Height), Height > 0,
+             is_integer(ChainTxCount), ChainTxCount >= 0 ->
+    case {parse_display_hex32(BlockHashHex), parse_display_hex32(HashSerHex)} of
+        {{ok, BlockHash}, {ok, UtxoHash}} ->
+            {ok, Height, #{block_hash => BlockHash,
+                           utxo_hash => UtxoHash,
+                           chain_tx_count => ChainTxCount}};
+        _ ->
+            {error, {campaign_assumeutxo_invalid_hex, Entry}}
+    end;
+parse_campaign_entry(Entry) ->
+    {error, {campaign_assumeutxo_missing_or_invalid_fields, Entry}}.
+
+%% Validate + convert a display-order hex hash (as printed by Core /
+%% shipped in the campaign JSON) to the same INTERNAL byte-order binary
+%% the built-in tables use (display_hex_to_bin/1's convention — see its
+%% doc comment below). Rejects anything that isn't exactly 64 hex chars.
+parse_display_hex32(HexBin) when is_binary(HexBin), byte_size(HexBin) =:= 64 ->
+    HexStr = binary_to_list(HexBin),
+    case lists:all(fun is_hex_char/1, HexStr) of
+        true -> {ok, display_hex_to_bin(HexStr)};
+        false -> error
+    end;
+parse_display_hex32(_) ->
+    error.
+
+is_hex_char(C) when C >= $0, C =< $9 -> true;
+is_hex_char(C) when C >= $a, C =< $f -> true;
+is_hex_char(C) when C >= $A, C =< $F -> true;
+is_hex_char(_) -> false.
+
+%% Refuse a campaign file that has two entries at the same height, or two
+%% entries with the same block hash (after byte-order conversion).
+check_no_internal_duplicates(Parsed) ->
+    Heights = [H || {H, _} <- Parsed],
+    Hashes  = [maps:get(block_hash, D) || {_, D} <- Parsed],
+    DupHeights = Heights -- lists:usort(Heights),
+    DupHashes  = Hashes -- lists:usort(Hashes),
+    case {DupHeights, DupHashes} of
+        {[], []} -> ok;
+        _ -> {error, {campaign_assumeutxo_duplicate, DupHeights, DupHashes}}
+    end.
+
+%% Refuse any campaign entry whose height or blockhash matches a built-in
+%% (production) entry on ANY network's static table — mainnet, testnet4,
+%% or regtest — not just whichever network happens to be configured to
+%% run. Campaign data may never override/shadow a production hash, and
+%% checking every network (rather than resolving "the" running network,
+%% which requires duplicating beamchain_config's env/app-env resolution
+%% order at a point in boot before that gen_server exists) is strictly
+%% more conservative: it can only reject more, never accept a collision
+%% it should have caught. Deliberately excludes the *runtime* regtest
+%% registry (register_regtest_assumeutxo/2,4) — that one is expected to
+%% be freely reassigned by tests/operators and isn't "production".
+check_no_builtin_collision(Parsed) ->
+    BuiltIn = maps:merge(maps:merge(mainnet_assumeutxo(), testnet4_assumeutxo()),
+                          regtest_assumeutxo()),
+    BuiltInHashes = sets:from_list(
+        [maps:get(block_hash, V) || V <- maps:values(BuiltIn)]),
+    Collisions = [H || {H, #{block_hash := BH}} <- Parsed,
+                        (maps:is_key(H, BuiltIn)
+                         orelse sets:is_element(BH, BuiltInHashes))],
+    case Collisions of
+        [] -> ok;
+        _  -> {error, {campaign_assumeutxo_collision, Collisions}}
+    end.
+
+install_campaign_entries(Parsed) ->
+    ensure_campaign_au_table(),
+    lists:foreach(fun({Height, Data}) ->
+        ets:insert(?CAMPAIGN_AU_TABLE, {Height, Data})
+    end, Parsed),
+    ok.
+
+ensure_campaign_au_table() ->
+    case ets:whereis(?CAMPAIGN_AU_TABLE) of
+        undefined ->
+            try ets:new(?CAMPAIGN_AU_TABLE,
+                        [set, public, named_table, {keypos, 1}])
+            catch error:badarg -> ?CAMPAIGN_AU_TABLE end;
+        _ ->
+            ?CAMPAIGN_AU_TABLE
+    end.
+
+%% @doc Snapshot of the current campaign registry as a height-keyed map.
+%% Returns #{} (not a lookup/crash) when the table was never created —
+%% i.e. whenever HASHHOG_CAMPAIGN_ASSUMEUTXO was unset/empty at startup.
+%% This is what makes effective_assumeutxo/1 bit-identical when the flag
+%% is off: maps:merge(X, #{}) =:= X.
+-spec campaign_assumeutxo_registry() -> map().
+campaign_assumeutxo_registry() ->
+    case ets:whereis(?CAMPAIGN_AU_TABLE) of
+        undefined -> #{};
+        _ -> maps:from_list(ets:tab2list(?CAMPAIGN_AU_TABLE))
+    end.
+
+%% @doc Remove all campaign AssumeUTXO registrations (test helper).
+-spec clear_campaign_assumeutxo() -> ok.
+clear_campaign_assumeutxo() ->
+    case ets:whereis(?CAMPAIGN_AU_TABLE) of
+        undefined -> ok;
+        _ -> ets:delete_all_objects(?CAMPAIGN_AU_TABLE), ok
+    end.
 
 %%% -------------------------------------------------------------------
 %%% assumeUTXO snapshot parameters
@@ -685,14 +898,40 @@ testnet4_assumeutxo() ->
         }
     }.
 
-%% Regtest assumeutxo - height 110 (useful for testing after coinbase maturity)
+%% Regtest assumeutxo snapshots — Core-parity entries mirrored verbatim
+%% from bitcoin-core/src/kernel/chainparams.cpp CRegTestParams
+%% m_assumeutxo_data (heights 110 / 200 / 299). These are the fixed
+%% snapshots feature_assumeutxo.py (and this repo's tools/boot-smoke.sh)
+%% builds against, so a regtest node must recognize them out of the box —
+%% unlike mainnet/testnet4, regtest has no other source of "real" base
+%% hashes, but these three ARE Core's own regtest values, not placeholders.
+%% Additional ad-hoc regtest snapshots (e.g. for a one-off test harness)
+%% still go through register_regtest_assumeutxo/2,4 below; entries there
+%% take precedence over these on height collision (see
+%% effective_assumeutxo/1).
 regtest_assumeutxo() ->
     #{
         %% Height 110 - allows spending first coinbase
         110 => #{
-            block_hash => <<0:256>>,  %% Placeholder - must be computed
-            utxo_hash => <<0:256>>,   %% Placeholder - must be computed
-            chain_tx_count => 110
+            block_hash => display_hex_to_bin(
+                "6affe030b7965ab538f820a56ef56c8149b7dc1d1c144af57113be080db7c397"),
+            utxo_hash => display_hex_to_bin(
+                "b952555c8ab81fec46f3d4253b7af256d766ceb39fb7752b9d18cdf4a0141327"),
+            chain_tx_count => 111
+        },
+        200 => #{
+            block_hash => display_hex_to_bin(
+                "385901ccbd69dff6bbd00065d01fb8a9e464dede7cfe0372443884f9b1dcf6b9"),
+            utxo_hash => display_hex_to_bin(
+                "17dcc016d188d16068907cdeb38b75691a118d43053b8cd6a25969419381d13a"),
+            chain_tx_count => 201
+        },
+        299 => #{
+            block_hash => display_hex_to_bin(
+                "7cc695046fec709f8c9394b6f928f81e81fd3ac20977bb68760fa1faa7916ea2"),
+            utxo_hash => display_hex_to_bin(
+                "d2b051ff5e8eef46520350776f4100dd710a63447a8e01d917e92e79751a63e2"),
+            chain_tx_count => 334
         }
     }.
 

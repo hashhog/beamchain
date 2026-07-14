@@ -548,22 +548,37 @@ test_g12_merge_never_triggered() ->
     ?assert(true).   %% fix: call merge_chainstates after background tip == snapshot base
 
 %%% ===================================================================
-%%% Regression: regtest assumeutxo placeholder hashes
+%%% FIXED (porter wave, Change-1): regtest assumeutxo Core-parity entries
 %%% ===================================================================
 
-%% The regtest assumeutxo entry (height 110) uses <<0:256>> for both
-%% block_hash and utxo_hash (beamchain_chain_params.erl:560-568).
-%% Loading a real regtest snapshot at height 110 will always fail the
-%% hash-serialized check because the stored utxo_hash is all-zeros.
-%% Document this as an operational correctness issue.
+%% Audit-flip: this test used to assert the height-110 regtest entry was
+%% <<0:256>> placeholder zeros for both block_hash and utxo_hash
+%% (beamchain_chain_params.erl), which meant loading a real regtest
+%% snapshot at that height always failed the hash-serialized check. Fixed
+%% by mirroring bitcoin-core/src/kernel/chainparams.cpp CRegTestParams
+%% m_assumeutxo_data (heights 110/200/299) verbatim into regtest_assumeutxo/0.
+%% Per the W138 audit-flip convention: this test now asserts the
+%% corrected (Core-parity) values and would fail again if the fix ever
+%% regressed.
 regtest_placeholder_test() ->
     #{assumeutxo := M} = beamchain_chain_params:params(regtest),
     ?assert(maps:is_key(110, M)),
-    #{block_hash := BH, utxo_hash := UH} = maps:get(110, M),
-    %% Both are placeholder zeros — a real snapshot will always fail
-    %% the content-hash gate.
-    ?assertEqual(<<0:256>>, BH),
-    ?assertEqual(<<0:256>>, UH).
+    ?assert(maps:is_key(200, M)),
+    ?assert(maps:is_key(299, M)),
+    #{block_hash := BH, utxo_hash := UH, chain_tx_count := C} = maps:get(110, M),
+    %% Core-parity values (chainparams.cpp:610-612), no longer placeholder
+    %% zeros.
+    ?assertNotEqual(<<0:256>>, BH),
+    ?assertNotEqual(<<0:256>>, UH),
+    ?assertEqual(
+       display_hex_to_bin(
+         "6affe030b7965ab538f820a56ef56c8149b7dc1d1c144af57113be080db7c397"),
+       BH),
+    ?assertEqual(
+       display_hex_to_bin(
+         "b952555c8ab81fec46f3d4253b7af256d766ceb39fb7752b9d18cdf4a0141327"),
+       UH),
+    ?assertEqual(111, C).
 
 %%% ===================================================================
 %%% Positive: assumeutxo table completeness (mainnet)
@@ -593,3 +608,22 @@ testnet4_entries_non_zero_test() ->
         ?assertNotEqual(<<0:256>>, BH),
         ?assertNotEqual(<<0:256>>, UH)
     end, maps:to_list(M)).
+
+%%% ===================================================================
+%%% Test helpers (local copy — mirrors beamchain_snapshot_tests.erl's
+%%% display_hex_to_bin/1, which mirrors the private helper of the same
+%%% name in beamchain_chain_params.erl)
+%%% ===================================================================
+
+display_hex_to_bin(HexStr) ->
+    list_to_binary(lists:reverse(binary_to_list(hex_to_bin(HexStr)))).
+
+hex_to_bin(HexStr) ->
+    hex_to_bin(HexStr, <<>>).
+hex_to_bin([], Acc) -> Acc;
+hex_to_bin([H1, H2 | Rest], Acc) ->
+    Byte = (hex_val(H1) bsl 4) bor hex_val(H2),
+    hex_to_bin(Rest, <<Acc/binary, Byte>>).
+hex_val(C) when C >= $0, C =< $9 -> C - $0;
+hex_val(C) when C >= $a, C =< $f -> C - $a + 10;
+hex_val(C) when C >= $A, C =< $F -> C - $A + 10.
