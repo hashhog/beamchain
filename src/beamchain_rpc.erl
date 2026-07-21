@@ -9387,12 +9387,31 @@ rpc_dumpprivkey(_, _WalletName) ->
 %% For default wallet (<<>> or URL without wallet path), use registered beamchain_wallet.
 %% For named wallets, look up in wallet_sup registry.
 resolve_wallet(<<>>) ->
-    %% Default wallet - try registered name first, then wallet_sup
-    case whereis(beamchain_wallet) of
-        undefined ->
-            beamchain_wallet_sup:get_wallet(<<>>);
-        Pid ->
-            {ok, Pid}
+    %% Core parity (wallet/rpc/util.cpp GetWalletForJSONRPCRequest ->
+    %% GetDefaultWallet): a request with NO /wallet/<name> URI-path resolves to
+    %% the SOLE loaded wallet when exactly one is loaded. Previously beamchain
+    %% always routed the base URL to the bootstrap `beamchain_wallet` singleton
+    %% (a blank default process that node_sup starts but that createwallet never
+    %% seeds — the RPC surface only ever creates registry-managed wallets), so a
+    %% node with a single NAMED wallet loaded rejected every pathless wallet RPC
+    %% with "No wallet loaded" and its funds were unreachable via the base URL.
+    %% The set of "loaded wallets" is the wallet_sup registry (== listwallets).
+    case beamchain_wallet_sup:list_wallets() of
+        [Only] ->
+            beamchain_wallet_sup:get_wallet(Only);
+        [] ->
+            %% No registry-managed wallet loaded: fall back to the registered
+            %% default (bootstrap singleton, or a default wallet created under
+            %% the <<>> name). Blank singleton -> callers surface the usual
+            %% "No wallet loaded".
+            case whereis(beamchain_wallet) of
+                undefined -> beamchain_wallet_sup:get_wallet(<<>>);
+                Pid       -> {ok, Pid}
+            end;
+        _Many ->
+            %% Core: >1 loaded wallets on a pathless request is an error; the
+            %% caller must select via /wallet/<name>.
+            {error, wallet_not_found}
     end;
 resolve_wallet(Name) when is_binary(Name) ->
     beamchain_wallet_sup:get_wallet(Name).
@@ -12873,7 +12892,17 @@ wcfp_fee_rate(Options) ->
 
 wcfp_select_coins(Pid, ManualInputs, OutputTotal, FeeRate) ->
     %% Wallet-owned UTXOs minus the manual inputs and any locked coins.
-    All = beamchain_wallet:get_wallet_utxos(),
+    %% Use the maturity-filtered spendable set so auto coin-selection never
+    %% picks an immature coinbase (Core's wallet only offers mature coins to
+    %% CreateTransaction; spending one is rejected at broadcast with
+    %% premature_spend_of_coinbase).  Mirror the sendtoaddress path
+    %% (rpc_sendtoaddress_spend): fall back to the full set only when the chain
+    %% tip is not yet known.  Manual inputs are honoured verbatim regardless
+    %% (Core lets a caller name an immature input explicitly).
+    All = case beamchain_chainstate:get_tip_height() of
+        {ok, TipHeight} -> beamchain_wallet:get_spendable_utxos(TipHeight);
+        not_found       -> beamchain_wallet:get_wallet_utxos()
+    end,
     ManualKeys = [{Txid, Vout} || {Txid, Vout, _} <- ManualInputs],
     Locked = sets:from_list(beamchain_wallet:list_locked_coins(Pid)),
     Available = lists:filter(fun({Txid, Vout, _U}) ->
