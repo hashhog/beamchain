@@ -1887,8 +1887,15 @@ select_coins(Target, FeeRate, Available) ->
 bnb_select(Target, FeeRate, Utxos) ->
     %% Cost of spending each UTXO
     CostPerInput = round(FeeRate * ?P2WPKH_INPUT_WEIGHT / 4),
-    %% Target with base tx fee (header + 1 output, no change)
-    BaseFee = round(FeeRate * 40),  %% ~40 vbytes for tx overhead + one output
+    %% Target with base tx fee (header + 1 output, no change).
+    %% Tx overhead is ~11 vB (version 4 + locktime 4 + in/out varints + segwit
+    %% marker/flag 0.5) and a P2WPKH output is 31 vB, so overhead+one-output is
+    %% ~42 vB, not the 40 the old constant used — the 2-vB undershoot made the
+    %% fee land BELOW fee_rate*vsize (Core over-estimates to stay at/above the
+    %% requested feerate; the P2WPKH_INPUT_WEIGHT=272 already assumes a max
+    %% 72-byte sig, so 42 keeps the whole estimate conservative, i.e. >= the
+    %% real finalized vsize).
+    BaseFee = round(FeeRate * 42),  %% ~11 vB overhead + one 31-vB P2WPKH output
     EffTarget = Target + BaseFee,
     %% Dust threshold — if we can get within this range, skip change
     DustLimit = 546,
@@ -1931,8 +1938,12 @@ bnb_search([{_Txid, _Vout, Utxo} = Coin | Rest], Target, CostPerInput,
 %% Knapsack: pick smallest UTXOs that cover target + fees + change output.
 knapsack_select(Target, FeeRate, Sorted) ->
     CostPerInput = round(FeeRate * ?P2WPKH_INPUT_WEIGHT / 4),
-    %% Base fee includes change output (~31 vbytes for P2WPKH change)
-    BaseFee = round(FeeRate * 71),  %% ~40 overhead + ~31 change output
+    %% Base fee includes change output (~31 vbytes for P2WPKH change).
+    %% ~11 vB tx overhead + 31 vB dest output + 31 vB P2WPKH change = 73 vB
+    %% (the old 71 undershot overhead by ~2 vB, pushing the fee just under
+    %% fee_rate*vsize; P2WPKH_INPUT_WEIGHT=272 already assumes a max 72-byte
+    %% sig, so 73 keeps the estimate at/above the real finalized vsize).
+    BaseFee = round(FeeRate * 73),  %% ~11 overhead + 31 dest + 31 change output
     EffTarget = Target + BaseFee,
     %% Reverse to pick smallest first (Sorted is desc)
     SmallFirst = lists:reverse(Sorted),
