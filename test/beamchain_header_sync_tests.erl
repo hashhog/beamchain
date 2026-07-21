@@ -279,6 +279,61 @@ classify_deep_fork_pruned_rejects_deep_fork_test() ->
                  beamchain_header_sync:classify_deep_fork(5000, 100, 50, true)).
 
 %%% ===================================================================
+%%% Probe rotation: select_next_probe_peer/2 (2026-07-20 header-sync
+%%% wedge fix, D3). On getheaders_timeout the sync loop must rotate to a
+%%% peer NOT yet attempted this round — regardless of the (possibly
+%%% handshake-stale) recorded heights — and only report `none` (falling
+%%% back to the height map / mark-complete path) after every connected
+%%% peer has been attempted.
+%%% ===================================================================
+
+select_next_probe_peer_empty_test() ->
+    ?assertEqual(none,
+                 beamchain_header_sync:select_next_probe_peer(#{}, [])).
+
+select_next_probe_peer_all_attempted_test() ->
+    P1 = list_to_pid("<0.901.0>"),
+    P2 = list_to_pid("<0.902.0>"),
+    Heights = #{P1 => 100, P2 => 200},
+    ?assertEqual(none,
+                 beamchain_header_sync:select_next_probe_peer(
+                     Heights, [P2, P1])).
+
+%% Rotation must skip already-attempted peers even when they have the
+%% highest recorded height (that peer just timed out on us).
+select_next_probe_peer_skips_attempted_test() ->
+    P1 = list_to_pid("<0.903.0>"),
+    P2 = list_to_pid("<0.904.0>"),
+    P3 = list_to_pid("<0.905.0>"),
+    Heights = #{P1 => 300, P2 => 200, P3 => 100},
+    %% P1 (highest) already attempted → pick P2 (next highest)
+    ?assertEqual({ok, P2},
+                 beamchain_header_sync:select_next_probe_peer(
+                     Heights, [P1])),
+    %% P1 and P2 attempted → pick P3
+    ?assertEqual({ok, P3},
+                 beamchain_header_sync:select_next_probe_peer(
+                     Heights, [P2, P1])).
+
+%% THE FIX'S KEY PROPERTY: peers whose recorded height does NOT exceed
+%% ours are still probe candidates. Heights are frozen at the version
+%% handshake, so post-IBD every peer can look equal-height-to-us while
+%% the network is really ahead — the pre-fix path (select_best_peer via
+%% pick_sync_peer_and_start) returned none here and logged "already at
+%% tip, marking complete", wedging the node.
+select_next_probe_peer_ignores_stale_heights_test() ->
+    P1 = list_to_pid("<0.906.0>"),
+    P2 = list_to_pid("<0.907.0>"),
+    Heights = #{P1 => 0, P2 => 0},
+    Result = beamchain_header_sync:select_next_probe_peer(Heights, []),
+    ?assertMatch({ok, P} when P =:= P1 orelse P =:= P2, Result),
+    {ok, First} = Result,
+    %% And after the first times out, the OTHER one is chosen.
+    {ok, Second} =
+        beamchain_header_sync:select_next_probe_peer(Heights, [First]),
+    ?assertNotEqual(First, Second).
+
+%%% ===================================================================
 %%% Internal helpers (duplicated from module for testing)
 %%% ===================================================================
 
