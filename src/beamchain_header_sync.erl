@@ -36,7 +36,8 @@
 
 %% Test-only exports: pure internal decision functions.
 -ifdef(TEST).
--export([classify_deep_fork/4]).
+-export([classify_deep_fork/4,
+         select_next_probe_peer/2]).
 -endif.
 
 -define(SERVER, ?MODULE).
@@ -91,7 +92,13 @@
     %% Populated when the peer's chain has not yet demonstrated sufficient
     %% cumulative work (mirrors Bitcoin Core's HeadersSyncState per peer).
     %% undefined = either past min_chainwork (skip pipeline) or no active sync.
-    hss_state = undefined   :: term() | undefined
+    hss_state = undefined   :: term() | undefined,
+    %% Peers already probed in the current probe round (getheaders sent,
+    %% no headers yielded). On getheaders_timeout we rotate to a peer NOT
+    %% in this list instead of consulting the possibly-stale height map;
+    %% only when every connected peer has been attempted do we fall back
+    %% to pick_sync_peer_and_start (which may mark complete).
+    probe_attempted = []    :: [pid()]
 }).
 
 %%% ===================================================================
@@ -193,21 +200,45 @@ handle_cast(stop_sync, State) ->
 handle_cast({headers, Peer, Headers}, #state{status = syncing,
                                               sync_peer = Peer} = State) ->
     State2 = cancel_timer(State),
+    %% Clear peer_manager's pending-getheaders tracking (2-min no-response
+    %% eviction in check_peer_staleness) — this peer answered.
+    catch beamchain_peer_manager:mark_headers_received(Peer),
+    %% Any reply from the sync/probed peer ends the current probe round.
+    State3 = State2#state{probe_attempted = []},
     %% Anti-DoS: Validate PoW and continuity before any processing
-    case check_headers_pow_and_continuity(Headers, State2) of
+    case check_headers_pow_and_continuity(Headers, State3) of
         ok ->
-            State3 = process_headers(Headers, Peer, State2),
-            {noreply, State3};
+            State4 = process_headers(Headers, Peer, State3),
+            {noreply, State4};
         {error, invalid_pow} ->
             logger:warning("header_sync: peer ~p sent header with invalid PoW", [Peer]),
-            {noreply, handle_misbehaving_peer(Peer, 100, State2)};
+            {noreply, handle_misbehaving_peer(Peer, 100, State3)};
         {error, non_continuous} ->
             logger:warning("header_sync: peer ~p sent non-continuous headers", [Peer]),
-            {noreply, handle_misbehaving_peer(Peer, 20, State2)}
+            {noreply, handle_misbehaving_peer(Peer, 20, State3)}
     end;
-handle_cast({headers, _Peer, _Headers}, State) ->
-    %% Headers from a peer we're not syncing from, ignore
-    {noreply, State};
+handle_cast({headers, Peer, Headers}, #state{status = Status} = State)
+  when Status =:= idle; Status =:= complete ->
+    %% BIP-130 announcement ingestion. We send `sendheaders` to every peer,
+    %% so post-IBD tip announcements arrive as UNSOLICITED headers messages.
+    %% Core's ProcessHeadersMessage accepts announced headers from ANY peer
+    %% at ANY time (net_processing.cpp) — the sync_peer guard above is for
+    %% IBD batch sequencing only and must not gate announcement ingestion.
+    %% Previously these were silently dropped, leaving the node deaf to new
+    %% blocks after IBD (2026-07-20 wedge: 92 blocks behind, 14h, 10 peers).
+    catch beamchain_peer_manager:mark_headers_received(Peer),
+    handle_announced_headers(Peer, Headers, State);
+handle_cast({headers, Peer, Headers}, State) ->
+    %% status = syncing but sender is not our sync peer. Don't interleave a
+    %% foreign batch with the active sequential sync — but don't lose the
+    %% information either: refresh the peer's known height (so peer
+    %% selection stops lying) and log instead of silently dropping.
+    catch beamchain_peer_manager:mark_headers_received(Peer),
+    State2 = note_announced_peer_height(Peer, Headers, State),
+    logger:debug("header_sync: ~B headers from non-sync peer ~p during "
+                 "active sync — height noted, batch deferred",
+                 [length(Headers), Peer]),
+    {noreply, State2};
 
 handle_cast({peer_connected, Peer, Info}, State) ->
     PeerHeight = maps:get(start_height, Info, 0),
@@ -246,45 +277,58 @@ handle_cast({peer_disconnected, Peer}, State) ->
 %% current locator regardless of what peer_heights says about this peer.
 %% Only runs when we're not in the middle of an active sync — we don't
 %% want to stomp on an in-progress handshake with a different sync_peer.
-handle_cast({probe_peer, Peer}, #state{status = Status,
-                                        tip_height = TipHeight,
-                                        tip_hash = TipHash} = State)
+handle_cast({probe_peer, Peer}, #state{status = Status} = State)
   when Status =:= idle; Status =:= complete ->
-    Locator = build_block_locator(TipHeight, TipHash),
-    Msg = #{version => ?PROTOCOL_VERSION,
-            locators => Locator,
-            stop_hash => <<0:256>>},
-    beamchain_peer:send_message(Peer, {getheaders, Msg}),
-    logger:info("header_sync: probing peer ~p for new headers "
-                "(tip ~B, prior status ~p)",
-                [Peer, TipHeight, Status]),
-    State2 = cancel_timer(State),
-    TimerRef = erlang:send_after(?GETHEADERS_TIMEOUT, self(),
-                                 getheaders_timeout),
-    {noreply, State2#state{status = syncing,
-                            sync_peer = Peer,
-                            timer_ref = TimerRef,
-                            headers_received = 0}};
-handle_cast({probe_peer, _Peer}, State) ->
+    %% Fresh probe round: reset the attempted set so timeout rotation can
+    %% walk the full peer set again.
+    {noreply, start_probe(Peer, State#state{probe_attempted = []})};
+handle_cast({probe_peer, Peer}, State) ->
+    %% A probe arriving while a sync/probe is in flight. Log it — a silent
+    %% drop here hid the stale-tip watchdog's no-op recovery (every probe
+    %% landing inside another probe's 20s window vanished without trace).
+    logger:info("header_sync: probe of ~p dropped — sync already in "
+                "progress (status ~p, sync_peer ~p)",
+                [Peer, State#state.status, State#state.sync_peer]),
     {noreply, State};
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info(getheaders_timeout, #state{status = syncing} = State) ->
-    logger:debug("header_sync: getheaders timed out from ~p",
-                 [State#state.sync_peer]),
-    %% Try a different peer
+handle_info(getheaders_timeout, #state{status = syncing,
+                                        hss_state = undefined} = State) ->
     OldPeer = State#state.sync_peer,
-    State2 = State#state{sync_peer = undefined, timer_ref = undefined},
-    State3 = pick_sync_peer_and_start(State2),
-    case State3#state.sync_peer of
-        OldPeer ->
-            %% Same peer picked again (only one available), retry anyway
-            {noreply, State3};
-        _ ->
-            {noreply, State3}
+    logger:info("header_sync: getheaders timed out from ~p", [OldPeer]),
+    %% Rotate to a DIFFERENT peer round-robin instead of consulting the
+    %% (possibly stale) height map. The old path went through
+    %% pick_sync_peer_and_start, whose frozen peer_heights concluded
+    %% "already at tip, marking complete" whenever the single probed peer
+    %% was mute — turning one unresponsive peer into a wedged node.
+    Attempted = case OldPeer =/= undefined andalso
+                     not lists:member(OldPeer, State#state.probe_attempted) of
+        true  -> [OldPeer | State#state.probe_attempted];
+        false -> State#state.probe_attempted
+    end,
+    State2 = State#state{sync_peer = undefined, timer_ref = undefined,
+                          probe_attempted = Attempted},
+    case select_next_probe_peer(State2#state.peer_heights, Attempted) of
+        {ok, NextPeer} ->
+            {noreply, start_probe(NextPeer, State2)};
+        none ->
+            %% Every connected peer probed this round without yielding
+            %% headers — only now consult the height map (which may
+            %% legitimately mark us complete).
+            {noreply, pick_sync_peer_and_start(
+                        State2#state{probe_attempted = []})}
     end;
+handle_info(getheaders_timeout, #state{status = syncing} = State) ->
+    %% HSS presync/redownload pipeline active — it is peer-specific (salted
+    %% hasher), so discard it and reselect via the height map, which lets
+    %% maybe_init_hss re-initialise for the newly chosen peer.
+    logger:debug("header_sync: getheaders timed out from ~p (hss active)",
+                 [State#state.sync_peer]),
+    State2 = State#state{sync_peer = undefined, timer_ref = undefined,
+                          hss_state = undefined},
+    {noreply, pick_sync_peer_and_start(State2)};
 handle_info(getheaders_timeout, State) ->
     {noreply, State#state{timer_ref = undefined}};
 
@@ -344,6 +388,50 @@ select_best_peer(PeerHeights, OurHeight) ->
             {ok, BestPid, BestHeight}
     end.
 
+%% Pick the next peer to probe in the current round: any connected peer
+%% not yet attempted, preferring the highest recorded height. Unlike
+%% select_best_peer this does NOT require the peer to be ahead of us —
+%% recorded heights are handshake-time values and may be stale.
+-spec select_next_probe_peer(#{pid() => non_neg_integer()}, [pid()]) ->
+    {ok, pid()} | none.
+select_next_probe_peer(PeerHeights, Attempted) ->
+    Candidates = [{P, H} || {P, H} <- maps:to_list(PeerHeights),
+                            not lists:member(P, Attempted)],
+    case Candidates of
+        [] -> none;
+        _ ->
+            {Best, _H} = lists:foldl(
+                fun({P, H}, {_BP, BH}) when H > BH -> {P, H};
+                   (_, Acc) -> Acc
+                end, hd(Candidates), tl(Candidates)),
+            {ok, Best}
+    end.
+
+%% Send an unconditional GETHEADERS probe to Peer from our real tip and
+%% arm the timeout. Adds the peer to the current round's attempted set.
+start_probe(Peer, #state{tip_height = TipHeight, tip_hash = TipHash,
+                          probe_attempted = Attempted} = State) ->
+    Locator = build_block_locator(TipHeight, TipHash),
+    Msg = #{version => ?PROTOCOL_VERSION,
+            locators => Locator,
+            stop_hash => <<0:256>>},
+    beamchain_peer:send_message(Peer, {getheaders, Msg}),
+    %% Arm peer_manager's 2-min no-headers-response eviction so a zombie
+    %% peer (socket open, answers pings, never serves headers) is rotated
+    %% out instead of winning the probe draw forever.
+    catch beamchain_peer_manager:mark_getheaders_sent(Peer),
+    logger:info("header_sync: probing peer ~p for new headers (tip ~B)",
+                [Peer, TipHeight]),
+    State2 = cancel_timer(State),
+    TimerRef = erlang:send_after(?GETHEADERS_TIMEOUT, self(),
+                                 getheaders_timeout),
+    State2#state{status = syncing,
+                 sync_peer = Peer,
+                 timer_ref = TimerRef,
+                 headers_received = 0,
+                 hss_state = undefined,
+                 probe_attempted = [Peer | lists:delete(Peer, Attempted)]}.
+
 %% Build block locator and send getheaders to the sync peer.
 %% When an HSS state is active (presync/redownload pipeline), use its locator
 %% (which may resume from m_last_header_received or m_redownload_buffer_last_hash
@@ -369,6 +457,9 @@ send_getheaders(#state{sync_peer = Peer, tip_height = TipHeight,
         stop_hash => <<0:256>>
     },
     beamchain_peer:send_message(Peer, {getheaders, Msg}),
+    %% Arm peer_manager's 2-min no-headers-response eviction (cleared by
+    %% mark_headers_received when any headers message arrives).
+    catch beamchain_peer_manager:mark_getheaders_sent(Peer),
     %% Set timeout
     TimerRef = erlang:send_after(?GETHEADERS_TIMEOUT, self(),
                                  getheaders_timeout),
@@ -446,7 +537,8 @@ process_headers(Headers, Peer, #state{hss_state = HssSt} = State)
                 [] -> State2;
                 _  ->
                     case validate_and_store_headers(ReadyHeaders, State2) of
-                        {ok, S} -> S;
+                        {ok, S} ->
+                            note_peer_height(Peer, S#state.tip_height, S);
                         {error, _Reason, S} ->
                             %% Already logged; treat as misbehaving
                             beamchain_peer:add_misbehavior(Peer, 20),
@@ -506,6 +598,88 @@ process_headers(Headers, Peer, State) ->
 %% Check if a header connects to our current chain tip
 headers_connect_to_chain(Header, #state{tip_hash = TipHash}) ->
     Header#block_header.prev_hash =:= TipHash.
+
+%%% ===================================================================
+%%% Internal: BIP-130 announcement ingestion
+%%% ===================================================================
+
+%% Process an unsolicited headers message received while idle/complete.
+%% Route it through the normal pipeline exactly like a solicited batch:
+%% connecting headers are validated + stored (advancing the tip and, via
+%% notify_headers_complete, triggering block download); unconnecting ones
+%% go through check_reorg / handle_unconnecting_headers, which replies
+%% with a getheaders to the announcing peer from our real tip (Core's
+%% MaybeSendGetHeaders-on-unconnecting behavior).
+handle_announced_headers(_Peer, [], State) ->
+    {noreply, State};
+handle_announced_headers(Peer, Headers, State) ->
+    LastHash = beamchain_serialize:block_hash(lists:last(Headers)),
+    case beamchain_db:get_block_index_by_hash(LastHash) of
+        {ok, #{height := KnownHeight}} ->
+            %% Re-announcement of headers we already have (e.g. several
+            %% peers announcing the same new block). Nothing to process,
+            %% but refresh the peer's known height so peer selection has
+            %% live data instead of the handshake-time snapshot.
+            {noreply, note_peer_height(Peer, KnownHeight, State)};
+        not_found ->
+            case check_headers_pow_and_continuity(Headers, State) of
+                ok ->
+                    %% Promote the announcer to sync peer for this batch.
+                    State2 = cancel_timer(State),
+                    State3 = State2#state{status = syncing,
+                                           sync_peer = Peer,
+                                           hss_state = undefined,
+                                           headers_received = 0},
+                    {noreply, process_headers(Headers, Peer, State3)};
+                {error, invalid_pow} ->
+                    logger:warning("header_sync: announced headers from ~p "
+                                   "have invalid PoW", [Peer]),
+                    beamchain_peer:add_misbehavior(Peer, 100),
+                    {noreply, remove_peer_state(Peer, State)};
+                {error, non_continuous} ->
+                    logger:warning("header_sync: announced headers from ~p "
+                                   "are non-continuous", [Peer]),
+                    beamchain_peer:add_misbehavior(Peer, 20),
+                    {noreply, remove_peer_state(Peer, State)}
+            end
+    end.
+
+%% Refresh a peer's recorded height in both the local peer_heights map and
+%% peer_manager's peer_entry.best_height (previously dead code — zero
+%% callers, so every height was frozen at the version-handshake value and
+%% all height-gated selectors lied after IBD). Mirrors Core's
+%% UpdateBlockAvailability / UpdatePeerStateForReceivedHeaders.
+note_peer_height(Peer, Height, #state{peer_heights = PeerHeights} = State) ->
+    Recorded = maps:get(Peer, PeerHeights, 0),
+    case Height > Recorded of
+        true ->
+            catch beamchain_peer_manager:update_peer_height(Peer, Height),
+            State#state{peer_heights = maps:put(Peer, Height, PeerHeights)};
+        false ->
+            State
+    end.
+
+%% Best-effort height note for a batch we can't process right now (from a
+%% non-sync peer during an active sync). If the batch's last header is
+%% already in our index, record that height; else if its first header
+%% connects to a known block, the peer knows at least that height plus
+%% the batch length.
+note_announced_peer_height(_Peer, [], State) ->
+    State;
+note_announced_peer_height(Peer, Headers, State) ->
+    LastHash = beamchain_serialize:block_hash(lists:last(Headers)),
+    case beamchain_db:get_block_index_by_hash(LastHash) of
+        {ok, #{height := H}} ->
+            note_peer_height(Peer, H, State);
+        not_found ->
+            FirstPrev = (hd(Headers))#block_header.prev_hash,
+            case beamchain_db:get_block_index_by_hash(FirstPrev) of
+                {ok, #{height := H0}} ->
+                    note_peer_height(Peer, H0 + length(Headers), State);
+                not_found ->
+                    State
+            end
+    end.
 
 %% Check if unconnecting headers represent a reorg (fork with more work).
 %% If the first header's prev_hash points to a known block in our index,
@@ -639,7 +813,10 @@ process_connecting_headers(Headers, Peer, State) ->
         {ok, State2} ->
             NumReceived = length(Headers),
             Total = State2#state.headers_received + NumReceived,
-            State3 = State2#state{headers_received = Total},
+            %% A peer serving connecting headers demonstrably knows the
+            %% chain up to our new tip — refresh its recorded height.
+            State2b = note_peer_height(Peer, State2#state.tip_height, State2),
+            State3 = State2b#state{headers_received = Total},
             report_progress(State3),
             case NumReceived >= ?MAX_HEADERS_RESULTS of
                 true ->
@@ -767,10 +944,12 @@ update_peer_last_header(Peer, Hash, #state{peer_header_state = PeerStates} = Sta
 
 %% Remove all state for a peer
 remove_peer_state(Peer, #state{peer_header_state = PeerStates,
-                                peer_heights = PeerHeights} = State) ->
+                                peer_heights = PeerHeights,
+                                probe_attempted = Attempted} = State) ->
     State#state{
         peer_header_state = maps:remove(Peer, PeerStates),
-        peer_heights = maps:remove(Peer, PeerHeights)
+        peer_heights = maps:remove(Peer, PeerHeights),
+        probe_attempted = lists:delete(Peer, Attempted)
     }.
 
 %%% ===================================================================
