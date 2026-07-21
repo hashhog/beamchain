@@ -875,6 +875,17 @@ mainnet_assumeutxo() ->
             utxo_hash => display_hex_to_bin(
                 "2eaf71725669a83c1c7947517b84c09b0d65f4e7c813087c74840320bcbc88a8"),
             chain_tx_count => 1334000000
+        },
+        %% Block 481,823 — Track-B WINDOWED replay: last pre-segwit block
+        %% (segwit activates at 481824). block_hash from the 481823 header;
+        %% utxo_hash (hash_serialized) + chain_tx_count (nchaintx) come from
+        %% the boundary-snapshot result JSON (Core dumptxoutset rollback=481823).
+        481823 => #{
+            block_hash => display_hex_to_bin(
+                "000000000000000000cbeff0b533f8e1189cf09dfbebf57a8ebe349362811b80"),
+            utxo_hash => display_hex_to_bin(
+                "25429c30cfa0b6051106c29d15b188d746d8e7ecd184bf34fae1cebe2ea447f4"),
+            chain_tx_count => 249036369
         }
     }.
 
