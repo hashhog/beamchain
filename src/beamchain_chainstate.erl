@@ -582,7 +582,7 @@ do_add_utxo(Txid, Vout, Utxo) ->
                 false -> beamchain_db:has_utxo(Txid, Vout)
             end
     end,
-    ets:insert(?UTXO_CACHE, {Key, Utxo}),
+    ets:insert(?UTXO_CACHE, {Key, detach_spk(Utxo)}),
     ets:insert(?UTXO_DIRTY, {Key}),
     case AlreadyInDb of
         true ->
@@ -610,7 +610,7 @@ add_utxo_fresh(Txid, Vout, #utxo{script_pubkey = SPK} = Utxo) ->
             ok;
         false ->
             Key = {Txid, Vout},
-            ets:insert(?UTXO_CACHE, {Key, Utxo}),
+            ets:insert(?UTXO_CACHE, {Key, detach_spk(Utxo)}),
             ets:insert(?UTXO_DIRTY, {Key}),
             ets:insert(?UTXO_FRESH, {Key}),
             ets:delete(?UTXO_SPENT, Key),
@@ -633,6 +633,39 @@ is_unspendable_script(SPK) when byte_size(SPK) > ?MAX_SCRIPT_SIZE ->
     true;
 is_unspendable_script(_) ->
     false.
+
+%% ERTS ERL_ONHEAP_BIN_LIMIT (erts/emulator/beam/erl_binary.h). A binary segment
+%% matched out of a larger binary is COPIED onto the process heap at or below this
+%% size; ABOVE it the match yields a SUB-BINARY that keeps its entire parent refc
+%% binary alive. Measured to the byte on OTP 27 / ERTS 15.2.7.
+-define(ONHEAP_BIN_LIMIT, 64).
+
+%% @doc Detach a stored scriptPubKey from the peer socket buffer it was sliced out of.
+%%
+%% beamchain_serialize:decode_varstr/1 carves every variable-length field out of the
+%% whole-block binary (which is itself a sub-binary of the peer's accumulated TCP
+%% buffer, beamchain_peer.erl:707). For a scriptPubKey over ?ONHEAP_BIN_LIMIT that
+%% slice is a sub-binary, and ETS stores it BY REFERENCE (?UTXO_CACHE is not
+%% `compressed`), so a single 105-byte coin pins its whole ~1.6 MB parent block for
+%% as long as it stays cached — and ?UTXO_CACHE is never cleared by do_flush/1.
+%%
+%% Measured on real mainnet blocks: a 105-byte scriptPubKey from block 956302 reported
+%% binary:referenced_byte_size = 1,807,324 (the entire buffer), while every <=64-byte
+%% scriptPubKey reported 8*byte_size (a clean heap binary). 42% of blocks carry at
+%% least one such output — ~97 MB/day of pinned parents at mainnet rates.
+%%
+%% The >?ONHEAP_BIN_LIMIT guard keeps this free: all standard script types (P2WPKH 22,
+%% P2SH 23, P2PKH 25, P2WSH/P2TR 34) are already independent heap binaries, so ~99.97%
+%% of outputs are untouched and copying them would be pure waste. Only ~3-4 outputs
+%% per block are copied, ~105 bytes each.
+%%
+%% Same shape as the hotbuns fix: detach at the boundary where a transient slice
+%% becomes long-lived, NOT in the parser (which would copy every scriptSig too).
+-spec detach_spk(#utxo{}) -> #utxo{}.
+detach_spk(#utxo{script_pubkey = SPK} = Utxo) when byte_size(SPK) > ?ONHEAP_BIN_LIMIT ->
+    Utxo#utxo{script_pubkey = binary:copy(SPK)};
+detach_spk(Utxo) ->
+    Utxo.
 
 %% @doc Add a UTXO from disk (for cache miss fills). Not marked FRESH or DIRTY.
 -spec add_utxo_from_disk(binary(), non_neg_integer(), #utxo{}) -> ok.
@@ -2993,7 +3026,11 @@ populate_utxo_cache_from_snapshot(Coins) ->
     %% Insert all coins from snapshot
     lists:foreach(fun({Txid, Vout, Utxo}) ->
         Key = {Txid, Vout},
-        ets:insert(?UTXO_CACHE, {Key, Utxo}),
+        %% detach_spk: the parent here is even larger than a block — beamchain_snapshot
+        %% file:read_file's the WHOLE snapshot into one refc binary and slices every
+        %% coin out of it, so a single surviving >64-byte scriptPubKey would pin the
+        %% entire snapshot file.
+        ets:insert(?UTXO_CACHE, {Key, detach_spk(Utxo)}),
         %% Mark as DIRTY so they get flushed to RocksDB
         ets:insert(?UTXO_DIRTY, {Key}),
         %% Mark as FRESH since they don't exist in RocksDB yet
