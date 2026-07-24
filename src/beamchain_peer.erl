@@ -65,8 +65,12 @@
 -define(FEEFILTER_MAX_CHANGE_DELAY_MS, 300000).
 %% Minimum protocol version for feefilter (BIP 133)
 -define(FEEFILTER_VERSION, 70013).
-%% Default minimum relay fee (1000 sat/kvB = 1 sat/vB)
--define(DEFAULT_MIN_RELAY_FEE, 1000).
+%% Default minimum relay fee (100 sat/kvB = 0.1 sat/vB).
+%% Core v31 policy/policy.h:70 DEFAULT_MIN_RELAY_TX_FEE{100} — LOWERED from the
+%% historical 1000. This is the floor of the BIP-133 feefilter we send to peers
+%% (see send_feefilter/2), so 1000 asked peers to withhold traffic Core relays.
+%% beamchain_protocol.hrl already documents the Core value as 100.
+-define(DEFAULT_MIN_RELAY_FEE, 100).
 
 %%% -------------------------------------------------------------------
 %%% Inv trickling constants (per Bitcoin Core net_processing.cpp)
