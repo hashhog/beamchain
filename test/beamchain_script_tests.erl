@@ -619,10 +619,29 @@ p2pkh_pattern_test() ->
 %%% flags_for_height tests
 %%% -------------------------------------------------------------------
 
-flags_mainnet_pre_p2sh_test() ->
-    Flags = beamchain_script:flags_for_height(100000, mainnet),
-    %% P2SH not active yet
-    ?assertEqual(0, Flags band ?SCRIPT_VERIFY_P2SH).
+%% WAVE B: Bitcoin Core sets SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS |
+%% SCRIPT_VERIFY_TAPROOT UNCONDITIONALLY for every block since v23
+%% (validation.cpp:2262).  There is no consensus.BIP16Height and no
+%% consensus.taprootHeight.  This test previously asserted the OPPOSITE —
+%% "P2SH not active yet" at height 100000 — which encoded a beamchain-invented
+%% height gate.  It now pins Core's actual rule across the whole height range.
+flags_mainnet_trio_unconditional_test() ->
+    Trio = ?SCRIPT_VERIFY_P2SH
+           bor ?SCRIPT_VERIFY_WITNESS
+           bor ?SCRIPT_VERIFY_TAPROOT,
+    %% The full trio at EVERY height: genesis, both old invented gates, both
+    %% grandfathered violator heights, and the tip era.
+    [ ?assertEqual(Trio, beamchain_script:flags_for_height(H, mainnet) band Trio)
+      || H <- [0, 1, 100000, 170060, 173804, 173805, 481823, 481824,
+               692261, 709631, 709632, 900000] ],
+    %% Guard against the opposite over-correction (turning EVERYTHING on
+    %% unconditionally): the four height-gated flags must still be gated.
+    Gated = ?SCRIPT_VERIFY_DERSIG
+            bor ?SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY
+            bor ?SCRIPT_VERIFY_CHECKSEQUENCEVERIFY
+            bor ?SCRIPT_VERIFY_NULLDUMMY,
+    ?assertEqual(0, beamchain_script:flags_for_height(100000, mainnet) band Gated),
+    ?assertEqual(Gated, beamchain_script:flags_for_height(900000, mainnet) band Gated).
 
 flags_mainnet_post_segwit_test() ->
     Flags = beamchain_script:flags_for_height(500000, mainnet),

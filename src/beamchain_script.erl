@@ -3700,40 +3700,65 @@ sighash_taproot(Tx, InputIndex, PrevOuts, HashType, AnnexHash,
 %%% Script flags for a given height
 %%% -------------------------------------------------------------------
 
+%% WAVE B: the base trio is UNCONDITIONAL.
+%%
+%% Bitcoin Core GetBlockScriptFlags (validation.cpp:2262) has, since v23:
+%%
+%%     script_verify_flags flags{SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS
+%%                               | SCRIPT_VERIFY_TAPROOT};
+%%
+%% with NO height test of any kind.  There is no consensus.BIP16Height and no
+%% consensus.taprootHeight in Core's params — those were beamchain inventions.
+%% Core's own comment: "For simplicity, always leave P2SH+WITNESS+TAPROOT on
+%% except for the two violating blocks."
+%%
+%% The historical blocks that genuinely violate those rules are grandfathered
+%% by the HASH-KEYED consensus.script_flag_exceptions table
+%% (kernel/chainparams.cpp:85-88 mainnet, :210-211 testnet3):
+%%
+%%     mainnet 00000000...ac4f9c22 (height 170060) -> SCRIPT_VERIFY_NONE
+%%     mainnet 00000000...a1e395ad (height 692261) -> P2SH | WITNESS
+%%     testnet3 00000000...a432b105 (height    514) -> SCRIPT_VERIFY_NONE
+%%
+%% applied by flags_for_block/3 below, which REPLACES the flag set on a hash
+%% hit and then ORs the height-gated flags on top — exactly Core's order.
+%% Height-gating the trio here is not a conservative approximation of that: it
+%% silently makes the exception table inert (both violators sit BELOW their old
+%% gates, so the exception had nothing to strip) and it under-enforces P2SH,
+%% WITNESS and TAPROOT on every block below the invented gates, which is a
+%% consensus divergence in the accept-invalid direction.
+%%
+%% Only DERSIG / CLTV / CSV / NULLDUMMY remain height-gated, matching Core's
+%% four DeploymentActiveAt tests at validation.cpp:2268-2286.
 -spec flags_for_height(non_neg_integer(), atom()) -> non_neg_integer().
 flags_for_height(Height, mainnet) ->
-    F0 = ?SCRIPT_VERIFY_NONE,
-    F1 = case Height >= 173805 of
-        true -> F0 bor ?SCRIPT_VERIFY_P2SH;
+    %% validation.cpp:2262 — unconditional, every block, every height.
+    F0 = ?SCRIPT_VERIFY_P2SH
+         bor ?SCRIPT_VERIFY_WITNESS
+         bor ?SCRIPT_VERIFY_TAPROOT,
+    %% BIP-66 DERSIG — validation.cpp:2268 (consensus.BIP66Height = 363725).
+    F1 = case Height >= 363725 of
+        true -> F0 bor ?SCRIPT_VERIFY_DERSIG;
         false -> F0
     end,
-    F2 = case Height >= 363725 of
-        true -> F1 bor ?SCRIPT_VERIFY_DERSIG;
+    %% BIP-65 CLTV — validation.cpp:2273 (consensus.BIP65Height = 388381).
+    F2 = case Height >= 388381 of
+        true -> F1 bor ?SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY;
         false -> F1
     end,
-    F3 = case Height >= 388381 of
-        true -> F2 bor ?SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY;
+    %% BIP-112 CSV — validation.cpp:2278 (consensus.CSVHeight = 419328).
+    F3 = case Height >= 419328 of
+        true -> F2 bor ?SCRIPT_VERIFY_CHECKSEQUENCEVERIFY;
         false -> F2
     end,
-    F4 = case Height >= 419328 of
-        true -> F3 bor ?SCRIPT_VERIFY_CHECKSEQUENCEVERIFY;
-        false -> F3
-    end,
-    F5 = case Height >= 481824 of
-        true -> F4 bor ?SCRIPT_VERIFY_WITNESS;
-        false -> F4
-    end,
-    F6 = case Height >= 709632 of
-        true -> F5 bor ?SCRIPT_VERIFY_TAPROOT;
-        false -> F5
-    end,
-    %% NULLDUMMY (BIP-147) is a consensus rule activated with segwit.
+    %% NULLDUMMY (BIP-147) is a consensus rule activated with segwit
+    %% (validation.cpp:2283, consensus.SegwitHeight = 481824).
     %% NULLFAIL and WITNESS_PUBKEYTYPE are STANDARD_SCRIPT_VERIFY_FLAGS
     %% (policy only) per Bitcoin Core policy/policy.h:125,128.  They must
     %% NOT appear in the block-consensus flag computer.
     case Height >= 481824 of
-        true -> F6 bor ?SCRIPT_VERIFY_NULLDUMMY;
-        false -> F6
+        true -> F3 bor ?SCRIPT_VERIFY_NULLDUMMY;
+        false -> F3
     end;
 
 flags_for_height(_Height, _Network) ->
@@ -3741,6 +3766,14 @@ flags_for_height(_Height, _Network) ->
     %% Only Bitcoin Core MANDATORY_SCRIPT_VERIFY_FLAGS here.
     %% Policy flags (CLEANSTACK, SIGPUSHONLY, LOW_S, STRICTENC, MINIMALDATA,
     %% NULLFAIL, WITNESS_PUBKEYTYPE, etc.) belong in the mempool path only.
+    %%
+    %% WAVE B: the base trio (P2SH|WITNESS|TAPROOT) was ALREADY unconditional
+    %% on this branch, so Wave B requires no change here.  The testnet3
+    %% catch-all separately over-enforces DERSIG/CLTV/CSV/NULLDUMMY from
+    %% genesis (Core height-gates them on testnet3: BIP66Height=330776,
+    %% BIP65Height=581885, CSVHeight=770112, SegwitHeight=834624) — that is a
+    %% REJECT-VALID divergence in the opposite direction from Wave B and is
+    %% tracked as its own fix.  Deliberately NOT bundled here.
     ?SCRIPT_VERIFY_P2SH
     bor ?SCRIPT_VERIFY_DERSIG
     bor ?SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY
@@ -3762,8 +3795,21 @@ flags_for_height(_Height, _Network) ->
 %%% -noassumevalid sync / reorg through those heights).
 %%%
 %%% Keys are Core's DISPLAY hex; block_hash/1 (raw double-SHA256) is INTERNAL
-%%% byte order, so reverse before comparing. A byte-order slip fails SAFE: the
-%%% key simply never matches and today's (height-only) behavior is reproduced.
+%%% byte order, so reverse before comparing.
+%%%
+%%% WAVE B INVERTED THIS TABLE'S FAILURE MODE — read before touching it.
+%%% While the trio was height-gated, both mainnet violators sat BELOW their own
+%%% gates (170060 < 173805, 692261 < 709632), so the exception had nothing to
+%%% strip and a byte-order slip failed SAFE: the key never matched and the
+%%% height-only answer was reproduced.  That is no longer true.  Now that the
+%%% trio is unconditional (flags_for_height/2 above), this table is the ONLY
+%%% thing keeping those blocks valid, and it is load-bearing on EVERY
+%%% block-validation path.  A slip in the stored constant, in internal_hash/1,
+%%% in reverse_bytes/1, or in the byte order of the hash the caller threads in
+%%% now HARD-FORKS beamchain off mainnet by false-rejecting 170060 and 692261
+%%% on any full revalidation (-noassumevalid sync, reorg, verifychain level 4).
+%%% This is the clearbit bc7cb98 bug shape.  Byte order is proven correct
+%%% (W-B0 census + G21c negative control); keep it that way.
 -define(BIP16_EXCEPTION_MAINNET,
         "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22").
 -define(TAPROOT_EXCEPTION_MAINNET,
