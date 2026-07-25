@@ -192,14 +192,16 @@ w105_checkqueue_test_() ->
            fun g17_skip_scripts_builds_no_jobs/0},
           {"G18: verify_scripts_parallel called only when ScriptJobs is non-empty",
            fun g18_empty_jobs_no_spawn/0},
-          {"G19: flags_for_height mainnet P2SH activation at block 173805",
-           fun g19_flags_p2sh_mainnet/0},
-          {"G20: flags_for_height mainnet NULLDUMMY (BIP-147) co-activates with WITNESS",
+          {"G19: flags_for_height mainnet P2SH|WITNESS|TAPROOT unconditional (no BIP16Height)",
+           fun g19_flags_trio_unconditional_mainnet/0},
+          {"G20: flags_for_height mainnet NULLDUMMY (BIP-147) gated at segwit height",
            fun g20_flags_nulldummy_with_witness/0},
           {"G21: flags_for_height testnet/regtest returns all consensus flags",
            fun g21_flags_regtest_all_consensus/0},
           {"G21b: script_flag_exceptions override flags for BIP16/Taproot violator blocks",
            fun g21b_script_flag_exceptions/0},
+          {"G21c: byte-reversed exception hash does NOT match (W-B0 negative control)",
+           fun g21c_script_flag_exception_byte_reversed_negative_control/0},
           {"G22: verify_tx_scripts accumulates folds over all inputs",
            fun g22_verify_tx_scripts_all_inputs/0},
           {"G23: script_verify_failed error propagated through spawn_monitor EXIT",
@@ -757,30 +759,58 @@ g18_empty_jobs_no_spawn() ->
     ?assert(erlang:function_exported(beamchain_validation, connect_block, 4)).
 
 %%% ===================================================================
-%%% G19: flags_for_height mainnet P2SH activation
+%%% G19: WAVE B — mainnet P2SH|WITNESS|TAPROOT are UNCONDITIONAL
 %%% ===================================================================
+%%%
+%%% Bitcoin Core validation.cpp:2262 has, since v23:
+%%%     script_verify_flags flags{SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS
+%%%                               | SCRIPT_VERIFY_TAPROOT};
+%%% with NO height test.  There is no consensus.BIP16Height and no
+%%% consensus.taprootHeight.  The two mainnet blocks that violate those rules
+%%% are grandfathered by the hash-keyed script_flag_exceptions table (G21b/G21c),
+%%% NOT by a height gate.
+%%%
+%%% This gate previously asserted the exact opposite — "P2SH off at 173804,
+%%% on at 173805" — which pinned a beamchain-invented BIP16Height in place.
 
-g19_flags_p2sh_mainnet() ->
-    %% BIP 16 P2SH: mainnet activation at block 173805
-    FlagsBefore = beamchain_script:flags_for_height(173804, mainnet),
-    FlagsAt     = beamchain_script:flags_for_height(173805, mainnet),
-    P2shFlag    = 1 bsl 0, % ?SCRIPT_VERIFY_P2SH
-    ?assertEqual(0, FlagsBefore band P2shFlag),
-    ?assertNotEqual(0, FlagsAt band P2shFlag).
+g19_flags_trio_unconditional_mainnet() ->
+    P2shFlag    = 1 bsl 0,  % ?SCRIPT_VERIFY_P2SH
+    WitnessFlag = 1 bsl 11, % ?SCRIPT_VERIFY_WITNESS
+    TaprootFlag = 1 bsl 17, % ?SCRIPT_VERIFY_TAPROOT
+    Trio        = P2shFlag bor WitnessFlag bor TaprootFlag,
+    %% Genesis, both former invented gates (173805 P2SH / 481824 WITNESS /
+    %% 709632 TAPROOT) and both grandfathered violator heights.
+    Heights = [0, 1, 170060, 173804, 173805, 481823, 481824,
+               692261, 709631, 709632, 900000],
+    lists:foreach(fun(H) ->
+        ?assertEqual(Trio, beamchain_script:flags_for_height(H, mainnet) band Trio)
+    end, Heights),
+    %% Non-vacuity: the flag word is NOT simply "everything on" — the four
+    %% height-gated deployment flags must still be absent at a low height.
+    Gated = (1 bsl 2) bor (1 bsl 9) bor (1 bsl 10) bor (1 bsl 4),
+            % DERSIG | CLTV | CSV | NULLDUMMY
+    ?assertEqual(0, beamchain_script:flags_for_height(170060, mainnet) band Gated),
+    ?assertEqual(Gated, beamchain_script:flags_for_height(900000, mainnet) band Gated).
 
 %%% ===================================================================
-%%% G20: flags_for_height mainnet NULLDUMMY co-activates with WITNESS
+%%% G20: flags_for_height mainnet NULLDUMMY gated at the segwit height
 %%% ===================================================================
 
 g20_flags_nulldummy_with_witness() ->
-    %% BIP-147 NULLDUMMY activates with segwit at block 481824.
+    %% BIP-147 NULLDUMMY activates with segwit at block 481824 and is one of
+    %% the four flags Core DOES still height-gate (validation.cpp:2283).
     NullDummyFlag = 1 bsl 4, % ?SCRIPT_VERIFY_NULLDUMMY
     WitnessFlag   = 1 bsl 11, % ?SCRIPT_VERIFY_WITNESS
     FlagsBefore = beamchain_script:flags_for_height(481823, mainnet),
     FlagsAt     = beamchain_script:flags_for_height(481824, mainnet),
     ?assertEqual(0, FlagsBefore band NullDummyFlag),
-    ?assertEqual(0, FlagsBefore band WitnessFlag),
     ?assertNotEqual(0, FlagsAt band NullDummyFlag),
+    %% WAVE B: WITNESS itself is NOT gated — it is on both sides of the segwit
+    %% height (and everywhere else).  Previously this gate asserted
+    %% `FlagsBefore band WitnessFlag == 0`, pinning the invented segwit gate on
+    %% the script-flag computer.  Core gates NULLDUMMY on DEPLOYMENT_SEGWIT but
+    %% sets WITNESS unconditionally at :2262.
+    ?assertNotEqual(0, FlagsBefore band WitnessFlag),
     ?assertNotEqual(0, FlagsAt band WitnessFlag).
 
 %%% ===================================================================
@@ -819,17 +849,149 @@ g21b_script_flag_exceptions() ->
     Bip16   = Ih("00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22"),
     Taproot = Ih("0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad"),
     TaprootFlag = 1 bsl 17,
-    %% BIP16 block (height 173818): height-only computes P2SH; exception -> NONE.
-    ?assertNotEqual(0, beamchain_script:flags_for_height(173818, mainnet)),
-    ?assertEqual(0, beamchain_script:flags_for_block(173818, mainnet, Bip16)),
-    %% Taproot block (height 709632): height-only includes TAPROOT; exception
-    %% strips it (keeps P2SH|WITNESS + the deployment flags).
-    ?assertNotEqual(0, beamchain_script:flags_for_height(709632, mainnet) band TaprootFlag),
-    ?assertEqual(0, beamchain_script:flags_for_block(709632, mainnet, Taproot) band TaprootFlag),
-    %% Non-exception block: flags_for_block == flags_for_height (no change).
+    %% WAVE B: these are now asserted at the violators' REAL heights.  While the
+    %% base trio was height-gated both violators sat BELOW their own gates
+    %% (170060 < 173805, 692261 < 709632), so the exception had nothing to strip
+    %% and this gate had to dodge to 173818/709632 to observe anything at all.
+    %% With the trio unconditional the exception is load-bearing exactly where
+    %% Core applies it, so the real heights are now the meaningful test.
+    %%
+    %% Expected values are Core's, computed as replace-then-OR:
+    %%   170060 -> SCRIPT_VERIFY_NONE, no deployment flag active   -> 0x0
+    %%             (0x20801 = P2SH|WITNESS|TAPROOT if the exception is MISSED)
+    %%   692261 -> P2SH|WITNESS, DERSIG|CLTV|CSV|NULLDUMMY active  -> 0xe15
+    %%             (0x20e15 if the exception is MISSED — bit 17 TAPROOT)
+    ?assertEqual(16#20801, beamchain_script:flags_for_height(170060, mainnet)),
+    ?assertEqual(16#00000, beamchain_script:flags_for_block(170060, mainnet, Bip16)),
+    ?assertEqual(16#20e15, beamchain_script:flags_for_height(692261, mainnet)),
+    ?assertEqual(16#00e15, beamchain_script:flags_for_block(692261, mainnet, Taproot)),
+    %% The Taproot exception strips TAPROOT but KEEPS P2SH|WITNESS and every
+    %% height-gated deployment flag — i.e. REPLACE-then-OR, not a blanket clear.
+    ?assertEqual(0, beamchain_script:flags_for_block(692261, mainnet, Taproot) band TaprootFlag),
+    ?assertNotEqual(0, beamchain_script:flags_for_block(692261, mainnet, Taproot) band (1 bsl 0)),
+    ?assertNotEqual(0, beamchain_script:flags_for_block(692261, mainnet, Taproot) band (1 bsl 11)),
+    %% Non-exception block: flags_for_block == flags_for_height (no change),
+    %% checked at BOTH violator heights so the table cannot fire on height alone.
     Rand = crypto:strong_rand_bytes(32),
+    ?assertEqual(beamchain_script:flags_for_height(170060, mainnet),
+                 beamchain_script:flags_for_block(170060, mainnet, Rand)),
+    ?assertEqual(beamchain_script:flags_for_height(692261, mainnet),
+                 beamchain_script:flags_for_block(692261, mainnet, Rand)),
     ?assertEqual(beamchain_script:flags_for_height(709632, mainnet),
                  beamchain_script:flags_for_block(709632, mainnet, Rand)).
+
+%%% ===================================================================
+%%% G21c: W-B0 NEGATIVE CONTROL — byte-reversed exception hash must NOT match
+%%% ===================================================================
+%%%
+%%% Asserting the flag set AT an exception block is VACUOUS on its own. For
+%%% beamchain the vacuity is total and provable: mainnet flags_for_height gates
+%%% P2SH at 173805, so at the BIP16 violator's real height (170060) the
+%%% height-only answer is already ?SCRIPT_VERIFY_NONE — indistinguishable from
+%%% "the exception fired". (That is exactly why G21b had to use 173818 instead
+%%% of the block's true height.) A byte-order slip anywhere in the chain — the
+%%% stored display-hex constant, internal_hash/1, or block_hash/1 — would sail
+%%% through the entire positive suite while the lookup never fires on a real
+%%% block: the silently-inert table the Wave B call-site census went hunting
+%%% for.
+%%%
+%%% The control feeds the BYTE-REVERSED exception hash and proves it is NOT
+%%% treated as an exception. Per entry:
+%%%   (a) reversed == a known-non-exception control hash, at the violator's own
+%%%       height AND at a height where the base trio is live. Compared against
+%%%       a control rather than a hard-coded by-height answer, so it stays true
+%%%       across the Wave B base-trio flip.
+%%%   (b) non-vacuity guard, asserted at the trio-live height where the two
+%%%       answers are guaranteed to differ: the CORRECT hash must NOT equal the
+%%%       control. Without this, (a) proves nothing.
+%%%   (c) at the trio-live height the reversed hash carries the FULL
+%%%       P2SH|WITNESS|TAPROOT trio while the correct hash does not. That pair
+%%%       is what a byte-order slip cannot fake.
+%%%
+%%% Bitcoin Core: validation.cpp:2262 (unconditional P2SH|WITNESS|TAPROOT),
+%%% kernel/chainparams.cpp:85-88 + :210-211 (hash-keyed script_flag_exceptions).
+
+g21c_script_flag_exception_byte_reversed_negative_control() ->
+    Ih = fun(Hex) ->
+        beamchain_serialize:reverse_bytes(beamchain_serialize:hex_decode(Hex))
+    end,
+    P2sh    = 1 bsl 0,
+    Witness = 1 bsl 11,
+    Taproot = 1 bsl 17,
+    Trio    = P2sh bor Witness bor Taproot,
+    %% Definitively not in any exception table.
+    Control = <<0:256>>,
+
+    %% {Network, CoreDisplayHex, ByteReversedDisplayHex, ViolatorHeight,
+    %%  TrioLiveHeight, CoreOverrideValue}
+    Cases = [
+        {mainnet,
+         "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22",
+         "229c4fac88bab194eb08f1a528cc308ded2397f4f4eb6e75dc02000000000000",
+         170060, 800000, 0},
+        {mainnet,
+         "0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad",
+         "ad95e3a15ee5ffd585c5e81d44b56a981e842d5bc3140f000000000000000000",
+         692261, 800000, P2sh bor Witness},
+        {testnet3,
+         "00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105",
+         "05b132a4f74a8799a57a4202d0eeb09612cc08d295401f007c4530dd00000000",
+         514, 2100000, 0}
+    ],
+
+    lists:foreach(fun({Net, Hex, RevHex, VioH, TrioH, Override}) ->
+        Correct  = Ih(Hex),
+        %% The slip under test: display-order bytes fed to a lookup that
+        %% expects internal order, or the reverse.
+        Reversed = beamchain_serialize:reverse_bytes(Correct),
+        ?assertNotEqual(Correct, Reversed),
+        %% Pins the reversed literal and guards reverse_bytes/1 against
+        %% silently becoming identity: RevHex decodes to the INTERNAL form of
+        %% the correct hash, Hex decodes to the byte-reversed form.
+        ?assertEqual(beamchain_serialize:hex_decode(RevHex), Correct),
+        ?assertEqual(beamchain_serialize:hex_decode(Hex), Reversed),
+
+        %% (a) reversed hash is ordinary at BOTH heights.
+        ?assertEqual(beamchain_script:flags_for_block(VioH, Net, Control),
+                     beamchain_script:flags_for_block(VioH, Net, Reversed)),
+        ?assertEqual(beamchain_script:flags_for_block(TrioH, Net, Control),
+                     beamchain_script:flags_for_block(TrioH, Net, Reversed)),
+
+        %% (b) non-vacuity at the trio-live height.
+        HiCorrect = beamchain_script:flags_for_block(TrioH, Net, Correct),
+        HiControl = beamchain_script:flags_for_block(TrioH, Net, Control),
+        ?assertNotEqual(HiControl, HiCorrect),
+        %% Core's replace-then-OR: the override REPLACES the trio; the
+        %% height-gated deployment flags (DERSIG|CLTV|CSV|NULLDUMMY) survive.
+        ?assertEqual(Override
+                     bor (beamchain_script:flags_for_height(TrioH, Net)
+                          band (bnot Trio)),
+                     HiCorrect),
+
+        %% (c) reversed => full trio, correct => not the full trio.
+        HiReversed = beamchain_script:flags_for_block(TrioH, Net, Reversed),
+        ?assertEqual(Trio, HiReversed band Trio),
+        ?assertNotEqual(Trio, HiCorrect band Trio)
+    end, Cases),
+
+    %% WAVE B KILLED THE VACUITY THIS BLOCK USED TO DOCUMENT.
+    %%
+    %% Before the flip, mainnet flags_for_height gated P2SH at 173805, so at the
+    %% BIP16 violator's REAL height (170060) the height-only answer was already
+    %% ?SCRIPT_VERIFY_NONE and "flags_for_block == 0" there could NOT distinguish
+    %% a fired exception from plain height-gating.  That is why the two
+    %% assertions here used to read `?assertEqual(0, flags_for_height(170060))`,
+    %% deliberately written to fail loudly if the by-height table ever moved.
+    %% It moved: the base trio is now unconditional (validation.cpp:2262).
+    %%
+    %% The replacement asserts the strictly stronger post-flip property — at the
+    %% violator's own height the exception is now DISCRIMINATING: a non-exception
+    %% hash keeps the full trio, the real hash clears it to SCRIPT_VERIFY_NONE.
+    ?assertEqual(Trio, beamchain_script:flags_for_height(170060, mainnet)),
+    ?assertEqual(Trio, beamchain_script:flags_for_block(170060, mainnet, Control)),
+    ?assertEqual(0, beamchain_script:flags_for_block(
+                        170060, mainnet,
+                        Ih("00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22"))).
 
 %%% ===================================================================
 %%% G22: verify_tx_scripts iterates all inputs
