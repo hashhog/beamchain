@@ -577,14 +577,26 @@ g28_no_package_bumpfee_test_() ->
 %%% access, which is field-name-driven and rot-safe.
 %%% ===================================================================
 
-g29_extract_entry_positional_pattern_test_() ->
+%% AUDIT-FLIP 2026-07-26 (Wave A). This marker used to assert the OPPOSITE:
+%% that bumpfee_extract_entry/1 still used a fixed-arity positional tuple
+%% pattern, and that the record-access form was ABSENT. That is exactly
+%% backwards, and the marker caused real damage — Wave A appended adj_weight to
+%% #mempool_entry{}, the 19-element pattern stopped matching, bumpfee and
+%% psbtbumpfee broke for every mempool transaction, and this test stayed GREEN
+%% because it only greps source text and the behavioural bumpfee tests never
+%% reach the extractor.
+%%
+%% Now inverted: demand the arity-independent shape and forbid a regression to
+%% positional matching.
+g29_extract_entry_uses_record_access_test_() ->
     Src = read_src(rpc_src_path()),
-    [?_assert(binary:match(Src,
-        <<"{mempool_entry, _Txid, _Wtxid, Tx, Fee">>) =/= nomatch),
-     %% A record-field-access version would mention #mempool_entry{tx
-     %% — confirm that future-fix shape is absent.
+    [%% The robust form must be present.
+     ?_assert(binary:match(Src,
+        <<"#mempool_entry{tx = Tx, fee = Fee, vsize = VSize}">>) =/= nomatch),
+     %% And the fixed-arity positional pattern must NOT come back — it is
+     %% silently broken by any future field addition.
      ?_assertEqual(nomatch,
-        binary:match(Src, <<"Entry#mempool_entry.tx">>))].
+        binary:match(Src, <<"{mempool_entry, _Txid, _Wtxid, Tx, Fee">>))].
 
 %%% ===================================================================
 %%% G30 — Comment-as-confession at descendants check

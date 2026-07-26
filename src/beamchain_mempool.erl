@@ -69,7 +69,7 @@
 -export([linearize_cluster/1]).  %% Exported for testing
 -export([uf_union/3, uf_get_cluster_members/2]).  %% Union-find utilities for debugging
 %% Policy constant accessors — for tests to verify Core parity without include leakage
--export([cluster_count_limit/0, cluster_vbytes_limit/0]).
+-export([cluster_count_limit/0, cluster_vbytes_limit/0, cluster_weight_limit/0]).
 %% W86 eviction constant accessors — for tests (Core parity guards)
 -export([incremental_relay_fee_constant/0,
          rolling_fee_halflife_constant/0,
@@ -137,7 +137,20 @@
 %% Cluster limits — mirrors Bitcoin Core policy/policy.h:72-74 (DEFAULT_CLUSTER_LIMIT=64,
 %% DEFAULT_CLUSTER_SIZE_LIMIT_KVB=101).
 -define(MAX_CLUSTER_COUNT, 64).            % Max transactions per cluster (Core DEFAULT_CLUSTER_LIMIT)
--define(MAX_CLUSTER_VBYTES, 101000).       % Max total vbytes per cluster (Core 101 kvB)
+-define(MAX_CLUSTER_VBYTES, 101000).       % Reported limit in VBYTES (Core rpc/mempool.cpp:1062
+                                           % reports limits.cluster_size_vbytes = 101 kvB).
+                                           % REPORTING ONLY — the enforcement gate is in weight
+                                           % units, see MAX_CLUSTER_WEIGHT below.
+%% Enforcement bound, in WEIGHT units.  Core txmempool.cpp:181 constructs the
+%% TxGraph with max_cluster_size = cluster_size_vbytes * WITNESS_SCALE_FACTOR,
+%% and the per-transaction quantity TxGraph sums is the UNROUNDED sigop-adjusted
+%% weight (txmempool.cpp:1017 -> policy.cpp:390 GetSigOpsAdjustedWeight).
+%% txgraph.cpp:2059 rejects on `total_size > max_size` (STRICT >).
+%%   101000 vB * 4 = 404000 weight units.
+%% Accumulating per-tx ceil(w/4) vbytes against 101000 instead would be
+%% systematically STRICTER than Core (Sum(ceil(w_i/4)) >= ceil(Sum(w_i)/4)) —
+%% up to 48 vB over a 64-tx cluster.  Do not reintroduce per-tx rounding here.
+-define(MAX_CLUSTER_WEIGHT, ?MAX_CLUSTER_VBYTES * ?WITNESS_SCALE_FACTOR). % 404000
 %% Legacy alias kept for recompute_cluster internal use; must equal MAX_CLUSTER_COUNT.
 -define(MAX_CLUSTER_SIZE, 64).
 
@@ -204,7 +217,13 @@
     descendant_size   :: non_neg_integer(),
     descendant_fee    :: non_neg_integer(),
     spends_coinbase   :: boolean(),
-    rbf_signaling     :: boolean()
+    rbf_signaling     :: boolean(),
+    %% Sigop-adjusted WEIGHT, unrounded: max(tx_weight, sigop_cost * 20).
+    %% Core policy.cpp:390 GetSigOpsAdjustedWeight — this is the per-tx quantity
+    %% Core's TxGraph sums for the cluster size limit (txmempool.cpp:1017).
+    %% Distinct from `weight` (raw BIP-141 weight, used for block assembly) and
+    %% from `vsize` (= ceil(adj_weight/4), used for feerate / RPC / byte accounting).
+    adj_weight        :: non_neg_integer()
 }).
 
 %%% -------------------------------------------------------------------
@@ -216,9 +235,14 @@
     id            :: binary(),             %% cluster identifier (txid of first tx)
     txids         :: [binary()],           %% list of txids in this cluster
     total_fee     :: non_neg_integer(),    %% sum of all fees
-    total_vsize   :: non_neg_integer(),    %% sum of all vsizes
+    total_vsize   :: non_neg_integer(),    %% sum of all vsizes (feerate / eviction accounting)
     linearization :: [binary()],           %% ordered txids (highest feerate prefix first)
     fee_rate      :: float()               %% aggregate fee rate (total_fee / total_vsize)
+    %% NOTE: the cluster SIZE axis (sigop-adjusted weight, gated against
+    %% MAX_CLUSTER_WEIGHT) is deliberately NOT cached here.  It is derived on
+    %% demand in check_cluster_limits/2 from live ?MEMPOOL_TXS membership, so it
+    %% cannot go stale when transactions are evicted (RBF) between the eviction
+    %% and the cluster rebuild.  One source of truth: mempool_entry.adj_weight.
 }).
 
 %%% -------------------------------------------------------------------
@@ -985,7 +1009,12 @@ do_add_transaction(Tx, PeerId, State) ->
         %% W96 GATE 12: compute size metrics.
         %% VSize uses sigop-adjusted weight per Core policy/policy.cpp:GetVirtualTransactionSize:
         %%   vsize = ceil(max(weight, sigop_cost * DEFAULT_BYTES_PER_SIGOP) / 4)
+        %% AdjWeight is the same quantity BEFORE the /4 rounding — Core
+        %% policy.cpp:390 GetSigOpsAdjustedWeight.  It is what the cluster size
+        %% gate accumulates (txmempool.cpp:1017 -> TxGraph); VSize keeps its
+        %% existing roles (feerate, RPC, mempool byte accounting).
         Weight = beamchain_serialize:tx_weight(Tx),
+        AdjWeight = beamchain_serialize:tx_sigop_adjusted_weight(Tx, TxSigopCost),
         VSize = beamchain_serialize:tx_sigop_vsize(Tx, TxSigopCost),
         Size = byte_size(beamchain_serialize:encode_transaction(Tx)),
         FeeRate = Fee / max(1, VSize),
@@ -1064,17 +1093,24 @@ do_add_transaction(Tx, PeerId, State) ->
                 throw(TrucErr)
         end,
 
-        %% W96 GATE 16: ancestor/descendant limits.
-        {AncCount, AncSize, AncFee} = compute_ancestors(Tx, Fee, VSize),
-        AncCount =< ?MAX_ANCESTOR_COUNT orelse throw('too-long-mempool-chain'),
-        AncSize =< ?MAX_ANCESTOR_SIZE orelse throw('too-long-mempool-chain'),
-        check_descendant_limits(Tx, VSize),
+        %% W96 GATE 16: cluster limits (Core validation.cpp:1343 "too-large-cluster",
+        %% policy.h:72-74, txmempool.cpp:181, txgraph.cpp:2059).
+        %% Must check BEFORE inserting: count + sigop-adjusted WEIGHT of the cluster
+        %% that would form after adding this tx.  Core uses CheckMemPoolPolicyLimits()
+        %% which queries the pending changeset; we compute it eagerly from parent
+        %% clusters.  This is the ONLY size bound on a cluster and therefore MUST be
+        %% present before the ancestor/descendant bounds are dropped below.
+        check_cluster_limits(Tx, AdjWeight),
 
-        %% W96 GATE 17: cluster limits (Core validation.cpp:1341-1344, policy.h:72-74).
-        %% Must check BEFORE inserting: count+vbytes of the cluster that would
-        %% form after adding this tx.  Core uses CheckMemPoolPolicyLimits() which
-        %% queries the pending changeset; we compute it eagerly from parent clusters.
-        check_cluster_limits(Tx, VSize),
+        %% W96 GATE 17: ancestor/descendant STATISTICS (no longer a gate).
+        %% Core v31 replaced -limitancestorcount / -limitdescendantcount with the
+        %% cluster limits; both settings are now DEBUG_ONLY/deprecated and used only
+        %% by the wallet for coin selection (init.cpp:650/656, node/interfaces.cpp:715).
+        %% "too-long-mempool-chain" occurs ZERO times in bitcoin-core/src.
+        %% The values are still computed because getmempoolentry reports them.
+        %% TRUC (v3) 2-ancestor / 2-descendant enforcement is unaffected — it lives in
+        %% check_truc_rules/4 at GATE 15 above.
+        {AncCount, AncSize, AncFee} = compute_ancestors(Tx, Fee, VSize),
 
         %% W96 GATE 18: coinbase maturity for mempool spending.
         %% TipHash and TipHeight were already fetched at GATE 4 above.
@@ -1133,7 +1169,8 @@ do_add_transaction(Tx, PeerId, State) ->
             descendant_size = VSize,
             descendant_fee = Fee,
             spends_coinbase = SpendsCoinbase,
-            rbf_signaling = RbfSignaling
+            rbf_signaling = RbfSignaling,
+            adj_weight = AdjWeight
         },
 
         %% 14. insert into all tables
@@ -1276,7 +1313,9 @@ do_add_transaction_dry_run(Tx, State) ->
         Fee = TotalIn - TotalOut,
         Fee =< ?MAX_MONEY orelse throw('bad-txns-fee-outofrange'),
 
-        %% GATE 12: size metrics
+        %% GATE 12: size metrics (see do_add_transaction/3 GATE 12 for the
+        %% AdjWeight-vs-VSize split).
+        AdjWeight = beamchain_serialize:tx_sigop_adjusted_weight(Tx, TxSigopCost),
         VSize = beamchain_serialize:tx_sigop_vsize(Tx, TxSigopCost),
         FeeRate = Fee / max(1, VSize),
 
@@ -1320,14 +1359,15 @@ do_add_transaction_dry_run(Tx, State) ->
                 throw(TrucErr)
         end,
 
-        %% GATE 16: ancestor/descendant limits
-        {AncCount, AncSize, _AncFee} = compute_ancestors(Tx, Fee, VSize),
-        AncCount =< ?MAX_ANCESTOR_COUNT orelse throw('too-long-mempool-chain'),
-        AncSize =< ?MAX_ANCESTOR_SIZE orelse throw('too-long-mempool-chain'),
-        check_descendant_limits(Tx, VSize),
+        %% GATE 16: cluster limits — count + sigop-adjusted WEIGHT (404000 wu).
+        %% Mirrors do_add_transaction/3 GATE 16 so testmempoolaccept returns the
+        %% same decision as sendrawtransaction.
+        check_cluster_limits(Tx, AdjWeight),
 
-        %% GATE 17: cluster limits
-        check_cluster_limits(Tx, VSize),
+        %% GATE 17: ancestor/descendant limits REMOVED — Core v31 deprecated
+        %% -limitancestorcount/-limitdescendantcount in favour of cluster limits
+        %% (init.cpp:650/656); "too-long-mempool-chain" no longer exists in Core.
+        %% The dry-run does not build an entry, so the stats are not computed here.
 
         %% GATE 18: coinbase maturity
         check_mempool_coinbase_maturity(InputCoins, TipHeight + 1),
@@ -1615,8 +1655,10 @@ compute_package_metrics(TxPairs, PackageTxMap, _State) ->
         TotalIn >= TotalOut orelse throw(insufficient_fee),
         Fee = TotalIn - TotalOut,
 
-        %% Compute size metrics (sigop-adjusted vsize, matching single-tx path)
+        %% Compute size metrics (sigop-adjusted vsize, matching single-tx path).
+        %% AdjWeight = unrounded max(weight, sigops*20) — cluster-gate quantity.
         Weight = beamchain_serialize:tx_weight(Tx),
+        AdjWeight = beamchain_serialize:tx_sigop_adjusted_weight(Tx, PkgSigopCost),
         VSize = beamchain_serialize:tx_sigop_vsize(Tx, PkgSigopCost),
         Size = byte_size(beamchain_serialize:encode_transaction(Tx)),
         FeeRate = Fee / max(1, VSize),
@@ -1653,7 +1695,8 @@ compute_package_metrics(TxPairs, PackageTxMap, _State) ->
             descendant_size = VSize,
             descendant_fee = Fee,
             spends_coinbase = SpendsCoinbase,
-            rbf_signaling = RbfSignaling
+            rbf_signaling = RbfSignaling,
+            adj_weight = AdjWeight
         },
 
         {FeeAcc + Fee, VSizeAcc + VSize, [{Txid, Tx, Entry, InputCoins} | EntriesAcc]}
@@ -1846,16 +1889,19 @@ accept_package_txs(TxEntries, EphemeralDeps, State) ->
         %% Verify scripts
         verify_scripts(Tx, InputCoins),
 
-        %% Check ancestor/descendant limits
         VSize = Entry#mempool_entry.vsize,
         Fee = Entry#mempool_entry.fee,
-        {AncCount, AncSize, AncFee} = compute_ancestors(Tx, Fee, VSize),
-        AncCount =< ?MAX_ANCESTOR_COUNT orelse throw(too_long_mempool_chain),
-        AncSize =< ?MAX_ANCESTOR_SIZE orelse throw(too_long_mempool_chain),
-        check_descendant_limits(Tx, VSize),
+        AdjWeight = Entry#mempool_entry.adj_weight,
 
-        %% Cluster limits (package path)
-        check_cluster_limits(Tx, VSize),
+        %% Cluster limits (package path) — count + sigop-adjusted WEIGHT.
+        %% Core validation.cpp:1521 emits "too-large-cluster" for the package
+        %% surface too.  Kept BEFORE the (now removed) ancestor/descendant gates
+        %% so the cluster is never left unbounded in size.
+        check_cluster_limits(Tx, AdjWeight),
+
+        %% Ancestor/descendant limits REMOVED (Core v31 deprecation, see
+        %% do_add_transaction/3 GATE 17).  Stats still computed for the entry.
+        {AncCount, AncSize, AncFee} = compute_ancestors(Tx, Fee, VSize),
 
         %% TRUC checks for package transactions
         MempoolParentTxids = get_parent_txids(Tx),
@@ -1947,8 +1993,14 @@ lookup_inputs_for_tx(#transaction{inputs = Inputs} = Tx) ->
 %% @doc Max transactions in a cluster — Core DEFAULT_CLUSTER_LIMIT (policy.h:72)
 cluster_count_limit() -> ?MAX_CLUSTER_COUNT.
 
-%% @doc Max vbytes in a cluster — Core DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000 (policy.h:74)
+%% @doc Max vbytes in a cluster — Core DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1000 (policy.h:74).
+%% This is the REPORTED figure (Core rpc/mempool.cpp:1062 pushes
+%% limits.cluster_size_vbytes).  The enforcement bound is cluster_weight_limit/0.
 cluster_vbytes_limit() -> ?MAX_CLUSTER_VBYTES.
+
+%% @doc Max sigop-adjusted WEIGHT in a cluster — Core txmempool.cpp:181
+%% max_cluster_size = cluster_size_vbytes * WITNESS_SCALE_FACTOR = 404000.
+cluster_weight_limit() -> ?MAX_CLUSTER_WEIGHT.
 
 %% @doc Core DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB (policy.h:48).
 %% Used by RBF Rule 4 (PaysForRBF) and TrimToSize rolling-fee bump.
@@ -1966,12 +2018,22 @@ compute_ancestors_for_test(Tx, Fee, VSize) ->
     compute_ancestors(Tx, Fee, VSize).
 
 %% @doc Test-exported wrapper for check_descendant_limits/2.
+%%
+%% NOTE (Core v31 cluster mempool): check_descendant_limits/2 is NO LONGER part
+%% of transaction acceptance — Core deprecated -limitdescendantcount in favour of
+%% the cluster limits (init.cpp:656) and "too-long-mempool-chain" no longer exists
+%% in bitcoin-core/src.  The function and this wrapper are retained only so the
+%% existing exported-surface tests keep compiling; nothing in
+%% do_add_transaction/3, do_add_transaction_dry_run/2 or accept_package_txs/3
+%% calls it.  Cluster size is bounded by check_cluster_limits/2.
 check_descendant_limits_for_test(Tx, VSize) ->
     check_descendant_limits(Tx, VSize).
 
 %% @doc Test-exported wrapper for check_cluster_limits/2.
-check_cluster_limits_for_test(Tx, VSize) ->
-    check_cluster_limits(Tx, VSize).
+%% Second argument is the new transaction's UNROUNDED sigop-adjusted WEIGHT
+%% (max(tx_weight, sigops*20)), not its vsize.
+check_cluster_limits_for_test(Tx, AdjWeight) ->
+    check_cluster_limits(Tx, AdjWeight).
 
 %%% ===================================================================
 %%% Internal: standardness checks
@@ -2841,18 +2903,29 @@ check_desc_limits_walk([Txid | Rest], VSize, Visited) ->
             end
     end.
 
-%% @doc Pre-acceptance cluster limit gate (Core validation.cpp:1341-1344,
-%% policy/policy.h:72-74).
+%% @doc Pre-acceptance cluster limit gate (Core validation.cpp:1024/:1116/:1343/:1521
+%% "too-large-cluster", policy/policy.h:72-74, txmempool.cpp:181, txgraph.cpp:2059).
 %%
 %% Computes the cluster that would result from adding Tx (by unioning the
 %% clusters of its in-mempool parents).  Throws too_large_cluster if the
 %% resulting cluster would exceed either:
-%%   - MAX_CLUSTER_COUNT (64 txs)  — Core DEFAULT_CLUSTER_LIMIT
-%%   - MAX_CLUSTER_VBYTES (101,000 vbytes) — Core DEFAULT_CLUSTER_SIZE_LIMIT_KVB*1000
+%%   - MAX_CLUSTER_COUNT  (64 txs)              — Core DEFAULT_CLUSTER_LIMIT
+%%   - MAX_CLUSTER_WEIGHT (404,000 weight units) — Core cluster_size_vbytes *
+%%     WITNESS_SCALE_FACTOR (txmempool.cpp:181)
+%%
+%% UNITS: the size axis is accumulated in WEIGHT, summing each member's UNROUNDED
+%% sigop-adjusted weight max(w_i, sigops_i * 20) (policy.cpp:390).  There is NO
+%% per-transaction division by 4 anywhere in this path.  Summing per-tx ceilinged
+%% vbytes against 101,000 would be systematically stricter than Core.
+%%
+%% FORM: Core rejects on `total_count > max_count || total_size > max_size`
+%% (txgraph.cpp:2059, strict >).  We accept on `Combined =< Max`, which is the
+%% exact logical complement — 64 accepts / 65 rejects, 404000 accepts /
+%% 404001 rejects.
 %%
 %% We read existing cluster data from the ETS table; the new tx is not yet
-%% inserted, so its VSize must be added explicitly.
-check_cluster_limits(Tx, VSize) ->
+%% inserted, so its AdjWeight must be added explicitly.
+check_cluster_limits(Tx, AdjWeight) ->
     ParentTxids = get_parent_txids_from_inputs(Tx#transaction.inputs),
     %% Collect the unique cluster ids that would be merged.
     %% For each in-mempool parent, resolve its cluster root (the ETS key).
@@ -2865,24 +2938,47 @@ check_cluster_limits(Tx, VSize) ->
                 []       -> false
             end
         end, ParentTxids)),
-    %% Sum up count and vbytes across all unique clusters that will merge.
-    {CombinedCount, CombinedVBytes} = lists:foldl(
-        fun(ClusterId, {AC, AV}) ->
+    %% Sum up count and sigop-adjusted WEIGHT across all clusters that will merge.
+    %%
+    %% Membership is taken from ?MEMPOOL_TXS, NOT from the cached cluster
+    %% totals.  Core evaluates the limits against the pending CHANGESET, so
+    %% transactions staged for removal are already gone when the check runs.
+    %% beamchain's RBF path (do_rbf/3, reached at GATE 10) removes the replaced
+    %% entries from ?MEMPOOL_TXS immediately, but ?MEMPOOL_CLUSTERS is only
+    %% rebuilt later via cluster_remove_tx/2.  Trusting the cached txids list
+    %% here would therefore count already-evicted members and reject a
+    %% replacement that in fact FREES cluster room (corpus: cluster-rbf-frees-room).
+    %% Bounded work: a live cluster is capped at MAX_CLUSTER_COUNT members.
+    {CombinedCount, CombinedWeight} = lists:foldl(
+        fun(ClusterId, {AC, AW}) ->
             case ets:lookup(?MEMPOOL_CLUSTERS, ClusterId) of
                 [{_, CD}] ->
-                    {AC + length(CD#cluster_data.txids),
-                     AV + CD#cluster_data.total_vsize};
+                    LiveTxids = [T || T <- CD#cluster_data.txids,
+                                      ets:member(?MEMPOOL_TXS, T)],
+                    {AC + length(LiveTxids),
+                     AW + lists:sum([entry_adj_weight(T) || T <- LiveTxids])};
                 [] ->
-                    {AC, AV}
+                    {AC, AW}
             end
         end,
-        {1, VSize},   %% start: the new tx itself counts as 1 tx, VSize vbytes
+        %% start: the new tx itself counts as 1 tx, AdjWeight weight units
+        {1, AdjWeight},
         ParentClusterIds),
     CombinedCount =< ?MAX_CLUSTER_COUNT
         orelse throw(too_large_cluster),
-    CombinedVBytes =< ?MAX_CLUSTER_VBYTES
+    CombinedWeight =< ?MAX_CLUSTER_WEIGHT
         orelse throw(too_large_cluster),
     ok.
+
+%% @doc Sigop-adjusted weight of an in-mempool transaction, by txid.
+%% Falls back to vsize * 4 for entries written before adj_weight existed.
+entry_adj_weight(Txid) ->
+    case ets:lookup(?MEMPOOL_TXS, Txid) of
+        [{_, #mempool_entry{adj_weight = W}}] when is_integer(W) -> W;
+        [{_, #mempool_entry{vsize = V}}] when is_integer(V) ->
+            V * ?WITNESS_SCALE_FACTOR;
+        _ -> 0
+    end.
 
 %% @doc Find the cluster root id for a txid by scanning cluster records.
 %% Falls back to the txid itself if not found (conservative: no cluster).

@@ -58,12 +58,14 @@
 -define(MAX_TIMEWARP, 600).
 
 %% Re-define mempool_entry record (internal to beamchain_mempool)
+%% MUST stay field-for-field identical to beamchain_mempool.erl's definition.
 -record(mempool_entry, {
     txid, wtxid, tx, fee, size, vsize, weight, fee_rate,
     time_added, height_added,
     ancestor_count, ancestor_size, ancestor_fee,
     descendant_count, descendant_size, descendant_fee,
-    spends_coinbase, rbf_signaling
+    spends_coinbase, rbf_signaling,
+    adj_weight
 }).
 
 -record(state, {
