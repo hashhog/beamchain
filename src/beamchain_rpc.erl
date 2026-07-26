@@ -268,12 +268,16 @@
 }).
 
 %% Re-define mempool_entry record (internal to beamchain_mempool).
+%% MUST stay field-for-field identical to beamchain_mempool.erl's definition —
+%% named-field record patterns compile to a fixed-arity tuple match, so a missing
+%% trailing field silently breaks every match against an ETS-stored entry.
 -record(mempool_entry, {
     txid, wtxid, tx, fee, size, vsize, weight, fee_rate,
     time_added, height_added,
     ancestor_count, ancestor_size, ancestor_fee,
     descendant_count, descendant_size, descendant_fee,
-    spends_coinbase, rbf_signaling
+    spends_coinbase, rbf_signaling,
+    adj_weight
 }).
 
 %%% ===================================================================
@@ -4081,6 +4085,16 @@ format_mempool_error(dust, _Txid) ->
     {error, ?RPC_VERIFY_REJECTED, <<"dust">>};
 format_mempool_error(too_long_mempool_chain, _Txid) ->
     {error, ?RPC_VERIFY_REJECTED, <<"too-long-mempool-chain">>};
+%% Cluster mempool size/count limit (Core validation.cpp:1024/:1116/:1343/:1521):
+%%   state.Invalid(TX_MEMPOOL_POLICY, "too-large-cluster", "");
+%% The reject reason is HYPHENATED and the debug string is EMPTY.  Without this
+%% clause the atom fell through to the catch-all at the bottom of
+%% format_mempool_error/2 and surfaced as the underscored Erlang term
+%% "too_large_cluster", which does not match Core.
+format_mempool_error(too_large_cluster, _Txid) ->
+    {error, ?RPC_VERIFY_REJECTED, <<"too-large-cluster">>};
+format_mempool_error('too-large-cluster', _Txid) ->
+    {error, ?RPC_VERIFY_REJECTED, <<"too-large-cluster">>};
 format_mempool_error(rbf_not_signaled, _Txid) ->
     {error, ?RPC_VERIFY_REJECTED, <<"txn-mempool-conflict">>};
 format_mempool_error(rbf_insufficient_fee, _Txid) ->
@@ -9742,12 +9756,24 @@ bumpfee_run(Pid, TxidHex, Options, Mode) ->
     end.
 
 bumpfee_extract_entry(Entry) ->
-    %% mempool_entry is private; reach in via record_info field index. We
-    %% defensively check the tag.
+    %% Field ACCESS, not a positional tuple match.
+    %%
+    %% This was a hand-written fixed-arity pattern listing all 18 fields
+    %% positionally. Wave A appended `adj_weight` to #mempool_entry{}, which
+    %% made entries 20-element tuples, so the clause could never match again and
+    %% every call fell through to the defensive catch-all — silently breaking
+    %% `bumpfee` and `psbtbumpfee` for EVERY mempool transaction
+    %% (handle_method at :924/:925 -> bumpfee_run/4 -> get_entry/1 -> here).
+    %%
+    %% It compiled clean and no test caught it, because the only behavioural
+    %% bumpfee tests pass a bogus txid and never reach this function, while
+    %% beamchain_w130_bip125_tests:g29 was a SOURCE-TEXT grep asserting the
+    %% fragile pattern was still present — the marker actively forbade the
+    %% robust form. That marker is now inverted to demand this shape instead.
+    %%
+    %% Record access is arity-independent: adding a field can no longer break it.
     case Entry of
-        {mempool_entry, _Txid, _Wtxid, Tx, Fee, _Size, VSize, _Weight,
-         _FeeRate, _TimeAdded, _HeightAdded, _AC, _AS, _AF, _DC, _DS, _DF,
-         _SC, _RBF} ->
+        #mempool_entry{tx = Tx, fee = Fee, vsize = VSize} ->
             {Tx, Fee, VSize};
         _ ->
             throw({bumpfee_error, ?RPC_MISC_ERROR,
