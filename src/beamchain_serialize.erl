@@ -37,7 +37,8 @@
 -export([compute_merkle_root/1, compute_witness_commitment/2]).
 
 %% Weight/vsize/size
--export([tx_weight/1, tx_vsize/1, tx_sigop_vsize/2, tx_size/1]).
+-export([tx_weight/1, tx_vsize/1, tx_sigop_vsize/2, tx_sigop_adjusted_weight/2,
+         tx_size/1]).
 %% Block weight (includes header + varint tx count + transactions)
 -export([block_weight/1, block_base_size/1]).
 
@@ -415,14 +416,31 @@ tx_vsize(Tx) ->
     Weight = tx_weight(Tx),
     (Weight + ?WITNESS_SCALE_FACTOR - 1) div ?WITNESS_SCALE_FACTOR.
 
+%% @doc Compute the sigop-adjusted transaction WEIGHT (unrounded).
+%% Mirrors Bitcoin Core policy/policy.cpp:390 GetSigOpsAdjustedWeight:
+%%   return std::max(weight, sigop_cost * bytes_per_sigop);
+%% bytes_per_sigop corresponds to Core's DEFAULT_BYTES_PER_SIGOP (policy.h:50 = 20).
+%%
+%% This is the per-transaction quantity Core's TxGraph sums when enforcing the
+%% cluster size limit (txmempool.cpp:1017 feeds GetSigOpsAdjustedWeight(...) into
+%% FeePerWeight, and txmempool.cpp:181 sets max_cluster_size =
+%% cluster_size_vbytes * WITNESS_SCALE_FACTOR).  It MUST stay unrounded: summing
+%% per-tx ceil(w/4) vbytes is systematically stricter than Core because
+%% Sum(ceil(w_i/4)) >= ceil(Sum(w_i)/4).
+-spec tx_sigop_adjusted_weight(#transaction{}, non_neg_integer()) -> non_neg_integer().
+tx_sigop_adjusted_weight(Tx, SigopCost) ->
+    max(tx_weight(Tx), SigopCost * ?DEFAULT_BYTES_PER_SIGOP).
+
 %% @doc Compute sigop-adjusted virtual transaction size.
 %% Mirrors Bitcoin Core policy/policy.cpp GetVirtualTransactionSize:
 %%   vsize = ceil(max(weight, sigop_cost * bytes_per_sigop) / WITNESS_SCALE_FACTOR)
 %% The bytes_per_sigop parameter corresponds to Core's DEFAULT_BYTES_PER_SIGOP (20).
+%% NOTE: this per-tx rounding is correct for feerate / RPC vsize / mempool byte
+%% accounting, but must NOT be used for cluster size accumulation — see
+%% tx_sigop_adjusted_weight/2.
 -spec tx_sigop_vsize(#transaction{}, non_neg_integer()) -> non_neg_integer().
 tx_sigop_vsize(Tx, SigopCost) ->
-    Weight = tx_weight(Tx),
-    AdjustedWeight = max(Weight, SigopCost * 20),
+    AdjustedWeight = tx_sigop_adjusted_weight(Tx, SigopCost),
     (AdjustedWeight + ?WITNESS_SCALE_FACTOR - 1) div ?WITNESS_SCALE_FACTOR.
 
 %% @doc Compute total block weight.

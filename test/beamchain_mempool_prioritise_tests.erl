@@ -32,7 +32,8 @@
     time_added, height_added,
     ancestor_count, ancestor_size, ancestor_fee,
     descendant_count, descendant_size, descendant_fee,
-    spends_coinbase, rbf_signaling
+    spends_coinbase, rbf_signaling,
+    adj_weight
 }).
 
 -record(cluster_data, {
