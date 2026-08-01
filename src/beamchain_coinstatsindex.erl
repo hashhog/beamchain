@@ -85,8 +85,8 @@
 %% Per-height DBVal — the full cumulative state Core persists per block.
 %% Stored as a self-describing tagged binary (see encode_dbval/1).
 -record(dbval, {
-    block_hash                          :: binary(),  %% 32B internal order
-    muhash                              :: binary(),  %% 768B serialized acc
+    block_hash                          :: binary() | undefined,  %% 32B internal order
+    muhash                              :: binary() | undefined,  %% 768B serialized acc
     txouts            = 0               :: non_neg_integer(),
     bogosize          = 0               :: non_neg_integer(),
     total_amount      = 0               :: integer(),  %% sat
@@ -152,7 +152,7 @@ add_block(Block, Height, SpentCoins) ->
 %% RevertBlock): copy its DBVal to the hash index, delete the height
 %% entry, and reset the tip to Height-1 (whose stored DBVal is already
 %% the correct rolled-back state). Best-effort, default-off.
--spec remove_block(binary(), non_neg_integer()) -> ok | {error, term()}.
+-spec remove_block(binary(), non_neg_integer() | 'undefined') -> ok | {error, term()}.
 remove_block(BlockHash, Height) ->
     case whereis(?SERVER) of
         undefined -> {error, index_not_running};
@@ -160,6 +160,8 @@ remove_block(BlockHash, Height) ->
                              {remove_block, BlockHash, Height}, 30000)
     end.
 
+%% Convenience wrapper: roll back without a known height. do_remove_block/3
+%% accepts non-integer heights (best-effort reverse-index cleanup only).
 remove_block(BlockHash) ->
     remove_block(BlockHash, undefined).
 
@@ -299,7 +301,7 @@ code_change(_Old, State, _Extra) -> {ok, State}.
 %% no tx output added; total_subsidy += subsidy(0); the genesis coinbase
 %% reward becomes total_unspendables_genesis_block). Idempotent: skipped
 %% if the index already holds any entry.
-maybe_index_genesis(undefined) -> ok;
+-spec maybe_index_genesis(rocksdb:db_handle()) -> ok.
 maybe_index_genesis(Db) ->
     case read_tip_height(Db) of
         H when is_integer(H), H >= 0 ->
@@ -687,7 +689,7 @@ base_stats_map(Height, DBVal) ->
 %%% Startup reconciliation (BaseIndex::Init -> Rewind)
 %%% ===================================================================
 
-reconcile_with_chain(undefined) -> ok;
+-spec reconcile_with_chain(rocksdb:db_handle()) -> ok.
 reconcile_with_chain(Db) ->
     case chain_tip_height() of
         not_found ->

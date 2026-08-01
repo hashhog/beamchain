@@ -442,7 +442,9 @@ g24_oversize_message_rejected_test() ->
     %% Feed just the EncLen into extract_v2_packet via the responder cipher.
     %% The buffer contains exactly 3 bytes — length field only.
     Peer = beamchain_peer:make_test_v2_peer(B1, EncLen),
-    ?assertEqual({stop, oversize_message},
+    %% Rejected with a GRACEFUL stop ({shutdown, _}) so no gen_statem
+    %% crash report is emitted — Core drops the peer cleanly.
+    ?assertEqual({stop, {shutdown, oversize_message}},
                  beamchain_peer:extract_v2_packet(Peer)),
 
     %% Boundary: exactly MaxLen is allowed.
@@ -451,7 +453,7 @@ g24_oversize_message_rejected_test() ->
     <<EncLen2:3/binary, _/binary>> = CT2,
     Peer2 = beamchain_peer:make_test_v2_peer(B1, EncLen2),
     %% Must NOT return oversize_message for the boundary-exact case.
-    ?assertNotEqual({stop, oversize_message},
+    ?assertNotEqual({stop, {shutdown, oversize_message}},
                     beamchain_peer:extract_v2_packet(Peer2)).
 
 %%% ===================================================================

@@ -193,7 +193,7 @@ combine([First | Rest]) ->
 %%   - Input+output order is SHUFFLED (Core std::shuffle privacy step);
 %%     byte-exactness vs Core is impossible regardless (Core's order is
 %%     random too), so callers/tests must compare SETS.
--spec join([#psbt{}]) -> {ok, #psbt{}} | {error, term()}.
+-spec join([#psbt{}]) -> {ok, #psbt{}} | {error, {duplicate_input, binary(), non_neg_integer()}}.
 join(Psbts) ->
     BestVersion = lists:foldl(fun(P, Acc) ->
         V = (P#psbt.unsigned_tx)#transaction.version band 16#ffffffff,

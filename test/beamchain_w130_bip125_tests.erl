@@ -313,18 +313,18 @@ g12_combined_bump_fee_missing_test_() ->
      ?_assertEqual(nomatch, binary:match(Joined, <<"combined_bump_fee">>))].
 
 %%% ===================================================================
-%%% G13 — `original_change_index` option missing
-%%% Core wallet/feebumper.cpp:181-184.
-%%% BUG-10 MEDIUM: no original_change_index in `rpc_bumpfee` Options
-%%% destructure. Change output discovered by listaddresses walk.
+%%% G13 — `original_change_index` option (Core: `change_position`)
+%%% Core wallet/feebumper.cpp:181-184 + bumpfee `change_position` option.
+%%% BUG-10 CLOSED: the funding engine consumes a `change_position` spec
+%%% key (fund_raw_tx in beamchain_rpc) instead of discovering the change
+%%% output by a listaddresses walk.
 %%% ===================================================================
 
 g13_original_change_index_missing_test_() ->
-    %% Use code-only view: rpc.erl line 5574 names the token in the
-    %% out-of-scope comment.
+    %% Use code-only view: strip comments so stale doc mentions don't count.
     Code = strip_comments(read_src(rpc_src_path())),
     [?_assertEqual(nomatch, binary:match(Code, <<"original_change_index">>)),
-     ?_assertEqual(nomatch, binary:match(Code, <<"change_position">>))].
+     ?_assertNotEqual(nomatch, binary:match(Code, <<"change_position">>))].
 
 %%% ===================================================================
 %%% G14 — `outputs` array override missing

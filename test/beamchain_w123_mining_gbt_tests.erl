@@ -184,9 +184,12 @@ g12_gbt_signet_challenge_absent_test() ->
 
 %% G13 [P0] BIP-34 coinbase height encoding (CScriptNum / sign-bit) — PRESENT.
 %% Re-verifies the W87 fix is still in place via live call.
+%% Heights 0..16 use the small-integer opcodes OP_0..OP_16 exactly like
+%% Core's CScript::push_int64 (script.h); 17+ use minimal-LE pushes.
 g13_coinbase_height_encoding_signbit_test() ->
-    ?assertEqual(<<1, 1>>,        beamchain_miner:encode_coinbase_height(1)),
-    ?assertEqual(<<1, 16>>,       beamchain_miner:encode_coinbase_height(16)),
+    ?assertEqual(<<16#00>>,       beamchain_miner:encode_coinbase_height(0)),
+    ?assertEqual(<<16#51>>,       beamchain_miner:encode_coinbase_height(1)),
+    ?assertEqual(<<16#60>>,       beamchain_miner:encode_coinbase_height(16)),
     ?assertEqual(<<1, 17>>,       beamchain_miner:encode_coinbase_height(17)),
     ?assertEqual(<<1, 127>>,      beamchain_miner:encode_coinbase_height(127)),
     ?assertEqual(<<2, 128, 0>>,   beamchain_miner:encode_coinbase_height(128)),

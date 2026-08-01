@@ -68,7 +68,12 @@
 -define(MAX_TRIED_ADDRS, (?TRIED_BUCKET_COUNT * ?BUCKET_SIZE)).
 
 -record(addr_info, {
-    address     :: {inet:ip_address(), inet:port_number()} | {binary(), inet:port_number()},
+    %% Onion/I2P/CJDNS addresses may be stored as printable strings (list) as
+    %% well as binaries (see addr_to_string/2 and the legacy-data note in
+    %% do_get_addresses/0). network_id may be 'undefined' on legacy entries
+    %% persisted before BIP155.
+    address     :: {inet:ip_address(), inet:port_number()} |
+                   {binary() | string(), inet:port_number()},
     services = 0 :: non_neg_integer(),
     timestamp   :: non_neg_integer(),    %% last time we heard about it
     source      :: term(),               %% where we learned this addr
@@ -78,7 +83,7 @@
     last_success = 0 :: non_neg_integer(), %% unix timestamp of last success
     in_tried = false :: boolean(),       %% true if in tried table
     ref_count = 0 :: non_neg_integer(),  %% number of new table buckets containing this
-    network_id = 1 :: non_neg_integer()  %% BIP155 network ID (1=IPv4, 2=IPv6, 4=TorV3, 5=I2P, 6=CJDNS)
+    network_id = 1 :: non_neg_integer() | 'undefined'  %% BIP155 network ID (1=IPv4, 2=IPv6, 4=TorV3, 5=I2P, 6=CJDNS)
 }).
 
 -record(state, {

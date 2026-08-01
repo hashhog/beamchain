@@ -548,9 +548,9 @@ rest_blockfilter_lookup(FilterTypeByte, HashHex, Format) ->
             {error, ?HTTP_NOT_FOUND,
              <<"Filter not found.  Either the block was not connected "
                "to the active chain, or block filters are still being "
-               "indexed.">>};
-        {error, _} ->
-            {error, ?HTTP_NOT_FOUND, <<"Filter not found">>}
+               "indexed.">>}
+            %% get_filter/1's contract is {ok, binary()} | not_found —
+            %% no {error, _} case exists.
     end.
 
 rest_blockfilter_format(FilterTypeByte, Hash, FilterBytes, json) ->
@@ -1148,9 +1148,8 @@ confirmations(Height, BlockHash) when is_binary(BlockHash) ->
     case is_block_in_active_chain(BlockHash) of
         true -> confirmations(Height);
         false -> 0
-    end;
-confirmations(Height, _) ->
-    confirmations(Height).
+    end.
+%% (Every caller passes a binary BlockHash, so no third clause is reachable.)
 
 %% Check if a block hash is on the active chain.
 is_block_in_active_chain(BlockHash) ->

@@ -300,15 +300,15 @@ g12_no_post_ibd_recovery_test_() ->
 
 g13_min_relay_floor_test_() ->
     {"G13: Gate-13 PARTIAL — beamchain applies a min-relay floor via "
-     "?DEFAULT_MIN_RELAY_FEE (1000), but Core uses the runtime "
-     "min_relay_feerate from mempool options. (net_processing.cpp:"
-     "5567 `std::max(filterToSend, m_mempool.m_opts.min_relay_feerate"
-     ".GetFeePerK())`).",
+     "?DEFAULT_MIN_RELAY_FEE (100 sat/kvB, Core v31 — commit 2be0529), "
+     "but Core uses the runtime min_relay_feerate from mempool options. "
+     "(net_processing.cpp:5567 `std::max(filterToSend, "
+     "m_mempool.m_opts.min_relay_feerate.GetFeePerK())`).",
      [
       ?_test(begin
          Src = read_src(beamchain_peer_src()),
          ?assertNotEqual(nomatch, binary:match(Src,
-             <<"DEFAULT_MIN_RELAY_FEE, 1000">>)),
+             <<"DEFAULT_MIN_RELAY_FEE, 100">>)),
          %% No mempool-option lookup in feefilter send path
          ?assertEqual(nomatch, binary:match(Src, <<"min_relay_feerate">>))
        end)

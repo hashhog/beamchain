@@ -75,7 +75,7 @@ version_roundtrip_test() ->
         addr_from => #{services => ?NODE_NETWORK bor ?NODE_WITNESS,
                        ip => {192,168,1,100}, port => 8333},
         nonce => 16#DEADBEEFCAFEBABE,
-        user_agent => <<"/beamchain:0.1.0/">>,
+        user_agent => <<"/beamchain:1.0.0/">>,
         start_height => 800000,
         relay => true
     },

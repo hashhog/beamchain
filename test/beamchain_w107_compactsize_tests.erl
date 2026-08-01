@@ -90,13 +90,20 @@ g3_compact_size_5byte_max32_test() ->
     ?assertMatch(<<16#FE, 4294967295:32/little>>, Enc).
 
 g3_compact_size_5byte_roundtrip_test() ->
-    Values = [65536, 100000, 16#00FFFFFF, 16#FFFFFFFF],
+    %% Roundtrip holds only up to Core's ReadCompactSize MAX_SIZE
+    %% (0x02000000; serialize.h:34) — values above it are rejected with
+    %% oversized_compact_size (see G10).
+    Values = [65536, 100000, 16#00FFFFFF],
     lists:foreach(fun(V) ->
         Enc = beamchain_serialize:encode_varint(V),
         ?assertEqual(5, byte_size(Enc),
                      {five_byte_expected_for, V}),
         ?assertEqual({V, <<>>}, beamchain_serialize:decode_varint(Enc))
-    end, Values).
+    end, Values),
+    %% 2^32-1 exceeds MAX_SIZE: Core throws "size too large" on read.
+    EncMax = beamchain_serialize:encode_varint(16#FFFFFFFF),
+    ?assertEqual({error, oversized_compact_size},
+                 beamchain_serialize:decode_varint(EncMax)).
 
 %%% -------------------------------------------------------------------
 %%% G4: CompactSize 9-byte range [2^32, 2^64-1] uses 0xFF prefix
@@ -114,12 +121,16 @@ g4_compact_size_9byte_large_test() ->
     ?assertMatch(<<16#FF, 16#0102030405060708:64/little>>, Enc).
 
 g4_compact_size_9byte_roundtrip_test() ->
+    %% Every canonical 9-byte value (N >= 2^32) exceeds Core's
+    %% ReadCompactSize MAX_SIZE (0x02000000; serialize.h:34), so Core
+    %% rejects ALL 0xFF-prefixed reads with "size too large" (see G10).
     Values = [4294967296, 4294967297, 16#00FFFFFFFFFFFFFF],
     lists:foreach(fun(V) ->
         Enc = beamchain_serialize:encode_varint(V),
         ?assertEqual(9, byte_size(Enc),
                      {nine_byte_expected_for, V}),
-        ?assertEqual({V, <<>>}, beamchain_serialize:decode_varint(Enc))
+        ?assertEqual({error, oversized_compact_size},
+                     beamchain_serialize:decode_varint(Enc))
     end, Values).
 
 %%% -------------------------------------------------------------------
@@ -140,8 +151,10 @@ g5_compact_size_decode_rest_5byte_test() ->
         beamchain_serialize:decode_varint(<<16#FE, 65536:32/little, "tail">>).
 
 g5_compact_size_decode_rest_9byte_test() ->
-    {4294967296, <<"end">>} =
-        beamchain_serialize:decode_varint(<<16#FF, 4294967296:64/little, "end">>).
+    %% 2^32 via 0xFF is above Core's MAX_SIZE (0x02000000) — rejected on
+    %% read before any rest is returned (see G10).
+    ?assertEqual({error, oversized_compact_size},
+        beamchain_serialize:decode_varint(<<16#FF, 4294967296:64/little, "end">>)).
 
 %%% -------------------------------------------------------------------
 %%% G6: CompactSize non-canonical encoding: values that SHOULD be
@@ -205,7 +218,8 @@ g7_snapshot_compact_size_decode_5byte_test() ->
         beamchain_snapshot:decode_compact_size(<<254, 65536:32/little>>)).
 
 g7_snapshot_compact_size_decode_9byte_test() ->
-    ?assertEqual({ok, 4294967296, <<>>},
+    %% 2^32 via 0xFF exceeds Core's MAX_SIZE (0x02000000; serialize.h:34).
+    ?assertEqual({error, oversized_compact_size},
         beamchain_snapshot:decode_compact_size(<<255, 4294967296:64/little>>)).
 
 g7_snapshot_compact_size_decode_error_truncated_test() ->
@@ -237,13 +251,18 @@ g8_snapshot_non_canonical_fe_bug_test() ->
 %%% -------------------------------------------------------------------
 
 g9_mempool_persist_compact_size_roundtrip_test() ->
-    Values = [0, 1, 252, 253, 65535, 65536, 4294967295],
+    %% Roundtrip up to Core's MAX_SIZE (0x02000000); 2^32-1 exceeds it
+    %% and is rejected with oversized_compact_size (see G10).
+    Values = [0, 1, 252, 253, 65535, 65536],
     lists:foreach(fun(V) ->
         Enc = beamchain_mempool_persist:encode_compact_size(V),
         ?assertEqual({V, <<>>},
             beamchain_mempool_persist:decode_compact_size(Enc),
             {roundtrip_failed_for, V})
-    end, Values).
+    end, Values),
+    EncMax = beamchain_mempool_persist:encode_compact_size(4294967295),
+    ?assertEqual({error, oversized_compact_size},
+                 beamchain_mempool_persist:decode_compact_size(EncMax)).
 
 %%% -------------------------------------------------------------------
 %%% G10: MAX_SIZE check — Core rejects CompactSize values > 0x02000000

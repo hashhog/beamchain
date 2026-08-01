@@ -1,6 +1,6 @@
 {application, beamchain, [
     {description, "Bitcoin full node in Erlang/OTP"},
-    {vsn, "0.1.0"},
+    {vsn, "1.0.0"},
     {registered, [
         beamchain_sup,
         beamchain_node_sup,

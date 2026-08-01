@@ -45,6 +45,19 @@
 %%% Helpers
 %%% ===================================================================
 
+%% Point HOME at a throwaway dir so the wallet's datadir fallback
+%% (beamchain_wallet:wallet_dir/1 -> default_datadir/0) stays hermetic:
+%% the legacy {create, Seed, Pass} path always writes <dir>/wallet.json
+%% regardless of wallet name, and without a beamchain_config datadir
+%% that lands in ~/.beamchain (the operator's real datadir). Mirrors
+%% beamchain_wallet_persist_tests' setup/0.
+set_test_home() ->
+    Home = "/tmp/beamchain_w111_home_"
+           ++ integer_to_list(erlang:unique_integer([positive])),
+    ok = filelib:ensure_dir(Home ++ "/"),
+    true = os:putenv("HOME", Home),
+    ok.
+
 hex_to_bin(Hex) ->
     L = string:lowercase(Hex),
     hex_to_bin(L, <<>>).
@@ -606,6 +619,7 @@ g23_wallet_persistence_test_() ->
     {"G23: Wallet save + load round-trip",
      [
       ?_test(begin
+         set_test_home(),
          {ok, Pid} = beamchain_wallet:start_link(<<"test_w111_g23">>),
          Seed = crypto:strong_rand_bytes(32),
          {ok, _} = gen_server:call(Pid, {create, Seed, undefined}),
@@ -624,6 +638,7 @@ g24_wallet_encryption_test_() ->
     {"G24: Wallet encryption lifecycle",
      [
       ?_test(begin
+         set_test_home(),
          {ok, Pid} = beamchain_wallet:start_link(<<"test_w111_g24">>),
          Seed = crypto:strong_rand_bytes(32),
          {ok, _} = gen_server:call(Pid, {create, Seed, undefined}),
@@ -651,6 +666,7 @@ g25_mnemonic_persistence_bug_test_() ->
     {"G25: BUG-1 — mnemonic lost after wallet restart",
      [
       ?_test(begin
+         set_test_home(),
          {ok, Pid} = beamchain_wallet:start_link(<<"test_w111_g25">>),
          Mnemonic = [<<"abandon">>, <<"abandon">>, <<"abandon">>,
                      <<"abandon">>, <<"abandon">>, <<"abandon">>,

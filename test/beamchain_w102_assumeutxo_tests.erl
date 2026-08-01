@@ -276,12 +276,18 @@ test_g2_coin_height_equal_base() ->
 %%% ===================================================================
 %%% G3 — per-coin vout >= UINT32_MAX (FIXED)
 %%%
-%%% parse_txid_coin_entries_validated/5 now checks Vout >= 16#ffffffff
-%%% and returns {error, {bad_coin_vout, Vout}}.
-%%% Mirrors Core validation.cpp:5815.
+%%% parse_txid_coin_entries_validated/5 checks Vout >= 16#ffffffff and
+%%% returns {error, {bad_coin_vout, Vout}} (Core validation.cpp:5815).
+%%% In practice a UINT32_MAX vout never reaches that guard: the value is
+%%% compactSize-encoded, and decode_compact_size/1 applies Core's
+%%% ReadCompactSize MAX_SIZE gate (serialize.h:34, MAX_SIZE=0x02000000)
+%%% first, rejecting it with {error, oversized_compact_size} — the same
+%%% rejection Core performs on the same bytes.
 %%% ===================================================================
 
-%% FIXED G3: a snapshot whose vout field equals UINT32_MAX is rejected.
+%% FIXED G3: a snapshot whose vout field equals UINT32_MAX is rejected
+%% (by the Core-faithful compactSize MAX_SIZE gate, before the
+%% bad_coin_vout guard — see the section comment above).
 test_g3_vout_max_uint32() ->
     RegtestMagic = <<16#FA, 16#BF, 16#B5, 16#DA>>,
     MaxVout = 16#ffffffff,
@@ -303,7 +309,7 @@ test_g3_vout_max_uint32() ->
         ok = file:write_file(TmpPath, SnapBin),
         Result = beamchain_snapshot:load_snapshot_validated(
                      TmpPath, RegtestMagic, 1000000),
-        ?assertMatch({error, {bad_coin_vout, _}}, Result)
+        ?assertMatch({error, oversized_compact_size}, Result)
     after
         file:delete(TmpPath)
     end.
@@ -584,10 +590,11 @@ regtest_placeholder_test() ->
 %%% Positive: assumeutxo table completeness (mainnet)
 %%% ===================================================================
 
-%% Mainnet must carry all 4 Core entries, and each must have non-zero hashes.
+%% Mainnet must carry all 6 entries (4 Core heights plus 481823 from
+%% commit 0acf39f and 944183 from commit db602d0), each with non-zero hashes.
 mainnet_entries_non_zero_test() ->
     #{assumeutxo := M} = beamchain_chain_params:params(mainnet),
-    ?assertEqual(4, maps:size(M)),
+    ?assertEqual(6, maps:size(M)),
     lists:foreach(fun({H, #{block_hash := BH, utxo_hash := UH,
                              chain_tx_count := C}}) ->
         ?assert(H > 0),

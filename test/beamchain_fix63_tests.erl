@@ -305,6 +305,7 @@ is_ok({ok_raw_json, _}) -> true;
 is_ok(_)                -> false.
 
 ensure_default_wallet() ->
+    set_test_home(),
     case whereis(beamchain_wallet) of
         undefined ->
             {ok, _Pid} = beamchain_wallet:start_link();
@@ -319,12 +320,41 @@ stop_default_wallet() ->
             gen_server:stop(Pid)
     end.
 
+%% Point HOME at a throwaway dir so the wallet's datadir fallback
+%% (beamchain_wallet:wallet_dir/1 -> default_datadir/0) stays hermetic:
+%% without a beamchain_config datadir the wallet gen_server would
+%% otherwise auto-load and persist into ~/.beamchain (the operator's
+%% real datadir). Mirrors beamchain_wallet_persist_tests' setup/0.
+set_test_home() ->
+    Home = "/tmp/beamchain_fix63_home_"
+           ++ integer_to_list(erlang:unique_integer([positive])),
+    ok = filelib:ensure_dir(Home ++ "/"),
+    case get(test_home_backup) of
+        undefined -> put(test_home_backup, os:getenv("HOME"));
+        _ -> ok
+    end,
+    true = os:putenv("HOME", Home),
+    put(test_home_dir, Home),
+    ok.
+
+restore_test_home() ->
+    case erase(test_home_backup) of
+        undefined -> ok;
+        false     -> os:unsetenv("HOME");
+        Prev      -> os:putenv("HOME", Prev)
+    end,
+    case erase(test_home_dir) of
+        undefined -> ok;
+        Dir       -> os:cmd("rm -rf " ++ Dir), ok
+    end.
+
 %% WPP-4: round-trip with sign=true + finalize=true on a P2WPKH input
 %% that the wallet owns. Expect complete=true and hex present.
 walletprocesspsbt_p2wpkh_roundtrip_test_() ->
     {setup,
      fun() ->
          %% Use a uniquely-seeded default wallet for this test.
+         set_test_home(),
          _ = stop_default_wallet(),
          {ok, Pid} = beamchain_wallet:start_link(),
          Seed = crypto:strong_rand_bytes(32),
@@ -333,7 +363,7 @@ walletprocesspsbt_p2wpkh_roundtrip_test_() ->
          {ok, Script} = beamchain_address:address_to_script(Addr, mainnet),
          Pid
      end,
-     fun(_Pid) -> stop_default_wallet() end,
+     fun(_Pid) -> stop_default_wallet(), restore_test_home() end,
      fun(_Pid) ->
        [
         ?_test(begin
@@ -371,6 +401,7 @@ walletprocesspsbt_p2wpkh_roundtrip_test_() ->
 walletprocesspsbt_locked_wallet_test_() ->
     {setup,
      fun() ->
+         set_test_home(),
          _ = stop_default_wallet(),
          {ok, Pid} = beamchain_wallet:start_link(),
          Seed = crypto:strong_rand_bytes(32),
@@ -379,7 +410,7 @@ walletprocesspsbt_locked_wallet_test_() ->
          _ = gen_server:call(Pid, walletlock),
          Pid
      end,
-     fun(_Pid) -> stop_default_wallet() end,
+     fun(_Pid) -> stop_default_wallet(), restore_test_home() end,
      fun(_Pid) ->
        [
         ?_test(begin
@@ -414,13 +445,14 @@ walletprocesspsbt_locked_wallet_test_() ->
 walletprocesspsbt_missing_key_test_() ->
     {setup,
      fun() ->
+         set_test_home(),
          _ = stop_default_wallet(),
          {ok, Pid} = beamchain_wallet:start_link(),
          Seed = crypto:strong_rand_bytes(32),
          {ok, _} = gen_server:call(Pid, {create, Seed, undefined}),
          Pid
      end,
-     fun(_Pid) -> stop_default_wallet() end,
+     fun(_Pid) -> stop_default_wallet(), restore_test_home() end,
      fun(_Pid) ->
        [
         ?_test(begin
@@ -457,13 +489,14 @@ walletprocesspsbt_missing_key_test_() ->
 walletprocesspsbt_sign_false_test_() ->
     {setup,
      fun() ->
+         set_test_home(),
          _ = stop_default_wallet(),
          {ok, Pid} = beamchain_wallet:start_link(),
          Seed = crypto:strong_rand_bytes(32),
          {ok, _} = gen_server:call(Pid, {create, Seed, undefined}),
          Pid
      end,
-     fun(_Pid) -> stop_default_wallet() end,
+     fun(_Pid) -> stop_default_wallet(), restore_test_home() end,
      fun(_Pid) ->
        [
         ?_test(begin
@@ -496,13 +529,14 @@ walletprocesspsbt_sign_false_test_() ->
 walletprocesspsbt_finalize_false_test_() ->
     {setup,
      fun() ->
+         set_test_home(),
          _ = stop_default_wallet(),
          {ok, Pid} = beamchain_wallet:start_link(),
          Seed = crypto:strong_rand_bytes(32),
          {ok, _} = gen_server:call(Pid, {create, Seed, undefined}),
          Pid
      end,
-     fun(_Pid) -> stop_default_wallet() end,
+     fun(_Pid) -> stop_default_wallet(), restore_test_home() end,
      fun(_Pid) ->
        [
         ?_test(begin

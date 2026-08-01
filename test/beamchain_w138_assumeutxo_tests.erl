@@ -861,10 +861,11 @@ bug1_regtest_assumeutxo_placeholder_test() ->
     ?assertNotEqual(<<0:256>>, BH),
     ?assertNotEqual(<<0:256>>, UH).
 
-%% Positive: mainnet entries are all non-zero.
+%% Positive: mainnet entries (4 Core heights + 481823 from commit
+%% 0acf39f + 944183 from commit db602d0) are all non-zero.
 mainnet_assumeutxo_entries_non_zero_test() ->
     #{assumeutxo := M} = beamchain_chain_params:params(mainnet),
-    ?assertEqual(4, maps:size(M)),
+    ?assertEqual(6, maps:size(M)),
     lists:foreach(
       fun({H, #{block_hash := BH, utxo_hash := UH,
                 chain_tx_count := C}}) ->

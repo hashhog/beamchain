@@ -236,8 +236,15 @@ setup() ->
     code:ensure_loaded(beamchain_crypto),
     code:ensure_loaded(beamchain_config),
     %% Start the sig cache gen_server (used by crypto cached path).
+    %% Earlier vector tests (script_vectors/signrawtxwithkey/crypto) may
+    %% have created the ETS tables directly via their ensure_sig_cache/0
+    %% helpers — those runner-owned tables linger (no live gen_server),
+    %% so clear them before start_link or init's ets:new crashes with
+    %% already_exists.
     case whereis(beamchain_sig_cache) of
         undefined ->
+            catch ets:delete(beamchain_sig_cache_tab),
+            catch ets:delete(beamchain_sig_cache_order),
             {ok, Pid} = beamchain_sig_cache:start_link(),
             Pid;
         ExistingPid ->

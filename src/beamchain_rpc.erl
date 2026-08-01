@@ -3971,8 +3971,9 @@ pick_best_input([Variant | Rest], I, BestScore, BestSS, BestWit) ->
             %% This variant has fewer inputs than index I (Core: skip variants
             %% with vin.size() <= i). Keep the current best.
             pick_best_input(Rest, I, BestScore, BestSS, BestWit);
-        #tx_in{script_sig = SS0, witness = Wit0} ->
-            SS = case SS0 of undefined -> <<>>; _ -> SS0 end,
+        #tx_in{script_sig = SS, witness = Wit0} ->
+            %% script_sig is always binary() per #tx_in; witness may be
+            %% 'undefined' for pre-segwit encodings.
             Wit = case Wit0 of undefined -> []; _ -> Wit0 end,
             WitNonEmpty = lists:any(fun(X) -> byte_size(X) > 0 end, Wit),
             SSNonEmpty = byte_size(SS) > 0,
@@ -4200,8 +4201,8 @@ mempool_reject_reason(missing_inputs, _Txid) ->
     <<"missing-inputs">>;
 mempool_reject_reason(Reason, Txid) ->
     case format_mempool_error(Reason, Txid) of
-        {error, _Code, Msg} when is_binary(Msg) -> Msg;
-        _ -> iolist_to_binary(io_lib:format("~p", [Reason]))
+        {error, _Code, Msg} when is_binary(Msg) -> Msg
+        %% format_mempool_error/2 only returns {error, -25|-26|-27, binary()}.
     end.
 
 %% @doc testmempoolaccept — dry-run validation without mutating the mempool.
@@ -6074,7 +6075,7 @@ networkinfo_proplist(Connections, ConnIn, ConnOut, LocalAddrs) ->
         lists:duplicate(16 - length(LocalServicesHex0), $0) ++ LocalServicesHex0),
     [
         {<<"version">>, 260000},
-        {<<"subversion">>, <<"/beamchain:0.1.0/">>},
+        {<<"subversion">>, <<"/beamchain:1.0.0/">>},
         {<<"protocolversion">>, ?PROTOCOL_VERSION},
         {<<"localservices">>, LocalServicesHex},
         {<<"localservicesnames">>, services_to_names(LocalServices)},
@@ -7116,8 +7117,8 @@ rpc_getmininginfo() ->
     %% getnetworkhashps().HandleRequest(request) — the estimate over the default
     %% 120-block window — not a hardcoded 0. Delegate to our own estimator.
     NetHashPS = case rpc_getnetworkhashps([120]) of
-        {ok, V} -> V;
-        _ -> 0
+        {ok, V} -> V
+        %% rpc_getnetworkhashps/1 only returns {ok, integer()}.
     end,
     Proplist = mininginfo_proplist(Blocks, BitsHex, TipBits, TargetHex, PooledTx,
                                    network_name(Network), NetHashPS),
@@ -7899,8 +7900,9 @@ rpc_verifymessage([Address, Signature, Message])
                             {error, ?RPC_TYPE_ERROR,
                              <<"Malformed base64 encoding">>};
                         {error, pubkey_not_recovered} -> {ok, false};
-                        {error, not_signed} -> {ok, false};
-                        {error, _} -> {ok, false}
+                        {error, not_signed} -> {ok, false}
+                            %% verify_message's only error atoms are the three
+                            %% above (its success typing) — no catch-all.
                     end;
                 _ ->
                     {error, ?RPC_TYPE_ERROR,
@@ -8129,9 +8131,9 @@ format_difficulty_16g(D) when is_float(D) ->
            true ->
             g16_sci(Digits, Exp)
         end,
-    Sign ++ Body;
-format_difficulty_16g(D) when is_integer(D) ->
-    integer_to_list(D).
+    Sign ++ Body.
+%% (format_difficulty_16g/1 is only ever called with a float — the integer
+%% clause was unreachable.)
 
 %% %g FIXED branch: place the decimal point after (Exp+1) significant digits,
 %% pad/prefix with zeros as needed, then strip trailing zeros.
@@ -8323,10 +8325,9 @@ confirmations(BlockHeight, BlockHash) when is_binary(BlockHash) ->
             confirmations(BlockHeight);
         false ->
             0
-    end;
-confirmations(BlockHeight, _) ->
-    %% Fallback: hash unavailable — best effort
-    confirmations(BlockHeight).
+    end.
+%% (Every caller passes a binary BlockHash, so no non-hash fallback is
+%% reachable.)
 
 %% Median time past for a specific block height.
 block_mtp(Height) when Height < 11 ->
@@ -8673,8 +8674,8 @@ format_utxo_result(Value, Script, IsCoinbase, CoinHeight) ->
         {ok, {TipHash, TipHeight}} ->
             Conf = case CoinHeight of
                 mempool -> 0;
-                H when is_integer(H) -> TipHeight - H + 1;
-                _ -> 0
+                H when is_integer(H) -> TipHeight - H + 1
+                %% CoinHeight :: 'mempool' | non_neg_integer().
             end,
             {hash_to_hex(TipHash), Conf};
         not_found ->
@@ -9545,10 +9546,9 @@ rpc_sendtoaddress_spend(Address, AmountBtc, Pid) ->
                                                 {error, Reason} ->
                                                     {error, ?RPC_VERIFY_REJECTED, iolist_to_binary(
                                                         io_lib:format("TX rejected: ~p", [Reason]))}
-                                            end;
-                                        {error, Reason} ->
-                                            {error, ?RPC_MISC_ERROR, iolist_to_binary(
-                                                io_lib:format("Signing failed: ~p", [Reason]))}
+                                            end
+                                        %% sign_transaction/3 only returns
+                                        %% {ok, Tx} (its spec).
                                     end;
                                 {error, wallet_locked} ->
                                     %% Core's RPC_WALLET_UNLOCK_NEEDED (-13).
@@ -9563,10 +9563,8 @@ rpc_sendtoaddress_spend(Address, AmountBtc, Pid) ->
                                         io_lib:format(
                                             "Input ~B scriptPubKey not in this "
                                             "wallet (~s)", [InputIdx, AddrInfo]))}
-                            end;
-                        {error, Reason} ->
-                            {error, ?RPC_MISC_ERROR, iolist_to_binary(
-                                io_lib:format("TX build failed: ~p", [Reason]))}
+                            end
+                        %% build_transaction/3 only returns {ok, Tx} (its spec).
                     end;
                 {error, insufficient_funds} ->
                     {error, ?RPC_MISC_ERROR, <<"Insufficient funds">>}
@@ -9708,8 +9706,8 @@ bumpfee_run(Pid, TxidHex, Options, Mode) ->
                 _NonSelf ->
                     throw({bumpfee_error, ?RPC_INVALID_PARAMETER,
                            <<"Transaction has descendants in the mempool">>})
-            end;
-        _ -> ok
+            end
+        %% get_descendants/1 only returns lists — no catch-all.
     end,
     %% --- precondition 3: all inputs signal BIP-125 (replaceable) ---
     lists:foreach(fun(#tx_in{sequence = Seq}) ->
@@ -9772,12 +9770,11 @@ bumpfee_extract_entry(Entry) ->
     %% robust form. That marker is now inverted to demand this shape instead.
     %%
     %% Record access is arity-independent: adding a field can no longer break it.
+    %% (The defensive catch-all from that commit was removed: OTP 27 dialyzer
+    %% proves every caller passes a #mempool_entry{}, so it was dead code.)
     case Entry of
         #mempool_entry{tx = Tx, fee = Fee, vsize = VSize} ->
-            {Tx, Fee, VSize};
-        _ ->
-            throw({bumpfee_error, ?RPC_MISC_ERROR,
-                   <<"Unexpected mempool_entry shape">>})
+            {Tx, Fee, VSize}
     end.
 
 bumpfee_lookup_input_utxos(Inputs) ->
@@ -9910,8 +9907,8 @@ bumpfee_change_outputs(Pid, OldTx, Network) ->
             AddrStr = beamchain_address:script_to_address(S, Network),
             AddrBin = case AddrStr of
                 unknown -> <<>>;
-                A when is_list(A) -> list_to_binary(A);
-                A when is_binary(A) -> A
+                A when is_list(A) -> list_to_binary(A)
+                %% script_to_address/2 :: string() | unknown — never binary.
             end,
             case AddrBin =/= <<>> andalso
                  sets:is_element(AddrBin, ChangeAddrSet) of
@@ -9940,12 +9937,8 @@ bumpfee_sign_and_submit(NewTx, InputUtxos, PrivKeys, OldFee, NewFee, OldTxid) ->
                         "(old=~s reason=~p)",
                         [beamchain_serialize:hex_encode(OldTxid), Reason])),
                     throw({bumpfee_error, ?RPC_VERIFY_REJECTED, Msg})
-            end;
-        {error, Reason} ->
-            throw({bumpfee_error, ?RPC_WALLET_ERROR,
-                   iolist_to_binary(io_lib:format(
-                       "Failed to sign replacement transaction: ~p",
-                       [Reason]))})
+            end
+        %% sign_transaction/3 only returns {ok, Tx} (its spec).
     end.
 
 bumpfee_emit_psbt(NewTx, InputUtxos, OldFee, NewFee) ->
@@ -10503,7 +10496,9 @@ rpc_sendpayjoinrequest(Params, WalletName) ->
     case resolve_wallet(WalletName) of
         {ok, Pid} ->
             try
-                do_sendpayjoinrequest(Pid, Params)
+                %% Args are (Params, WalletPid) — do_sendpayjoinrequest/2
+                %% takes the params list first.
+                do_sendpayjoinrequest(Params, Pid)
             catch
                 throw:{pj_error, Code, Msg} ->
                     {error, Code, Msg};
@@ -12328,11 +12323,9 @@ rpc_joinpsbts([Psbts]) when is_list(Psbts) ->
                         {error, ?RPC_INVALID_PARAMETER,
                          iolist_to_binary(
                            io_lib:format("Input ~s:~p exists in multiple PSBTs",
-                                         [TxidHex, N]))};
-                    {error, JoinErr} ->
-                        {error, ?RPC_DESERIALIZATION_ERROR,
-                         iolist_to_binary(
-                           io_lib:format("TX decode failed ~p", [JoinErr]))}
+                                         [TxidHex, N]))}
+                        %% beamchain_psbt:join/1's only error is duplicate_input
+                        %% (its spec).
                 end
             catch
                 throw:{join_decode_error, Reason} ->
@@ -13260,15 +13253,10 @@ fund_raw_tx(Spec, Available, FeeRate, ChangeScript, _ExistingIns)
                             inputs = AllIns,
                             outputs = FinalOuts,
                             locktime = Locktime},
-    {FundedTx, FinalFee, ChangePos};
-%% Convenience clause used by callers that pass the explicit shape directly.
-fund_raw_tx(ExistingIns, ExistingOuts, Available, FeeRate, ChangeScript) ->
-    fund_raw_tx(#{existing_inputs => ExistingIns,
-                  existing_outputs => ExistingOuts,
-                  add_inputs => true, sffo => [],
-                  change_script => ChangeScript,
-                  change_position => undefined, locktime => 0},
-                Available, FeeRate, ChangeScript, ExistingIns).
+    {FundedTx, FinalFee, ChangePos}.
+
+%% (All callers pass the Spec map form; the former explicit-tuple convenience
+%% clause had no callers and was removed.)
 
 %% Distribute Fee equally across the Sffo output indices, reducing each by its
 %% share (last index absorbs the rounding remainder, Core's behaviour).  The
@@ -14048,8 +14036,9 @@ is_valid_der_sig_encoding(Vch) when is_binary(Vch) ->
                             end
                     end
             end
-    end;
-is_valid_der_sig_encoding(_) -> false.
+    end.
+%% (All callers pass a binary sig candidate, so no non-binary fallback clause
+%% is reachable.)
 
 %% script_to_asm_sighash/1 — ScriptToAsmStr(script, fAttemptSighashDecode=true).
 %% For push operands >= 5 bytes that pass IsValidSignatureEncoding:
@@ -14140,7 +14129,7 @@ rpc_createmultisig(_) ->
 %% Parse and validate pubkeys, then build the output.
 cm_parse_keys(NRequired, Keys, AddrType) ->
     case cm_validate_keys(Keys, []) of
-        {error, _} = Err ->
+        {error, _, _} = Err ->
             Err;
         {ok, PubKeys} ->
             NKeys = length(PubKeys),
@@ -14169,7 +14158,7 @@ cm_validate_keys([HexKey | Rest], Acc) when is_binary(HexKey) ->
     case cm_hex_to_pubkey(HexKey) of
         {ok, PubKeyBin} ->
             cm_validate_keys(Rest, [PubKeyBin | Acc]);
-        {error, _} = Err ->
+        {error, _, _} = Err ->
             Err
     end;
 cm_validate_keys([_BadKey | _], _Acc) ->

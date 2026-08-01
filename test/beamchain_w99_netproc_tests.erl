@@ -680,8 +680,8 @@ g30_feefilter_test_() ->
           ?assert(true)
       end},
 
-     {"G30: feefilter floor is DEFAULT_MIN_RELAY_FEE = 1000 sat/kvB", fun() ->
-          ?assertEqual(1000, ?DEFAULT_MIN_RELAY_TX_FEE)
+     {"G30: feefilter floor is DEFAULT_MIN_RELAY_FEE = 100 sat/kvB (Core v31, commit 2be0529)", fun() ->
+          ?assertEqual(100, ?DEFAULT_MIN_RELAY_TX_FEE)
       end},
 
      {"G30: feefilter version gate is 70013 (FEEFILTER_VERSION)", fun() ->

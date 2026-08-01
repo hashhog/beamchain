@@ -24,6 +24,10 @@ cleanup({ConfigPid, AddrmanPid, TestDir}) ->
     gen_server:stop(ConfigPid),
     %% Clean up ETS table
     catch ets:delete(beamchain_config_ets),
+    %% Undo the env overrides so later config gen_servers see their own
+    %% app-env network/datadir (the eunit runner is a single OS process).
+    os:unsetenv("BEAMCHAIN_NETWORK"),
+    os:unsetenv("BEAMCHAIN_DATADIR"),
     %% Clean up test directory
     os:cmd("rm -rf " ++ TestDir),
     ok.

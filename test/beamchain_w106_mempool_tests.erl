@@ -772,17 +772,21 @@ g30_package_rbf_incremental_fee_constant_test_() ->
     [fun() ->
         %% Verify the correct constant is used for package RBF.
         ?assertEqual(100, ?DEFAULT_INCREMENTAL_RELAY_FEE),
-        ?assertEqual(1000, ?DEFAULT_MIN_RELAY_TX_FEE),
+        %% DEFAULT_MIN_RELAY_TX_FEE is also 100 sat/kvB since commit
+        %% 2be0529 (Core v31 default, lowered from the historical 1000).
+        ?assertEqual(100, ?DEFAULT_MIN_RELAY_TX_FEE),
 
         %% 500-vbyte package: min additional = ceil(500 * 100 / 1000) = 50 sat.
         VSize = 500,
         MinAdditional = (VSize * ?DEFAULT_INCREMENTAL_RELAY_FEE + 999) div 1000,
         ?assertEqual(50, MinAdditional),
 
-        %% Wrong constant (1000 sat/kvB) would give 500 sat — 10x too strict.
-        WrongMinAdditional = (VSize * ?DEFAULT_MIN_RELAY_TX_FEE + 999) div 1000,
-        ?assertEqual(500, WrongMinAdditional),
-        ?assert(MinAdditional < WrongMinAdditional)
+        %% The package-RBF floor must come from DEFAULT_INCREMENTAL_RELAY_FEE,
+        %% not from a hardcoded higher relay floor (the pre-Core-v31 1000
+        %% sat/kvB default would have given 500 sat — 10x too strict).
+        HistoricalWrongMinAdditional = (VSize * 1000 + 999) div 1000,
+        ?assertEqual(500, HistoricalWrongMinAdditional),
+        ?assert(MinAdditional < HistoricalWrongMinAdditional)
     end].
 
 %%% ===================================================================

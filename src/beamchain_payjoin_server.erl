@@ -560,9 +560,9 @@ do_build_payjoin_psbt(OriginalPsbt, Params, WalletPid) ->
                                     {ok, SignedPsbt};
                                 {error, DErr} ->
                                     {error, {round_trip_decode, DErr}}
-                            end;
-                        _ ->
-                            {error, {round_trip_b64, SignedB64}}
+                            end
+                            %% base64:decode/1 throws on invalid input rather
+                            %% than returning a non-binary — no catch-all.
                     end;
                 {error, -13, _} ->
                     {error, {wallet_locked, locked}};
@@ -753,8 +753,9 @@ validate_invoice_token(Req0, _Params) ->
 payjoin_require_token() ->
     try beamchain_config:payjoin_require_token() of
         true  -> true;
-        false -> false;
-        _     -> false
+        false -> false
+        %% beamchain_config:payjoin_require_token/0 normalises to boolean()
+        %% already, so no catch-all clause is reachable here.
     catch
         _:_ -> false
     end.
