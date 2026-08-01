@@ -486,9 +486,9 @@ bug10_no_atomic_commit_during_invalidation() ->
     %% (tag at 1, then fields: tip_hash=2, tip_height=3, mtp_timestamps=4,
     %%  params=5, blocks_since_flush=6, max_cache_bytes=7, max_cache_entries=8,
     %%  cache_usage_bytes=9, ibd=10, chainstate_role=11,
-    %%  snapshot_base_height=12, snapshot_base_hash=13, reorg_in_progress=14,
-    %%  pending_undo_deletes=15).
-    ReorgInProgress = element(14, S),
+    %%  snapshot_base_height=12, snapshot_base_hash=13, snapshot_validation=14,
+    %%  reorg_in_progress=15, pending_undo_deletes=16).
+    ReorgInProgress = element(15, S),
     ?assertEqual(false, ReorgInProgress,
         "reorg_in_progress must be false outside of a reorg"),
     %% BUG-10 documented: during do_invalidate_block_impl the flag is never

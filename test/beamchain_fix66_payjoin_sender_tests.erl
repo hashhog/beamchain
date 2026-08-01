@@ -82,11 +82,40 @@ stop_default_wallet() ->
     end.
 
 ensure_seeded_wallet() ->
+    set_test_home(),
     _ = stop_default_wallet(),
     Pid = start_default_wallet(),
     Seed = crypto:strong_rand_bytes(32),
     {ok, _} = gen_server:call(Pid, {create, Seed, undefined}),
     Pid.
+
+%% Point HOME at a throwaway dir so the wallet's datadir fallback
+%% (beamchain_wallet:wallet_dir/1 -> default_datadir/0) stays hermetic:
+%% without a beamchain_config datadir the wallet gen_server would
+%% otherwise auto-load and persist into ~/.beamchain (the operator's
+%% real datadir). Mirrors beamchain_wallet_persist_tests' setup/0.
+set_test_home() ->
+    Home = "/tmp/beamchain_fix66_home_"
+           ++ integer_to_list(erlang:unique_integer([positive])),
+    ok = filelib:ensure_dir(Home ++ "/"),
+    case get(test_home_backup) of
+        undefined -> put(test_home_backup, os:getenv("HOME"));
+        _ -> ok
+    end,
+    true = os:putenv("HOME", Home),
+    put(test_home_dir, Home),
+    ok.
+
+restore_test_home() ->
+    case erase(test_home_backup) of
+        undefined -> ok;
+        false     -> os:unsetenv("HOME");
+        Prev      -> os:putenv("HOME", Prev)
+    end,
+    case erase(test_home_dir) of
+        undefined -> ok;
+        Dir       -> os:cmd("rm -rf " ++ Dir), ok
+    end.
 
 %%% ===================================================================
 %%% Module-load smoke
@@ -574,7 +603,7 @@ rpc_dispatcher_routes_payjoin_test() ->
 rpc_getpayjoinrequest_round_trip_test_() ->
     {setup,
      fun() -> ensure_seeded_wallet() end,
-     fun(_) -> stop_default_wallet() end,
+     fun(_) -> stop_default_wallet(), restore_test_home() end,
      fun(_Pid) ->
        [
         ?_test(begin
@@ -605,7 +634,7 @@ rpc_getpayjoinrequest_round_trip_test_() ->
 rpc_sendpayjoinrequest_dispatches_test_() ->
     {setup,
      fun() -> ensure_seeded_wallet() end,
-     fun(_) -> stop_default_wallet() end,
+     fun(_) -> stop_default_wallet(), restore_test_home() end,
      fun(_Pid) ->
        [
         {timeout, 10,
@@ -626,7 +655,7 @@ rpc_sendpayjoinrequest_dispatches_test_() ->
 rpc_sendpayjoinrequest_rejects_missing_pj_test_() ->
     {setup,
      fun() -> ensure_seeded_wallet() end,
-     fun(_) -> stop_default_wallet() end,
+     fun(_) -> stop_default_wallet(), restore_test_home() end,
      fun(_Pid) ->
         [?_test(begin
             Uri = <<"bitcoin:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa?"

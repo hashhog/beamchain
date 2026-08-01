@@ -596,7 +596,7 @@ bug19_block_relay_sends_relay_true_test() ->
         addr_recv    => #{services => 0, ip => {127,0,0,1}, port => 8333},
         addr_from    => #{services => ?NODE_NETWORK, ip => {0,0,0,0}, port => 8333},
         nonce        => 0,
-        user_agent   => <<"/beamchain:0.1.0/">>,
+        user_agent   => <<"/beamchain:1.0.0/">>,
         start_height => 0,
         relay        => true
     }),

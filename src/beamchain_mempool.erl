@@ -1024,7 +1024,7 @@ do_add_transaction(Tx, PeerId, State) ->
                 %% In sat/vB:
                 %%   effective_min = max(rolling_min_fee_sat_per_vb,
                 %%                       DEFAULT_MIN_RELAY_TX_FEE / 1000)
-                %% DEFAULT_MIN_RELAY_TX_FEE = 1000 sat/kvB = 1.0 sat/vB.
+                %% DEFAULT_MIN_RELAY_TX_FEE = 100 sat/kvB = 0.1 sat/vB (Core v31).
                 {RollingMin, St1} = get_min_fee(State),
                 StaticMinRelay = ?DEFAULT_MIN_RELAY_TX_FEE / 1000.0,
                 EffectiveMin = max(RollingMin, StaticMinRelay),

@@ -29,6 +29,9 @@ cleanup({ConfigPid, AddrmanPid, TestDir}) ->
     gen_server:stop(AddrmanPid),
     gen_server:stop(ConfigPid),
     catch ets:delete(beamchain_config_ets),
+    %% Undo the env overrides (see beamchain_addrman_tests).
+    os:unsetenv("BEAMCHAIN_NETWORK"),
+    os:unsetenv("BEAMCHAIN_DATADIR"),
     os:cmd("rm -rf " ++ TestDir),
     ok.
 

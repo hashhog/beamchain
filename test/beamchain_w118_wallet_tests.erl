@@ -714,10 +714,13 @@ g22_incremental_relay_fee_wired_test_() ->
      "(min sat/vB clamp + PaysForRBF Rule 4 delta)",
      [
       ?_test(begin
-         %% The cosmetic getnetworkinfo field stays.
+         %% The cosmetic getnetworkinfo field stays. (Commit 0ef8ee8 added
+         %% a second, comment-level mention of the field name when
+         %% documenting the Core v31.99 parity fields — assert presence,
+         %% not exact count.)
          {ok, Src} = file:read_file(beamchain_rpc_path()),
          Matches = binary:matches(Src, <<"incrementalrelayfee">>),
-         ?assertEqual(1, length(Matches))
+         ?assert(length(Matches) >= 1)
        end),
       ?_test(begin
          %% Bumpfee references the wallet's incremental relay fee floor.
@@ -916,6 +919,7 @@ g23b_sendtoaddress_real_keystore_roundtrip_test_() ->
      "for a UTXO whose scriptPubKey belongs to the wallet",
      [
       ?_test(begin
+         set_test_home(),
          {ok, Pid} = beamchain_wallet:start_link(<<"w118-bug1-rt">>),
          try
              Seed = crypto:strong_rand_bytes(32),
@@ -964,6 +968,7 @@ g23c_sendtoaddress_missing_key_errors_test_() ->
      "with <<0:256>>)",
      [
       ?_test(begin
+         set_test_home(),
          {ok, Pid} = beamchain_wallet:start_link(<<"w118-bug1-miss">>),
          try
              Seed = crypto:strong_rand_bytes(32),
@@ -985,6 +990,7 @@ g23d_sendtoaddress_locked_wallet_errors_test_() ->
      "the wallet is encrypted-and-locked (maps to RPC -13 in dispatcher)",
      [
       ?_test(begin
+         set_test_home(),
          {ok, Pid} = beamchain_wallet:start_link(<<"w118-bug1-lock">>),
          try
              Seed = crypto:strong_rand_bytes(32),
@@ -1109,6 +1115,7 @@ g28_lockunspent_roundtrip_test_() ->
     {"G28: lockunspent + listlockunspent round-trip on wallet pid",
      [
       ?_test(begin
+         set_test_home(),
          {ok, Pid} = beamchain_wallet:start_link(<<"test_w118_g28">>),
          try
              Seed = crypto:strong_rand_bytes(32),
@@ -1139,20 +1146,28 @@ g29_wallet_utxo_tracking_test_() ->
      [
       ?_test(begin
          %% Initialize ETS tables (idempotent)
-         _ = beamchain_wallet:start_link(),
-         Txid = <<33:256>>,
-         Script = <<16#00, 16#14, 0,1,2,3,4,5,6,7,8,9,
-                    10,11,12,13,14,15,16,17,18,19>>,
-         beamchain_wallet:add_wallet_utxo(Txid, 0, 50000, Script, 100),
-         All = beamchain_wallet:get_wallet_utxos(),
-         ?assert(lists:any(fun({T, V, _}) ->
-             T =:= Txid andalso V =:= 0
-         end, All)),
-         beamchain_wallet:spend_wallet_utxo(Txid, 0),
-         All2 = beamchain_wallet:get_wallet_utxos(),
-         ?assertNot(lists:any(fun({T, V, _}) ->
-             T =:= Txid andalso V =:= 0
-         end, All2))
+         set_test_home(),
+         %% Stop the wallet at the end: leaving it running (linked to the
+         %% shared eunit runner) turns a later stop_default()-style
+         %% exit(Pid, kill) into a runner-killer (cancels whole groups).
+         {ok, WPid} = beamchain_wallet:start_link(),
+         try
+             Txid = <<33:256>>,
+             Script = <<16#00, 16#14, 0,1,2,3,4,5,6,7,8,9,
+                        10,11,12,13,14,15,16,17,18,19>>,
+             beamchain_wallet:add_wallet_utxo(Txid, 0, 50000, Script, 100),
+             All = beamchain_wallet:get_wallet_utxos(),
+             ?assert(lists:any(fun({T, V, _}) ->
+                 T =:= Txid andalso V =:= 0
+             end, All)),
+             beamchain_wallet:spend_wallet_utxo(Txid, 0),
+             All2 = beamchain_wallet:get_wallet_utxos(),
+             ?assertNot(lists:any(fun({T, V, _}) ->
+                 T =:= Txid andalso V =:= 0
+             end, All2))
+         after
+             gen_server:stop(WPid)
+         end
        end)
      ]}.
 
@@ -1206,3 +1221,15 @@ two_pipeline_psbt_test_() ->
          ?assertNotEqual(nomatch, HasWalletPsbtRec)
        end)
      ]}.
+
+%% Point HOME at a throwaway dir so the wallet's datadir fallback
+%% (beamchain_wallet:wallet_dir/1 -> default_datadir/0) stays hermetic:
+%% without a beamchain_config datadir the wallet gen_server would
+%% otherwise auto-load and persist into ~/.beamchain (the operator's
+%% real datadir). Mirrors beamchain_wallet_persist_tests' setup/0.
+set_test_home() ->
+    Home = "/tmp/beamchain_w118_home_"
+           ++ integer_to_list(erlang:unique_integer([positive])),
+    ok = filelib:ensure_dir(Home ++ "/"),
+    true = os:putenv("HOME", Home),
+    ok.

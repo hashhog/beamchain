@@ -17,8 +17,22 @@
 %%% ===================================================================
 
 start_wallet(Name) ->
+    set_test_home(),
     {ok, Pid} = beamchain_wallet:start_link(Name),
     Pid.
+
+%% Point HOME at a throwaway dir so the wallet's datadir fallback
+%% (beamchain_wallet:wallet_dir/1 -> default_datadir/0) stays hermetic:
+%% the legacy {create, Seed, Pass} path always writes <dir>/wallet.json
+%% regardless of wallet name, and without a beamchain_config datadir
+%% that lands in ~/.beamchain (the operator's real datadir). Mirrors
+%% beamchain_wallet_persist_tests' setup/0.
+set_test_home() ->
+    Home = "/tmp/beamchain_lockunspent_home_"
+           ++ integer_to_list(erlang:unique_integer([positive])),
+    ok = filelib:ensure_dir(Home ++ "/"),
+    true = os:putenv("HOME", Home),
+    ok.
 
 stop_wallet(Pid) ->
     case is_process_alive(Pid) of

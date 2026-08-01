@@ -351,15 +351,16 @@ g22_ephemeral_eviction_widening_test_() ->
 %%% ===================================================================
 %%% G23 — Modified-fee accounting (prioritisetransaction)
 %%% Core uses GetModifiedFee() everywhere (incl. RBF Rule 3+4).
-%%% Beamchain has no prioritisetransaction RPC mutation path; uses raw `fee`.
-%%% **BUG-6 P2**: divergence latent until prioritisetransaction is wired.
+%%% **BUG-6 CLOSED**: prioritisetransaction has landed — the mempool
+%%% carries fee-delta accounting (mempool_deltas) and GetModifiedFee-style
+%%% modified-fee reads. Guard the closure: the wiring must stay.
 %%% ===================================================================
 
 g23_modified_fee_not_implemented_test_() ->
     {ok, Src} = file:read_file(mempool_src_path()),
-    %% No fee_delta / modified_fee field on mempool_entry.
-    [?_assertEqual(nomatch, binary:match(Src, <<"fee_delta">>)),
-     ?_assertEqual(nomatch, binary:match(Src, <<"GetModifiedFee">>))].
+    %% fee_delta accounting + GetModifiedFee reference must be present.
+    [?_assertNotEqual(nomatch, binary:match(Src, <<"fee_delta">>)),
+     ?_assertNotEqual(nomatch, binary:match(Src, <<"GetModifiedFee">>))].
 
 %%% ===================================================================
 %%% G24 — bip125-replaceable flag in getmempoolentry RPC
@@ -400,12 +401,10 @@ g26_fullrbf_config_path_test_() ->
 
 %%% ===================================================================
 %%% G27 — Error atoms map back to RPC strings
-%%% rpc.erl format_mempool_error/2: covers rbf_not_signaled,
-%%%   rbf_insufficient_fee, rbf_insufficient_additional_fee,
-%%%   rbf_insufficient_fee_rate, rbf_too_many_evictions,
-%%%   rbf_new_unconfirmed_inputs.
-%%% Missing in formatter: rbf_spends_conflicting_tx, rbf_cluster_diagram_not_dominated.
-%%% **BUG-14 P2**: two thrown atoms have NO RPC formatter -> generic-error path.
+%%% **BUG-14 CLOSED**: every atom thrown by do_rbf — including the two
+%%% that were missing (rbf_spends_conflicting_tx,
+%%% rbf_cluster_diagram_not_dominated) — now has a format_mempool_error/2
+%%% clause. Guard: no thrown atom may fall through to the generic path.
 %%% ===================================================================
 
 g27_error_atoms_have_rpc_strings_test_() ->
@@ -421,9 +420,9 @@ g27_error_atoms_have_rpc_strings_test_() ->
               <<"rbf_cluster_diagram_not_dominated">>],
     Covered = [A || A <- Thrown,
                     binary:match(RpcSrc, <<"format_mempool_error(", A/binary>>) =/= nomatch],
-    %% Verify which ones are uncovered.
+    %% All thrown atoms must be covered (BUG-14 closure).
     Uncovered = Thrown -- Covered,
-    [?_assert(length(Uncovered) >= 2)].  %% spends_conflicting + cluster_diagram
+    [?_assertEqual([], Uncovered)].
 
 %%% ===================================================================
 %%% G28 — bumpfee RPC enforces BIP-125 input sequence on the source tx
@@ -436,23 +435,20 @@ g28_bumpfee_requires_signaling_test_() ->
 
 %%% ===================================================================
 %%% G29 — createrawtransaction `replaceable` flag maps to 0xFFFFFFFD/0xFFFFFFFF
-%%% Beamchain rpc.erl line 2631-2633:
-%%%   true -> 16#FFFFFFFD; _ -> 16#FFFFFFFF.
-%%% Core: replaceable=true → MAX_BIP125_RBF_SEQUENCE; false → MAX (with locktime
-%%%   carve-out: nSequence = MAX-1 if locktime > 0 to enable nLockTime).
-%%% **BUG-15 P2**: beamchain ignores locktime → does NOT switch to MAX-1 when
-%%%   locktime>0.  Tx with locktime + replaceable=false will have inputs at
-%%%   0xFFFFFFFF (final) so locktime is silently ignored — wire-level user bug.
+%%% **BUG-15 CLOSED**: the default nSequence now uses Core's three-way
+%%% AddInputs logic (rawtransaction_util.cpp:49-55):
+%%%   Replaceable        -> 16#FFFFFFFD (MAX_BIP125_RBF_SEQUENCE)
+%%%   Locktime =/= 0     -> 16#FFFFFFFE (MAX_SEQUENCE_NONFINAL)
+%%%   true               -> 16#FFFFFFFF (SEQUENCE_FINAL)
+%%% so locktime is no longer silently ignored when replaceable=false.
 %%% ===================================================================
 
 g29_createrawtransaction_replaceable_flag_test_() ->
     {ok, RpcSrc} = file:read_file(rpc_src_path()),
-    [?_assert(binary:match(RpcSrc, <<"true -> 16#FFFFFFFD">>) =/= nomatch),
-     %% Beamchain non-replaceable falls through to 0xFFFFFFFF unconditionally —
-     %% verify by checking neither the locktime-aware MAX-1 nor a "false ->"
-     %% clause matches.
-     ?_assertEqual(nomatch, binary:match(RpcSrc, <<"16#FFFFFFFE  %%">>)),
-     ?_assert(binary:match(RpcSrc, <<"_ -> 16#FFFFFFFF">>) =/= nomatch)].
+    [?_assert(binary:match(RpcSrc, <<"Replaceable        -> 16#FFFFFFFD">>) =/= nomatch),
+     %% Locktime-aware MAX-1 branch must exist (BUG-15 closure).
+     ?_assertNotEqual(nomatch, binary:match(RpcSrc, <<"Locktime =/= 0     -> 16#FFFFFFFE">>)),
+     ?_assert(binary:match(RpcSrc, <<"true               -> 16#FFFFFFFF">>) =/= nomatch)].
 
 %%% ===================================================================
 %%% G30 — Incremental relay fee constant cross-check with Core

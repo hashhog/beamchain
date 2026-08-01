@@ -40,8 +40,8 @@ snapshot_test_() ->
            fun test_tx_out_ser_format/0},
           {"assumeutxo params lookup by height", fun test_assumeutxo_by_height/0},
           {"assumeutxo params lookup by hash", fun test_assumeutxo_by_hash/0},
-          {"mainnet has all 4 assumeutxo entries from Core",
-           fun test_mainnet_four_entries/0},
+          {"mainnet has all 6 assumeutxo entries (4 Core + 481823 + 944183)",
+           fun test_mainnet_six_entries/0},
           {"loadtxoutset refuses heights not in m_assumeutxo_data (Core-strict)",
            fun test_validate_snapshot_height_strict/0},
           {"compute_utxo_hash_from_list/1 is SHA256d via HashWriter (Core HASH_SERIALIZED)",
@@ -472,13 +472,14 @@ test_assumeutxo_by_hash() ->
             end
     end.
 
-%% Mainnet must carry exactly the 4 entries from
-%% bitcoin-core/src/kernel/chainparams.cpp CMainParams (heights 840000,
-%% 880000, 910000, 935000). If Core adds a new entry upstream, this test
-%% will fail and force a sync.
-test_mainnet_four_entries() ->
+%% Mainnet must carry exactly the 6 entries from
+%% bitcoin-core/src/kernel/chainparams.cpp CMainParams — the 4 Core
+%% heights (840000, 880000, 910000, 935000) plus 481823 (last
+%% pre-segwit boundary, commit 0acf39f) and 944183 (commit db602d0).
+%% If Core adds a new entry upstream, this test will fail and force a sync.
+test_mainnet_six_entries() ->
     #{assumeutxo := M} = beamchain_chain_params:params(mainnet),
-    Expected = [840000, 880000, 910000, 935000],
+    Expected = [481823, 840000, 880000, 910000, 935000, 944183],
     ?assertEqual(Expected, lists:sort(maps:keys(M))),
     %% Spot-check the 840000 utxo_hash matches Core (display-order hex
     %% from kernel/chainparams.cpp:161, stored internally reversed).
@@ -498,11 +499,13 @@ test_mainnet_four_entries() ->
 %%   "Assumeutxo height in snapshot metadata not recognized (<H>) - refusing to load snapshot"
 %% Heights in the whitelist must pass; everything else must be refused.
 test_validate_snapshot_height_strict() ->
-    %% Mainnet whitelist: 840000, 880000, 910000, 935000.
+    %% Mainnet whitelist: 481823, 840000, 880000, 910000, 935000, 944183.
+    ?assertEqual(ok, beamchain_rpc:validate_snapshot_height(481823, mainnet)),
     ?assertEqual(ok, beamchain_rpc:validate_snapshot_height(840000, mainnet)),
     ?assertEqual(ok, beamchain_rpc:validate_snapshot_height(880000, mainnet)),
     ?assertEqual(ok, beamchain_rpc:validate_snapshot_height(910000, mainnet)),
     ?assertEqual(ok, beamchain_rpc:validate_snapshot_height(935000, mainnet)),
+    ?assertEqual(ok, beamchain_rpc:validate_snapshot_height(944183, mainnet)),
 
     %% Heights NOT in the whitelist (incl. off-by-one near a real entry,
     %% and a height in a totally different range) must be refused with the

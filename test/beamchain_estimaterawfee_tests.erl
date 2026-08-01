@@ -17,12 +17,16 @@ setup() ->
     %% beamchain_chainstate:get_tip on init, which does an ETS lookup
     %% on the beamchain_chain_meta table. Provide an empty table so
     %% get_tip/0 cleanly returns `not_found' and the estimator
-    %% defaults to height 0.
-    case ets:info(beamchain_chain_meta) of
+    %% defaults to height 0. Track whether WE created the table: the
+    %% eunit runner shares one process across modules, so a table left
+    %% behind crashes a later beamchain_chainstate start (already_exists
+    %% in init_chainstate/2).
+    Created = case ets:info(beamchain_chain_meta) of
         undefined ->
             ets:new(beamchain_chain_meta,
-                    [set, public, named_table]);
-        _ -> ok
+                    [set, public, named_table]),
+            true;
+        _ -> false
     end,
     case whereis(beamchain_fee_estimator) of
         undefined -> ok;
@@ -35,14 +39,18 @@ setup() ->
     Files = filelib:wildcard("fee_estimates.dat"),
     lists:foreach(fun file:delete/1, Files),
     {ok, NewPid} = beamchain_fee_estimator:start_link(),
-    NewPid.
+    {NewPid, Created}.
 
-teardown(Pid) ->
+teardown({Pid, Created}) ->
     case is_process_alive(Pid) of
         true ->
             unlink(Pid),
             exit(Pid, kill),
             wait_dead(Pid);
+        false -> ok
+    end,
+    case Created of
+        true  -> catch ets:delete(beamchain_chain_meta);
         false -> ok
     end.
 

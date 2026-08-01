@@ -22,11 +22,15 @@
 %%% ===================================================================
 
 setup() ->
-    %% Provide the chain-meta ETS table that init reads
-    case ets:info(beamchain_chain_meta) of
+    %% Provide the chain-meta ETS table that init reads. Track whether
+    %% WE created it: the eunit runner shares one process across
+    %% modules, so a table left behind crashes a later
+    %% beamchain_chainstate start (already_exists in init_chainstate/2).
+    Created = case ets:info(beamchain_chain_meta) of
         undefined ->
-            ets:new(beamchain_chain_meta, [set, public, named_table]);
-        _ -> ok
+            ets:new(beamchain_chain_meta, [set, public, named_table]),
+            true;
+        _ -> false
     end,
     %% Kill any leftover server from a prior run
     case whereis(beamchain_fee_estimator) of
@@ -41,14 +45,18 @@ setup() ->
                   filelib:wildcard("fee_estimates.dat") ++
                   filelib:wildcard("/tmp/fee_estimates.dat")),
     {ok, NewPid} = beamchain_fee_estimator:start_link(),
-    NewPid.
+    {NewPid, Created}.
 
-teardown(Pid) ->
+teardown({Pid, Created}) ->
     case is_process_alive(Pid) of
         true ->
             unlink(Pid),
             exit(Pid, kill),
             wait_dead(Pid);
+        false -> ok
+    end,
+    case Created of
+        true  -> catch ets:delete(beamchain_chain_meta);
         false -> ok
     end.
 
@@ -468,7 +476,8 @@ g18_blocks_waited_off_by_one_test_() ->
 
 %%% ===================================================================
 %%% G19 — failAvg tracking: evicted txs recorded as failures
-%%% BUG-5: no removeTx / remove_tx API — evictions silently inflate in_mempool
+%%% BUG-5 CLOSED (commit 59bbdfc): remove_tx/1 exists and the mempool
+%%% calls it on non-mining removals, mirroring Core removeTx.
 %%% ===================================================================
 
 g19_evicted_tx_failure_tracking_test_() ->
@@ -477,33 +486,38 @@ g19_evicted_tx_failure_tracking_test_() ->
         [fun() ->
              %% Core: when a tx is removed from mempool without confirmation,
              %% removeTx(hash) is called and failAvg is updated.
-             %% beamchain has no such API.  We verify by checking the module
-             %% exports do NOT include remove_tx (confirming the gap).
+             %% BUG-5 was the absence of that hook; commit 59bbdfc added
+             %% remove_tx/1. Guard the closure: the export must stay.
              Exports = beamchain_fee_estimator:module_info(exports),
              HasRemoveTx = lists:keymember(remove_tx, 1, Exports) orelse
                            lists:keymember(removetx, 1, Exports),
-             ?assertNot(HasRemoveTx,
-                 "BUG-5: remove_tx/1 should exist to track evicted txs like Core removeTx")
+             ?assert(HasRemoveTx,
+                 "BUG-5 regressed: remove_tx/1 must exist to track evicted txs like Core removeTx")
          end]
      end}.
 
 %%% ===================================================================
 %%% G20 — leftmempool field non-zero after evictions
-%%% BUG-5: without removeTx, leftmempool is always near-zero / wrong
+%%% BUG-5 CLOSED (commit 59bbdfc): remove_tx/1 mirrors Core removeTx —
+%%% the mempool reports non-mining removals and the estimator moves
+%%% those txs from in_mempool into the failAvg/leftmempool counters.
 %%% ===================================================================
 
 g20_leftmempool_reflects_evictions_test_() ->
     {setup, fun setup/0, fun teardown/1,
      fun(_) ->
         [fun() ->
-             %% Track a tx, do NOT confirm it in any block, then check that
-             %% leftmempool is not zero in a raw estimate (it should be after decay).
-             %% With no eviction tracking, leftmempool will always be ~0.
+             %% Track txs, then report them evicted via remove_tx (the
+             %% hook 59bbdfc added; Core: mempool calls removeTx on
+             %% eviction). leftmempool must then be non-zero.
              Txids = [crypto:strong_rand_bytes(32) || _ <- lists:seq(1, 200)],
              lists:foreach(fun(T) ->
                  beamchain_fee_estimator:track_tx(T, 30.0, 50)
              end, Txids),
-             %% Process several blocks WITHOUT those txids (they "expired")
+             lists:foreach(fun(T) ->
+                 beamchain_fee_estimator:remove_tx(T)
+             end, Txids),
+             %% Process several blocks WITHOUT those txids (they left).
              lists:foreach(fun(H) ->
                  beamchain_fee_estimator:process_block(H, [])
              end, lists:seq(51, 100)),
@@ -511,10 +525,9 @@ g20_leftmempool_reflects_evictions_test_() ->
              Med = maps:get(<<"medium">>, Res, #{}),
              Fail = maps:get(<<"fail">>, Med, #{}),
              LeftMem = maps:get(<<"leftmempool">>, Fail, 0.0),
-             %% After many blocks without confirmation, leftmempool should be > 0
-             %% BUG-5: without eviction tracking this stays at 0
+             %% After removals reported via remove_tx, leftmempool > 0.
              ?assert(LeftMem > 0,
-                 "BUG-5: leftmempool should be > 0 for unconfirmed evicted txs")
+                 "BUG-5 regressed: leftmempool must be > 0 for remove_tx-reported evictions")
          end]
      end}.
 
@@ -632,10 +645,13 @@ g25_persistence_roundtrip_test_() ->
     {setup,
      fun() ->
          %% Custom setup that does NOT start the server -- we control lifecycle inside.
-         case ets:info(beamchain_chain_meta) of
+         %% Track table ownership (see setup/0): leave no table behind for
+         %% later modules in the shared runner process.
+         Created = case ets:info(beamchain_chain_meta) of
              undefined ->
-                 ets:new(beamchain_chain_meta, [set, public, named_table]);
-             _ -> ok
+                 ets:new(beamchain_chain_meta, [set, public, named_table]),
+                 true;
+             _ -> false
          end,
          %% Kill any leftover server.
          case whereis(beamchain_fee_estimator) of
@@ -644,9 +660,14 @@ g25_persistence_roundtrip_test_() ->
          end,
          lists:foreach(fun file:delete/1,
                        filelib:wildcard("fee_estimates.dat")),
-         ok  %% Return ok (not a pid) so teardown is a no-op.
+         Created  %% teardown deletes the table iff we created it.
      end,
-     fun(_) -> ok end,  %% no-op teardown
+     fun(Created) ->
+         case Created of
+             true  -> catch ets:delete(beamchain_chain_meta);
+             false -> ok
+         end
+     end,
      fun(_) ->
         [fun() ->
              %% Start server, seed, save, stop.

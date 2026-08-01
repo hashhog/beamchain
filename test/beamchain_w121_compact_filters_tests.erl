@@ -475,13 +475,15 @@ g26_rpc_disabled_returns_misc_error_test() ->
     ?assertMatch({error, -1, _},
         beamchain_rpc:rpc_getblockfilter([BHHex])).
 
-%% G27 — RPC getblockfilter rejects unknown filter types with -8.
+%% G27 — RPC getblockfilter rejects unknown filter types with -5
+%% (Core RPC_INVALID_ADDRESS_OR_KEY, "Unknown filtertype" —
+%% rpc/blockchain.cpp getblockfilter).
 g27_rpc_unknown_filter_type_test() ->
     %% Validation happens *before* the index-running check, so the
     %% test works regardless of index state.
     BHHex = beamchain_serialize:hex_encode(
               reverse_bytes(<<1:256/big>>)),
-    ?assertMatch({error, -8, _},
+    ?assertMatch({error, -5, _},
         beamchain_rpc:rpc_getblockfilter([BHHex, <<"extended">>])).
 
 %%% ===================================================================

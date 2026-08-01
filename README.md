@@ -15,10 +15,17 @@ docker run -v beamchain-data:/data -p 48348:48348 -p 48338:48338 beamchain
 
 ```bash
 rebar3 compile
-rebar3 escriptize
-./beamchain start --network=testnet4
-./beamchain --help
+rebar3 as prod release
+_build/prod/rel/beamchain/bin/beamchain daemon   # or: foreground / console
 ```
+
+Note: `rebar3 escriptize` is not supported — the rocksdb dependency is a
+NIF (`.so`) which cannot be loaded from inside an escript zip archive.
+Use the release build (or `rebar3 shell` for development).
+
+The node is configured via environment variables (e.g.
+`BEAMCHAIN_NETWORK=testnet4`, `BEAMCHAIN_DATADIR=/path/to/data`) or
+`config/sys.config` in the release — see Configuration below.
 
 ## Features
 

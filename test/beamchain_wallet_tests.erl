@@ -444,6 +444,7 @@ wallet_sup_list_empty_test() ->
 %% Test wallet name in state record
 wallet_name_in_state_test() ->
     %% Start a wallet directly with a name
+    set_test_home(),
     {ok, Pid} = beamchain_wallet:start_link(<<"testwallet">>),
     {ok, Info} = beamchain_wallet:get_wallet_info(Pid),
     ?assertEqual(<<"testwallet">>, maps:get(wallet_name, Info)),
@@ -451,6 +452,7 @@ wallet_name_in_state_test() ->
 
 %% Test default wallet name (empty binary)
 wallet_default_name_test() ->
+    set_test_home(),
     {ok, Pid} = beamchain_wallet:start_link(<<>>),
     {ok, Info} = beamchain_wallet:get_wallet_info(Pid),
     ?assertEqual(<<>>, maps:get(wallet_name, Info)),
@@ -458,6 +460,7 @@ wallet_default_name_test() ->
 
 %% Test get_new_address with pid
 wallet_get_address_with_pid_test() ->
+    set_test_home(),
     {ok, Pid} = beamchain_wallet:start_link(<<"addrtest">>),
     %% Need to create wallet first
     Seed = crypto:strong_rand_bytes(32),
@@ -469,6 +472,7 @@ wallet_get_address_with_pid_test() ->
 
 %% Test get_balance with pid
 wallet_get_balance_with_pid_test() ->
+    set_test_home(),
     {ok, Pid} = beamchain_wallet:start_link(<<"baltest">>),
     Seed = crypto:strong_rand_bytes(32),
     {ok, _} = gen_server:call(Pid, {create, Seed, undefined}),
@@ -479,6 +483,7 @@ wallet_get_balance_with_pid_test() ->
 
 %% Test is_locked with pid
 wallet_is_locked_with_pid_test() ->
+    set_test_home(),
     {ok, Pid} = beamchain_wallet:start_link(<<"locktest">>),
     Seed = crypto:strong_rand_bytes(32),
     {ok, _} = gen_server:call(Pid, {create, Seed, undefined}),
@@ -505,6 +510,7 @@ restore_from_mnemonic_derives_canonical_address_test() ->
     %% restore_from_mnemonic uses the registered ?SERVER name; the
     %% other wallet tests use start_link/1 which doesn't register, so
     %% we run our own registered instance and tear it down.
+    set_test_home(),
     {ok, Pid} = beamchain_wallet:start_link(),
     try
         {ok, _Seed} = beamchain_wallet:restore_from_mnemonic(Mnemonic, <<>>),
@@ -518,6 +524,7 @@ restore_from_mnemonic_derives_canonical_address_test() ->
     end.
 
 create_with_mnemonic_returns_valid_words_test() ->
+    set_test_home(),
     {ok, Pid} = beamchain_wallet:start_link(),
     try
         {ok, Mnemonic} = beamchain_wallet:create_with_mnemonic(12),
@@ -533,6 +540,7 @@ getwalletmnemonic_raw_seed_returns_error_test() ->
     %% A wallet created from a raw seed (the pre-W21 path) has no
     %% mnemonic; the export RPC must report that explicitly rather
     %% than silently returning an empty list.
+    set_test_home(),
     {ok, Pid} = beamchain_wallet:start_link(<<"raw_seed_wallet">>),
     try
         Seed = crypto:strong_rand_bytes(32),
@@ -546,6 +554,18 @@ getwalletmnemonic_raw_seed_returns_error_test() ->
 %%% -------------------------------------------------------------------
 %%% Helper functions
 %%% -------------------------------------------------------------------
+
+%% Point HOME at a throwaway dir so the wallet's datadir fallback
+%% (beamchain_wallet:wallet_dir/1 -> default_datadir/0) stays hermetic:
+%% without a beamchain_config datadir the wallet gen_server would
+%% otherwise auto-load and persist into ~/.beamchain (the operator's
+%% real datadir). Mirrors beamchain_wallet_persist_tests' setup/0.
+set_test_home() ->
+    Home = "/tmp/beamchain_wallet_tests_home_"
+           ++ integer_to_list(erlang:unique_integer([positive])),
+    ok = filelib:ensure_dir(Home ++ "/"),
+    true = os:putenv("HOME", Home),
+    ok.
 
 hex_to_bin(Hex) ->
     binary:decode_hex(list_to_binary(Hex)).

@@ -86,10 +86,13 @@ setup() ->
              ++ integer_to_list(erlang:unique_integer([positive])),
     ok = filelib:ensure_dir(filename:join(TmpDir, "dummy")),
     %% Stand up a config ETS table the gen_server reads (datadir + enabled).
+    %% Track whether WE created it: the eunit runner shares one process
+    %% across module groups, so a table left behind here would crash a
+    %% later beamchain_config:start_link (already_exists in init/1).
     Tbl = beamchain_config_ets,
-    case ets:info(Tbl) of
-        undefined -> ets:new(Tbl, [named_table, set, public]);
-        _ -> ok
+    Created = case ets:info(Tbl) of
+        undefined -> ets:new(Tbl, [named_table, set, public]), true;
+        _ -> false
     end,
     ets:insert(Tbl, {datadir, TmpDir}),
     ets:insert(Tbl, {txospenderindex, "1"}),
@@ -97,11 +100,14 @@ setup() ->
     os:unsetenv("BEAMCHAIN_TXOSPENDERINDEX"),
     catch ?IDX:stop(),
     {ok, _Pid} = ?IDX:start_link(),
-    {TmpDir, SavedEnv}.
+    {TmpDir, SavedEnv, Created}.
 
-teardown({TmpDir, SavedEnv}) ->
+teardown({TmpDir, SavedEnv, Created}) ->
     catch ?IDX:stop(),
-    catch ets:delete(beamchain_config_ets, txospenderindex),
+    case Created of
+        true  -> catch ets:delete(beamchain_config_ets);
+        false -> catch ets:delete(beamchain_config_ets, txospenderindex)
+    end,
     case SavedEnv of
         false -> os:unsetenv("BEAMCHAIN_TXOSPENDERINDEX");
         _ -> os:putenv("BEAMCHAIN_TXOSPENDERINDEX", SavedEnv)
@@ -115,7 +121,7 @@ teardown({TmpDir, SavedEnv}) ->
 
 connect_disconnect_reorg_test_() ->
     {setup, fun setup/0, fun teardown/1,
-     fun({_TmpDir, _Env}) ->
+     fun({_TmpDir, _Env, _Created}) ->
         [
          {"connect/disconnect + live-reorg erase", fun() ->
             %% Block A (height 1): coinbase txA paying 50 BTC to <<0x51>>.
@@ -172,7 +178,7 @@ connect_disconnect_reorg_test_() ->
 
 persist_tip_reopen_test_() ->
     {setup, fun setup/0, fun teardown/1,
-     fun({_TmpDir, _Env}) ->
+     fun({_TmpDir, _Env, _Created}) ->
         [
          {"best-block persisted across close+reopen", fun() ->
             TxA = coinbase_tx(5000000000, <<16#51>>),

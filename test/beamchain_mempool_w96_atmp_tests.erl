@@ -415,10 +415,11 @@ check_tx_already_known_no_cache_hit_test_() ->
 max_p2sh_sigops_constant_test() ->
     ?assertEqual(15, ?MAX_P2SH_SIGOPS).
 
-%% Confirm DEFAULT_MIN_RELAY_TX_FEE = 1000 sat/kvB = 1 sat/vB
-%% (Core kernel/mempool_options.h:25).
+%% Confirm DEFAULT_MIN_RELAY_TX_FEE = 100 sat/kvB = 0.1 sat/vB.
+%% Commit 2be0529 lowered it from 1000 to track Core v31's default
+%% (Core PR #33106: default min relay feerate 1 -> 0.1 sat/vB).
 default_min_relay_fee_constant_test() ->
-    ?assertEqual(1000, ?DEFAULT_MIN_RELAY_TX_FEE).
+    ?assertEqual(100, ?DEFAULT_MIN_RELAY_TX_FEE).
 
 %% Confirm DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB (Core policy/policy.h:48).
 default_incremental_relay_fee_constant_test() ->
@@ -426,7 +427,7 @@ default_incremental_relay_fee_constant_test() ->
 
 %% Effective minimum relay fee composition: CheckFeeRate uses
 %%   max(rolling_min_fee_sat_per_vb, DEFAULT_MIN_RELAY_TX_FEE / 1000)
-%% The static floor must always be at least 1.0 sat/vB.
-effective_min_relay_floor_at_least_1_satvb_test() ->
+%% The static floor is 0.1 sat/vB (Core v31, commit 2be0529).
+effective_min_relay_floor_tracks_core_v31_test() ->
     StaticMinRelay = ?DEFAULT_MIN_RELAY_TX_FEE / 1000.0,
-    ?assertEqual(1.0, StaticMinRelay).
+    ?assertEqual(0.1, StaticMinRelay).

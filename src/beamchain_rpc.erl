@@ -6060,7 +6060,7 @@ networkinfo_proplist(Connections, ConnIn, ConnOut, LocalAddrs) ->
         lists:duplicate(16 - length(LocalServicesHex0), $0) ++ LocalServicesHex0),
     [
         {<<"version">>, 260000},
-        {<<"subversion">>, <<"/beamchain:0.1.0/">>},
+        {<<"subversion">>, <<"/beamchain:1.0.0/">>},
         {<<"protocolversion">>, ?PROTOCOL_VERSION},
         {<<"localservices">>, LocalServicesHex},
         {<<"localservicesnames">>, services_to_names(LocalServices)},

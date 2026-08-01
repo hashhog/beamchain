@@ -22,7 +22,7 @@
 %%% ===================================================================
 
 setup() ->
-    Tables = [mempool_txs, mempool_by_fee, mempool_outpoints, mempool_orphans, mempool_clusters, mempool_ephemeral],
+    Tables = [mempool_txs, mempool_by_fee, mempool_outpoints, mempool_orphans, mempool_clusters, mempool_ephemeral, mempool_deltas],
     lists:foreach(fun(T) ->
         case ets:info(T) of
             undefined -> ok;
@@ -35,6 +35,10 @@ setup() ->
     ets:new(mempool_orphans, [set, public, named_table]),
     ets:new(mempool_clusters, [set, public, named_table, {read_concurrency, true}]),
     ets:new(mempool_ephemeral, [set, public, named_table]),
+    %% prioritisetransaction deltas table (created in the gen_server init in
+    %% production — beamchain_mempool.erl); get_sorted_by_fee/0 folds deltas
+    %% into the returned entries and does a pure ets:lookup on it.
+    ets:new(mempool_deltas, [set, public, named_table, {read_concurrency, true}]),
     ok.
 
 cleanup(_) ->
@@ -43,7 +47,7 @@ cleanup(_) ->
             undefined -> ok;
             _ -> ets:delete(T)
         end
-    end, [mempool_txs, mempool_by_fee, mempool_outpoints, mempool_orphans, mempool_clusters, mempool_ephemeral]).
+    end, [mempool_txs, mempool_by_fee, mempool_outpoints, mempool_orphans, mempool_clusters, mempool_ephemeral, mempool_deltas]).
 
 %%% ===================================================================
 %%% has_tx / get_tx / get_all_txids tests
@@ -2017,7 +2021,10 @@ check_standard_64byte_nonwitness_rejected_test() ->
     Tx64 = make_tx([{<<1:256>>, 0}], [{0, Script64}]),
     NonWit64 = beamchain_serialize:encode_transaction(Tx64, no_witness),
     ?assertEqual(64, byte_size(NonWit64)),
-    ?assertThrow(tx_size, beamchain_mempool:check_standard(Tx64)).
+    %% The <65B gate throws tx_size_small (distinct from the max-size
+    %% tx_size gate) so the RPC reject reason maps to Core's
+    %% "tx-size-small" (MIN_STANDARD_TX_NONWITNESS_SIZE).
+    ?assertThrow(tx_size_small, beamchain_mempool:check_standard(Tx64)).
 
 %% check_standard/1 — a 65-byte non-witness tx passes the size gate
 check_standard_65byte_nonwitness_accepted_test() ->
