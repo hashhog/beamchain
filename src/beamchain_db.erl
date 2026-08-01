@@ -178,7 +178,7 @@ store_block(Block, Height) ->
     gen_server:call(?SERVER, {store_block, Block, Height}, 30000).
 
 %% @doc Get a block by hash
--spec get_block(binary()) -> {ok, #block{}} | not_found.
+-spec get_block(binary()) -> {ok, #block{}} | not_found | {error, block_pruned}.
 get_block(Hash) when byte_size(Hash) =:= 32 ->
     gen_server:call(?SERVER, {get_block, Hash}).
 
@@ -269,8 +269,8 @@ fold_utxos_loop({error, invalid_iterator}, _Iter, _Fun, Acc) ->
     Acc;
 fold_utxos_loop({error, iterator_closed}, _Iter, _Fun, Acc) ->
     Acc;
-fold_utxos_loop({error, _Reason} = Err, _Iter, _Fun, _Acc) ->
-    Err;
+%% (rocksdb:iterator_move/2's only error reasons are invalid_iterator and
+%% iterator_closed — both end-of-iteration sentinels handled above.)
 fold_utxos_loop({ok, <<Txid:32/binary, Vout:32/big>>, ValueBin}, Iter,
                 Fun, Acc) ->
     Utxo = decode_utxo(ValueBin),
@@ -395,14 +395,16 @@ store_block_index(Height, Hash, Header, Chainwork, Status, NTx) ->
 %% @doc Get block index by height
 -spec get_block_index(non_neg_integer()) ->
     {ok, #{hash => binary(), header => #block_header{},
-           chainwork => binary(), status => integer()}} | not_found.
+           chainwork => binary(), status => integer(),
+           n_tx => non_neg_integer()}} | not_found.
 get_block_index(Height) ->
     gen_server:call(?SERVER, {get_block_index, Height}, 30000).
 
 %% @doc Get block index by hash (reverse lookup)
 -spec get_block_index_by_hash(binary()) ->
     {ok, #{height => integer(), header => #block_header{},
-           chainwork => binary(), status => integer()}} | not_found.
+           chainwork => binary(), status => integer(),
+           n_tx => non_neg_integer()}} | not_found.
 get_block_index_by_hash(Hash) when byte_size(Hash) =:= 32 ->
     gen_server:call(?SERVER, {get_block_index_by_hash, Hash}, 30000).
 
@@ -570,7 +572,8 @@ prune_block_files() ->
 %% Returns {ok, EffectiveHeight} where EffectiveHeight is the (clamped)
 %% height up to which pruning was attempted; or {error, Reason}.
 -spec prune_block_files_manual(non_neg_integer()) ->
-    {ok, non_neg_integer()} | {error, term()}.
+    {ok, #{pruned_count := non_neg_integer(),
+           effective_height := non_neg_integer()}} | {error, term()}.
 prune_block_files_manual(TargetHeight) ->
     gen_server:call(?SERVER, {prune_block_files_manual, TargetHeight}, 60000).
 
@@ -2140,14 +2143,16 @@ get_blocks_in_time_range(FromTime, ToTime) ->
     ets:select(?TIME_INDEX_ETS, MatchSpec).
 
 %% @doc Store block statistics in ETS cache.
-%% Stats is a map with keys like txcount, total_weight, total_fee, etc.
--spec store_block_stats(binary(), map()) -> ok.
+%% Stats is an ORDERED proplist of {binary(), term()} pairs (Core's ret_all
+%% key order — jsx would alphabetise a plain map), as produced by
+%% beamchain_rpc:compute_block_stats/3.
+-spec store_block_stats(binary(), [{binary(), term()}]) -> ok.
 store_block_stats(Hash, Stats) when byte_size(Hash) =:= 32 ->
     ets:insert(?BLOCK_STATS_ETS, {Hash, Stats}),
     ok.
 
 %% @doc Get cached block statistics.
--spec get_block_stats(binary()) -> {ok, map()} | not_found.
+-spec get_block_stats(binary()) -> {ok, [{binary(), term()}]} | not_found.
 get_block_stats(Hash) when byte_size(Hash) =:= 32 ->
     case ets:lookup(?BLOCK_STATS_ETS, Hash) of
         [{Hash, Stats}] -> {ok, Stats};

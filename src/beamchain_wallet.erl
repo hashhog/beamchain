@@ -1251,7 +1251,7 @@ bech32_hrp(regtest)  -> "bcrt".
 -spec build_transaction([{binary(), non_neg_integer(), #utxo{}}],
                         [{string(), non_neg_integer()}],
                         atom()) ->
-    {ok, #transaction{}} | {error, term()}.
+    {ok, #transaction{}}.
 build_transaction(Inputs, Outputs, Network) ->
     TxIns = lists:map(fun({Txid, Vout, _Utxo}) ->
         #tx_in{

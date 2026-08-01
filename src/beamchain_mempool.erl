@@ -5353,11 +5353,21 @@ check_tx_already_known(#transaction{outputs = Outputs} = Tx) ->
 %% so the cost is acceptable; if it becomes a hotspot a secondary ets index
 %% on wtxid → txid would be the right fix.
 lookup_entry_by_wtxid(Wtxid) ->
-    case ets:match_object(?MEMPOOL_TXS,
-                          {'_', #mempool_entry{wtxid = Wtxid, _ = '_'}}) of
-        [{_, Entry}] -> {ok, Entry};
-        []           -> not_found;
-        _Many        -> not_found  %% defensive; wtxid must be unique
+    %% Linear scan via foldl (bounded by mempool size — see the module doc
+    %% above). A plain ets:match_object/2 over a #mempool_entry{} pattern is
+    %% avoided: the wildcard construction trips dialyzer's record-field type
+    %% checks.
+    Found = ets:foldl(
+              fun({_, #mempool_entry{wtxid = W} = Entry}, Acc)
+                    when W =:= Wtxid ->
+                      [Entry | Acc];
+                 (_, Acc) ->
+                      Acc
+              end, [], ?MEMPOOL_TXS),
+    case Found of
+        [Entry]   -> {ok, Entry};
+        []        -> not_found;
+        _Many     -> not_found  %% defensive; wtxid must be unique
     end.
 
 %%% ===================================================================
@@ -5381,7 +5391,7 @@ lookup_entry_by_wtxid(Wtxid) ->
 %%
 %% Returns sat/vB as a float (multiply by 1000 for sat/kvB comparisons).
 -spec get_min_fee(#state{}) -> {float(), #state{}}.
-get_min_fee(#state{rolling_min_fee = R} = State) when R =:= 0 ->
+get_min_fee(#state{rolling_min_fee = R} = State) when R == 0 ->
     %% Gate 1b: rolling rate is zero — return incremental relay floor.
     IncrFee = ?DEFAULT_INCREMENTAL_RELAY_FEE / 1000.0,  %% sat/kvB → sat/vB
     {IncrFee, State};

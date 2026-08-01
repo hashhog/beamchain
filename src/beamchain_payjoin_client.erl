@@ -368,6 +368,14 @@ set_tor_proxy() ->
         _:E -> {error, E}
     end.
 
+%% OTP contract gap workaround: clearing the proxy requires writing OTP's own
+%% "no proxy" sentinel {proxy, {undefined, []}} — which is the DEFAULT value
+%% OTP stores internally and uses in its own test suites, but is not admitted
+%% by httpc:set_options/2's public contract (Proxy :: {HostName :: string(),
+%% Port}). Any contract-conforming alternative (dummy host) would actually
+%% route requests through a bogus proxy and change behavior. Suppress only
+%% this warning, on this function only.
+-dialyzer({nowarn_function, clear_proxy/0}).
 clear_proxy() ->
     try
         ok = httpc:set_options([{proxy, {undefined, []}}], default),
@@ -403,10 +411,9 @@ build_original_psbt_for(#bip21_uri{address = Addr, amount = Amount},
             case beamchain_wallet:build_transaction(
                    Selected, Outputs, Network) of
                 {ok, Tx} ->
-                    finalize_original(Tx, Selected, WalletPid, Network);
-                {error, R} ->
-                    {error, -4, iolist_to_binary(
-                                    io_lib:format("build failed: ~p", [R]))}
+                    finalize_original(Tx, Selected, WalletPid, Network)
+                    %% build_transaction/3 only returns {ok, Tx} (its spec);
+                    %% failures crash, not {error, _}.
             end;
         {error, insufficient_funds} ->
             {error, -6, <<"Insufficient funds">>}

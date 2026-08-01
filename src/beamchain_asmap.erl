@@ -440,9 +440,10 @@ decode_bits_loop(Asmap, Pos, Val, [Size | Rest], EndPos) ->
                             decode_mantissa(Asmap, Pos1, Val, Size, EndPos)
                     end
             end
-    end;
-decode_bits_loop(_Asmap, Pos, _Val, [], _EndPos) ->
-    {?INVALID, Pos}.  %% Ran out of classes
+    end.
+%% (The loop only recurses on a non-empty class list — the [] case is
+%% unreachable; truncation is reported via the Pos >= EndPos guards in
+%% decode_bits_loop/5 and decode_mantissa/5.)
 
 %% Read `Size` mantissa bits in big-endian order and add to Val.
 decode_mantissa(_Asmap, Pos, Val, 0, _EndPos) ->

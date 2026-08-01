@@ -129,7 +129,7 @@ add_block(Block, Height, PrevScripts) ->
 %% @doc Remove a filter index entry (used during block-disconnect for
 %% reorgs).  The caller is responsible for restoring the tip header
 %% via the returned previous-header value.
--spec remove_block(binary(), non_neg_integer()) ->
+-spec remove_block(binary(), non_neg_integer() | 'undefined') ->
     ok | {error, term()}.
 remove_block(BlockHash, Height) ->
     case whereis(?SERVER) of
@@ -139,6 +139,8 @@ remove_block(BlockHash, Height) ->
                 {remove_block, BlockHash, Height}, 30000)
     end.
 
+%% Convenience wrapper: roll back without a known height. The gen_server
+%% handler accepts 'undefined' (skips the height-index bookkeeping).
 remove_block(BlockHash) ->
     remove_block(BlockHash, undefined).
 
@@ -469,7 +471,7 @@ code_change(_Old, State, _Extra) ->
 %% genesis cfheader uses the all-zero pre-genesis previous header per BIP-157,
 %% and the genesis block has no spent prevouts so the element set is just its
 %% (non-OP_RETURN) coinbase output script.
-maybe_index_genesis(undefined) -> ok;
+-spec maybe_index_genesis(rocksdb:db_handle()) -> ok.
 maybe_index_genesis(Db) ->
     case read_tip_height(Db) of
         H when is_integer(H), H >= 0 ->
@@ -508,7 +510,7 @@ maybe_index_genesis(Db) ->
 %% if the chainstate/db are not available — e.g. in unit-test contexts
 %% where the index gen_server is started standalone. Mirrors
 %% Core BaseIndex::Init reading m_chainstate->m_chain.
-reconcile_with_chain(undefined) -> ok;
+-spec reconcile_with_chain(rocksdb:db_handle()) -> ok.
 reconcile_with_chain(Db) ->
     case chain_tip_height() of
         not_found ->
