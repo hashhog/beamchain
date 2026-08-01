@@ -181,6 +181,13 @@
     locked         :: boolean(),            %% true if wallet is locked (keys unavailable)
     encrypted_seed :: binary() | undefined, %% AES-256-CBC encrypted seed
     encryption_salt :: binary() | undefined, %% 16-byte salt for PBKDF2
+    %% SHA256d of the plaintext seed, stored at encrypt time and checked on
+    %% unlock. AES-256-CBC has no authentication, so a wrong passphrase
+    %% otherwise "decrypts" to valid PKCS#7 padding ~0.4% of the time and
+    %% unlocks with a garbage key (Core detects bad passphrases via its
+    %% master-key check). undefined for wallets encrypted before this
+    %% field existed (legacy: accept any padding-valid decrypt).
+    seed_verifier :: binary() | undefined,
     lock_timer_ref :: reference() | undefined,  %% auto-lock timer reference
     %% Locked coins (lockunspent / listlockunspent).  Memory-only set of
     %% {Txid, Vout} pairs that coin selection must skip.  Mirrors Core's
@@ -1975,6 +1982,7 @@ save_wallet(#wallet_state{addresses = Addrs,
                            passphrase = Passphrase, wallet_file = File,
                            encrypted = Encrypted, encrypted_seed = EncSeed,
                            encryption_salt = EncSalt, seed = Seed,
+                           seed_verifier = SeedVerifier,
                            last_synced_height = LastSynced,
                            private_keys_enabled = PrivKeysEnabled}) ->
     %% For encrypted wallets, save the encrypted seed
@@ -1989,11 +1997,17 @@ save_wallet(#wallet_state{addresses = Addrs,
     },
     WalletData = case Encrypted of
         true ->
-            Common#{
+            EncBase = Common#{
                 <<"encrypted">>       => true,
                 <<"encrypted_seed">>  => hex_encode(EncSeed),
                 <<"encryption_salt">> => hex_encode(EncSalt)
-            };
+            },
+            %% Legacy encrypted wallets have no tag until re-encrypted.
+            case SeedVerifier of
+                undefined -> EncBase;
+                _         -> EncBase#{<<"seed_verifier">> =>
+                                      hex_encode(SeedVerifier)}
+            end;
         false ->
             Common#{<<"seed">> => hex_encode(Seed)}
     end,
@@ -2109,13 +2123,18 @@ apply_loaded_wallet(WalletData, FilePath, Passphrase, State) ->
         true ->
             EncSeed = hex_decode(maps:get(<<"encrypted_seed">>, WalletData)),
             EncSalt = hex_decode(maps:get(<<"encryption_salt">>, WalletData)),
+            SeedVerifier = case maps:get(<<"seed_verifier">>, WalletData, undefined) of
+                undefined -> undefined;   %% legacy wallet, pre-integrity-tag
+                SVHex     -> hex_decode(SVHex)
+            end,
             Base#wallet_state{
                 master_key      = undefined,
                 seed            = undefined,
                 encrypted       = true,
                 locked          = true,
                 encrypted_seed  = EncSeed,
-                encryption_salt = EncSalt
+                encryption_salt = EncSalt,
+                seed_verifier   = SeedVerifier
             };
         false ->
             Seed = hex_decode(maps:get(<<"seed">>, WalletData)),
@@ -2936,7 +2955,10 @@ do_encrypt_wallet(#wallet_state{seed = Seed} = State, Passphrase) ->
         encrypted = true,
         locked = true,
         encrypted_seed = EncryptedSeed,
-        encryption_salt = Salt
+        encryption_salt = Salt,
+        %% Integrity tag so unlock can reject wrong passphrases
+        %% deterministically (CBC alone has no authentication).
+        seed_verifier = beamchain_crypto:hash256(Seed)
     },
     logger:info("wallet: encrypted with passphrase (~B byte salt)",
                 [byte_size(Salt)]),
@@ -2959,6 +2981,11 @@ do_unlock_wallet(#wallet_state{encrypted_seed = EncSeed,
     try
         DecryptedPadded = crypto:crypto_one_time(aes_256_cbc, Key, IV, EncSeed, false),
         Seed = pkcs7_unpad(DecryptedPadded),
+        %% Integrity check: CBC decryption with a wrong key yields garbage
+        %% that nevertheless has valid PKCS#7 padding ~0.4% of the time.
+        %% Compare the seed hash against the tag stored at encrypt time
+        %% (legacy wallets without a tag fall through to the old behavior).
+        ok = check_seed_verifier(State#wallet_state.seed_verifier, Seed),
         %% Verify the seed is valid by deriving the master key
         MasterKey = master_from_seed(Seed),
         %% Set auto-lock timer
@@ -2974,6 +3001,17 @@ do_unlock_wallet(#wallet_state{encrypted_seed = EncSeed,
     catch
         _:_ ->
             {error, wrong_passphrase}
+    end.
+
+%% @doc Wrong-passphrase guard for do_unlock_wallet/3. Returns ok when the
+%% decrypted seed matches the encrypt-time tag; throws on mismatch so the
+%% caller's catch maps it to {error, wrong_passphrase}. Legacy wallets
+%% (tag absent) always pass.
+check_seed_verifier(undefined, _Seed) -> ok;
+check_seed_verifier(Verifier, Seed) ->
+    case beamchain_crypto:hash256(Seed) =:= Verifier of
+        true  -> ok;
+        false -> throw(wrong_passphrase)
     end.
 
 %% @doc Lock the wallet by clearing the decrypted seed from memory.

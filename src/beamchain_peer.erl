@@ -1445,7 +1445,7 @@ do_send_version(#peer_data{address = {IP, Port}, our_nonce = Nonce} = Data) ->
         addr_from   => #{services => Services, ip => {0,0,0,0},
                          port => Params#network_params.default_port},
         nonce       => Nonce,
-        user_agent  => <<"/beamchain:0.1.0/">>,
+        user_agent  => <<"/beamchain:1.0.0/">>,
         start_height => StartHeight,
         relay       => true
     }),

@@ -15,7 +15,7 @@
 %%   types even though dialyzer only sees list/binary from current call sites.
 -dialyzer({nowarn_function, [import_utxo/1, flatten/1]}).
 
--define(VERSION, "0.1.0").
+-define(VERSION, "1.0.0").
 
 %% Spinner frames (braille pattern dots)
 -define(SPINNER, ["\xe2\xa0\x8b", "\xe2\xa0\x99", "\xe2\xa0\xb9",

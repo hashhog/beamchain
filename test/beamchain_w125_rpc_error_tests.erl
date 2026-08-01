@@ -111,6 +111,9 @@ net_cleanup({ConfigPid, TestDir}) ->
     catch ets:delete_all_objects(beamchain_added_nodes),
     catch gen_server:stop(ConfigPid),
     catch ets:delete(beamchain_config_ets),
+    %% Undo the env overrides (see beamchain_addrman_tests).
+    os:unsetenv("BEAMCHAIN_NETWORK"),
+    os:unsetenv("BEAMCHAIN_DATADIR"),
     os:cmd("rm -rf " ++ TestDir),
     ok.
 

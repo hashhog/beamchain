@@ -198,7 +198,9 @@ g15_rpcuser_rpcpassword_plumbed_test() ->
                      <<"beamchain_config:get(rpcpassword)">>)).
 
 %% G16 MISSING — **P0-SEC** plaintext password stored & compared
-%% literally.  BUG-2.
+%% literally.  BUG-2.  (Cookie auth — Core's GenerateAuthCookie —
+%% has since been implemented, commit 9357360; the plaintext
+%% rpcuser/rpcpassword gap below remains open.)
 g16_plaintext_password_stored_test() ->
     Src = rpc_module_src(),
     %% ETS slot literally stores {rpc_credentials, U, P}.
@@ -206,7 +208,6 @@ g16_plaintext_password_stored_test() ->
                      <<"{rpc_credentials, to_bin(U), to_bin(P)}">>)),
     %% No HMAC, no salt, no hashing anywhere in setup_auth.
     ?assertEqual(nomatch, binary:match(Src, <<"hmac_sha256">>)),
-    ?assertEqual(nomatch, binary:match(Src, <<"GenerateAuthCookie">>)),
     ?assertEqual(nomatch, binary:match(Src, <<"password_hmac">>)).
 
 %% G17 PARTIAL — authorization header parsed via cowboy_req:parse_header

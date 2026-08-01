@@ -30,11 +30,15 @@
 %%% ===================================================================
 
 setup() ->
-    %% Provide the chain-meta ETS table that init reads
-    case ets:info(beamchain_chain_meta) of
+    %% Provide the chain-meta ETS table that init reads. Track whether
+    %% WE created it: the eunit runner shares one process across
+    %% modules, so a table left behind crashes a later
+    %% beamchain_chainstate start (already_exists in init_chainstate/2).
+    Created = case ets:info(beamchain_chain_meta) of
         undefined ->
-            ets:new(beamchain_chain_meta, [set, public, named_table]);
-        _ -> ok
+            ets:new(beamchain_chain_meta, [set, public, named_table]),
+            true;
+        _ -> false
     end,
     %% Kill any leftover server from a prior run
     case whereis(beamchain_fee_estimator) of
@@ -49,14 +53,18 @@ setup() ->
                   filelib:wildcard("fee_estimates.dat") ++
                   filelib:wildcard("/tmp/fee_estimates.dat")),
     {ok, NewPid} = beamchain_fee_estimator:start_link(),
-    NewPid.
+    {NewPid, Created}.
 
-teardown(Pid) ->
+teardown({Pid, Created}) ->
     case is_process_alive(Pid) of
         true ->
             unlink(Pid),
             exit(Pid, kill),
             wait_dead(Pid);
+        false -> ok
+    end,
+    case Created of
+        true  -> catch ets:delete(beamchain_chain_meta);
         false -> ok
     end.
 
@@ -291,8 +299,15 @@ g08_process_block_wired_from_chainstate_test_() ->
     {setup, fun setup/0, fun teardown/1,
      fun(_) ->
         [fun() ->
-             ChainstatePath = "/home/work/hashhog/beamchain/src/beamchain_chainstate.erl",
-             AltPath = "../../../../src/beamchain_chainstate.erl",
+             %% Resolve beamchain_chainstate.erl via the loaded beam's
+             %% location (works on any checkout), falling back to the
+             %% repo-relative path.
+             BeamPath = code:which(beamchain_chainstate),
+             EbinDir = filename:dirname(BeamPath),
+             LibDir = filename:dirname(EbinDir),
+             ChainstatePath = filename:join(
+                                [LibDir, "src", "beamchain_chainstate.erl"]),
+             AltPath = "src/beamchain_chainstate.erl",
              Path = case file:read_file(ChainstatePath) of
                  {ok, _} -> ChainstatePath;
                  _ -> AltPath
@@ -306,7 +321,7 @@ g08_process_block_wired_from_chainstate_test_() ->
                          "W114-BUG-1 regressed: chainstate no longer calls process_block");
                  _ ->
                      ?assert(lists:keymember(
-                                process_block, 2,
+                                process_block, 1,
                                 beamchain_fee_estimator:module_info(exports)))
              end
          end]
@@ -375,7 +390,7 @@ g11_bug2_period_index_floor_test_() ->
      end].
 
 %%% ===================================================================
-%%% G12 — BUG-3: No removeTx/remove_tx hook
+%%% G12 — BUG-3 CLOSED (commit 59bbdfc): remove_tx/1 exists, mirroring
 %%% Core: block_policy_estimator.cpp:522 (CBlockPolicyEstimator::removeTx)
 %%% ===================================================================
 
@@ -386,8 +401,8 @@ g12_bug3_no_remove_tx_test_() ->
              Exports = beamchain_fee_estimator:module_info(exports),
              HasRemove = lists:keymember(remove_tx, 1, Exports) orelse
                          lists:keymember(removetx, 1, Exports),
-             ?assertNot(HasRemove,
-                 "BUG-3: remove_tx/1 should exist to mirror Core "
+             ?assert(HasRemove,
+                 "BUG-3 regressed: remove_tx/1 must exist to mirror Core "
                  "CBlockPolicyEstimator::removeTx (failAvg tracking)")
          end]
      end}.

@@ -602,9 +602,10 @@ g29_pending_undo_in_flush_batch() ->
     ok = beamchain_db:store_undo(BlockHash, UndoBin),
     ?assertMatch({ok, _}, beamchain_db:get_undo(BlockHash)),
     %% Manually inject the hash into pending_undo_deletes via sys:replace_state
+    %% (element 16 of the #state{} record tuple — see beamchain_chainstate.erl).
     sys:replace_state(beamchain_chainstate, fun(S) ->
-        Pending = element(18, S),  %% pending_undo_deletes field
-        setelement(18, S, [BlockHash | Pending])
+        Pending = element(16, S),  %% pending_undo_deletes field
+        setelement(16, S, [BlockHash | Pending])
     end),
     %% Trigger a flush (needs at least one dirty/spent op or tip change
     %% to take the non-fast path; add a dirty entry)

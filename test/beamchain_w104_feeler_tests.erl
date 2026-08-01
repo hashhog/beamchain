@@ -51,6 +51,9 @@ cleanup({ConfigPid, AddrmanPid, TestDir}) ->
     gen_server:stop(AddrmanPid),
     gen_server:stop(ConfigPid),
     catch ets:delete(beamchain_config_ets),
+    %% Undo the env overrides (see beamchain_addrman_tests).
+    os:unsetenv("BEAMCHAIN_NETWORK"),
+    os:unsetenv("BEAMCHAIN_DATADIR"),
     os:cmd("rm -rf " ++ TestDir),
     ok.
 
@@ -172,20 +175,22 @@ feeler_test_() ->
 
 getaddr_cap_formula_test_() ->
     [
-     {"23% cap: ceil(0.23*size) below the 1000 absolute cap", fun() ->
-         %% size=100 -> ceil(23) = 23
+     {"23% cap: floor(0.23*size) below the 1000 absolute cap", fun() ->
+         %% Core AddrManImpl::GetAddr_ uses integer division
+         %% (max_pct * size / 100 — FLOOR, addrman.cpp:800), not ceil.
+         %% size=100 -> floor(23) = 23
          ?assertEqual(23, ?PM:getaddr_cap(100)),
-         %% size=10 -> ceil(2.3) = 3
-         ?assertEqual(3, ?PM:getaddr_cap(10)),
-         %% size=1 -> ceil(0.23) = 1
-         ?assertEqual(1, ?PM:getaddr_cap(1)),
+         %% size=10 -> floor(2.3) = 2
+         ?assertEqual(2, ?PM:getaddr_cap(10)),
+         %% size=1 -> floor(0.23) = 0 (Core has no max(1,_) clamp)
+         ?assertEqual(0, ?PM:getaddr_cap(1)),
          %% size=0 -> 0
          ?assertEqual(0, ?PM:getaddr_cap(0))
      end},
      {"23% cap: clamped at MAX_ADDR_TO_SEND (1000) for large tables", fun() ->
          %% 0.23 * 5000 = 1150 -> min(1000, 1150) = 1000
          ?assertEqual(1000, ?PM:getaddr_cap(5000)),
-         %% Exactly at the knee: ceil(0.23 * 4348) = 1001 -> clamped to 1000
+         %% (4348*23) div 100 = 1000 -> at the knee, stays 1000
          ?assertEqual(1000, ?PM:getaddr_cap(4348))
      end},
      {"MAX_PCT_ADDR_TO_SEND constant is genuine Core 23", fun() ->

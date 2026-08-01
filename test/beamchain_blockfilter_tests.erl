@@ -382,7 +382,10 @@ filter_index_persistence_test_() ->
           fun() ->
             BHHex = beamchain_serialize:hex_encode(
                 reverse_bytes(<<1:256/big>>)),
-            ?assertMatch({error, -8, _},
+            %% Core: BlockFilterTypeByName failure throws
+            %% RPC_INVALID_ADDRESS_OR_KEY (-5) "Unknown filtertype"
+            %% (bitcoin-core rpc/blockchain.cpp getblockfilter).
+            ?assertMatch({error, -5, _},
                 beamchain_rpc:rpc_getblockfilter([BHHex, <<"extended">>]))
           end},
 

@@ -204,8 +204,10 @@ g08_node_sup_rest_for_one_test() ->
 %% replayed ~42 blocks on restart.
 g09_chainstate_shutdown_timeout_test() ->
     Src = read_src(beamchain_chainstate_sup),
-    %% Two child specs (main + snapshot) both need 30000ms.
-    ?assertEqual(3, length([X || X <- string:tokens(Src, "\n"),
+    %% Two child specs (main + snapshot) both need 30000ms. (The former
+    %% third — the deprecated bg-validation chainstate — was removed when
+    %% background validation moved to beamchain_bg_validation.)
+    ?assertEqual(2, length([X || X <- string:tokens(Src, "\n"),
                                   string:str(X, "shutdown => 30000") > 0])).
 
 %% G10 — wallet_sup uses temporary restart (PASS).  Wallets crashing
@@ -218,14 +220,18 @@ g10_wallet_restart_temporary_test() ->
 %% G11 — node_sup children OTHER than chainstate keep the default
 %% 5000ms shutdown (PARTIAL).  Long-flush processes (mempool,
 %% peer_manager, sync) could lose state if they cannot complete a
-%% terminate/2 in 5s.  No explicit shutdown timeout in
-%% beamchain_node_sup's generic child_spec/2 helper.
+%% terminate/2 in 5s.  Mempool has since been bumped to an explicit
+%% 30000ms (beamchain_node_sup:mempool_spec/0); peer_manager / sync /
+%% addrman still run the default.
 g11_node_sup_default_shutdown_test() ->
     Src = read_src(beamchain_node_sup),
-    %% child_spec/2 does NOT set a shutdown key, so OTP applies the
-    %% default 5000ms.  Marker — future fix should bump mempool /
-    %% peer_manager / sync / addrman to e.g. 15000ms each.
-    ?assertNot(contains(Src, "shutdown =>")),
+    %% The mempool child now carries an explicit 30s shutdown (partial
+    %% closure of the G11 marker); the generic child_spec/2 helper still
+    %% does NOT set a shutdown key, so OTP applies the default 5000ms to
+    %% everything else.  Remaining gap: bump peer_manager / sync /
+    %% addrman to e.g. 15000ms each.
+    ?assert(contains(Src, "shutdown => 30000")),
+    ?assertNot(contains(Src, "child_spec(beamchain_peer_manager, worker))#{shutdown =>")),
     ?assert(true).
 
 %% G12 — Intensity / period not tuned for child count (PARTIAL).  Both

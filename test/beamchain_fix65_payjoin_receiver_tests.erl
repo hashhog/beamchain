@@ -70,11 +70,40 @@ stop_default_wallet() ->
     end.
 
 ensure_seeded_wallet() ->
+    set_test_home(),
     _ = stop_default_wallet(),
     Pid = start_default_wallet(),
     Seed = crypto:strong_rand_bytes(32),
     {ok, _} = gen_server:call(Pid, {create, Seed, undefined}),
     Pid.
+
+%% Point HOME at a throwaway dir so the wallet's datadir fallback
+%% (beamchain_wallet:wallet_dir/1 -> default_datadir/0) stays hermetic:
+%% without a beamchain_config datadir the wallet gen_server would
+%% otherwise auto-load and persist into ~/.beamchain (the operator's
+%% real datadir). Mirrors beamchain_wallet_persist_tests' setup/0.
+set_test_home() ->
+    Home = "/tmp/beamchain_fix65_home_"
+           ++ integer_to_list(erlang:unique_integer([positive])),
+    ok = filelib:ensure_dir(Home ++ "/"),
+    case get(test_home_backup) of
+        undefined -> put(test_home_backup, os:getenv("HOME"));
+        _ -> ok
+    end,
+    true = os:putenv("HOME", Home),
+    put(test_home_dir, Home),
+    ok.
+
+restore_test_home() ->
+    case erase(test_home_backup) of
+        undefined -> ok;
+        false     -> os:unsetenv("HOME");
+        Prev      -> os:putenv("HOME", Prev)
+    end,
+    case erase(test_home_dir) of
+        undefined -> ok;
+        Dir       -> os:cmd("rm -rf " ++ Dir), ok
+    end.
 
 %% Generate a wallet-owned P2WPKH address, return {AddrStr, Script}.
 new_wallet_p2wpkh() ->
@@ -223,7 +252,7 @@ g17_error_tokens_test_() ->
 round_trip_signed_payjoin_test_() ->
     {setup,
      fun() -> ensure_seeded_wallet() end,
-     fun(_) -> stop_default_wallet() end,
+     fun(_) -> stop_default_wallet(), restore_test_home() end,
      fun(_Pid) ->
        [
         ?_test(begin
@@ -298,7 +327,7 @@ round_trip_signed_payjoin_test_() ->
 not_enough_money_test_() ->
     {setup,
      fun() -> ensure_seeded_wallet() end,
-     fun(_) -> stop_default_wallet() end,
+     fun(_) -> stop_default_wallet(), restore_test_home() end,
      fun(_Pid) ->
        [
         ?_test(begin
@@ -344,30 +373,39 @@ original_psbt_rejected_no_inputs_test() ->
                                          script_pubkey = <<0>>}],
                       locktime = 0},
     Psbt = #psbt{unsigned_tx = Tx, inputs = [], outputs = [#{}]},
-    Pid = case whereis(beamchain_wallet) of
+    set_test_home(),
+    %% If we start the wallet ourselves, stop it at the end: a lingering
+    %% default wallet (linked to the shared eunit runner) becomes a
+    %% runner-killer when a later fixture does stop_default()+exit(kill)
+    %% (it cancels whole test groups).
+    {Pid, Started} = case whereis(beamchain_wallet) of
               undefined ->
                   {ok, P} = beamchain_wallet:start_link(),
-                  P;
-              P -> P
+                  {P, true};
+              P -> {P, false}
           end,
-    Params = #{version => 1,
-               additional_fee_output_index => undefined,
-               max_additional_fee_contribution => 0,
-               disable_output_substitution => false,
-               min_fee_rate => 0},
-    %% Calling build_payjoin_psbt directly skips
-    %% validate_original_psbt (that runs in the handler before the
-    %% builder). Drive validation via the handler interface for
-    %% completeness — but since we can't easily spin a cowboy listener
-    %% here, we assert the structural shape from
-    %% validate_original_psbt via the public surface we have.
-    %% (We DO assert that the builder bails on no wallet UTXOs even on
-    %% the malformed input, so the error chain is exercised.)
-    R = beamchain_payjoin_server:build_payjoin_psbt(Psbt, Params, Pid),
-    %% Either the builder bails on the malformed Original (preferable)
-    %% or it bails on no eligible UTXO; either way it surfaces an
-    %% {error, _} that the HTTP handler would map to a BIP-78 error.
-    ?assertMatch({error, _}, R).
+    try
+        Params = #{version => 1,
+                   additional_fee_output_index => undefined,
+                   max_additional_fee_contribution => 0,
+                   disable_output_substitution => false,
+                   min_fee_rate => 0},
+        %% Calling build_payjoin_psbt directly skips
+        %% validate_original_psbt (that runs in the handler before the
+        %% builder). Drive validation via the handler interface for
+        %% completeness — but since we can't easily spin a cowboy listener
+        %% here, we assert the structural shape from
+        %% validate_original_psbt via the public surface we have.
+        %% (We DO assert that the builder bails on no wallet UTXOs even on
+        %% the malformed input, so the error chain is exercised.)
+        R = beamchain_payjoin_server:build_payjoin_psbt(Psbt, Params, Pid),
+        %% Either the builder bails on the malformed Original (preferable)
+        %% or it bails on no eligible UTXO; either way it surfaces an
+        %% {error, _} that the HTTP handler would map to a BIP-78 error.
+        ?assertMatch({error, _}, R)
+    after
+        Started andalso gen_server:stop(Pid)
+    end.
 
 %%% ===================================================================
 %%% Error: version-unsupported (exercised through parse_qs_params)

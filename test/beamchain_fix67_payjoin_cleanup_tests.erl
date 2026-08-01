@@ -92,6 +92,7 @@ stop_default_wallet() ->
     end.
 
 ensure_seeded_wallet() ->
+    set_test_home(),
     _ = stop_default_wallet(),
     Pid = start_default_wallet(),
     Seed = crypto:strong_rand_bytes(32),
@@ -99,6 +100,34 @@ ensure_seeded_wallet() ->
     %% Wipe any leftover payjoin state between tests.
     beamchain_payjoin_state:clear_all(),
     Pid.
+
+%% Point HOME at a throwaway dir so the wallet's datadir fallback
+%% (beamchain_wallet:wallet_dir/1 -> default_datadir/0) stays hermetic:
+%% without a beamchain_config datadir the wallet gen_server would
+%% otherwise auto-load and persist into ~/.beamchain (the operator's
+%% real datadir). Mirrors beamchain_wallet_persist_tests' setup/0.
+set_test_home() ->
+    Home = "/tmp/beamchain_fix67_home_"
+           ++ integer_to_list(erlang:unique_integer([positive])),
+    ok = filelib:ensure_dir(Home ++ "/"),
+    case get(test_home_backup) of
+        undefined -> put(test_home_backup, os:getenv("HOME"));
+        _ -> ok
+    end,
+    true = os:putenv("HOME", Home),
+    put(test_home_dir, Home),
+    ok.
+
+restore_test_home() ->
+    case erase(test_home_backup) of
+        undefined -> ok;
+        false     -> os:unsetenv("HOME");
+        Prev      -> os:putenv("HOME", Prev)
+    end,
+    case erase(test_home_dir) of
+        undefined -> ok;
+        Dir       -> os:cmd("rm -rf " ++ Dir), ok
+    end.
 
 %%% ===================================================================
 %%% G18 — Receiver TTL / request budget
@@ -117,7 +146,7 @@ g18_compute_request_budget_ms_default_test() ->
 g18_bounded_build_times_out_test_() ->
     {setup,
      fun() -> ensure_seeded_wallet() end,
-     fun(_) -> stop_default_wallet() end,
+     fun(_) -> stop_default_wallet(), restore_test_home() end,
      fun(_Pid) ->
        [?_test(begin
           %% Construct a minimal #psbt{} that the build path could
@@ -232,7 +261,7 @@ g20_uih_score_recency_penalty_test() ->
 g20_pick_anti_fingerprint_prefers_large_utxo_test_() ->
     {setup,
      fun() -> ensure_seeded_wallet() end,
-     fun(_) -> stop_default_wallet() end,
+     fun(_) -> stop_default_wallet(), restore_test_home() end,
      fun(_Pid) ->
        [?_test(begin
           %% Stage TWO wallet UTXOs with different values + scripts.
@@ -279,7 +308,7 @@ g20_pick_anti_fingerprint_prefers_large_utxo_test_() ->
 g20_pick_anti_fingerprint_empty_wallet_test_() ->
     {setup,
      fun() -> ensure_seeded_wallet() end,
-     fun(_) -> stop_default_wallet() end,
+     fun(_) -> stop_default_wallet(), restore_test_home() end,
      fun(_Pid) ->
        [?_test(begin
           %% No UTXOs staged → no_eligible_utxo.
@@ -371,7 +400,7 @@ g30_rpc_getpayjoinrequest_emits_token_test_() ->
         beamchain_payjoin_state:clear_all(),
         ensure_seeded_wallet()
      end,
-     fun(_) -> stop_default_wallet() end,
+     fun(_) -> stop_default_wallet(), restore_test_home() end,
      fun(_Pid) ->
        [?_test(begin
           Result = beamchain_rpc:rpc_getpayjoinrequest(

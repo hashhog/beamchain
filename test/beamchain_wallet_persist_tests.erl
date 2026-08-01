@@ -71,15 +71,20 @@ start_default() ->
     Pid.
 
 persist_test_() ->
-    {foreach,
-     fun setup/0,
-     fun cleanup/1,
-     [
-      fun t1_atomic_durable_roundtrip/1,
-      fun t2_mutation_survives_unclean_restart/1,
-      fun t3_corrupt_file_load_recovers_from_bak/1,
-      fun t4_missing_file_is_clean_noop/1
-     ]}.
+    %% Explicit group timeout: T2 kills and restarts the wallet gen_server
+    %% (fsync + reload), which can exceed eunit's default 5s per-test
+    %% timeout under full-suite load — the kill cancelled the rest of the
+    %% group.
+    {timeout, 120,
+     {foreach,
+      fun setup/0,
+      fun cleanup/1,
+      [
+       fun t1_atomic_durable_roundtrip/1,
+       fun t2_mutation_survives_unclean_restart/1,
+       fun t3_corrupt_file_load_recovers_from_bak/1,
+       fun t4_missing_file_is_clean_noop/1
+      ]}}.
 
 %%% -------------------------------------------------------------------
 %%% T1 — atomic + durable write, no temp leftover, reload intact
