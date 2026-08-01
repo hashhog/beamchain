@@ -1859,10 +1859,8 @@ active_tip_chainwork(TipHash) ->
 %% the now-active blocks are stale and should be removed.
 do_promote_side_branch(NewTipHash, State) ->
     case build_side_branch_chain_to_active(NewTipHash, State#state.tip_hash) of
-        {ok, []} ->
-            %% Already on the active chain.  Shouldn't happen given
-            %% the chainwork comparison above, but defend anyway.
-            {ok, side_branch, State};
+        %% (The walker always returns at least the start block on success,
+        %% so {ok, []} is impossible and no side_branch/no-op case exists.)
         {ok, NewBlocks} ->
             case do_reorganize(NewBlocks, State) of
                 {ok, State2, DisconnectedTxs} ->
@@ -1914,6 +1912,9 @@ do_promote_side_branch(NewTipHash, State) ->
 %% until we find a hash that's on the active chain (i.e. its hash
 %% matches the active block_index entry at its height).  Returns the
 %% blocks in fork→tip order, loaded from cf_blocks.
+-spec build_side_branch_chain_to_active(binary(), binary() | 'undefined') ->
+    {ok, [#block{}, ...]} |
+    {error, {'broken_chain' | 'block_data_missing', binary()}}.
 build_side_branch_chain_to_active(StartHash, ConnTipHash) ->
     build_side_branch_chain_to_active(StartHash, ConnTipHash, []).
 
@@ -2509,9 +2510,10 @@ maybe_flush(#state{ibd = false, max_cache_bytes = MaxBytes,
             do_flush(State);
         false ->
             State
-    end;
-maybe_flush(State) ->
-    State.
+    end.
+
+%% (maybe_flush/1 is exhaustive over #state.ibd :: boolean(), so no
+%% catch-all clause is needed or reachable.)
 
 %% Flush dirty entries to RocksDB in a single write batch.
 %% After flush, all entries become "clean" (match what's in RocksDB).
@@ -2645,8 +2647,9 @@ build_flush_ops() ->
 %% This is NOT power-loss durable (no fsync), which is fine for the import
 %% workflow but means an OS-level crash between import and the next start
 %% could lose the import.
-flush_snapshot_chunked(#state{tip_hash = undefined} = State) ->
-    State;
+-spec flush_snapshot_chunked(#state{}) -> #state{}.
+%% Only called after a successful snapshot import (State.tip_hash is the
+%% 256-bit base hash), so no tip-less clause is needed.
 flush_snapshot_chunked(#state{tip_hash = TipHash,
                               tip_height = TipHeight} = State) ->
     DirtyCount = ets:info(?UTXO_DIRTY, size),
@@ -3653,10 +3656,6 @@ do_precious_block_impl(Hash, TipWork,
             case do_promote_side_branch(Hash, State1) of
                 {ok, {reorg, DisconnectedTxs}, State2} ->
                     {ok, reorg, DisconnectedTxs, State2};
-                {ok, side_branch, State2} ->
-                    %% build_side_branch_chain_to_active found nothing to connect
-                    %% (block already effectively active) — no tip change.
-                    {ok, State2};
                 {error, Reason, RolledBack} ->
                     %% Atomic reorg failed and rolled back to the pre-reorg tip;
                     %% keep the seqid mark (precious persists for a retry).  The

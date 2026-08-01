@@ -344,8 +344,8 @@ bitwriter_flush(Acc, NBits, Buf) when NBits > 0 ->
 %%% GCS decoding (matching path)
 %%% -------------------------------------------------------------------
 
-decode_and_match(_Stream, 0, _P, _Targets) ->
-    false;
+%% Callers (gcs_match_any/6) guard N = 0 before dispatching, so no
+%% zero-count clause is needed here.
 decode_and_match(_Stream, _N, _P, []) ->
     false;
 decode_and_match(Stream, N, P, Targets) ->

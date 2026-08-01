@@ -339,7 +339,7 @@ lookup_spender(Db, PrevTxid, PrevVout) ->
 %%% Startup reconciliation (BaseIndex::Init -> Rewind)
 %%% ===================================================================
 
-reconcile_with_chain(undefined) -> ok;
+-spec reconcile_with_chain(rocksdb:db_handle()) -> ok.
 reconcile_with_chain(Db) ->
     case chain_tip_height() of
         not_found ->
