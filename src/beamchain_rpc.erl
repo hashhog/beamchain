@@ -9770,12 +9770,11 @@ bumpfee_extract_entry(Entry) ->
     %% robust form. That marker is now inverted to demand this shape instead.
     %%
     %% Record access is arity-independent: adding a field can no longer break it.
+    %% (The defensive catch-all from that commit was removed: OTP 27 dialyzer
+    %% proves every caller passes a #mempool_entry{}, so it was dead code.)
     case Entry of
         #mempool_entry{tx = Tx, fee = Fee, vsize = VSize} ->
-            {Tx, Fee, VSize};
-        _ ->
-            throw({bumpfee_error, ?RPC_MISC_ERROR,
-                   <<"Unexpected mempool_entry shape">>})
+            {Tx, Fee, VSize}
     end.
 
 bumpfee_lookup_input_utxos(Inputs) ->
