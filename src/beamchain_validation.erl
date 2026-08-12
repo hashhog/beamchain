@@ -368,7 +368,7 @@ contextual_check_block_header(Header, PrevIndex, Params) ->
         case Height >= Bip34Height of
             true ->
                 Header#block_header.version >= 2
-                    orelse throw(bad_version);
+                    orelse throw({bad_version, Header#block_header.version});
             false -> ok
         end,
 
@@ -377,7 +377,7 @@ contextual_check_block_header(Header, PrevIndex, Params) ->
         case Height >= Bip66Height of
             true ->
                 Header#block_header.version >= 3
-                    orelse throw(bad_version);
+                    orelse throw({bad_version, Header#block_header.version});
             false -> ok
         end,
 
@@ -386,7 +386,7 @@ contextual_check_block_header(Header, PrevIndex, Params) ->
         case Height >= Bip65Height of
             true ->
                 Header#block_header.version >= 4
-                    orelse throw(bad_version);
+                    orelse throw({bad_version, Header#block_header.version});
             false -> ok
         end,
 
