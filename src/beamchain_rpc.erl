@@ -7241,10 +7241,42 @@ bip22_result(bad_coinbase_length)       -> <<"bad-cb-length">>;
 bip22_result({bad_tx, bad_coinbase_length}) -> <<"bad-cb-length">>;
 bip22_result(bad_cb_height)             -> <<"bad-cb-height">>;
 bip22_result(bad_txns_bip30)            -> <<"bad-txns-BIP30">>;
+%% Outdated block nVersion (buried BIP34/66/65 height gates).  Core
+%% validation.cpp:4116 ContextualCheckBlockHeader:
+%%   state.Invalid(BLOCK_INVALID_HEADER,
+%%                 strprintf("bad-version(0x%08x)", block.nVersion), ...).
+%% beamchain_validation:contextual_check_block_header throws
+%% {bad_version, V} carrying the block's (signed int32) nVersion; format the
+%% reason string identically to Core — nVersion reinterpreted UNSIGNED,
+%% zero-padded to 8 lowercase hex digits (so v=-1 -> 0xffffffff,
+%% v=0x80000000 -> 0x80000000, v=1 -> 0x00000001).
+bip22_result({bad_version, V}) when is_integer(V) ->
+    format_bad_version(V);
+%% Double-spend across two txs in one block: the second spend's prevout is
+%% already spent/absent in the UTXO view.  beamchain_validation:connect_block
+%% (fetch_input_coins) throws missing_inputs.  Core validation.cpp:866
+%% ConnectBlock: state.Invalid(TX_MISSING_INPUTS, "bad-txns-inputs-missingorspent").
+bip22_result(missing_inputs)            -> <<"bad-txns-inputs-missingorspent">>;
+%% CheckTransaction (consensus/tx_check.cpp) failures surface from
+%% beamchain_validation:check_block wrapped as {bad_tx, Atom}.  These fire at
+%% the CheckTransaction stage BEFORE any script verification, so they must map
+%% to Core's canonical tx_check tokens rather than falling through to the
+%% generic {bad_tx, _} -> block-script-verify-flag-failed catch-all below.
+%%   tx_check.cpp:15 vout empty  -> bad-txns-vout-empty  (also the coinbase case)
+%%   tx_check.cpp:13 vin  empty  -> bad-txns-vin-empty
+%%   tx_check.cpp:44 dup vin     -> bad-txns-inputs-duplicate
+bip22_result({bad_tx, no_outputs})      -> <<"bad-txns-vout-empty">>;
+bip22_result({bad_tx, no_inputs})       -> <<"bad-txns-vin-empty">>;
+bip22_result({bad_tx, duplicate_inputs}) -> <<"bad-txns-inputs-duplicate">>;
 bip22_result(time_too_old)              -> <<"time-too-old">>;
 bip22_result(time_too_new)              -> <<"time-too-new">>;
 bip22_result(time_timewarp_attack)      -> <<"time-timewarp-attack">>;
-bip22_result(duplicate_inputs)          -> <<"bad-txns-duplicate">>;
+%% Duplicate prevout within a single tx.  consensus/tx_check.cpp:44
+%% CheckTransaction: state.Invalid(TX_CONSENSUS, "bad-txns-inputs-duplicate").
+%% (Core's token is bad-txns-inputs-duplicate, NOT bad-txns-duplicate; the
+%% {bad_tx, duplicate_inputs} wrapped form above is the usual block-path
+%% producer, but pin the bare atom to the same canonical token.)
+bip22_result(duplicate_inputs)          -> <<"bad-txns-inputs-duplicate">>;
 %% Negative output value: check_transaction fires negative_output when value < 0.
 %% The validate_block path wraps it as {bad_tx, negative_output}.
 %% decode_tx_out now uses signed-little so the guard fires at CheckTransaction
@@ -7272,6 +7304,17 @@ bip22_result(duplicate)                 -> <<"duplicate">>;
 %% rpc/mining.cpp::submitblock, this is success-with-no-tip-flip.
 bip22_result(inconclusive)              -> <<"inconclusive">>;
 bip22_result(_)                         -> <<"rejected">>.
+
+%% Format a block nVersion as Core's "bad-version(0x%08x)" reason string.
+%% nVersion is a signed int32 on the wire (beamchain decodes it
+%% little-signed); Core's strprintf("%08x", nVersion) reinterprets it as
+%% unsigned and zero-pads to 8 lowercase hex digits.  Mask to 32 bits to
+%% turn any negative value into its two's-complement unsigned form
+%% (-1 -> 16#ffffffff, -2147483648 -> 16#80000000).
+-spec format_bad_version(integer()) -> binary().
+format_bad_version(V) ->
+    U = V band 16#FFFFFFFF,
+    iolist_to_binary(io_lib:format("bad-version(0x~8.16.0b)", [U])).
 
 rpc_submitblock([HexData]) when is_binary(HexData) ->
     %% NetworkDisable gate: refuse submissions while a `dumptxoutset
