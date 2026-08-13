@@ -1049,7 +1049,9 @@ bip22_result_bad_diffbits_test() ->
 
 bip22_result_bad_txnmrklroot_test() ->
     ?assertEqual(<<"bad-txnmrklroot">>, beamchain_rpc:bip22_result(bad_merkle_root)),
-    ?assertEqual(<<"bad-txnmrklroot">>, beamchain_rpc:bip22_result(mutated_merkle)).
+    %% CVE-2012-2459 mutated merkle: Core validation.cpp:3853 CheckBlock
+    %% rejects with "bad-txns-duplicate"; bad-txnmrklroot is root-mismatch only.
+    ?assertEqual(<<"bad-txns-duplicate">>, beamchain_rpc:bip22_result(mutated_merkle)).
 
 bip22_result_bad_witness_test() ->
     ?assertEqual(<<"bad-witness-merkle-match">>, beamchain_rpc:bip22_result(bad_witness_commitment)),

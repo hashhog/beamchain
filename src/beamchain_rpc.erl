@@ -7188,7 +7188,13 @@ rpc_getblocktemplate(_) ->
 bip22_result(high_hash)                  -> <<"high-hash">>;
 bip22_result(bad_diffbits)               -> <<"bad-diffbits">>;
 bip22_result(bad_merkle_root)            -> <<"bad-txnmrklroot">>;
-bip22_result(mutated_merkle)             -> <<"bad-txnmrklroot">>;
+%% CVE-2012-2459 mutated merkle (aligned duplicate subtree).  Core
+%% validation.cpp:3853 CheckBlock: if (mutated) state.Invalid(BLOCK_MUTATED,
+%% "bad-txns-duplicate", "duplicate transaction") — NOT bad-txnmrklroot,
+%% which Core reserves for a plain root mismatch (hashMerkleRoot != computed).
+%% (corpus: _cve-histbug-2026-07-07/cve-2012-2459-merkle-dup reject-leaf-dup,
+%% reject-subtree-dup; submitblock-sidebranch/cve-2012-2459-dup.)
+bip22_result(mutated_merkle)             -> <<"bad-txns-duplicate">>;
 %% Duplicate non-coinbase txid: Core emits bad-txns-inputs-missingorspent
 %% from ConnectBlock when the second instance tries to spend an already-spent
 %% prevout.  Our pre-check fires before the merkle root check to emit the

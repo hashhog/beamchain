@@ -321,7 +321,9 @@ g23_bip22_result_canonical_strings_test() ->
                  beamchain_rpc:bip22_result(bad_diffbits)),
     ?assertEqual(<<"bad-txnmrklroot">>,
                  beamchain_rpc:bip22_result(bad_merkle_root)),
-    ?assertEqual(<<"bad-txnmrklroot">>,
+    %% CVE-2012-2459 mutated merkle: Core validation.cpp:3853 rejects with
+    %% "bad-txns-duplicate", not bad-txnmrklroot (root-mismatch only).
+    ?assertEqual(<<"bad-txns-duplicate">>,
                  beamchain_rpc:bip22_result(mutated_merkle)),
     ?assertEqual(<<"bad-cb-amount">>,
                  beamchain_rpc:bip22_result(bad_cb_amount)),
