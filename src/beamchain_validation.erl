@@ -258,29 +258,36 @@ check_block(#block{header = Header, transactions = Txs}, Params, CheckPow, Check
             end
         end, Txs),
 
-        %% 5b. Explicit duplicate-txid pre-check (Core BIP-22 parity).
+        %% 5b. Merkle tree malleation (CVE-2012-2459) — checked FIRST.
+        %% Core computes BlockMerkleRoot with the mutated out-param and
+        %% rejects mutated blocks with "bad-txns-duplicate" (validation.cpp
+        %% :3853) BEFORE the root comparison and before any per-tx or
+        %% connect-stage check, so an ALIGNED duplicate subtree must surface
+        %% as mutated_merkle, not dup_txid / bad_merkle_root.
+        %% (corpus: _cve-histbug-2026-07-07/cve-2012-2459-merkle-dup
+        %% reject-leaf-dup + reject-subtree-dup.)
+        TxHashes = [beamchain_serialize:tx_hash(Tx) || Tx <- Txs],
+        check_merkle_malleation(TxHashes),
+
+        %% 5c. Explicit duplicate-txid pre-check (Core BIP-22 parity).
         %% Iterate non-coinbase transactions and accumulate txids into a set.
         %% If any non-coinbase txid appears more than once, reject with
-        %% dup_txid before the merkle root check fires.  This ensures the
-        %% BIP-22 reason string maps to "bad-txns-inputs-missingorspent"
-        %% (matching Bitcoin Core's ConnectBlock path) rather than the
-        %% implementation-specific "bad-txnmrklroot" we would otherwise
-        %% emit.  Note: coinbase uniqueness is enforced by BIP-34 / height
-        %% commitment, not here.
+        %% dup_txid before the merkle root check fires.  After the 5b
+        %% malleation check this only catches MISALIGNED duplicates (e.g. the
+        %% 3-leaf [cb, S, S] shape, whose lone trailing leaf Core's mutation
+        %% scan deliberately skips); Core rejects those in ConnectBlock when
+        %% the second instance re-spends the same prevout, so the BIP-22
+        %% reason maps to "bad-txns-inputs-missingorspent" (corpus:
+        %% dup-txid-merkle-malleation, bwmc/B6, cve-2012-2459-merkle-dup
+        %% reject-misaligned-dup).  Note: coinbase uniqueness is enforced by
+        %% BIP-34 / height commitment, not here.
         NonCbTxids = [beamchain_serialize:tx_hash(Tx) || Tx <- RestTxs],
         check_no_dup_txids(NonCbTxids),
 
         %% 6. verify merkle root
-        TxHashes = [beamchain_serialize:tx_hash(Tx) || Tx <- Txs],
         ComputedMerkle = beamchain_serialize:compute_merkle_root(TxHashes),
         ComputedMerkle =:= Header#block_header.merkle_root
             orelse throw(bad_merkle_root),
-
-        %% 7. check for merkle tree malleation (CVE-2012-2459)
-        %% if the last two tx hashes at any level are the same, the
-        %% merkle tree could be mutated. We check for duplicate final
-        %% leaves which is the simplest form of this attack.
-        check_merkle_malleation(TxHashes),
 
         %% 8. size limits (Core CheckBlock, validation.cpp:3947) — the
         %%    NON-WITNESS serialized block size scaled by WITNESS_SCALE_FACTOR
