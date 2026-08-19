@@ -1265,8 +1265,31 @@ validate_and_connect(Height, Block,
             side_branch ->
                 ok;
             _ ->
-                %% 3. Store the block
-                ok = beamchain_db:store_block(Block, Height),
+                %% 3. Block body: ALREADY persisted — do not write it again.
+                %%
+                %% direct_atomic_connect_writes puts {BlocksCF, Hash, BlockBin}
+                %% in the same WriteBatch as the block index and reverse index
+                %% (beamchain_db.erl:645), and sets ?BLOCK_HAVE_DATA on the
+                %% entry. store_block/2 does exactly one thing —
+                %% rocksdb:put(cf_blocks, Hash, BlockBin) (beamchain_db.erl:889)
+                %% — so calling it here re-serialised the WHOLE block via
+                %% encode_block, recomputed block_hash, and pushed identical
+                %% bytes to an identical key through a synchronous
+                %% gen_server:call round-trip on the single beamchain_db
+                %% process. Once per block, for nothing.
+                %%
+                %% Safe for every outcome reaching this branch: side_branch is
+                %% handled above (submit_block persists it via
+                %% persist_side_branch_block), and both `active` and `reorg`
+                %% funnel through do_connect_block -> do_connect_block_inner,
+                %% whose single direct_atomic_connect_writes call is the ONLY
+                %% writer of block bodies on the active path. A block could not
+                %% be active without it — find_best_valid_chain filters on
+                %% ?BLOCK_HAVE_DATA, which that write is what sets.
+                %%
+                %% This is the same removal already made for the tx-index pass
+                %% in step 4 below, for the same reason: that duplicate
+                %% saturated the db mailbox and wedged block_sync at h491872.
 
                 %% 4. Tx index entries are already persisted atomically by
                 %% connect_block (direct_atomic_connect_writes) in the SAME

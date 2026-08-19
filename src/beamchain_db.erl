@@ -655,9 +655,31 @@ direct_atomic_connect_writes(Block, Height, Chainwork, BlockHash, Status) ->
     RevKey = <<"blkidx:", BlockHash/binary>>,
     RevOp = {put, MetaCF, RevKey, HeightKey},
 
-    %% 4. Tx index entries
-    TxOps = build_tx_index_ops(Block#block.transactions, BlockHash,
-                                Height, 0, TxCF, []),
+    %% 4. Tx index entries — only when txindex is actually enabled.
+    %%
+    %% This was unconditional, so every block paid build_tx_index_ops for every
+    %% transaction, and that computes beamchain_serialize:tx_hash(Tx) — a FULL
+    %% re-serialize plus double-SHA256 per tx — purely to key an index the
+    %% operator may not have asked for. Core gates the equivalent on -txindex
+    %% and defaults it OFF.
+    %%
+    %% The knob already existed (beamchain_config:txindex_enabled/0) and the
+    %% READERS already honour it (beamchain_rpc.erl:2566/3381,
+    %% beamchain_rest.erl:807 all refuse when disabled) — only the writers
+    %% ignored it. So setting txindex=0 previously bought nothing: you lost the
+    %% queries and still paid for every write.
+    %%
+    %% The default is deliberately left at TRUE rather than flipped to match
+    %% Core. Flipping it would silently stop indexing on datadirs that already
+    %% hold a populated index, leaving it PARTIAL — old txids resolve, recent
+    %% ones do not — a worse failure than either consistent state. Operators
+    %% who want the IBD saving set BEAMCHAIN_TXINDEX=0 explicitly; the genesis
+    %% rigs do, since nothing queries a rig by txid.
+    TxOps = case beamchain_config:txindex_enabled() of
+                true  -> build_tx_index_ops(Block#block.transactions, BlockHash,
+                                            Height, 0, TxCF, []);
+                false -> []
+            end,
 
     %% 5. Cumulative tx count (Core's CBlockIndex::m_chain_tx_count, chain.h:129):
     %% the total number of transactions from genesis up to and including this
@@ -1117,9 +1139,31 @@ handle_call({atomic_connect_writes, Block, Height, Chainwork, BlockHash, Status}
     RevKey = <<"blkidx:", BlockHash/binary>>,
     RevOp = {put, MetaCF, RevKey, HeightKey},
 
-    %% 4. Tx index entries
-    TxOps = build_tx_index_ops(Block#block.transactions, BlockHash,
-                                Height, 0, TxCF, []),
+    %% 4. Tx index entries — only when txindex is actually enabled.
+    %%
+    %% This was unconditional, so every block paid build_tx_index_ops for every
+    %% transaction, and that computes beamchain_serialize:tx_hash(Tx) — a FULL
+    %% re-serialize plus double-SHA256 per tx — purely to key an index the
+    %% operator may not have asked for. Core gates the equivalent on -txindex
+    %% and defaults it OFF.
+    %%
+    %% The knob already existed (beamchain_config:txindex_enabled/0) and the
+    %% READERS already honour it (beamchain_rpc.erl:2566/3381,
+    %% beamchain_rest.erl:807 all refuse when disabled) — only the writers
+    %% ignored it. So setting txindex=0 previously bought nothing: you lost the
+    %% queries and still paid for every write.
+    %%
+    %% The default is deliberately left at TRUE rather than flipped to match
+    %% Core. Flipping it would silently stop indexing on datadirs that already
+    %% hold a populated index, leaving it PARTIAL — old txids resolve, recent
+    %% ones do not — a worse failure than either consistent state. Operators
+    %% who want the IBD saving set BEAMCHAIN_TXINDEX=0 explicitly; the genesis
+    %% rigs do, since nothing queries a rig by txid.
+    TxOps = case beamchain_config:txindex_enabled() of
+                true  -> build_tx_index_ops(Block#block.transactions, BlockHash,
+                                            Height, 0, TxCF, []);
+                false -> []
+            end,
 
     AllOps = [BlockOp, IdxOp, RevOp | TxOps],
     Result = rocksdb:write(Db, AllOps, []),
