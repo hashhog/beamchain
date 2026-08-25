@@ -363,10 +363,29 @@ init([]) ->
     %% workers, not how long one call may run (-rpcservertimeout defaults to
     %% 30s only for the *client* side, bitcoin-cli). One hour is the same
     %% bound blockbrew adopted for its dumptxoutset write timeout.
+    %% THREE timers, not two. Cowboy 2.12 kills a connection on whichever
+    %% fires first, and the third is the one that actually bit:
+    %%   idle_timeout       (default 60_000)  — no data received
+    %%   request_timeout    (default  5_000)  — no request line yet
+    %%   inactivity_timeout (default 300_000) — cowboy_http.erl:217, the
+    %%                                          connection process receives NO
+    %%                                          message at all for 5 minutes
+    %%
+    %% A long RPC handler trips all three: the request is fully received and the
+    %% client is just waiting, so nothing arrives on the socket and nothing is
+    %% sent. gettxoutsetinfo/dumptxoutset walk ~166M coins here (no
+    %% --coinstatsindex on this node) and take longer than five minutes.
+    %%
+    %% Raising only the first two moved the wall from 60s to EXACTLY 300s and
+    %% no further — three capture attempts died at 300s to the second, and
+    %% hash_type=none died there too, which ruled out the hashing and pointed
+    %% at the transport. Setting all three is the fix; leaving any one at its
+    %% default just relocates the ceiling.
     ProtoOpts = #{
         env => #{dispatch => Dispatch},
         idle_timeout => 3600000,
-        request_timeout => 3600000
+        request_timeout => 3600000,
+        inactivity_timeout => 3600000
     },
     %% W119 FIX-64: optional HTTPS/TLS termination. When BOTH
     %% rpc_tls_cert and rpc_tls_key are set (via --rpc-tls-cert /
