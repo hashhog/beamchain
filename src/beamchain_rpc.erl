@@ -346,7 +346,28 @@ init([]) ->
             {"/health", beamchain_rpc, [health]}
         ]}
     ]),
-    ProtoOpts = #{env => #{dispatch => Dispatch}},
+    %% idle_timeout / request_timeout: Cowboy's defaults are 60_000ms each.
+    %% They are wall-clock limits on a connection with no incoming data, and a
+    %% long-running RPC handler looks exactly like that — the request is fully
+    %% received and the client is simply waiting. So Cowboy closed the
+    %% connection at 60s and killed the handler with it.
+    %%
+    %% That silently capped every long RPC. gettxoutsetinfo and dumptxoutset
+    %% walk the whole UTXO set (~166M coins at mainnet scale, and this node
+    %% runs WITHOUT --coinstatsindex, so there is no per-height shortcut) and
+    %% cannot finish in 60s. It blocked the from-genesis UTXO-commitment
+    %% capture at the pinned anchor height for as long as the rig has been
+    %% frozen there.
+    %%
+    %% Core has no equivalent cap: its HTTP server bounds the number of
+    %% workers, not how long one call may run (-rpcservertimeout defaults to
+    %% 30s only for the *client* side, bitcoin-cli). One hour is the same
+    %% bound blockbrew adopted for its dumptxoutset write timeout.
+    ProtoOpts = #{
+        env => #{dispatch => Dispatch},
+        idle_timeout => 3600000,
+        request_timeout => 3600000
+    },
     %% W119 FIX-64: optional HTTPS/TLS termination. When BOTH
     %% rpc_tls_cert and rpc_tls_key are set (via --rpc-tls-cert /
     %% --rpc-tls-key or rpctlscert= / rpctlskey= in beamchain.conf),
