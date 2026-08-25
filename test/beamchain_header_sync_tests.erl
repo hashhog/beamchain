@@ -451,3 +451,48 @@ hex_to_bin([H1, H2 | Rest], Acc) ->
 hex_val(C) when C >= $0, C =< $9 -> C - $0;
 hex_val(C) when C >= $a, C =< $f -> C - $a + 10;
 hex_val(C) when C >= $A, C =< $F -> C - $A + 10.
+
+%%% ===================================================================
+%%% Chain selection is by WORK, never by LENGTH (#45)
+%%%
+%%% Core's CBlockIndexWorkComparator (validation.cpp:3114-3123) orders
+%%% candidates by nChainWork and breaks ties on nSequenceId — never on height
+%%% or block count. Bitcoin abandoned length-based selection in 2010.
+%%%
+%%% check_reorg used to accept a fork that was merely LONGER, provided the fork
+%%% point was within 10 blocks of the tip. That arm alone — no header drift, no
+%%% other precondition — let a 6-header fork carrying 95.05% of the tip's work
+%%% evict five VALIDATED blocks, and the eviction is permanent: the caller runs
+%%% mark_orphaned_blocks (FAILED_VALID, HAVE_DATA cleared) before the fork's
+%%% headers are even validated.
+%%% ===================================================================
+
+%% A strictly heavier chain wins. This is the whole rule.
+reorg_accepts_strictly_more_work_test() ->
+    ?assert(beamchain_header_sync:incoming_chain_wins(1001, 1000)).
+
+%% Equal work does NOT reorg: Core requires strictly greater, so a tie leaves
+%% the incumbent tip in place rather than thrashing between equal chains.
+reorg_rejects_equal_work_test() ->
+    ?assertNot(beamchain_header_sync:incoming_chain_wins(1000, 1000)).
+
+%% A lighter chain never wins, however long it is.
+reorg_rejects_less_work_test() ->
+    ?assertNot(beamchain_header_sync:incoming_chain_wins(999, 1000)).
+
+%% THE REGRESSION, with the receipt's measured numbers: a 6-header fork rooted
+%% within 10 blocks of the tip, carrying 95.05% of the tip's work. Under the
+%% old length arm this evicted five validated blocks. It must now lose.
+reorg_rejects_longer_but_lighter_fork_test() ->
+    TipCW = 100000000,
+    IncomingCW = 95050000,          %% 95.05% of tip work
+    ?assertNot(beamchain_header_sync:incoming_chain_wins(IncomingCW, TipCW)).
+
+%% Length is not an input at all — the predicate cannot see it. A fork twice as
+%% long but a hair lighter still loses.
+reorg_length_is_not_a_tiebreaker_test() ->
+    ?assertNot(beamchain_header_sync:incoming_chain_wins(99999999, 100000000)).
+
+%% Genesis-adjacent sanity: zero work never displaces a real chain.
+reorg_rejects_zero_work_test() ->
+    ?assertNot(beamchain_header_sync:incoming_chain_wins(0, 1)).

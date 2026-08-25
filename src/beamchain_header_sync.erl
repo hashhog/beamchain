@@ -36,7 +36,8 @@
 
 %% Test-only exports: pure internal decision functions.
 -ifdef(TEST).
--export([classify_deep_fork/4,
+-export([incoming_chain_wins/2,
+         classify_deep_fork/4,
          select_next_probe_peer/2]).
 -endif.
 
@@ -699,12 +700,9 @@ check_reorg(FirstHeader, Headers, #state{tip_height = TipHeight,
             ForkCWInt = binary:decode_unsigned(ForkCW, big),
             IncomingCWInt = ForkCWInt + NewWork,
             TipCWInt = binary:decode_unsigned(TipCW, big),
-            case IncomingCWInt > TipCWInt orelse
-                 (length(Headers) + ForkHeight > TipHeight andalso
-                  ForkHeight >= TipHeight - 10) of
+            case incoming_chain_wins(IncomingCWInt, TipCWInt) of
                 true ->
-                    %% More work (or a shallow fork where the peer
-                    %% likely has more headers to send). Accept reorg.
+                    %% Strictly more work. Accept reorg.
                     logger:info("header_sync: fork at height ~B "
                                 "(depth ~B), incoming work ~B vs tip ~B",
                                 [ForkHeight,
@@ -726,6 +724,38 @@ check_reorg(FirstHeader, Headers, #state{tip_height = TipHeight,
             %% prev_hash not in our index at all
             no_reorg
     end.
+
+%% Chain selection is by CHAINWORK ALONE.
+%%
+%% Core: CBlockIndexWorkComparator (validation.cpp:3114-3123) orders candidates
+%% by nChainWork and breaks ties on nSequenceId — never on height or block
+%% count. Bitcoin abandoned length-based selection in 2010.
+%%
+%% This predicate used to carry a second arm that accepted a fork which was
+%% merely LONGER IN BLOCK COUNT, provided the fork point sat within 10 blocks
+%% of the tip:
+%%
+%%     IncomingCW > TipCW orelse
+%%       (length(Headers) + ForkHeight > TipHeight andalso
+%%        ForkHeight >= TipHeight - 10)
+%%
+%% Measured against a real gen_server with no source modification, that arm
+%% ALONE — no header drift, no other precondition — let a 6-header fork
+%% carrying 95.05% of the tip's work evict five validated blocks
+%% (receipts/beamchain-length-based-reorg-2026-08-23.md). The eviction is not
+%% recoverable: the caller runs mark_orphaned_blocks BEFORE the fork's headers
+%% are validated, writing FAILED_VALID with HAVE_DATA cleared, so
+%% find_best_valid_chain permanently excludes the heavier chain.
+%%
+%% The arm existed for a real reason: a peer may still have more headers to
+%% send, so a partial batch can understate a fork's true work. But that case
+%% already has a NON-DESTRUCTIVE path — returning no_reorg falls through to
+%% handle_unconnecting_headers, which sends another getheaders (bounded by
+%% MAX_UNCONNECTING_HEADERS before the peer is dropped). Waiting for the
+%% evidence costs a round trip; guessing costs the chain.
+-spec incoming_chain_wins(non_neg_integer(), non_neg_integer()) -> boolean().
+incoming_chain_wins(IncomingCW, TipCW) ->
+    IncomingCW > TipCW.
 
 %% Mark blocks from StartHeight to EndHeight as orphaned (failed valid).
 mark_orphaned_blocks(StartHeight, EndHeight) when StartHeight > EndHeight ->
