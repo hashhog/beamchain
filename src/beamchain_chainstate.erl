@@ -450,16 +450,25 @@ load_snapshot(Path) ->
 %% (validation.cpp:5901-5914 + kernel/coinstats.cpp:161). Used for snapshot
 %% integrity checks after background validation and as the `txoutset_hash`
 %% field in dumptxoutset.
+%% TIMEOUT: these three walk the ENTIRE UTXO set. At mainnet scale that is
+%% ~166M coins and takes well over five minutes, so the previous 300_000ms
+%% (5 min) gen_server:call timeout silently killed them — the caller got a
+%% {timeout, ...} exit and the RPC returned nothing at all. It was the SECOND
+%% cap in series on this path: raising Cowboy's 60s idle_timeout (2026-08-24)
+%% only moved the wall from 60s to exactly 300s, which is how this one was
+%% found. One hour matches the Cowboy bound so no layer caps below another.
+%% NOT changed for connect_block/submit_block/invalidate_block: those SHOULD
+%% stay bounded, since a stuck write path is a bug rather than a long scan.
 -spec compute_utxo_hash() -> binary().
 compute_utxo_hash() ->
-    gen_server:call(?SERVER, compute_utxo_hash, 300000).
+    gen_server:call(?SERVER, compute_utxo_hash, 3600000).
 
 %% @doc Compute the MuHash3072 finalize digest over the current UTXO set.
 %% Surfaced by `gettxoutsetinfo hash_type=muhash`. NOT used by the
 %% loadtxoutset strict-content-hash gate — that one is HASH_SERIALIZED.
 -spec compute_utxo_muhash() -> binary().
 compute_utxo_muhash() ->
-    gen_server:call(?SERVER, compute_utxo_muhash, 300000).
+    gen_server:call(?SERVER, compute_utxo_muhash, 3600000).
 
 %% @doc Scan the entire UTXO set for outputs whose scriptPubKey is a member
 %% of ScriptSet (a sets:set/0 of raw scriptPubKey binaries). Returns the
@@ -471,7 +480,7 @@ compute_utxo_muhash() ->
 %% have not yet been flushed to RocksDB are still found.
 -spec scan_utxos(sets:set(binary())) -> [{binary(), non_neg_integer(), #utxo{}}].
 scan_utxos(ScriptSet) ->
-    gen_server:call(?SERVER, {scan_utxos, ScriptSet}, 300000).
+    gen_server:call(?SERVER, {scan_utxos, ScriptSet}, 3600000).
 
 %% @doc Check if this chainstate was loaded from a snapshot.
 -spec is_snapshot_chainstate() -> boolean().
