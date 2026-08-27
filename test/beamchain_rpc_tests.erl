@@ -981,8 +981,12 @@ dumptxoutset_resolve_rollback_no_snapshot_below_tip_test() ->
 
 assumeutxo_heights_mainnet_test() ->
     Heights = beamchain_chain_params:list_assumeutxo_heights(mainnet),
-    %% 4 mainnet snapshot heights baked in (840k, 880k, 910k, 935k).
-    ?assertEqual([840000, 880000, 910000, 935000], Heights).
+    %% 6 mainnet snapshot heights: 840k is Core's shipped entry
+    %% (kernel/chainparams.cpp); 880k/910k/935k are earlier project
+    %% waypoints; 481823 (pre-segwit boundary, Core dumptxoutset
+    %% rollback) and 944183 (R4-era base) are provenance-documented
+    %% project pins — see the comments in beamchain_chain_params.
+    ?assertEqual([481823, 840000, 880000, 910000, 935000, 944183], Heights).
 
 assumeutxo_heights_testnet4_test() ->
     Heights = beamchain_chain_params:list_assumeutxo_heights(testnet4),
@@ -1098,7 +1102,10 @@ bip22_result_mandatory_script_test() ->
 bip22_result_catchall_test() ->
     ?assertEqual(<<"rejected">>, beamchain_rpc:bip22_result(unknown_error)),
     ?assertEqual(<<"rejected">>, beamchain_rpc:bip22_result(bad_prevblk)),
-    ?assertEqual(<<"rejected">>, beamchain_rpc:bip22_result(no_transactions)).
+    %% no_transactions is no longer a catchall: an empty block fails Core's
+    %% size limits (validation.cpp CheckBlock -> "bad-blk-length"), and the
+    %% R2 token map now returns the specific token.
+    ?assertEqual(<<"bad-blk-length">>, beamchain_rpc:bip22_result(no_transactions)).
 
 %% inconclusive: side-branch acceptance per BIP-22 + Core
 %% rpc/mining.cpp::submitblock — block stored but not on the active

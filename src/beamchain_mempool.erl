@@ -611,9 +611,17 @@ get_prioritised_transactions() ->
 %% read — safe from any process. Core: ApplyDelta lookup (txmempool.cpp:657).
 -spec get_fee_delta(binary()) -> integer().
 get_fee_delta(Txid) ->
-    case ets:lookup(?MEMPOOL_DELTAS, Txid) of
-        [{Txid, Delta}] -> Delta;
-        [] -> 0
+    %% Tolerate a missing table: the deltas ets is created by the mempool
+    %% gen_server; callers that run before it (or direct-call test drivers)
+    %% semantically have "no delta set" = 0.  A badarg here crashed every
+    %% fee-sorted read on the bare-ets path (eunit triage 2026-08-27).
+    case ets:info(?MEMPOOL_DELTAS) of
+        undefined -> 0;
+        _ ->
+            case ets:lookup(?MEMPOOL_DELTAS, Txid) of
+                [{Txid, Delta}] -> Delta;
+                [] -> 0
+            end
     end.
 
 %% @doc All `{Txid, Delta}` pairs in mapDeltas (used by the persist module's

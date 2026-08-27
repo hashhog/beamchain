@@ -382,7 +382,7 @@ filter_index_persistence_test_() ->
           fun() ->
             BHHex = beamchain_serialize:hex_encode(
                 reverse_bytes(<<1:256/big>>)),
-            ?assertMatch({error, -8, _},
+            ?assertMatch({error, -5, _},
                 beamchain_rpc:rpc_getblockfilter([BHHex, <<"extended">>]))
           end},
 

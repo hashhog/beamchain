@@ -40,7 +40,7 @@ snapshot_test_() ->
            fun test_tx_out_ser_format/0},
           {"assumeutxo params lookup by height", fun test_assumeutxo_by_height/0},
           {"assumeutxo params lookup by hash", fun test_assumeutxo_by_hash/0},
-          {"mainnet has all 4 assumeutxo entries from Core",
+          {"mainnet assumeutxo table: Core entry + provenance-documented project pins",
            fun test_mainnet_four_entries/0},
           {"loadtxoutset refuses heights not in m_assumeutxo_data (Core-strict)",
            fun test_validate_snapshot_height_strict/0},
@@ -478,7 +478,10 @@ test_assumeutxo_by_hash() ->
 %% will fail and force a sync.
 test_mainnet_four_entries() ->
     #{assumeutxo := M} = beamchain_chain_params:params(mainnet),
-    Expected = [840000, 880000, 910000, 935000],
+    %% 840000 = Core's shipped entry; the rest are provenance-documented
+    %% project pins (see beamchain_chain_params comments; 481823 + 944183
+    %% added for the boundary-snapshot / R4 waypoints).
+    Expected = [481823, 840000, 880000, 910000, 935000, 944183],
     ?assertEqual(Expected, lists:sort(maps:keys(M))),
     %% Spot-check the 840000 utxo_hash matches Core (display-order hex
     %% from kernel/chainparams.cpp:161, stored internally reversed).

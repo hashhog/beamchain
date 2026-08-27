@@ -3176,7 +3176,7 @@ w85_bad_version_bip34_test() ->
                            bits = 16#207fffff, nonce = 0},
     Params = (make_w85_regtest_params())#{bip34_height => 1, bip66_height => 999999,
                                           bip65_height => 999999},
-    ?assertEqual({error, bad_version},
+    ?assertMatch({error, {bad_version, _}},
         beamchain_validation:contextual_check_block_header(Header, PrevIndex, Params)).
 
 %% Gate 5: bad-version — BIP66: version < 3 after bip66_height.
@@ -3190,7 +3190,7 @@ w85_bad_version_bip66_test() ->
                            bits = 16#207fffff, nonce = 0},
     Params = (make_w85_regtest_params())#{bip34_height => 1, bip66_height => 1,
                                           bip65_height => 999999},
-    ?assertEqual({error, bad_version},
+    ?assertMatch({error, {bad_version, _}},
         beamchain_validation:contextual_check_block_header(Header, PrevIndex, Params)).
 
 %% Gate 5: bad-version — BIP65: version < 4 after bip65_height.
@@ -3204,7 +3204,7 @@ w85_bad_version_bip65_test() ->
                            bits = 16#207fffff, nonce = 0},
     Params = (make_w85_regtest_params())#{bip34_height => 1, bip66_height => 1,
                                           bip65_height => 1},
-    ?assertEqual({error, bad_version},
+    ?assertMatch({error, {bad_version, _}},
         beamchain_validation:contextual_check_block_header(Header, PrevIndex, Params)).
 
 %% Gate 5: version = 4 satisfies all BIP34/66/65 version gates.
@@ -3247,7 +3247,7 @@ w85_nversion_high_bit_false_accept_test() ->
     Params = (make_w85_regtest_params())#{bip34_height => 1, bip66_height => 1,
                                           bip65_height => 1},
     %% Post-fix: signed version < 4 → bad_version
-    ?assertEqual({error, bad_version},
+    ?assertMatch({error, {bad_version, _}},
         beamchain_validation:contextual_check_block_header(Header, PrevIndex, Params)).
 
 %% Version checks do not fire before activation height.

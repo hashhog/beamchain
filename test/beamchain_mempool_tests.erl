@@ -2018,7 +2018,7 @@ check_standard_64byte_nonwitness_rejected_test() ->
     Tx64 = make_tx([{<<1:256>>, 0}], [{0, Script64}]),
     NonWit64 = beamchain_serialize:encode_transaction(Tx64, no_witness),
     ?assertEqual(64, byte_size(NonWit64)),
-    ?assertThrow(tx_size, beamchain_mempool:check_standard(Tx64)).
+    ?assertThrow(tx_size_small, beamchain_mempool:check_standard(Tx64)).
 
 %% check_standard/1 — a 65-byte non-witness tx passes the size gate
 check_standard_65byte_nonwitness_accepted_test() ->
