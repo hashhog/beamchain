@@ -499,6 +499,17 @@ connecting(info, {tcp_error, _, Reason}, Data) ->
 connecting(cast, disconnect, _Data) ->
     {stop, normal};
 
+connecting(cast, {send, Command, _Payload}, _Data) ->
+    %% #74 (2026-08-27): the catch-all below used to EAT send casts to a
+    %% peer that had not finished connecting — getdata/getheaders vanished
+    %% with no log while caller-side trackers assumed them sent (the
+    %% request_ping doc at :261 admitted the drop; the same clause ate
+    %% request commands identically). Postpone: gen_statem replays
+    %% postponed events on the next state transition, so the send fires
+    %% the moment the peer is ready.
+    logger:info("peer: postponing ~p send until handshake completes", [Command]),
+    {keep_state_and_data, [postpone]};
+
 connecting(_EventType, _Event, _Data) ->
     keep_state_and_data.
 
@@ -569,6 +580,12 @@ handshaking(cast, {misbehavior, Score}, Data) ->
 
 handshaking({call, From}, info, Data) ->
     {keep_state_and_data, [{reply, From, {ok, build_info(Data)}}]};
+
+handshaking(cast, {send, Command, _Payload}, _Data) ->
+    %% #74: same as connecting/3 — postpone pre-ready sends instead of
+    %% silently eating them.
+    logger:info("peer: postponing ~p send until handshake completes", [Command]),
+    {keep_state_and_data, [postpone]};
 
 handshaking(_EventType, _Event, _Data) ->
     keep_state_and_data.
@@ -1863,6 +1880,13 @@ do_send_msg(Command, PayloadData, Data) ->
 %% `handshaking(info, {tcp_closed, _})` clause.  Net effect: behaviourally
 %% equivalent to the prior silent-failure code, but cipher state stays
 %% consistent with what's actually on the wire.
+%% #74: a failed send of a REQUEST command strands caller-side tracking
+%% (getdata/getheaders/getblocktxn) — those deserve warning, not debug.
+send_fail_log_level(getdata) -> warning;
+send_fail_log_level(getheaders) -> warning;
+send_fail_log_level(getblocktxn) -> warning;
+send_fail_log_level(_) -> debug.
+
 do_send_raw(Command, Payload, #peer_data{v2_phase = ready,
                                           v2_cipher = Cipher,
                                           socket = Socket} = Data)
@@ -1878,9 +1902,10 @@ do_send_raw(Command, Payload, #peer_data{v2_phase = ready,
                 last_send  = erlang:system_time(millisecond)
             };
         {error, Reason} ->
-            logger:debug("peer ~p v2 send ~p failed: ~p — leaving cipher "
-                         "untouched; closing on next tcp_closed",
-                         [Data#peer_data.address, Command, Reason]),
+            logger:log(send_fail_log_level(Command),
+                       "peer ~p v2 send ~p failed: ~p — leaving cipher "
+                       "untouched; closing on next tcp_closed",
+                       [Data#peer_data.address, Command, Reason]),
             Data
     end;
 do_send_raw(Command, Payload, #peer_data{socket = Socket, magic = Magic} = Data) ->
@@ -1892,8 +1917,9 @@ do_send_raw(Command, Payload, #peer_data{socket = Socket, magic = Magic} = Data)
                 last_send  = erlang:system_time(millisecond)
             };
         {error, Reason} ->
-            logger:debug("peer ~p v1 send ~p failed: ~p",
-                         [Data#peer_data.address, Command, Reason]),
+            logger:log(send_fail_log_level(Command),
+                       "peer ~p v1 send ~p failed: ~p",
+                       [Data#peer_data.address, Command, Reason]),
             Data
     end.
 
