@@ -619,9 +619,36 @@ add_utxo_fresh(Txid, Vout, #utxo{script_pubkey = SPK} = Utxo) ->
             ok;
         false ->
             Key = {Txid, Vout},
+            %% FRESH provenance guard (audit 2026-08-23 unconditional-FRESH
+            %% row; same phantom class as clearbit fb4051b).  FRESH means
+            %% "provably absent from RocksDB, so a spend before the next
+            %% flush may skip the DB delete" (see spend_utxo/2).  The caller
+            %% vouches the OUTPOINT is new to the chain, but the KEY can
+            %% still be DB-resident:
+            %%   - pending delete (?UTXO_SPENT): a reorg disconnected the
+            %%     branch that carried this txid after it was flushed; the
+            %%     old code CANCELLED the delete and marked FRESH, so the
+            %%     next spend skipped the delete and the flushed copy
+            %%     survived in RocksDB forever — a phantom UTXO.
+            %%   - already cached and NOT fresh: a clean (flushed or
+            %%     read-through) entry is being overwritten; same hazard.
+            %% Both checks are O(1) ets lookups; no RocksDB probe needed
+            %% because do_flush clears ?UTXO_FRESH atomically and the
+            %% cache/spent markers carry the provenance.
+            DbResident =
+                ets:member(?UTXO_SPENT, Key) orelse
+                (ets:member(?UTXO_CACHE, Key) andalso
+                 not ets:member(?UTXO_FRESH, Key)),
             ets:insert(?UTXO_CACHE, {Key, detach_spk(Utxo)}),
             ets:insert(?UTXO_DIRTY, {Key}),
-            ets:insert(?UTXO_FRESH, {Key}),
+            case DbResident of
+                true ->
+                    %% Cancel any pending delete: the new dirty value will
+                    %% overwrite the DB copy at flush.  NOT fresh.
+                    ets:delete(?UTXO_FRESH, Key);
+                false ->
+                    ets:insert(?UTXO_FRESH, {Key})
+            end,
             ets:delete(?UTXO_SPENT, Key),
             ok
     end.

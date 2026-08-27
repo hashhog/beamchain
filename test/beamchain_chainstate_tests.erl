@@ -22,6 +22,10 @@ chainstate_test_() ->
           {"cache hit returns cached entry", fun test_cache_hit/0},
           {"cache miss falls through to RocksDB", fun test_cache_miss/0},
           {"FRESH optimization: spend before flush skips DB", fun test_fresh_optimization/0},
+          {"reorg re-add of flushed txid is NOT fresh; no phantom in RocksDB",
+           fun test_fresh_reorg_readd_no_phantom/0},
+          {"truly new outpoint keeps the FRESH optimization",
+           fun test_fresh_truly_new_still_fresh/0},
           {"flush persists dirty entries to RocksDB", fun test_flush_persistence/0},
           {"cache stats reports correct counts", fun test_cache_stats/0},
           %% assumeUTXO tests
@@ -370,6 +374,54 @@ test_fresh_optimization() ->
     ?assertNot(ets:member(beamchain_utxo_spent, {Txid, 0})),
 
     %% UTXO should not be in RocksDB (never written)
+    ?assertEqual(not_found, beamchain_db:get_utxo(Txid, 0)).
+
+test_fresh_reorg_readd_no_phantom() ->
+    %% Audit 2026-08-23 unconditional-FRESH row (phantom-UTXO class; sibling
+    %% of clearbit fb4051b).  Reorg shape: a txid's outputs flushed on branch
+    %% A, branch A disconnected (spend queues the DB delete), branch B
+    %% re-connects the SAME txid via add_utxo_fresh.  Pre-fix add_utxo_fresh
+    %% cancelled the pending delete AND marked the key FRESH, so the next
+    %% spend skipped the DB delete and the branch-A copy survived in RocksDB
+    %% forever.  FAILS AT PARENT at the first utxo_spent assertion below.
+    Txid = <<16#dddd4:256>>,
+    Utxo = #utxo{value = 42000, script_pubkey = <<16#54>>,
+                 is_coinbase = false, height = 40},
+
+    %% Branch A: connect + flush -> DB-resident, FRESH cleared by flush.
+    beamchain_chainstate:add_utxo(Txid, 0, Utxo),
+    beamchain_chainstate:flush(),
+    ?assertMatch({ok, _}, beamchain_db:get_utxo(Txid, 0)),
+    ?assertNot(ets:member(beamchain_utxo_fresh, {Txid, 0})),
+
+    %% Disconnect branch A: spend queues the DB delete.
+    {ok, _} = beamchain_chainstate:spend_utxo(Txid, 0),
+    ?assert(ets:member(beamchain_utxo_spent, {Txid, 0})),
+
+    %% Branch B re-connects the same txid through the fast path.
+    beamchain_chainstate:add_utxo_fresh(Txid, 0, Utxo),
+    %% The key is DB-resident: it must NOT be FRESH.
+    ?assertNot(ets:member(beamchain_utxo_fresh, {Txid, 0})),
+
+    %% Spend on branch B before the next flush: the DB delete must be
+    %% (re-)queued, not skipped.
+    {ok, _} = beamchain_chainstate:spend_utxo(Txid, 0),
+    ?assert(ets:member(beamchain_utxo_spent, {Txid, 0})),
+
+    %% Flush: the branch-A copy is gone from RocksDB — no phantom.
+    beamchain_chainstate:flush(),
+    ?assertEqual(not_found, beamchain_db:get_utxo(Txid, 0)).
+
+test_fresh_truly_new_still_fresh() ->
+    %% Positive control: a genuinely new outpoint keeps the FRESH
+    %% optimization (spend-before-flush touches no DB).
+    Txid = <<16#eeee5:256>>,
+    Utxo = #utxo{value = 1000, script_pubkey = <<16#55>>,
+                 is_coinbase = false, height = 41},
+    beamchain_chainstate:add_utxo_fresh(Txid, 0, Utxo),
+    ?assert(ets:member(beamchain_utxo_fresh, {Txid, 0})),
+    {ok, _} = beamchain_chainstate:spend_utxo(Txid, 0),
+    ?assertNot(ets:member(beamchain_utxo_spent, {Txid, 0})),
     ?assertEqual(not_found, beamchain_db:get_utxo(Txid, 0)).
 
 test_flush_persistence() ->
