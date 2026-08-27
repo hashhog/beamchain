@@ -27,6 +27,7 @@
 -include("beamchain.hrl").
 -include("beamchain_protocol.hrl").
 
+-export([chain_start_locator_entries/3]).
 -export([new/5,
          process_next_headers/3,
          next_headers_request_locator/1,
@@ -655,17 +656,60 @@ finalize(Hss) ->
 maybe_finalize(true, Hss) -> Hss;     %% keep state — more work needed
 maybe_finalize(false, Hss) -> finalize(Hss).
 
-%% Build a block-locator-style entry list for chain_start.
-%% Mirrors Core's LocatorEntries(&m_chain_start) in the locator functions.
-%% We use only the chain_start hash (no DB calls needed — we already have
-%% the hash in the state).  Core builds a full exponential locator from the
-%% chain_start CBlockIndex, but for the anti-DoS pipeline the important
-%% property is that the locator contains the fork point so the peer knows
-%% where to resume.
+%% Build the chain_start locator entries — Core's
+%% LocatorEntries(&m_chain_start) (headerssync.cpp:296-317, chain.cpp:26-43):
+%% chain_start's own hash, then exponentially spaced ancestors resolved
+%% through the persisted height index, terminating at genesis.
+%%
+%% The previous version returned ONLY the chain_start hash — the 2-hash
+%% anti-pattern this fleet has now fixed five times (nimrod 4deead0,
+%% camlcoin PRESYNC unwedge, clearbit 7b97bce, blockbrew 7009b2b, hotbuns
+%% 0e5e25c): if the peer recognizes neither hash in the locator it serves
+%% headers from GENESIS and the sync tears down.  When the height index
+%% has no rows (detached unit-test states), the walk degrades to the bare
+%% chain_start hash — identical to the old behavior.
 -spec chain_start_locator(map()) -> [binary()].
 chain_start_locator(CS) ->
     Hash = maps:get(hash, CS, <<0:256>>),
-    [Hash].
+    Height = maps:get(height, CS, 0),
+    Lookup = fun(H) -> catch beamchain_db:get_block_index(H) end,
+    chain_start_locator_entries(Height, Hash, Lookup).
+
+%% Exported for eunit: the walk with an injectable height->index lookup.
+-spec chain_start_locator_entries(integer(), binary(),
+                                  fun((non_neg_integer()) -> term())) -> [binary()].
+chain_start_locator_entries(Height, Hash, _Lookup) when Height =< 0 ->
+    [Hash];
+chain_start_locator_entries(Height, Hash, Lookup) ->
+    csl_walk(Height, Hash, 1, [], Lookup).
+
+csl_walk(Height, Hash, _Step, Acc, Lookup) when Height =< 0 ->
+    csl_ensure_genesis(lists:reverse([Hash | Acc]), Lookup);
+csl_walk(Height, Hash, Step, Acc, Lookup) ->
+    Acc2 = [Hash | Acc],
+    NextHeight = max(0, Height - Step),
+    Step2 = case length(Acc2) >= 10 of
+        true  -> Step * 2;
+        false -> 1
+    end,
+    case Lookup(NextHeight) of
+        {ok, #{hash := NextHash}} -> csl_walk(NextHeight, NextHash, Step2, Acc2, Lookup);
+        _ -> csl_ensure_genesis(lists:reverse(Acc2), Lookup)
+    end.
+
+%% A locator that does not end at genesis loses its anchor the moment the
+%% peer recognizes none of the walked hashes (holey index truncation —
+%% same defect as beamchain_header_sync's build_locator_hashes not_found
+%% arm, fixed alongside this).
+csl_ensure_genesis(Hashes, Lookup) ->
+    case Lookup(0) of
+        {ok, #{hash := G}} ->
+            case lists:last(Hashes) =:= G of
+                true  -> Hashes;
+                false -> Hashes ++ [G]
+            end;
+        _ -> Hashes
+    end.
 
 %% Suppress unused variable warning for logging helper.
 extra_log(_Hss, _H) -> [].

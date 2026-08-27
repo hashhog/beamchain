@@ -36,6 +36,7 @@
 
 %% Test-only exports: pure internal decision functions.
 -ifdef(TEST).
+-export([build_block_locator/2]).
 -export([incoming_chain_wins/2,
          classify_deep_fork/4,
          select_next_probe_peer/2]).
@@ -511,7 +512,23 @@ build_locator_hashes(Height, Hash, Step, Acc) ->
         {ok, #{hash := NextHash}} ->
             build_locator_hashes(NextHeight, NextHash, Step2, Acc2);
         not_found ->
-            lists:reverse(Acc2)
+            %% Holey height index: do NOT truncate without genesis — a
+            %% locator that loses its genesis anchor becomes unrecognizable
+            %% to peers the moment the walked hashes are stale (#72 row 6,
+            %% 2026-08-27). Same guarantee the Height =< 0 clause provides.
+            append_genesis_terminator(lists:reverse(Acc2))
+    end.
+
+%% Ensure the locator's last entry is the genesis hash when the height
+%% index can resolve it; leave unchanged otherwise.
+append_genesis_terminator(Hashes) ->
+    case beamchain_db:get_block_index(0) of
+        {ok, #{hash := GenesisHash}} ->
+            case lists:last(Hashes) =:= GenesisHash of
+                true  -> Hashes;
+                false -> Hashes ++ [GenesisHash]
+            end;
+        not_found -> Hashes
     end.
 
 %%% ===================================================================
