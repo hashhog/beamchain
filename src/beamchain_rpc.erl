@@ -3779,6 +3779,20 @@ rpc_createrawtransaction([Inputs, Outputs, Locktime, Replaceable0])
             false     -> false;
             _         -> true   %% non-bool passthrough -> Core get_bool default true
         end,
+        %% ...but "absent" and "explicitly true" are NOT interchangeable for the
+        %% contradiction check further down, and that asymmetry is deliberate in
+        %% Core, not an accident.  createrawtransaction builds a
+        %% std::optional<bool> that stays nullopt when params[3].isNull()
+        %% (rawtransaction.cpp:398-401).  AddInputs consumes it as
+        %% rbf.value_or(true), so an ABSENT arg still SELECTS the RBF sequence;
+        %% but ConstructTransaction's closing check is guarded by
+        %% rbf.has_value() && rbf.value(), so an absent arg can never
+        %% CONTRADICT anything -- only an explicitly-supplied `true` can.
+        %% jsx decodes JSON null to the atom `null`, and Core treats an explicit
+        %% null exactly like an omitted arg (isNull() is true for both), so both
+        %% `undefined` and `null` count as ABSENT here.  Nothing above changes:
+        %% DefaultSequence still keys off Replaceable alone.
+        ReplaceableExplicit = (Replaceable0 =:= true orelse Replaceable0 =:= false),
         %% Default nSequence (Core AddInputs three-way, rawtransaction_util.cpp:49-55).
         DefaultSequence =
             if Replaceable        -> 16#FFFFFFFD;  %% MAX_BIP125_RBF_SEQUENCE
@@ -3832,6 +3846,45 @@ rpc_createrawtransaction([Inputs, Outputs, Locktime, Replaceable0])
                     binary_to_list(Address), beamchain_config:network()),
                 #tx_out{value = Satoshis, script_pubkey = Script}
         end, OutputPairs),
+        %% replaceable=true + an all-non-signalling input set is a CONTRADICTION,
+        %% and Core refuses to guess which half the caller meant.  This is the
+        %% last thing ConstructTransaction does before returning the tx
+        %% (rawtransaction_util.cpp, right after AddInputs AND AddOutputs):
+        %%
+        %%   if (rbf.has_value() && rbf.value() && rawTx.vin.size() > 0 &&
+        %%       !SignalsOptInRBF(CTransaction(rawTx)))
+        %%       throw JSONRPCError(RPC_INVALID_PARAMETER,
+        %%           "Invalid parameter combination: Sequence number(s) "
+        %%           "contradict replaceable option");
+        %%
+        %% SignalsOptInRBF (util/rbf.cpp) is true when ANY input carries
+        %% nSequence =< MAX_BIP125_RBF_SEQUENCE (util/rbf.h, 0xfffffffd);
+        %% ONE signalling input is enough, which is BIP-125's multi-party rule
+        %% -- no single co-signer may opt the whole transaction out of
+        %% replacement through their own input.
+        %%
+        %% Placed HERE, after TxOutputs, on purpose: Core evaluates it after
+        %% AddOutputs, so a bad address or amount must still win over this
+        %% error.  Moving it earlier would reorder the two.
+        %%
+        %% Nine of the ten nodes in this repo silently ACCEPT the contradiction
+        %% today.  A caller who explicitly asks for replaceable=true and also
+        %% pins a final sequence gets back a transaction that CANNOT be
+        %% fee-bumped -- no error, no log line.  The node quietly resolves the
+        %% contradiction in favour of the sequence and never says which side it
+        %% took, so the caller only finds out when the fee-bump fails later.
+        Signals = lists:any(fun(#tx_in{sequence = S}) ->
+                                S =< ?MAX_BIP125_RBF_SEQUENCE
+                            end, TxInputs),
+        case ReplaceableExplicit andalso Replaceable
+             andalso TxInputs =/= [] andalso not Signals of
+            true ->
+                throw({invalid_parameter,
+                       <<"Invalid parameter combination: Sequence number(s) "
+                         "contradict replaceable option">>});
+            false ->
+                ok
+        end,
         Tx = #transaction{
             version = 2,
             inputs = TxInputs,
