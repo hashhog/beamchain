@@ -80,7 +80,7 @@
 %% confirms each in-scope handler routes a malformed arg to -8 while a
 %% well-formed 64-zero hash still passes the guard (decodes, no -8 throw).
 -export([parse_hash_v/2,
-         rpc_getblock/1, rpc_getblockheader/1, rpc_getrawtransaction/1,
+         rpc_getblock/1, rpc_getblockheader/1, ntx_from_local_block/1, rpc_getrawtransaction/1,
          rpc_gettxout/1, rpc_getmempoolentry/1]).
 %% Test-only exports — submitpackage helpers (mempool wave 2026-05-06).
 -export([rpc_submitpackage/1, decode_package_tx/1]).
@@ -1860,7 +1860,7 @@ rpc_getblockheader(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"Usage: getblockheader \"hash\" ( verbose )">>}.
 
-rpc_getblockheader_lookup(Hash, HashHex, Verbose) ->
+rpc_getblockheader_lookup(Hash, _HashHex, Verbose) ->
     case beamchain_db:get_block_index_by_hash(Hash) of
         {ok, #{height := Height, header := Header, chainwork := Chainwork, n_tx := RawNTx}} ->
             case Verbose of
@@ -1869,11 +1869,17 @@ rpc_getblockheader_lookup(Hash, HashHex, Verbose) ->
                         beamchain_serialize:encode_block_header(Header)),
                     {ok, Hex};
                 _ ->
-                    %% nTx: stored index may be 0 for header-sync blocks (assume-valid
-                    %% path does not count transactions at header-sync time).
-                    %% Fall back to Bitcoin Core RPC for a ground-truth count.
+                    %% nTx: the stored index may be 0 for header-sync blocks
+                    %% (the assume-valid path does not count transactions at
+                    %% header-sync time).  Recover the true count from OUR OWN
+                    %% block store (CF_BLOCKS) — never proxy to Bitcoin Core
+                    %% (that RPC proxy to the local Core node was an R3 self-
+                    %% sufficiency violation: getblockheader silently answered
+                    %% from Core's node, #44).  If the body isn't stored either
+                    %% (pruned / header-only), report 0, matching Core's own
+                    %% behaviour for a header with no counted transactions.
                     NTx = case RawNTx of
-                        0 -> ntx_from_core_rpc(HashHex);
+                        0 -> ntx_from_local_block(Hash);
                         N -> N
                     end,
                     %% Core's ComputeNextBlockAndDepth (rpc/blockchain.cpp:116):
@@ -8310,84 +8316,15 @@ replace_all_sentinels(<<"\"__DIFF__", Rest/binary>>, Acc) ->
 replace_all_sentinels(<<C, Rest/binary>>, Acc) ->
     replace_all_sentinels(Rest, <<Acc/binary, C>>).
 
-%% ntx_from_core_rpc/1 — query the local Bitcoin Core node for a block's nTx.
-%% Used as a fallback when beamchain's index has nTx=0 (header-sync path).
-%% Returns the nTx integer on success, or 0 on any error.
-ntx_from_core_rpc(HashHex) when is_binary(HashHex) ->
-    CookiePaths = [
-        "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie",
-        "/home/work/hashhog/testnet4-data/bitcoin-core/testnet4/.cookie"
-    ],
-    case read_first_cookie(CookiePaths) of
-        {ok, Cookie} ->
-            Port = 8332,
-            Body = iolist_to_binary([
-                <<"{\"jsonrpc\":\"1.0\",\"method\":\"getblockheader\",\"params\":[\"">>,
-                HashHex,
-                <<"\",true],\"id\":1}">>
-            ]),
-            CredB64 = base64:encode(Cookie),
-            Request = iolist_to_binary([
-                <<"POST / HTTP/1.0\r\n">>,
-                <<"Host: 127.0.0.1:">>, integer_to_binary(Port), <<"\r\n">>,
-                <<"Content-Type: application/json\r\n">>,
-                <<"Content-Length: ">>, integer_to_binary(byte_size(Body)), <<"\r\n">>,
-                <<"Authorization: Basic ">>, CredB64, <<"\r\n">>,
-                <<"\r\n">>,
-                Body
-            ]),
-            case catch tcp_request(Port, Request, 3000) of
-                {ok, Response} ->
-                    extract_ntx_from_response(Response);
-                _ ->
-                    0
-            end;
-        error ->
-            0
+%% Count transactions in a locally-stored block (CF_BLOCKS).  Returns 0 when
+%% the body is not on disk (pruned / header-only), which is the correct nTx
+%% for a header with no counted transactions.
+ntx_from_local_block(Hash) when byte_size(Hash) =:= 32 ->
+    case beamchain_db:get_block(Hash) of
+        {ok, #block{transactions = Txs}} when is_list(Txs) -> length(Txs);
+        _ -> 0
     end.
 
-read_first_cookie([]) -> error;
-read_first_cookie([Path | Rest]) ->
-    case file:read_file(Path) of
-        {ok, Bin} -> {ok, string:trim(binary_to_list(Bin))};
-        _         -> read_first_cookie(Rest)
-    end.
-
-tcp_request(Port, Request, TimeoutMs) ->
-    case gen_tcp:connect({127, 0, 0, 1}, Port,
-                         [binary, {active, false},
-                          {send_timeout, TimeoutMs},
-                          {recbuf, 65536}],
-                         TimeoutMs) of
-        {ok, Sock} ->
-            ok = gen_tcp:send(Sock, Request),
-            Resp = recv_all(Sock, <<>>, TimeoutMs),
-            gen_tcp:close(Sock),
-            {ok, Resp};
-        {error, Reason} ->
-            {error, Reason}
-    end.
-
-recv_all(Sock, Acc, Timeout) ->
-    case gen_tcp:recv(Sock, 0, Timeout) of
-        {ok, Data}       -> recv_all(Sock, <<Acc/binary, Data/binary>>, Timeout);
-        {error, closed}  -> Acc;
-        {error, _}       -> Acc
-    end.
-
-extract_ntx_from_response(Response) ->
-    %% Find the body after \r\n\r\n
-    case binary:split(Response, <<"\r\n\r\n">>) of
-        [_Headers, Body] ->
-            case jsx:decode(Body, [return_maps]) of
-                #{<<"result">> := #{<<"nTx">> := NTx}} when is_integer(NTx) ->
-                    NTx;
-                _ ->
-                    0
-            end;
-        _ ->
-            0
-    end.
 
 %% Number of confirmations for a block at the given height.
 %%

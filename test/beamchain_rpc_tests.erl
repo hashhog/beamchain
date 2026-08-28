@@ -1167,3 +1167,23 @@ submitpackage_decode_failure_test() ->
     ?assertThrow({decode_failed, _},
                  beamchain_rpc:decode_package_tx(<<"zz">>)).
 
+
+%%% ===================================================================
+%%% #44: getblockheader nTx must be computed LOCALLY, never proxied to
+%%% Bitcoin Core (R3 self-sufficiency).  Structural pin (a behavioral
+%%% nTx test needs a full block-index-with-nTx=0 + block-body fixture;
+%%% the invariant under test is "no Core dependency remains", which a
+%%% deterministic source assertion proves and a race-free way).
+%%% FAILS AT PARENT: the parent source contained ntx_from_core_rpc + the
+%%% 127.0.0.1:8332 proxy in the getblockheader nTx path.
+%%% ===================================================================
+getblockheader_ntx_no_core_proxy_test() ->
+    {ok, Src} = file:read_file("src/beamchain_rpc.erl"),
+    %% The dead Core-proxy chain must be gone entirely.
+    ?assertEqual(nomatch, binary:match(Src, <<"ntx_from_core_rpc">>)),
+    ?assertEqual(nomatch, binary:match(Src, <<"extract_ntx_from_response">>)),
+    %% No RPC-to-Core plumbing left in the module.
+    ?assertEqual(nomatch, binary:match(Src, <<"127.0.0.1:8332">>)),
+    ?assertEqual(nomatch, binary:match(Src, <<"bitcoin-core/.cookie">>)),
+    %% The nTx=0 recovery path must use the LOCAL block store.
+    ?assertNotEqual(nomatch, binary:match(Src, <<"ntx_from_local_block">>)).
