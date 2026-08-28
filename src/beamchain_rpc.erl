@@ -3785,17 +3785,36 @@ rpc_createrawtransaction([Inputs, Outputs, Locktime, Replaceable0])
                Locktime =/= 0     -> 16#FFFFFFFE;  %% MAX_SEQUENCE_NONFINAL
                true               -> 16#FFFFFFFF   %% SEQUENCE_FINAL
             end,
-        %% Parse inputs (explicit per-input "sequence" wins over the default).
-        TxInputs = lists:map(fun(#{<<"txid">> := TxidHex, <<"vout">> := Vout} = InMap) ->
-            Txid = hex_to_internal_hash(TxidHex),
-            Sequence = case maps:get(<<"sequence">>, InMap, undefined) of
-                undefined -> DefaultSequence;
-                Seq -> Seq
-            end,
-            #tx_in{prev_out = #outpoint{hash = Txid, index = Vout},
-                   script_sig = <<>>,
-                   sequence = Sequence,
-                   witness = []}
+        %% Every numeric field is range-checked BEFORE it reaches the record.
+        %%
+        %% beamchain_serialize encodes index/sequence/locktime with
+        %% <<X:32/little>>, and Erlang's bit syntax TRUNCATES instead of
+        %% failing.  Unvalidated, this node answered SUCCESS to three requests
+        %% Core rejects, each time with a value carrying the OPPOSITE consensus
+        %% meaning to the one asked for:
+        %%
+        %%   vout     -1          -> 16#FFFFFFFF, the reserved null/coinbase
+        %%                           outpoint index (Core COutPoint::SetNull)
+        %%   sequence 16#100000000 -> 0, which CLEARS the BIP-68 disable bit
+        %%                           AND signals BIP-125 replaceability
+        %%   locktime -1          -> 16#FFFFFFFF, the maximum locktime
+        %%
+        %% No error, no log line -- the caller cannot tell.  Core rejects all
+        %% three (rawtransaction_util.cpp:41-66, :151-155).
+        LocktimeChecked = parse_createraw_locktime(Locktime),
+        TxInputs = lists:map(fun
+            (InMap) when is_map(InMap) ->
+                Txid = parse_createraw_txid(maps:get(<<"txid">>, InMap, undefined)),
+                Vout = parse_createraw_vout(maps:get(<<"vout">>, InMap, undefined)),
+                Sequence = parse_createraw_sequence(
+                    maps:get(<<"sequence">>, InMap, undefined), DefaultSequence),
+                #tx_in{prev_out = #outpoint{hash = Txid, index = Vout},
+                       script_sig = <<>>,
+                       sequence = Sequence,
+                       witness = []};
+            (_) ->
+                %% Core: input.get_obj() on a non-object.
+                throw({misc_error, <<"JSON value is not an object as expected">>})
         end, Inputs),
         %% Outputs: NormalizeOutputs -> ordered list of {Key, Value} pairs.
         %% Object form -> maps:to_list; array form -> each element is a
@@ -3817,11 +3836,19 @@ rpc_createrawtransaction([Inputs, Outputs, Locktime, Replaceable0])
             version = 2,
             inputs = TxInputs,
             outputs = TxOutputs,
-            locktime = Locktime
+            locktime = LocktimeChecked
         },
         HexTx = beamchain_serialize:hex_encode(beamchain_serialize:encode_transaction(Tx)),
         {ok, HexTx}
     catch
+        %% Carry Core's own code with the message.  Without these two clauses
+        %% every rejection fell through to the catch-all below and surfaced as
+        %% RPC_MISC_ERROR (-1) with a raw Erlang term -- "Error: function_clause"
+        %% for a missing vout, "Error: badarg" for a malformed txid.
+        throw:{invalid_parameter, PMsg} ->
+            {error, ?RPC_INVALID_PARAMETER, PMsg};
+        throw:{misc_error, MMsg} ->
+            {error, ?RPC_MISC_ERROR, MMsg};
         _:Err ->
             {error, ?RPC_MISC_ERROR,
              iolist_to_binary(io_lib:format("Error: ~p", [Err]))}
@@ -3829,6 +3856,64 @@ rpc_createrawtransaction([Inputs, Outputs, Locktime, Replaceable0])
 rpc_createrawtransaction(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"Usage: createrawtransaction [{\"txid\":\"hex\",\"vout\":n},...] [{\"address\":amount},...] ( locktime replaceable )">>}.
+
+%% --- createrawtransaction argument validation (Core parity) -------------
+%%
+%% Core's ordering is univalue's, not the obvious one: getInt<int>() runs
+%% BEFORE the sign test, so a value outside int32 reports "JSON integer out of
+%% range" at RPC_MISC_ERROR (-1) even when it is also negative.  Preserved
+%% here deliberately.
+
+%% Core ParseHashO/ParseHashV (rpc/util.cpp:117-125).
+parse_createraw_txid(Hex) when is_binary(Hex) ->
+    case byte_size(Hex) of
+        64 ->
+            try hex_to_internal_hash(Hex)
+            catch _:_ ->
+                throw({invalid_parameter,
+                       iolist_to_binary(io_lib:format(
+                           "txid must be hexadecimal string (not '~s')", [Hex]))})
+            end;
+        Len ->
+            throw({invalid_parameter,
+                   iolist_to_binary(io_lib:format(
+                       "txid must be of length 64 (not ~p, for '~s')", [Len, Hex]))})
+    end;
+parse_createraw_txid(_) ->
+    throw({misc_error, <<"JSON value is not a string as expected">>}).
+
+%% Core AddInputs (rawtransaction_util.cpp:38-45).
+parse_createraw_vout(V) when not is_integer(V) ->
+    throw({invalid_parameter, <<"Invalid parameter, missing vout key">>});
+parse_createraw_vout(V) when V < -2147483648 orelse V > 2147483647 ->
+    throw({misc_error, <<"JSON integer out of range">>});
+parse_createraw_vout(V) when V < 0 ->
+    throw({invalid_parameter, <<"Invalid parameter, vout cannot be negative">>});
+parse_createraw_vout(V) ->
+    V.
+
+%% Core AddInputs (rawtransaction_util.cpp:57-65).  Note the isNum() guard:
+%% a NON-numeric sequence is ignored and the default applies -- only a numeric
+%% one out of [0, SEQUENCE_FINAL] is an error.
+parse_createraw_sequence(undefined, Default) ->
+    Default;
+parse_createraw_sequence(S, _Default) when is_integer(S), S >= 0, S =< 16#FFFFFFFF ->
+    S;
+parse_createraw_sequence(S, Default) when not is_integer(S) ->
+    Default;
+parse_createraw_sequence(_S, _Default) ->
+    throw({invalid_parameter, <<"Invalid parameter, sequence number is out of range">>}).
+
+%% Core ConstructTransaction (rawtransaction_util.cpp:151-155): LOCKTIME_MAX
+%% is 0xFFFFFFFF.
+parse_createraw_locktime(undefined) ->
+    0;
+parse_createraw_locktime(L) when is_integer(L), L >= 0, L =< 16#FFFFFFFF ->
+    L;
+parse_createraw_locktime(L) when is_integer(L) ->
+    throw({invalid_parameter, <<"Invalid parameter, locktime out of range">>});
+parse_createraw_locktime(_) ->
+    throw({misc_error, <<"JSON value is not an integer as expected">>}).
 
 %% Core NormalizeOutputs (rawtransaction_util.cpp:74-99): accept either a JSON
 %% object {addr:amt,...} (jsx return_maps -> Erlang map) or an array of
