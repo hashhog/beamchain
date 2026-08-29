@@ -1287,6 +1287,9 @@ wait_param(Params, N) when is_list(Params), N >= 1 ->
 parse_wait_timeout(undefined) ->
     infinity;
 parse_wait_timeout(V) when is_integer(V) ->
+    %% getInt<int> width check runs BEFORE the negative-timeout test.
+    core_in_int32(V) orelse
+        throw({rpc_error, ?RPC_MISC_ERROR, <<"JSON integer out of range">>}),
     case V < 0 of
         true  -> throw({rpc_error, ?RPC_MISC_ERROR, <<"Negative timeout">>});
         false when V =:= 0 -> infinity;
@@ -1302,6 +1305,8 @@ parse_wait_int(undefined, Name) ->
     throw({rpc_error, ?RPC_TYPE_ERROR,
            <<"Missing required parameter: ", Name/binary>>});
 parse_wait_int(V, _Name) when is_integer(V) ->
+    core_in_int32(V) orelse
+        throw({rpc_error, ?RPC_MISC_ERROR, <<"JSON integer out of range">>}),
     V;
 parse_wait_int(V, _Name) ->
     throw({rpc_error, ?RPC_TYPE_ERROR, type_error_msg(V)}).
@@ -3773,6 +3778,19 @@ rpc_sendrawtransaction(_) ->
 %% Integers in Erlang are bignums: nothing here truncates, so the uint32 test
 %% is the only bound and it must come before the [1,3] domain test to match
 %% univalue's ordering.
+%% Core reads every numeric RPC argument through UniValue::getInt<T>()
+%% (univalue.h), which runs std::from_chars INTO THE DESTINATION WIDTH.  The
+%% width check therefore lives INSIDE the conversion and fires BEFORE the
+%% handler's own domain test: out of width -> std::runtime_error("JSON integer
+%% out of range") -> RPC_MISC_ERROR (-1); only values that survive the
+%% conversion reach a -8 range check.  Erlang integers are arbitrary-precision,
+%% so an explicit bound is the ONLY thing standing between a hostile argument
+%% and a handler that quietly acts on it.
+core_in_int32(V) when is_integer(V) ->
+    V >= -2147483648 andalso V =< 2147483647;
+core_in_int32(_) ->
+    false.
+
 parse_createraw_version(undefined) -> 2;
 parse_createraw_version(null)      -> 2;
 parse_createraw_version(V) when is_integer(V) ->
@@ -4733,6 +4751,14 @@ build_pkg_tx_result(Tx, Txid, AcceptedSet, PackageMsg) ->
 
 rpc_gettxout([TxidHex, N]) ->
     rpc_gettxout([TxidHex, N, true]);
+%% Core reads n as getInt<uint32_t> (rpc/blockchain.cpp): from_chars accepts no
+%% sign for an unsigned destination, so a NEGATIVE vout fails the conversion
+%% with -1 -- the same error as one above 2^32-1, and not a handler-level
+%% range check.
+rpc_gettxout([TxidHex, N, _IncludeMempool]) when is_binary(TxidHex),
+                                                 is_integer(N),
+                                                 N < 0 orelse N > 4294967295 ->
+    {error, ?RPC_MISC_ERROR, <<"JSON integer out of range">>};
 rpc_gettxout([TxidHex, N, IncludeMempool]) when is_binary(TxidHex),
                                                   is_integer(N) ->
     try rpc_gettxout_lookup(parse_hash_v(TxidHex, <<"txid">>), N, IncludeMempool)
@@ -5851,18 +5877,16 @@ rpc_getmempooldescendants(_) ->
 %% Accepted call shapes (positional):
 %%   ["txid", FeeDelta]            (dummy omitted — preferred forward form)
 %%   ["txid", Dummy, FeeDelta]     (legacy 3-arg form; Dummy must be 0/null)
-rpc_prioritisetransaction([TxidHex, FeeDelta])
-  when is_binary(TxidHex), is_integer(FeeDelta) ->
-    do_prioritisetransaction(TxidHex, 0, FeeDelta);
+%% Core's signature is prioritisetransaction "txid" ( dummy ) fee_delta with
+%% fee_delta REQUIRED at positional 2, so a TWO-argument call is rejected --
+%% Core does not read the second value as fee_delta.  Accepting it here meant
+%% `prioritisetransaction txid <n>` mutated the mempool on a call Core refuses.
 rpc_prioritisetransaction([TxidHex, Dummy, FeeDelta])
   when is_binary(TxidHex), is_integer(FeeDelta) ->
     do_prioritisetransaction(TxidHex, Dummy, FeeDelta);
 %% Tolerate a JSON float fee_delta that is integral (e.g. 10000.0) — Core's
 %% getInt<int64_t> would reject a non-integral value, but jsx may hand us a
 %% float for whole numbers; round only when it is exactly integral.
-rpc_prioritisetransaction([TxidHex, FeeDelta])
-  when is_binary(TxidHex), is_float(FeeDelta) ->
-    coerce_fee_delta_then(TxidHex, 0, FeeDelta);
 rpc_prioritisetransaction([TxidHex, Dummy, FeeDelta])
   when is_binary(TxidHex), is_float(FeeDelta) ->
     coerce_fee_delta_then(TxidHex, Dummy, FeeDelta);
@@ -6621,6 +6645,11 @@ rpc_getnodeaddresses(Params) ->
             case coerce_int(CountArg) of
                 {error, _} ->
                     {error, ?RPC_TYPE_ERROR, <<"JSON value is not an integer as expected">>};
+                %% getInt<int> BEFORE the handler's own -8 range test: an
+                %% out-of-int32 count fails the CONVERSION (-1), while an
+                %% in-range negative one reaches the domain error (-8).
+                {ok, Count} when Count < -2147483648 orelse Count > 2147483647 ->
+                    {error, ?RPC_MISC_ERROR, <<"JSON integer out of range">>};
                 {ok, Count} when Count < 0 ->
                     {error, ?RPC_INVALID_PARAMETER, <<"Address count out of range">>};
                 {ok, Count} ->
@@ -7830,7 +7859,47 @@ try_parse_raw_tx(TxHex, Rest, Acc) ->
 %%% Fee estimation
 %%% ===================================================================
 
-rpc_estimatesmartfee([ConfTarget | _]) when is_integer(ConfTarget) ->
+%% Core: ParseConfirmTarget (rpc/util.cpp) reads conf_target with getInt<int>
+%% and then REJECTS anything outside [1, HighestTargetTracked] -- it does not
+%% clamp.  estimate_mode is validated by FeeModeFromString
+%% (common/messages.cpp), case-insensitively; ignoring it returned an estimate
+%% for whatever garbage the caller passed.
+rpc_estimatesmartfee([ConfTarget | Rest]) when is_integer(ConfTarget) ->
+    case core_in_int32(ConfTarget) of
+        false -> {error, ?RPC_MISC_ERROR, <<"JSON integer out of range">>};
+        true when ConfTarget < 1 orelse ConfTarget > 1008 ->
+            {error, ?RPC_INVALID_PARAMETER,
+             <<"Invalid conf_target, must be between 1 and 1008">>};
+        true ->
+            case check_estimate_mode(Rest) of
+                ok -> rpc_estimatesmartfee_do(ConfTarget);
+                {error, C, M} -> {error, C, M}
+            end
+    end;
+rpc_estimatesmartfee(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: estimatesmartfee conf_target">>}.
+
+%% Core FeeModeMap: "unset" | "economical" | "conservative", matched after
+%% ToUpper, so the comparison is case-insensitive.
+check_estimate_mode([]) -> ok;
+check_estimate_mode([undefined | _]) -> ok;
+check_estimate_mode([null | _]) -> ok;
+check_estimate_mode([Mode | _]) when is_binary(Mode) ->
+    case string:uppercase(Mode) of
+        <<"UNSET">> -> ok;
+        <<"ECONOMICAL">> -> ok;
+        <<"CONSERVATIVE">> -> ok;
+        _ -> {error, ?RPC_INVALID_PARAMETER,
+              <<"Invalid estimate_mode parameter, must be one of: "
+                "\"unset\", \"economical\", \"conservative\"">>}
+    end;
+check_estimate_mode([Mode | _]) ->
+    {error, ?RPC_TYPE_ERROR,
+     <<"JSON value of type ", (univalue_type_name(Mode))/binary,
+       " is not of expected type string">>}.
+
+rpc_estimatesmartfee_do(ConfTarget) ->
     case beamchain_fee_estimator:estimate_fee(ConfTarget) of
         {ok, FeeRate} ->
             %% Convert sat/vB to BTC/kvB
@@ -7845,10 +7914,7 @@ rpc_estimatesmartfee([ConfTarget | _]) when is_integer(ConfTarget) ->
                 <<"errors">> => [<<"Insufficient data">>],
                 <<"blocks">> => ConfTarget
             }}
-    end;
-rpc_estimatesmartfee(_) ->
-    {error, ?RPC_INVALID_PARAMS,
-     <<"Usage: estimatesmartfee conf_target">>}.
+    end.
 
 %% estimaterawfee — Core hidden RPC. Returns per-horizon raw bucket
 %% estimate. We expose a single "medium" horizon (beamchain's
@@ -12380,11 +12446,16 @@ rpc_createpsbt([Inputs, Outputs, Locktime, _Replaceable, Version0]) when is_list
         end, Outputs),
         %% Create unsigned transaction
         PsbtVersion = parse_createraw_version(Version0),
+        %% Core builds createpsbt from the SAME ConstructTransaction as
+        %% createrawtransaction, so locktime is bounded to [0, LOCKTIME_MAX]
+        %% here too.  Taking it raw meant 4294967296 reached the serializer and
+        %% the caller got a SUCCESS reply describing a transaction it had not
+        %% asked for.
         Tx = #transaction{
             version = PsbtVersion,
             inputs = TxIns,
             outputs = TxOuts,
-            locktime = Locktime
+            locktime = parse_createraw_locktime(Locktime)
         },
         %% Create PSBT
         case beamchain_psbt:create(Tx) of
@@ -12397,6 +12468,14 @@ rpc_createpsbt([Inputs, Outputs, Locktime, _Replaceable, Version0]) when is_list
                  iolist_to_binary(io_lib:format("PSBT creation failed: ~p", [Reason]))}
         end
     catch
+        %% Same two clauses createrawtransaction already carried: without them
+        %% a Core-shaped rejection from the SHARED argument parsers surfaced as
+        %% -32602 wrapping a raw Erlang term instead of Core's own code and
+        %% message.
+        throw:{invalid_parameter, PMsg} ->
+            {error, ?RPC_INVALID_PARAMETER, PMsg};
+        throw:{misc_error, MMsg} ->
+            {error, ?RPC_MISC_ERROR, MMsg};
         _:Err ->
             {error, ?RPC_INVALID_PARAMS,
              iolist_to_binary(io_lib:format("Invalid parameters: ~p", [Err]))}
@@ -12996,7 +13075,12 @@ rpc_walletcreatefundedpsbt([Inputs, Outputs, Locktime, Options, _Bip32Derivs],
     case resolve_wallet(WalletName) of
         {ok, Pid} ->
             try
-                do_walletcreatefundedpsbt(Pid, Inputs, Outputs, Locktime,
+                %% walletcreatefundedpsbt routes through Core's
+                %% ConstructTransaction as well, so the same [0, LOCKTIME_MAX]
+                %% bound applies -- this is argument validation in the shared
+                %% non-wallet routine, not wallet behaviour.
+                do_walletcreatefundedpsbt(Pid, Inputs, Outputs,
+                                           parse_createraw_locktime(Locktime),
                                            Options)
             catch
                 throw:{wcfp_error, Code, Msg} ->
