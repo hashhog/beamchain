@@ -3764,11 +3764,43 @@ rpc_sendrawtransaction(_) ->
 %% beamchain_serialize:encode_transaction/1 (the node's tx serializer — no
 %% witness on the all-empty-scriptSig unsigned tx, so no segwit marker, matching
 %% Core's EncodeHexTx).
+%% @doc Core's `version` argument for the createrawtransaction family.
+%%
+%% Absent or JSON null means Core's DEFAULT_RAWTX_VERSION
+%% (CTransaction::CURRENT_VERSION = 2).  jsx decodes JSON null to the atom
+%% `null`, and Core treats an explicit null exactly like an omitted argument.
+%%
+%% Integers in Erlang are bignums: nothing here truncates, so the uint32 test
+%% is the only bound and it must come before the [1,3] domain test to match
+%% univalue's ordering.
+parse_createraw_version(undefined) -> 2;
+parse_createraw_version(null)      -> 2;
+parse_createraw_version(V) when is_integer(V) ->
+    if
+        V < 0 orelse V > 4294967295 ->
+            throw({misc_error, <<"JSON integer out of range">>});
+        V < 1 orelse V > 3 ->
+            throw({invalid_parameter,
+                   <<"Invalid parameter, version out of range(1~3)">>});
+        true ->
+            V
+    end;
+parse_createraw_version(_) ->
+    throw({misc_error, <<"JSON integer out of range">>}).
+
 rpc_createrawtransaction([Inputs, Outputs]) when is_list(Inputs) ->
-    rpc_createrawtransaction([Inputs, Outputs, 0, undefined]);
+    rpc_createrawtransaction([Inputs, Outputs, 0, undefined, undefined]);
 rpc_createrawtransaction([Inputs, Outputs, Locktime]) when is_list(Inputs) ->
-    rpc_createrawtransaction([Inputs, Outputs, Locktime, undefined]);
+    rpc_createrawtransaction([Inputs, Outputs, Locktime, undefined, undefined]);
 rpc_createrawtransaction([Inputs, Outputs, Locktime, Replaceable0])
+  when is_list(Inputs) ->
+    rpc_createrawtransaction([Inputs, Outputs, Locktime, Replaceable0, undefined]);
+%% Core's 5th argument, `version` (rpc/rawtransaction.cpp:122).  There was no
+%% five-element clause at all, so the call fell through to the catch-all and was
+%% rejected with -32602 and the help text -- a caller asking for version 3 could
+%% not reach the builder.  Version 3 is TRUC (BIP 431) and carries different
+%% policy rules.
+rpc_createrawtransaction([Inputs, Outputs, Locktime, Replaceable0, Version0])
   when is_list(Inputs), (is_list(Outputs) orelse is_map(Outputs)) ->
     try
         %% Core: rbf is std::optional<bool>, value_or(true) => absent defaults
@@ -3885,8 +3917,23 @@ rpc_createrawtransaction([Inputs, Outputs, Locktime, Replaceable0])
             false ->
                 ok
         end,
+        %% Core reads `version` as self.Arg<uint32_t>("version") -- a
+        %% THIRTY-TWO BIT UNSIGNED parse, unlike the int32 used for vout --
+        %% then bounds it to
+        %% [TX_MIN_STANDARD_VERSION, TX_MAX_STANDARD_VERSION] = [1, 3]
+        %% (policy/policy.h:152-153) inside ConstructTransaction
+        %% (rawtransaction_util.cpp:158-161) and ASSIGNS it.
+        %%
+        %% The UNSIGNED width decides which error you get: 2147483648 fits a
+        %% uint32, survives the conversion and reaches the DOMAIN error (-8),
+        %% while -1 and 4294967296 fail the CONVERSION first (-1).
+        %%
+        %% ERLANG HAZARD: integers here are BIGNUMS, so there is no width to
+        %% overflow and no implicit truncation to lean on -- the explicit range
+        %% test below is the ONLY thing enforcing Core's bound.
+        TxVersion = parse_createraw_version(Version0),
         Tx = #transaction{
-            version = 2,
+            version = TxVersion,
             inputs = TxInputs,
             outputs = TxOutputs,
             locktime = LocktimeChecked
@@ -12297,8 +12344,15 @@ rpc_importprivkey(_, _) ->
 %% @doc Create a PSBT from inputs and outputs.
 %% createpsbt [{"txid":"hex","vout":n},...] [{"address":amount},...] (locktime)
 rpc_createpsbt([Inputs, Outputs]) ->
-    rpc_createpsbt([Inputs, Outputs, 0]);
-rpc_createpsbt([Inputs, Outputs, Locktime]) when is_list(Inputs),
+    rpc_createpsbt([Inputs, Outputs, 0, undefined, undefined]);
+rpc_createpsbt([Inputs, Outputs, Locktime]) when is_list(Inputs) ->
+    rpc_createpsbt([Inputs, Outputs, Locktime, undefined, undefined]);
+rpc_createpsbt([Inputs, Outputs, Locktime, Replaceable]) when is_list(Inputs) ->
+    rpc_createpsbt([Inputs, Outputs, Locktime, Replaceable, undefined]);
+%% Core builds createpsbt from the SAME ConstructTransaction as
+%% createrawtransaction, so it takes the same 5th `version` argument
+%% (rpc/rawtransaction.cpp:1642).  There was no clause for it here either.
+rpc_createpsbt([Inputs, Outputs, Locktime, _Replaceable, Version0]) when is_list(Inputs),
                                                    is_list(Outputs) ->
     try
         Network = beamchain_config:network(),
@@ -12325,8 +12379,9 @@ rpc_createpsbt([Inputs, Outputs, Locktime]) when is_list(Inputs),
             end, [], OutputObj)
         end, Outputs),
         %% Create unsigned transaction
+        PsbtVersion = parse_createraw_version(Version0),
         Tx = #transaction{
-            version = 2,
+            version = PsbtVersion,
             inputs = TxIns,
             outputs = TxOuts,
             locktime = Locktime

@@ -258,3 +258,84 @@ rbf_explicit_json_null_counts_as_absent_test() ->
     ?assertEqual({ok, one_input_hex(<<"ffffffff">>)},
                  rpc([input([{<<"txid">>, ?TXID}, {<<"vout">>, 0},
                              {<<"sequence">>, 16#FFFFFFFF}]), #{}, 0, null])).
+
+%%% --- createrawtransaction must HONOUR the `version` argument (#84) ------
+%%%
+%%% Core's createrawtransaction takes a 5th argument, `version`
+%%% (bitcoin-core/src/rpc/rawtransaction.cpp:122). It reads it as
+%%% self.Arg<uint32_t>("version"), bounds it to
+%%% [TX_MIN_STANDARD_VERSION, TX_MAX_STANDARD_VERSION] = [1, 3]
+%%% (src/policy/policy.h:152-153) and ASSIGNS it to the transaction
+%%% (src/rpc/rawtransaction_util.cpp:158-161).
+%%%
+%%% beamchain had NO five-element clause at all, so the call fell through to
+%%% the catch-all and was rejected with -32602 and the help text. A caller
+%%% asking for version 3 could not reach the builder. Version 3 is TRUC
+%%% (BIP 431) and carries different policy rules.
+%%%
+%%% Note the shape of the pre-fix defect: the call was REJECTED, not silently
+%%% mis-served. So an "the call is accepted" assertion would pass the moment
+%%% the argument was merely TOLERATED and discarded -- which is why every
+%%% assertion below reads the VERSION BYTES off the returned hex instead.
+%%%
+%%% THE UNSIGNED WIDTH decides which error you get: 2147483648 fits a uint32,
+%%% survives the conversion and reaches the DOMAIN error (-8), while -1 and
+%%% 4294967296 fail the CONVERSION first (-1). Both directions asserted.
+%%%
+%%% ERLANG HAZARD: integers here are BIGNUMS. Nothing truncates and there is no
+%%% width to overflow, so the explicit range test is the ONLY thing enforcing
+%%% Core's bound -- there is no accidental safety net to fall back on.
+
+version_prefix(Hex) ->
+    binary:part(Hex, 0, 8).
+
+version_1_is_emitted_test() ->
+    {ok, Hex} = rpc([input([{<<"txid">>, ?TXID}, {<<"vout">>, 0}]), #{}, 0, false, 1]),
+    ?assertEqual(<<"01000000">>, version_prefix(Hex)).
+
+version_2_is_emitted_test() ->
+    {ok, Hex} = rpc([input([{<<"txid">>, ?TXID}, {<<"vout">>, 0}]), #{}, 0, false, 2]),
+    ?assertEqual(<<"02000000">>, version_prefix(Hex)).
+
+version_3_truc_is_emitted_test() ->
+    {ok, Hex} = rpc([input([{<<"txid">>, ?TXID}, {<<"vout">>, 0}]), #{}, 0, false, 3]),
+    ?assertEqual(<<"03000000">>, version_prefix(Hex)).
+
+version_zero_is_out_of_domain_test() ->
+    ?assertEqual({error, -8, <<"Invalid parameter, version out of range(1~3)">>},
+                 rpc([input([{<<"txid">>, ?TXID}, {<<"vout">>, 0}]), #{}, 0, false, 0])).
+
+version_four_is_out_of_domain_test() ->
+    ?assertEqual({error, -8, <<"Invalid parameter, version out of range(1~3)">>},
+                 rpc([input([{<<"txid">>, ?TXID}, {<<"vout">>, 0}]), #{}, 0, false, 4])).
+
+%% Inside uint32, outside [1,3]: the DOMAIN error, after a successful
+%% conversion.
+version_int32_max_plus_one_is_domain_error_test() ->
+    ?assertEqual({error, -8, <<"Invalid parameter, version out of range(1~3)">>},
+                 rpc([input([{<<"txid">>, ?TXID}, {<<"vout">>, 0}]), #{}, 0, false,
+                      2147483648])).
+
+%% Outside uint32: the CONVERSION fails first, so -1 and not -8. Paired with
+%% the test above, this is what pins the boundary in BOTH directions.
+version_beyond_uint32_is_conversion_error_test() ->
+    ?assertEqual({error, -1, <<"JSON integer out of range">>},
+                 rpc([input([{<<"txid">>, ?TXID}, {<<"vout">>, 0}]), #{}, 0, false,
+                      4294967296])).
+
+version_negative_is_conversion_error_test() ->
+    ?assertEqual({error, -1, <<"JSON integer out of range">>},
+                 rpc([input([{<<"txid">>, ?TXID}, {<<"vout">>, 0}]), #{}, 0, false, -1])).
+
+%%% CONTROLS. Without these a handler that rejected every version would
+%%% satisfy every rejection assertion above.
+
+control_absent_version_defaults_to_2_test() ->
+    {ok, Hex} = rpc([input([{<<"txid">>, ?TXID}, {<<"vout">>, 0}]), #{}, 0, false]),
+    ?assertEqual(<<"02000000">>, version_prefix(Hex)).
+
+control_null_version_defaults_to_2_test() ->
+    %% jsx decodes JSON null to the atom `null`; Core treats an explicit null
+    %% exactly like an omitted argument.
+    {ok, Hex} = rpc([input([{<<"txid">>, ?TXID}, {<<"vout">>, 0}]), #{}, 0, false, null]),
+    ?assertEqual(<<"02000000">>, version_prefix(Hex)).
