@@ -7525,6 +7525,15 @@ rpc_submitblock([HexData]) when is_binary(HexData) ->
                 ok ->
                     %% null = success per BIP-22
                     {ok, null};
+                {error, block_decode_failed} ->
+                    %% Core rpc/mining.cpp:1079-1081 — DecodeHexBlk failure
+                    %% is a JSON-RPC error, NOT a BIP-22 result string:
+                    %%   throw JSONRPCError(RPC_DESERIALIZATION_ERROR,
+                    %%                      "Block decode failed");
+                    %% Identical ladder to rpc_submitheader's -22
+                    %% "Block header decode failed" arm below.
+                    {error, ?RPC_DESERIALIZATION_ERROR,
+                     <<"Block decode failed">>};
                 {error, Reason} ->
                     %% Return the BIP-22 string as the result field,
                     %% not as a JSON-RPC error.  Per BIP-22 and Bitcoin

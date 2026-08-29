@@ -20,6 +20,9 @@
 -export([submit_block/1]).
 -export([generate_blocks/3, generate_block_with_txs/3]).
 -export([encode_coinbase_height/1]).
+%% Exported for testing: Core's DecodeHexBlk step in isolation, so a pin can
+%% assert the decode/validate SPLIT without standing up the miner gen_server.
+-export([decode_block_hex/1]).
 -export([build_gbt_rules_and_vbavailable/2]).
 
 %% gen_server callbacks
@@ -512,13 +515,41 @@ short_hex(Other) ->
 %%% ===================================================================
 
 do_submit_block(HexBlock) ->
+    %% Steps 1+2 (hex -> bytes -> CBlock) ARE Core's DecodeHexBlk
+    %% (rpc/mining.cpp:1079).  Core runs them BEFORE any validation and
+    %% answers a failure with JSONRPCError(RPC_DESERIALIZATION_ERROR,
+    %% "Block decode failed") (rpc/mining.cpp:1080) — never with a BIP-22
+    %% result string.  Folding them into the catch-all `catch` below
+    %% collapsed every decode failure into `{error, Reason}` and thus into
+    %% bip22_result/1's `rejected` fallback (beamchain_rpc.erl:7317), which
+    %% is the R2 reason-token divergence measured on all 4 rows of diff-test
+    %% corpus _tierc-guards-2026-07-06/C1-noncanonical-compactsize
+    %% (beamchain reject:rejected vs Core reject:block-decode-failed; both
+    %% REJECT, tip unchanged — reason parity only, not a consensus split).
+    case decode_block_hex(HexBlock) of
+        {error, decode_failed} ->
+            logger:warning("miner: submit_block hex/deserialize failed"),
+            {error, block_decode_failed};
+        {ok, Block} ->
+            do_submit_decoded_block(Block)
+    end.
+
+%% Core DecodeHexBlk parity: hex -> binary -> CBlock, with every failure
+%% collapsed to one opaque atom.  Core does exactly this — the underlying
+%% std::ios_base::failure text ("non-canonical ReadCompactSize()",
+%% serialize.h:344/:350/:356) is swallowed by DecodeHexBlk, which returns a
+%% bare bool, so it never reaches the client.
+decode_block_hex(HexBlock) ->
     try
-        %% 1. decode hex to binary
         BlockBin = beamchain_serialize:hex_decode(HexBlock),
-
-        %% 2. deserialize block
         {Block, _Rest} = beamchain_serialize:decode_block(BlockBin),
+        {ok, Block}
+    catch
+        _:_ -> {error, decode_failed}
+    end.
 
+do_submit_decoded_block(Block) ->
+    try
         %% 3. context-free block checks (PoW, merkle root, sigops, weight).
         %% Mirrors Bitcoin Core CheckBlock() in validation.cpp — in particular
         %% the BlockMerkleRoot() recomputation that catches bad-txnmrklroot.
