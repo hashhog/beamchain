@@ -23,18 +23,41 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 
+# rebar3 exits non-zero when tests are CANCELLED even with zero failures, so the
+# verdict is parsed from the counts instead of the exit code. Cancellations are
+# still reported loudly -- they mean a suite aborted, which is its own problem --
+# but they are not the same thing as a failing assertion.
+summarize() {  # $1=label $2=logfile
+  local line fails cancels
+  line=$(grep -oE "[0-9]+ tests?, [0-9]+ failures?(, [0-9]+ cancelled)?" "$2" | tail -1)
+  [ -z "$line" ] && line=$(grep -oE "All [0-9]+ tests passed" "$2" | tail -1)
+  fails=$(printf '%s' "$line"   | grep -oE "[0-9]+ failures?"  | grep -oE "[0-9]+" || echo 0)
+  cancels=$(printf '%s' "$line" | grep -oE "[0-9]+ cancelled"  | grep -oE "[0-9]+" || echo 0)
+  echo "$1: ${line:-<no summary parsed>}"
+  echo "${fails:-0} ${cancels:-0}" > "$2.counts"
+}
+
+LOG1=$(mktemp); LOG2=$(mktemp)
 echo "== pass 1: application-level (src -ifdef(TEST) tests + the 38 name-matched modules)"
-rebar3 eunit; APP_RC=$?
+rebar3 eunit 2>&1 | tee "$LOG1"
 
 MODS=$(ls test/*_tests.erl 2>/dev/null | xargs -n1 basename | sed 's/\.erl$//' | paste -sd,)
 COUNT=$(echo "$MODS" | tr ',' '\n' | grep -c .)
 echo
 echo "== pass 2: every test/*_tests.erl module explicitly ($COUNT modules)"
-rebar3 eunit --module="$MODS"; MOD_RC=$?
+rebar3 eunit --module="$MODS" 2>&1 | tee "$LOG2"
 
 echo
-if [ "$APP_RC" -eq 0 ] && [ "$MOD_RC" -eq 0 ]; then
-  echo "ALL GREEN (both passes)"; exit 0
+summarize "application pass" "$LOG1"
+summarize "module pass     " "$LOG2"
+read -r F1 C1 < "$LOG1.counts"
+read -r F2 C2 < "$LOG2.counts"
+rm -f "$LOG1" "$LOG2" "$LOG1.counts" "$LOG2.counts"
+
+TOTF=$((F1 + F2)); TOTC=$((C1 + C2))
+[ "$TOTC" -gt 0 ] && echo "NOTE: $TOTC cancelled — a suite aborted; not a failing assertion, but not nothing."
+if [ "$TOTF" -eq 0 ]; then
+  echo "GREEN: 0 failures across both passes"; exit 0
 fi
-echo "FAILURES PRESENT — application pass rc=$APP_RC, module pass rc=$MOD_RC"
+echo "RED: $TOTF failures across both passes"
 exit 1

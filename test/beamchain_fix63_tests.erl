@@ -312,7 +312,19 @@ ensure_default_wallet() ->
             ok
     end.
 
+%% Called at the start of every fixture setup in this module, and from every
+%% teardown -- so isolating the datadir HERE covers every wallet the module
+%% creates, without touching each fixture.
+%%
+%% Without the isolation, wallet_dir/1 falls back to $HOME/.beamchain and all
+%% 10 wallet-touching test modules share ONE auto-loaded wallet.json. The
+%% locked-wallet test below encrypts it, so every test ordered after it -- in
+%% this run AND in every later run, because the file persists -- came up locked
+%% and got RPC -13 "Please enter the wallet passphrase" where it expected a
+%% signature. That one leak accounted for all 5 failures #89 surfaced.
+%% See beamchain_wallet_test_env for the full write-up.
 stop_default_wallet() ->
+    beamchain_wallet_test_env:ensure_isolated_datadir(),
     case whereis(beamchain_wallet) of
         undefined -> ok;
         Pid ->
