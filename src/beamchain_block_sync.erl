@@ -48,7 +48,11 @@
 %% so the BIP152 reconstruction-failure behaviour (collision -> full-block
 %% request, no ban) can be exercised without standing up the gen_server.
 %% test_new_state/0 is defined after the #state{} record below.
--export([do_handle_cmpctblock/5, test_new_state/0]).
+%% test_state/1 + test_get/2 build/inspect a #state{} from a map of field
+%% overrides so the frontier-lifecycle tests (issue #34) can drive the
+%% gen_server callbacks directly with a scripted state.
+-export([do_handle_cmpctblock/5, test_new_state/0,
+         test_state/1, test_get/2]).
 -endif.
 
 -define(SERVER, ?MODULE).
@@ -165,11 +169,54 @@
     %% Consecutive stall_check ticks where next_to_validate did not advance.
     %% Used to escalate the watchdog to force_unstick/2 when a single peer
     %% silently dropped a block request (no notfound, no block, no timeout).
-    stuck_ticks = 0        :: non_neg_integer()
+    stuck_ticks = 0        :: non_neg_integer(),
+
+    %% Height at which the watchdog last observed the stuck condition.
+    %% stuck_ticks accumulates ONLY while this height is unchanged: a
+    %% stuck tick observed at one height must never escalate at another.
+    %% Under validation backlog, ticks are processed minutes apart; two
+    %% ticks that each catch a transient empty-buffer moment at DIFFERENT
+    %% heights used to sum to ticks>=2 and force_unstick a healthy peer
+    %% (issue #34: the from-genesis rig killed its only peer every 287
+    %% blocks this way). Core analogue: m_stalling_since is cleared on
+    %% every completed block request (net_processing.cpp:1199-1230), so
+    %% stalling escalation never survives download progress.
+    stuck_height = -1      :: integer()
 }).
 
 -ifdef(TEST).
 test_new_state() -> #state{}.
+
+%% Build a #state{} from a map of overrides. Only the fields the
+%% frontier-lifecycle tests need are supported; peer_stats takes a map of
+%% Pid => InFlightCount and is expanded to #peer_stats{} records.
+test_state(Overrides) ->
+    maps:fold(fun
+        (status, V, S)           -> S#state{status = V};
+        (download_queue, V, S)   -> S#state{download_queue = V};
+        (in_flight, V, S)        -> S#state{in_flight = V};
+        (hash_to_height, V, S)   -> S#state{hash_to_height = V};
+        (downloaded, V, S)       -> S#state{downloaded = V};
+        (next_to_validate, V, S) -> S#state{next_to_validate = V};
+        (target_height, V, S)    -> S#state{target_height = V};
+        (peers, V, S)            -> S#state{peers = V};
+        (stuck_ticks, V, S)      -> S#state{stuck_ticks = V};
+        (peer_stats, V, S) ->
+            S#state{peer_stats = maps:map(
+                fun(_Pid, Count) ->
+                    #peer_stats{in_flight_count = Count}
+                end, V)}
+    end, #state{}, Overrides).
+
+test_get(status, S)           -> S#state.status;
+test_get(download_queue, S)   -> S#state.download_queue;
+test_get(in_flight, S)        -> S#state.in_flight;
+test_get(hash_to_height, S)   -> S#state.hash_to_height;
+test_get(downloaded, S)       -> S#state.downloaded;
+test_get(next_to_validate, S) -> S#state.next_to_validate;
+test_get(target_height, S)    -> S#state.target_height;
+test_get(peers, S)            -> S#state.peers;
+test_get(stuck_ticks, S)      -> S#state.stuck_ticks.
 -endif.
 
 %%% ===================================================================
@@ -459,7 +506,17 @@ handle_info(stall_check, #state{status = syncing,
                      orelse maps:size(State4#state.in_flight) > 0),
     State5 = case Stuck of
         true ->
-            NewCount = State4#state.stuck_ticks + 1,
+            %% stuck_ticks is per-height: escalate only when the SAME
+            %% height failed to advance on consecutive observations. A
+            %% count carried over from a previous height is stale — the
+            %% pipeline made progress in between, so this observation is
+            %% the FIRST at the current height (Core: m_stalling_since is
+            %% reset by every completed request, net_processing.cpp:1230,
+            %% so stalling never escalates across download progress).
+            NewCount = case State4#state.stuck_height =:= NextH of
+                true -> State4#state.stuck_ticks + 1;
+                false -> 1
+            end,
             logger:info("block_sync: watchdog — stuck at ~B, "
                         "downloaded=~B in_flight=~B ticks=~B",
                         [NextH, maps:size(State4#state.downloaded),
@@ -472,12 +529,14 @@ handle_info(stall_check, #state{status = syncing,
             %% RequestedAt not being refreshed by validation cycles.
             case NewCount >= 2 of
                 true ->
-                    force_unstick(NextH, State4#state{stuck_ticks = 0});
+                    force_unstick(NextH, State4#state{stuck_ticks = 0,
+                                                      stuck_height = NextH});
                 false ->
-                    State4#state{stuck_ticks = NewCount}
+                    State4#state{stuck_ticks = NewCount,
+                                 stuck_height = NextH}
             end;
         false ->
-            State4#state{stuck_ticks = 0}
+            State4#state{stuck_ticks = 0, stuck_height = -1}
     end,
     {noreply, State5};
 handle_info(stall_check, State) ->
@@ -738,7 +797,28 @@ blast_request_height(Height, #state{peers = Peers,
             %% Pick the first peer as the "official" in_flight owner
             case PeerList of
                 [] ->
-                    State;
+                    %% No connected peers right now — e.g. force_unstick
+                    %% just killed the only peer and its replacement is
+                    %% still handshaking. Do NOT drop the height from the
+                    %% request frontier: the caller already removed it
+                    %% from in_flight, so returning the state unchanged
+                    %% loses it entirely (not queued, not in flight, not
+                    %% downloaded) and validation can never pass it —
+                    %% issue #34's frontier hole, which forced the buffer
+                    %% to fill to MAX_DOWNLOADED_AHEAD and evict 64 good
+                    %% blocks every cycle. Re-queue it at the FRONT so
+                    %% the next fill_pipeline (peer_connected) requests
+                    %% it first. Core never drops a window block: every
+                    %% in-flight removal leaves the block eligible for
+                    %% FindNextBlocksToDownload's next walk
+                    %% (net_processing.cpp:1199, 1394).
+                    logger:warning("block_sync: blast_request — no "
+                                   "connected peers, re-queueing height "
+                                   "~B at front", [Height]),
+                    Queue1 = [Height |
+                              lists:delete(Height,
+                                           State#state.download_queue)],
+                    State#state{download_queue = Queue1};
                 [Primary | _Others] ->
                     InFlight2 = maps:put(Height, {Primary, Now, Hash}, InFlight),
                     H2H2 = maps:put(Hash, Height, H2H),

@@ -355,3 +355,269 @@ syncing_no_change_when_new_target_not_higher_test() ->
     OldQueue = [945120, 945121],
     ?assertEqual(OldQueue, extend_queue(945200, 945200, OldQueue)),
     ?assertEqual(OldQueue, extend_queue(945200, 945100, OldQueue)).
+
+%%% ===================================================================
+%%% Issue #34 — frontier-request lifecycle regression tests
+%%%
+%%% The from-genesis R4 rig soft-deadlocked every ~287 blocks: the
+%%% watchdog force_unstick killed the (healthy) pinned peer, the blast
+%%% re-request then ran against ZERO connected peers (the replacement
+%%% was still handshaking) and silently DROPPED next_to_validate from
+%%% the request frontier — not queued, not in flight, not downloaded.
+%%% With the head missing, the refill ramp packed the buffer to
+%%% MAX_DOWNLOADED_AHEAD, the deadlock branch evicted 64 good blocks
+%%% and finally re-planted the head; ~193 blocks later the eviction gap
+%%% caused a ticks=1 stall observation, and because stuck_ticks carried
+%%% over ACROSS heights, the very next tick that caught a transient
+%%% empty-buffer moment at a DIFFERENT height summed to ticks=2 and
+%%% killed the healthy peer again. Period: 192 (post-evict buffer) + 1
+%%% (blast) + 30 (arrival races) + 64 (re-fetched evictions) = 287.
+%%%
+%%% Core reference: a removed block request never leaves the download
+%%% window (net_processing.cpp:1199 RemoveBlockRequest + :1394
+%%% FindNextBlocksToDownload re-walks every non-received block), and
+%%% stalling state is cleared on every completed request
+%%% (net_processing.cpp:1230), so stalling escalation never survives
+%%% download progress.
+%%%
+%%% These tests drive the gen_server callbacks directly on a scripted
+%%% #state{} (test_state/1) with meck on the collaborators, so both the
+%%% frontier hole and the watchdog carryover reproduce deterministically
+%%% without timers.
+%%% ===================================================================
+
+-define(MOCKED, [beamchain_db, beamchain_peer, beamchain_peer_manager,
+                 beamchain_chainstate, beamchain_validation,
+                 beamchain_serialize, beamchain_sync]).
+
+%%% ===================================================================
+%%% Fixtures
+%%% ===================================================================
+
+setup() ->
+    Tab = ets:new(frontier_test_tip, [set, public]),
+    ets:insert(Tab, {tip, {height_hash(99), 99}}),
+    lists:foreach(fun(M) -> ok = meck:new(M, [no_link]) end, ?MOCKED),
+    ok = meck:expect(beamchain_db, get_block_index,
+        fun(H) ->
+            {ok, #{hash => height_hash(H), header => mk_header(H),
+                   chainwork => H, n_tx => 1}}
+        end),
+    ok = meck:expect(beamchain_db, store_block_index,
+        fun(_, _, _, _, _) -> ok end),
+    ok = meck:expect(beamchain_db, store_block_index,
+        fun(_, _, _, _, _, _) -> ok end),
+    ok = meck:expect(beamchain_peer, send_message,
+        fun(_Peer, _Msg) -> ok end),
+    ok = meck:expect(beamchain_peer, disconnect, fun(_) -> ok end),
+    ok = meck:expect(beamchain_peer, add_misbehavior, fun(_, _) -> ok end),
+    ok = meck:expect(beamchain_peer_manager, get_peers, fun() -> [] end),
+    ok = meck:expect(beamchain_chainstate, get_tip,
+        fun() -> [{tip, T}] = ets:lookup(Tab, tip), {ok, T} end),
+    ok = meck:expect(beamchain_chainstate, connect_block,
+        fun(#block{header = #block_header{merkle_root = <<H:256>>}}) ->
+            ets:insert(Tab, {tip, {height_hash(H), H}}),
+            ok
+        end),
+    ok = meck:expect(beamchain_validation, check_block,
+        fun(_, _) -> ok end),
+    ok = meck:expect(beamchain_serialize, block_hash,
+        fun(#block_header{merkle_root = MR}) -> MR end),
+    ok = meck:expect(beamchain_sync, notify_blocks_complete,
+        fun(_) -> ok end),
+    Tab.
+
+teardown(Tab) ->
+    lists:foreach(fun(M) -> catch meck:unload(M) end, ?MOCKED),
+    ets:delete(Tab),
+    flush_all().
+
+frontier_test_() ->
+    {foreach, fun setup/0, fun teardown/1,
+     [fun(_) -> {"forced eviction with no peers keeps the height in "
+                 "the frontier and refills without the timeout path",
+                 fun frontier_survives_forced_eviction/0} end,
+      fun(_) -> {"watchdog stuck count does not carry across heights "
+                 "(no healthy-peer kill after progress)",
+                 fun watchdog_no_cross_height_carryover/0} end]}.
+
+%%% ===================================================================
+%%% Test 1: the frontier hole (issue #34 root cause A)
+%%%
+%%% Wedge instant from the rig: next_to_validate is in flight from a
+%%% dead peer, no replacement connected yet, watchdog escalating.
+%%% force_unstick evicts the in_flight entry and blast-requests the
+%%% height — with zero connected peers. The height MUST remain in the
+%%% request frontier (queue/in_flight/downloaded); when the replacement
+%%% peer connects, it must be requested FIRST and sync must run to
+%%% completion with no stall-timeout involvement.
+%%% ===================================================================
+
+frontier_survives_forced_eviction() ->
+    put(getdata_seen, 0),
+    DeadPid = spawn(fun() -> ok end),
+    Now = erlang:monotonic_time(millisecond),
+    S0 = beamchain_block_sync:test_state(#{
+        status           => syncing,
+        next_to_validate => 100,
+        target_height    => 140,
+        download_queue   => lists:seq(101, 140),
+        in_flight        => #{100 => {DeadPid, Now, height_hash(100)}},
+        hash_to_height   => #{height_hash(100) => 100},
+        downloaded       => #{},
+        peers            => #{},
+        peer_stats       => #{},
+        stuck_ticks      => 1
+    }),
+
+    %% Two watchdog ticks at the same stuck height escalate to
+    %% force_unstick (with per-height tracking the first tick counts 1,
+    %% the second 2; the pre-fix code escalates on the first already —
+    %% either way the eviction + empty blast has happened after two).
+    {noreply, S1} = beamchain_block_sync:handle_info(stall_check, S0),
+    {noreply, S2} = beamchain_block_sync:handle_info(stall_check, S1),
+    flush_getdata(),
+
+    %% THE frontier invariant (Core: a removed request never leaves the
+    %% download window): height 100 is still queued, in flight, or
+    %% downloaded. The unfixed code dropped it in blast_request_height's
+    %% no-peers branch.
+    ?assert(in_frontier(100, S2)),
+
+    %% Replacement peer completes its handshake. The frontier head must
+    %% be requested first, and serving every getdata (no stall timeouts,
+    %% no further watchdog ticks) must complete the sync.
+    P1 = spawn(fun() -> receive stop -> ok end end),
+    {noreply, S3} = beamchain_block_sync:handle_cast(
+                      {peer_connected, P1, #{}}, S2),
+    FirstBatch = collect_getdata(),
+    ?assert(lists:member(height_hash(100), FirstBatch)),
+
+    S4 = serve_until_quiescent(P1, FirstBatch, S3, 2000),
+    ?assertEqual(141, beamchain_block_sync:test_get(next_to_validate, S4)),
+    ?assertEqual(complete, beamchain_block_sync:test_get(status, S4)),
+    P1 ! stop.
+
+%%% ===================================================================
+%%% Test 2: watchdog cross-height carryover (issue #34 root cause B)
+%%%
+%%% A ticks=1 observation at one height must not combine with a later
+%%% observation at a DIFFERENT height into an escalation: in between
+%%% the pipeline made progress, so the peer is healthy. The unfixed
+%%% code killed the rig's only peer this way every 287 blocks. A
+%%% genuine same-height repeat must still escalate (eviction preserved).
+%%% ===================================================================
+
+watchdog_no_cross_height_carryover() ->
+    put(getdata_seen, 0),
+    P1 = spawn(fun() -> receive stop -> ok end end),
+    Now = erlang:monotonic_time(millisecond),
+    S0 = beamchain_block_sync:test_state(#{
+        status           => syncing,
+        next_to_validate => 100,
+        target_height    => 400,
+        download_queue   => [101],
+        in_flight        => #{100 => {P1, Now, height_hash(100)}},
+        hash_to_height   => #{height_hash(100) => 100},
+        downloaded       => #{},
+        peers            => #{P1 => #{}},
+        peer_stats       => #{P1 => 1},
+        stuck_ticks      => 0
+    }),
+
+    %% Tick 1: stuck at 100 -> counts 1, no escalation.
+    {noreply, S1} = beamchain_block_sync:handle_info(stall_check, S0),
+    ?assertEqual(0, meck:num_calls(beamchain_peer, disconnect, '_')),
+
+    %% Progress: 100 arrives and connects; the refill puts 101 in
+    %% flight (fresh request to the same healthy peer).
+    {noreply, S2} = beamchain_block_sync:handle_cast(
+                      {block, P1, mk_block(100)}, S1),
+    flush_getdata(),
+    ?assertEqual(101, beamchain_block_sync:test_get(next_to_validate, S2)),
+    ?assert(maps:is_key(101, beamchain_block_sync:test_get(in_flight, S2))),
+
+    %% Tick 2: first stuck observation at 101. The count from height 100
+    %% is stale — this must NOT escalate and must NOT kill the peer.
+    {noreply, S3} = beamchain_block_sync:handle_info(stall_check, S2),
+    ?assertEqual(0, meck:num_calls(beamchain_peer, disconnect, '_')),
+    ?assert(maps:is_key(P1, beamchain_block_sync:test_get(peers, S3))),
+
+    %% Tick 3: SECOND stuck observation at 101 — a genuine wedge at one
+    %% height. Escalation (force_unstick -> disconnect) must still fire:
+    %% stalled-request eviction is preserved.
+    {noreply, _S4} = beamchain_block_sync:handle_info(stall_check, S3),
+    ?assertEqual(1, meck:num_calls(beamchain_peer, disconnect, '_')),
+    P1 ! stop.
+
+%%% ===================================================================
+%%% Helpers
+%%% ===================================================================
+
+height_hash(H) -> <<H:256>>.
+
+mk_header(H) ->
+    #block_header{
+        version     = 1,
+        prev_hash   = height_hash(H - 1),
+        merkle_root = height_hash(H),
+        timestamp   = 1296688602 + H,
+        bits        = 16#1d00ffff,
+        nonce       = 0
+    }.
+
+mk_block(H) ->
+    #block{header = mk_header(H), transactions = []}.
+
+in_frontier(Height, S) ->
+    lists:member(Height,
+                 beamchain_block_sync:test_get(download_queue, S))
+        orelse maps:is_key(Height,
+                           beamchain_block_sync:test_get(in_flight, S))
+        orelse maps:is_key(Height,
+                           beamchain_block_sync:test_get(downloaded, S)).
+
+%% Serve every outstanding getdata (perfectly responsive peer) and drain
+%% continue_validation self-messages until nothing is pending. Never
+%% invokes the stall/watchdog path — liveness must come from the
+%% request lifecycle alone.
+serve_until_quiescent(_Peer, _Hashes, S, 0) ->
+    S;
+serve_until_quiescent(Peer, [<<H:256>> | Rest], S, Fuel) ->
+    {noreply, S2} = beamchain_block_sync:handle_cast(
+                      {block, Peer, mk_block(H)}, S),
+    serve_until_quiescent(Peer, Rest ++ collect_getdata(), S2, Fuel - 1);
+serve_until_quiescent(Peer, [], S, Fuel) ->
+    receive
+        continue_validation ->
+            {noreply, S2} = beamchain_block_sync:handle_info(
+                              continue_validation, S),
+            serve_until_quiescent(Peer, collect_getdata(), S2, Fuel - 1)
+    after 0 ->
+        case collect_getdata() of
+            [] -> S;
+            More -> serve_until_quiescent(Peer, More, S, Fuel - 1)
+        end
+    end.
+
+%% getdata capture is meck-history based (fixture setup may run in a
+%% different process than the test body, so a mailbox capture is not
+%% reliable). A process-dictionary cursor yields only NEW requests.
+all_requested() ->
+    lists:append(
+      [[Hash || #{hash := Hash} <- Items]
+       || {_Pid, {beamchain_peer, send_message,
+                  [_Peer, {getdata, #{items := Items}}]}, _Ret}
+              <- meck:history(beamchain_peer)]).
+
+collect_getdata() ->
+    All = all_requested(),
+    Seen = case get(getdata_seen) of undefined -> 0; N -> N end,
+    put(getdata_seen, length(All)),
+    lists:nthtail(min(Seen, length(All)), All).
+
+flush_getdata() ->
+    put(getdata_seen, length(all_requested())).
+
+flush_all() ->
+    receive _ -> flush_all() after 0 -> ok end.
