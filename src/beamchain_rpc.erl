@@ -1795,6 +1795,11 @@ build_deployment_proplist(Network, Height, HeightGetter) ->
         Entries -> Entries
     end.
 
+rpc_getblockhash([Height]) when is_integer(Height), not (Height >= -2147483648
+                                                         andalso Height =< 2147483647) ->
+    %% getInt<int> fails in the CONVERSION, so an out-of-int32 height never
+    %% reaches the -8 domain test below.
+    {error, ?RPC_MISC_ERROR, <<"JSON integer out of range">>};
 rpc_getblockhash([Height]) when is_integer(Height), Height >= 0 ->
     case beamchain_db:get_block_index(Height) of
         {ok, #{hash := Hash}} ->
@@ -1814,12 +1819,18 @@ rpc_getblockhash(_) ->
 rpc_getblock([HashHex]) ->
     rpc_getblock([HashHex, 1]);
 rpc_getblock([HashHex, Verbosity]) when is_binary(HashHex) ->
+    %% getInt<int> before the block lookup: an out-of-int32 verbosity answered
+    %% -5 "Block not found" where Core answers -1.
+    case core_int32_arg(Verbosity) of
+      {error, VC, VM} -> {error, VC, VM};
+      ok ->
     %% No `of` clause: the catch must protect the lookup body too (a later
     %% ParseHashV guard may throw from inside the lookup, e.g. an optional
     %% blockhash argument on a sibling RPC).
     try rpc_getblock_lookup(parse_hash_v(HashHex, <<"blockhash">>), Verbosity)
     catch
         throw:{rpc_error, Code, Msg} -> {error, Code, Msg}
+    end
     end;
 rpc_getblock(_) ->
     {error, ?RPC_INVALID_PARAMS, <<"Usage: getblock \"hash\" ( verbosity )">>}.
@@ -2802,6 +2813,16 @@ rpc_getchaintxstats([]) ->
         not_found ->
             {error, ?RPC_MISC_ERROR, <<"Chain not found">>}
     end;
+rpc_getchaintxstats([NBlocks]) when is_integer(NBlocks),
+                                   not (NBlocks >= -2147483648
+                                        andalso NBlocks =< 2147483647) ->
+    %% getInt<int> fails in the CONVERSION: an out-of-int32 nblocks never
+    %% reaches the -8 "Invalid block count" domain test.
+    {error, ?RPC_MISC_ERROR, <<"JSON integer out of range">>};
+rpc_getchaintxstats([NBlocks, _BH]) when is_integer(NBlocks),
+                                         not (NBlocks >= -2147483648
+                                              andalso NBlocks =< 2147483647) ->
+    {error, ?RPC_MISC_ERROR, <<"JSON integer out of range">>};
 rpc_getchaintxstats([NBlocks]) when is_integer(NBlocks) ->
     case beamchain_chainstate:get_tip() of
         {ok, {Hash, Height}} ->
@@ -3351,6 +3372,11 @@ rpc_getrawtransaction([TxidHex]) ->
 rpc_getrawtransaction([TxidHex, Verbose]) ->
     rpc_getrawtransaction([TxidHex, Verbose, null]);
 rpc_getrawtransaction([TxidHex, Verbose, BlockHashParam]) when is_binary(TxidHex) ->
+    %% getInt<int> before the tx lookup: an out-of-int32 verbosity answered -5
+    %% "No such mempool or blockchain transaction" where Core answers -1.
+    case core_int32_arg(Verbose) of
+      {error, VC, VM} -> {error, VC, VM};
+      ok ->
     %% No `of` clause: the optional blockhash (param 3) is parsed via ParseHashV
     %% deeper in the lookup (rpc_getrawtransaction_lookup); its -8 throw must be
     %% caught here too.
@@ -3358,6 +3384,7 @@ rpc_getrawtransaction([TxidHex, Verbose, BlockHashParam]) when is_binary(TxidHex
           parse_hash_v(TxidHex, <<"parameter 1">>), Verbose, BlockHashParam)
     catch
         throw:{rpc_error, Code, Msg} -> {error, Code, Msg}
+    end
     end;
 rpc_getrawtransaction(_) ->
     {error, ?RPC_INVALID_PARAMS,
@@ -3790,6 +3817,19 @@ core_in_int32(V) when is_integer(V) ->
     V >= -2147483648 andalso V =< 2147483647;
 core_in_int32(_) ->
     false.
+
+%% core_int32_arg/1 — Core's getInt<int> as an EARLY guard for handlers whose
+%% own domain test or lookup would otherwise answer first.  Erlang integers
+%% are arbitrary-precision, so a hostile argument arrives INTACT and every
+%% handler below simply acted on a number Core refuses.  Returns ok, or an
+%% {error, Code, Msg} the caller returns unchanged.
+core_int32_arg(V) when is_integer(V) ->
+    case core_in_int32(V) of
+        true  -> ok;
+        false -> {error, ?RPC_MISC_ERROR, <<"JSON integer out of range">>}
+    end;
+core_int32_arg(_) ->
+    ok.
 
 parse_createraw_version(undefined) -> 2;
 parse_createraw_version(null)      -> 2;
@@ -7265,6 +7305,28 @@ rpc_disconnectnode([Address]) when is_binary(Address) ->
         {error, Msg} ->
             {error, ?RPC_INVALID_PARAMETER, Msg}
     end;
+rpc_disconnectnode([Address, NodeId]) when (Address =:= <<>> orelse Address =:= null),
+                                           is_integer(NodeId) ->
+    %% Core (rpc/net.cpp): "to disconnect by nodeid, either set `address` to
+    %% the empty string, or call using the named `nodeid` argument only".
+    %% beamchain read only params[0] and answered -32602 with a usage string
+    %% for every by-id call -- the form getpeerinfo's "id" field exists to feed.
+    %% getpeerinfo reports id as the index into get_peers(), so by-id
+    %% disconnect uses the SAME mapping or the two disagree.
+    Peers = beamchain_peer_manager:get_peers(),
+    case NodeId >= 0 andalso NodeId < length(Peers) of
+        true ->
+            #{pid := Pid} = lists:nth(NodeId + 1, Peers),
+            beamchain_peer_manager:disconnect_peer(Pid),
+            {ok, null};
+        false ->
+            {error, ?RPC_CLIENT_NODE_NOT_CONNECTED,
+             <<"Node not found in connected nodes">>}
+    end;
+rpc_disconnectnode([Address, NodeId]) when is_binary(Address), is_integer(NodeId) ->
+    %% Strictly one of address and nodeid (rpc/net.cpp).
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Only one of address and nodeid should be provided.">>};
 rpc_disconnectnode(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"Usage: disconnectnode \"address\"">>}.
@@ -14439,6 +14501,13 @@ script_asm_push_token_sighash(Data) ->
 %% (pubkeys in input order; no BIP-67 sorting — Core's GetScriptForMultisig).
 rpc_createmultisig([NRequired, Keys]) ->
     rpc_createmultisig([NRequired, Keys, <<"legacy">>]);
+rpc_createmultisig([NRequired, _Keys, _AddrType]) when is_integer(NRequired),
+                                                      not (NRequired >= -2147483648
+                                                           andalso NRequired =< 2147483647) ->
+    %% Core reads nrequired with getInt<int>, and the conversion runs before
+    %% the key-count checks -- so -1, not -32602, even when pubkeys is ALSO
+    %% empty.
+    {error, ?RPC_MISC_ERROR, <<"JSON integer out of range">>};
 rpc_createmultisig([NRequired, Keys, AddrType]) when is_integer(NRequired),
                                                       is_list(Keys),
                                                       is_binary(AddrType) ->
