@@ -26,6 +26,10 @@
 %% Exported for testing — Core-strict assumeutxo height whitelist check.
 -export([validate_snapshot_height/2]).
 
+%% Exported for testing — Core's central argument-count gate (#103) and the
+%% method list it consults. dispatch/2 is the only production caller.
+-export([core_arity_violation/2, beamchain_method_names/0]).
+
 %% Exported for testing — dumptxoutset rollback target resolution.
 %% Pure function; no side effects beyond DB lookups for height/hash → index.
 -export([resolve_dump_target/5]).
@@ -746,6 +750,61 @@ check_rate_limit(IP) ->
     end.
 
 %%% ===================================================================
+%%% Core's central argument-count gate (#103)
+%%% ===================================================================
+%%
+%% Core validates argument COUNT in one place, after the method lookup and
+%% before any handler runs (rpc/util.cpp:644 -> IsValidNumArgs, :733):
+%% Required =< N =< Declared, else it throws the help text as error -1.
+%% beamchain went straight into handle_method/3, so surplus positional
+%% arguments were silently dropped.
+%%
+%% Verified read-only against the live Core oracle 2026-08-31:
+%%   getblockhash []           -> -1 "getblockhash height"
+%%   getblockcount ["surplus"] -> -1 "getblockcount"
+%%
+%% ORDERING. Core looks the method up first, so an unknown name must stay
+%% -32601 and never become -1. handle_method/3 both resolves AND executes, so
+%% the gate cannot simply run first for every name. It therefore fires only for
+%% methods beamchain actually serves -- the intersection of its own help list
+%% with Core's table. A method Core declares but beamchain does not implement
+%% still falls through to the -32601 clause, unchanged.
+%%
+%% Named params (a map) are exempt: Core resolves those by name instead.
+core_arity_violation(Method, Params) when is_binary(Method), is_list(Params) ->
+    case lists:member(Method, beamchain_method_names()) of
+        false ->
+            false;
+        true ->
+            case beamchain_core_arity:lookup(Method) of
+                error ->
+                    %% Not in the table (coverage is 87 of 103) -- fail OPEN.
+                    false;
+                {ok, {Required, Declared}} ->
+                    N = length(Params),
+                    N < Required orelse N > Declared
+            end
+    end;
+core_arity_violation(_, _) ->
+    %% Non-list params (a named-argument map, or a malformed request) are not
+    %% subject to the positional count check.
+    false.
+
+%% The method names beamchain serves, taken from the same help listing the
+%% `help' RPC prints, so the two cannot drift apart. Header lines ("== ... ==")
+%% and the argument part of each signature are stripped.
+beamchain_method_names() ->
+    lists:filtermap(
+      fun(Line) ->
+              case binary:split(Line, <<" ">>) of
+                  [<<"==", _/binary>> | _] -> false;
+                  [Name | _] when Name =/= <<>> -> {true, Name};
+                  _ -> false
+              end
+      end,
+      rpc_help_lines()).
+
+%%% ===================================================================
 %%% JSON-RPC dispatch
 %%% ===================================================================
 
@@ -757,6 +816,11 @@ dispatch(Request, WalletName) ->
                 error_obj(Id, ?RPC_INVALID_REQUEST, <<"Missing method">>);
             Method ->
                 Params = maps:get(<<"params">>, Request, []),
+                case core_arity_violation(Method, Params) of
+                    true ->
+                        error_obj(Id, ?RPC_MISC_ERROR,
+                                  <<"Wrong number of arguments">>);
+                    false ->
                 case handle_method(Method, Params, WalletName) of
                     {ok, Result} ->
                         result_obj(Id, Result);
@@ -767,6 +831,7 @@ dispatch(Request, WalletName) ->
                         {raw_json, raw_result_obj(Id, JsonBin)};
                     {error, Code, Msg} ->
                         error_obj(Id, Code, Msg)
+                end
                 end
         end
     catch
@@ -1005,8 +1070,10 @@ rpc_help([]) -> rpc_help_list();
 rpc_help([Command]) when is_binary(Command) -> rpc_help_command(Command);
 rpc_help(_) -> rpc_help_list().
 
-rpc_help_list() ->
-    Lines = [
+%% The raw help listing. Split out of rpc_help_list/0 so the #103 arity gate
+%% and the `help' RPC read the SAME list and cannot drift apart.
+rpc_help_lines() ->
+    [
         <<"== Blockchain ==">>,
         <<"getbestblockhash">>,
         <<"getblock \"blockhash\" ( verbosity )">>,
@@ -1149,8 +1216,10 @@ rpc_help_list() ->
         <<"== assumeUTXO ==">>,
         <<"loadtxoutset \"path\"">>,
         <<"dumptxoutset \"path\" ( \"type\" {\"rollback\":n|\"hash\"} )">>
-    ],
-    {ok, iolist_to_binary(lists:join(<<"\n">>, Lines))}.
+    ].
+
+rpc_help_list() ->
+    {ok, iolist_to_binary(lists:join(<<"\n">>, rpc_help_lines()))}.
 
 rpc_help_command(_Command) ->
     {ok, <<"No detailed help available for this command yet">>}.
