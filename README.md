@@ -13,12 +13,19 @@ docker run -v beamchain-data:/data -p 48348:48348 -p 48338:48338 beamchain
 
 ### From Source
 
+Toolchain: Erlang/OTP 27 + rebar3 3.24 (the tested/CI version; no manifest pins OTP).
+System deps: C compiler, `cmake`, `git` and a C++ toolchain + `libsnappy`/`liblz4`/`libzstd` dev headers —
+`c_src/Makefile` clones and builds libsecp256k1 `v0.5.1`, and `rebar.config` builds erlang-rocksdb `9.10.0-emqx-2` from git (network required).
+
 ```bash
 rebar3 compile
 rebar3 escriptize
 ./beamchain start --network=testnet4
 ./beamchain --help
 ```
+
+Note: `rebar.config` states escript mode is unsupported (the RocksDB NIF cannot load from an escript archive);
+the deployed path is `rebar3 as prod release` then `_build/prod/rel/beamchain/bin/beamchain daemon`.
 
 ## Features
 
