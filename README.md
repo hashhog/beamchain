@@ -2,6 +2,48 @@
 
 A Bitcoin full node implementation in Erlang/OTP.
 
+## Status — v1.0.0
+
+**Label: "Validated — reproduced Core's UTXO set from genesis with all scripts
+verified"** (`receipts/RELEASE-v1.0-SCORECARD.md`, §What each label means). That
+label means one specific thing: beamchain connected every mainnet block from block 0
+to height 958,794 with its assumevalid gate off, serialized its entire UTXO set,
+and produced the byte string
+`29692050559b8f064a03af9cd605040e71d1d978fa22947c079cc7e5546e7af0` over
+166,180,925 coins — the same value Bitcoin Core's `dumptxoutset` produced at that
+height. A single wrong coin anywhere in fifteen years changes that hash. The git
+tag `v0.1.0-rc1` (`receipts/RELEASE-v1.0-FREEZE.md`) marks the same bar: `rc` in this
+project certifies that reproduction and nothing else
+(`receipts/beta1-tag-drafts-2026-08-20.md:23-27`). Neither label certifies wallet
+or fund-custody readiness — see `SECURITY.md`.
+
+**Operator RPC parity: 60 of Bitcoin Core's 85** — the highest of the ten
+implementations, and still 25 short of Core. From the 103-method R5 operator
+probe run 2026-09-01
+(`tools/diff-test-artifacts/r5-probe/20260901T182642Z.json`): beamchain 60 PASS /
+25 FAIL, Bitcoin Core 85 PASS on the same probe, 18 methods unmeasured
+(`SKIP-REGTEST`) for every node including Core.
+
+**Known gaps in this repo** (`receipts/UNIT-BASELINE-v1.0.md`, 2026-09-01):
+beamchain is the only node whose unit suite was already green when the v1.0
+baseline was taken — 2808 tests, 0 failures, 0 carried gaps; 8 suites are
+*cancelled* (they abort rather than assert), which the baseline counts as
+neither pass nor failure. One closed item worth recording: until `8622118`,
+verbose `getblockheader` fell back to Bitcoin Core's own RPC on
+127.0.0.1:8332 for `nTx` when the local index held 0
+(`receipts/beamchain-r3-proxy-survivor-2026-08-23.md`). It was measured dormant
+— zero such connections observed across eight sampled heights — and the fallback
+was removed on 2026-08-27 in `8622118`, which is an ancestor of this repository's
+HEAD. The release scorecard also records beamchain stateful-prover shims that did not
+launch in the 2026-09-01 nightly — it counts three and names two,
+`checkheader_prove_beamchain.py` and `bip30_prove_beamchain.py`.
+
+**Fleet-wide comparison:** `receipts/RELEASE-v1.0-SCORECARD.md` in the
+[hashhog meta-repo](https://github.com/hashhog/hashhog).
+
+> Paths beginning `receipts/`, `tools/`, `docs/` and `CORE-PARITY-AUDIT/` refer to
+> the hashhog meta-repo, not to this repository.
+
 ## Quick Start
 
 ### Docker
@@ -26,6 +68,15 @@ rebar3 escriptize
 
 Note: `rebar.config` states escript mode is unsupported (the RocksDB NIF cannot load from an escript archive);
 the deployed path is `rebar3 as prod release` then `_build/prod/rel/beamchain/bin/beamchain daemon`.
+
+**Two committed sources disagree about which artifact ships.** The meta-repo's
+`CLAUDE.md` lists beamchain's binary as `_build/default/bin/beamchain (escript)` and
+relies on `build-all.sh`'s `rebar3 escriptize` step as its rot protection, while this
+file and `rebar.config` name the prod release. The project's own notes record the cost
+of that ambiguity: "beamchain's differential measures the prod release while mainnet
+runs the escript, so a real fix measured as no-change"
+(`CORE-PARITY-AUDIT/_loop-ledger.md:16025-16026`). Confirm which artifact you are
+running before drawing conclusions from either.
 
 ## Features
 
@@ -102,7 +153,7 @@ the deployed path is `rebar3 as prod release` then `_build/prod/rel/beamchain/bi
 
 ## RPC API
 
-Bitcoin Core-compatible JSON-RPC with batch request support.
+JSON-RPC modelled on Bitcoin Core's, with batch request support. Not behaviourally compatible: on the 2026-09-01 operator probe beamchain answers 60 of the 103 probed methods correctly against Core's 85 — the highest of the ten implementations, and still 25 short (`tools/diff-test-artifacts/r5-probe/20260901T182642Z.json`).
 
 | Category | Methods |
 |----------|---------|
