@@ -11,13 +11,16 @@ to height 958,794 with its assumevalid gate off, serialized its entire UTXO set,
 and produced the byte string
 `29692050559b8f064a03af9cd605040e71d1d978fa22947c079cc7e5546e7af0` over
 166,180,925 coins — the same value Bitcoin Core's `dumptxoutset` produced at that
-height. A single wrong coin anywhere in fifteen years changes that hash. The git
+height. A single wrong coin anywhere in fifteen years changes that hash — the *capture* is unfakeable. **The lineage under it is not checkable from a clone:** what the ledger row records is height, hash and coin count; that the chain beneath was built from genesis with assumevalid off rests on the row's `lineage receipt` column, and four of the five rows point at logs under `/home/work/genesis-ibd/logs/` — outside any repository and uncommitted — while blockbrew's says only `--commit` (`receipts/TRUST-ANCHOR.md:141-145`). The git
 tag `v0.1.0-rc1` (`receipts/RELEASE-v1.0-FREEZE.md`) marks the same bar: `rc` in this
 project certifies that reproduction and nothing else
 (`receipts/beta1-tag-drafts-2026-08-20.md:23-27`). Neither label certifies wallet
 or fund-custody readiness — see `SECURITY.md`.
 
-**Operator RPC parity: 60 of Bitcoin Core's 85** — the highest of the ten
+**Operator RPC parity: 60 of Bitcoin Core's 85** — arithmetically the highest of
+the ten *in this run*; two probe runs ten minutes apart disagreed by ±2 on other
+nodes with no deploy between them, so treat the ranking as run-scoped, not as a
+standing property
 implementations, and still 25 short of Core. From the 103-method R5 operator
 probe run 2026-09-01
 (`tools/diff-test-artifacts/r5-probe/20260901T182642Z.json`): beamchain 60 PASS /
@@ -34,15 +37,23 @@ verbose `getblockheader` fell back to Bitcoin Core's own RPC on
 (`receipts/beamchain-r3-proxy-survivor-2026-08-23.md`). It was measured dormant
 — zero such connections observed across eight sampled heights — and the fallback
 was removed on 2026-08-27 in `8622118`, which is an ancestor of this repository's
-HEAD. The release scorecard also records beamchain stateful-prover shims that did not
-launch in the 2026-09-01 nightly — it counts three and names two,
-`checkheader_prove_beamchain.py` and `bip30_prove_beamchain.py`.
+HEAD. **Two** beamchain stateful-prover shims did not launch in the 2026-09-01 nightly:
+`checkheader_prove_beamchain.py` and `bip30_prove_beamchain.py`
+(`consensus-diff-artifacts/diffguard-20260901T083001Z.log:110,123`). An earlier
+draft of the release scorecard said three and named two; the scorecard is now
+corrected to two, and this line no longer passes the error through.
 
 **Fleet-wide comparison:** `receipts/RELEASE-v1.0-SCORECARD.md` in the
 [hashhog meta-repo](https://github.com/hashhog/hashhog).
 
 > Paths beginning `receipts/`, `tools/`, `docs/` and `CORE-PARITY-AUDIT/` refer to
 > the hashhog meta-repo, not to this repository.
+> **Two notes on the citations above.** The R5 probe JSON is **gitignored** in the
+> meta-repo (`.gitignore:60  tools/diff-test-artifacts/`), so a stranger cloning
+> either repository cannot read it; regenerate it with `python3 tools/r5_probe.py`
+> against a running fleet. The nightly `diffguard-*.log` files are likewise
+> gitignored (`.gitignore:43  *.log`). Paths under `receipts/`, `docs/` and
+> `CORE-PARITY-AUDIT/` are tracked, but in the **meta-repo**, not here.
 
 ## Quick Start
 
