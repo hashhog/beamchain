@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# hashhog convention (CLAUDE.md, stated twice): NO co-author trailers on any
+# commit. Enforced here rather than relied upon, because a harness-level
+# attribution setting silently overrode it on 2026-09-02 and the rule is only
+# as good as whoever remembers it. Strips the trailer lines and any blank
+# lines they leave behind. Local-only (.git/hooks is never committed).
+f="$1"
+grep -viE '^[[:space:]]*(Co-Authored-By|Claude-Session):' "$f" \
+  | grep -viE '^[[:space:]]*https://claude\.ai/code/session_' \
+  | awk 'BEGIN{b=0} {if($0 ~ /^[[:space:]]*$/){b++} else {b=0} if(b<2) print}' \
+  | awk 'NR>1 || NF' > "$f.tmp" && mv "$f.tmp" "$f"
+# trim trailing blank lines
+printf '%s\n' "$(cat "$f")" > "$f.tmp" && mv "$f.tmp" "$f"
