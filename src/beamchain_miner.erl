@@ -564,7 +564,11 @@ do_submit_decoded_block(Block) ->
                 %% become reorg candidates rather than being silently
                 %% dropped.  See chainstate:submit_block/1 docstring +
                 %% CORE-PARITY-AUDIT/_reorg-via-submitblock-fleet-result-2026-05-05.md.
-                case beamchain_chainstate:submit_block(Block) of
+                %% min_pow_checked = true: Core's submitblock passes
+                %% /*min_pow_checked=*/true (rpc/mining.cpp:1095), as does
+                %% generateblock (:157).  The anti-DoS work threshold guards
+                %% the p2p path, not a locally-authenticated RPC submission.
+                case beamchain_chainstate:submit_block(Block, true) of
                     {ok, Outcome} when Outcome =:= active;
                                        Outcome =:= reorg ->
                         %% Active-chain advance (either direct extension

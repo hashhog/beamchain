@@ -49,7 +49,7 @@
 %% it on arrival, so the existing reorganize/1 dispatcher (Pattern A)
 %% was structurally unreachable from the submitblock path.  This entry
 %% point closes both gaps.
--export([submit_block/1, refill_mempool_after_reorg/1]).
+-export([submit_block/1, submit_block/2, refill_mempool_after_reorg/1]).
 
 %% submit_header/1 is the header-only acceptance entry point used by the
 %% submitheader RPC.  It mirrors Bitcoin Core's
@@ -76,6 +76,7 @@
 -export([precious_block/1]).
 
 %% Block status constants (from beamchain_db)
+-define(BLOCK_VALID_HEADER, 1).
 -define(BLOCK_VALID_SCRIPTS, 5).
 -define(BLOCK_HAVE_DATA, 8).
 -define(BLOCK_HAVE_UNDO, 16).
@@ -316,7 +317,31 @@ reorganize(NewBlocks) ->
 -spec submit_block(#block{}) -> {ok, active | side_branch | reorg} |
                                 {error, term()}.
 submit_block(Block) ->
-    case gen_server:call(?SERVER, {submit_block, Block}, 300000) of
+    submit_block(Block, false).
+
+%% @doc submit_block/2 with Bitcoin Core's `min_pow_checked` argument.
+%%
+%% Core threads this per CALL SITE through ProcessNewBlock -> AcceptBlock ->
+%% AcceptBlockHeader, where a false value is what produces the
+%% "too-little-chainwork" rejection (validation.cpp:4229-4231).  The call
+%% sites are not uniform:
+%%
+%%   rpc/mining.cpp:1095  submitblock     -> min_pow_checked = TRUE
+%%   rpc/mining.cpp:157   generateblock   -> min_pow_checked = TRUE
+%%   net_processing.cpp:4795-4812  unsolicited p2p BLOCK -> computed from the
+%%                                 anti-DoS work threshold
+%%
+%% i.e. the anti-DoS gate exists to stop a PEER filling the block index with
+%% cheap headers; a locally-authenticated RPC submission is never subject to
+%% it.  beamchain applied it unconditionally, so `submitblock` of a
+%% perfectly valid historical block onto a low-work tip — every block above
+%% an assumeUTXO snapshot base on the range-validation ladder — was rejected
+%% with too_little_chainwork.  MinPowChecked = false keeps the existing
+%% behaviour for the p2p path.
+-spec submit_block(#block{}, boolean()) ->
+    {ok, active | side_branch | reorg} | {error, term()}.
+submit_block(Block, MinPowChecked) when is_boolean(MinPowChecked) ->
+    case gen_server:call(?SERVER, {submit_block, Block, MinPowChecked}, 300000) of
         {ok, reorg, DisconnectedTxs} ->
             refill_mempool_after_reorg(DisconnectedTxs),
             {ok, reorg};
@@ -952,8 +977,8 @@ handle_call({connect_block, Block}, _From, State) ->
             {reply, {error, Reason}, State}
     end;
 
-handle_call({submit_block, Block}, _From, State) ->
-    case do_submit_block(Block, State) of
+handle_call({submit_block, Block, MinPowChecked}, _From, State) ->
+    case do_submit_block(Block, MinPowChecked, State) of
         {ok, {reorg, DisconnectedTxs}, State2} ->
             %% Pattern B: surface disconnected non-coinbase txs to
             %% caller for out-of-process mempool refill (avoids
@@ -1225,26 +1250,50 @@ do_connect_block(#block{header = Header} = Block,
             do_connect_block_inner(Block, State)
     end.
 
-do_connect_block_inner(#block{header = Header} = Block,
-                       #state{tip_height = TipHeight, params = Params,
-                              mtp_timestamps = MTPTimestamps} = State) ->
-    Height = TipHeight + 1,
+do_connect_block_inner(Block, State) ->
+    case build_prev_index(State) of
+        {ok, PrevIndex} ->
+            do_connect_block_inner(Block, PrevIndex, State);
+        not_found ->
+            %% The parent of the block being connected is not in the block
+            %% index.  Answer with a plain rejection instead of raising:
+            %% error/1 here took the chainstate gen_server down and surfaced
+            %% at the RPC as -32603 "Internal error: exit: {{missing_prev_index
+            %% ,H}, ...}" rather than as a BIP-22 result string.
+            {error, missing_prev_index}
+    end.
 
-    %% Build PrevIndex for validation
-    PrevIndex = case TipHeight < 0 of
-        true ->
-            %% Genesis block — no previous block
-            #{height => -1, header => undefined,
-              chainwork => <<0:256>>, status => 2};
-        false ->
-            case beamchain_db:get_block_index(TipHeight) of
-                {ok, PI} ->
-                    %% Inject cached MTP timestamps so validation can compute
-                    %% median_time_past without walking the DB (11 lookups/block).
-                    PI#{mtp_timestamps => MTPTimestamps};
-                not_found -> error({missing_prev_index, TipHeight})
-            end
-    end,
+%% Resolve the current tip's block-index entry — the PrevIndex every
+%% contextual check of the incoming block runs against.
+%%
+%% Resolved BY HASH, not by height.  Bitcoin Core looks the parent up in the
+%% hash-keyed m_blockman.m_block_index (AcceptBlockHeader,
+%% bitcoin-core/src/validation.cpp:4190-4206) and never through a height
+%% projection, because a height index only describes ONE chain: mid-reorg, or
+%% on a chain whose lower band was never materialised (an assumeUTXO snapshot
+%% base), "the entry at height N" is either the wrong block or absent while
+%% the tip itself is perfectly well known.  beamchain_validation's MTP walk
+%% was already converted to a hash walk for exactly this reason (see
+%% collect_timestamps/3 there).
+build_prev_index(#state{tip_height = TipHeight}) when TipHeight < 0 ->
+    %% Genesis block — no previous block.
+    {ok, #{height => -1, header => undefined,
+           chainwork => <<0:256>>, status => 2}};
+build_prev_index(#state{tip_hash = TipHash, tip_height = TipHeight,
+                        mtp_timestamps = MTPTimestamps}) ->
+    case lookup_block_index_anywhere(TipHash) of
+        {ok, PI} ->
+            %% Inject cached MTP timestamps so validation can compute
+            %% median_time_past without walking the DB (11 lookups/block).
+            {ok, PI#{height => maps:get(height, PI, TipHeight),
+                     mtp_timestamps => MTPTimestamps}};
+        not_found ->
+            not_found
+    end.
+
+do_connect_block_inner(#block{header = Header} = Block, PrevIndex,
+                       #state{tip_height = TipHeight, params = Params} = State) ->
+    Height = TipHeight + 1,
 
     %% Full consensus validation + UTXO update
     case beamchain_validation:connect_block(Block, Height, PrevIndex, Params) of
@@ -1557,20 +1606,25 @@ maybe_check_ibd(State) ->
 %%% (Pattern Y) and the rustoshi reference fix at 68a422b.
 %%% ===================================================================
 
-do_submit_block(#block{header = Header} = Block,
+do_submit_block(#block{header = Header} = Block, MinPowChecked,
                 #state{tip_hash = TipHash, tip_height = TipHeight,
                        params = Params} = State) ->
     PrevHash = Header#block_header.prev_hash,
     %% G8 (W97): min_pow_checked gate.
-    %% submit_block is the untrusted path (RPC submitblock + unsolicited peer
-    %% blocks).  It is NOT preceded by the PRESYNC anti-DoS pipeline that
-    %% guarantees the header chain reaches min_chainwork before AddToBlockIndex.
     %% Mirror Core validation.cpp:4229-4232: if !min_pow_checked, reject with
     %% too-little-chainwork unless the new block's cumulative work meets the
-    %% embedded minimum.  The PRESYNC-verified path uses connect_block/1 directly
-    %% and never goes through do_submit_block, so min_pow_checked is always false
-    %% here.
-    case check_min_pow_chainwork(Header, PrevHash, Params) of
+    %% embedded minimum.
+    %%
+    %% MinPowChecked is now threaded from the CALL SITE, as Core threads it
+    %% (see submit_block/2's doc comment).  The unsolicited-peer path passes
+    %% false and is unchanged; `submitblock` / `generateblock` pass true,
+    %% matching rpc/mining.cpp:1095 and :157, because a locally-authenticated
+    %% RPC submission is not what the anti-DoS threshold defends against.
+    MinPowResult = case MinPowChecked of
+        true  -> ok;
+        false -> check_min_pow_chainwork(Header, PrevHash, Params)
+    end,
+    case MinPowResult of
         ok ->
             %% If parent IS the active tip, take the happy path: validate+
             %% connect (UTXO update, atomic write).
@@ -3052,6 +3106,17 @@ do_load_snapshot_parse(Path, State, Network, NetworkMagic, BaseHash, BaseHeight)
                     logger:info("chainstate: loading ~B coins from snapshot at height ~B",
                                 [NumCoins, BaseHeight]),
 
+                    %% Materialise the base block (and, when the entry
+                    %% carries one, its pre-base header band) in the block
+                    %% index BEFORE anything else, so the base is a usable
+                    %% PARENT the moment the tip moves to it.  Done first so
+                    %% a broken ancestry aborts the load without having
+                    %% clobbered the UTXO cache.
+                    case graft_snapshot_base_index(BaseHash, BaseHeight,
+                                                   Network, State) of
+                        {error, GraftReason} ->
+                            {error, {snapshot_base_graft_failed, GraftReason}};
+                        {ok, MTPTimestamps} ->
                     %% Populate the UTXO cache
                     populate_utxo_cache_from_snapshot(Coins),
 
@@ -3064,7 +3129,8 @@ do_load_snapshot_parse(Path, State, Network, NetworkMagic, BaseHash, BaseHeight)
                         chainstate_role = snapshot,
                         snapshot_base_height = BaseHeight,
                         snapshot_base_hash = BaseHash,
-                        snapshot_validation = pending
+                        snapshot_validation = pending,
+                        mtp_timestamps = MTPTimestamps
                     },
 
                     %% Update ETS chain meta
@@ -3078,7 +3144,8 @@ do_load_snapshot_parse(Path, State, Network, NetworkMagic, BaseHash, BaseHeight)
                     %% this re-derivation is the non-circular check.
                     spawn(fun() -> start_background_validation(BaseHeight) end),
 
-                    {ok, State2, BaseHeight};
+                            {ok, State2, BaseHeight}
+                    end;
                 {error, BinMsg} when is_binary(BinMsg) ->
                     %% Verbatim Core "Bad snapshot content hash: ..." text.
                     {error, {snapshot_content_hash_mismatch, BinMsg}};
@@ -3114,6 +3181,209 @@ populate_utxo_cache_from_snapshot(Coins) ->
     NumCoins = length(Coins),
     logger:info("chainstate: loaded ~B coins into cache", [NumCoins]),
     ok.
+
+%%% -------------------------------------------------------------------
+%%% AssumeUTXO: make the snapshot base a real, usable PARENT.
+%%%
+%%% Bitcoin Core never has to do this.  ActivateSnapshot REFUSES a snapshot
+%%% whose base header is not already in the headers chain:
+%%%
+%%%     snapshot_start_block = m_blockman.LookupBlockIndex(base_blockhash);
+%%%     if (!snapshot_start_block) { return util::Error{... "The base block
+%%%         header (%s) must appear in the headers chain..."}; }
+%%%                             (bitcoin-core/src/validation.cpp:5611-5616)
+%%%
+%%% so by the time it reaches
+%%% `snapshot_chainstate.m_chain.SetTip(*snapshot_start_block)`
+%%% (validation.cpp:5917) the base already has a real CBlockIndex with a real
+%%% pprev chain, and every contextual check of the next block — expected
+%%% nBits, median-time-past, cumulative work — reads it straight off that
+%%% entry.
+%%%
+%%% beamchain's `import-utxo` deliberately accepts a snapshot with NO synced
+%%% headers: that is the premise of the range-validation ladder, which
+%%% fast-forwards a scratch node to an arbitrary rung.  Before this function
+%%% the load promoted the base in the CHAINSTATE only — coins flushed, ETS
+%%% CHAIN_META tip, the durable `chain_tip` meta key — and wrote no block
+%%% index entry for it at all.  The base was the tip and simultaneously
+%%% unknown to the index, so the first block above it died in
+%%% do_connect_block_inner/2 with `{missing_prev_index, BaseHeight}`.
+%%%
+%%% So beamchain has to materialise the base itself, from the ancestry the
+%%% campaign entry carries (base_header / base_tail_headers / chainwork —
+%%% see beamchain_chain_params:parse_campaign_ancestry/3).  A campaign band
+%%% is 2027 headers: 2016 so the next retarget's ancestor walk lands on a
+%%% real header, plus the 11 of the median-time-past window.
+%%%
+%%% Degrades LOUDLY, never silently: an entry with no ancestry (every
+%%% built-in production entry, which is only ever activated on a node that
+%%% has already synced headers) leaves the index untouched and says so at
+%%% warning volume.  Ancestry that is present but internally inconsistent —
+%%% bad PoW, broken linkage, chainwork too small for the band — fails the
+%%% load outright, because these bytes are spliced straight into the block
+%%% index.
+%%% -------------------------------------------------------------------
+
+graft_snapshot_base_index(BaseHash, BaseHeight, Network,
+                          #state{params = Params}) ->
+    case beamchain_db:get_block_index_by_hash(BaseHash) of
+        {ok, #{height := BaseHeight}} ->
+            %% Already indexed — a header sync got there first, or this
+            %% datadir was grafted by an earlier import.  This is Core's
+            %% precondition, met the ordinary way.
+            {ok, load_mtp_timestamps(BaseHeight)};
+        {ok, #{height := Other}} ->
+            {error, {snapshot_base_indexed_at_height, Other, BaseHeight}};
+        not_found ->
+            AuData = snapshot_base_ancestry(BaseHash, BaseHeight, Network),
+            do_graft_snapshot_base(BaseHash, BaseHeight, AuData, Params)
+    end.
+
+%% The assumeutxo entry for this base, looked up by hash first (the
+%% authoritative key) and by height as a fallback for the
+%% HASHHOG_UNSAFE_SNAPSHOT_HEIGHT path, where the base is not in any
+%% whitelist by hash.  #{} when there is no entry at all.
+snapshot_base_ancestry(BaseHash, BaseHeight, Network) ->
+    case beamchain_chain_params:get_assumeutxo_by_hash(BaseHash, Network) of
+        {ok, BaseHeight, Data} ->
+            Data;
+        _ ->
+            case beamchain_chain_params:get_assumeutxo(BaseHeight, Network) of
+                {ok, #{block_hash := BH} = D} when BH =:= BaseHash -> D;
+                _ -> #{}
+            end
+    end.
+
+do_graft_snapshot_base(BaseHash, BaseHeight, AuData, Params) ->
+    case {maps:get(base_tail_headers, AuData, undefined),
+          maps:get(chainwork, AuData, undefined)} of
+        {undefined, _} ->
+            logger:warning(
+              "chainstate: assumeutxo base ~s at height ~B carries no "
+              "base_header/base_tail_headers — the coins are loaded and "
+              "durable, but the base block is NOT in the block index, so "
+              "nothing can be connected on top of it until header sync "
+              "reaches height ~B",
+              [hash_hex(BaseHash), BaseHeight, BaseHeight]),
+            {ok, load_mtp_timestamps(BaseHeight)};
+        {_, undefined} ->
+            %% Cumulative work at the base cannot be derived from the band
+            %% (the work below it is missing) and must never be invented: it
+            %% decides every future best-chain comparison.
+            {error, {snapshot_base_ancestry_without_chainwork, BaseHeight}};
+        {Band, CW} ->
+            graft_snapshot_band(Band, BaseHash, BaseHeight, CW, AuData, Params)
+    end.
+
+graft_snapshot_band(Band, BaseHash, BaseHeight, CW, AuData, Params) ->
+    Len = length(Band),
+    FirstHeight = BaseHeight - (Len - 1),
+    case check_band_shape(Band, BaseHash, FirstHeight) of
+        {error, _} = Err -> Err;
+        ok ->
+            case check_band_pow(Band, Params) of
+                {error, _} = Err -> Err;
+                ok ->
+                    CWInt = binary:decode_unsigned(CW, big),
+                    case band_chainworks(Band, CWInt) of
+                        {error, _} = Err -> Err;
+                        {ok, Works} ->
+                            write_snapshot_band(
+                              lists:zip3(lists:seq(FirstHeight, BaseHeight),
+                                         Band, Works),
+                              BaseHeight),
+                            record_snapshot_base_tx_count(BaseHeight, AuData),
+                            logger:notice(
+                              "chainstate: grafted assumeutxo base ~s at "
+                              "height ~B into the block index with ~B "
+                              "pre-base headers (~B..~B), chainwork=~.16b",
+                              [hash_hex(BaseHash), BaseHeight, Len - 1,
+                               FirstHeight, BaseHeight, CWInt]),
+                            {ok, load_mtp_timestamps(BaseHeight)}
+                    end
+            end
+    end.
+
+%% Re-verified AT THE SPLICE, not only at parse time: linkage, the band's
+%% last header being the base, and that the band sits above genesis.
+check_band_shape(Band, BaseHash, FirstHeight) when FirstHeight >= 0 ->
+    case beamchain_serialize:block_hash(lists:last(Band)) =:= BaseHash of
+        false -> {error, snapshot_base_band_does_not_end_at_base};
+        true  -> check_band_links(Band)
+    end;
+check_band_shape(_Band, _BaseHash, _FirstHeight) ->
+    {error, snapshot_base_band_runs_below_genesis}.
+
+check_band_links([_]) ->
+    ok;
+check_band_links([A, B | Rest]) ->
+    case B#block_header.prev_hash =:= beamchain_serialize:block_hash(A) of
+        true  -> check_band_links([B | Rest]);
+        false -> {error, snapshot_base_band_unlinked}
+    end.
+
+%% Proof-of-work + bits-in-powlimit on every band header.  The CONTEXTUAL
+%% gates (expected difficulty, MTP) are deliberately not re-run: their
+%% inputs live below the band by construction, which is exactly the state
+%% this graft exists to represent.
+check_band_pow([], _Params) ->
+    ok;
+check_band_pow([H | Rest], Params) ->
+    case beamchain_validation:check_block_header(H, Params) of
+        ok -> check_band_pow(Rest, Params);
+        {error, Reason} ->
+            {error, {snapshot_base_band_bad_header,
+                     hash_hex(beamchain_serialize:block_hash(H)), Reason}}
+    end.
+
+%% Cumulative work descends from the base: work(prev) = work(h) - work_of(h).
+%% Returns one chainwork integer per band header, ASCENDING (same order as
+%% the band).  A band longer than the supplied work can account for is a
+%% broken fixture, not something to clamp.
+band_chainworks(Band, BaseCWInt) ->
+    band_chainworks_walk(lists:reverse(Band), BaseCWInt, []).
+
+band_chainworks_walk([_Oldest], CW, Acc) when CW > 0 ->
+    {ok, [CW | Acc]};
+band_chainworks_walk([_Oldest], _CW, _Acc) ->
+    {error, snapshot_base_chainwork_too_small_for_band};
+band_chainworks_walk([H | Rest], CW, Acc) when CW > 0 ->
+    PrevCW = CW - beamchain_pow:compute_work(H#block_header.bits),
+    band_chainworks_walk(Rest, PrevCW, [CW | Acc]);
+band_chainworks_walk([_H | _Rest], _CW, _Acc) ->
+    {error, snapshot_base_chainwork_too_small_for_band}.
+
+%% Status: the pre-base band is header-only and says so (BLOCK_VALID_HEADER,
+%% no BLOCK_HAVE_DATA — those bodies are genuinely not on disk).  The base
+%% itself is BLOCK_VALID_SCRIPTS because the snapshot IS its post-ConnectBlock
+%% state, which is what Core's BLOCK_ASSUMED_VALID means for a snapshot
+%% chainstate — but still WITHOUT BLOCK_HAVE_DATA/BLOCK_HAVE_UNDO, because
+%% the base's body and undo data were never fetched and claiming otherwise
+%% would make getblock/prune promise bytes that do not exist.
+write_snapshot_band([], _BaseHeight) ->
+    ok;
+write_snapshot_band([{Height, Header, CWInt} | Rest], BaseHeight) ->
+    Status = case Height =:= BaseHeight of
+        true  -> ?BLOCK_VALID_SCRIPTS;
+        false -> ?BLOCK_VALID_HEADER
+    end,
+    Hash = beamchain_serialize:block_hash(Header),
+    ok = beamchain_db:store_block_index(Height, Hash, Header,
+                                        encode_chainwork(CWInt), Status, 0),
+    write_snapshot_band(Rest, BaseHeight).
+
+%% Core validation.cpp:5949 — `index->m_chain_tx_count = au_data.m_chain_tx_count;`
+%% The cumulative transaction count up to the base cannot be recomputed from a
+%% snapshot (there are no bodies below it); the assumeutxo entry supplies it,
+%% and getchaintxstats reads it straight back out.
+record_snapshot_base_tx_count(BaseHeight, AuData) ->
+    case maps:get(chain_tx_count, AuData, undefined) of
+        undefined -> ok;
+        Count when is_integer(Count), Count >= 0 ->
+            beamchain_db:store_cumulative_tx_count(BaseHeight, Count),
+            ok;
+        _ -> ok
+    end.
 
 %% Compute the UTXO-set commitment over the cache.
 %%

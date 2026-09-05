@@ -783,11 +783,29 @@ parse_campaign_entries([Raw | Rest], Acc) ->
         {error, _} = Err -> Err
     end.
 
-%% First four keys required (prompt schema); base_mtp/base_header/
-%% chainwork are accepted but currently unused by beamchain's chokepoint
-%% (mirrors the shape of mainnet_assumeutxo/0's entries above, which
-%% likewise carry only these three fields) — parsed-and-ignored rather
-%% than rejected, so a shared fixture built for other impls still loads.
+%% First four keys required (prompt schema).  base_header / chainwork /
+%% base_tail_headers / base_mtp are OPTIONAL, and when present they are
+%% now CONSUMED: they are the snapshot base's own header, its cumulative
+%% chain work, and a link-verified band of real ancestors ending at it.
+%%
+%% Why they matter.  Bitcoin Core refuses to activate a snapshot whose
+%% base header is not already in the headers chain
+%% (bitcoin-core/src/validation.cpp:5611-5616), so by the time it reaches
+%% `snapshot_chainstate.m_chain.SetTip(*snapshot_start_block)`
+%% (validation.cpp:5917) the base has a real CBlockIndex with a real
+%% pprev chain.  beamchain's `import-utxo` deliberately accepts a
+%% snapshot with NO synced headers (that is the whole premise of the
+%% range-validation ladder), so it has to materialise the base itself or
+%% the base is not a usable PARENT: beamchain_chainstate:
+%% do_connect_block_inner/2 looks the tip up with
+%% beamchain_db:get_block_index/1 and crashed with
+%% `{missing_prev_index, BaseHeight}` on the first block above the base.
+%% See beamchain_chainstate:graft_snapshot_base_index/4.
+%%
+%% Still optional, not required: the built-in production entries carry
+%% none of these (they are only ever activated on a node that has
+%% already synced headers), and a shared campaign fixture written for
+%% another impl must keep loading.  Absent = same map as before.
 parse_campaign_entry(#{<<"height">> := Height,
                         <<"blockhash">> := BlockHashHex,
                         <<"hash_serialized">> := HashSerHex,
@@ -796,14 +814,152 @@ parse_campaign_entry(#{<<"height">> := Height,
              is_integer(ChainTxCount), ChainTxCount >= 0 ->
     case {parse_display_hex32(BlockHashHex), parse_display_hex32(HashSerHex)} of
         {{ok, BlockHash}, {ok, UtxoHash}} ->
-            {ok, Height, #{block_hash => BlockHash,
-                           utxo_hash => UtxoHash,
-                           chain_tx_count => ChainTxCount}};
+            Base = #{block_hash => BlockHash,
+                     utxo_hash => UtxoHash,
+                     chain_tx_count => ChainTxCount},
+            case parse_campaign_ancestry(Entry, Height, BlockHash) of
+                {ok, Extra}      -> {ok, Height, maps:merge(Base, Extra)};
+                {error, _} = Err -> Err
+            end;
         _ ->
             {error, {campaign_assumeutxo_invalid_hex, Entry}}
     end;
 parse_campaign_entry(Entry) ->
     {error, {campaign_assumeutxo_missing_or_invalid_fields, Entry}}.
+
+%% Parse the OPTIONAL snapshot-base ancestry fields.  Every check here is
+%% structural (hex width, 80-byte header framing, hash-to-declared-hash,
+%% prev_hash linkage, band fits above genesis); the PROOF-OF-WORK re-check
+%% needs the running network's pow_limit and therefore lives at the graft
+%% site (beamchain_chainstate:graft_snapshot_base_index/4).  A fixture that
+%% fails any of these is refused outright rather than silently degraded:
+%% these bytes are spliced straight into the block index, so "prefer one
+%% field over the other" is not an option.
+parse_campaign_ancestry(Entry, Height, BlockHash) ->
+    case parse_optional_header(maps:get(<<"base_header">>, Entry, undefined)) of
+        {error, Reason} ->
+            {error, {campaign_assumeutxo_bad_base_header, Reason, Height}};
+        {ok, BaseHeader} ->
+            case parse_optional_band(maps:get(<<"base_tail_headers">>, Entry,
+                                              undefined)) of
+                {error, Reason} ->
+                    {error, {campaign_assumeutxo_bad_base_tail_headers,
+                             Reason, Height}};
+                {ok, Band} ->
+                    finish_campaign_ancestry(Entry, Height, BlockHash,
+                                             BaseHeader, Band)
+            end
+    end.
+
+finish_campaign_ancestry(Entry, Height, BlockHash, BaseHeader, Band) ->
+    %% Assemble the effective band: base_tail_headers when supplied,
+    %% otherwise the single base_header, otherwise nothing at all.
+    Effective = case {Band, BaseHeader} of
+        {undefined, undefined} -> undefined;
+        {undefined, H}         -> [H];
+        {B, undefined}         -> B;
+        {B, H} ->
+            %% Both supplied: they must agree, or the fixture is broken.
+            case lists:last(B) =:= H of
+                true  -> B;
+                false -> mismatch
+            end
+    end,
+    case Effective of
+        mismatch ->
+            {error, {campaign_assumeutxo_band_header_disagree, Height}};
+        undefined ->
+            with_chainwork_and_mtp(Entry, Height, #{});
+        Headers ->
+            case validate_band(Headers, Height, BlockHash) of
+                {error, Reason} ->
+                    {error, {campaign_assumeutxo_bad_band, Reason, Height}};
+                ok ->
+                    with_chainwork_and_mtp(
+                      Entry, Height,
+                      #{base_header       => lists:last(Headers),
+                        base_tail_headers => Headers})
+            end
+    end.
+
+with_chainwork_and_mtp(Entry, Height, Acc0) ->
+    %% chainwork is a 256-bit BIG-ENDIAN number printed as plain hex (Core
+    %% prints arith_uint256::GetHex(), which is NOT byte-reversed the way a
+    %% block hash is), so hex_to_bin/1 — not display_hex_to_bin/1 — is the
+    %% right converter.  It is stored in exactly the form
+    %% beamchain_db:store_block_index/6 wants.
+    case maps:get(<<"chainwork">>, Entry, undefined) of
+        undefined -> with_mtp(Entry, Height, Acc0);
+        CWHex when is_binary(CWHex), byte_size(CWHex) =:= 64 ->
+            CWStr = binary_to_list(CWHex),
+            case lists:all(fun is_hex_char/1, CWStr) of
+                true  -> with_mtp(Entry, Height,
+                                  Acc0#{chainwork => hex_to_bin(CWStr)});
+                false -> {error, {campaign_assumeutxo_bad_chainwork, Height}}
+            end;
+        _ ->
+            {error, {campaign_assumeutxo_bad_chainwork, Height}}
+    end.
+
+with_mtp(Entry, Height, Acc) ->
+    case maps:get(<<"base_mtp">>, Entry, undefined) of
+        undefined -> {ok, Acc};
+        MTP when is_integer(MTP), MTP >= 0 -> {ok, Acc#{base_mtp => MTP}};
+        _ -> {error, {campaign_assumeutxo_bad_base_mtp, Height}}
+    end.
+
+parse_optional_header(undefined) ->
+    {ok, undefined};
+parse_optional_header(Hex) when is_binary(Hex), byte_size(Hex) =:= 160 ->
+    HexStr = binary_to_list(Hex),
+    case lists:all(fun is_hex_char/1, HexStr) of
+        false -> {error, not_hex};
+        true ->
+            try beamchain_serialize:decode_block_header(hex_to_bin(HexStr)) of
+                {Header, <<>>} -> {ok, Header};
+                {_, _Trailing} -> {error, trailing_bytes}
+            catch
+                _:_ -> {error, undecodable}
+            end
+    end;
+parse_optional_header(_) ->
+    {error, bad_width}.
+
+parse_optional_band(undefined) ->
+    {ok, undefined};
+parse_optional_band([]) ->
+    {error, empty};
+parse_optional_band(L) when is_list(L) ->
+    parse_band_headers(L, []);
+parse_optional_band(_) ->
+    {error, not_a_list}.
+
+parse_band_headers([], Acc) ->
+    {ok, lists:reverse(Acc)};
+parse_band_headers([Hex | Rest], Acc) ->
+    case parse_optional_header(Hex) of
+        {ok, undefined}  -> {error, null_entry};
+        {ok, Header}     -> parse_band_headers(Rest, [Header | Acc]);
+        {error, _} = Err -> Err
+    end.
+
+%% Structural band validation: ascending, prev_hash-linked, ending at the
+%% declared base blockhash, and short enough to sit above genesis.
+validate_band(Headers, BaseHeight, BlockHash) ->
+    Len = length(Headers),
+    case beamchain_serialize:block_hash(lists:last(Headers)) =:= BlockHash of
+        false -> {error, last_header_is_not_the_base};
+        true when Len > BaseHeight + 1 -> {error, band_runs_below_genesis};
+        true -> validate_band_links(Headers)
+    end.
+
+validate_band_links([_]) ->
+    ok;
+validate_band_links([A, B | Rest]) ->
+    case B#block_header.prev_hash =:= beamchain_serialize:block_hash(A) of
+        true  -> validate_band_links([B | Rest]);
+        false -> {error, unlinked}
+    end.
 
 %% Validate + convert a display-order hex hash (as printed by Core /
 %% shipped in the campaign JSON) to the same INTERNAL byte-order binary
