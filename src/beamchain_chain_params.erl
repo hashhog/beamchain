@@ -13,6 +13,7 @@
          clear_regtest_assumeutxo/0, regtest_assumeutxo_registry/0]).
 -export([load_campaign_assumeutxo/0, campaign_assumeutxo_registry/0,
          clear_campaign_assumeutxo/0]).
+-export([unsafe_snapshot_height/0, warn_unsafe_snapshot/3]).
 
 %% @doc Returns comprehensive chain parameters for the given network.
 %%
@@ -528,6 +529,87 @@ get_assumeutxo_by_hash(BlockHash, Network) ->
 list_assumeutxo_heights(Network) ->
     AssumeUtxo = effective_assumeutxo(Network),
     lists:sort(maps:keys(AssumeUtxo)).
+
+%%% -------------------------------------------------------------------
+%%% HASHHOG_UNSAFE_SNAPSHOT_HEIGHT: development-only escape from the
+%%% chainparams assumeutxo whitelist.
+%%%
+%%% Core (and this node by default) only accepts snapshots whose base
+%%% blockhash is a hard-coded trust anchor, because loadtxoutset is a
+%%% trust shortcut for end users. Setting this variable to the snapshot's
+%%% base height accepts ANY snapshot and takes that height on faith -- it
+%%% exists so the fleet can validate arbitrary block ranges in parallel
+%%% from a locally generated snapshot ladder, where correctness is
+%%% established by checking the range's OUTPUT utxo hash against an
+%%% independent commitment, not by trusting the input. ONLY whitelist
+%%% membership and the hard-coded hash_serialized comparison that hangs
+%%% off it are bypassed; format, magic, coin count and per-coin parsing
+%%% gates all still run.
+%%%
+%%% Unset (the default, and what ships) = unchanged Core-equivalent
+%%% behaviour: every caller below takes exactly the branch it took before
+%%% this knob existed, after a single os:getenv/1.
+%%% -------------------------------------------------------------------
+
+-define(UNSAFE_SNAPSHOT_HEIGHT_ENV, "HASHHOG_UNSAFE_SNAPSHOT_HEIGHT").
+
+%% @doc The operator-supplied base height for an unwhitelisted snapshot,
+%% or `undefined` when the escape hatch is off (the shipped default). A
+%% malformed / negative value is treated as OFF (fail closed) with a loud
+%% warning, never as height 0.
+-spec unsafe_snapshot_height() -> {ok, non_neg_integer()} | undefined.
+unsafe_snapshot_height() ->
+    case os:getenv(?UNSAFE_SNAPSHOT_HEIGHT_ENV) of
+        false -> undefined;
+        ""    -> undefined;
+        Str   -> parse_unsafe_snapshot_height(Str)
+    end.
+
+parse_unsafe_snapshot_height(Str) ->
+    try list_to_integer(string:trim(Str)) of
+        H when H >= 0 ->
+            {ok, H};
+        Neg ->
+            logger:warning(
+              "[UNSAFE-SNAPSHOT] ignoring ~s=~p: base height must be a "
+              "non-negative integer; the assumeutxo whitelist stays "
+              "ENFORCED",
+              [?UNSAFE_SNAPSHOT_HEIGHT_ENV, Neg]),
+            undefined
+    catch
+        error:badarg ->
+            logger:warning(
+              "[UNSAFE-SNAPSHOT] ignoring ~s=~ts: not an integer block "
+              "height; the assumeutxo whitelist stays ENFORCED",
+              [?UNSAFE_SNAPSHOT_HEIGHT_ENV, Str]),
+            undefined
+    end.
+
+%% @doc Emit the loud, uniform warning every time the escape hatch is
+%% actually taken. `Site` names the gate that was bypassed; `BaseHash` is
+%% the snapshot's base blockhash in internal byte order (or `undefined`
+%% where the caller only has a height).
+-spec warn_unsafe_snapshot(iodata(), non_neg_integer(),
+                           binary() | undefined) -> ok.
+warn_unsafe_snapshot(Site, Height, BaseHash) ->
+    logger:warning(
+      "[UNSAFE-SNAPSHOT] ~s=~B -- ACCEPTING AN UNVERIFIED SNAPSHOT at ~s: "
+      "base blockhash ~s is NOT a chainparams trust anchor, so the "
+      "hard-coded hash_serialized commitment could not be checked. This "
+      "snapshot's UTXO set is taken entirely on faith. DEVELOPMENT USE "
+      "ONLY -- never enable this in production.",
+      [?UNSAFE_SNAPSHOT_HEIGHT_ENV, Height, Site,
+       unsafe_snapshot_hash_str(BaseHash)]),
+    ok.
+
+unsafe_snapshot_hash_str(undefined) ->
+    "<unknown>";
+unsafe_snapshot_hash_str(<<Hash:32/binary>>) ->
+    %% Display (big-endian) order, matching uint256::ToString.
+    Rev = lists:reverse(binary_to_list(Hash)),
+    lists:flatten([io_lib:format("~2.16.0b", [B]) || B <- Rev]);
+unsafe_snapshot_hash_str(Other) ->
+    lists:flatten(io_lib:format("~p", [Other])).
 
 %%% -------------------------------------------------------------------
 %%% Runtime-registerable regtest AssumeUTXO whitelist.

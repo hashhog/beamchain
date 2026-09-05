@@ -154,7 +154,26 @@ verify_snapshot(#{base_hash := BaseHash, coins := Coins} = _Snapshot, Network) -
                     {error, Msg}
             end;
         not_found ->
-            {error, {unknown_snapshot_base, BaseHash}}
+            %% HASHHOG_UNSAFE_SNAPSHOT_HEIGHT: development-only escape from
+            %% the chainparams assumeutxo whitelist. loadtxoutset is a trust
+            %% shortcut for end users, which is why Core hardcodes the
+            %% anchors; with no anchor there is no hash_serialized to compare
+            %% against, so the strict-content-hash gate cannot run and the
+            %% snapshot is taken on faith. This project needs to validate
+            %% arbitrary block ranges in parallel from a locally generated
+            %% snapshot ladder, where correctness comes from checking each
+            %% range's OUTPUT utxo hash against an independent commitment,
+            %% not from trusting the input snapshot. Unset (the default, and
+            %% what ships) keeps production trust semantics intact.
+            case beamchain_chain_params:unsafe_snapshot_height() of
+                {ok, UnsafeHeight} ->
+                    beamchain_chain_params:warn_unsafe_snapshot(
+                      "beamchain_snapshot:verify_snapshot/2 "
+                      "(strict-content-hash gate)", UnsafeHeight, BaseHash),
+                    ok;
+                undefined ->
+                    {error, {unknown_snapshot_base, BaseHash}}
+            end
     end.
 
 %% @doc Format the verbatim Core "Bad snapshot content hash" refusal string.

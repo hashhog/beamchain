@@ -806,8 +806,22 @@ init_chainstate(Role, SnapshotData) ->
                         logger:info("chainstate: loading snapshot at height ~B", [Height]),
                         {BaseHash, Height, Height, BaseHash};
                     not_found ->
-                        logger:warning("chainstate: unknown snapshot base hash"),
-                        {BaseHash, 0, 0, BaseHash}
+                        %% HASHHOG_UNSAFE_SNAPSHOT_HEIGHT: same
+                        %% development-only escape as do_load_snapshot_inner/4
+                        %% -- when set it supplies the base height the
+                        %% whitelist entry normally would, instead of the
+                        %% height-0 fallback below. Unset = unchanged.
+                        case beamchain_chain_params:unsafe_snapshot_height() of
+                            {ok, UnsafeHeight} ->
+                                beamchain_chain_params:warn_unsafe_snapshot(
+                                  "beamchain_chainstate:init_chainstate/2 "
+                                  "(snapshot base height)",
+                                  UnsafeHeight, BaseHash),
+                                {BaseHash, UnsafeHeight, UnsafeHeight, BaseHash};
+                            undefined ->
+                                logger:warning("chainstate: unknown snapshot base hash"),
+                                {BaseHash, 0, 0, BaseHash}
+                        end
                 end;
             {background, _} ->
                 %% Background chainstate starts from genesis
@@ -2957,7 +2971,31 @@ do_load_snapshot_inner(Path, State, Network, NetworkMagic) ->
         {ok, #{base_hash := BaseHash}} ->
             case beamchain_chain_params:get_assumeutxo_by_hash(BaseHash, Network) of
                 not_found ->
-                    {error, {unknown_snapshot_base, BaseHash}};
+                    %% HASHHOG_UNSAFE_SNAPSHOT_HEIGHT: development-only
+                    %% escape from the chainparams assumeutxo whitelist.
+                    %% loadtxoutset is a trust shortcut for end users, which
+                    %% is why Core hardcodes the anchors. This project needs
+                    %% to validate arbitrary block ranges in parallel from a
+                    %% locally generated snapshot ladder; correctness is
+                    %% established by checking each range's OUTPUT utxo hash
+                    %% against an independent commitment, not by trusting the
+                    %% input snapshot. The env var supplies the base height
+                    %% the whitelist entry normally would -- every other gate
+                    %% (G1-G5 magic/per-coin, G8 block status, G9 chainwork)
+                    %% still runs against it. Unset (the default, and what
+                    %% ships) keeps production trust semantics intact.
+                    case beamchain_chain_params:unsafe_snapshot_height() of
+                        {ok, UnsafeHeight} ->
+                            beamchain_chain_params:warn_unsafe_snapshot(
+                              "beamchain_chainstate:do_load_snapshot_inner/4 "
+                              "(assumeutxo whitelist)",
+                              UnsafeHeight, BaseHash),
+                            do_load_snapshot_with_height(Path, State, Network,
+                                                         NetworkMagic, BaseHash,
+                                                         UnsafeHeight);
+                        undefined ->
+                            {error, {unknown_snapshot_base, BaseHash}}
+                    end;
                 {ok, BaseHeight, _} ->
                     do_load_snapshot_with_height(Path, State, Network,
                                                  NetworkMagic, BaseHash,

@@ -14894,12 +14894,31 @@ validate_snapshot_height(BaseHeight, Network) ->
         {ok, _AuData} ->
             ok;
         not_found ->
-            Msg = iolist_to_binary(
-                    io_lib:format(
-                      "Assumeutxo height in snapshot metadata not "
-                      "recognized (~b) - refusing to load snapshot",
-                      [BaseHeight])),
-            {error, Msg}
+            %% HASHHOG_UNSAFE_SNAPSHOT_HEIGHT: development-only escape from
+            %% the chainparams assumeutxo whitelist. loadtxoutset is a trust
+            %% shortcut for end users, which is why Core hardcodes the
+            %% anchors. This project needs to validate arbitrary block ranges
+            %% in parallel from a locally generated snapshot ladder;
+            %% correctness is established by checking each range's OUTPUT
+            %% utxo hash against an independent commitment, not by trusting
+            %% the input snapshot. Only this membership test (and the
+            %% hard-coded hash_serialized comparison hanging off it) is
+            %% bypassed. Unset (the default, and what ships) keeps production
+            %% trust semantics intact.
+            case beamchain_chain_params:unsafe_snapshot_height() of
+                {ok, UnsafeHeight} ->
+                    beamchain_chain_params:warn_unsafe_snapshot(
+                      "beamchain_rpc:validate_snapshot_height/2 "
+                      "(loadtxoutset whitelist)", UnsafeHeight, undefined),
+                    ok;
+                undefined ->
+                    Msg = iolist_to_binary(
+                            io_lib:format(
+                              "Assumeutxo height in snapshot metadata not "
+                              "recognized (~b) - refusing to load snapshot",
+                              [BaseHeight])),
+                    {error, Msg}
+            end
     end.
 
 %% @doc Load a UTXO set snapshot from file.

@@ -123,7 +123,24 @@ run(Network, BaseHeight, BlockFun) ->
                 ets:delete(Store)
             end;
         not_found ->
-            {error, {no_assumeutxo_for_height, BaseHeight}}
+            %% HASHHOG_UNSAFE_SNAPSHOT_HEIGHT: development-only escape from
+            %% the chainparams assumeutxo whitelist. There is no trust anchor
+            %% for this base, so there is no hard-coded hash_serialized to
+            %% re-derive against -- the comparison this module exists to make
+            %% is exactly the one the escape hatch bypasses, so it reports
+            %% "no anchor" loudly instead of a verdict. Every other snapshot
+            %% gate still ran at load time. Unset (the default, and what
+            %% ships) keeps the original refusal verbatim.
+            case beamchain_chain_params:unsafe_snapshot_height() of
+                {ok, UnsafeHeight} ->
+                    beamchain_chain_params:warn_unsafe_snapshot(
+                      "beamchain_bg_validation:run/3 (background "
+                      "hash_serialized re-derivation SKIPPED)",
+                      UnsafeHeight, undefined),
+                    {error, {unsafe_snapshot_no_trust_anchor, BaseHeight}};
+                undefined ->
+                    {error, {no_assumeutxo_for_height, BaseHeight}}
+            end
     end.
 
 %% @doc Current verdict of a running bg-validation process.
@@ -364,7 +381,20 @@ init([Network, BaseHeight, BlockFun]) ->
             self() ! start_replay,
             {ok, St};
         not_found ->
-            {stop, {no_assumeutxo_for_height, BaseHeight}}
+            %% HASHHOG_UNSAFE_SNAPSHOT_HEIGHT: see run/3 above -- with no
+            %% chainparams trust anchor there is no expected commitment to
+            %% re-derive against, so the async engine refuses to start rather
+            %% than fabricate a verdict. Unset = unchanged refusal.
+            case beamchain_chain_params:unsafe_snapshot_height() of
+                {ok, UnsafeHeight} ->
+                    beamchain_chain_params:warn_unsafe_snapshot(
+                      "beamchain_bg_validation:init/1 (background "
+                      "hash_serialized re-derivation SKIPPED)",
+                      UnsafeHeight, undefined),
+                    {stop, {unsafe_snapshot_no_trust_anchor, BaseHeight}};
+                undefined ->
+                    {stop, {no_assumeutxo_for_height, BaseHeight}}
+            end
     end.
 
 handle_info(start_replay, #bgstate{store = Store,
