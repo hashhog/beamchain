@@ -15,6 +15,62 @@ init([]) ->
         intensity => 5,
         period => 10
     },
+    Children = case beamchain_config:batch_mode() of
+        true  -> batch_children();
+        false -> daemon_children()
+    end,
+    {ok, {SupFlags, Children}}.
+
+%% @private One-shot batch mode (`beamchain import-utxo`): start ONLY the
+%% storage + validation core.  A batch job runs offline to completion and
+%% then halts, so anything that binds a socket, dials out, or drives sync
+%% is at best useless and at worst fatal:
+%%
+%%   * beamchain_rpc bound the network's DEFAULT RPC port (mainnet 8332)
+%%     when no --rpc-port was given, and its bind failure is a hard
+%%     start_error -- so on a host already running a node on 8332 the
+%%     import died with {listener_bind_failed, rpc, 8332, eaddrinuse}
+%%     before reading a single coin.  beamchain_metrics / beamchain_rest
+%%     bind listeners the same way.
+%%   * beamchain_peer_manager (+ header_sync / block_sync / beamchain_sync
+%%     / erlay / addrman) would open a P2P listener and start dialling
+%%     mainnet peers for a chain the job is about to halt on.
+%%   * beamchain_miner / beamchain_wallet / the optional indexes have no
+%%     part in an import.
+%%
+%% What is kept, and why it is the minimum:
+%%   * beamchain_db          -- the RocksDB handle everything below writes to.
+%%   * beamchain_sig_cache   -- beamchain_crypto's ECDSA/Schnorr verify path
+%%                              looks up this ETS-backed cache directly.
+%%   * beamchain_tip_notifier-- must precede beamchain_chainstate_sup (the
+%%                              connect/reorg tip-advance chokepoint expects
+%%                              it registered); cheap, in-VM, no socket.
+%%   * beamchain_chainstate_sup -- the chainstate that actually performs the
+%%                              load_snapshot + chunked flush.
+%%   * beamchain_mempool     -- load_snapshot's G7 guard calls
+%%                              beamchain_mempool:get_info/0 SYNCHRONOUSLY
+%%                              (Core validation.cpp:5626, "Can't activate a
+%%                              snapshot when mempool not empty"); with no
+%%                              mempool that gen_server:call exits noproc.
+%%
+%% Every other cross-module notification on the connect path
+%% (remove_for_block_with_txs_async, fee_estimator:process_block,
+%% zmq:notify_block, peer_manager:notify_tip_updated, tip_notifier:notify)
+%% is a gen_server:cast, which is silently dropped for an unregistered
+%% name, and the wallet / blockfilter / coinstats / txospender hooks are
+%% `catch`-wrapped -- so omitting those children is a no-op, not a crash.
+batch_children() ->
+    [
+        child_spec(beamchain_db, worker),
+        child_spec(beamchain_sig_cache, worker),
+        child_spec(beamchain_tip_notifier, worker),
+        child_spec(beamchain_chainstate_sup, supervisor),
+        mempool_child_spec()
+    ].
+
+%% @private The full node supervision tree -- unchanged daemon behaviour
+%% (`beamchain start` / `sync` / `import`).
+daemon_children() ->
     %% Core children always started
     CoreChildren = [
         child_spec(beamchain_db, worker),
@@ -105,11 +161,10 @@ init([]) ->
             true  -> [child_spec(beamchain_torcontrol, worker)];
             false -> []
         end,
-    Children = CoreChildren ++ RestChildren ++ ZmqChildren
-               ++ BlockFilterChildren ++ CoinStatsChildren
-               ++ TxoSpenderChildren
-               ++ TorControlChildren,
-    {ok, {SupFlags, Children}}.
+    CoreChildren ++ RestChildren ++ ZmqChildren
+        ++ BlockFilterChildren ++ CoinStatsChildren
+        ++ TxoSpenderChildren
+        ++ TorControlChildren.
 
 child_spec(Module, Type) ->
     #{

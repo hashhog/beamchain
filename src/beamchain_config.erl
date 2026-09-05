@@ -28,6 +28,7 @@
          coinstatsindex_enabled/0,
          txospenderindex_enabled/0,
          rest_enabled/0,
+         batch_mode/0,
          %% ASMap
          asmap_path/0,
          %% Proxy configuration
@@ -404,6 +405,30 @@ rest_enabled() ->
             end;
         _ -> true
     end.
+
+%% @doc One-shot batch mode: true when the VM was started to run a single
+%% offline job to completion (today: `beamchain import-utxo`) rather than
+%% to serve as a daemon.
+%%
+%% A batch job needs the storage + validation core (db, sig cache,
+%% chainstate) and nothing that talks to the outside world.  Booting the
+%% full node supervision tree for a one-shot import bound the RPC listener
+%% on the network's default RPC port, which is both pointless (nobody can
+%% usefully call a process that halts when the import finishes) and
+%% actively harmful: on a host already running a node on that port the
+%% import aborts with `{listener_bind_failed, rpc, 8332, eaddrinuse}`
+%% before a single coin is read.  beamchain_node_sup consults this to
+%% build the reduced child list.
+%%
+%% Set by beamchain_cli via the `batch_mode` application env BEFORE
+%% application:ensure_all_started/1, so it is readable from
+%% beamchain_node_sup:init/1.  Deliberately NOT a beamchain.conf key or a
+%% BEAMCHAIN_* env var: this is a property of the command being run, not
+%% of the node's configuration, and a daemon must never be able to
+%% inherit it (that would silently start a node with no RPC).
+-spec batch_mode() -> boolean().
+batch_mode() ->
+    application:get_env(beamchain, batch_mode, false) =:= true.
 
 %% @doc Get SOCKS5 proxy configuration for general outbound connections.
 %% Format: "socks5://host:port" or "host:port" (default port 9050).

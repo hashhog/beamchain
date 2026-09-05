@@ -551,6 +551,19 @@ import_utxo(Opts) ->
             halt(1);
         Path ->
             apply_opts(Opts),
+            %% One-shot batch job: bring up the storage + validation core
+            %% ONLY.  Without this the import boots the whole node
+            %% supervision tree, and beamchain_rpc binds the network's
+            %% DEFAULT RPC port whenever --rpc-port is absent -- mainnet
+            %% 8332.  On a host already serving 8332 that bind is a hard
+            %% start_error ({listener_bind_failed, rpc, 8332, eaddrinuse})
+            %% and the import never runs, having had no reason to listen
+            %% on anything in the first place: it loads a snapshot, flushes
+            %% it, and halts.  Must be set BEFORE start_app/0 --
+            %% beamchain_node_sup:init/1 reads it via
+            %% beamchain_config:batch_mode/0 while the tree is being built.
+            application:set_env(beamchain, batch_mode, true,
+                                [{persistent, true}]),
             case start_app() of
                 ok ->
                     setup_file_logger(),
