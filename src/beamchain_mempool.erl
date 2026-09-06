@@ -684,6 +684,15 @@ get_mempool_utxo(Txid, Vout) ->
 %%% gen_server callbacks
 %%% ===================================================================
 
+%% Create a named table only if it is not already there. Unguarded ets:new/2
+%% in a gen_server init/1 turns a pre-existing public table into a badarg
+%% crash; see the note in init/1.
+ensure_table(Name, Opts) ->
+    case ets:info(Name) of
+        undefined -> ets:new(Name, Opts);
+        _ -> Name
+    end.
+
 init([]) ->
     %% Trap exits so a supervisor-initiated shutdown runs terminate/2,
     %% which dumps mempool.dat (warm-restart parity with Bitcoin Core).
@@ -694,22 +703,27 @@ init([]) ->
     %% beamchain_node_sup so the dump has time to complete.
     process_flag(trap_exit, true),
     %% Create ETS tables
-    ets:new(?MEMPOOL_TXS, [set, public, named_table,
-                            {read_concurrency, true},
-                            {write_concurrency, true}]),
-    ets:new(?MEMPOOL_BY_FEE, [ordered_set, public, named_table]),
-    ets:new(?MEMPOOL_OUTPOINTS, [set, public, named_table,
-                                  {write_concurrency, true}]),
-    ets:new(?MEMPOOL_ORPHANS, [set, public, named_table]),
-    ets:new(?MEMPOOL_ORPHAN_BY_TXID, [set, public, named_table]),
-    ets:new(?MEMPOOL_ORPHAN_PEER_COUNT, [set, public, named_table]),
-    ets:new(?MEMPOOL_ORPHAN_PEER_WEIGHT, [set, public, named_table]),
-    ets:new(?MEMPOOL_ORPHANS_BY_PEER, [ordered_set, public, named_table]),
-    ets:new(?MEMPOOL_CLUSTERS, [set, public, named_table,
-                                 {read_concurrency, true}]),
-    ets:new(?MEMPOOL_EPHEMERAL, [set, public, named_table]),
-    ets:new(?MEMPOOL_DELTAS, [set, public, named_table,
-                              {read_concurrency, true}]),
+    %% Guarded create: these are `public' named tables, so another process
+    %% (an eunit fixture, most often) may already have created them. An
+    %% unguarded ets:new/2 raises badarg inside init/1; under eunit that kills
+    %% the test process and CANCELS every module queued after it. Same idiom
+    %% as beamchain_db:805 / beamchain_peer_manager:789.
+    ensure_table(?MEMPOOL_TXS, [set, public, named_table,
+                                {read_concurrency, true},
+                                {write_concurrency, true}]),
+    ensure_table(?MEMPOOL_BY_FEE, [ordered_set, public, named_table]),
+    ensure_table(?MEMPOOL_OUTPOINTS, [set, public, named_table,
+                                      {write_concurrency, true}]),
+    ensure_table(?MEMPOOL_ORPHANS, [set, public, named_table]),
+    ensure_table(?MEMPOOL_ORPHAN_BY_TXID, [set, public, named_table]),
+    ensure_table(?MEMPOOL_ORPHAN_PEER_COUNT, [set, public, named_table]),
+    ensure_table(?MEMPOOL_ORPHAN_PEER_WEIGHT, [set, public, named_table]),
+    ensure_table(?MEMPOOL_ORPHANS_BY_PEER, [ordered_set, public, named_table]),
+    ensure_table(?MEMPOOL_CLUSTERS, [set, public, named_table,
+                                     {read_concurrency, true}]),
+    ensure_table(?MEMPOOL_EPHEMERAL, [set, public, named_table]),
+    ensure_table(?MEMPOOL_DELTAS, [set, public, named_table,
+                                   {read_concurrency, true}]),
 
     %% Schedule periodic orphan expiry
     erlang:send_after(60000, self(), expire_orphans),

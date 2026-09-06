@@ -779,9 +779,14 @@ asmap_health_check() ->
 init([]) ->
     %% Create ETS table for peer registry — set with pid as key,
     %% public reads so other processes can look up peers quickly
-    ets:new(?PEER_TABLE, [named_table, set, public,
-                          {keypos, #peer_entry.pid},
-                          {read_concurrency, true}]),
+    case ets:info(?PEER_TABLE) of
+        undefined ->
+            ets:new(?PEER_TABLE, [named_table, set, public,
+                                  {keypos, #peer_entry.pid},
+                                  {read_concurrency, true}]);
+        _ ->
+            ok  %% table already exists (e.g., from tests)
+    end,
     %% Create ETS table for banned peers: {IP, BanExpiry}
     %% Using IP only (not port) for banning as that matches Bitcoin Core
     case ets:info(?BANNED_PEERS_TABLE) of

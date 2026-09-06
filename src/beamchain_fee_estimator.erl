@@ -163,7 +163,15 @@ save_state() ->
 %%% ===================================================================
 
 init([]) ->
-    ets:new(?FEE_EST_TRACKED, [set, public, named_table]),
+    %% Guarded create: these are `public' named tables, so another process
+    %% (an eunit fixture, most often) may already have created them. An
+    %% unguarded ets:new/2 raises badarg inside init/1; under eunit that kills
+    %% the test process and CANCELS every module queued after it. Same idiom
+    %% as beamchain_db:805 / beamchain_peer_manager:789.
+    case ets:info(?FEE_EST_TRACKED) of
+        undefined -> ets:new(?FEE_EST_TRACKED, [set, public, named_table]);
+        _ -> ok
+    end,
 
     Buckets = generate_buckets(),
     NumBuckets = length(Buckets),

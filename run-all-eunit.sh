@@ -1,23 +1,37 @@
 #!/usr/bin/env bash
 # Run the COMPLETE beamchain eunit suite.
 #
-# WHY THIS EXISTS
+# WHY THIS EXISTS  (diagnosis corrected 2026-09-06 — see below)
 # ---------------
-# `rebar3 eunit` does NOT run every test in test/. Its default is
-# `{eunit_tests, [{application, beamchain}]}`, and EUnit's {application, App}
-# expands to the modules listed in the .app file PLUS, for each module M, a
-# sibling module named M_tests. So a test module is discovered only if its name
-# is a src module's name with "_tests" appended.
+# The 2026-08-30 note here blamed eunit DISCOVERY: "a test module is discovered
+# only if its name is a src module's name with _tests appended". That is WRONG
+# for rebar3 >= 3.20 and it sent two separate investigations down a dead end.
 #
-# Measured 2026-08-30: of the 139 test/*_tests.erl files, `rebar3 eunit` ran
-# 38 — every one of which had a matching src/<M>.erl — and skipped 101, of
-# which 97 had no such src module. Those 101 contribute 239 tests, 4 of them
-# FAILING, and none of it appeared in the suite's "0 failures" summary.
-# A test that is never discovered is worse than no test: it reports green.
+# rebar_prv_eunit:default_tests/2 is
+#     set_apps(Apps) ++ set_modules(Apps, State)
+# and set_modules/3 globs <AppDir>/test/*.erl, drops the ones whose name is
+# "<src module>_tests" (the {application,_} primitive already covers those) and
+# appends the REST as explicit {module, M} entries. So every orphan
+# beamchain_w1xx_*_tests module IS in the test set. That is also why pointing
+# eunit_tests at {dir, "test"} changed nothing: there was nothing to fix.
 #
-# {dir, "test"} and {dir, "_build/test/lib/beamchain/test"} in eunit_tests were
-# both tried and did NOT change discovery, so this names the modules
-# explicitly instead — derived from the directory, so it cannot go stale.
+# What actually hid 97 modules was an ABORT. eunit kills the whole run when a
+# test process terminates unexpectedly, and everything queued after the abort
+# is silently cancelled — the orphan {module, _} entries sit AFTER
+# {application, beamchain} in the list, so they were always in the cancelled
+# tail. The trigger was a leaked named ETS table: a fixture creates
+# beamchain_config_ets / beamchain_chain_meta as a stand-in, never drops it,
+# and the next module to start the real gen_server dies in ets:new/2 with
+# "table name already exists" INSIDE init/1.
+#
+# Fixed 2026-09-06 by guarding every named-table create in src (the idiom
+# beamchain_db:805 and beamchain_peer_manager:789 already used) plus two test
+# fixtures. Plain `rebar3 eunit` now runs all 140 test modules; measured
+# 4717 passed / 47 failed, against 2047 tests / 39 modules before.
+#
+# This wrapper is kept as a belt-and-braces second pass: pass 2 names every
+# module explicitly, so if a future abort ever truncates pass 1 again the
+# difference between the two passes makes it visible.
 #
 # Usage: ./run-all-eunit.sh   (exit 0 only if BOTH passes are clean)
 set -uo pipefail

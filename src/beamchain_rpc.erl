@@ -329,10 +329,16 @@ start_link() ->
 
 init([]) ->
     %% Auth table for cookie and rpc credentials
-    ets:new(?RPC_AUTH_TABLE, [named_table, set, public,
-                              {read_concurrency, true}]),
+    case ets:info(?RPC_AUTH_TABLE) of
+        undefined -> ets:new(?RPC_AUTH_TABLE, [named_table, set, public,
+                                               {read_concurrency, true}]);
+        _ -> ok
+    end,
     %% Rate limit: {IP, Count, WindowStart}
-    ets:new(?RATE_LIMIT_TABLE, [named_table, set, public]),
+    case ets:info(?RATE_LIMIT_TABLE) of
+        undefined -> ets:new(?RATE_LIMIT_TABLE, [named_table, set, public]);
+        _ -> ok
+    end,
 
     setup_auth(),
 

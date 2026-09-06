@@ -87,8 +87,16 @@ setup() ->
     ok = filelib:ensure_dir(filename:join(TmpDir, "dummy")),
     %% Stand up a config ETS table the gen_server reads (datadir + enabled).
     Tbl = beamchain_config_ets,
+    %% If WE create the config ETS table, we must drop it again in teardown:
+    %% left behind it outlives this module, and the next module that starts the
+    %% real beamchain_config gen_server dies in ets:new/2 with
+    %% "table name already exists" -- which kills the eunit test process and
+    %% CANCELS every module that would have run after it. Ownership is recorded
+    %% in the table itself so the fixture's return shape stays {TmpDir, Env}.
     case ets:info(Tbl) of
-        undefined -> ets:new(Tbl, [named_table, set, public]);
+        undefined ->
+            ets:new(Tbl, [named_table, set, public]),
+            ets:insert(Tbl, {'$owned_by_txospenderindex_tests', true});
         _ -> ok
     end,
     ets:insert(Tbl, {datadir, TmpDir}),
@@ -102,6 +110,11 @@ setup() ->
 teardown({TmpDir, SavedEnv}) ->
     catch ?IDX:stop(),
     catch ets:delete(beamchain_config_ets, txospenderindex),
+    case (catch ets:lookup(beamchain_config_ets,
+                           '$owned_by_txospenderindex_tests')) of
+        [{_, true}] -> catch ets:delete(beamchain_config_ets);
+        _ -> ok
+    end,
     case SavedEnv of
         false -> os:unsetenv("BEAMCHAIN_TXOSPENDERINDEX");
         _ -> os:putenv("BEAMCHAIN_TXOSPENDERINDEX", SavedEnv)

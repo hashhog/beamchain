@@ -632,8 +632,22 @@ payjoin_require_token() ->
 %%% ===================================================================
 
 init([]) ->
-    %% Create ETS table for fast config reads from any process
-    ets:new(?CONFIG_TABLE, [named_table, set, public, {read_concurrency, true}]),
+    %% Create ETS table for fast config reads from any process.
+    %%
+    %% Guarded, exactly as beamchain_db:805 and beamchain_wallet:628 already
+    %% guard their named tables. ?CONFIG_TABLE is `public', so anything in the
+    %% VM may have created it first -- under eunit several test fixtures stand
+    %% one up to seed a datadir before the server exists. An unguarded ets:new/2
+    %% then raises badarg *inside gen_server init/1*, which kills the calling
+    %% eunit test process; eunit treats that as an unexpected termination and
+    %% CANCELS the entire remaining run. That single crash is why 97 of
+    %% beamchain's 140 test modules never executed.
+    case ets:info(?CONFIG_TABLE) of
+        undefined ->
+            ets:new(?CONFIG_TABLE,
+                    [named_table, set, public, {read_concurrency, true}]);
+        _ -> ok
+    end,
 
     Network = determine_network(),
     DataDir = determine_datadir(Network),

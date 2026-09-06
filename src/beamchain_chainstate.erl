@@ -792,24 +792,38 @@ init([background]) ->
 init([snapshot, SnapshotData]) ->
     init_chainstate(snapshot, SnapshotData).
 
+%% Create a named table only if it is not already there. See the comment in
+%% init_chainstate/2 for why the unguarded form is a whole-run hazard.
+ensure_table(Name, Opts) ->
+    case ets:info(Name) of
+        undefined -> ets:new(Name, Opts);
+        _ -> Name
+    end.
+
 %% Common initialization for all chainstate roles
 init_chainstate(Role, SnapshotData) ->
     %% Create ETS tables (only for main chainstate, others reuse)
     case Role of
         main ->
-            %% UTXO cache: read_concurrency for parallel reads during validation
-            ets:new(?UTXO_CACHE, [set, public, named_table,
-                                   {read_concurrency, true},
-                                   {write_concurrency, true}]),
+            %% All five are `public' named tables, so a process that is not
+            %% this gen_server may legitimately have created them already
+            %% (eunit fixtures seed ?CHAIN_META so get_tip/0 answers
+            %% not_found before the chainstate exists). Guarded the same way
+            %% beamchain_db:805 guards its own named tables: an unguarded
+            %% ets:new/2 raises badarg inside init/1, which under eunit kills
+            %% the test process and cancels every module after it.
+            ensure_table(?UTXO_CACHE, [set, public, named_table,
+                                       {read_concurrency, true},
+                                       {write_concurrency, true}]),
             %% Dirty/fresh/spent: write_concurrency since many processes update these
-            ets:new(?UTXO_DIRTY, [set, public, named_table,
-                                   {write_concurrency, true}]),
-            ets:new(?UTXO_FRESH, [set, public, named_table,
-                                   {write_concurrency, true}]),
-            ets:new(?UTXO_SPENT, [set, public, named_table,
-                                   {write_concurrency, true}]),
-            ets:new(?CHAIN_META, [set, public, named_table,
-                                   {read_concurrency, true}]);
+            ensure_table(?UTXO_DIRTY, [set, public, named_table,
+                                       {write_concurrency, true}]),
+            ensure_table(?UTXO_FRESH, [set, public, named_table,
+                                       {write_concurrency, true}]),
+            ensure_table(?UTXO_SPENT, [set, public, named_table,
+                                       {write_concurrency, true}]),
+            ensure_table(?CHAIN_META, [set, public, named_table,
+                                       {read_concurrency, true}]);
         _ ->
             %% Snapshot and background chainstates reuse the main ETS tables
             ok

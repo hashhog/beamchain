@@ -89,9 +89,21 @@ init([]) ->
     %% read it directly without going through the gen_server.
     Nonce = crypto:strong_rand_bytes(32),
     persistent_term:put(?NONCE_PTERM, Nonce),
-    ets:new(?SIG_CACHE, [set, public, named_table,
-                          {read_concurrency, true}]),
-    ets:new(?SIG_CACHE_ORDER, [ordered_set, public, named_table]),
+    %% Guarded create: these are `public' named tables, so another process
+    %% (an eunit fixture, most often) may already have created them. An
+    %% unguarded ets:new/2 raises badarg inside init/1; under eunit that kills
+    %% the test process and CANCELS every module queued after it. Same idiom
+    %% as beamchain_db:805 / beamchain_peer_manager:789.
+    case ets:info(?SIG_CACHE) of
+        undefined -> ets:new(?SIG_CACHE, [set, public, named_table,
+                                          {read_concurrency, true}]);
+        _ -> ok
+    end,
+    case ets:info(?SIG_CACHE_ORDER) of
+        undefined -> ets:new(?SIG_CACHE_ORDER,
+                             [ordered_set, public, named_table]);
+        _ -> ok
+    end,
     logger:info("sig_cache: initialized (max ~B entries, nonce seeded)", [?MAX_ENTRIES]),
     {ok, #state{nonce = Nonce}}.
 

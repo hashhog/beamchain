@@ -54,6 +54,14 @@ stop_default() ->
     case whereis(beamchain_wallet) of
         undefined -> ok;
         Pid ->
+            %% The registered wallet may have been started -- and LINKED -- by
+            %% an EARLIER test module (beamchain_fix63_tests' ensure_default_wallet
+            %% does exactly that). exit(Pid, kill) on a process still linked to the
+            %% eunit test process kills the test process too, which eunit reports
+            %% as `*unexpected termination of test process* ::killed' and which
+            %% CANCELS every module queued after this one. unlink/1 is a no-op
+            %% when there is no link, so this is safe either way.
+            _ = unlink(Pid),
             MRef = erlang:monitor(process, Pid),
             exit(Pid, kill),
             receive {'DOWN', MRef, process, Pid, _} -> ok
