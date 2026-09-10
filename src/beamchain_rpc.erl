@@ -4592,11 +4592,9 @@ mempool_reject_reason(Reason, Txid) ->
 %% multi-tx cases; we dispatch to the same dry-run helpers.
 rpc_testmempoolaccept([RawTxs]) when is_list(RawTxs) ->
     try
-        Decoded = lists:map(fun(HexStr) ->
-            Bin = beamchain_serialize:hex_decode(HexStr),
-            {Tx, _} = beamchain_serialize:decode_transaction(Bin),
-            Tx
-        end, RawTxs),
+        %% Core rpc/mempool.cpp:332-335: DecodeHexTx failure is an RPC error
+        %% (RPC_DESERIALIZATION_ERROR -22), not a result-row reject-reason.
+        Decoded = [decode_package_tx(HexStr) || HexStr <- RawTxs],
         Results = case length(Decoded) of
             1 ->
                 %% Single-tx path — dry-run via accept_to_memory_pool_dry_run/1
@@ -4660,10 +4658,11 @@ rpc_testmempoolaccept([RawTxs]) when is_list(RawTxs) ->
         end,
         {ok, Results}
     catch
-        _:_ ->
-            {ok, [#{<<"txid">>          => <<>>,
-                    <<"allowed">>       => false,
-                    <<"reject-reason">> => <<"TX decode failed">>}]}
+        throw:{decode_failed, BadHex} ->
+            {error, ?RPC_DESERIALIZATION_ERROR,
+             iolist_to_binary(io_lib:format(
+                 "TX decode failed: ~s Make sure the tx has at "
+                 "least one input.", [BadHex]))}
     end;
 rpc_testmempoolaccept(_) ->
     {error, ?RPC_INVALID_PARAMS,
@@ -7353,7 +7352,10 @@ rpc_addnode([NodeStr, CommandStr]) when is_binary(NodeStr),
                     {error, ?RPC_INVALID_PARAMETER, Msg}
             end;
         _ ->
-            {error, ?RPC_INVALID_PARAMETER,
+            %% Core rpc/net.cpp:336-339: unknown command throws
+            %% std::runtime_error(RPCHelpMan::ToString()), which
+            %% JSONRPCExec maps to RPC_MISC_ERROR (-1), not -8.
+            {error, ?RPC_MISC_ERROR,
              <<"Command must be add, remove, or onetry">>}
     end;
 rpc_addnode(_) ->
@@ -7562,23 +7564,41 @@ mininginfo_proplist(Blocks, BitsHex, TipBits, TargetHex, PooledTx, Chain, NetHas
 rpc_getblocktemplate([]) ->
     rpc_getblocktemplate([#{}]);
 rpc_getblocktemplate([TemplateRequest]) when is_map(TemplateRequest) ->
-    %% Use a default coinbase script (OP_TRUE) for template generation
-    DefaultScript = <<16#51>>,
-    CoinbaseScript = maps:get(<<"coinbasescript">>, TemplateRequest,
-                               DefaultScript),
-    case beamchain_miner:create_block_template(CoinbaseScript) of
-        {ok, Template} ->
-            %% Strip internal fields (prefixed with _)
-            Public = maps:filter(fun(<<"_", _/binary>>, _) -> false;
-                                     (_, _) -> true
-                                 end, Template),
-            {ok, Public};
-        {error, Reason} ->
-            {error, ?RPC_MISC_ERROR,
-             iolist_to_binary(io_lib:format("~p", [Reason]))}
+    %% Core rpc/mining.cpp:854-857: GBT must be called with 'segwit' in
+    %% the client rules array. Missing/empty/non-array rules -> -8.
+    case gbt_client_has_segwit(TemplateRequest) of
+        false ->
+            {error, ?RPC_INVALID_PARAMETER,
+             <<"getblocktemplate must be called with the segwit rule set "
+               "(call with {\"rules\": [\"segwit\"]})">>};
+        true ->
+            %% Use a default coinbase script (OP_TRUE) for template generation
+            DefaultScript = <<16#51>>,
+            CoinbaseScript = maps:get(<<"coinbasescript">>, TemplateRequest,
+                                       DefaultScript),
+            case beamchain_miner:create_block_template(CoinbaseScript) of
+                {ok, Template} ->
+                    %% Strip internal fields (prefixed with _)
+                    Public = maps:filter(fun(<<"_", _/binary>>, _) -> false;
+                                             (_, _) -> true
+                                         end, Template),
+                    {ok, Public};
+                {error, Reason} ->
+                    {error, ?RPC_MISC_ERROR,
+                     iolist_to_binary(io_lib:format("~p", [Reason]))}
+            end
     end;
 rpc_getblocktemplate(_) ->
     rpc_getblocktemplate([#{}]).
+
+%% True iff template_request.rules is an array containing "segwit".
+gbt_client_has_segwit(Req) when is_map(Req) ->
+    case maps:get(<<"rules">>, Req, []) of
+        Rules when is_list(Rules) ->
+            lists:member(<<"segwit">>, Rules);
+        _ ->
+            false
+    end.
 
 %% bip22_result/1 maps a beamchain_miner:submit_block/1 error reason to
 %% the canonical BIP-22 result string defined in BIP-22 and Bitcoin Core
@@ -15418,47 +15438,120 @@ chain_tx_count_for_height(Height, Network) ->
 %%% Wave-47b: getnetworkhashps, gettxoutproof, verifytxoutproof, getrpcinfo
 %%% ===================================================================
 
-%% getnetworkhashps([NBlocks]) -> estimated hashes/second over recent window.
-%% Mirrors Bitcoin Core: workDiff / timeDiff over a sliding window.
-rpc_getnetworkhashps([]) ->
-    rpc_getnetworkhashps([120]);
-rpc_getnetworkhashps([NBlocks]) when is_integer(NBlocks) ->
-    case beamchain_chainstate:get_tip() of
-        {ok, {_TipHash, TipHeight}} when TipHeight >= 2 ->
-            Window = case NBlocks =< 0 of
-                true  -> 120;
-                false -> min(NBlocks, TipHeight)
-            end,
-            Hi = TipHeight,
-            Lo = Hi - Window,
-            case {beamchain_db:get_block_index(Hi),
-                  beamchain_db:get_block_index(Lo)} of
-                {{ok, #{chainwork := HiCW, header := HiHdr}},
-                 {ok, #{chainwork := LoCW, header := LoHdr}}} ->
-                    WorkDiff = chainwork_to_float(HiCW) - chainwork_to_float(LoCW),
-                    TimeDiff = HiHdr#block_header.timestamp
-                             - LoHdr#block_header.timestamp,
-                    case TimeDiff > 0 of
-                        true ->
-                            HashPS = WorkDiff / TimeDiff,
-                            {ok, trunc(HashPS)};
-                        false -> {ok, 0}
-                    end;
-                _ -> {ok, 0}
-            end;
-        _ -> {ok, 0}
+%% getnetworkhashps ( nblocks height ) — Core rpc/mining.cpp GetNetworkHashPS.
+%% Both args are Arg<int> (default nblocks=120, height=-1 = tip). A string
+%% nblocks is RPC_TYPE_ERROR (-3); nblocks < -1 or 0 is -8; height outside
+%% [-1, tip] is -8. Return a JSON number (IEEE double), never a truncated
+%% integer, and honour `height` so a historical window is not the tip's.
+rpc_getnetworkhashps(Params) when is_list(Params) ->
+    try
+        NBlocks = parse_optional_int32(nth_param(Params, 0), 120),
+        Height  = parse_optional_int32(nth_param(Params, 1), -1),
+        compute_network_hashps(NBlocks, Height)
+    catch
+        throw:{rpc_error, Code, Msg} -> {error, Code, Msg}
     end;
 rpc_getnetworkhashps(_) ->
-    rpc_getnetworkhashps([120]).
+    rpc_getnetworkhashps([]).
 
-%% Convert a 32-byte big-endian chainwork binary to a float.
-%% (float is sufficient; Bitcoin's current chainwork fits in a 64-bit mantissa
-%%  for the purposes of computing a ratio.)
-chainwork_to_float(CW) when byte_size(CW) =:= 32 ->
-    <<_:128, Lo:128/big>> = CW,
-    %% Use the lower 128 bits; the upper 128 are zero on current mainnet
-    float(Lo);
-chainwork_to_float(_) -> 0.0.
+%% Core UniValue::getInt<int> for an optional numeric RPC arg.
+%% null/omitted -> Default; out-of-int32 or a JSON float -> -1
+%% "JSON integer out of range"; any other JSON type -> -3.
+parse_optional_int32(null, Default) ->
+    Default;
+parse_optional_int32(V, _Default) when is_integer(V) ->
+    core_in_int32(V) orelse
+        throw({rpc_error, ?RPC_MISC_ERROR, <<"JSON integer out of range">>}),
+    V;
+parse_optional_int32(V, _Default) when is_float(V) ->
+    throw({rpc_error, ?RPC_MISC_ERROR, <<"JSON integer out of range">>});
+parse_optional_int32(V, _Default) ->
+    throw({rpc_error, ?RPC_TYPE_ERROR, type_error_msg(V)}).
+
+compute_network_hashps(Lookup0, HeightArg) ->
+    case Lookup0 < -1 orelse Lookup0 =:= 0 of
+        true ->
+            {error, ?RPC_INVALID_PARAMETER,
+             <<"Invalid nblocks. Must be a positive number or -1.">>};
+        false ->
+            case beamchain_chainstate:get_tip() of
+                {ok, {_TipHash, TipHeight}} ->
+                    case HeightArg < -1 orelse HeightArg > TipHeight of
+                        true ->
+                            {error, ?RPC_INVALID_PARAMETER,
+                             <<"Block does not exist at specified height">>};
+                        false ->
+                            HiHeight = case HeightArg >= 0 of
+                                           true  -> HeightArg;
+                                           false -> TipHeight
+                                       end,
+                            %% Core: if (pb == nullptr || !pb->nHeight) return 0
+                            case HiHeight < 1 of
+                                true -> {ok, 0};
+                                false ->
+                                    Lookup1 = case Lookup0 of
+                                        -1 ->
+                                            (HiHeight rem
+                                                 ?DIFFICULTY_ADJUSTMENT_INTERVAL)
+                                                + 1;
+                                        _ -> Lookup0
+                                    end,
+                                    Lookup = case Lookup1 > HiHeight of
+                                                 true  -> HiHeight;
+                                                 false -> Lookup1
+                                             end,
+                                    hashps_from_window(HiHeight, Lookup)
+                            end
+                    end;
+                _ -> {ok, 0}
+            end
+    end.
+
+%% workDiff / timeDiff over `Lookup` steps back from HiHeight.
+%% timeDiff is max(timestamp) - min(timestamp) across the window (Core),
+%% not the endpoint delta — time-warped headers make those differ.
+hashps_from_window(HiHeight, Lookup) ->
+    LoHeight = HiHeight - Lookup,
+    case {beamchain_db:get_block_index(HiHeight),
+          beamchain_db:get_block_index(LoHeight)} of
+        {{ok, #{chainwork := HiCW, header := HiHdr}},
+         {ok, #{chainwork := LoCW}}} ->
+            {MinT, MaxT} = window_time_range(
+                             HiHeight, Lookup,
+                             HiHdr#block_header.timestamp),
+            TimeDiff = MaxT - MinT,
+            case TimeDiff > 0 of
+                true ->
+                    {ok, chainwork_diff_float(HiCW, LoCW) / TimeDiff};
+                false -> {ok, 0}
+            end;
+        _ -> {ok, 0}
+    end.
+
+window_time_range(HiHeight, Lookup, HiTime) ->
+    lists:foldl(
+      fun(I, {MinT, MaxT}) ->
+          case beamchain_db:get_block_index(HiHeight - I) of
+              {ok, #{header := H}} ->
+                  T = H#block_header.timestamp,
+                  {erlang:min(MinT, T), erlang:max(MaxT, T)};
+              _ ->
+                  {MinT, MaxT}
+          end
+      end,
+      {HiTime, HiTime},
+      lists:seq(1, Lookup)).
+
+%% Subtract 256-bit chainwork THEN convert — Core's
+%% (pb->nChainWork - pb0->nChainWork).getdouble(). Converting each side
+%% first loses low bits of a ~2^99 mainnet chainwork in the IEEE mantissa.
+chainwork_diff_float(HiCW, LoCW)
+  when byte_size(HiCW) =:= 32, byte_size(LoCW) =:= 32 ->
+    <<Hi:256/big>> = HiCW,
+    <<Lo:256/big>> = LoCW,
+    float(Hi - Lo);
+chainwork_diff_float(_, _) ->
+    0.0.
 
 %% gettxoutproof([Txids]) or ([Txids, BlockHash]) -> CMerkleBlock hex proof.
 rpc_gettxoutproof([TxidList]) ->
