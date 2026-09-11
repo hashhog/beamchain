@@ -4,6 +4,7 @@
 
 Changes since `v1.0.0`:
 
+- fix: snapshot graft uses trusted assumeutxo chainwork (G9 no longer treats 0 as a bypass)
 - fix: pin escript zip extras so three `rebar3 escriptize` builds share one sha
 - fix: stream assumeutxo snapshot load and HASH_SERIALIZED (8G HIT_CAP)
 - fix: T1 RPC parity — GBT requires rules=["segwit"], testmempoolaccept decode is -22, addnode invalid-command is -1, getnetworkhashps is a float honoring height

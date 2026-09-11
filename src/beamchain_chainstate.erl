@@ -69,6 +69,13 @@
 %% Args: ParentCWInt (integer), Bits (nBits word), MinCWInt (integer).
 -export([check_min_pow_work_int/3]).
 
+%% Snapshot graft: trusted chainwork from the assumeutxo/campaign entry.
+%% Exported for EUnit. graft_snapshot_base_index/3 is the splice;
+%% snapshot_trusted_chainwork/3 is the scalar G9 compares; the comparator
+%% is check_snapshot_chainwork/2.
+-export([graft_snapshot_base_index/3, snapshot_trusted_chainwork/3,
+         check_snapshot_chainwork/2]).
+
 %% Block invalidation / reconsideration
 -export([invalidate_block/1, reconsider_block/1]).
 
@@ -3079,17 +3086,16 @@ do_load_snapshot_with_height(Path, State, Network, NetworkMagic, BaseHash, BaseH
             {error, snapshot_base_block_failed_valid};
         true ->
             %% G9: snapshot chainwork must exceed active tip chainwork —
-            %% Core validation.cpp:5703-5708.
+            %% Core validation.cpp:5703-5708. Use the trusted assumeutxo/
+            %% campaign chainwork (the same scalar the graft writes) when
+            %% the base is unindexed or the index entry is a zero-work
+            %% stub. Core has no SnapCW=0 bypass for a known value.
             ActiveTipCWInt = active_tip_chainwork(State#state.tip_hash),
-            SnapCWInt =
-                case beamchain_db:get_block_index_by_hash(BaseHash) of
-                    {ok, #{chainwork := CW}} -> binary:decode_unsigned(CW, big);
-                    _                        -> 0
-                end,
-            case SnapCWInt =:= 0 orelse SnapCWInt > ActiveTipCWInt of
-                false ->
-                    {error, snapshot_chainwork_not_greater};
-                true ->
+            SnapCWInt = snapshot_trusted_chainwork(BaseHash, BaseHeight, Network),
+            case check_snapshot_chainwork(SnapCWInt, ActiveTipCWInt) of
+                {error, _} = Err ->
+                    Err;
+                ok ->
                     %% Parse snapshot with all per-coin guards (G1-G5) applied.
                     do_load_snapshot_parse(Path, State, Network,
                                           NetworkMagic, BaseHash, BaseHeight)
@@ -3172,23 +3178,32 @@ snapshot_import_group(Txid, Coins, #{batch := Batch, batch_len := Len,
 finish_snapshot_load(State, Network, BaseHash, BaseHeight, NumCoins) ->
     logger:info("chainstate: loading ~B coins from snapshot at height ~B",
                 [NumCoins, BaseHeight]),
-    case graft_snapshot_base_index(BaseHash, BaseHeight, Network, State) of
-        {error, GraftReason} ->
+    %% Duplicate G9 (Core validation.cpp:5703 after PopulateAndValidateSnapshot).
+    case check_snapshot_chainwork(
+           snapshot_trusted_chainwork(BaseHash, BaseHeight, Network),
+           active_tip_chainwork(State#state.tip_hash)) of
+        {error, _} = Err ->
             _ = beamchain_db:clear_chainstate_cf(),
-            {error, {snapshot_base_graft_failed, GraftReason}};
-        {ok, MTPTimestamps} ->
-            State2 = State#state{
-                tip_hash = BaseHash,
-                tip_height = BaseHeight,
-                chainstate_role = snapshot,
-                snapshot_base_height = BaseHeight,
-                snapshot_base_hash = BaseHash,
-                snapshot_validation = pending,
-                mtp_timestamps = MTPTimestamps
-            },
-            ets:insert(?CHAIN_META, {tip, BaseHash, BaseHeight}),
-            spawn(fun() -> start_background_validation(BaseHeight) end),
-            {ok, State2, BaseHeight}
+            Err;
+        ok ->
+            case graft_snapshot_base_index(BaseHash, BaseHeight, Network, State) of
+                {error, GraftReason} ->
+                    _ = beamchain_db:clear_chainstate_cf(),
+                    {error, {snapshot_base_graft_failed, GraftReason}};
+                {ok, MTPTimestamps} ->
+                    State2 = State#state{
+                        tip_hash = BaseHash,
+                        tip_height = BaseHeight,
+                        chainstate_role = snapshot,
+                        snapshot_base_height = BaseHeight,
+                        snapshot_base_hash = BaseHash,
+                        snapshot_validation = pending,
+                        mtp_timestamps = MTPTimestamps
+                    },
+                    ets:insert(?CHAIN_META, {tip, BaseHash, BaseHeight}),
+                    spawn(fun() -> start_background_validation(BaseHeight) end),
+                    {ok, State2, BaseHeight}
+            end
     end.
 
 %% Populate the UTXO cache from snapshot coins.
@@ -3251,19 +3266,101 @@ populate_utxo_cache_from_snapshot(Coins) ->
 %%% index.
 %%% -------------------------------------------------------------------
 
+%% @doc Splice the snapshot base (and its pre-base header band) into the
+%% block index, writing the trusted assumeutxo/campaign chainwork.  A
+%% zero-work stub already in the index is overlaid, not left as a silent
+%% accumulator-from-zero.  Real header-sync chainwork is left untouched.
+-spec graft_snapshot_base_index(binary(), non_neg_integer(), atom()) ->
+    {ok, [non_neg_integer()]} | {error, term()}.
+graft_snapshot_base_index(BaseHash, BaseHeight, Network) ->
+    graft_snapshot_base_index(BaseHash, BaseHeight, Network,
+                              beamchain_chain_params:params(Network)).
+
 graft_snapshot_base_index(BaseHash, BaseHeight, Network,
                           #state{params = Params}) ->
+    graft_snapshot_base_index(BaseHash, BaseHeight, Network, Params);
+graft_snapshot_base_index(BaseHash, BaseHeight, Network, Params) when is_map(Params) ->
+    AuData = snapshot_base_ancestry(BaseHash, BaseHeight, Network),
+    Trusted = trusted_chainwork_int(AuData),
     case beamchain_db:get_block_index_by_hash(BaseHash) of
-        {ok, #{height := BaseHeight}} ->
-            %% Already indexed — a header sync got there first, or this
-            %% datadir was grafted by an earlier import.  This is Core's
-            %% precondition, met the ordinary way.
-            {ok, load_mtp_timestamps(BaseHeight)};
+        {ok, #{height := BaseHeight} = Entry} ->
+            CW = maps:get(chainwork, Entry, <<0:256>>),
+            Indexed = binary:decode_unsigned(CW, big),
+            case {Indexed > 0, Trusted > 0} of
+                {true, _} ->
+                    %% Header-sync already wrote real work. Core's path.
+                    {ok, load_mtp_timestamps(BaseHeight)};
+                {false, true} ->
+                    overlay_trusted_chainwork(
+                      BaseHash, BaseHeight, Trusted, AuData, Params, Entry);
+                {false, false} ->
+                    {ok, load_mtp_timestamps(BaseHeight)}
+            end;
         {ok, #{height := Other}} ->
             {error, {snapshot_base_indexed_at_height, Other, BaseHeight}};
         not_found ->
-            AuData = snapshot_base_ancestry(BaseHash, BaseHeight, Network),
             do_graft_snapshot_base(BaseHash, BaseHeight, AuData, Params)
+    end.
+
+%% Chainwork the graft will write, and G9 must compare against. Prefer
+%% the assumeutxo/campaign trusted scalar (cannot be derived from the
+%% header band). Fall back to the block-index entry (Core path: headers
+%% already synced). Never invent.
+-spec snapshot_trusted_chainwork(binary(), non_neg_integer(), atom()) ->
+    non_neg_integer().
+snapshot_trusted_chainwork(BaseHash, BaseHeight, Network) ->
+    case trusted_chainwork_int(snapshot_base_ancestry(BaseHash, BaseHeight, Network)) of
+        N when N > 0 ->
+            N;
+        _ ->
+            case beamchain_db:get_block_index_by_hash(BaseHash) of
+                {ok, #{chainwork := CW}} -> binary:decode_unsigned(CW, big);
+                _ -> 0
+            end
+    end.
+
+%% Core validation.cpp:5703-5708 / 5787-5788: snapshot work must exceed
+%% the active tip. Zero means "unknown" — HASHHOG_UNSAFE_SNAPSHOT_HEIGHT
+%% with no ancestry, which does not graft. A positive trusted value is
+%% never bypassed.
+-spec check_snapshot_chainwork(non_neg_integer(), non_neg_integer()) ->
+    ok | {error, snapshot_chainwork_not_greater}.
+check_snapshot_chainwork(0, _ActiveCW) ->
+    ok;
+check_snapshot_chainwork(SnapCW, ActiveCW) when SnapCW > ActiveCW ->
+    ok;
+check_snapshot_chainwork(_SnapCW, _ActiveCW) ->
+    {error, snapshot_chainwork_not_greater}.
+
+trusted_chainwork_int(AuData) ->
+    case maps:get(chainwork, AuData, undefined) of
+        CW when is_binary(CW), byte_size(CW) =:= 32 ->
+            binary:decode_unsigned(CW, big);
+        _ ->
+            0
+    end.
+
+overlay_trusted_chainwork(BaseHash, BaseHeight, Trusted, AuData, Params, Entry) ->
+    case maps:get(base_tail_headers, AuData, undefined) of
+        Band when is_list(Band), Band =/= [] ->
+            case maps:get(chainwork, AuData, undefined) of
+                undefined ->
+                    {error, {snapshot_base_ancestry_without_chainwork, BaseHeight}};
+                CW ->
+                    graft_snapshot_band(Band, BaseHash, BaseHeight, CW, AuData, Params)
+            end;
+        _ ->
+            Header = maps:get(header, Entry),
+            Status = maps:get(status, Entry, ?BLOCK_VALID_SCRIPTS),
+            NTx = maps:get(n_tx, Entry, 0),
+            ok = beamchain_db:store_block_index(
+                   BaseHeight, BaseHash, Header,
+                   encode_chainwork(Trusted), Status, NTx),
+            logger:notice(
+              "chainstate: stamped trusted chainwork ~.16b onto snapshot "
+              "base ~s at height ~B (index had zero work)",
+              [Trusted, hash_hex(BaseHash), BaseHeight]),
+            {ok, load_mtp_timestamps(BaseHeight)}
     end.
 
 %% The assumeutxo entry for this base, looked up by hash first (the

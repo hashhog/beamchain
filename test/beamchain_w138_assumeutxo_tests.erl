@@ -437,45 +437,35 @@ gate11_error_atom_defined_test() ->
     ?assert(is_atom(ErrorAtom)).
 
 %%% ===================================================================
-%%% Gate 12 — Snapshot chainwork > active chainwork (PARTIAL, BUG-9).
+%%% Gate 12 — Snapshot chainwork > active chainwork (FIXED, was BUG-9).
 %%% Core: validation.cpp:5703-5708.
-%%% beamchain: do_load_snapshot_with_height/6:2174-2184.
+%%% beamchain: check_snapshot_chainwork/2, used by
+%%% do_load_snapshot_with_height and finish_snapshot_load.
 %%%
-%%% BUG-9: the predicate at line 2182 is
-%%%
-%%%     case SnapCWInt =:= 0 orelse SnapCWInt > ActiveTipCWInt of
-%%%
-%%% The `SnapCWInt =:= 0` clause is an exception Core does NOT have.
-%%% A block-index entry with chainwork stored as <<0:256>> (e.g. a
-%%% partially-written entry from a crashed atomic-connect-writes batch,
-%%% W109) silently passes the gate.
+%%% A positive trusted chainwork that does not exceed the active tip is
+%%% refused. Zero still permits (HASHHOG_UNSAFE_SNAPSHOT_HEIGHT with no
+%%% ancestry, which does not graft).
 %%% ===================================================================
 
 gate12_chainwork_zero_bypass_documented_test() ->
-    %% Source-level documentation. The fix is a one-line change at
-    %% line 2182: remove the `SnapCWInt =:= 0 orelse` clause.
     ErrorAtom = snapshot_chainwork_not_greater,
     ?assert(is_atom(ErrorAtom)),
-    %% Forward-regression: this atom MUST remain defined when BUG-9 is
-    %% fixed (the atom is still the error for the strict-greater path).
-    ?assert(true).
+    ?assertEqual({error, snapshot_chainwork_not_greater},
+                 beamchain_chainstate:check_snapshot_chainwork(500, 1000)),
+    ?assertEqual(ok, beamchain_chainstate:check_snapshot_chainwork(1001, 1000)),
+    ?assertEqual(ok, beamchain_chainstate:check_snapshot_chainwork(0, 1000)).
 
 %%% ===================================================================
-%%% Gate 13 — Inner chainwork check in PopulateAndValidateSnapshot (MISSING, BUG-10).
-%%% Core: validation.cpp:5787-5788.
-%%% beamchain: not present — chainwork is checked once in
-%%% do_load_snapshot_with_height before per-coin parsing, never again
-%%% after.
+%%% Gate 13 — Inner chainwork check in PopulateAndValidateSnapshot
+%%% (FIXED, was BUG-10). Core: validation.cpp:5787-5788.
+%%% beamchain: finish_snapshot_load re-runs check_snapshot_chainwork/2
+%%% before grafting the base and updating #state.tip_hash.
 %%% ===================================================================
 
 gate13_inner_chainwork_check_missing_test() ->
-    %% Source-level absence assertion. Inspect do_load_snapshot_parse
-    %% (beamchain_chainstate.erl:2192-2230): there is no second
-    %% chainwork comparison between `load_snapshot_validated` and
-    %% `ets:insert(?CHAIN_META, ...)`. This is BUG-10.
-    %% The fix would add an `active_tip_chainwork` re-check before
-    %% the State#state{tip_hash = BaseHash, ...} update.
-    ?assert(true).
+    Exports = beamchain_chainstate:module_info(exports),
+    ?assert(lists:member({check_snapshot_chainwork, 2}, Exports)),
+    ?assert(lists:member({snapshot_trusted_chainwork, 3}, Exports)).
 
 %%% ===================================================================
 %%% Gate 14 — Headers-chain ancestor check on base (MISSING, BUG-11).

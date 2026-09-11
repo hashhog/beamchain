@@ -641,10 +641,18 @@ register_regtest_assumeutxo(Height, BlockHash, UtxoHash, ChainTxCount)
     ok.
 
 %% @doc Register a regtest AssumeUTXO entry from a data map.
+%% Extra keys (chainwork, base_header, base_tail_headers, base_mtp) are
+%% preserved — they are the snapshot-graft ancestry. The arity-4 form
+%% still stores only the four Core AssumeutxoData fields.
 -spec register_regtest_assumeutxo(non_neg_integer(), map()) -> ok.
-register_regtest_assumeutxo(Height, #{block_hash := BH, utxo_hash := UH} = Data) ->
-    register_regtest_assumeutxo(Height, BH, UH,
-                                maps:get(chain_tx_count, Data, Height)).
+register_regtest_assumeutxo(Height, #{block_hash := BH, utxo_hash := UH} = Data)
+        when is_integer(Height), Height >= 0,
+             is_binary(BH), byte_size(BH) =:= 32,
+             is_binary(UH), byte_size(UH) =:= 32 ->
+    ensure_regtest_au_table(),
+    ChainTx = maps:get(chain_tx_count, Data, Height),
+    ets:insert(?REGTEST_AU_TABLE, {Height, Data#{chain_tx_count => ChainTx}}),
+    ok.
 
 %% @doc Remove all runtime regtest AssumeUTXO registrations.
 -spec clear_regtest_assumeutxo() -> ok.
