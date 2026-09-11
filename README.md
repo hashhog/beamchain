@@ -88,6 +88,10 @@ rebar3 escriptize
 ./beamchain --help
 ```
 
+`rebar3 escriptize` is byte-reproducible on a given toolchain: a post-hook
+strips zip atime extras (`scripts/normalize_escript.escript`). Control:
+`bash scripts/reproducible-escript.sh` (three builds, one sha).
+
 Note: `rebar.config` states escript mode is unsupported (the RocksDB NIF cannot load from an escript archive);
 the deployed path is `rebar3 as prod release` then `_build/prod/rel/beamchain/bin/beamchain daemon`.
 
