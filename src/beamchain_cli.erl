@@ -535,9 +535,8 @@ import_blocks(Opts) ->
 %%% ===================================================================
 %%% import-utxo command -- import a Bitcoin Core UTXO snapshot
 %%% (assumeutxo). Routes through beamchain_chainstate:load_snapshot/1
-%%% which calls beamchain_snapshot:load_snapshot/1 (Core-byte-compatible
-%%% loader), then verify_snapshot/2 against the chain_params'
-%%% m_assumeutxo_data, then populates the UTXO cache.
+%%% which streams fold_snapshot_groups_validated/5 (raw fd, one txid
+%%% group write/flush/discard) then HASH_SERIALIZED over the CF.
 %%% ===================================================================
 
 import_utxo(Opts) ->

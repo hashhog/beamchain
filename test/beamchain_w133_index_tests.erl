@@ -83,10 +83,12 @@ g2_no_coinstatsindex_test_() ->
       ?_test(begin
          ?assertEqual(non_existing, code:which(beamchain_coinstatsindex)),
          ?assertEqual(non_existing, code:which(beamchain_coin_stats_index)),
-         %% gettxoutsetinfo path in beamchain_rpc walks utxos via
-         %% beamchain_db:fold_utxos, not a per-height index read.
+         %% gettxoutsetinfo walks the chainstate CF via
+         %% compute_utxo_stats (one txid group at a time), not a
+         %% per-height index read and not a materialised coin list.
          RpcSrc = read_src(beamchain_rpc_src()),
-         ?assertNotEqual(nomatch, binary:match(RpcSrc, <<"fold_utxos">>)),
+         ?assertNotEqual(nomatch, binary:match(RpcSrc, <<"compute_utxo_stats">>)),
+         ?assertEqual(nomatch, binary:match(RpcSrc, <<"compute_utxo_hash_from_list(">>)),
          %% No LookUpStats analog
          ?assertEqual(nomatch, binary:match(RpcSrc, <<"lookup_stats">>)),
          ?assertEqual(nomatch, binary:match(RpcSrc, <<"LookUpStats">>))

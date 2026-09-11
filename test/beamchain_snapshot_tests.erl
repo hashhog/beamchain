@@ -59,11 +59,18 @@ snapshot_test_() ->
           {"verify_snapshot rejects MuHash3072 commitment (separate from HASH_SERIALIZED)",
            fun test_verify_snapshot_rejects_muhash/0},
           {"dumptxoutset emits HASH_SERIALIZED (SHA256d) in txoutset_hash field",
-           fun test_dumptxoutset_emits_hash_serialized/0}
+           fun test_dumptxoutset_emits_hash_serialized/0},
+          {"load path must not file:read_file the snapshot (8G HIT_CAP anti-pattern)",
+           fun test_load_path_rejects_file_read_file/0},
+          {"fold_snapshot_groups peak is the widest txid (133-coin fixture), not the set",
+           fun test_fold_snapshot_groups_peak_is_widest_txid/0},
+          {"streamed HASH_SERIALIZED over the 133-coin fixture matches from_list",
+           fun test_streamed_hash_matches_from_list_on_133_fixture/0}
          ]
      end}.
 
 setup() ->
+    application:ensure_all_started(crypto),
     application:set_env(beamchain, network, regtest),
     ok.
 
@@ -732,6 +739,106 @@ test_dumptxoutset_emits_hash_serialized() ->
     %% Backwards-compatible alias: compute_utxo_hash_from_list_legacy/1
     %% must produce the same digest (it routes to the same impl).
     ?assertEqual(H, beamchain_snapshot:compute_utxo_hash_from_list_legacy(Coins)).
+
+%% Restoring file:read_file/1 on the snapshot load path is the 8G HIT_CAP
+%% (QUEUES.md 2026-09-11: MemoryPeak 8 GiB, curl_rc=143). Comments may
+%% mention the anti-pattern; the CALL `file:read_file(` must not return.
+test_load_path_rejects_file_read_file() ->
+    {ok, Snap} = file:read_file("src/beamchain_snapshot.erl"),
+    ?assertEqual(nomatch, binary:match(Snap, <<"file:read_file(">>)),
+    ?assertNotEqual(nomatch, binary:match(Snap, <<"fold_snapshot_groups_validated">>)),
+    ?assertNotEqual(nomatch, binary:match(Snap, <<"STREAMING-HASH">>)),
+    {ok, CS} = file:read_file("src/beamchain_chainstate.erl"),
+    ?assertEqual(nomatch, binary:match(CS, <<"load_snapshot_validated(">>)),
+    ?assertNotEqual(nomatch, binary:match(CS, <<"fold_snapshot_groups_validated">>)),
+    ?assertNotEqual(nomatch, binary:match(CS, <<"snapshot_import_group">>)),
+    {ok, Rpc} = file:read_file("src/beamchain_rpc.erl"),
+    ?assertEqual(nomatch, binary:match(Rpc, <<"compute_utxo_hash_from_list(">>)),
+    ?assertNotEqual(nomatch, binary:match(Rpc, <<"compute_utxo_stats">>)),
+    ?assertNotEqual(nomatch, binary:match(Rpc, <<"STREAMING-HASH">>)).
+
+%% 50 singleton txids + one txid with 133 outputs + one txid with vouts
+%% {0,1,256} (numeric map order, not LE32 key order). Peak live group
+%% must be 133, not 50+133+3. A fold that materialises the set and then
+%% reports length as "peak" fails this.
+test_fold_snapshot_groups_peak_is_widest_txid() ->
+    {Path, Magic, _Coins} = write_133_coin_fixture(),
+    try
+        Fun = fun(_Txid, Group, {Count, Peak, Sizes}) ->
+                      G = length(Group),
+                      {Count + G, max(Peak, G), [G | Sizes]}
+              end,
+        {ok, #{num_coins := Num}, {Count, Peak, Sizes}} =
+            beamchain_snapshot:fold_snapshot_groups_validated(
+              Path, Magic, 1000000, Fun, {0, 0, []}),
+        ?assertEqual(50 + 133 + 3, Num),
+        ?assertEqual(50 + 133 + 3, Count),
+        ?assertEqual(133, Peak),
+        ?assert(lists:member(133, Sizes)),
+        ?assert(lists:member(3, Sizes)),
+        ?assert(lists:member(1, Sizes)),
+        ?assertEqual(false, lists:member(50 + 133 + 3, Sizes))
+    after
+        file:delete(Path)
+    end.
+
+test_streamed_hash_matches_from_list_on_133_fixture() ->
+    {Path, Magic, Coins} = write_133_coin_fixture(),
+    try
+        {ok, _, Ctx} =
+            beamchain_snapshot:fold_snapshot_groups_validated(
+              Path, Magic, 1000000,
+              fun(Txid, Group, C) ->
+                      Sorted = lists:keysort(1, Group),
+                      lists:foldl(
+                        fun({Vout, Utxo}, Acc) ->
+                                crypto:hash_update(
+                                  Acc, beamchain_snapshot:tx_out_ser(Txid, Vout, Utxo))
+                        end, C, Sorted)
+              end, crypto:hash_init(sha256)),
+        Inner = crypto:hash_final(Ctx),
+        Streamed = crypto:hash(sha256, Inner),
+        FromList = beamchain_snapshot:compute_utxo_hash_from_list(Coins),
+        ?assertEqual(FromList, Streamed),
+        ?assertEqual(32, byte_size(Streamed))
+    after
+        file:delete(Path)
+    end.
+
+write_133_coin_fixture() ->
+    Magic = <<16#FA, 16#BF, 16#B5, 16#DA>>,
+    BaseHash = <<9:256>>,
+    U = fun(V) ->
+                #utxo{value = V, script_pubkey = <<16#51>>,
+                      is_coinbase = false, height = 1}
+        end,
+    Singletons = [{<<I:256>>, [{0, U(I)}]} || I <- lists:seq(1, 50)],
+    WideTxid = <<16#aa:256>>,
+    Wide = {WideTxid, [{N, U(1000 + N)} || N <- lists:seq(0, 132)]},
+    LeTxid = <<16#bb:256>>,
+    Le = {LeTxid, [{0, U(2000)}, {1, U(2001)}, {256, U(2256)}]},
+    %% File order is txid-lex so a naive file-order hasher matches from_list
+    %% which sorts (txid, vout). <<1:256>> .. <<50:256>> then <<0xaa..>> then
+    %% <<0xbb..>> is already lex-sorted (1..50 < 0xaa < 0xbb as 32-byte keys
+    %% of <<I:256>> for I=1..50 start with zeros).
+    Groups = lists:sort(fun({T1, _}, {T2, _}) -> T1 =< T2 end,
+                        Singletons ++ [Wide, Le]),
+    Coins = lists:append([[{Txid, V, Utxo} || {V, Utxo} <- Cs]
+                          || {Txid, Cs} <- Groups]),
+    Body = [build_snapshot_group(Txid, Cs) || {Txid, Cs} <- Groups],
+    Header = beamchain_snapshot:serialize_metadata(Magic, BaseHash, length(Coins)),
+    Bin = iolist_to_binary([Header, Body]),
+    Path = "/tmp/beamchain_snap_133_" ++ integer_to_list(erlang:unique_integer([positive])) ++ ".dat",
+    ok = file:write_file(Path, Bin),
+    {Path, Magic, Coins}.
+
+build_snapshot_group(Txid, Coins) ->
+    Ordered = lists:sort(fun({V1, _}, {V2, _}) -> V1 =< V2 end, Coins),
+    Count = beamchain_snapshot:encode_compact_size(length(Ordered)),
+    Entries = [[beamchain_snapshot:encode_compact_size(V),
+                beamchain_snapshot:serialize_coin(U)]
+               || {V, U} <- Ordered],
+    [Txid, Count, Entries].
 
 bin_to_display_hex(Bin) ->
     Reversed = list_to_binary(lists:reverse(binary_to_list(Bin))),

@@ -5395,26 +5395,16 @@ do_rpc_gettxoutsetinfo(HashType) ->
 %% height/coinbase + amount + scriptlen) plus the script length itself
 %% (kernel/coinstats.cpp:78-86).
 compute_utxo_set_stats(<<"hash_serialized_3">>) ->
-    %% Flush dirty cache → disk so the cursor walk sees the authoritative
-    %% UTXO set at the current tip. Same idiom Core uses for its cursor
-    %% (the cache is force-promoted by FlushStateToDisk before the walk
-    %% in coinstats.cpp:69-72).
+    %% STREAMING-HASH: one cursor walk, one txid group at a time. Must not
+    %% fold_utxos into a list and must not call compute_utxo_hash_from_list.
     beamchain_chainstate:flush(),
-    Coins = beamchain_db:fold_utxos(
-              fun(Coin, Acc) -> [Coin | Acc] end, []),
-    CoinList = case Coins of L when is_list(L) -> L; _ -> [] end,
-    Stats = tally_coins(CoinList),
-    UtxoHash = beamchain_snapshot:compute_utxo_hash_from_list(CoinList),
+    {UtxoHash, Stats} = beamchain_snapshot:compute_utxo_stats(hash_serialized),
     Hex = beamchain_serialize:hex_encode(
             beamchain_serialize:reverse_bytes(UtxoHash)),
     {Stats, Hex};
 compute_utxo_set_stats(<<"muhash">>) ->
     beamchain_chainstate:flush(),
-    Coins = beamchain_db:fold_utxos(
-              fun(Coin, Acc) -> [Coin | Acc] end, []),
-    CoinList = case Coins of L when is_list(L) -> L; _ -> [] end,
-    Stats = tally_coins(CoinList),
-    MuHash = beamchain_snapshot:compute_txoutset_muhash_from_list(CoinList),
+    {MuHash, Stats} = beamchain_snapshot:compute_utxo_stats(muhash),
     Hex = beamchain_serialize:hex_encode(
             beamchain_serialize:reverse_bytes(MuHash)),
     {Stats, Hex}.
@@ -5425,39 +5415,8 @@ compute_utxo_set_stats(<<"muhash">>) ->
 %% map. Flushes dirty cache to disk first so the walk sees the authoritative tip.
 compute_utxo_set_stats_no_commitment() ->
     beamchain_chainstate:flush(),
-    Coins = beamchain_db:fold_utxos(
-              fun(Coin, Acc) -> [Coin | Acc] end, []),
-    CoinList = case Coins of L when is_list(L) -> L; _ -> [] end,
-    tally_coins(CoinList).
-
-tally_coins(Coins) ->
-    %% Track the set of distinct txids so we can report Core's
-    %% `nTransactions` (= # of txids with >=1 unspent output). Core
-    %% increments nTransactions once per coin group in ApplyStats
-    %% (kernel/coinstats.cpp:99); a sets:add_element accumulation over the
-    %% (unordered) coin list gives the same count without relying on the
-    %% cursor order.
-    Acc0 = #{txouts => 0, bogosize => 0, total_amount => 0,
-             txids => sets:new([{version, 2}])},
-    Final = lists:foldl(
-      fun({Txid, _Vout, #utxo{script_pubkey = SPK, value = Value}}, Acc) ->
-              ScriptLen = byte_size(SPK),
-              %% Core: 50 + scriptPubKey.size() — see
-              %% kernel/coinstats.cpp ComputeBogoSize (49 + 1 amount byte
-              %% per Core's accounting; we follow Core's actual constant).
-              Bogo = 50 + ScriptLen,
-              #{txouts := T, bogosize := B, total_amount := A,
-                txids := S} = Acc,
-              Acc#{txouts       => T + 1,
-                   bogosize     => B + Bogo,
-                   total_amount => A + Value,
-                   txids        => sets:add_element(Txid, S)}
-      end,
-      Acc0,
-      Coins),
-    #{txids := TxidSet} = Final,
-    NTx = sets:size(TxidSet),
-    maps:put(transactions, NTx, maps:remove(txids, Final)).
+    {_NoHash, Stats} = beamchain_snapshot:compute_utxo_stats(none),
+    Stats.
 
 %%% ===================================================================
 %%% scantxoutset — scan the UTXO set by scriptPubKey (wallet recovery)

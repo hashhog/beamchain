@@ -1075,33 +1075,13 @@ handle_call(wipe_chainstate, _From, State) ->
 handle_call({load_snapshot, Path}, _From, State) ->
     case do_load_snapshot(Path, State) of
         {ok, State2, Height} ->
-            %% Synchronously persist the snapshot-loaded chainstate to
-            %% RocksDB BEFORE returning. populate_utxo_cache_from_snapshot
-            %% only writes the coins to the in-memory ETS cache (marked
-            %% DIRTY/FRESH) and sets tip_hash/tip_height in State; nothing
-            %% reaches disk. The CLI `import-utxo` command halt(0)s right
-            %% after this call returns, and halt/1 does NOT run the OTP
-            %% terminate/2 callback (which is the only other place a flush
-            %% happens on shutdown), so without this the imported UTXO set
-            %% and the chain tip would never be persisted — a subsequent
-            %% `start` would read an empty DB (chain_tip not_found) and
-            %% reconnect genesis, discarding the snapshot.
-            %%
-            %% We must NOT use do_flush/1 here: at mainnet height 944183 the
-            %% snapshot holds ~180M coins, all marked DIRTY. do_flush builds
-            %% ONE in-memory Ops list over the whole DIRTY table (≈180M
-            %% tuples) and hands a single multi-GB WriteBatch to rocksdb:write
-            %% — that doubles peak memory on top of the already-resident ETS
-            %% tables and risks OOM / a multi-minute write stall on the
-            %% gen_server. Instead flush in bounded chunks (same pattern as
-            %% beamchain_db:scrub_unspendable/0, which chunks at 5000 ops to
-            %% "keep WriteBatch footprint bounded on a multi-million-coin
-            %% chainstate"). flush_snapshot_chunked/1 streams the DIRTY coins
-            %% to the chainstate CF in ?SNAPSHOT_FLUSH_CHUNK-sized batches,
-            %% then writes the chain_tip / utxo_flush_height / HEAD_BLOCKS
-            %% meta keys in a final small batch. On the next `start`, the
-            %% main-role init reads chain_tip via load_chain_tip/0 and
-            %% forward-syncs from BaseHeight.
+            %% Coins were already streamed to the chainstate CF in
+            %% ?SNAPSHOT_FLUSH_CHUNK batches during parse (snapshot_import_group/3).
+            %% flush_snapshot_chunked/1 now writes chain_tip / utxo_flush_height /
+            %% HEAD_BLOCKS — the DIRTY table is empty, so this is a small
+            %% meta-key batch. The CLI `import-utxo` halt(0)s right after
+            %% this call; halt/1 does NOT run terminate/2, so the tip MUST
+            %% be durable here or the next `start` reconnects genesis.
             State3 = flush_snapshot_chunked(State2),
             {reply, {ok, Height}, State3};
         {error, Reason} ->
@@ -1109,12 +1089,17 @@ handle_call({load_snapshot, Path}, _From, State) ->
     end;
 
 handle_call(compute_utxo_hash, _From, State) ->
-    Hash = do_compute_utxo_hash(),
-    {reply, Hash, State};
+    %% Flush first: compute_utxo_hash_stream walks the CF. Do not call
+    %% beamchain_snapshot:compute_utxo_hash/0 from here — that flush()s
+    %% via gen_server:call and would deadlock.
+    State2 = do_flush(State),
+    Hash = beamchain_snapshot:compute_utxo_hash_stream(),
+    {reply, Hash, State2};
 
 handle_call(compute_utxo_muhash, _From, State) ->
-    MuHash = do_compute_utxo_muhash(),
-    {reply, MuHash, State};
+    State2 = do_flush(State),
+    {MuHash, _Stats} = beamchain_snapshot:compute_utxo_stats(muhash),
+    {reply, MuHash, State2};
 
 handle_call({scan_utxos, ScriptSet}, _From, State) ->
     Matches = do_scan_utxos(ScriptSet),
@@ -2849,6 +2834,8 @@ flush_snapshot_loop(Key, Batch, BatchLen, Written) ->
             flush_snapshot_loop(Next, NewBatch, NewLen, Written)
     end.
 
+snapshot_write_chunk([]) ->
+    ok;
 snapshot_write_chunk(Ops) ->
     case beamchain_db:direct_write_batch(Ops) of
         ok -> ok;
@@ -3008,10 +2995,10 @@ compute_mtp(Timestamps) ->
 %%   G8  BLOCK_FAILED_VALID on base block rejected (validation.cpp:5617-5619).
 %%   G9  snapshot chainwork must exceed active tip chainwork (v.cpp:5703-5708).
 %%
-%% After per-coin parsing, routes through verify_snapshot/2 (SHA256d
-%% strict-content-hash, mirrors validation.cpp:5901-5914 +
-%% kernel/coinstats.cpp:161). On mismatch propagates verbatim Core wording
-%% wrapped in {snapshot_content_hash_mismatch, BinMsg}.
+%% After the streamed write, HASH_SERIALIZED is computed over the CF
+%% (compute_utxo_hash_stream/0, kernel/coinstats.cpp ComputeUTXOStats)
+%% and compared via verify_hash_serialized/3. On mismatch: wipe the CF
+%% and return {snapshot_content_hash_mismatch, BinMsg} with Core wording.
 do_load_snapshot(Path, State) ->
     Network = beamchain_config:network(),
     Params = beamchain_chain_params:params(Network),
@@ -3111,89 +3098,115 @@ do_load_snapshot_with_height(Path, State, Network, NetworkMagic, BaseHash, BaseH
 
 do_load_snapshot_parse(Path, State, Network, NetworkMagic, BaseHash, BaseHeight) ->
     %% G1 (network_magic), G2 (per-coin height), G3 (vout), G4 (MoneyRange),
-    %% G5 (trailing bytes) are all enforced inside load_snapshot_validated/3.
-    case beamchain_snapshot:load_snapshot_validated(Path, NetworkMagic, BaseHeight) of
-        {ok, #{num_coins := NumCoins, coins := Coins} = SnapshotData} ->
-            %% SHA256d strict-content-hash check (validation.cpp:5901-5914).
-            case beamchain_snapshot:verify_snapshot(SnapshotData, Network) of
-                ok ->
-                    logger:info("chainstate: loading ~B coins from snapshot at height ~B",
-                                [NumCoins, BaseHeight]),
-
-                    %% Materialise the base block (and, when the entry
-                    %% carries one, its pre-base header band) in the block
-                    %% index BEFORE anything else, so the base is a usable
-                    %% PARENT the moment the tip moves to it.  Done first so
-                    %% a broken ancestry aborts the load without having
-                    %% clobbered the UTXO cache.
-                    case graft_snapshot_base_index(BaseHash, BaseHeight,
-                                                   Network, State) of
-                        {error, GraftReason} ->
-                            {error, {snapshot_base_graft_failed, GraftReason}};
-                        {ok, MTPTimestamps} ->
-                    %% Populate the UTXO cache
-                    populate_utxo_cache_from_snapshot(Coins),
-
-                    %% Update state. The snapshot chainstate is now active
-                    %% but UNVALIDATED (Core Assumeutxo::UNVALIDATED) until
-                    %% the background re-derivation completes.
-                    State2 = State#state{
-                        tip_hash = BaseHash,
-                        tip_height = BaseHeight,
-                        chainstate_role = snapshot,
-                        snapshot_base_height = BaseHeight,
-                        snapshot_base_hash = BaseHash,
-                        snapshot_validation = pending,
-                        mtp_timestamps = MTPTimestamps
-                    },
-
-                    %% Update ETS chain meta
-                    ets:insert(?CHAIN_META, {tip, BaseHash, BaseHeight}),
-
-                    %% Stage 2: start the REAL background validation — a
-                    %% separate genesis->base coins store whose recomputed
-                    %% HASH_SERIALIZED is compared to au_data
-                    %% (beamchain_bg_validation). The load gate above only
-                    %% authenticated the file against its own claimed hash;
-                    %% this re-derivation is the non-circular check.
-                    spawn(fun() -> start_background_validation(BaseHeight) end),
-
-                            {ok, State2, BaseHeight}
-                    end;
-                {error, BinMsg} when is_binary(BinMsg) ->
-                    %% Verbatim Core "Bad snapshot content hash: ..." text.
-                    {error, {snapshot_content_hash_mismatch, BinMsg}};
-                {error, Reason} ->
-                    {error, {snapshot_verification_failed, Reason}}
-            end;
-        {error, Reason} ->
-            {error, {snapshot_load_failed, Reason}}
-    end.
-
-%% Populate the UTXO cache from snapshot coins
-populate_utxo_cache_from_snapshot(Coins) ->
-    %% Clear existing cache entries
+    %% G5 (trailing bytes) are enforced inside fold_snapshot_groups_validated/5.
+    %% STREAMING-HASH: one txid group is parsed, written, flushed, discarded.
+    %% The previous load_snapshot_validated/3 returned a `coins` list of
+    %% every UTXO; that is the 8G HIT_CAP. Do not restore it here.
     ets:delete_all_objects(?UTXO_CACHE),
     ets:delete_all_objects(?UTXO_DIRTY),
     ets:delete_all_objects(?UTXO_FRESH),
     ets:delete_all_objects(?UTXO_SPENT),
+    %% The HASH_SERIALIZED gate walks this CF after the stream. Leftover
+    %% coins from a crashed prior import (or genesis) would mix into the
+    %% digest. Wipe first so the hashed set is exactly the snapshot.
+    _ = beamchain_db:clear_chainstate_cf(),
 
-    %% Insert all coins from snapshot
+    Acc0 = #{batch => [], batch_len => 0, coins => 0, peak => 0},
+    case beamchain_snapshot:fold_snapshot_groups_validated(
+           Path, NetworkMagic, BaseHeight,
+           fun snapshot_import_group/3, Acc0) of
+        {ok, #{num_coins := NumCoins}, Acc1} ->
+            ok = snapshot_write_chunk(maps:get(batch, Acc1)),
+            logger:info("chainstate: streamed ~B coins from snapshot "
+                        "(peak txid group ~B) at height ~B",
+                        [maps:get(coins, Acc1), maps:get(peak, Acc1),
+                         BaseHeight]),
+            %% HASH_SERIALIZED over the coins just written, one txid group
+            %% at a time (kernel/coinstats.cpp ComputeUTXOStats). Must not
+            %% call compute_utxo_hash_from_list/1 — that materialises the set.
+            Computed = beamchain_snapshot:compute_utxo_hash_stream(),
+            case beamchain_snapshot:verify_hash_serialized(
+                   BaseHash, Computed, Network) of
+                ok ->
+                    finish_snapshot_load(State, Network, BaseHash, BaseHeight,
+                                         NumCoins);
+                {error, BinMsg} when is_binary(BinMsg) ->
+                    _ = beamchain_db:clear_chainstate_cf(),
+                    {error, {snapshot_content_hash_mismatch, BinMsg}};
+                {error, Reason} ->
+                    _ = beamchain_db:clear_chainstate_cf(),
+                    {error, {snapshot_verification_failed, Reason}}
+            end;
+        {error, Reason} ->
+            _ = beamchain_db:clear_chainstate_cf(),
+            {error, {snapshot_load_failed, Reason}}
+    end.
+
+%% Write one txid group into the current RocksDB batch and flush when the
+%% batch hits ?SNAPSHOT_FLUSH_CHUNK. The live op-list never exceeds one
+%% chunk plus the current group — Core flushes the snapshot cache every
+%% ~120k coins (validation.cpp:5840).
+snapshot_import_group(Txid, Coins, #{batch := Batch, batch_len := Len,
+                                     coins := N, peak := Peak} = Acc) ->
+    G = length(Coins),
+    Ops = [{put, chainstate, <<Txid:32/binary, Vout:32/big>>, encode_utxo(Utxo)}
+           || {Vout, Utxo} <- Coins],
+    Batch1 = Ops ++ Batch,
+    Len1 = Len + G,
+    N1 = N + G,
+    case N1 rem 1000000 < G of
+        true when N1 > 0 ->
+            logger:info("chainstate: [snapshot] ~B coins loaded", [N1]);
+        _ ->
+            ok
+    end,
+    Acc1 = Acc#{coins := N1, peak := max(Peak, G)},
+    case Len1 >= ?SNAPSHOT_FLUSH_CHUNK of
+        true ->
+            ok = snapshot_write_chunk(Batch1),
+            Acc1#{batch := [], batch_len := 0};
+        false ->
+            Acc1#{batch := Batch1, batch_len := Len1}
+    end.
+
+finish_snapshot_load(State, Network, BaseHash, BaseHeight, NumCoins) ->
+    logger:info("chainstate: loading ~B coins from snapshot at height ~B",
+                [NumCoins, BaseHeight]),
+    case graft_snapshot_base_index(BaseHash, BaseHeight, Network, State) of
+        {error, GraftReason} ->
+            _ = beamchain_db:clear_chainstate_cf(),
+            {error, {snapshot_base_graft_failed, GraftReason}};
+        {ok, MTPTimestamps} ->
+            State2 = State#state{
+                tip_hash = BaseHash,
+                tip_height = BaseHeight,
+                chainstate_role = snapshot,
+                snapshot_base_height = BaseHeight,
+                snapshot_base_hash = BaseHash,
+                snapshot_validation = pending,
+                mtp_timestamps = MTPTimestamps
+            },
+            ets:insert(?CHAIN_META, {tip, BaseHash, BaseHeight}),
+            spawn(fun() -> start_background_validation(BaseHeight) end),
+            {ok, State2, BaseHeight}
+    end.
+
+%% Populate the UTXO cache from snapshot coins.
+%% Used only by init_chainstate/2 for an in-memory snapshot-role start
+%% (small fixtures). Production import-utxo streams groups to RocksDB
+%% via snapshot_import_group/3 and does not call this.
+populate_utxo_cache_from_snapshot(Coins) ->
+    ets:delete_all_objects(?UTXO_CACHE),
+    ets:delete_all_objects(?UTXO_DIRTY),
+    ets:delete_all_objects(?UTXO_FRESH),
+    ets:delete_all_objects(?UTXO_SPENT),
     lists:foreach(fun({Txid, Vout, Utxo}) ->
         Key = {Txid, Vout},
-        %% detach_spk: the parent here is even larger than a block — beamchain_snapshot
-        %% file:read_file's the WHOLE snapshot into one refc binary and slices every
-        %% coin out of it, so a single surviving >64-byte scriptPubKey would pin the
-        %% entire snapshot file.
         ets:insert(?UTXO_CACHE, {Key, detach_spk(Utxo)}),
-        %% Mark as DIRTY so they get flushed to RocksDB
         ets:insert(?UTXO_DIRTY, {Key}),
-        %% Mark as FRESH since they don't exist in RocksDB yet
         ets:insert(?UTXO_FRESH, {Key})
     end, Coins),
-
-    NumCoins = length(Coins),
-    logger:info("chainstate: loaded ~B coins into cache", [NumCoins]),
+    logger:info("chainstate: loaded ~B coins into cache", [length(Coins)]),
     ok.
 
 %%% -------------------------------------------------------------------
@@ -3399,31 +3412,11 @@ record_snapshot_base_tx_count(BaseHeight, AuData) ->
         _ -> ok
     end.
 
-%% Compute the UTXO-set commitment over the cache.
-%%
-%% Returns the HASH_SERIALIZED commitment — SHA256d via HashWriter over
-%% Core's TxOutSer per-coin layout. This is the same commitment used by
-%% loadtxoutset strict validation against
-%% m_assumeutxo_data.hash_serialized (see
-%% beamchain_snapshot:verify_snapshot/2 and
-%% bitcoin-core/src/validation.cpp:5901-5914 +
-%% kernel/coinstats.cpp:161). For the MuHash3072 commitment routed by
-%% `gettxoutsetinfo hash_type=muhash`, see
-%% beamchain_snapshot:compute_txoutset_muhash_from_list/1.
-do_compute_utxo_hash() ->
-    %% Materialize UTXOs from the ETS cache as the standard
-    %% {Txid, Vout, #utxo{}} tuples.
-    AllEntries = ets:tab2list(?UTXO_CACHE),
-    Coins = [{Txid, Vout, Utxo} || {{Txid, Vout}, Utxo} <- AllEntries],
-    beamchain_snapshot:compute_utxo_hash_from_list(Coins).
-
-%% MuHash3072 finalize digest over the cache UTXO set. Mirrors
-%% kernel/coinstats.cpp:165-167 (the MUHASH branch). Order-independent
-%% (the deterministic sort isn't strictly needed but is cheap).
-do_compute_utxo_muhash() ->
-    AllEntries = ets:tab2list(?UTXO_CACHE),
-    Coins = [{Txid, Vout, Utxo} || {{Txid, Vout}, Utxo} <- AllEntries],
-    beamchain_snapshot:compute_txoutset_muhash_from_list(Coins).
+%% HASH_SERIALIZED / MuHash over the UTXO set are computed by
+%% beamchain_snapshot:compute_utxo_hash_stream/0 and compute_utxo_stats/1
+%% after do_flush/1 (handle_call compute_utxo_hash / compute_utxo_muhash).
+%% Those walk the chainstate CF one txid group at a time. Do not tab2list
+%% ?UTXO_CACHE or call compute_utxo_hash_from_list/1 on this path.
 
 %% @private Scan the full UTXO set for outputs matching ScriptSet.
 %% Walks the write-behind ETS cache first, then the on-disk chainstate,

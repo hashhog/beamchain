@@ -38,6 +38,13 @@
 -export([compute_utxo_hash/0, serialize_snapshot/2]).
 -export([read_metadata/1]).
 -export([compute_utxo_hash_from_list/1]).
+%% Streaming load / HASH_SERIALIZED. Production import-utxo and
+%% gettxoutsetinfo MUST use these: they never materialise the coin set.
+%% compute_utxo_hash_from_list/1 is the in-memory helper for tests and
+%% small fixtures, not the 188M-coin production hasher.
+-export([fold_snapshot_groups/3, fold_snapshot_groups_validated/5]).
+-export([fold_utxo_txid_groups/2, compute_utxo_hash_stream/0]).
+-export([compute_utxo_stats/1, verify_hash_serialized/3]).
 %% MuHash3072 helpers — used by `gettxoutsetinfo hash_type=muhash` (NOT by
 %% the loadtxoutset strict-content-hash check, which is HASH_SERIALIZED /
 %% SHA256d per validation.cpp:5910-5914 + kernel/coinstats.cpp:161).
@@ -77,33 +84,50 @@
 
 %% @doc Load a UTXO snapshot from file path.
 %% Returns {ok, #{base_hash, num_coins, coins}} or {error, Reason}.
+%%
+%% This accumulates the coin list. It is the small-fixture / test helper.
+%% Production import-utxo MUST use fold_snapshot_groups_validated/5 so the
+%% full 188M-coin set is never resident. The file is streamed (raw fd);
+%% file:read_file/1 of the whole dump is the 8G HIT_CAP anti-pattern.
 -spec load_snapshot(string()) ->
     {ok, #{base_hash => binary(), num_coins => non_neg_integer(),
            coins => [{binary(), non_neg_integer(), #utxo{}}]}} |
     {error, term()}.
 load_snapshot(Path) ->
-    case file:read_file(Path) of
-        {ok, Data} ->
-            parse_snapshot(Data);
+    case fold_snapshot_groups(Path, fun acc_group_coins/3, []) of
+        {ok, Meta, Acc} ->
+            {ok, Meta#{coins => lists:reverse(Acc)}};
         {error, Reason} ->
-            {error, {file_read_failed, Reason}}
+            {error, Reason}
     end.
 
 %% @doc Load a UTXO snapshot with per-coin validation gates (G2-G5).
 %% ExpectedMagic is the running network's pchMessageStart (G1).
 %% BaseHeight is the snapshot base block height for the per-coin height check (G2).
+%%
+%% Same memory caveat as load_snapshot/1: the returned `coins` list is for
+%% tests. Production walks fold_snapshot_groups_validated/5 and discards
+%% each txid group after write/flush.
 -spec load_snapshot_validated(string(), binary(), non_neg_integer()) ->
     {ok, #{base_hash => binary(), num_coins => non_neg_integer(),
            network_magic => binary(),
            coins => [{binary(), non_neg_integer(), #utxo{}}]}} |
     {error, term()}.
 load_snapshot_validated(Path, ExpectedMagic, BaseHeight) ->
-    case file:read_file(Path) of
-        {ok, Data} ->
-            parse_snapshot_validated(Data, ExpectedMagic, BaseHeight);
+    case fold_snapshot_groups_validated(Path, ExpectedMagic, BaseHeight,
+                                        fun acc_group_coins/3, []) of
+        {ok, Meta, Acc} ->
+            {ok, Meta#{coins => lists:reverse(Acc)}};
         {error, Reason} ->
-            {error, {file_read_failed, Reason}}
+            {error, Reason}
     end.
+
+%% Fold callback for the accumulating load_* helpers: prepend each coin
+%% so a final lists:reverse/1 restores file order. Not used on the
+%% production import path.
+acc_group_coins(Txid, Coins, Acc) ->
+    lists:foldl(fun({Vout, Utxo}, A) -> [{Txid, Vout, Utxo} | A] end,
+                Acc, Coins).
 
 %% @doc Read only the metadata from a snapshot file.
 %% Returns {ok, #{base_hash, num_coins, network_magic}} or {error, Reason}.
@@ -143,10 +167,20 @@ read_metadata(Path) ->
 %% matching uint256::ToString.
 -spec verify_snapshot(map(), atom()) -> ok | {error, term()}.
 verify_snapshot(#{base_hash := BaseHash, coins := Coins} = _Snapshot, Network) ->
-    %% Look up assumeutxo data by block hash
+    %% In-memory path for tests / small fixtures. Production import hashes
+    %% the coins just written via compute_utxo_hash_stream/0 (one txid
+    %% group at a time) and calls verify_hash_serialized/3 directly.
+    ComputedHash = compute_utxo_hash_from_list(Coins),
+    verify_hash_serialized(BaseHash, ComputedHash, Network).
+
+%% @doc Compare a HASH_SERIALIZED digest to the assumeutxo whitelist.
+%% ComputedHash is the 32-byte uint256 in INTERNAL byte order, the same
+%% layout as `m_assumeutxo_data.hash_serialized`.
+-spec verify_hash_serialized(binary(), binary(), atom()) -> ok | {error, term()}.
+verify_hash_serialized(BaseHash, ComputedHash, Network)
+        when byte_size(BaseHash) =:= 32, byte_size(ComputedHash) =:= 32 ->
     case beamchain_chain_params:get_assumeutxo_by_hash(BaseHash, Network) of
         {ok, _Height, #{utxo_hash := ExpectedUtxoHash}} ->
-            ComputedHash = compute_utxo_hash_from_list(Coins),
             case ComputedHash =:= ExpectedUtxoHash of
                 true -> ok;
                 false ->
@@ -168,7 +202,7 @@ verify_snapshot(#{base_hash := BaseHash, coins := Coins} = _Snapshot, Network) -
             case beamchain_chain_params:unsafe_snapshot_height() of
                 {ok, UnsafeHeight} ->
                     beamchain_chain_params:warn_unsafe_snapshot(
-                      "beamchain_snapshot:verify_snapshot/2 "
+                      "beamchain_snapshot:verify_hash_serialized/3 "
                       "(strict-content-hash gate)", UnsafeHeight, BaseHash),
                     ok;
                 undefined ->
@@ -204,8 +238,11 @@ bin_to_display_hex(Bin) when is_binary(Bin) ->
 %% separate Core code path and a different digest.
 -spec compute_utxo_hash() -> binary().
 compute_utxo_hash() ->
-    Coins = collect_all_utxos(),
-    compute_utxo_hash_from_list(Coins).
+    %% STREAMING-HASH: flush dirty cache so the CF is authoritative, then
+    %% walk one txid group at a time. Must not collect_all_utxos/0 into a
+    %% list — that is the 8G HIT_CAP on a 188M-coin set.
+    beamchain_chainstate:flush(),
+    compute_utxo_hash_stream().
 
 %%% ===================================================================
 %%% MuHash3072 over the UTXO set (gettxoutsetinfo "muhash" mode)
@@ -334,105 +371,248 @@ parse_metadata(_) ->
     {error, truncated_header}.
 
 %%% ===================================================================
-%%% Internal: Parsing
+%%% Streaming snapshot fold (raw fd, one txid group at a time)
+%%%
+%%% Mirrors bitcoin-core/src/validation.cpp PopulateAndValidateSnapshot
+%%% (the per-txid loop at L5797-5863) and rpc/blockchain.cpp
+%%% WriteUTXOSnapshot (txid group = 32-byte txid + CompactSize count +
+%%% count * (CompactSize vout + Coin)).
+%%%
+%%% The previous load path did file:read_file/1 of the entire Core
+%%% dumptxoutset (9.9 GB at soak-875000) into one binary, then parsed
+%%% 188M `{txid,vout,#utxo{}}` tuples. That cannot fit in 8G (HIT_CAP,
+%%% curl_rc=143). This walk holds one txid's coins plus a bounded read
+%%% buffer; the callback writes/flushes that group and discards it.
 %%% ===================================================================
 
-parse_snapshot(Data) ->
-    case parse_metadata(Data) of
-        {ok, #{base_hash := BaseHash, num_coins := NumCoins,
-               network_magic := _Magic}, Rest} ->
-            case parse_coins(Rest, NumCoins, []) of
-                {ok, Coins} ->
-                    {ok, #{base_hash => BaseHash,
-                           num_coins => NumCoins,
-                           coins => Coins}};
-                {error, Reason} ->
-                    {error, Reason}
-            end;
-        {error, Reason} ->
-            {error, Reason}
-    end.
+%% 4 MiB read-ahead, same cadence as haskoin's streamSnapshotIntoLegacyUTXO.
+-define(SNAP_READ_CHUNK, 4 * 1024 * 1024).
+%% CompactSize MAX_SIZE plus one chunk of slack: a malicious script length
+%% must not grow the buffer without bound.
+-define(SNAP_MAX_BUF, 16#02000000 + ?SNAP_READ_CHUNK).
 
-%% parse_snapshot_validated/3 — adds G1 network-magic check + G2-G5 per-coin
-%% guards, mirroring Core validation.cpp:5600-5883 ActivateSnapshot/
-%% PopulateAndValidateSnapshot.
-%%
-%% G1: verify metadata network_magic == ExpectedMagic (pchMessageStart).
-%% G2: per-coin height > BaseHeight → {error, bad_coin_height}.
-%% G3: per-coin vout >= 16#ffffffff → {error, bad_coin_vout}.
-%% G4: per-coin value > MAX_MONEY → {error, bad_tx_out_value}.
-%% G5: leftover bytes after all coins consumed → {error, coins_left_over}.
-parse_snapshot_validated(Data, ExpectedMagic, BaseHeight) ->
-    case parse_metadata(Data) of
-        {ok, #{base_hash := BaseHash, num_coins := NumCoins,
-               network_magic := FileMagic} = _Meta, Rest} ->
-            %% G1: network magic must match the running node's pchMessageStart.
-            case FileMagic =:= ExpectedMagic of
-                false ->
-                    {error, {wrong_network_magic, FileMagic}};
-                true ->
-                    case parse_coins_validated(Rest, NumCoins, BaseHeight, []) of
-                        {ok, Coins, Remainder} ->
-                            %% G5: no bytes may follow the last declared coin.
-                            case Remainder of
-                                <<>> ->
-                                    {ok, #{base_hash => BaseHash,
-                                           num_coins => NumCoins,
-                                           network_magic => FileMagic,
-                                           coins => Coins}};
-                                _ ->
-                                    {error, coins_left_over}
-                            end;
-                        {error, Reason} ->
-                            {error, Reason}
-                    end
-            end;
-        {error, Reason} ->
-            {error, Reason}
-    end.
-
-%% parse_coins_validated/4 — like parse_coins/3 but returns the leftover binary
-%% and applies per-coin guards (G2-G4) via parse_txid_coins_validated/2.
-parse_coins_validated(Data, 0, _BaseHeight, Acc) ->
-    {ok, lists:reverse(Acc), Data};
-parse_coins_validated(Data, Remaining, BaseHeight, Acc) when Remaining > 0 ->
-    case parse_txid_coins_validated(Data, BaseHeight) of
-        {ok, TxidCoins, Rest, CoinsRead} ->
-            parse_coins_validated(Rest, Remaining - CoinsRead, BaseHeight, TxidCoins ++ Acc);
-        {error, Reason} ->
-            {error, Reason}
-    end.
-
-parse_txid_coins_validated(<<Txid:32/binary, Rest/binary>>, BaseHeight) ->
-    case decode_compact_size(Rest) of
-        {ok, CoinsPerTxid, Rest2} ->
-            parse_txid_coin_entries_validated(Rest2, Txid, CoinsPerTxid, BaseHeight, []);
-        {error, Reason} ->
-            {error, Reason}
-    end;
-parse_txid_coins_validated(_, _BaseHeight) ->
-    {error, truncated_txid}.
+-record(snap_rdr, {
+    fd  :: file:fd(),
+    buf = <<>> :: binary()
+}).
 
 %% G3 guard: vout must be < UINT32_MAX (Core validation.cpp:5815).
 -define(MAX_VOUT, 16#fffffffe).   %% = UINT32_MAX - 1; largest valid vout index
 
-parse_txid_coin_entries_validated(Data, _Txid, 0, _BaseHeight, Acc) ->
-    {ok, lists:reverse(Acc), Data, length(Acc)};
-parse_txid_coin_entries_validated(Data, Txid, Remaining, BaseHeight, Acc) when Remaining > 0 ->
-    case decode_compact_size(Data) of
-        {ok, Vout, _Rest} when Vout >= 16#ffffffff ->
-            %% G3: vout >= UINT32_MAX would wrap around in ApplyHash.
-            {error, {bad_coin_vout, Vout}};
-        {ok, Vout, Rest} ->
-            case parse_coin_validated(Rest, BaseHeight) of
-                {ok, Utxo, Rest2} ->
-                    Entry = {Txid, Vout, Utxo},
-                    parse_txid_coin_entries_validated(Rest2, Txid, Remaining - 1, BaseHeight, [Entry | Acc]);
+%% @doc Stream a snapshot file, invoking Fun once per txid group.
+%% Fun(Txid, [{Vout, #utxo{}}], Acc) -> Acc.
+%% Groups are in file order; vouts inside a group are file order (Core
+%% WriteUTXOSnapshot cursor order). The HASH_SERIALIZED hasher sorts
+%% vouts numerically per group (std::map<uint32_t, Coin>).
+-spec fold_snapshot_groups(string(),
+                           fun((binary(), [{non_neg_integer(), #utxo{}}], Acc)
+                               -> Acc),
+                           Acc) ->
+    {ok, #{base_hash => binary(), num_coins => non_neg_integer(),
+           network_magic => binary()}, Acc} |
+    {error, term()}.
+fold_snapshot_groups(Path, Fun, Acc0) when is_function(Fun, 3) ->
+    fold_snapshot(Path, Fun, Acc0, undefined, undefined).
+
+%% @doc Like fold_snapshot_groups/3 plus G1-G5 (network magic, per-coin
+%% height/vout/MoneyRange, leftover bytes). This is the production
+%% import-utxo walker.
+-spec fold_snapshot_groups_validated(string(), binary(), non_neg_integer(),
+                                     fun((binary(), [{non_neg_integer(), #utxo{}}], Acc)
+                                         -> Acc),
+                                     Acc) ->
+    {ok, #{base_hash => binary(), num_coins => non_neg_integer(),
+           network_magic => binary()}, Acc} |
+    {error, term()}.
+fold_snapshot_groups_validated(Path, ExpectedMagic, BaseHeight, Fun, Acc0)
+        when byte_size(ExpectedMagic) =:= 4,
+             is_integer(BaseHeight), BaseHeight >= 0,
+             is_function(Fun, 3) ->
+    fold_snapshot(Path, Fun, Acc0, ExpectedMagic, BaseHeight).
+
+fold_snapshot(Path, Fun, Acc0, ExpectedMagic, BaseHeight) ->
+    case file:open(Path, [read, binary, raw]) of
+        {ok, Fd} ->
+            try
+                fold_snapshot_fd(#snap_rdr{fd = Fd}, Fun, Acc0,
+                                 ExpectedMagic, BaseHeight)
+            after
+                _ = file:close(Fd)
+            end;
+        {error, Reason} ->
+            {error, {file_open_failed, Reason}}
+    end.
+
+fold_snapshot_fd(R0, Fun, Acc0, ExpectedMagic, BaseHeight) ->
+    case read_exact(R0, ?METADATA_SIZE) of
+        {ok, Header, R1} ->
+            case parse_metadata(Header) of
+                {ok, #{base_hash := BaseHash, num_coins := NumCoins,
+                       network_magic := FileMagic} = Meta, <<>>} ->
+                    case ExpectedMagic =:= undefined orelse
+                         FileMagic =:= ExpectedMagic of
+                        false ->
+                            {error, {wrong_network_magic, FileMagic}};
+                        true ->
+                            case fold_groups(R1, NumCoins, Fun, Acc0,
+                                             BaseHeight) of
+                                {ok, Acc, R2} ->
+                                    case leftover_check(R2, ExpectedMagic) of
+                                        ok ->
+                                            {ok, Meta#{base_hash => BaseHash,
+                                                       num_coins => NumCoins,
+                                                       network_magic => FileMagic},
+                                             Acc};
+                                        {error, _} = E ->
+                                            E
+                                    end;
+                                {error, _} = E ->
+                                    E
+                            end
+                    end;
+                {ok, _Meta, _Rest} ->
+                    {error, truncated_header};
                 {error, Reason} ->
                     {error, Reason}
             end;
         {error, Reason} ->
             {error, Reason}
+    end.
+
+%% Unvalidated load ignores trailing bytes (historical behaviour of
+%% parse_coins/3). Validated load (ExpectedMagic =/= undefined) is G5.
+leftover_check(_R, undefined) ->
+    ok;
+leftover_check(#snap_rdr{buf = Buf}, _ExpectedMagic) when byte_size(Buf) > 0 ->
+    {error, coins_left_over};
+leftover_check(#snap_rdr{fd = Fd}, _ExpectedMagic) ->
+    case file:read(Fd, 1) of
+        {ok, <<_>>} -> {error, coins_left_over};
+        {ok, <<>>} -> ok;
+        eof -> ok;
+        {error, Reason} -> {error, {read_failed, Reason}}
+    end.
+
+fold_groups(R, 0, _Fun, Acc, _BaseHeight) ->
+    {ok, Acc, R};
+fold_groups(R, Remaining, Fun, Acc, BaseHeight) when Remaining > 0 ->
+    case read_txid_group(R, Remaining, BaseHeight) of
+        {ok, _Txid, Coins, CoinsRead, R1} ->
+            Acc1 = Fun(_Txid, Coins, Acc),
+            fold_groups(R1, Remaining - CoinsRead, Fun, Acc1, BaseHeight);
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+read_txid_group(R, Remaining, BaseHeight) ->
+    case read_exact(R, 32) of
+        {ok, Txid, R1} ->
+            case read_parsed(R1, fun decode_compact_size/1) of
+                {ok, CoinsPerTxid, _RTooMany} when CoinsPerTxid > Remaining ->
+                    {error, coins_count_mismatch};
+                {ok, CoinsPerTxid, R2} ->
+                    case read_group_coins(R2, Txid, CoinsPerTxid, BaseHeight, []) of
+                        {ok, Coins, R3} ->
+                            {ok, Txid, Coins, CoinsPerTxid, R3};
+                        {error, Reason} ->
+                            {error, Reason}
+                    end;
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        {error, truncated} ->
+            {error, truncated_txid};
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+read_group_coins(R, _Txid, 0, _BaseHeight, Acc) ->
+    {ok, lists:reverse(Acc), R};
+read_group_coins(R, Txid, Remaining, BaseHeight, Acc) when Remaining > 0 ->
+    case read_parsed(R, fun decode_compact_size/1) of
+        {ok, Vout, _R1} when Vout >= 16#ffffffff, BaseHeight =/= undefined ->
+            %% G3 (validated path only): vout >= UINT32_MAX wraps ApplyHash.
+            {error, {bad_coin_vout, Vout}};
+        {ok, Vout, R1} ->
+            ParseCoin = case BaseHeight of
+                undefined -> fun parse_coin/1;
+                _ -> fun(Bin) -> parse_coin_validated(Bin, BaseHeight) end
+            end,
+            case read_parsed(R1, ParseCoin) of
+                {ok, Utxo0, R2} ->
+                    Utxo = detach_spk(Utxo0),
+                    read_group_coins(R2, Txid, Remaining - 1, BaseHeight,
+                                     [{Vout, Utxo} | Acc]);
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+%% ERTS ERL_ONHEAP_BIN_LIMIT: a >64-byte scriptPubKey sliced out of the
+%% 4 MiB read buffer is a sub-binary that would pin the whole chunk if
+%% stored. Copy it at the parse boundary, same as chainstate:detach_spk/1.
+-define(ONHEAP_BIN_LIMIT, 64).
+detach_spk(#utxo{script_pubkey = SPK} = Utxo)
+        when byte_size(SPK) > ?ONHEAP_BIN_LIMIT ->
+    Utxo#utxo{script_pubkey = binary:copy(SPK)};
+detach_spk(Utxo) ->
+    Utxo.
+
+read_exact(#snap_rdr{buf = Buf} = R, N) when byte_size(Buf) >= N ->
+    <<Got:N/binary, Rest/binary>> = Buf,
+    {ok, Got, R#snap_rdr{buf = Rest}};
+read_exact(R, N) ->
+    case fill(R) of
+        {ok, R2} -> read_exact(R2, N);
+        eof -> {error, truncated};
+        {error, _} = E -> E
+    end.
+
+read_parsed(R, ParseFun) ->
+    case ParseFun(R#snap_rdr.buf) of
+        {ok, Val, Rest} ->
+            {ok, Val, R#snap_rdr{buf = Rest}};
+        {error, Reason} ->
+            case is_truncated(Reason) of
+                true ->
+                    case fill(R) of
+                        {ok, R2} ->
+                            case byte_size(R2#snap_rdr.buf) >
+                                 byte_size(R#snap_rdr.buf) of
+                                true -> read_parsed(R2, ParseFun);
+                                false -> {error, Reason}
+                            end;
+                        eof ->
+                            {error, Reason};
+                        {error, _} = E ->
+                            E
+                    end;
+                false ->
+                    {error, Reason}
+            end
+    end.
+
+is_truncated(truncated) -> true;
+is_truncated(truncated_header) -> true;
+is_truncated(truncated_txid) -> true;
+is_truncated(truncated_compact_size) -> true;
+is_truncated(truncated_varint) -> true;
+is_truncated(truncated_script) -> true;
+is_truncated(truncated_special_script) -> true;
+is_truncated(_) -> false.
+
+fill(#snap_rdr{buf = Buf}) when byte_size(Buf) > ?SNAP_MAX_BUF ->
+    {error, snapshot_buffer_overflow};
+fill(#snap_rdr{fd = Fd, buf = Buf} = R) ->
+    case file:read(Fd, ?SNAP_READ_CHUNK) of
+        {ok, Data} ->
+            {ok, R#snap_rdr{buf = <<Buf/binary, Data/binary>>}};
+        eof ->
+            eof;
+        {error, Reason} ->
+            {error, {read_failed, Reason}}
     end.
 
 %% parse_coin_validated/2 — parse_coin/1 plus G2 (height) and G4 (MoneyRange).
@@ -488,43 +668,6 @@ read_metadata_from_fd(Fd) ->
             {error, truncated_header};
         {error, Reason} ->
             {error, {read_failed, Reason}}
-    end.
-
-parse_coins(_Data, 0, Acc) ->
-    {ok, lists:reverse(Acc)};
-parse_coins(Data, Remaining, Acc) when Remaining > 0 ->
-    case parse_txid_coins(Data) of
-        {ok, TxidCoins, Rest, CoinsRead} ->
-            parse_coins(Rest, Remaining - CoinsRead, TxidCoins ++ Acc);
-        {error, Reason} ->
-            {error, Reason}
-    end.
-
-%% Parse coins for a single txid
-parse_txid_coins(<<Txid:32/binary, Rest/binary>>) ->
-    case decode_compact_size(Rest) of
-        {ok, CoinsPerTxid, Rest2} ->
-            parse_txid_coin_entries(Rest2, Txid, CoinsPerTxid, []);
-        {error, Reason} ->
-            {error, Reason}
-    end;
-parse_txid_coins(_) ->
-    {error, truncated_txid}.
-
-parse_txid_coin_entries(Data, _Txid, 0, Acc) ->
-    {ok, lists:reverse(Acc), Data, length(Acc)};
-parse_txid_coin_entries(Data, Txid, Remaining, Acc) when Remaining > 0 ->
-    case decode_compact_size(Data) of
-        {ok, Vout, Rest} ->
-            case parse_coin(Rest) of
-                {ok, Utxo, Rest2} ->
-                    Entry = {Txid, Vout, Utxo},
-                    parse_txid_coin_entries(Rest2, Txid, Remaining - 1, [Entry | Acc]);
-                {error, Reason} ->
-                    {error, Reason}
-            end;
-        {error, Reason} ->
-            {error, Reason}
     end.
 
 %% Parse a single coin: VARINT(code) + VARINT(CompressAmount(value)) +
@@ -847,15 +990,137 @@ compute_utxo_hash_from_list_legacy(Coins) ->
 -spec compute_utxo_hash_from_list([{binary(), non_neg_integer(),
                                     #utxo{}}]) -> binary().
 compute_utxo_hash_from_list(Coins) when is_list(Coins) ->
-    %% Sort by (Txid lex, Vout ASC) — matches Core's cursor walk order.
+    %% In-memory helper for tests / small fixtures. Production walks
+    %% compute_utxo_hash_stream/0. Sort by (Txid lex, Vout ASC) — matches
+    %% Core's std::map<uint32_t, Coin> ApplyHash order, not LE32 key order.
     Sorted = lists:sort(fun({Txid1, Vout1, _}, {Txid2, Vout2, _}) ->
         {Txid1, Vout1} =< {Txid2, Vout2}
     end, Coins),
-    %% Stream each coin through Core's TxOutSer layout, then SHA256d.
-    AllBins = lists:map(fun({Txid, Vout, Utxo}) ->
-        tx_out_ser(Txid, Vout, Utxo)
-    end, Sorted),
-    beamchain_crypto:hash256(iolist_to_binary(AllBins)).
+    Ctx = lists:foldl(fun({Txid, Vout, Utxo}, C) ->
+        hash_writer_update(C, tx_out_ser(Txid, Vout, Utxo))
+    end, hash_writer_new(), Sorted),
+    hash_writer_final(Ctx).
+
+%% HashWriter (bitcoin-core/src/hash.h): incremental SHA256, GetHash() =
+%% SHA256(SHA256_state). Same digest as hash256(concat(bytes)) but the
+%% payload is never concatenated into one binary.
+hash_writer_new() ->
+    crypto:hash_init(sha256).
+
+hash_writer_update(Ctx, Data) ->
+    crypto:hash_update(Ctx, Data).
+
+hash_writer_final(Ctx) ->
+    Inner = crypto:hash_final(Ctx),
+    crypto:hash(sha256, Inner).
+
+%% @doc HASH_SERIALIZED over the on-disk chainstate CF, one txid group
+%% at a time. Mirrors kernel/coinstats.cpp ComputeUTXOStats + ApplyHash
+%% (std::map<uint32_t, Coin> so vouts are numeric, not LE32-lex) and
+%% haskoin 5b59a06 computeUtxoHashFromDBPrefix.
+%%
+%% Caller must have flushed the write-behind cache (compute_utxo_hash/0
+%% does; handle_call(compute_utxo_hash) must do_flush first to avoid
+%% deadlock). Does NOT call chainstate:flush/0.
+-spec compute_utxo_hash_stream() -> binary().
+compute_utxo_hash_stream() ->
+    {Hash, _Stats} = compute_utxo_stats(hash_serialized),
+    Hash.
+
+%% @doc Single cursor walk: tally Core's nTransactionOutputs / nBogoSize /
+%% nTotalAmount / nTransactions, and optionally HASH_SERIALIZED or MuHash.
+%% STREAMING-HASH: never materialises the coin set.
+-spec compute_utxo_stats(hash_serialized | muhash | none) ->
+    {binary() | undefined,
+     #{txouts := non_neg_integer(),
+       bogosize := non_neg_integer(),
+       total_amount := integer(),
+       transactions := non_neg_integer()}}.
+compute_utxo_stats(HashType) ->
+    Acc0 = #{hash => init_stats_hash(HashType),
+             txouts => 0,
+             bogosize => 0,
+             total_amount => 0,
+             transactions => 0},
+    case fold_utxo_txid_groups(fun(Txid, Outs, Acc) ->
+                                       stats_visit_group(HashType, Txid, Outs, Acc)
+                               end, Acc0) of
+        {ok, Acc, _Peak} ->
+            Hash = finalize_stats_hash(HashType, maps:get(hash, Acc)),
+            Stats = maps:with([txouts, bogosize, total_amount, transactions], Acc),
+            {Hash, Stats};
+        {error, Reason} ->
+            logger:error("beamchain_snapshot: fold_utxo_txid_groups failed: ~p",
+                         [Reason]),
+            erlang:error({utxo_stats_walk_failed, Reason})
+    end.
+
+init_stats_hash(hash_serialized) -> hash_writer_new();
+init_stats_hash(muhash) -> beamchain_muhash:new();
+init_stats_hash(none) -> undefined.
+
+finalize_stats_hash(hash_serialized, Ctx) -> hash_writer_final(Ctx);
+finalize_stats_hash(muhash, Acc) -> beamchain_muhash:finalize(Acc);
+finalize_stats_hash(none, _) -> undefined.
+
+stats_visit_group(HashType, Txid, Outs, Acc) ->
+    Acc1 = tally_group(Outs, Acc),
+    hash_group(HashType, Txid, Outs, Acc1).
+
+tally_group(Outs, Acc) ->
+    lists:foldl(fun({_Vout, #utxo{script_pubkey = SPK, value = Value}}, A) ->
+        %% Core GetBogoSize: 50 + scriptPubKey.size()
+        %% (kernel/coinstats.cpp:36-42).
+        A#{txouts := maps:get(txouts, A) + 1,
+           bogosize := maps:get(bogosize, A) + 50 + byte_size(SPK),
+           total_amount := maps:get(total_amount, A) + Value}
+    end, Acc#{transactions := maps:get(transactions, Acc) + 1}, Outs).
+
+hash_group(hash_serialized, Txid, Outs, Acc) ->
+    Ctx = lists:foldl(fun({Vout, Utxo}, C) ->
+        hash_writer_update(C, tx_out_ser(Txid, Vout, Utxo))
+    end, maps:get(hash, Acc), Outs),
+    Acc#{hash := Ctx};
+hash_group(muhash, Txid, Outs, Acc) ->
+    Mu = lists:foldl(fun({Vout, Utxo}, M) ->
+        txoutset_muhash_apply(add, {Txid, Vout, Utxo}, M)
+    end, maps:get(hash, Acc), Outs),
+    Acc#{hash := Mu};
+hash_group(none, _Txid, _Outs, Acc) ->
+    Acc.
+
+%% @doc Walk the chainstate CF grouped by txid. Fun is called once per
+%% txid with vouts in ascending NUMERIC order (Core ApplyHash). Returns
+%% `{ok, Acc, Peak}` where Peak is the widest single-txid group seen —
+%% the RAM bound of this walk, not the size of the UTXO set.
+-spec fold_utxo_txid_groups(fun((binary(), [{non_neg_integer(), #utxo{}}], Acc)
+                                -> Acc),
+                            Acc) ->
+    {ok, Acc, non_neg_integer()} | {error, term()}.
+fold_utxo_txid_groups(Fun, Acc0) when is_function(Fun, 3) ->
+    case beamchain_db:fold_utxos(fun utxo_group_visit/2,
+                                 {undefined, [], Acc0, Fun, 0}) of
+        {error, _} = E ->
+            E;
+        {undefined, [], Acc, _Fun, Peak} ->
+            {ok, Acc, Peak};
+        {Txid, Outs, Acc, Fun, Peak} ->
+            Sorted = lists:keysort(1, Outs),
+            Acc1 = Fun(Txid, Sorted, Acc),
+            {ok, Acc1, max(Peak, length(Sorted))};
+        Other ->
+            {error, {unexpected_utxo_fold_acc, Other}}
+    end.
+
+utxo_group_visit({Txid, Vout, Utxo}, {Txid, Outs, Acc, Fun, Peak}) ->
+    {Txid, [{Vout, Utxo} | Outs], Acc, Fun, Peak};
+utxo_group_visit({Txid, Vout, Utxo}, {undefined, [], Acc, Fun, Peak}) ->
+    {Txid, [{Vout, Utxo}], Acc, Fun, Peak};
+utxo_group_visit({Txid, Vout, Utxo}, {PrevTxid, Outs, Acc, Fun, Peak}) ->
+    Sorted = lists:keysort(1, Outs),
+    Acc1 = Fun(PrevTxid, Sorted, Acc),
+    Peak1 = max(Peak, length(Sorted)),
+    {Txid, [{Vout, Utxo}], Acc1, Fun, Peak1}.
 
 %%% ===================================================================
 %%% Internal: UTXO collection
