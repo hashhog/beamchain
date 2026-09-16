@@ -19,6 +19,13 @@
 %%%
 %%% meck new/expect/unload happen INSIDE each test body so self() is the
 %%% process that will receive the cast.
+%%%
+%%% Passthrough meck recompiles the original module inside meck_proc:init
+%%% (gen_server start, 5s). After a long eunit run that exceeds eunit's
+%%% default 5s test timeout and aborts the runner (clean-clone gate:
+%%% 2794/4788, {timeout, proc_lib:sync_start} at install/2 line for
+%%% beamchain_mempool). Force-load first (passthrough needs the module
+%%% present) and wrap the bodies in a 60s timeout.
 -module(beamchain_tx_inv_request_tests).
 
 -include_lib("eunit/include/eunit.hrl").
@@ -26,6 +33,7 @@
 
 -define(UNKNOWN, <<1:256>>).   %% txid/wtxid NOT in mempool
 -define(KNOWN,   <<2:256>>).   %% txid/wtxid already in mempool
+-define(PASSTHROUGH, [beamchain_chainstate, beamchain_peer_manager, beamchain_mempool]).
 
 %%% ===================================================================
 %%% Helpers
@@ -33,16 +41,20 @@
 
 flush() -> receive _ -> flush() after 0 -> ok end.
 
+%% meck:new(..., [passthrough]) recompiles the original from abstract
+%% code. That requires the module loaded; code:ensure_loaded/1 first.
+meck_passthrough(Mod) ->
+    {module, Mod} = code:ensure_loaded(Mod),
+    ok = meck:new(Mod, [no_link, passthrough]).
+
 %% Install the tx-path collaborators.
 %%  Synced  :: boolean() - beamchain_chainstate:is_synced/0
 %%  ConnType:: full_relay | block_relay | feeler - our conn to the peer
 install(Synced, ConnType) ->
-    ok = meck:new(beamchain_chainstate, [no_link, passthrough]),
+    lists:foreach(fun meck_passthrough/1, ?PASSTHROUGH),
     ok = meck:expect(beamchain_chainstate, is_synced, fun() -> Synced end),
-    ok = meck:new(beamchain_peer_manager, [no_link, passthrough]),
     ok = meck:expect(beamchain_peer_manager, get_peer,
                      fun(_Pid) -> {ok, #{conn_type => ConnType}} end),
-    ok = meck:new(beamchain_mempool, [no_link, passthrough]),
     %% Only ?KNOWN is in the mempool (by txid and by wtxid).
     ok = meck:expect(beamchain_mempool, has_tx,
                      fun(H) -> H =:= ?KNOWN end),
@@ -78,64 +90,71 @@ recv_getdata(Timeout) ->
         no_message
     end.
 
+%% Each body does three passthrough meck:new calls on 2k–5k-line modules.
+%% Default eunit timeout is 5s; wrap so a slow clean-clone run cannot abort
+%% the runner the way known_wtxid_not_requested_test did at 2794/4788.
+with_install(Synced, ConnType, Fun) ->
+    {timeout, 60, fun() ->
+        install(Synced, ConnType),
+        try Fun()
+        after unload() end
+    end}.
+
 %%% ===================================================================
 %%% Request leg: unknown tx -> getdata
 %%% ===================================================================
 
 %% A wtxidrelay peer announces MSG_TX (txid) we don't have -> getdata
 %% MSG_WITNESS_TX (witness serialization) for that txid.
-unknown_txid_requests_witness_tx_test() ->
-    install(true, full_relay),
-    try
+unknown_txid_requests_witness_tx_test_() ->
+    with_install(true, full_relay, fun() ->
         ?assertEqual([#{type => ?MSG_WITNESS_TX, hash => ?UNKNOWN}],
                      route([{?MSG_TX, ?UNKNOWN}]))
-    after unload() end.
+    end).
 
 %% A wtxid announcement (MSG_WTX) we don't have -> getdata MSG_WTX (wtxid).
-unknown_wtxid_requests_wtx_test() ->
-    install(true, full_relay),
-    try
+unknown_wtxid_requests_wtx_test_() ->
+    with_install(true, full_relay, fun() ->
         ?assertEqual([#{type => ?MSG_WTX, hash => ?UNKNOWN}],
                      route([{?MSG_WTX, ?UNKNOWN}]))
-    after unload() end.
+    end).
 
 %%% ===================================================================
 %%% Dedup: already-in-mempool tx -> no getdata
 %%% ===================================================================
 
-known_txid_not_requested_test() ->
-    install(true, full_relay),
-    try ?assertEqual(no_message, route([{?MSG_TX, ?KNOWN}]))
-    after unload() end.
+known_txid_not_requested_test_() ->
+    with_install(true, full_relay, fun() ->
+        ?assertEqual(no_message, route([{?MSG_TX, ?KNOWN}]))
+    end).
 
-known_wtxid_not_requested_test() ->
-    install(true, full_relay),
-    try ?assertEqual(no_message, route([{?MSG_WTX, ?KNOWN}]))
-    after unload() end.
+known_wtxid_not_requested_test_() ->
+    with_install(true, full_relay, fun() ->
+        ?assertEqual(no_message, route([{?MSG_WTX, ?KNOWN}]))
+    end).
 
 %% Mixed inv: only the unknown tx is requested; the known one is deduped.
-mixed_only_unknown_requested_test() ->
-    install(true, full_relay),
-    try
+mixed_only_unknown_requested_test_() ->
+    with_install(true, full_relay, fun() ->
         ?assertEqual([#{type => ?MSG_WITNESS_TX, hash => ?UNKNOWN}],
                      route([{?MSG_TX, ?KNOWN}, {?MSG_TX, ?UNKNOWN}]))
-    after unload() end.
+    end).
 
 %%% ===================================================================
 %%% Gates: IBD and block-relay-only / feeler peers
 %%% ===================================================================
 
-no_request_during_ibd_test() ->
-    install(false, full_relay),   %% is_synced = false => in IBD
-    try ?assertEqual(no_message, route([{?MSG_TX, ?UNKNOWN}]))
-    after unload() end.
+no_request_during_ibd_test_() ->
+    with_install(false, full_relay, fun() ->
+        ?assertEqual(no_message, route([{?MSG_TX, ?UNKNOWN}]))
+    end).
 
-no_request_from_block_relay_peer_test() ->
-    install(true, block_relay),
-    try ?assertEqual(no_message, route([{?MSG_TX, ?UNKNOWN}]))
-    after unload() end.
+no_request_from_block_relay_peer_test_() ->
+    with_install(true, block_relay, fun() ->
+        ?assertEqual(no_message, route([{?MSG_TX, ?UNKNOWN}]))
+    end).
 
-no_request_from_feeler_peer_test() ->
-    install(true, feeler),
-    try ?assertEqual(no_message, route([{?MSG_TX, ?UNKNOWN}]))
-    after unload() end.
+no_request_from_feeler_peer_test_() ->
+    with_install(true, feeler, fun() ->
+        ?assertEqual(no_message, route([{?MSG_TX, ?UNKNOWN}]))
+    end).

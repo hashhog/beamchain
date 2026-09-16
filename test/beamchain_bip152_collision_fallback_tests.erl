@@ -38,8 +38,13 @@ colliding_cmpctblock() ->
       short_ids => [12345, 12345],
       prefilled_txns => []}.
 
-collision_requests_full_block_no_ban_test() ->
+collision_requests_full_block_no_ban_test_() ->
+    {timeout, 60, fun() -> collision_requests_full_block_no_ban() end}.
+
+collision_requests_full_block_no_ban() ->
     Height = 100,
+    {module, beamchain_peer} = code:ensure_loaded(beamchain_peer),
+    {module, beamchain_chainstate} = code:ensure_loaded(beamchain_chainstate),
     ok = meck:new(beamchain_peer, [no_link, passthrough]),
     ok = meck:new(beamchain_chainstate, [no_link, passthrough]),
     try
@@ -75,8 +80,13 @@ collision_requests_full_block_no_ban_test() ->
 %% Control: a genuinely-invalid cmpctblock (null header) IS still banned 100
 %% (READ_STATUS_INVALID) — the fix narrows the ban to real invalidity, it does
 %% not remove it.
-invalid_cmpctblock_still_bans_test() ->
+invalid_cmpctblock_still_bans_test_() ->
+    {timeout, 60, fun() -> invalid_cmpctblock_still_bans() end}.
+
+invalid_cmpctblock_still_bans() ->
     Height = 100,
+    {module, beamchain_peer} = code:ensure_loaded(beamchain_peer),
+    {module, beamchain_chainstate} = code:ensure_loaded(beamchain_chainstate),
     ok = meck:new(beamchain_peer, [no_link, passthrough]),
     ok = meck:new(beamchain_chainstate, [no_link, passthrough]),
     try

@@ -55,7 +55,11 @@ hss_holey_index_still_ends_at_genesis_test() ->
 
 %% ---- (b) header_sync holey-index genesis terminator ----
 
-header_sync_holey_index_ends_at_genesis_test() ->
+header_sync_holey_index_ends_at_genesis_test_() ->
+    {timeout, 60, fun() -> header_sync_holey_index_ends_at_genesis() end}.
+
+header_sync_holey_index_ends_at_genesis() ->
+    {module, beamchain_db} = code:ensure_loaded(beamchain_db),
     ok = meck:new(beamchain_db, [no_link, passthrough, non_strict]),
     try
         meck:expect(beamchain_db, get_block_index,
