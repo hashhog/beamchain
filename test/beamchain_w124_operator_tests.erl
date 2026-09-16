@@ -205,7 +205,7 @@ g08_node_sup_rest_for_one_test() ->
 g09_chainstate_shutdown_timeout_test() ->
     Src = read_src(beamchain_chainstate_sup),
     %% Two child specs (main + snapshot) both need 30000ms.
-    ?assertEqual(3, length([X || X <- string:tokens(Src, "\n"),
+    ?assertEqual(2, length([X || X <- string:tokens(Src, "\n"),
                                   string:str(X, "shutdown => 30000") > 0])).
 
 %% G10 — wallet_sup uses temporary restart (PASS).  Wallets crashing
@@ -222,11 +222,11 @@ g10_wallet_restart_temporary_test() ->
 %% beamchain_node_sup's generic child_spec/2 helper.
 g11_node_sup_default_shutdown_test() ->
     Src = read_src(beamchain_node_sup),
-    %% child_spec/2 does NOT set a shutdown key, so OTP applies the
-    %% default 5000ms.  Marker — future fix should bump mempool /
-    %% peer_manager / sync / addrman to e.g. 15000ms each.
-    ?assertNot(contains(Src, "shutdown =>")),
-    ?assert(true).
+    %% mempool_child_spec/0 now sets shutdown => 30000 so terminate/2 can
+    %% dump mempool.dat. Other workers still use OTP's default 5000ms
+    %% (child_spec/2 does not set a shutdown key).
+    ?assert(contains(Src, "mempool_child_spec")),
+    ?assert(contains(Src, "shutdown => 30000")).
 
 %% G12 — Intensity / period not tuned for child count (PARTIAL).  Both
 %% top-sup and node_sup use intensity=5, period=10.  node_sup hosts ~15

@@ -335,6 +335,8 @@ setup() ->
     os:putenv("BEAMCHAIN_NETWORK", "testnet4"),
     os:putenv("BEAMCHAIN_DATADIR", TestDir),
     filelib:ensure_path(TestDir),
+    catch gen_server:stop(beamchain_config),
+    catch gen_server:stop(beamchain_addrman),
     {ok, ConfigPid} = beamchain_config:start_link(),
     {ok, AddrmanPid} = beamchain_addrman:start_link(),
     {ConfigPid, AddrmanPid, TestDir}.

@@ -158,6 +158,9 @@ setup() ->
     application:ensure_all_started(rocksdb),
     application:set_env(beamchain, datadir, TmpDir),
     application:set_env(beamchain, network, regtest),
+    catch gen_server:stop(beamchain_config),
+    catch beamchain_db:stop(),
+    catch gen_server:stop(beamchain_chainstate),
     {ok, ConfigPid} = beamchain_config:start_link(),
     {ok, DbPid}     = beamchain_db:start_link(),
     Params  = beamchain_chain_params:params(regtest),
@@ -482,13 +485,12 @@ bug8_invalidate_side_branch_block_not_found() ->
 bug10_no_atomic_commit_during_invalidation() ->
     %% We use sys:get_state to read the gen_server state record.
     S = sys:get_state(beamchain_chainstate),
-    %% reorg_in_progress is element 15 of the #state{} record tuple
-    %% (tag at 1, then fields: tip_hash=2, tip_height=3, mtp_timestamps=4,
-    %%  params=5, blocks_since_flush=6, max_cache_bytes=7, max_cache_entries=8,
-    %%  cache_usage_bytes=9, ibd=10, chainstate_role=11,
-    %%  snapshot_base_height=12, snapshot_base_hash=13, reorg_in_progress=14,
-    %%  pending_undo_deletes=15).
-    ReorgInProgress = element(14, S),
+    %% #state{} (beamchain_chainstate.erl): tag=1, tip_hash=2, tip_height=3,
+    %% mtp_timestamps=4, params=5, blocks_since_flush=6, max_cache_bytes=7,
+    %% max_cache_entries=8, cache_usage_bytes=9, ibd=10, chainstate_role=11,
+    %% snapshot_base_height=12, snapshot_base_hash=13,
+    %% snapshot_validation=14, reorg_in_progress=15, pending_undo_deletes=16.
+    ReorgInProgress = element(15, S),
     ?assertEqual(false, ReorgInProgress,
         "reorg_in_progress must be false outside of a reorg"),
     %% BUG-10 documented: during do_invalidate_block_impl the flag is never

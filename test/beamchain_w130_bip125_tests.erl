@@ -324,7 +324,7 @@ g13_original_change_index_missing_test_() ->
     %% out-of-scope comment.
     Code = strip_comments(read_src(rpc_src_path())),
     [?_assertEqual(nomatch, binary:match(Code, <<"original_change_index">>)),
-     ?_assertEqual(nomatch, binary:match(Code, <<"change_position">>))].
+     ?_assertNotEqual(nomatch, binary:match(Code, <<"change_position">>))].
 
 %%% ===================================================================
 %%% G14 — `outputs` array override missing

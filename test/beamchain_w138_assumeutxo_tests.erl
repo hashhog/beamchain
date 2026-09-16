@@ -854,7 +854,9 @@ bug1_regtest_assumeutxo_placeholder_test() ->
 %% Positive: mainnet entries are all non-zero.
 mainnet_assumeutxo_entries_non_zero_test() ->
     #{assumeutxo := M} = beamchain_chain_params:params(mainnet),
-    ?assertEqual(4, maps:size(M)),
+    lists:foreach(fun(H) -> ?assert(maps:is_key(H, M)) end,
+                  [840000, 880000, 910000, 935000]),
+    ?assert(maps:size(M) >= 4),
     lists:foreach(
       fun({H, #{block_hash := BH, utxo_hash := UH,
                 chain_tx_count := C}}) ->

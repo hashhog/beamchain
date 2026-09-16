@@ -481,7 +481,9 @@ g27_rpc_unknown_filter_type_test() ->
     %% test works regardless of index state.
     BHHex = beamchain_serialize:hex_encode(
               reverse_bytes(<<1:256/big>>)),
-    ?assertMatch({error, -8, _},
+    %% Core blockchain.cpp:2982 throws RPC_INVALID_ADDRESS_OR_KEY (-5)
+    %% "Unknown filtertype" (not -8 RPC_INVALID_PARAMETER).
+    ?assertMatch({error, -5, <<"Unknown filtertype">>},
         beamchain_rpc:rpc_getblockfilter([BHHex, <<"extended">>])).
 
 %%% ===================================================================

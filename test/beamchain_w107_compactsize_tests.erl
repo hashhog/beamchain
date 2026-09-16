@@ -90,7 +90,12 @@ g3_compact_size_5byte_max32_test() ->
     ?assertMatch(<<16#FE, 4294967295:32/little>>, Enc).
 
 g3_compact_size_5byte_roundtrip_test() ->
-    Values = [65536, 100000, 16#00FFFFFF, 16#FFFFFFFF],
+    %% 5-byte form covers [65536, 2^32-1], but decode_varint/1 applies Core's
+    %% ReadCompactSize range_check=true (serialize.h:358, MAX_SIZE=0x02000000).
+    %% Roundtrip only values that both use the 5-byte form AND pass the cap.
+    %% 0xFFFFFFFF is still *encoded* as 5 bytes (g3_compact_size_5byte_max32_test)
+    %% but decoding it with the default range check is oversized — see G10.
+    Values = [65536, 100000, 16#00FFFFFF, 16#02000000],
     lists:foreach(fun(V) ->
         Enc = beamchain_serialize:encode_varint(V),
         ?assertEqual(5, byte_size(Enc),
@@ -114,12 +119,19 @@ g4_compact_size_9byte_large_test() ->
     ?assertMatch(<<16#FF, 16#0102030405060708:64/little>>, Enc).
 
 g4_compact_size_9byte_roundtrip_test() ->
+    %% Canonical 9-byte CompactSize requires N >= 2^32. That is always
+    %% > MAX_SIZE (0x02000000), so decode_varint/1 (range_check=true) MUST
+    %% reject every 9-byte form as oversized — matching Core. Encoding is
+    %% still 9 bytes; the no-range decoder round-trips the integer.
     Values = [4294967296, 4294967297, 16#00FFFFFFFFFFFFFF],
     lists:foreach(fun(V) ->
         Enc = beamchain_serialize:encode_varint(V),
         ?assertEqual(9, byte_size(Enc),
                      {nine_byte_expected_for, V}),
-        ?assertEqual({V, <<>>}, beamchain_serialize:decode_varint(Enc))
+        ?assertEqual({error, oversized_compact_size},
+                     beamchain_serialize:decode_varint(Enc)),
+        ?assertEqual({V, <<>>},
+                     beamchain_serialize:decode_varint_no_range(Enc))
     end, Values).
 
 %%% -------------------------------------------------------------------
@@ -140,8 +152,13 @@ g5_compact_size_decode_rest_5byte_test() ->
         beamchain_serialize:decode_varint(<<16#FE, 65536:32/little, "tail">>).
 
 g5_compact_size_decode_rest_9byte_test() ->
+    %% 2^32 is a canonical 9-byte CompactSize and is > MAX_SIZE, so the
+    %% default decoder rejects it; the no-range decoder keeps the rest.
+    Enc = <<16#FF, 4294967296:64/little, "end">>,
+    ?assertEqual({error, oversized_compact_size},
+                 beamchain_serialize:decode_varint(Enc)),
     {4294967296, <<"end">>} =
-        beamchain_serialize:decode_varint(<<16#FF, 4294967296:64/little, "end">>).
+        beamchain_serialize:decode_varint_no_range(Enc).
 
 %%% -------------------------------------------------------------------
 %%% G6: CompactSize non-canonical encoding: values that SHOULD be
@@ -205,7 +222,10 @@ g7_snapshot_compact_size_decode_5byte_test() ->
         beamchain_snapshot:decode_compact_size(<<254, 65536:32/little>>)).
 
 g7_snapshot_compact_size_decode_9byte_test() ->
-    ?assertEqual({ok, 4294967296, <<>>},
+    %% Snapshot coins_per_tx / vout are sizes, so decode_compact_size uses
+    %% range_check=true. 2^32 > MAX_SIZE: Core ReadCompactSize throws
+    %% "size too large"; we return {error, oversized_compact_size}.
+    ?assertEqual({error, oversized_compact_size},
         beamchain_snapshot:decode_compact_size(<<255, 4294967296:64/little>>)).
 
 g7_snapshot_compact_size_decode_error_truncated_test() ->
@@ -237,7 +257,10 @@ g8_snapshot_non_canonical_fe_bug_test() ->
 %%% -------------------------------------------------------------------
 
 g9_mempool_persist_compact_size_roundtrip_test() ->
-    Values = [0, 1, 252, 253, 65535, 65536, 4294967295],
+    %% mempool.dat CompactSize fields are vector lengths (XOR key, deltas,
+    %% unbroadcast) so they go through range_check=true. 0xFFFFFFFF is a
+    %% valid 5-byte *encoding* but Core rejects it as "size too large".
+    Values = [0, 1, 252, 253, 65535, 65536, 16#02000000],
     lists:foreach(fun(V) ->
         Enc = beamchain_mempool_persist:encode_compact_size(V),
         ?assertEqual({V, <<>>},
@@ -278,6 +301,19 @@ g10_large_value_no_range_check_test() ->
     Enc = beamchain_serialize:encode_varint(LargeVal),
     ?assertEqual({error, oversized_compact_size},
                  beamchain_serialize:decode_varint(Enc)).
+
+g10_uint32_max_is_oversized_but_no_range_roundtrips_test() ->
+    %% The G3/G9 audit originally expected {4294967295, <<>>} from the
+    %% default decoder. That was wrong vs Core: 0xFFFFFFFF > MAX_SIZE, so
+    %% ReadCompactSize(range_check=true) throws "size too large". The
+    %% no-range decoder (addrv2 services and similar integer fields) is
+    %% the path that accepts it.
+    Enc = beamchain_serialize:encode_varint(16#FFFFFFFF),
+    ?assertEqual(<<16#FE, 16#FFFFFFFF:32/little>>, Enc),
+    ?assertEqual({error, oversized_compact_size},
+                 beamchain_serialize:decode_varint(Enc)),
+    ?assertEqual({16#FFFFFFFF, <<>>},
+                 beamchain_serialize:decode_varint_no_range(Enc)).
 
 %%% -------------------------------------------------------------------
 %%% G11: Snapshot decode_compact_size also lacks MAX_SIZE check

@@ -5948,8 +5948,7 @@ rpc_getmempooldescendants(_) ->
 %% Returns true (Core returns the bool literal true).
 %%
 %% Accepted call shapes (positional):
-%%   ["txid", FeeDelta]            (dummy omitted — preferred forward form)
-%%   ["txid", Dummy, FeeDelta]     (legacy 3-arg form; Dummy must be 0/null)
+%%   ["txid", Dummy, FeeDelta]     (Dummy must be 0 or null)
 %% Core's signature is prioritisetransaction "txid" ( dummy ) fee_delta with
 %% fee_delta REQUIRED at positional 2, so a TWO-argument call is rejected --
 %% Core does not read the second value as fee_delta.  Accepting it here meant

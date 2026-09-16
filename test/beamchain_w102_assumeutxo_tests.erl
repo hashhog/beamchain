@@ -276,9 +276,11 @@ test_g2_coin_height_equal_base() ->
 %%% ===================================================================
 %%% G3 — per-coin vout >= UINT32_MAX (FIXED)
 %%%
-%%% parse_txid_coin_entries_validated/5 now checks Vout >= 16#ffffffff
-%%% and returns {error, {bad_coin_vout, Vout}}.
-%%% Mirrors Core validation.cpp:5815.
+%%% UINT32_MAX CompactSize is > MAX_SIZE, so the snapshot decoder rejects
+%%% it as oversized_compact_size (Core ReadCompactSize "size too large")
+%%% before the vout wrap check. Defence-in-depth still returns
+%%% {error, {bad_coin_vout, Vout}} if a value >= UINT32_MAX ever got past
+%%% CompactSize. Mirrors Core validation.cpp:5811-5815.
 %%% ===================================================================
 
 %% FIXED G3: a snapshot whose vout field equals UINT32_MAX is rejected.
@@ -303,7 +305,16 @@ test_g3_vout_max_uint32() ->
         ok = file:write_file(TmpPath, SnapBin),
         Result = beamchain_snapshot:load_snapshot_validated(
                      TmpPath, RegtestMagic, 1000000),
-        ?assertMatch({error, {bad_coin_vout, _}}, Result)
+        %% UINT32_MAX CompactSize is > MAX_SIZE (0x02000000), so Core's
+        %% ReadCompactSize throws "size too large" before the vout wrap
+        %% check at validation.cpp:5815. Either rejection is Core-faithful.
+        case Result of
+            {error, oversized_compact_size} -> ok;
+            {error, {bad_coin_vout, _}} -> ok;
+            Other ->
+                ?assertEqual({error, oversized_compact_size_or_bad_coin_vout},
+                             Other)
+        end
     after
         file:delete(TmpPath)
     end.
@@ -584,10 +595,15 @@ regtest_placeholder_test() ->
 %%% Positive: assumeutxo table completeness (mainnet)
 %%% ===================================================================
 
-%% Mainnet must carry all 4 Core entries, and each must have non-zero hashes.
+%% Mainnet must carry all 4 Core entries (kernel/chainparams.cpp CMainParams
+%% m_assumeutxo_data: 840000/880000/910000/935000), and may carry extra
+%% campaign/track-B bases (currently 944183 and 481823). Each entry must
+%% have non-zero hashes.
 mainnet_entries_non_zero_test() ->
     #{assumeutxo := M} = beamchain_chain_params:params(mainnet),
-    ?assertEqual(4, maps:size(M)),
+    lists:foreach(fun(H) -> ?assert(maps:is_key(H, M)) end,
+                  [840000, 880000, 910000, 935000]),
+    ?assert(maps:size(M) >= 4),
     lists:foreach(fun({H, #{block_hash := BH, utxo_hash := UH,
                              chain_tx_count := C}}) ->
         ?assert(H > 0),

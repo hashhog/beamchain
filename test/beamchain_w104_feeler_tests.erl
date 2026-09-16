@@ -41,6 +41,8 @@ setup() ->
     os:putenv("BEAMCHAIN_NETWORK", "testnet4"),
     os:putenv("BEAMCHAIN_DATADIR", TestDir),
     filelib:ensure_path(TestDir),
+    catch gen_server:stop(beamchain_config),
+    catch gen_server:stop(beamchain_addrman),
     {ok, ConfigPid} = beamchain_config:start_link(),
     {ok, AddrmanPid} = beamchain_addrman:start_link(),
     ?PM:test_ensure_peer_table(),
@@ -172,20 +174,19 @@ feeler_test_() ->
 
 getaddr_cap_formula_test_() ->
     [
-     {"23% cap: ceil(0.23*size) below the 1000 absolute cap", fun() ->
-         %% size=100 -> ceil(23) = 23
+     {"23% cap: floor(0.23*size) below the 1000 absolute cap", fun() ->
+         %% Core addrman.cpp:800 `nNodes = max_pct * nNodes / 100` is integer
+         %% (floor) division, then min with MAX_ADDR_TO_SEND. No ceil, and
+         %% no clamp-up to 1 — Size=1..4 yields 0.
          ?assertEqual(23, ?PM:getaddr_cap(100)),
-         %% size=10 -> ceil(2.3) = 3
-         ?assertEqual(3, ?PM:getaddr_cap(10)),
-         %% size=1 -> ceil(0.23) = 1
-         ?assertEqual(1, ?PM:getaddr_cap(1)),
-         %% size=0 -> 0
+         ?assertEqual(2, ?PM:getaddr_cap(10)),
+         ?assertEqual(0, ?PM:getaddr_cap(1)),
          ?assertEqual(0, ?PM:getaddr_cap(0))
      end},
      {"23% cap: clamped at MAX_ADDR_TO_SEND (1000) for large tables", fun() ->
          %% 0.23 * 5000 = 1150 -> min(1000, 1150) = 1000
          ?assertEqual(1000, ?PM:getaddr_cap(5000)),
-         %% Exactly at the knee: ceil(0.23 * 4348) = 1001 -> clamped to 1000
+         %% Knee: floor(0.23 * 4348) = 1000; 4347 -> 999 (see peer_manager_tests)
          ?assertEqual(1000, ?PM:getaddr_cap(4348))
      end},
      {"MAX_PCT_ADDR_TO_SEND constant is genuine Core 23", fun() ->

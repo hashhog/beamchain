@@ -290,8 +290,15 @@ rpc_accept_path_test_() ->
                    <<"prioritisetransaction">>, [HexA, 0, 10000], undefined),
         NullOk = beamchain_rpc:handle_method(
                    <<"prioritisetransaction">>, [HexB, null, 20000], undefined),
+        %% Core rpc/mining.cpp prioritisetransaction: dummy is Optional::OMITTED
+        %% in the *middle*, fee_delta is required at positional 2. A two-arg
+        %% call is (txid, dummy) with fee_delta missing — Core refuses it
+        %% (does not reread arg1 as fee_delta). Three-arg dummy=0 is the
+        %% accepted form.
         TwoArg = beamchain_rpc:handle_method(
                    <<"prioritisetransaction">>, [HexC, 30000], undefined),
+        ThreeArgC = beamchain_rpc:handle_method(
+                      <<"prioritisetransaction">>, [HexC, 0, 30000], undefined),
         %% The deltas are now live in the gen_server's mapDeltas.
         DA = beamchain_mempool:get_fee_delta(IntA),
         DB = beamchain_mempool:get_fee_delta(IntB),
@@ -301,7 +308,8 @@ rpc_accept_path_test_() ->
                 <<"getprioritisedtransactions">>, [], undefined),
         [?_assertEqual({ok, true}, ZeroOk),
          ?_assertEqual({ok, true}, NullOk),
-         ?_assertEqual({ok, true}, TwoArg),
+         ?_assertMatch({error, -32602, _}, TwoArg),
+         ?_assertEqual({ok, true}, ThreeArgC),
          ?_assertEqual(10000, DA),
          ?_assertEqual(20000, DB),
          ?_assertEqual(30000, DC),

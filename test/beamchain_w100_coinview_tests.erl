@@ -102,6 +102,9 @@ setup() ->
     application:ensure_all_started(rocksdb),
     application:set_env(beamchain, datadir, TmpDir),
     application:set_env(beamchain, network, regtest),
+    catch gen_server:stop(beamchain_config),
+    catch beamchain_db:stop(),
+    catch gen_server:stop(beamchain_chainstate),
     {ok, ConfigPid}     = beamchain_config:start_link(),
     {ok, DbPid}         = beamchain_db:start_link(),
     %% Pre-seed genesis so chainstate init finds a tip
@@ -603,8 +606,9 @@ g29_pending_undo_in_flush_batch() ->
     ?assertMatch({ok, _}, beamchain_db:get_undo(BlockHash)),
     %% Manually inject the hash into pending_undo_deletes via sys:replace_state
     sys:replace_state(beamchain_chainstate, fun(S) ->
-        Pending = element(18, S),  %% pending_undo_deletes field
-        setelement(18, S, [BlockHash | Pending])
+        %% #state{}: 1=tag, ... 15=reorg_in_progress, 16=pending_undo_deletes
+        Pending = element(16, S),
+        setelement(16, S, [BlockHash | Pending])
     end),
     %% Trigger a flush (needs at least one dirty/spent op or tip change
     %% to take the non-fast path; add a dirty entry)
@@ -647,6 +651,7 @@ bug10_zmq_before_flush() ->
     %% Core's ordering is: validation → flush → zmq_notify.
     %%
     %% We assert the beamchain_zmq module is available:
+    {module, beamchain_zmq} = code:ensure_loaded(beamchain_zmq),
     ?assert(erlang:function_exported(beamchain_zmq, notify_block, 2)),
     %% And that beamchain_chainstate's flush path can be called independently:
     Txid = fresh_txid(),

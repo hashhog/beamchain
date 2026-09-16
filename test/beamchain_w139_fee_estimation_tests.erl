@@ -375,7 +375,7 @@ g11_bug2_period_index_floor_test_() ->
      end].
 
 %%% ===================================================================
-%%% G12 — BUG-3: No removeTx/remove_tx hook
+%%% G12 — removeTx/remove_tx hook (FIXED)
 %%% Core: block_policy_estimator.cpp:522 (CBlockPolicyEstimator::removeTx)
 %%% ===================================================================
 
@@ -386,9 +386,7 @@ g12_bug3_no_remove_tx_test_() ->
              Exports = beamchain_fee_estimator:module_info(exports),
              HasRemove = lists:keymember(remove_tx, 1, Exports) orelse
                          lists:keymember(removetx, 1, Exports),
-             ?assertNot(HasRemove,
-                 "BUG-3: remove_tx/1 should exist to mirror Core "
-                 "CBlockPolicyEstimator::removeTx (failAvg tracking)")
+             ?assert(HasRemove)
          end]
      end}.
 
@@ -465,8 +463,8 @@ g15_bug6_no_three_estimate_max_test_() ->
      end].
 
 %%% ===================================================================
-%%% G16 — BUG-7: estimate_mode parameter swallowed by RPC dispatch
-%%% rpc_estimatesmartfee([ConfTarget | _]) ignores the mode argument.
+%%% G16 — estimate_mode parameter is validated (BUG-7 FIXED)
+%%% rpc_estimatesmartfee([ConfTarget | Rest]) + check_estimate_mode/1.
 %%% ===================================================================
 
 g16_bug7_estimate_mode_swallowed_test_() ->
@@ -479,14 +477,14 @@ g16_bug7_estimate_mode_swallowed_test_() ->
          end,
          case file:read_file(Path) of
              {ok, Bin} ->
-                 %% Look for the buggy pattern that eats the mode arg.
                  Swallowed =
                      binary:match(
                        Bin,
                        <<"rpc_estimatesmartfee([ConfTarget | _])">>) =/= nomatch,
-                 ?assert(Swallowed,
-                     "BUG-7: rpc_estimatesmartfee swallows estimate_mode via "
-                     "[ConfTarget | _]; should be [ConfTarget, Mode | _]");
+                 Validates =
+                     binary:match(Bin, <<"check_estimate_mode">>) =/= nomatch,
+                 ?assertNot(Swallowed),
+                 ?assert(Validates);
              _ ->
                  ?assert(true)
          end

@@ -75,6 +75,8 @@ setup_db() ->
     application:set_env(beamchain, network, regtest),
     os:unsetenv(?CAMPAIGN_ENV),
     beamchain_chain_params:clear_campaign_assumeutxo(),
+    catch gen_server:stop(beamchain_config),
+    catch beamchain_db:stop(),
     {ok, ConfigPid} = beamchain_config:start_link(),
     {ok, DbPid} = beamchain_db:start_link(),
     #{tmpdir => TmpDir, config => ConfigPid, db => DbPid}.
@@ -96,6 +98,8 @@ setup_full() ->
            0, GenesisHash, Genesis#block.header,
            <<(?ACTIVE_CW):256>>, 5, 1),
     ok = beamchain_db:set_chain_tip(GenesisHash, 0),
+    catch gen_server:stop(beamchain_mempool),
+    catch gen_server:stop(beamchain_chainstate),
     {ok, MpPid} = beamchain_mempool:start_link(),
     {ok, CsPid} = beamchain_chainstate:start_link(),
     Env#{mempool => MpPid, chainstate => CsPid, genesis => Genesis}.

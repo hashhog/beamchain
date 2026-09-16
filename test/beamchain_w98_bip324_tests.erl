@@ -408,10 +408,12 @@ g23_unknown_short_id_returns_error_test() ->
 %%% G24 — Max plaintext 4 MB cap enforced in extract_v2_packet
 %%% ===================================================================
 
-%% FIX-5 / W98 G24: extract_v2_packet must return {stop, oversize_message}
-%% when the decrypted ContentsLen exceeds MAX_PROTOCOL_MESSAGE_LENGTH
-%% (4 000 000 bytes, matching Bitcoin Core).  Previously the guard was
-%% absent — a peer could force a 16 MiB buffer allocation pre-AEAD.
+%% FIX-5 / W98 G24: extract_v2_packet must return
+%% {stop, {shutdown, oversize_message}} when the decrypted ContentsLen
+%% exceeds MAX_PROTOCOL_MESSAGE_LENGTH (4 000 000 bytes, matching Bitcoin
+%% Core).  {shutdown, Reason} is the OTP clean-disconnect form (no crash
+%% report).  Previously the guard was absent — a peer could force a 16 MiB
+%% buffer allocation pre-AEAD.
 %%
 %% Strategy: set up a real initiator/responder cipher pair, encrypt a
 %% packet whose plaintext length is MAX_PROTOCOL_MESSAGE_LENGTH + 1 (we
@@ -442,7 +444,7 @@ g24_oversize_message_rejected_test() ->
     %% Feed just the EncLen into extract_v2_packet via the responder cipher.
     %% The buffer contains exactly 3 bytes — length field only.
     Peer = beamchain_peer:make_test_v2_peer(B1, EncLen),
-    ?assertEqual({stop, oversize_message},
+    ?assertEqual({stop, {shutdown, oversize_message}},
                  beamchain_peer:extract_v2_packet(Peer)),
 
     %% Boundary: exactly MaxLen is allowed.
@@ -451,7 +453,7 @@ g24_oversize_message_rejected_test() ->
     <<EncLen2:3/binary, _/binary>> = CT2,
     Peer2 = beamchain_peer:make_test_v2_peer(B1, EncLen2),
     %% Must NOT return oversize_message for the boundary-exact case.
-    ?assertNotEqual({stop, oversize_message},
+    ?assertNotEqual({stop, {shutdown, oversize_message}},
                     beamchain_peer:extract_v2_packet(Peer2)).
 
 %%% ===================================================================

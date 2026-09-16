@@ -357,9 +357,10 @@ g22_ephemeral_eviction_widening_test_() ->
 
 g23_modified_fee_not_implemented_test_() ->
     {ok, Src} = file:read_file(mempool_src_path()),
-    %% No fee_delta / modified_fee field on mempool_entry.
-    [?_assertEqual(nomatch, binary:match(Src, <<"fee_delta">>)),
-     ?_assertEqual(nomatch, binary:match(Src, <<"GetModifiedFee">>))].
+    %% prioritisetransaction fee_delta is now stored on the mempool entry
+    %% and GetModifiedFee (fee + delta) is used by RBF Rule 3+4.
+    [?_assertNotEqual(nomatch, binary:match(Src, <<"fee_delta">>)),
+     ?_assertNotEqual(nomatch, binary:match(Src, <<"GetModifiedFee">>))].
 
 %%% ===================================================================
 %%% G24 — bip125-replaceable flag in getmempoolentry RPC
@@ -423,7 +424,7 @@ g27_error_atoms_have_rpc_strings_test_() ->
                     binary:match(RpcSrc, <<"format_mempool_error(", A/binary>>) =/= nomatch],
     %% Verify which ones are uncovered.
     Uncovered = Thrown -- Covered,
-    [?_assert(length(Uncovered) >= 2)].  %% spends_conflicting + cluster_diagram
+    [?_assertEqual([], Uncovered)].
 
 %%% ===================================================================
 %%% G28 — bumpfee RPC enforces BIP-125 input sequence on the source tx
@@ -447,12 +448,13 @@ g28_bumpfee_requires_signaling_test_() ->
 
 g29_createrawtransaction_replaceable_flag_test_() ->
     {ok, RpcSrc} = file:read_file(rpc_src_path()),
-    [?_assert(binary:match(RpcSrc, <<"true -> 16#FFFFFFFD">>) =/= nomatch),
-     %% Beamchain non-replaceable falls through to 0xFFFFFFFF unconditionally —
-     %% verify by checking neither the locktime-aware MAX-1 nor a "false ->"
-     %% clause matches.
-     ?_assertEqual(nomatch, binary:match(RpcSrc, <<"16#FFFFFFFE  %%">>)),
-     ?_assert(binary:match(RpcSrc, <<"_ -> 16#FFFFFFFF">>) =/= nomatch)].
+    %% Core AddInputs three-way (rawtransaction_util.cpp:49-55):
+    %%   replaceable -> MAX_BIP125_RBF_SEQUENCE 0xFFFFFFFD
+    %%   locktime!=0 -> MAX_SEQUENCE_NONFINAL    0xFFFFFFFE
+    %%   else        -> SEQUENCE_FINAL           0xFFFFFFFF
+    [?_assert(binary:match(RpcSrc, <<"16#FFFFFFFD">>) =/= nomatch),
+     ?_assert(binary:match(RpcSrc, <<"16#FFFFFFFE">>) =/= nomatch),
+     ?_assert(binary:match(RpcSrc, <<"16#FFFFFFFF">>) =/= nomatch)].
 
 %%% ===================================================================
 %%% G30 — Incremental relay fee constant cross-check with Core

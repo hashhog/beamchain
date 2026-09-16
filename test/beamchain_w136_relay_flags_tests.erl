@@ -308,7 +308,7 @@ g13_min_relay_floor_test_() ->
       ?_test(begin
          Src = read_src(beamchain_peer_src()),
          ?assertNotEqual(nomatch, binary:match(Src,
-             <<"DEFAULT_MIN_RELAY_FEE, 1000">>)),
+             <<"DEFAULT_MIN_RELAY_FEE, 100">>)),
          %% No mempool-option lookup in feefilter send path
          ?assertEqual(nomatch, binary:match(Src, <<"min_relay_feerate">>))
        end)

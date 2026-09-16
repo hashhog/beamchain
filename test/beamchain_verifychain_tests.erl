@@ -56,6 +56,10 @@ setup() ->
     application:ensure_all_started(rocksdb),
     application:set_env(beamchain, datadir, TmpDir),
     application:set_env(beamchain, network, regtest),
+    os:putenv("BEAMCHAIN_NETWORK", "regtest"),
+    os:putenv("BEAMCHAIN_DATADIR", TmpDir),
+    catch gen_server:stop(beamchain_config),
+    catch beamchain_db:stop(),
     {ok, ConfigPid} = beamchain_config:start_link(),
     {ok, DbPid} = beamchain_db:start_link(),
     %% Make sure the ETS chain-meta table exists so rpc_verifychain can

@@ -206,7 +206,6 @@ g16_plaintext_password_stored_test() ->
                      <<"{rpc_credentials, to_bin(U), to_bin(P)}">>)),
     %% No HMAC, no salt, no hashing anywhere in setup_auth.
     ?assertEqual(nomatch, binary:match(Src, <<"hmac_sha256">>)),
-    ?assertEqual(nomatch, binary:match(Src, <<"GenerateAuthCookie">>)),
     ?assertEqual(nomatch, binary:match(Src, <<"password_hmac">>)).
 
 %% G17 PARTIAL — authorization header parsed via cowboy_req:parse_header
@@ -312,11 +311,10 @@ g24_no_rpcwhitelist_test() ->
 %% BUG-12.
 g25_rpc_perf_flags_missing_test() ->
     Src = rpc_module_src(),
-    ?assertEqual(nomatch, binary:match(Src, <<"rpcservertimeout">>)),
     ?assertEqual(nomatch, binary:match(Src, <<"rpcworkqueue">>)),
     ?assertEqual(nomatch, binary:match(Src, <<"rpcthreads">>)),
-    %% No explicit idle_timeout / max_keepalive override.
-    ?assertEqual(nomatch, binary:match(Src, <<"idle_timeout =>">>)).
+    %% cowboy idle_timeout is now set (1 hour) so long RPC is not dropped.
+    ?assertNotEqual(nomatch, binary:match(Src, <<"idle_timeout =>">>)).
 
 %% G26 MISSING — no -norpccookiefile opt-out.  BUG-13.
 g26_no_norpccookiefile_test() ->

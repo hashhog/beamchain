@@ -185,8 +185,10 @@ g12_gbt_signet_challenge_absent_test() ->
 %% G13 [P0] BIP-34 coinbase height encoding (CScriptNum / sign-bit) — PRESENT.
 %% Re-verifies the W87 fix is still in place via live call.
 g13_coinbase_height_encoding_signbit_test() ->
-    ?assertEqual(<<1, 1>>,        beamchain_miner:encode_coinbase_height(1)),
-    ?assertEqual(<<1, 16>>,       beamchain_miner:encode_coinbase_height(16)),
+    %% Core CScript << int64 uses OP_1..OP_16 for 1..16 (script.h push_int64),
+    %% then CScriptNum with the sign-bit pad for larger values.
+    ?assertEqual(<<16#51>>,       beamchain_miner:encode_coinbase_height(1)),
+    ?assertEqual(<<16#60>>,       beamchain_miner:encode_coinbase_height(16)),
     ?assertEqual(<<1, 17>>,       beamchain_miner:encode_coinbase_height(17)),
     ?assertEqual(<<1, 127>>,      beamchain_miner:encode_coinbase_height(127)),
     ?assertEqual(<<2, 128, 0>>,   beamchain_miner:encode_coinbase_height(128)),
@@ -353,7 +355,7 @@ g23_bip22_result_canonical_strings_test() ->
                  beamchain_rpc:bip22_result(bad_witness_nonce)),
     ?assertEqual(<<"bad-txns-BIP30">>,
                  beamchain_rpc:bip22_result(bad_txns_bip30)),
-    ?assertEqual(<<"bad-txns-duplicate">>,
+    ?assertEqual(<<"bad-txns-inputs-duplicate">>,
                  beamchain_rpc:bip22_result(duplicate_inputs)),
     ?assertEqual(<<"bad-txns-premature-spend-of-coinbase">>,
                  beamchain_rpc:bip22_result(premature_spend_of_coinbase)),

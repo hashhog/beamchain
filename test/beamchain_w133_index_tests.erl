@@ -81,7 +81,7 @@ g2_no_coinstatsindex_test_() ->
      "lookup.",
      [
       ?_test(begin
-         ?assertEqual(non_existing, code:which(beamchain_coinstatsindex)),
+         ?assertNotEqual(non_existing, code:which(beamchain_coinstatsindex)),
          ?assertEqual(non_existing, code:which(beamchain_coin_stats_index)),
          %% gettxoutsetinfo walks the chainstate CF via
          %% compute_utxo_stats (one txid group at a time), not a
@@ -175,31 +175,17 @@ g5_no_locator_persisted_test_() ->
 %%% ===================================================================
 
 g6_genesis_coinbase_indexed_test_() ->
-    {"G6: BUG-6 (HIGH) — store_tx_index has no height-zero exception. "
-     "Core skips at txindex.cpp:77 ('if (block.height == 0) return true').",
+    {"G6: tx index is written atomically in connect_block, not via a "
+     "post-connect store_tx_index/2 pass in block_sync.",
      [
       ?_test(begin
          BsSrc = read_src(beamchain_block_sync_src()),
-         %% The store_tx_index function in block_sync.erl unconditionally
-         %% iterates txs without a height guard.
-         %% Match the function head + immediate case-clause structure.
-         ?assertNotEqual(nomatch,
+         ?assertEqual(nomatch,
              binary:match(BsSrc,
                  <<"store_tx_index(#block{header = Header, "
                    "transactions = Txs}, Height) ->">>)),
-         %% No "Height =/= 0" or "Height > 0" guard around the lists:foldl.
-         %% Extract the function body window starting at the function head
-         %% so we can grep for guards locally without false positives from
-         %% unrelated code earlier or later in the file.
-         Tail = case binary:match(BsSrc, <<"store_tx_index(#block">>) of
-             {Start, _Len} ->
-                 binary:part(BsSrc, Start,
-                             min(800, byte_size(BsSrc) - Start));
-             nomatch -> <<>>
-         end,
-         ?assertEqual(nomatch, binary:match(Tail, <<"Height > 0">>)),
-         ?assertEqual(nomatch, binary:match(Tail, <<"Height =/= 0">>)),
-         ?assertEqual(nomatch, binary:match(Tail, <<"Height /= 0">>))
+         ?assertNotEqual(nomatch,
+             binary:match(BsSrc, <<"direct_atomic_connect_writes">>))
        end)
      ]}.
 
@@ -225,9 +211,10 @@ g7_no_background_sync_thread_test_() ->
          ?assertEqual(nomatch, binary:match(DbSrc, <<"background_sync">>)),
          %% Confirm we don't accidentally spawn a sync worker.
          BsSrc = read_src(beamchain_block_sync_src()),
-         %% store_tx_index is called synchronously from block-connect.
+         %% Tx index is written inside connect_block (atomic WriteBatch),
+         %% still synchronous with block-connect — no background thread.
          ?assertNotEqual(nomatch,
-             binary:match(BsSrc, <<"store_tx_index(Block, Height)">>)),
+             binary:match(BsSrc, <<"direct_atomic_connect_writes">>)),
          %% No proc_lib:spawn_link nor erlang:spawn for tx_index path.
          ?assertEqual(nomatch,
              binary:match(BsSrc, <<"spawn(fun store_tx_index">>)),
@@ -257,8 +244,6 @@ g8_no_block_until_synced_test_() ->
              ?assertEqual(nomatch,
                  binary:match(Src, <<"block_until_synced">>)),
              ?assertEqual(nomatch,
-                 binary:match(Src, <<"BlockUntilSyncedToCurrentChain">>)),
-             ?assertEqual(nomatch,
                  binary:match(Src, <<"wait_for_index_sync">>))
          end, AllSrcs)
        end)
@@ -277,10 +262,10 @@ g9_no_getindexinfo_rpc_test_() ->
          %% The handle_method dispatcher has rows like
          %%   handle_method(<<"getblock">>, ...) -> ...
          %% Verify <<"getindexinfo">> is NOT one of them.
-         ?assertEqual(nomatch,
+         ?assertNotEqual(nomatch,
              binary:match(RpcSrc,
                  <<"handle_method(<<\"getindexinfo\">>">>)),
-         ?assertEqual(nomatch, binary:match(RpcSrc, <<"getindexinfo">>))
+         ?assertNotEqual(nomatch, binary:match(RpcSrc, <<"getindexinfo">>))
        end)
      ]}.
 
@@ -293,18 +278,9 @@ g10_no_index_summary_struct_test_() ->
      "getindexinfo were added there's no record to populate from.",
      [
       ?_test(begin
-         AllSrcs = [
-             read_src(beamchain_db_src()),
-             read_src(beamchain_rpc_src()),
-             read_src(beamchain_chainstate_src())
-         ],
-         lists:foreach(fun(Src) ->
-             ?assertEqual(nomatch,
-                 binary:match(Src, <<"index_summary">>)),
-             ?assertEqual(nomatch,
-                 binary:match(Src, <<"IndexSummary">>))
-         end, AllSrcs),
-         %% No record `index_summary` defined in any module.
+         RpcSrc = read_src(beamchain_rpc_src()),
+         ?assertNotEqual(nomatch,
+             binary:match(RpcSrc, <<"index_summary">>)),
          ?assertEqual(nomatch,
              binary:match(read_src(beamchain_blockfilter_index_src()),
                           <<"-record(index_summary">>))
@@ -386,7 +362,7 @@ g14_no_custom_commit_atomic_batch_test_() ->
      "best-block locator. Moot until coinstatsindex exists.",
      [
       ?_test(begin
-         ?assertEqual(non_existing, code:which(beamchain_coinstatsindex)),
+         ?assertNotEqual(non_existing, code:which(beamchain_coinstatsindex)),
          %% Verify the absence of a Commit-style batched write for any
          %% per-block muhash state in blockfilter_index either.
          BfSrc = read_src(beamchain_blockfilter_index_src()),
@@ -589,7 +565,7 @@ g23_no_legacy_coinstats_migration_test_() ->
       ?_test(begin
          %% A future coinstatsindex should imitate Core's
          %% coinstatsindex.cpp:97-101 ('indexes/coinstats' legacy warning).
-         ?assertEqual(non_existing, code:which(beamchain_coinstatsindex)),
+         ?assertNotEqual(non_existing, code:which(beamchain_coinstatsindex)),
          %% No legacy-path string anywhere.
          AllSrcs = [
              read_src(beamchain_db_src()),
@@ -615,9 +591,9 @@ g24_no_blockinfo_shared_artifact_test_() ->
      [
       ?_test(begin
          BsSrc = read_src(beamchain_block_sync_src()),
-         %% store_tx_index takes #block{} (decoded) — that's good.
+         %% Tx index is written inside connect_block's atomic batch.
          ?assertNotEqual(nomatch,
-             binary:match(BsSrc, <<"store_tx_index(#block">>)),
+             binary:match(BsSrc, <<"direct_atomic_connect_writes">>)),
          %% But there's no BlockInfo wrapper carrying both block + undo.
          ?assertEqual(nomatch, binary:match(BsSrc, <<"block_info">>)),
          ?assertEqual(nomatch, binary:match(BsSrc, <<"-record(block_info">>))

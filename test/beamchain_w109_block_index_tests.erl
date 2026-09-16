@@ -219,6 +219,8 @@ setup() ->
     application:ensure_all_started(rocksdb),
     application:set_env(beamchain, datadir, TmpDir),
     application:set_env(beamchain, network, regtest),
+    catch gen_server:stop(beamchain_config),
+    catch beamchain_db:stop(),
     {ok, ConfigPid} = beamchain_config:start_link(),
     {ok, DbPid}     = beamchain_db:start_link(),
     #{tmpdir => TmpDir, config => ConfigPid, db => DbPid}.

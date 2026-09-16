@@ -763,26 +763,21 @@ g29_package_cpfp_fee_rate_gate_test_() ->
 
 %%% ===================================================================
 %%% G30 — Package RBF: incremental relay fee check uses correct constant
-%%% Core: PaysForRBF uses DEFAULT_INCREMENTAL_RELAY_FEE (100 sat/kvB) NOT
-%%% DEFAULT_MIN_RELAY_TX_FEE (1000 sat/kvB).
-%%% beamchain do_package_rbf line ~1202 uses ?DEFAULT_INCREMENTAL_RELAY_FEE = 100.
+%%% Core: PaysForRBF uses DEFAULT_INCREMENTAL_RELAY_FEE (100 sat/kvB).
+%%% As of Core v31 DEFAULT_MIN_RELAY_TX_FEE is also 100 sat/kvB (policy.h:70),
+%%% so the numeric floor matches; the source still names the incremental
+%%% constant (NOT the historical 1000 sat/kvB min-relay).
 %%% ===================================================================
 
 g30_package_rbf_incremental_fee_constant_test_() ->
     [fun() ->
-        %% Verify the correct constant is used for package RBF.
         ?assertEqual(100, ?DEFAULT_INCREMENTAL_RELAY_FEE),
-        ?assertEqual(1000, ?DEFAULT_MIN_RELAY_TX_FEE),
+        ?assertEqual(100, ?DEFAULT_MIN_RELAY_TX_FEE),
 
         %% 500-vbyte package: min additional = ceil(500 * 100 / 1000) = 50 sat.
         VSize = 500,
         MinAdditional = (VSize * ?DEFAULT_INCREMENTAL_RELAY_FEE + 999) div 1000,
-        ?assertEqual(50, MinAdditional),
-
-        %% Wrong constant (1000 sat/kvB) would give 500 sat — 10x too strict.
-        WrongMinAdditional = (VSize * ?DEFAULT_MIN_RELAY_TX_FEE + 999) div 1000,
-        ?assertEqual(500, WrongMinAdditional),
-        ?assert(MinAdditional < WrongMinAdditional)
+        ?assertEqual(50, MinAdditional)
     end].
 
 %%% ===================================================================
