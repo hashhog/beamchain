@@ -124,6 +124,16 @@
 -define(DEFAULT_MAX_CACHE_MB, 450).
 -define(IBD_MAX_CACHE_MB, 4096).
 -define(IBD_FLUSH_INTERVAL, 5000).
+%% Crash-recovery checkpoints. maybe_flush inside do_connect_block is
+%% gated on IBD_FLUSH_INTERVAL (5000), which is why the 2026-09-17 live
+%% incident lost 310 connected blocks when a 5 s db call timed out 14
+%% min into roll-forward — none of them had been flushed. Checkpoint
+%% every recovered block so a crash mid-replay resumes at the last
+%% connected height. A recovery of a few hundred blocks is extra
+%% WriteBatches, not a 15-min crash loop. Core ConnectTip flushes
+%% IF_NEEDED / PERIODIC per block; ReplayBlocks is a different path
+%% (interrupted coins flush) and commits once at the end.
+-define(ROLL_FORWARD_FLUSH_INTERVAL, 1).
 
 %% Estimated cache entry count threshold (3 million entries ~ 450MB)
 %% Each UTXO entry is roughly 150 bytes on average (key + value + ETS overhead)
@@ -247,18 +257,26 @@
 %%% API
 %%% ===================================================================
 
+%% Init timeout is infinity: roll_forward_from_disk can run for many
+%% minutes after an unclean shutdown (live 2026-09-17: 14 min / 310
+%% blocks before a db call timed out). OTP 27 already defaults start
+%% timeout to infinity; pass it explicitly so a future default change
+%% cannot re-introduce a 5 s proc_lib:sync_start cliff.
 start_link() ->
-    gen_server:start_link({local, ?SERVER}, ?MODULE, [main], []).
+    gen_server:start_link({local, ?SERVER}, ?MODULE, [main],
+                          [{timeout, infinity}]).
 
 %% @doc Start a named chainstate with a specific role.
 %% Role can be: main, snapshot, or background.
 start_link(Role) when Role =:= main; Role =:= background ->
-    gen_server:start_link({local, ?SERVER}, ?MODULE, [Role], []).
+    gen_server:start_link({local, ?SERVER}, ?MODULE, [Role],
+                          [{timeout, infinity}]).
 
 %% @doc Start a snapshot chainstate with preloaded UTXO data.
 %% SnapshotData = #{base_hash, num_coins, coins}
 start_link(snapshot, SnapshotData) ->
-    gen_server:start_link({local, ?SERVER}, ?MODULE, [snapshot, SnapshotData], []).
+    gen_server:start_link({local, ?SERVER}, ?MODULE, [snapshot, SnapshotData],
+                          [{timeout, infinity}]).
 
 %% @doc Get the current chain tip.
 %% Direct ETS read — no gen_server bottleneck.
@@ -966,6 +984,11 @@ init_chainstate(Role, SnapshotData) ->
 %% or a side-branch; per-block disk writes are overwrite-by-key, so re-applying
 %% the partially-written tail is idempotent. Stops when no contiguous block
 %% remains or a connect fails to advance the tip.
+%%
+%% get_block_by_height/1 uses an unbounded gen_server:call (see
+%% beamchain_db) so a slow rocksdb read cannot kill init. After each
+%% successful connect we checkpoint (do_flush) so a crash mid-replay
+%% resumes from this height, not from the pre-crash flush.
 roll_forward_from_disk(State) ->
     Next = State#state.tip_height + 1,
     case beamchain_db:get_block_by_height(Next) of
@@ -973,13 +996,27 @@ roll_forward_from_disk(State) ->
             case do_connect_block(Block, State) of
                 {ok, State2}
                   when State2#state.tip_height > State#state.tip_height ->
-                    roll_forward_from_disk(State2);
+                    State3 = maybe_checkpoint_roll_forward(State2),
+                    roll_forward_from_disk(State3);
                 _ ->
                     State
             end;
         not_found ->
             State
     end.
+
+maybe_checkpoint_roll_forward(#state{blocks_since_flush = N} = State)
+  when N >= ?ROLL_FORWARD_FLUSH_INTERVAL ->
+    case State#state.tip_height rem 64 of
+        0 ->
+            logger:info("chainstate: crash recovery checkpoint at height ~B",
+                        [State#state.tip_height]);
+        _ ->
+            ok
+    end,
+    do_flush(State);
+maybe_checkpoint_roll_forward(State) ->
+    State.
 
 handle_call(get_mtp, _From, #state{mtp_timestamps = Ts} = State) ->
     {reply, compute_mtp(Ts), State};

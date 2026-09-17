@@ -16,7 +16,8 @@
 -export([start_link/0, stop/0]).
 
 %% Block storage
--export([store_block/2, get_block/1, get_block_by_height/1, has_block/1]).
+-export([store_block/2, get_block/1, get_block_by_height/1,
+         get_block_by_height/2, has_block/1]).
 
 %% Flat file block storage
 -export([write_block/2, read_block/1, get_block_file_info/0]).
@@ -180,17 +181,30 @@ store_block(Block, Height) ->
 %% @doc Get a block by hash
 -spec get_block(binary()) -> {ok, #block{}} | not_found.
 get_block(Hash) when byte_size(Hash) =:= 32 ->
-    gen_server:call(?SERVER, {get_block, Hash}).
+    gen_server:call(?SERVER, {get_block, Hash}, infinity).
 
-%% @doc Get a block by height
+%% @doc Get a block by height.
+%%
+%% Infinity timeout: a slow rocksdb read (the box often runs several
+%% coverage slices) must not crash the caller. The live 2026-09-17
+%% boot loop was `roll_forward_from_disk` dying on the 5 s default
+%% (`{timeout,{gen_server,call,[beamchain_db,{get_block_by_height,_}]}}`
+%% in chainstate init). Core's ReplayBlocks / LoadBlockIndex reads are
+%% unbounded. Use get_block_by_height/2 only when a caller has a real
+%% deadline (RPC).
 -spec get_block_by_height(non_neg_integer()) -> {ok, #block{}} | not_found.
 get_block_by_height(Height) ->
-    gen_server:call(?SERVER, {get_block_by_height, Height}).
+    get_block_by_height(Height, infinity).
+
+-spec get_block_by_height(non_neg_integer(), timeout()) ->
+    {ok, #block{}} | not_found.
+get_block_by_height(Height, Timeout) ->
+    gen_server:call(?SERVER, {get_block_by_height, Height}, Timeout).
 
 %% @doc Check if a block exists
 -spec has_block(binary()) -> boolean().
 has_block(Hash) when byte_size(Hash) =:= 32 ->
-    gen_server:call(?SERVER, {has_block, Hash}).
+    gen_server:call(?SERVER, {has_block, Hash}, infinity).
 
 %% @doc Get a UTXO by outpoint.
 %% Uses direct RocksDB read (bypasses gen_server for lower latency).
@@ -454,10 +468,12 @@ delete_side_branch_index(Hash) when byte_size(Hash) =:= 32 ->
 get_all_side_branch_indexes() ->
     gen_server:call(?SERVER, get_all_side_branch_indexes, 60000).
 
-%% @doc Get the current chain tip
+%% @doc Get the current chain tip.
+%% Infinity: this is on the chainstate init / roll-forward boot path
+%% (load_chain_tip/0). Same 5 s cliff as get_block_by_height/1.
 -spec get_chain_tip() -> {ok, #{hash => binary(), height => integer()}} | not_found.
 get_chain_tip() ->
-    gen_server:call(?SERVER, get_chain_tip).
+    gen_server:call(?SERVER, get_chain_tip, infinity).
 
 %% @doc Set the chain tip
 -spec set_chain_tip(binary(), non_neg_integer()) -> ok.
