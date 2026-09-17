@@ -695,14 +695,16 @@ encode_output_map(OutputMap) ->
             undefined -> [];
             WS -> [encode_kv(<<?PSBT_OUT_WITNESS_SCRIPT>>, WS)]
         end,
-        %% BIP32 derivation paths
+        %% BIP32 derivation paths — Core sorts
+        %% std::map<CPubKey, KeyOriginInfo> by raw pubkey bytes.
         case maps:get(bip32_derivation, OutputMap, undefined) of
             undefined -> [];
             Derivs ->
-                maps:fold(fun(PubKey, {Fingerprint, Path}, Acc) ->
-                    PathBin = encode_bip32_path(Fingerprint, Path),
-                    [encode_kv(<<?PSBT_OUT_BIP32_DERIVATION, PubKey/binary>>, PathBin) | Acc]
-                end, [], Derivs)
+                Sorted = lists:keysort(1, maps:to_list(Derivs)),
+                [begin
+                     PathBin = encode_bip32_path(FP, P),
+                     encode_kv(<<?PSBT_OUT_BIP32_DERIVATION, PubKey/binary>>, PathBin)
+                 end || {PubKey, {FP, P}} <- Sorted]
         end,
         %% Taproot internal key
         case maps:get(tap_internal_key, OutputMap, undefined) of

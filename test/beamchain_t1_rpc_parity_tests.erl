@@ -83,6 +83,10 @@ addnode_invalid_command_is_minus1_test() ->
 %%% (r5-probes.d/mining-relay.jsonl)
 %%% ===================================================================
 
+help_lists_getnetworkhashps_test() ->
+    Names = beamchain_rpc:beamchain_method_names(),
+    ?assertEqual(true, lists:member(<<"getnetworkhashps">>, Names)).
+
 getnetworkhashps_string_nblocks_is_minus3_test() ->
     Res = rpc(<<"getnetworkhashps">>, [<<"foo">>]),
     ?assertMatch({error, -3, _}, Res),

@@ -27,8 +27,10 @@
 -export([validate_snapshot_height/2]).
 
 %% Exported for testing — Core's central argument-count gate (#103) and the
-%% method list it consults. dispatch/2 is the only production caller.
--export([core_arity_violation/2, beamchain_method_names/0]).
+%% method list it consults. dispatch/2 is the production caller of both;
+%% eunit drives it so a handler that is correct but hidden behind a wrong
+%% arity entry cannot pass the R5 probes.
+-export([core_arity_violation/2, beamchain_method_names/0, dispatch/2]).
 
 %% Exported for testing — dumptxoutset rollback target resolution.
 %% Pure function; no side effects beyond DB lookups for height/hash → index.
@@ -1137,6 +1139,7 @@ rpc_help_lines() ->
         <<"generatetoaddress nblocks \"address\" ( maxtries ) [regtest only]">>,
         <<"getblocktemplate ( \"template_request\" )">>,
         <<"getmininginfo">>,
+        <<"getnetworkhashps ( nblocks height )">>,
         <<"getprioritisedtransactions">>,
         <<"prioritisetransaction \"txid\" ( dummy ) fee_delta">>,
         <<"submitblock \"hexdata\"">>,
@@ -12930,14 +12933,17 @@ rpc_finalizepsbt([PsbtB64, Extract]) when is_binary(PsbtB64) ->
                 end;
             {error, Reason} ->
                 {error, ?RPC_DESERIALIZATION_ERROR,
-                 iolist_to_binary(io_lib:format("PSBT decode failed: ~p", [Reason]))}
+                 iolist_to_binary(io_lib:format("TX decode failed ~p", [Reason]))}
         end
     catch
-        error:badarg ->
-            {error, ?RPC_DESERIALIZATION_ERROR, <<"Invalid base64 encoding">>};
-        _:Err ->
-            {error, ?RPC_MISC_ERROR,
-             iolist_to_binary(io_lib:format("Error: ~p", [Err]))}
+        %% Core DecodeBase64PSBT: invalid base64 -> RPC_DESERIALIZATION_ERROR
+        %% (-22) "TX decode failed invalid base64" (rawtransaction.cpp:1591-1592,
+        %% psbt.cpp:611). OTP 27 throws error:missing_padding rather than
+        %% badarg for "notbase64!!"; the previous catch-all collapsed that
+        %% to RPC_MISC_ERROR (-1).
+        _:_ ->
+            {error, ?RPC_DESERIALIZATION_ERROR,
+             <<"TX decode failed invalid base64">>}
     end;
 rpc_finalizepsbt(_) ->
     {error, ?RPC_INVALID_PARAMS, <<"finalizepsbt \"psbt\" (extract)">>}.
@@ -13048,9 +13054,14 @@ decode_psbt_rpc(PsbtB64) ->
     end.
 
 %% descriptorprocesspsbt "psbt" [descriptors] ( sighashtype bip32derivs finalize )
-%% Invalid descriptors are -5 (EvalDescriptorStringOrObject). Without a
-%% resolvable UTXO the PSBT cannot be signed, so complete=false.
-rpc_descriptorprocesspsbt([PsbtB64, Descs | _Rest])
+%%
+%% Core: rawtransaction.cpp::descriptorprocesspsbt + ProcessPSBT.
+%% Invalid descriptors are -5 (EvalDescriptorStringOrObject). bip32derivs
+%% defaults true and attaches PSBT_OUT_BIP32_DERIVATION (fingerprint =
+%% HASH160(pubkey)[0..4], empty path) on outputs whose scriptPubKey the
+%% descriptor solves. Without a resolvable UTXO the PSBT cannot be signed,
+%% so complete=false — the T2 update-exact probe is this case.
+rpc_descriptorprocesspsbt([PsbtB64, Descs | Rest])
   when is_binary(PsbtB64), is_list(Descs) ->
     case decode_psbt_rpc(PsbtB64) of
         {error, _, _} = Err ->
@@ -13059,9 +13070,19 @@ rpc_descriptorprocesspsbt([PsbtB64, Descs | _Rest])
             case parse_psbt_descriptors(Descs) of
                 {error, _, _} = Err ->
                     Err;
-                ok ->
+                {ok, Parsed} ->
+                    Bip32 = case nth_param(Rest, 1) of
+                                B when is_boolean(B) -> B;
+                                _ -> true
+                            end,
+                    Updated = case Bip32 of
+                                  true ->
+                                      attach_descriptor_bip32(Psbt, Parsed);
+                                  false ->
+                                      Psbt
+                              end,
                     {ok, #{<<"psbt">> =>
-                               base64:encode(beamchain_psbt:encode(Psbt)),
+                               base64:encode(beamchain_psbt:encode(Updated)),
                            <<"complete">> => false}}
             end
     end;
@@ -13070,26 +13091,78 @@ rpc_descriptorprocesspsbt(_) ->
      <<"descriptorprocesspsbt \"psbt\" [\"descriptor\",...] "
        "( sighashtype bip32derivs finalize )">>}.
 
-parse_psbt_descriptors([]) ->
-    ok;
-parse_psbt_descriptors([D | Rest]) when is_binary(D) ->
+parse_psbt_descriptors(Descs) ->
+    parse_psbt_descriptors(Descs, []).
+
+parse_psbt_descriptors([], Acc) ->
+    {ok, lists:reverse(Acc)};
+parse_psbt_descriptors([D | Rest], Acc) when is_binary(D) ->
     case beamchain_descriptor:parse(D) of
-        {ok, _} ->
-            parse_psbt_descriptors(Rest);
+        {ok, Parsed} ->
+            parse_psbt_descriptors(Rest, [Parsed | Acc]);
+        {error, {unknown_descriptor_type, _}} ->
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+             iolist_to_binary(
+               io_lib:format("'~s' is not a valid descriptor function", [D]))};
         {error, _} ->
             {error, ?RPC_INVALID_ADDRESS_OR_KEY, <<"Invalid descriptor">>}
     end;
-parse_psbt_descriptors([M | Rest]) when is_map(M) ->
+parse_psbt_descriptors([M | Rest], Acc) when is_map(M) ->
     case maps:get(<<"desc">>, M, undefined) of
         D when is_binary(D) ->
-            parse_psbt_descriptors([D | Rest]);
+            parse_psbt_descriptors([D | Rest], Acc);
         _ ->
             {error, ?RPC_INVALID_PARAMETER,
              <<"Descriptor needs to be provided in scan object">>}
     end;
-parse_psbt_descriptors(_) ->
+parse_psbt_descriptors(_, _) ->
     {error, ?RPC_INVALID_PARAMETER,
      <<"Scan object needs to be either a string or an object">>}.
+
+%% Attach BIP32 derivation on outputs the descriptor solves. Mirrors
+%% nimrod handleDescriptorProcessPsbt / Core ProcessPSBT with
+%% bip32derivs=true and hide_secret=false: fingerprint is the first four
+%% bytes of HASH160(pubkey) and the path is empty for a raw (non-HD) key.
+attach_descriptor_bip32(Psbt, Descs) ->
+    Tx = beamchain_psbt:get_unsigned_tx(Psbt),
+    Outputs = Tx#transaction.outputs,
+    lists:foldl(
+      fun(Desc, AccPsbt) ->
+              case beamchain_descriptor:solved_pubkeys(Desc) of
+                  {ok, Pairs} ->
+                      lists:foldl(
+                        fun({PK, Script}, P) ->
+                                attach_bip32_matching_outputs(
+                                  P, Outputs, 0, PK, Script)
+                        end,
+                        AccPsbt, Pairs);
+                  _ ->
+                      AccPsbt
+              end
+      end,
+      Psbt, Descs).
+
+attach_bip32_matching_outputs(Psbt, [], _I, _PK, _Script) ->
+    Psbt;
+attach_bip32_matching_outputs(Psbt, [#tx_out{script_pubkey = SPK} | Rest],
+                              I, PK, Script) ->
+    NewPsbt =
+        case SPK =:= Script of
+            true ->
+                OutMap0 = case beamchain_psbt:get_output(Psbt, I) of
+                              undefined -> #{};
+                              M -> M
+                          end,
+                Derivs = maps:get(bip32_derivation, OutMap0, #{}),
+                Hash = beamchain_crypto:hash160(PK),
+                FP = binary:part(Hash, 0, 4),
+                beamchain_psbt:set_output(
+                  Psbt, I,
+                  OutMap0#{bip32_derivation => Derivs#{PK => {FP, []}}});
+            false ->
+                Psbt
+        end,
+    attach_bip32_matching_outputs(NewPsbt, Rest, I + 1, PK, Script).
 
 %% Build the analyzepsbt response object. Pure function, exposed via
 %% rpc_analyzepsbt; no side effects so eunit can call it directly.

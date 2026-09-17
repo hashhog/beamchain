@@ -14,6 +14,13 @@
 %% repo's deploy step moves binaries around: camlcoin shipped exactly this
 %% check on 2026-08-31 reading its table from a relative path, and it silently
 %% did nothing in production while every test passed.
+%%
+%% HAND PATCH: descriptorprocesspsbt is {2, 5}, not the generator's {4, 7}.
+%% tools/core-arity.py splits on the space in `n or [n,n]` inside the
+%% descriptors-array token of Core's help line, so it counts four required
+%% arguments. Core's RPCHelpMan (rawtransaction.cpp:1997-2014) is 2 required
+%% (psbt, descriptors) and 5 declared. Live Core on :8332 accepts n=2..5 and
+%% rejects n=1 and n=6 with -1. Do not restore {4, 7}.
 -module(beamchain_core_arity).
 -export([table/0, lookup/1]).
 
@@ -33,7 +40,7 @@ table() ->
       <<"decoderawtransaction">> => {1, 2},
       <<"decodescript">> => {1, 1},
       <<"deriveaddresses">> => {1, 2},
-      <<"descriptorprocesspsbt">> => {4, 7},
+      <<"descriptorprocesspsbt">> => {2, 5},
       <<"disconnectnode">> => {0, 2},
       <<"estimatesmartfee">> => {1, 2},
       <<"finalizepsbt">> => {1, 2},

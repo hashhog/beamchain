@@ -16,6 +16,12 @@
 -define(PSBT_A,
         <<"cHNidP8BAFICAAAAAaqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqAAAAAAD9"
           "////AaCGAQAAAAAAFgAUdR526BmRltRUlBxF0bOjI/FDO9YAAAAAAAAA">>).
+%% Core descriptorprocesspsbt(?PSBT_A, [wpkh(WIF-key-1)]) — ProcessPSBT
+%% attached PSBT_OUT_BIP32_DERIVATION on the matching wpkh output.
+-define(PSBT_A_WP1_DERIV,
+        <<"cHNidP8BAFICAAAAAaqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqAAAAAAD9"
+          "////AaCGAQAAAAAAFgAUdR526BmRltRUlBxF0bOjI/FDO9YAAAAAAAAiAgJ5vmZ++d"
+          "y7rFWgYpXOhwsHApv82y3OKNlZ8oFbFvgXmAR1HnboAA==">>).
 -define(RAW_HEX,
         <<"0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
           "aaaaaaaa0000000000fdffffff01a086010000000000160014751e76e8199196d4"
@@ -39,6 +45,22 @@ rpc(Method, Params) ->
     try beamchain_rpc:handle_method(Method, Params, undefined)
     catch
         throw:{rpc_error, Code, Msg} -> {error, Code, Msg}
+    end.
+
+%% Production path: arity gate then handle_method. The live r5_probe
+%% talks JSON-RPC, so a handler that is correct but hidden behind a
+%% wrong {Required,Declared} cannot pass these.
+dispatch_rpc(Method, Params) ->
+    case beamchain_rpc:dispatch(
+           #{<<"jsonrpc">> => <<"1.0">>,
+             <<"id">> => <<"t2">>,
+             <<"method">> => Method,
+             <<"params">> => Params},
+           undefined) of
+        #{<<"error">> := null, <<"result">> := Result} ->
+            {ok, Result};
+        #{<<"error">> := #{<<"code">> := Code, <<"message">> := Msg}} ->
+            {error, Code, Msg}
     end.
 
 %%% ===================================================================
@@ -196,6 +218,16 @@ finalizepsbt_incomplete_exact_matches_core_test() ->
     ?assertEqual(false, maps:is_key(<<"error">>, Map)),
     ?assertEqual(false, maps:is_key(<<"hex">>, Map)).
 
+%% r5-probes.d/rawtx-psbt.jsonl bad-base64. Live FAIL was
+%% error code -1 != Core's -22 because OTP 27 throws missing_padding
+%% and the catch-all mapped that to RPC_MISC_ERROR.
+finalizepsbt_bad_base64_is_minus22_test() ->
+    Res = rpc(<<"finalizepsbt">>, [<<"notbase64!!">>]),
+    ?assertMatch({error, -22, _}, Res),
+    {error, -22, Msg} = Res,
+    ?assertEqual(<<"TX decode failed invalid base64">>, Msg),
+    ?assertEqual(Res, dispatch_rpc(<<"finalizepsbt">>, [<<"notbase64!!">>])).
+
 %%% ===================================================================
 %%% utxoupdatepsbt / descriptorprocesspsbt / signrawtransactionwithkey
 %%% ===================================================================
@@ -213,16 +245,25 @@ utxoupdatepsbt_unknown_inputs_passthrough_is_psbt_string_test() ->
 descriptorprocesspsbt_bad_descriptor_is_minus5_test() ->
     Res = rpc(<<"descriptorprocesspsbt">>,
               [?PSBT_A, [<<"nonsense(desc)">>]]),
-    ?assertMatch({error, -5, _}, Res).
+    ?assertMatch({error, -5, _}, Res),
+    {error, -5, Msg} = Res,
+    ?assertEqual(
+       <<"'nonsense(desc)' is not a valid descriptor function">>, Msg),
+    %% Live FAIL was -1 "Wrong number of arguments": the arity table
+    %% required 4 args so dispatch never reached the -5 handler.
+    ?assertEqual(Res, dispatch_rpc(<<"descriptorprocesspsbt">>,
+                                   [?PSBT_A, [<<"nonsense(desc)">>]])).
 
+%% r5-probes.d/rawtx-psbt.jsonl update-exact. Core ProcessPSBT with
+%% bip32derivs=true attaches PSBT_OUT_BIP32_DERIVATION on the wpkh
+%% output (WIF key 1 / G compressed, fingerprint HASH160[0..4]).
 descriptorprocesspsbt_update_unknown_input_complete_false_test() ->
-    Res = rpc(<<"descriptorprocesspsbt">>,
-              [?PSBT_A, [<<"wpkh(", ?WIF_PRIV1/binary, ")">>]]),
-    ?assertMatch({ok, _}, Res),
-    {ok, Map} = Res,
-    ?assertEqual(false, maps:get(<<"complete">>, Map)),
-    Psbt = maps:get(<<"psbt">>, Map),
-    ?assertEqual(<<"cHNidP8">>, binary:part(Psbt, 0, 7)).
+    Params = [?PSBT_A, [<<"wpkh(", ?WIF_PRIV1/binary, ")">>]],
+    Res = rpc(<<"descriptorprocesspsbt">>, Params),
+    ?assertEqual({ok, #{<<"psbt">> => ?PSBT_A_WP1_DERIV,
+                        <<"complete">> => false}},
+                 Res),
+    ?assertEqual(Res, dispatch_rpc(<<"descriptorprocesspsbt">>, Params)).
 
 signrawtransactionwithkey_bad_privkey_is_minus5_test() ->
     Res = rpc(<<"signrawtransactionwithkey">>, [?RAW_HEX, [<<"notakey">>]]),

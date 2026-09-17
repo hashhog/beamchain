@@ -18,6 +18,7 @@
 -export([parse/1, parse/2,
          derive/2, derive/3,
          expand/2, expand/3,
+         solved_pubkeys/1,
          checksum/1,
          add_checksum/1,
          verify_checksum/1]).
@@ -143,6 +144,36 @@ expand(Desc, {Start, End}, Network) when Start =< End ->
         throw:{derive_error, Idx, Reason} ->
             {error, {derive_failed, Idx, Reason}}
     end.
+
+%% @doc Pubkeys the descriptor solves at index 0, paired with the
+%% scriptPubKey they produce. Used by descriptorprocesspsbt to attach
+%% PSBT_OUT_BIP32_DERIVATION on matching outputs (Core ProcessPSBT,
+%% bip32derivs default true).
+-spec solved_pubkeys(tuple()) ->
+          {ok, [{binary(), binary()}]} | {error, term()}.
+solved_pubkeys(Desc) ->
+    case derive_key(Desc, 0) of
+        {ok, Derived} ->
+            case script_from_desc(Derived, mainnet) of
+                {ok, Script} ->
+                    {ok, [{PK, Script} || PK <- collect_pubkeys(Derived)]};
+                {error, _} = Err ->
+                    Err
+            end;
+        {error, _} = Err ->
+            Err
+    end.
+
+collect_pubkeys(#desc_pk{key = Key}) -> [get_pubkey(Key)];
+collect_pubkeys(#desc_pkh{key = Key}) -> [get_pubkey(Key)];
+collect_pubkeys(#desc_wpkh{key = Key}) -> [get_pubkey(Key)];
+collect_pubkeys(#desc_combo{key = Key}) -> [get_pubkey(Key)];
+collect_pubkeys(#desc_rawtr{key = Key}) -> [get_pubkey(Key)];
+collect_pubkeys(#desc_tr{internal_key = Key}) -> [get_pubkey(Key)];
+collect_pubkeys(#desc_multi{keys = Keys}) -> [get_pubkey(K) || K <- Keys];
+collect_pubkeys(#desc_sh{inner = Inner}) -> collect_pubkeys(Inner);
+collect_pubkeys(#desc_wsh{inner = Inner}) -> collect_pubkeys(Inner);
+collect_pubkeys(_) -> [].
 
 %% @doc Compute the checksum for a descriptor string.
 -spec checksum(string() | binary()) -> string().

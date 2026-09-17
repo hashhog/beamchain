@@ -101,3 +101,17 @@ control_named_params_are_exempt_test() ->
     %% Core resolves a named-argument object by name, not by position.
     ?assertNot(beamchain_rpc:core_arity_violation(
                  <<"getblockhash">>, #{<<"height">> => 1})).
+
+%% tools/core-arity.py reports {4,7} because it splits on the space in
+%% `n or [n,n]`. Core's RPCHelpMan is 2 required, 5 declared. The live
+%% r5_probe update-exact / bad-descriptor calls use 2 args.
+descriptorprocesspsbt_arity_matches_core_not_help_parser_test() ->
+    ?assertEqual({ok, {2, 5}},
+                 beamchain_core_arity:lookup(<<"descriptorprocesspsbt">>)),
+    ?assertNot(beamchain_rpc:core_arity_violation(
+                 <<"descriptorprocesspsbt">>, [<<"psbt">>, [<<"d">>]])),
+    ?assert(beamchain_rpc:core_arity_violation(
+              <<"descriptorprocesspsbt">>, [<<"psbt">>])),
+    ?assert(beamchain_rpc:core_arity_violation(
+              <<"descriptorprocesspsbt">>,
+              [<<"psbt">>, [<<"d">>], <<"ALL">>, true, true, extra])).
