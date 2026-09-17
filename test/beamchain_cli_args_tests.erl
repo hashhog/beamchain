@@ -146,3 +146,27 @@ apply_all_pseudo_category_sets_primary_test() ->
     %% Restore.
     logger:set_primary_config(level, Pre),
     ?assertEqual(debug, Mid).
+
+%%% ===================================================================
+%%% -blockfilterindex[=basic]  (R5 regtest-lane launch flag)
+%%% ===================================================================
+
+blockfilterindex_eq_basic_test() ->
+    {start, Opts} = beamchain_cli:parse_args(
+                      ["start", "-blockfilterindex=basic"]),
+    ?assertEqual(1, maps:get(cfilter, Opts)).
+
+blockfilterindex_double_dash_eq_basic_test() ->
+    {start, Opts} = beamchain_cli:parse_args(
+                      ["start", "--blockfilterindex=basic"]),
+    ?assertEqual(1, maps:get(cfilter, Opts)).
+
+blockfilterindex_bare_test() ->
+    {start, Opts} = beamchain_cli:parse_args(
+                      ["start", "-blockfilterindex"]),
+    ?assertEqual(1, maps:get(cfilter, Opts)).
+
+blockfilterindex_eq_zero_test() ->
+    {start, Opts} = beamchain_cli:parse_args(
+                      ["start", "-blockfilterindex=0"]),
+    ?assertEqual(0, maps:get(cfilter, Opts)).

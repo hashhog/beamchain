@@ -68,7 +68,8 @@
 %% Address generation (pure functions)
 -export([pubkey_to_p2wpkh/2,
          pubkey_to_p2tr/2,
-         pubkey_to_p2pkh/2]).
+         pubkey_to_p2pkh/2,
+         pubkey_to_p2sh_p2wpkh/2]).
 
 %% Transaction signing
 -export([sign_transaction/3,
@@ -333,7 +334,7 @@ get_new_address() ->
     get_new_address(p2wpkh).
 
 %% @doc Generate a new receiving address of the given type.
--spec get_new_address(p2wpkh | p2tr | p2pkh) -> {ok, string()}.
+-spec get_new_address(p2wpkh | p2tr | p2pkh | p2sh_p2wpkh) -> {ok, string()}.
 get_new_address(Type) ->
     gen_server:call(?SERVER, {get_new_address, Type}).
 
@@ -342,7 +343,7 @@ get_new_address(Type) ->
 get_change_address() ->
     get_change_address(p2wpkh).
 
--spec get_change_address(p2wpkh | p2tr | p2pkh) -> {ok, string()}.
+-spec get_change_address(p2wpkh | p2tr | p2pkh | p2sh_p2wpkh) -> {ok, string()}.
 get_change_address(Type) ->
     gen_server:call(?SERVER, {get_change_address, Type}).
 
@@ -460,12 +461,14 @@ list_locked_coins(Pid) when is_pid(Pid) ->
 %%% ===================================================================
 
 %% @doc Get a new address from a specific wallet.
--spec get_new_address(pid(), p2wpkh | p2tr | p2pkh) -> {ok, string()} | {error, term()}.
+-spec get_new_address(pid(), p2wpkh | p2tr | p2pkh | p2sh_p2wpkh) ->
+          {ok, string()} | {error, term()}.
 get_new_address(Pid, Type) when is_pid(Pid) ->
     gen_server:call(Pid, {get_new_address, Type}).
 
 %% @doc Get a change address from a specific wallet.
--spec get_change_address(pid(), p2wpkh | p2tr | p2pkh) -> {ok, string()} | {error, term()}.
+-spec get_change_address(pid(), p2wpkh | p2tr | p2pkh | p2sh_p2wpkh) ->
+          {ok, string()} | {error, term()}.
 get_change_address(Pid, Type) when is_pid(Pid) ->
     gen_server:call(Pid, {get_change_address, Type}).
 
@@ -1177,14 +1180,17 @@ generate_address(Type, Direction, State) ->
 
 purpose_for_type(p2wpkh) -> 84 + ?HARDENED;
 purpose_for_type(p2tr)   -> 86 + ?HARDENED;
-purpose_for_type(p2pkh)  -> 44 + ?HARDENED.
+purpose_for_type(p2pkh)  -> 44 + ?HARDENED;
+purpose_for_type(p2sh_p2wpkh) -> 49 + ?HARDENED.
 
 make_address(p2wpkh, PubKey, Network) ->
     pubkey_to_p2wpkh(PubKey, Network);
 make_address(p2tr, PubKey, Network) ->
     pubkey_to_p2tr(PubKey, Network);
 make_address(p2pkh, PubKey, Network) ->
-    pubkey_to_p2pkh(PubKey, Network).
+    pubkey_to_p2pkh(PubKey, Network);
+make_address(p2sh_p2wpkh, PubKey, Network) ->
+    pubkey_to_p2sh_p2wpkh(PubKey, Network).
 
 format_path(Indices) ->
     Parts = lists:map(fun(I) ->
@@ -1233,6 +1239,19 @@ pubkey_to_p2pkh(PubKey, Network) when byte_size(PubKey) =:= 33 ->
         _       -> 16#6f
     end,
     beamchain_address:base58check_encode(Version, Hash).
+
+%% @doc Generate a P2SH-P2WPKH (nested SegWit) address. BIP-49.
+%% Redeem script is OP_0 <20-byte HASH160(pubkey)>; address is P2SH of that.
+-spec pubkey_to_p2sh_p2wpkh(binary(), atom()) -> string().
+pubkey_to_p2sh_p2wpkh(PubKey, Network) when byte_size(PubKey) =:= 33 ->
+    PkHash = beamchain_crypto:hash160(PubKey),
+    RedeemScript = <<16#00, 16#14, PkHash/binary>>,
+    ScriptHash = beamchain_crypto:hash160(RedeemScript),
+    Version = case Network of
+        mainnet -> 16#05;
+        _       -> 16#c4
+    end,
+    beamchain_address:base58check_encode(Version, ScriptHash).
 
 bech32_hrp(mainnet)  -> "bc";
 bech32_hrp(testnet)  -> "tb";

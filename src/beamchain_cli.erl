@@ -290,6 +290,23 @@ parse_args(["--cfilter", Value | Rest], Cmd, Opts) ->
     parse_args(Rest, Cmd, Opts#{cfilter => parse_cfilter_arg(Value)});
 parse_args(["--cfilter=" ++ Value | Rest], Cmd, Opts) ->
     parse_args(Rest, Cmd, Opts#{cfilter => parse_cfilter_arg(Value)});
+%% Core-shaped alias used by tools/regtest-harness.sh --r5-lane
+%% (`-blockfilterindex=basic`). Without this the unknown-option clause
+%% halt(1)s and the node never boots on the R5 regtest lane.
+parse_args(["-blockfilterindex=" ++ Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{cfilter => parse_blockfilterindex_arg(Value)});
+parse_args(["--blockfilterindex=" ++ Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{cfilter => parse_blockfilterindex_arg(Value)});
+parse_args(["-blockfilterindex", Value | Rest], Cmd, Opts)
+  when is_list(Value), Value =/= [], hd(Value) =/= $- ->
+    parse_args(Rest, Cmd, Opts#{cfilter => parse_blockfilterindex_arg(Value)});
+parse_args(["--blockfilterindex", Value | Rest], Cmd, Opts)
+  when is_list(Value), Value =/= [], hd(Value) =/= $- ->
+    parse_args(Rest, Cmd, Opts#{cfilter => parse_blockfilterindex_arg(Value)});
+parse_args(["-blockfilterindex" | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{cfilter => 1});
+parse_args(["--blockfilterindex" | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{cfilter => 1});
 
 %% --coinstatsindex[=0|1]: enable the persistent coinstatsindex (default
 %% off, matching Core -coinstatsindex). Bare --coinstatsindex == on.
@@ -387,6 +404,7 @@ print_usage() ->
         "                    Bitcoin Core's `dumptxoutset`); alias --load-snapshot~n"
         "  --cfilter=<n>     BIP-157/158 compact block filter index~n"
         "                    (0=off, 1=basic; mirrors Core -blockfilterindex)~n"
+        "  -blockfilterindex[=basic]  alias for --cfilter=1 (Core spelling)~n"
         "  --coinstatsindex[=n] per-height UTXO-set commitment index for~n"
         "                    gettxoutsetinfo at historical heights~n"
         "                    (0=off default, 1=on; mirrors Core -coinstatsindex)~n"
@@ -961,6 +979,16 @@ parse_cfilter_arg(Str) ->
                       "warning: --cfilter=~s not an integer; ignoring~n",
                       [Str]),
             undefined
+    end.
+
+%% Core `-blockfilterindex` accepts 0/1/true/false/basic (init.cpp).
+%% `basic` is the only implemented filter type and means "on".
+parse_blockfilterindex_arg(Str) ->
+    case string:lowercase(Str) of
+        "basic" -> 1;
+        "true"  -> 1;
+        "false" -> 0;
+        _       -> parse_cfilter_arg(Str)
     end.
 
 %% Parse a --dbcache MiB value; soft-warn + ignore on a non-positive / garbage

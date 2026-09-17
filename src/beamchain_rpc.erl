@@ -231,6 +231,7 @@
 -define(RPC_TYPE_ERROR, -3).
 -define(RPC_WALLET_ERROR, -4).
 -define(RPC_INVALID_ADDRESS_OR_KEY, -5).
+-define(RPC_WALLET_INSUFFICIENT_FUNDS, -6).
 -define(RPC_INVALID_PARAMETER, -8).
 -define(RPC_DATABASE_ERROR, -20).
 -define(RPC_DESERIALIZATION_ERROR, -22).
@@ -249,6 +250,7 @@
 %% RPC_CLIENT_P2P_DISABLED). EnsureConnman raises this when the connection
 %% manager is unavailable — used by setnetworkactive (NOT -1).
 -define(RPC_CLIENT_P2P_DISABLED, -31).
+-define(RPC_WALLET_NOT_FOUND, -18).
 -define(RPC_WALLET_ALREADY_LOADED, -35).
 -define(RPC_WALLET_ALREADY_EXISTS, -36).
 
@@ -902,7 +904,8 @@ error_obj(Id, Code, Message) ->
 
 %% -- Control --
 handle_method(<<"help">>, Params, _W) -> rpc_help(Params);
-handle_method(<<"stop">>, _, _W) -> rpc_stop();
+handle_method(<<"stop">>, [], _W) -> rpc_stop();
+handle_method(<<"stop">>, P, _W) -> rpc_stop(P);
 handle_method(<<"uptime">>, _, _W) -> rpc_uptime();
 handle_method(<<"logging">>, P, _W) -> rpc_logging(P);
 
@@ -1014,7 +1017,10 @@ handle_method(<<"restorewallet">>, P, _W) -> rpc_restorewallet(P);
 handle_method(<<"loadwallet">>, P, _W) -> rpc_loadwallet(P);
 handle_method(<<"unloadwallet">>, P, _W) -> rpc_unloadwallet(P);
 handle_method(<<"listwallets">>, _, _W) -> rpc_listwallets();
+handle_method(<<"backupwallet">>, P, W) -> rpc_backupwallet(P, W);
 handle_method(<<"getnewaddress">>, P, W) -> rpc_getnewaddress(P, W);
+handle_method(<<"getbalances">>, _, W) -> rpc_getbalances(W);
+handle_method(<<"send">>, P, W) -> rpc_send(P, W);
 handle_method(<<"getrawchangeaddress">>, P, W) -> rpc_getrawchangeaddress(P, W);
 handle_method(<<"getbalance">>, _, W) -> rpc_getbalance(W);
 handle_method(<<"listaddresses">>, _, W) -> rpc_listaddresses(W);
@@ -1205,10 +1211,13 @@ rpc_help_lines() ->
         <<"validateaddress \"address\"">>,
         <<"">>,
         <<"== Wallet ==">>,
-        <<"createwallet ( \"name\" )">>,
+        <<"backupwallet \"destination\"">>,
+        <<"createwallet \"wallet_name\" ( disable_private_keys blank \"passphrase\" avoid_reuse descriptors load_on_startup external_signer )">>,
         <<"dumpprivkey \"address\"">>,
         <<"encryptwallet \"passphrase\"">>,
+        <<"getaddressinfo \"address\"">>,
         <<"getbalance">>,
+        <<"getbalances">>,
         <<"getnewaddress ( \"label\" \"address_type\" )">>,
         <<"getrawchangeaddress ( \"address_type\" )">>,
         <<"gettransaction \"txid\" ( include_watchonly verbose )">>,
@@ -1226,6 +1235,8 @@ rpc_help_lines() ->
         <<"listdescriptors ( private )">>,
         <<"importprivkey \"privkey\" ( \"label\" rescan )">>,
         <<"rescanblockchain ( start_height stop_height )">>,
+        <<"restorewallet \"wallet_name\" \"backup_file\" ( load_on_startup )">>,
+        <<"send [{\"address\":amount},...] ( conf_target \"estimate_mode\" fee_rate options )">>,
         <<"sendtoaddress \"address\" amount ( \"comment\" )">>,
         <<"signrawtransactionwithkey \"hexstring\" [\"privatekey\",...] ( [{\"txid\":\"hex\",\"vout\":n,\"scriptPubKey\":\"hex\",\"redeemScript\":\"hex\",\"witnessScript\":\"hex\",\"amount\":n},...] \"sighashtype\" )">>,
         <<"signrawtransactionwithwallet \"hexstring\" ( [{\"txid\":\"hex\",\"vout\":n,\"scriptPubKey\":\"hex\"},...] )">>,
@@ -1251,11 +1262,22 @@ rpc_help_command(_Command) ->
     {ok, <<"No detailed help available for this command yet">>}.
 
 rpc_stop() ->
+    rpc_stop([]).
+rpc_stop([]) ->
     spawn(fun() ->
         timer:sleep(200),
         init:stop()
     end),
-    {ok, <<"Beamchain server stopping">>}.
+    {ok, <<"Beamchain server stopping">>};
+rpc_stop([Wait]) when is_integer(Wait); is_float(Wait) ->
+    %% Core rpc/server.cpp stop() optional `wait` NUM. Type is checked
+    %% before anything happens — a string must not shut the node down.
+    rpc_stop([]);
+rpc_stop([_]) ->
+    {error, ?RPC_TYPE_ERROR,
+     <<"JSON value of type str is not of expected type num">>};
+rpc_stop(_) ->
+    {error, ?RPC_MISC_ERROR, <<"stop ( wait )">>}.
 
 rpc_uptime() ->
     StartTime = gen_server:call(?SERVER, get_start_time),
@@ -9346,7 +9368,12 @@ format_mempool_entry(_) ->
 %% Response: {"name": ..., "warnings": [...]} (warnings only when
 %% non-empty — the modern array shape, not the deprecated "warning").
 rpc_createwallet([]) ->
-    rpc_createwallet([<<>>]);  %% Default wallet name
+    %% Core requires wallet_name (RPCHelpMan, wallet.cpp). Empty args
+    %% are HelpResult → -1, not a silent default wallet.
+    {error, ?RPC_MISC_ERROR,
+     <<"createwallet \"wallet_name\" ( disable_private_keys blank "
+       "\"passphrase\" avoid_reuse descriptors load_on_startup "
+       "external_signer )">>};
 rpc_createwallet(Params) when is_list(Params), length(Params) =< 8 ->
     [Name, Dpk, Blank, Pass, AvoidReuse, Descriptors, _LoadOnStartup,
      ExtSigner] = pad_createwallet_args(Params),
@@ -9409,15 +9436,17 @@ rpc_createwallet_opts(_Name, true, _Blank, Pass, _HasPass, _AvoidReuse,
        "with private keys disabled.">>};
 rpc_createwallet_opts(Name, Dpk, Blank, Pass, HasPass, AvoidReuse,
                       _Descriptors, _ExtSigner) ->
-    %% -36: a named wallet whose file already exists on disk must not be
-    %% silently overwritten (Core HandleWalletError FAILED_ALREADY_EXISTS).
+    %% createwallet on an existing name is -4, not -36. MakeWalletDatabase
+    %% sets FAILED_ALREADY_EXISTS, but CreateWallet then overwrites status
+    %% with FAILED_VERIFY ("Wallet file verification failed."), and
+    %% HandleWalletError's default arm maps that to RPC_WALLET_ERROR.
+    %% -36 survives only on restorewallet (wallet.cpp RestoreWallet).
     AlreadyOnDisk = Name =/= <<>> andalso
         filelib:is_regular(beamchain_wallet_sup:wallet_file_path(Name)),
     case AlreadyOnDisk of
         true ->
-            {error, ?RPC_WALLET_ALREADY_EXISTS,
-             iolist_to_binary(io_lib:format(
-                 "Wallet \"~s\" already exists.", [Name]))};
+            {error, ?RPC_WALLET_ERROR,
+             <<"Wallet file verification failed.">>};
         false ->
             Warnings = case HasPass andalso Pass =:= <<>> of
                 true ->
@@ -9453,62 +9482,91 @@ rpc_createwallet_opts(Name, Dpk, Blank, Pass, HasPass, AvoidReuse,
             end
     end.
 
-%% @doc Restore a wallet from a BIP-39 mnemonic (seed-only recovery).
-%% restorewallet "name" "mnemonic" ( "passphrase" )
-%% The mnemonic may be a space-separated string or a JSON array of words.
-%% This is the seed-only recovery entry point: restoring the same mnemonic
-%% deterministically reconstructs the identical keypool and addresses, so a
-%% subsequent scantxoutset rediscovers all funds.
-rpc_restorewallet([Name, Mnemonic]) ->
-    rpc_restorewallet([Name, Mnemonic, <<>>]);
-rpc_restorewallet([Name, Mnemonic, Passphrase])
-  when is_binary(Name), is_binary(Passphrase) ->
-    Words = case Mnemonic of
-        M when is_binary(M) ->
-            [W || W <- binary:split(M, [<<" ">>], [global]), W =/= <<>>];
-        L when is_list(L) ->
-            [ensure_bin(W) || W <- L]
-    end,
-    case beamchain_wallet_sup:restore_wallet(Name, Words, Passphrase) of
-        {ok, _Pid} ->
-            WalletName = case Name of <<>> -> <<"default">>; _ -> Name end,
-            {ok, #{<<"name">> => WalletName, <<"warning">> => <<>>}};
-        {error, wallet_already_loaded} ->
-            {error, ?RPC_MISC_ERROR, <<"Wallet already loaded">>};
-        {error, bad_checksum} ->
-            {error, ?RPC_INVALID_PARAMS, <<"Invalid mnemonic checksum">>};
-        {error, Reason} ->
-            {error, ?RPC_MISC_ERROR, iolist_to_binary(
-                io_lib:format("Failed to restore wallet: ~p", [Reason]))}
+%% @doc Restore and load a wallet from a backup file.
+%% restorewallet "wallet_name" "backup_file" ( load_on_startup )
+%% Mirrors bitcoin-core/src/wallet/rpc/backup.cpp RestoreWallet:
+%%   missing backup → FAILED_INVALID_BACKUP_FILE → -8
+%%   dest already exists → FAILED_ALREADY_EXISTS → -36
+rpc_restorewallet([Name, Backup]) ->
+    rpc_restorewallet([Name, Backup, null]);
+rpc_restorewallet([Name, Backup, _LoadOnStartup])
+  when is_binary(Name), is_binary(Backup) ->
+    BackupPath = binary_to_list(Backup),
+    case filelib:is_regular(BackupPath) of
+        false ->
+            {error, ?RPC_INVALID_PARAMETER, <<"Backup file does not exist">>};
+        true ->
+            Dest = beamchain_wallet_sup:wallet_file_path(Name),
+            Already = filelib:is_regular(Dest) orelse
+                (beamchain_wallet_sup:get_wallet(Name) =/= {error, wallet_not_found}),
+            case Already of
+                true ->
+                    {error, ?RPC_WALLET_ALREADY_EXISTS,
+                     iolist_to_binary(io_lib:format(
+                         "Failed to restore wallet. Database file exists.",
+                         []))};
+                false ->
+                    ok = filelib:ensure_dir(Dest),
+                    case file:copy(BackupPath, Dest) of
+                        {ok, _} ->
+                            case beamchain_wallet_sup:load_wallet(Name) of
+                                {ok, _Pid} ->
+                                    Display = case Name of
+                                        <<>> -> <<"default">>;
+                                        _    -> Name
+                                    end,
+                                    {ok, [{<<"name">>, Display}]};
+                                {error, Reason} ->
+                                    _ = file:delete(Dest),
+                                    {error, ?RPC_WALLET_ERROR,
+                                     iolist_to_binary(io_lib:format(
+                                         "Failed to restore wallet: ~p",
+                                         [Reason]))}
+                            end;
+                        {error, _} ->
+                            {error, ?RPC_WALLET_ERROR,
+                             <<"Error: Wallet restore failed!">>}
+                    end
+            end
     end;
 rpc_restorewallet(_) ->
-    {error, ?RPC_INVALID_PARAMS,
-     <<"restorewallet \"name\" \"mnemonic\" ( \"passphrase\" )">>}.
-
-ensure_bin(B) when is_binary(B) -> B;
-ensure_bin(L) when is_list(L)   -> list_to_binary(L).
+    {error, ?RPC_MISC_ERROR,
+     <<"restorewallet \"wallet_name\" \"backup_file\" ( load_on_startup )">>}.
 
 %% @doc Load a wallet from file.
 %% loadwallet "name" - Loads wallet with the given name.
 rpc_loadwallet([Name]) when is_binary(Name) ->
-    case beamchain_wallet_sup:load_wallet(Name) of
+    case beamchain_wallet_sup:get_wallet(Name) of
         {ok, _Pid} ->
-            WalletName = case Name of
-                <<>> -> <<"default">>;
-                _ -> Name
-            end,
-            {ok, #{
-                <<"name">> => WalletName,
-                <<"warning">> => <<>>
-            }};
-        {error, wallet_already_loaded} ->
-            {error, ?RPC_MISC_ERROR, <<"Wallet already loaded">>};
-        {error, Reason} ->
-            {error, ?RPC_MISC_ERROR, iolist_to_binary(
-                io_lib:format("Failed to load wallet: ~p", [Reason]))}
+            {error, ?RPC_WALLET_ALREADY_LOADED,
+             iolist_to_binary(io_lib:format(
+                 "Wallet \"~s\" is already loaded.", [Name]))};
+        {error, wallet_not_found} ->
+            case filelib:is_regular(beamchain_wallet_sup:wallet_file_path(Name)) of
+                false ->
+                    {error, ?RPC_WALLET_NOT_FOUND,
+                     <<"Wallet file verification failed.">>};
+                true ->
+                    case beamchain_wallet_sup:load_wallet(Name) of
+                        {ok, _Pid} ->
+                            WalletName = case Name of
+                                <<>> -> <<"default">>;
+                                _ -> Name
+                            end,
+                            {ok, [{<<"name">>, WalletName}]};
+                        {error, wallet_already_loaded} ->
+                            {error, ?RPC_WALLET_ALREADY_LOADED,
+                             iolist_to_binary(io_lib:format(
+                                 "Wallet \"~s\" is already loaded.", [Name]))};
+                        {error, Reason} ->
+                            {error, ?RPC_WALLET_ERROR, iolist_to_binary(
+                                io_lib:format("Failed to load wallet: ~p",
+                                              [Reason]))}
+                    end
+            end
     end;
 rpc_loadwallet(_) ->
-    {error, ?RPC_INVALID_PARAMS, <<"loadwallet \"name\"">>}.
+    {error, ?RPC_MISC_ERROR, <<"loadwallet \"name\"">>}.
 
 %% @doc Unload a wallet.
 %% unloadwallet "name" - Unloads the wallet with the given name.
@@ -9521,18 +9579,17 @@ rpc_unloadwallet([Name]) when is_binary(Name) ->
                 <<>> -> <<"default">>;
                 _ -> Name
             end,
-            {ok, #{
-                <<"name">> => WalletName,
-                <<"warning">> => <<>>
-            }};
+            {ok, [{<<"name">>, WalletName}]};
         {error, wallet_not_found} ->
-            {error, ?RPC_MISC_ERROR, <<"Wallet not found">>};
+            {error, ?RPC_WALLET_NOT_FOUND,
+             iolist_to_binary(io_lib:format(
+                 "Requested wallet does not exist or is not loaded", []))};
         {error, Reason} ->
-            {error, ?RPC_MISC_ERROR, iolist_to_binary(
+            {error, ?RPC_WALLET_ERROR, iolist_to_binary(
                 io_lib:format("Failed to unload wallet: ~p", [Reason]))}
     end;
 rpc_unloadwallet(_) ->
-    {error, ?RPC_INVALID_PARAMS, <<"unloadwallet ( \"name\" )">>}.
+    {error, ?RPC_MISC_ERROR, <<"unloadwallet ( \"name\" )">>}.
 
 %% @doc List all loaded wallets.
 rpc_listwallets() ->
@@ -9540,27 +9597,198 @@ rpc_listwallets() ->
     DisplayNames = [case N of <<>> -> <<"default">>; _ -> N end || N <- Names],
     {ok, DisplayNames}.
 
-%% @doc Get a new address from the specified wallet.
-rpc_getnewaddress(Params, WalletName) ->
+%% @doc getbalances — Core wallet/rpc/coins.cpp.
+%% Returns mine.{trusted, untrusted_pending, immature} plus
+%% lastprocessedblock. Confirmed non-immature coins are trusted;
+%% mempool (0-conf) coins are untrusted_pending; immature coinbase is
+%% immature.
+rpc_getbalances(WalletName) ->
+    case resolve_wallet(WalletName) of
+        {ok, _Pid} ->
+            TipH = case catch beamchain_chainstate:get_tip_height() of
+                {ok, H} -> H;
+                _ -> 0
+            end,
+            {Trusted, Pending, Immature} =
+                lists:foldl(
+                  fun({_Txid, _Vout, U}, {T, P, I}) ->
+                      Confs = TipH - U#utxo.height + 1,
+                      Imm = U#utxo.is_coinbase andalso
+                          (TipH - U#utxo.height) < ?COINBASE_MATURITY,
+                      V = U#utxo.value,
+                      case {Imm, Confs >= 1} of
+                          {true, _} -> {T, P, I + V};
+                          {false, true} -> {T + V, P, I};
+                          {false, false} -> {T, P + V, I}
+                      end
+                  end, {0, 0, 0}, beamchain_wallet:get_wallet_utxos()),
+            Map = #{
+                <<"mine">> => #{
+                    <<"trusted">> => format_amount_sentinel(Trusted),
+                    <<"untrusted_pending">> => format_amount_sentinel(Pending),
+                    <<"immature">> => format_amount_sentinel(Immature)
+                },
+                <<"lastprocessedblock">> => lastprocessedblock_obj()
+            },
+            {ok_raw_json, replace_btc_sentinels(jsx:encode(Map))};
+        {error, _} ->
+            wallet_not_found_error(WalletName)
+    end.
+
+%% @doc backupwallet "destination" — Core wallet/rpc/backup.cpp.
+%% Copies the current wallet file. Returns JSON null. Missing parent
+%% directory (or any copy failure) is RPC_WALLET_ERROR (-4).
+rpc_backupwallet([Dest], WalletName) when is_binary(Dest) ->
     case resolve_wallet(WalletName) of
         {ok, Pid} ->
-            {_Label, Type} = parse_getnewaddress_params(Params),
-            AddrType = address_type_from_rpc(Type),
-            case beamchain_wallet:get_new_address(Pid, AddrType) of
-                {ok, Address} ->
-                    {ok, iolist_to_binary(Address)};
-                {error, no_wallet} ->
-                    {error, ?RPC_MISC_ERROR, <<"No wallet loaded">>};
-                {error, private_keys_disabled} ->
-                    %% Core: getnewaddress on a disable_private_keys wallet.
+            case beamchain_wallet:get_wallet_info(Pid) of
+                {ok, Info} ->
+                    Src = maps:get(wallet_file, Info, undefined),
+                    copy_wallet_backup(Src, binary_to_list(Dest));
+                {error, _} ->
                     {error, ?RPC_WALLET_ERROR,
-                     <<"Error: This wallet has no available keys">>};
-                {error, Reason} ->
-                    {error, ?RPC_MISC_ERROR, iolist_to_binary(
-                        io_lib:format("~p", [Reason]))}
+                     <<"Error: Wallet backup failed!">>}
             end;
         {error, _} ->
             wallet_not_found_error(WalletName)
+    end;
+rpc_backupwallet(_, _) ->
+    {error, ?RPC_MISC_ERROR, <<"backupwallet \"destination\"">>}.
+
+copy_wallet_backup(Src, _Dest)
+  when Src =:= undefined; Src =:= "" ->
+    {error, ?RPC_WALLET_ERROR, <<"Error: Wallet backup failed!">>};
+copy_wallet_backup(Src, Dest) ->
+    case filelib:is_regular(Src) of
+        false ->
+            {error, ?RPC_WALLET_ERROR, <<"Error: Wallet backup failed!">>};
+        true ->
+            Target = case filelib:is_dir(Dest) of
+                true -> filename:join(Dest, filename:basename(Src));
+                false -> Dest
+            end,
+            case filelib:is_dir(filename:dirname(Target)) of
+                false ->
+                    {error, ?RPC_WALLET_ERROR,
+                     <<"Error: Wallet backup failed!">>};
+                true ->
+                    case file:copy(Src, Target) of
+                        {ok, _} -> {ok, null};
+                        {error, _} ->
+                            {error, ?RPC_WALLET_ERROR,
+                             <<"Error: Wallet backup failed!">>}
+                    end
+            end
+    end.
+
+%% @doc send [{"address":amount},...] ( conf_target estimate_mode fee_rate )
+%% Core wallet/rpc/spend.cpp send(). Funds, signs, broadcasts. Returns
+%% {complete: true, txid: ...}.
+rpc_send([Outputs | Rest], WalletName) ->
+    case normalize_send_outputs(Outputs) of
+        {error, Code, Msg} ->
+            {error, Code, Msg};
+        {ok, []} ->
+            {error, ?RPC_INVALID_PARAMETER, <<"No destination specified">>};
+        {ok, OutMaps} ->
+            FeeRate = send_fee_rate(Rest),
+            case resolve_wallet(WalletName) of
+                {ok, Pid} ->
+                    try
+                        do_send(Pid, OutMaps, FeeRate, WalletName)
+                    catch
+                        throw:{send_error, C, M} -> {error, C, M};
+                        throw:{wcfp_error, C, M} -> {error, C, M};
+                        throw:{wpp_error, C, M} -> {error, C, M};
+                        throw:{rpc_error, C, M} -> {error, C, M}
+                    end;
+                {error, _} ->
+                    wallet_not_found_error(WalletName)
+            end
+    end;
+rpc_send(_, _) ->
+    {error, ?RPC_MISC_ERROR,
+     <<"send [{\"address\":amount},...] ( conf_target \"estimate_mode\" "
+       "fee_rate options )">>}.
+
+normalize_send_outputs(List) when is_list(List) ->
+    {ok, [M || M <- List, is_map(M)]};
+normalize_send_outputs(Map) when is_map(Map) ->
+    {ok, [Map]};
+normalize_send_outputs(_) ->
+    {error, ?RPC_TYPE_ERROR, <<"Invalid outputs">>}.
+
+send_fee_rate([_, _, FR | _]) when is_number(FR) -> FR;
+send_fee_rate(_) -> 5.
+
+do_send(Pid, OutMaps, FeeRate, WalletName) ->
+    Options = #{<<"fee_rate">> => FeeRate},
+    case do_walletcreatefundedpsbt(Pid, [], OutMaps, 0, Options) of
+        {ok_raw_json, JsonBin} ->
+            Map = jsx:decode(JsonBin, [return_maps]),
+            Psbt = maps:get(<<"psbt">>, Map),
+            case do_walletprocesspsbt(Pid, Psbt, true, <<"ALL">>, true, true) of
+                {ok, Wpp} ->
+                    case {maps:get(<<"complete">>, Wpp, false),
+                          maps:get(<<"hex">>, Wpp, undefined)} of
+                        {true, Hex} when is_binary(Hex) ->
+                            case rpc_sendrawtransaction([Hex]) of
+                                {ok, Txid} ->
+                                    {ok, #{<<"complete">> => true,
+                                           <<"txid">> => Txid}};
+                                {error, C, M} ->
+                                    {error, C, M}
+                            end;
+                        _ ->
+                            {error, ?RPC_WALLET_ERROR,
+                             <<"Transaction not complete">>}
+                    end;
+                {error, C, M} ->
+                    {error, C, M}
+            end;
+        {ok, #{<<"psbt">> := Psbt}} ->
+            do_send_from_psbt(Pid, Psbt, WalletName);
+        {error, C, M} ->
+            {error, C, M}
+    end.
+
+do_send_from_psbt(Pid, Psbt, _WalletName) ->
+    case do_walletprocesspsbt(Pid, Psbt, true, <<"ALL">>, true, true) of
+        {ok, Wpp} ->
+            case maps:get(<<"hex">>, Wpp, undefined) of
+                Hex when is_binary(Hex) ->
+                    rpc_sendrawtransaction([Hex]);
+                _ ->
+                    {error, ?RPC_WALLET_ERROR, <<"Transaction not complete">>}
+            end;
+        {error, C, M} ->
+            {error, C, M}
+    end.
+
+%% @doc Get a new address from the specified wallet.
+rpc_getnewaddress(Params, WalletName) ->
+    {_Label, Type} = parse_getnewaddress_params(Params),
+    case address_type_from_rpc(Type) of
+        {error, Msg} ->
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY, Msg};
+        AddrType ->
+            case resolve_wallet(WalletName) of
+                {ok, Pid} ->
+                    case beamchain_wallet:get_new_address(Pid, AddrType) of
+                        {ok, Address} ->
+                            {ok, iolist_to_binary(Address)};
+                        {error, no_wallet} ->
+                            {error, ?RPC_MISC_ERROR, <<"No wallet loaded">>};
+                        {error, private_keys_disabled} ->
+                            {error, ?RPC_WALLET_ERROR,
+                             <<"Error: This wallet has no available keys">>};
+                        {error, Reason} ->
+                            {error, ?RPC_MISC_ERROR, iolist_to_binary(
+                                io_lib:format("~p", [Reason]))}
+                    end;
+                {error, _} ->
+                    wallet_not_found_error(WalletName)
+            end
     end.
 
 parse_getnewaddress_params([]) -> {<<>>, <<"bech32">>};
@@ -9577,7 +9805,10 @@ rpc_getrawchangeaddress(Params, WalletName) ->
                 [T] -> T;
                 _ -> <<"bech32">>
             end,
-            AddrType = address_type_from_rpc(Type),
+            AddrType = case address_type_from_rpc(Type) of
+                {error, _} -> p2wpkh;
+                A -> A
+            end,
             case beamchain_wallet:get_change_address(Pid, AddrType) of
                 {ok, Address} ->
                     {ok, iolist_to_binary(Address)};
@@ -9646,6 +9877,7 @@ rpc_getwalletinfo(WalletName) ->
                     end,
                     Encrypted = maps:get(encrypted, Info, false),
                     Locked = maps:get(locked, Info, false),
+                    TxCount = length(beamchain_wallet:get_tx_history()),
                     BaseInfo = #{
                         <<"walletname">> => WalletNameDisplay,
                         <<"walletversion">> => 1,
@@ -9655,15 +9887,18 @@ rpc_getwalletinfo(WalletName) ->
                         <<"balance">> => format_amount_sentinel(Balance),
                         <<"unconfirmed_balance">> => format_amount_sentinel(0),
                         <<"immature_balance">> => format_amount_sentinel(0),
-                        <<"txcount">> => 0,
+                        <<"txcount">> => TxCount,
                         <<"keypoolsize">> => maps:get(addresses, Info, 0),
                         <<"paytxfee">> => format_amount_sentinel(0),
-                        %% Core wallet/rpc/wallet.cpp:98 — false for an
-                        %% enforced watch-only (disable_private_keys) wallet.
                         <<"private_keys_enabled">> =>
                             maps:get(private_keys_enabled, Info, true),
                         <<"avoid_reuse">> => false,
-                        <<"scanning">> => false
+                        <<"scanning">> => false,
+                        <<"descriptors">> => true,
+                        <<"external_signer">> => false,
+                        <<"blank">> => false,
+                        <<"flags">> => [],
+                        <<"lastprocessedblock">> => lastprocessedblock_obj()
                     },
                     InfoWithEncryption = case Encrypted of
                         true ->
@@ -9783,7 +10018,13 @@ getaddressinfo_proplist(Pid, Address, Script) ->
      {<<"ismine">>, IsMine},
      {<<"solvable">>, Solvable}]
     ++ [{<<"desc">>, DescOut} || DescOut =/= undefined]
-    ++ [{<<"parent_desc">>, EntryDesc} || EntryDesc =/= undefined]
+    ++ begin
+           ParentDesc = case EntryDesc of
+               undefined -> DescOut;
+               PD -> PD
+           end,
+           [{<<"parent_desc">>, ParentDesc} || ParentDesc =/= undefined]
+       end
     ++ [{<<"iswatchonly">>, false},      %% deprecated, Core hardcodes false
         {<<"isscript">>, IsScript},
         {<<"iswitness">>, IsWitness}]
@@ -9921,6 +10162,8 @@ rpc_dumpprivkey(_, _WalletName) ->
 %% @doc Resolve wallet name to pid.
 %% For default wallet (<<>> or URL without wallet path), use registered beamchain_wallet.
 %% For named wallets, look up in wallet_sup registry.
+resolve_wallet(undefined) ->
+    resolve_wallet(<<>>);
 resolve_wallet(<<>>) ->
     %% Core parity (wallet/rpc/util.cpp GetWalletForJSONRPCRequest ->
     %% GetDefaultWallet): a request with NO /wallet/<name> URI-path resolves to
@@ -9955,7 +10198,7 @@ resolve_wallet(Name) when is_binary(Name) ->
 wallet_not_found_error(<<>>) ->
     {error, ?RPC_MISC_ERROR, <<"No wallet loaded">>};
 wallet_not_found_error(Name) ->
-    {error, ?RPC_MISC_ERROR, iolist_to_binary(
+    {error, ?RPC_WALLET_NOT_FOUND, iolist_to_binary(
         io_lib:format("Wallet \"~s\" not found", [Name]))}.
 
 %% @doc Send to address (multi-wallet aware).
@@ -9973,7 +10216,10 @@ rpc_sendtoaddress([Address, AmountBtc, _Comment], WalletName) when is_binary(Add
                     {error, ?RPC_WALLET_ERROR,
                      <<"Error: Private keys are disabled for this wallet">>};
                 true ->
-                    rpc_sendtoaddress_spend(Address, AmountBtc, Pid)
+                    try rpc_sendtoaddress_spend(Address, AmountBtc, Pid)
+                    catch
+                        throw:{rpc_error, C, M} -> {error, C, M}
+                    end
             end;
         {error, _} ->
             wallet_not_found_error(WalletName)
@@ -9999,7 +10245,18 @@ cfg_network() ->
     end.
 
 rpc_sendtoaddress_spend(Address, AmountBtc, Pid) ->
-            Amount = btc_to_satoshi(AmountBtc),
+            Network = cfg_network(),
+            case beamchain_address:address_to_script(
+                     binary_to_list(Address), Network) of
+                {ok, _} -> ok;
+                {error, _} ->
+                    throw({rpc_error, ?RPC_INVALID_ADDRESS_OR_KEY,
+                           <<"Invalid Bitcoin address">>})
+            end,
+            Amount = case parse_rpc_amount(AmountBtc) of
+                {ok, Sat} -> Sat;
+                {error, Code, Msg} -> throw({rpc_error, Code, Msg})
+            end,
             %% Get wallet UTXOs for coin selection.  Use the maturity-filtered
             %% spendable set so coin-selection never picks an immature coinbase
             %% (those would be rejected at broadcast with
@@ -10020,7 +10277,6 @@ rpc_sendtoaddress_spend(Address, AmountBtc, Pid) ->
             case beamchain_wallet:select_coins(Amount, FeeRate, Utxos) of
                 {ok, Selected, Change} ->
                     %% Build and sign transaction
-                    Network = beamchain_config:network(),
                     Outputs = [{binary_to_list(Address), Amount}],
                     %% Add change output if needed
                     FinalOutputs = case Change > 546 of  %% Dust threshold
@@ -10090,7 +10346,8 @@ rpc_sendtoaddress_spend(Address, AmountBtc, Pid) ->
                                 io_lib:format("TX build failed: ~p", [Reason]))}
                     end;
                 {error, insufficient_funds} ->
-                    {error, ?RPC_MISC_ERROR, <<"Insufficient funds">>}
+                    {error, ?RPC_WALLET_INSUFFICIENT_FUNDS,
+                     <<"Insufficient funds">>}
             end.
 
 %% W118 BUG-1: real privkey lookup for each input. Walks the selected-coin
@@ -10631,9 +10888,7 @@ do_walletprocesspsbt(Pid, PsbtB64, Sign, SighashStr, _Bip32Derivs, Finalize) ->
                        "TX decode failed: ~p", [R]))})
     end,
     %% Updater + Signer roles per BIP-174.
-    Network = try beamchain_config:network()
-              catch error:badarg -> mainnet  %% eunit fallback (no ETS)
-              end,
+    Network = cfg_network(),
     Tx = beamchain_psbt:get_unsigned_tx(Psbt0),
     Inputs0 = inputs_field(Psbt0),
     NumInputs = length(Tx#transaction.inputs),
@@ -10727,8 +10982,54 @@ wpp_process_input(Pid, Tx, TxIn, InputMap, Idx, Sighash, Sign, AllInputMaps,
                                           Sighash, AllInputMaps, Network)
                     end;
                 error ->
-                    %% No UTXO info — cannot sign, cannot finalize.
-                    {InputMap, false}
+                    %% Core FillPSBT (psbt.cpp): if the PSBT has no
+                    %% witness/non-witness UTXO (createpsbt emits none),
+                    %% look the prevout up in the wallet and the chain
+                    %% UTXO set and attach it (Updater role).
+                    case wpp_lookup_prevout(TxIn) of
+                        {ok, Value, ScriptPubKey} ->
+                            InputMap1 = maps:put(witness_utxo,
+                                                 {Value, ScriptPubKey},
+                                                 InputMap),
+                            Utxo = #utxo{value = Value,
+                                         script_pubkey = ScriptPubKey,
+                                         is_coinbase = false,
+                                         height = 0},
+                            case Sign of
+                                false ->
+                                    {InputMap1, false};
+                                true ->
+                                    wpp_try_sign(Pid, Tx, TxIn, InputMap1,
+                                                  Idx, Utxo, Sighash,
+                                                  AllInputMaps, Network)
+                            end;
+                        error ->
+                            {InputMap, false}
+                    end
+            end
+    end.
+
+%% Look up a prevout in the wallet UTXO ledger, then the chainstate.
+%% Tries both internal and display-order txids: Core createpsbt writes
+%% wire-order outpoints; some callers pass display-order hashes.
+wpp_lookup_prevout(#tx_in{prev_out = #outpoint{hash = Txid, index = Vout}}) ->
+    Rev = beamchain_serialize:reverse_bytes(Txid),
+    wpp_lookup_prevout_ids([Txid, Rev], Vout).
+
+wpp_lookup_prevout_ids([], _Vout) ->
+    error;
+wpp_lookup_prevout_ids([Txid | Rest], Vout) ->
+    WalletHit = [U || {T, V, U} <- beamchain_wallet:get_wallet_utxos(),
+                      T =:= Txid, V =:= Vout],
+    case WalletHit of
+        [U | _] ->
+            {ok, U#utxo.value, U#utxo.script_pubkey};
+        [] ->
+            case catch beamchain_chainstate:get_utxo(Txid, Vout) of
+                {ok, U} ->
+                    {ok, U#utxo.value, U#utxo.script_pubkey};
+                _ ->
+                    wpp_lookup_prevout_ids(Rest, Vout)
             end
     end.
 
@@ -11079,57 +11380,145 @@ pj_normalize_options(Uri, Options) ->
 
 %% @doc List unspent outputs (multi-wallet aware).
 rpc_listunspent(Params, WalletName) ->
-    case resolve_wallet(WalletName) of
-        {ok, _Pid} ->
-            {MinConf, MaxConf} = case Params of
-                [] -> {0, 9999999};
-                [Min, Max] -> {Min, Max};
-                _ -> {0, 9999999}
-            end,
-            Utxos = beamchain_wallet:get_wallet_utxos(),
-            case beamchain_chainstate:get_tip() of
-                {ok, {_, CurrentHeight}} ->
-                    Filtered = lists:filtermap(fun({Txid, Vout, Utxo}) ->
-                        Confs = CurrentHeight - Utxo#utxo.height + 1,
-                        case Confs >= MinConf andalso Confs =< MaxConf of
-                            true ->
-                                Network = beamchain_config:network(),
-                                Address = case beamchain_address:script_to_address(
-                                              Utxo#utxo.script_pubkey, Network) of
-                                    unknown -> <<>>;
-                                    A -> iolist_to_binary(A)
-                                end,
-                                %% Immature coinbase coins are listed but flagged
-                                %% non-spendable, matching Core's
-                                %% getrawchangeaddress / AvailableCoins semantics
-                                %% (a coinbase at height H matures once
-                                %% CurrentHeight - H >= COINBASE_MATURITY).
-                                Spendable = (not Utxo#utxo.is_coinbase)
-                                    orelse (CurrentHeight - Utxo#utxo.height)
-                                           >= ?COINBASE_MATURITY,
-                                {true, #{
-                                    <<"txid">> => beamchain_serialize:hex_encode(Txid),
-                                    <<"vout">> => Vout,
-                                    <<"address">> => Address,
-                                    %% Core uses ValueFromAmount; use sentinel for
-                                    %% exact 8-decimal formatting via ok_raw_json.
-                                    <<"amount">> => format_amount_sentinel(Utxo#utxo.value),
-                                    <<"confirmations">> => Confs,
-                                    <<"spendable">> => Spendable,
-                                    <<"solvable">> => true,
-                                    <<"safe">> => Spendable
-                                }};
-                            false ->
-                                false
-                        end
-                    end, Utxos),
-                    {ok_raw_json, replace_btc_sentinels(jsx:encode(Filtered))};
-                not_found ->
-                    {ok, []}
-            end;
-        {error, _} ->
-            wallet_not_found_error(WalletName)
+    case parse_listunspent_params(Params) of
+        {error, Code, Msg} ->
+            {error, Code, Msg};
+        {ok, MinConf, MaxConf, AddrFilter} ->
+            case resolve_wallet(WalletName) of
+                {ok, Pid} ->
+                    Utxos = beamchain_wallet:get_wallet_utxos(),
+                    case beamchain_chainstate:get_tip() of
+                        {ok, {_, CurrentHeight}} ->
+                            Network = cfg_network(),
+                            Filtered = lists:filtermap(
+                                fun({Txid, Vout, Utxo}) ->
+                                    listunspent_entry(
+                                        Pid, Txid, Vout, Utxo, CurrentHeight,
+                                        MinConf, MaxConf, AddrFilter, Network)
+                                end, Utxos),
+                            {ok_raw_json,
+                             replace_btc_sentinels(jsx:encode(Filtered))};
+                        not_found ->
+                            {ok, []}
+                    end;
+                {error, _} ->
+                    wallet_not_found_error(WalletName)
+            end
     end.
+
+parse_listunspent_params(Params) ->
+    Min = case Params of
+        [M | _] when is_integer(M) -> M;
+        _ -> 0
+    end,
+    Max = case Params of
+        [_, M2 | _] when is_integer(M2) -> M2;
+        _ -> 9999999
+    end,
+    case Params of
+        [_, _, Addrs | _] when is_list(Addrs) ->
+            case validate_listunspent_addrs(Addrs, []) of
+                {ok, Set} -> {ok, Min, Max, Set};
+                {error, _, _} = E -> E
+            end;
+        _ ->
+            {ok, Min, Max, undefined}
+    end.
+
+validate_listunspent_addrs([], Acc) ->
+    {ok, Acc};
+validate_listunspent_addrs([Addr | Rest], Acc) when is_binary(Addr) ->
+    case lists:member(Addr, Acc) of
+        true ->
+            {error, ?RPC_INVALID_PARAMETER,
+             iolist_to_binary(io_lib:format(
+                 "Invalid parameter, duplicated address: ~s", [Addr]))};
+        false ->
+            case beamchain_address:address_to_script(
+                     binary_to_list(Addr), cfg_network()) of
+                {ok, _} ->
+                    validate_listunspent_addrs(Rest, [Addr | Acc]);
+                {error, _} ->
+                    {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+                     <<"Invalid Bitcoin address">>}
+            end
+    end;
+validate_listunspent_addrs(_, _) ->
+    {error, ?RPC_TYPE_ERROR, <<"Expected type array for addresses">>}.
+
+listunspent_entry(Pid, Txid, Vout, Utxo, CurrentHeight, MinConf, MaxConf,
+                  AddrFilter, Network) ->
+    Confs = CurrentHeight - Utxo#utxo.height + 1,
+    case Confs >= MinConf andalso Confs =< MaxConf of
+        false ->
+            false;
+        true ->
+            Address = case beamchain_address:script_to_address(
+                              Utxo#utxo.script_pubkey, Network) of
+                unknown -> <<>>;
+                A -> iolist_to_binary(A)
+            end,
+            case AddrFilter =:= undefined orelse lists:member(Address, AddrFilter) of
+                false ->
+                    false;
+                true ->
+                    Spendable = (not Utxo#utxo.is_coinbase)
+                        orelse (CurrentHeight - Utxo#utxo.height)
+                               >= ?COINBASE_MATURITY,
+                    {Desc, ParentDescs, Label} =
+                        listunspent_desc_fields(Pid, Address, Utxo),
+                    {true, #{
+                        <<"txid">> => beamchain_serialize:hex_encode(Txid),
+                        <<"vout">> => Vout,
+                        <<"address">> => Address,
+                        <<"label">> => Label,
+                        <<"scriptPubKey">> =>
+                            beamchain_serialize:hex_encode(Utxo#utxo.script_pubkey),
+                        <<"amount">> => format_amount_sentinel(Utxo#utxo.value),
+                        <<"confirmations">> => Confs,
+                        <<"spendable">> => Spendable,
+                        <<"solvable">> => true,
+                        <<"desc">> => Desc,
+                        <<"parent_descs">> => ParentDescs,
+                        <<"safe">> => Spendable
+                    }}
+            end
+    end.
+
+listunspent_desc_fields(Pid, Address, Utxo) ->
+    Entry = try beamchain_wallet:get_address_entry(Pid, Address) of
+        {ok, E} -> E;
+        _ -> undefined
+    catch
+        _:_ -> undefined
+    end,
+    Type = beamchain_address:classify_script(Utxo#utxo.script_pubkey),
+    EntryDesc = case Entry of
+        undefined -> undefined;
+        _ -> maps:get(<<"desc">>, Entry, undefined)
+    end,
+    PubHex = case Entry of
+        undefined -> undefined;
+        _ -> maps:get(<<"pubkey_hex">>, Entry, undefined)
+    end,
+    {_Solvable, DescOut} = address_solvability(Entry, EntryDesc, PubHex, Type),
+    Desc = case DescOut of
+        undefined -> <<>>;
+        D -> D
+    end,
+    Parent = case EntryDesc of
+        undefined -> Desc;
+        PD -> PD
+    end,
+    Label = case Entry of
+        undefined -> <<>>;
+        _ ->
+            case maps:get(<<"label">>, Entry, <<>>) of
+                L when is_binary(L) -> L;
+                _ -> <<>>
+            end
+    end,
+    {Desc, [Parent || Parent =/= <<>>], Label}.
 
 %% @doc listtransactions ( "label" count skip include_watchonly )
 %%
@@ -11152,9 +11541,12 @@ rpc_listunspent(Params, WalletName) ->
 %% slice reversed).  We sort wallet txs by (blockheight, then stable txid) and
 %% return the most recent `count`.
 rpc_listtransactions(Params, WalletName) ->
+    case parse_listtransactions_params(Params) of
+        {error, Code, Msg} ->
+            {error, Code, Msg};
+        {ok, {_Label, Count, Skip}} ->
     case resolve_wallet(WalletName) of
         {ok, _Pid} ->
-            {_Label, Count, Skip} = parse_listtransactions_params(Params),
             Network = beamchain_config:network(),
             TipHeight = case beamchain_chainstate:get_tip_height() of
                 {ok, H}   -> H;
@@ -11188,24 +11580,33 @@ rpc_listtransactions(Params, WalletName) ->
             {ok_raw_json, replace_btc_sentinels(jsx:encode(Windowed))};
         {error, _} ->
             wallet_not_found_error(WalletName)
+    end
     end.
 
 %% Parse listtransactions params: ( "label" count skip include_watchonly ).
-%% Defaults: label "*" (all), count 10, skip 0.  Non-integers tolerated.
+%% Defaults: label "*" (all), count 10, skip 0.
+%% Core RPCHelpMan: negative count/skip is RPC_INVALID_PARAMETER (-8).
 parse_listtransactions_params(Params) ->
     Label = case Params of
         [L | _] when is_binary(L) -> L;
         _ -> <<"*">>
     end,
-    Count = case Params of
-        [_, C | _] when is_integer(C), C >= 0 -> C;
-        _ -> 10
-    end,
-    Skip = case Params of
-        [_, _, S | _] when is_integer(S), S >= 0 -> S;
-        _ -> 0
-    end,
-    {Label, Count, Skip}.
+    case Params of
+        [_, C | _] when is_integer(C), C < 0 ->
+            {error, ?RPC_INVALID_PARAMETER, <<"Negative count">>};
+        [_, _, S | _] when is_integer(S), S < 0 ->
+            {error, ?RPC_INVALID_PARAMETER, <<"Negative skip">>};
+        _ ->
+            Count = case Params of
+                [_, C | _] when is_integer(C) -> C;
+                _ -> 10
+            end,
+            Skip = case Params of
+                [_, _, S | _] when is_integer(S) -> S;
+                _ -> 0
+            end,
+            {ok, {Label, Count, Skip}}
+    end.
 
 %% Build the Core ListTransactions per-output entries for one wallet tx.
 %% Long?=true includes the WalletTxToJSON block fields (confirmations etc.);
@@ -11643,14 +12044,19 @@ rpc_walletlock(WalletName) ->
             wallet_not_found_error(WalletName)
     end.
 
-%% Helper: Convert RPC address type to atom
+%% Helper: Convert RPC address type to atom.
+%% Core ParseOutputType (outputtype.cpp): unknown string is
+%% RPC_INVALID_ADDRESS_OR_KEY "Unknown address type ''".
 address_type_from_rpc(Type) when is_binary(Type) ->
     case string:lowercase(binary_to_list(Type)) of
         "bech32" -> p2wpkh;
         "bech32m" -> p2tr;
-        "p2sh-segwit" -> p2wpkh;  %% Map to native segwit for simplicity
+        "p2sh-segwit" -> p2sh_p2wpkh;
         "legacy" -> p2pkh;
-        _ -> p2wpkh  %% Default to native segwit
+        "" -> p2wpkh;
+        Other ->
+            {error, iolist_to_binary(
+                io_lib:format("Unknown address type '~s'", [Other]))}
     end;
 address_type_from_rpc(_) ->
     p2wpkh.
@@ -11671,6 +12077,30 @@ btc_to_satoshi(Btc) when is_float(Btc) ->
     round(Btc * 100000000);
 btc_to_satoshi(Btc) when is_integer(Btc) ->
     Btc * 100000000.
+
+%% Core AmountFromValue (rpc/util.cpp): not a number or out of [0, 21e6]
+%% is RPC_TYPE_ERROR (-3).
+parse_rpc_amount(N) when is_integer(N), N >= 0, N =< 21000000 ->
+    {ok, N * 100000000};
+parse_rpc_amount(N) when is_float(N), N >= 0.0, N =< 21000000.0 ->
+    {ok, round(N * 100000000)};
+parse_rpc_amount(N) when is_number(N) ->
+    {error, ?RPC_TYPE_ERROR, <<"Amount out of range">>};
+parse_rpc_amount(_) ->
+    {error, ?RPC_TYPE_ERROR,
+     <<"JSON value is not a number as expected">>}.
+
+%% Core AppendLastProcessedBlock (wallet/rpc/util.cpp).
+lastprocessedblock_obj() ->
+    case catch beamchain_chainstate:get_tip() of
+        {ok, {Hash, Height}} ->
+            #{<<"hash">> => hash_to_hex(Hash),
+              <<"height">> => Height};
+        _ ->
+            #{<<"hash">> =>
+                  <<"0000000000000000000000000000000000000000000000000000000000000000">>,
+              <<"height">> => 0}
+    end.
 
 %%% ===================================================================
 %%% Wallet signing and descriptor import
@@ -13456,8 +13886,8 @@ do_walletcreatefundedpsbt(Pid, ManualInputs, Outputs, Locktime, Options) ->
     OutputPairs = normalize_wcfp_outputs(Outputs, Network),
     case OutputPairs of
         [] ->
-            throw({wcfp_error, ?RPC_INVALID_PARAMS,
-                   <<"At least one output required">>});
+            throw({wcfp_error, ?RPC_INVALID_PARAMETER,
+                   <<"TX must have at least one output">>});
         _ -> ok
     end,
     OutputTotal = lists:sum([Sat || {_, Sat} <- OutputPairs]),
@@ -13554,23 +13984,41 @@ do_walletcreatefundedpsbt(Pid, ManualInputs, Outputs, Locktime, Options) ->
             <<"changepos">> => ChangePos},
     {ok_raw_json, replace_btc_sentinels(jsx:encode(Map))}.
 
-normalize_wcfp_outputs(Outputs, _Network) when is_list(Outputs) ->
+normalize_wcfp_outputs(Outputs, Network) when is_list(Outputs) ->
     lists:flatmap(fun(Obj) when is_map(Obj) ->
         maps:fold(fun(K, V, Acc) ->
-            [{binary_to_list(K), btc_to_satoshi(V)} | Acc]
+            [wcfp_output_pair(K, V, Network) | Acc]
         end, [], Obj);
     (_) ->
-        throw({wcfp_error, ?RPC_INVALID_PARAMS,
+        throw({wcfp_error, ?RPC_INVALID_PARAMETER,
                <<"Output entries must be objects">>})
     end, Outputs);
-normalize_wcfp_outputs(Outputs, _Network) when is_map(Outputs) ->
+normalize_wcfp_outputs(Outputs, Network) when is_map(Outputs) ->
     %% Compatibility form: caller passed a single object instead of [obj].
     maps:fold(fun(K, V, Acc) ->
-        [{binary_to_list(K), btc_to_satoshi(V)} | Acc]
+        [wcfp_output_pair(K, V, Network) | Acc]
     end, [], Outputs);
 normalize_wcfp_outputs(_, _) ->
-    throw({wcfp_error, ?RPC_INVALID_PARAMS,
+    throw({wcfp_error, ?RPC_INVALID_PARAMETER,
            <<"outputs must be an array or object">>}).
+
+wcfp_output_pair(K, V, Network) when is_binary(K) ->
+    Addr = binary_to_list(K),
+    case beamchain_address:address_to_script(Addr, Network) of
+        {ok, _} ->
+            Sat = case parse_rpc_amount(V) of
+                {ok, S} -> S;
+                {error, Code, Msg} -> throw({wcfp_error, Code, Msg})
+            end,
+            {Addr, Sat};
+        {error, _} ->
+            throw({wcfp_error, ?RPC_INVALID_ADDRESS_OR_KEY,
+                   iolist_to_binary(
+                       ["Invalid Bitcoin address: ", K])})
+    end;
+wcfp_output_pair(_, _, _) ->
+    throw({wcfp_error, ?RPC_INVALID_PARAMETER,
+           <<"Output entries must be objects">>}).
 
 %% Resolve fee rate from options.  Order of preference matches Core's:
 %% `fee_rate` (sat/vB) > `feeRate` (BTC/kvB) > wallet estimator > 1 sat/vB.

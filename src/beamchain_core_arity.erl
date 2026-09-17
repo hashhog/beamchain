@@ -21,6 +21,16 @@
 %% arguments. Core's RPCHelpMan (rawtransaction.cpp:1997-2014) is 2 required
 %% (psbt, descriptors) and 5 declared. Live Core on :8332 accepts n=2..5 and
 %% rejects n=1 and n=6 with -1. Do not restore {4, 7}.
+%%
+%% HAND PATCH: stop is {0, 1} (optional `wait` NUM), not the generator's {0, 0}.
+%% Core rpc/server.cpp stop() declares one omitted NUM; a string is -3
+%% (MatchesType) and the node stays up. The T3/T1 regtest-lane probe
+%% `stop "notanumber"` asserts that.
+%%
+%% HAND PATCH: T3 wallet methods were missing from the generated 87-row
+%% table (fail-open), so extra args on getwalletinfo/listwallets/getbalances
+%% and createwallet [] were silently accepted. Counts from Core RPCHelpMan
+%% (wallet/rpc/*.cpp).
 -module(beamchain_core_arity).
 -export([table/0, lookup/1]).
 
@@ -36,6 +46,8 @@ table() ->
       <<"createmultisig">> => {2, 3},
       <<"createpsbt">> => {2, 5},
       <<"createrawtransaction">> => {2, 5},
+      <<"createwallet">> => {1, 8},
+      <<"backupwallet">> => {1, 1},
       <<"decodepsbt">> => {1, 1},
       <<"decoderawtransaction">> => {1, 2},
       <<"decodescript">> => {1, 1},
@@ -46,6 +58,8 @@ table() ->
       <<"finalizepsbt">> => {1, 2},
       <<"getaddednodeinfo">> => {0, 1},
       <<"getaddrmaninfo">> => {0, 0},
+      <<"getaddressinfo">> => {1, 1},
+      <<"getbalances">> => {0, 0},
       <<"getbestblockhash">> => {0, 0},
       <<"getblock">> => {1, 2},
       <<"getblockchaininfo">> => {0, 0},
@@ -73,6 +87,7 @@ table() ->
       <<"getnettotals">> => {0, 0},
       <<"getnetworkhashps">> => {0, 2},
       <<"getnetworkinfo">> => {0, 0},
+      <<"getnewaddress">> => {0, 2},
       <<"getnodeaddresses">> => {0, 2},
       <<"getpeerinfo">> => {0, 0},
       <<"getprioritisedtransactions">> => {0, 0},
@@ -83,28 +98,37 @@ table() ->
       <<"gettxoutproof">> => {1, 2},
       <<"gettxoutsetinfo">> => {0, 3},
       <<"gettxspendingprevout">> => {1, 2},
+      <<"getwalletinfo">> => {0, 0},
       <<"help">> => {0, 1},
       <<"importmempool">> => {1, 2},
       <<"joinpsbts">> => {1, 1},
       <<"listbanned">> => {0, 0},
+      <<"listtransactions">> => {0, 4},
+      <<"listunspent">> => {0, 5},
+      <<"listwallets">> => {0, 0},
+      <<"loadwallet">> => {1, 2},
       <<"logging">> => {0, 2},
       <<"ping">> => {0, 0},
       <<"preciousblock">> => {1, 1},
       <<"prioritisetransaction">> => {1, 3},
+      <<"restorewallet">> => {2, 3},
       <<"pruneblockchain">> => {1, 1},
       <<"savemempool">> => {0, 0},
       <<"scanblocks">> => {1, 6},
       <<"scantxoutset">> => {1, 2},
+      <<"send">> => {1, 6},
       <<"sendrawtransaction">> => {1, 3},
+      <<"sendtoaddress">> => {2, 9},
       <<"setban">> => {2, 4},
       <<"setnetworkactive">> => {1, 1},
       <<"signmessagewithprivkey">> => {2, 2},
       <<"signrawtransactionwithkey">> => {2, 4},
-      <<"stop">> => {0, 0},
+      <<"stop">> => {0, 1},
       <<"submitblock">> => {1, 2},
       <<"submitheader">> => {1, 1},
       <<"submitpackage">> => {1, 3},
       <<"testmempoolaccept">> => {1, 2},
+      <<"unloadwallet">> => {0, 2},
       <<"uptime">> => {0, 0},
       <<"utxoupdatepsbt">> => {1, 4},
       <<"validateaddress">> => {1, 1},
@@ -113,7 +137,9 @@ table() ->
       <<"verifytxoutproof">> => {1, 1},
       <<"waitforblock">> => {1, 2},
       <<"waitforblockheight">> => {1, 2},
-      <<"waitfornewblock">> => {0, 2}
+      <<"waitfornewblock">> => {0, 2},
+      <<"walletcreatefundedpsbt">> => {2, 5},
+      <<"walletprocesspsbt">> => {1, 5}
     }.
 
 %% Returns `error' when the method is absent -- callers MUST fail OPEN.
