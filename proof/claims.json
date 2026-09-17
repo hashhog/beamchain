@@ -1,0 +1,72 @@
+{
+  "r4": {
+    "files": [
+      "r4/C958794.json",
+      "r4/capture.md",
+      "r4/capture-watch-excerpt.txt",
+      "r4/capture-state-marker.txt",
+      "r4/genesis-unit.service",
+      "r4/lineage.log.gz",
+      "r4/lineage.log.sha256",
+      "r4/lineage.log.gz.sha256",
+      "r4/lineage-excerpt.txt",
+      "r4/av0-250000-ledger.txt",
+      "r4/av0-250000-ledger.jsonl"
+    ],
+    "height": 958794,
+    "bestblockhash": "000000000000000000015eaadd989e4f09ff75b643a128dc7bdf6070431d7d0e",
+    "hash_serialized_3": "29692050559b8f064a03af9cd605040e71d1d978fa22947c079cc7e5546e7af0",
+    "coins": 166180925,
+    "lineage_log_sha256": "6978c314f8d3e761858d51a5962283f8863e76c1281d8ab29a2a53d171418e31",
+    "genesis_block_hash": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+    "snapshot_booted": false,
+    "assumevalid": "0"
+  },
+  "r1": {
+    "files": ["r1/results.json", "r1/script.txt", "r1/tx.txt", "r1/sighash.txt", "r1/command.txt"],
+    "script_pass": 1222,
+    "script_fail": 0,
+    "script_non_witness": 1109,
+    "script_witness": 113,
+    "tx_valid_pass": 121,
+    "tx_invalid_pass": 93,
+    "sighash_pass": 500,
+    "divergences": 0,
+    "decided": 1936,
+    "charter_vector_count": 1936
+  },
+  "r2": {
+    "files": ["r2/results.json", "r2/nightly-report-excerpt.txt", "r2/command.txt"],
+    "pass": 367,
+    "fail": 3,
+    "err": 0,
+    "consensus_splits_accept_vs_reject": 0
+  },
+  "r5": {
+    "files": [
+      "r5/scorecard.json",
+      "r5/live-20260917T112139Z.json",
+      "r5/regtest-20260917T122831Z.json",
+      "r5/t1-after.txt",
+      "r5/command.txt"
+    ],
+    "live_t1_pass": 45,
+    "live_t1_total": 46,
+    "live_t2_pass": 40,
+    "live_t2_total": 41,
+    "live_fail_count": 0,
+    "regtest_t3_pass": 16,
+    "regtest_t3_total": 16
+  },
+  "provenance": {
+    "files": ["provenance.txt"],
+    "binary_sha256": "e3569180d2aa1c3d8176f3950c37e5380a89c095770083755eb3395a4d165e57",
+    "binary_path": "_build/default/bin/beamchain",
+    "toolchain": "Erlang/OTP 27 Erts 15.2.7 / rebar3 3.24.0",
+    "parent_commit": "8a40a0693173571117ec48d600e267e6d5c681a2",
+    "deploy_pin": "none",
+    "live_argv0": "/home/work/hashhog/beamchain/_build/default/bin/beamchain",
+    "live_started_utc": "2026-09-17T11:20:42Z",
+    "live_commit_at_start": "d46a9e3d0670"
+  }
+}

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- docs: CHARTER proof bundle (`proof/`; `bash proof/verify.sh`)
+
 ## v1.0.2 — 2026-09-17
 
 - 41c97aa fix: reject wrong walletpassphrase instead of unlocking

@@ -1,0 +1,26 @@
+{
+  "live": {
+    "artifact": "r5/live-20260917T112139Z.json",
+    "command": "python3 tools/r5_probe.py --impl beamchain -v",
+    "T1": {"pass": 45, "total": 46},
+    "T2": {"pass": 40, "total": 41},
+    "T3": {"pass": 0, "total": 16, "note": "SKIP-REGTEST on the live lane"},
+    "fails": [],
+    "skip_regtest": ["stop", "getblockfilter"],
+    "note": "Live probe 2026-09-17T11:21Z after deploying d46a9e3: zero FAIL rows. The two live-lane non-passes are SKIP-REGTEST (stop, getblockfilter), scored on the regtest lane instead. T3 is SKIP-REGTEST here."
+  },
+  "regtest": {
+    "artifact": "r5/regtest-20260917T122831Z.json",
+    "command": "bash tools/regtest-harness.sh --r5-lane=beamchain",
+    "T1": {"pass": 1, "total": 1},
+    "T2": {"pass": 1, "total": 1},
+    "T3": {"pass": 16, "total": 16},
+    "methods_scored": 18,
+    "fails": []
+  },
+  "in_repo_t1": {
+    "command": "rebar3 eunit --module=beamchain_t1_rpc_parity_tests",
+    "after": "r5/t1-after.txt",
+    "after_summary": "10 tests, 0 failures"
+  }
+}

@@ -1,0 +1,88 @@
+## start of lineage log (first 25 non-empty-ish lines)
+1:=PROGRESS REPORT==== 30-Jul-2026::14:33:42.591840 ===
+2:    application: crypto
+3:    started_at: nonode@nohost
+4:
+5:=PROGRESS REPORT==== 30-Jul-2026::14:33:42.600931 ===
+6:    application: asn1
+7:    started_at: nonode@nohost
+8:
+9:=PROGRESS REPORT==== 30-Jul-2026::14:33:42.602732 ===
+10:    application: public_key
+11:    started_at: nonode@nohost
+12:
+13:=PROGRESS REPORT==== 30-Jul-2026::14:33:42.613968 ===
+14:    supervisor: {local,ssl_admin_sup}
+15:    started: [{pid,<0.89.0>},
+16:              {id,ssl_pem_cache},
+17:              {mfargs,{ssl_pem_cache,start_link,[[]]}},
+18:              {restart_type,permanent},
+19:              {significant,false},
+20:              {shutdown,4000},
+21:              {child_type,worker}]
+22:
+23:=PROGRESS REPORT==== 30-Jul-2026::14:33:42.621479 ===
+24:    supervisor: {local,ssl_admin_sup}
+25:    started: [{pid,<0.90.0>},
+26:              {id,ssl_manager},
+27:              {mfargs,{ssl_manager,start_link,[[]]}},
+28:              {restart_type,permanent},
+29:              {significant,false},
+30:              {shutdown,4000},
+31:              {child_type,worker}]
+32:
+33:=PROGRESS REPORT==== 30-Jul-2026::14:33:42.623390 ===
+34:    supervisor: {local,ssl_admin_sup}
+35:    started: [{pid,<0.91.0>},
+36:              {id,tls_client_ticket_store},
+37:              {mfargs,{tls_client_ticket_store,start_link,[1000,7200]}},
+38:              {restart_type,permanent},
+39:              {significant,false},
+40:              {shutdown,4000},
+
+## empty chainstate then genesis (height -1 -> connected genesis block)
+330:chainstate (main): initialized at height -1 (cache 7168MB)
+332:chainstate: connected genesis block
+
+## header_sync at height 0 (Bitcoin genesis is the only header)
+424:header_sync: initialized at height 0
+
+## Bitcoin genesis hash (beamchain_chain_params.erl params_raw(mainnet) genesis_hash)
+000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f
+
+## first IBD: from height 1, scripts on
+1039:block_sync: starting IBD from 1 to 960004
+1041:block_sync: checkpoint at height 1000 (verifying scripts)
+
+## feeder is the capped blk-replay at the T2 anchor
+765:peer {{127,0,0,1},28620} ready (/blk-replay:0.1.0/, height=958794)
+
+## first flush/restart with chainstate already at 958794
+466304:chainstate (main): initialized at height 958794 (cache 7168MB)
+
+## assumevalid is the zero hash (AV=0) in a crash dump of header_sync state
+## (the same dump also prints the hardcoded campaign assumeutxo TABLE;
+##  that is not a snapshot boot — loadtxoutset matches=0 below)
+376367:                           assume_valid =>
+376368:                            <<0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+376369:                              0,0,0,0,0,0,0,0>>,
+376370:                           assumeutxo =>
+
+## snapshot-boot negative control
+loadtxoutset matches=0 (must be 0 for a from-genesis lineage)
+loading snapshot matches=0
+assumeutxo matches=1 (a gen_server crash dump of hardcoded campaign params, not loadtxoutset)
+
+## end of lineage log (last 12 lines)
+661689:block_sync: watchdog — stuck at 958795, downloaded=0 in_flight=16 ticks=2
+661690:=INFO REPORT==== 31-Aug-2026::09:48:05.009951 ===
+661691:block_sync: watchdog — stuck at 958795, downloaded=0 in_flight=16 ticks=1
+661692:=NOTICE REPORT==== 31-Aug-2026::09:48:18.827502 ===
+661693:beamchain: sigterm received, running graceful shutdown
+661694:=INFO REPORT==== 31-Aug-2026::09:48:18.849744 ===
+661695:mempool: shutting down (0 transactions)
+661696:=INFO REPORT==== 31-Aug-2026::09:48:18.862795 ===
+661697:    application: beamchain
+661698:    exited: stopped
+661699:    type: temporary
+661700:

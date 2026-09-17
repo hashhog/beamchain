@@ -1,0 +1,32 @@
+{
+  "source": "tools/diff-test-artifacts/corpus-sweep/nightly-history.jsonl (jobs recorded: 440, after the 2026-09-15T07:30:03Z partial marker)",
+  "impl": "beamchain",
+  "pass": 367,
+  "fail": 3,
+  "err": 0,
+  "agreement_pct": 99.2,
+  "consensus_splits_accept_vs_reject": 0,
+  "fails": [
+    {
+      "corpus": "_cve-histbug-2026-07-07/cve-2010-value-overflow",
+      "entry": "sum-over-maxmoney",
+      "core": "reject:bad-txns-txouttotal-toolarge",
+      "beamchain": "reject:block-script-verify-flag-failed",
+      "same_accept_reject": true
+    },
+    {
+      "corpus": "_tierc-guards-2026-07-06/C9-sidebranch-invalid-reorg",
+      "entry": "cb-overpay-sidebranch-reorg",
+      "core": "reject:bad-cb-amount",
+      "beamchain": "reject:rejected",
+      "same_accept_reject": true
+    },
+    {
+      "corpus": "_tierc-guards-2026-07-06/C9-sidebranch-invalid-reorg",
+      "entry": "immature-cb-spend-sidebranch-reorg",
+      "core": "reject:bad-txns-premature-spend-of-coinbase",
+      "beamchain": "reject:rejected",
+      "same_accept_reject": true
+    }
+  ]
+}

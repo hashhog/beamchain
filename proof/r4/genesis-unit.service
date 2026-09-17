@@ -1,0 +1,25 @@
+[Unit]
+Description=HashHog genesis IBD — beamchain (mainnet, from-genesis, AV=0, pruned)
+Documentation=https://github.com/hashhog receipts/IBD-BOTTLENECK-2026-07-30.md
+After=network-online.target
+
+[Service]
+Type=simple
+# Launch command PROVEN BY EXECUTION 2026-07-30 (probe on a throwaway datadir:
+# booted, handshaked with the capped replay feed, connected blocks, AV=0
+# confirmed active). Feed is the capped blk-replay-server on 127.0.0.1:28620
+# (--max-serve-height 958794) so the lineage FREEZES on the T2 anchor and never
+# needs a rollback — the operation that destroyed the blockbrew lineage.
+Environment=BEAMCHAIN_PRUNE=10000
+ExecStart=/home/work/hashhog/beamchain/_build/default/bin/beamchain start --network=mainnet --datadir=/home/work/genesis-ibd/beamchain --rpc-port=8376 --p2p-port=8476 --noassumevalid --connect=127.0.0.1:28620 --dbcache=8192
+WorkingDirectory=/home/work/hashhog/beamchain
+Nice=15
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=300
+LimitNOFILE=524288
+StandardOutput=append:/home/work/genesis-ibd/logs/beamchain-genesis.log
+StandardError=append:/home/work/genesis-ibd/logs/beamchain-genesis.log
+
+[Install]
+WantedBy=default.target

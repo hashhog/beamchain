@@ -1,0 +1,26 @@
+  jobs recorded: 440   corpora x impls
+  (table from nightly-history.jsonl after the 2026-09-15T07:30:03Z partial marker)
+  IMPL           PASS   FAIL   ERR   AGREEMENT
+  ----------------------------------------------
+  beamchain       367      3     0       99.2%
+
+  DIVERGENCES (beamchain rows only):
+    beamchain    _tierc-guards-2026-07-06/C9-sidebranch-invalid-reorg 2 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/_tierc-guards-2026-07-06__C9-sidebranch-invalid-reorg__beamchain.log
+    beamchain    _cve-histbug-2026-07-07/cve-2010-value-overflow 1 failed  -> /home/work/hashhog/tools/diff-test-artifacts/corpus-sweep/logs/_cve-histbug-2026-07-07__cve-2010-value-overflow__beamchain.log
+
+CONSENSUS SPLITS (accept vs reject -- chain-split risk): 0
+  ERROR-CODE ONLY (same accept/reject, different reason): 0
+  MEMPOOL DIVERGENCE (policy, not block consensus): 14
+     ouroboros   10
+     camlcoin    1
+     clearbit    1
+     haskoin     1
+     rustoshi    1
+  TXINDEX DIVERGENCE (index, not block consensus): 1
+     ouroboros   1
+  
+     !! ACCOUNTING GAP: runner counted 80 failed entries, classifier saw 92 (77 unparsed). Do not trust the split count until this is zero.
+
+  (The nightly classifier's split count has an accounting gap on the full
+   10-impl report; the three beamchain FAIL logs were read directly and each is
+   reject-vs-reject. See r2/results.json.)

@@ -1,0 +1,11 @@
+=== Script Test Vector Results ===
+Non-witness tests: 1109
+  PASS:  1109
+  FAIL:  0
+  ERROR: 0
+Witness tests: 113
+  PASS:  113
+  FAIL:  0
+  ERROR: 0
+  Skipped: 0
+[0;32m.[0m

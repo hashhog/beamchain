@@ -1,0 +1,12 @@
+# Re-run R5 (operator RPC subset). Needs the hashhog meta-repo instruments
+# and a running node (live fleet or the regtest harness).
+#
+# Live lane (T1/T2; T3 is SKIP-REGTEST here):
+#   python3 tools/r5_probe.py --impl beamchain -v
+#
+# Regtest lane (T3 wallet + stop/getblockfilter):
+#   REGTEST_SLOTS=1 REGTEST_MEM=8G bash tools/regtest-slot.sh \
+#     bash tools/regtest-harness.sh --r5-lane=beamchain
+#
+# In-repo encoding of T1 operator-subset parity (no live node required):
+#   rebar3 eunit --module=beamchain_t1_rpc_parity_tests

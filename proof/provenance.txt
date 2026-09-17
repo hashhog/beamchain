@@ -1,0 +1,28 @@
+# Provenance — beamchain proof bundle
+assembled_utc: 2026-09-17T19:01:43Z
+repo: https://github.com/hashhog/beamchain
+branch: master
+commit: 8a40a0693173571117ec48d600e267e6d5c681a2
+commit_short: 8a40a0693173
+subject: feat: R5 T3 wallet lane 16/16 plus stop and getblockfilter
+tree_clean: NO
+binary: _build/default/bin/beamchain
+binary_sha256: e3569180d2aa1c3d8176f3950c37e5380a89c095770083755eb3395a4d165e57
+toolchain: Erlang/OTP 27 [erts-15.2.7] [source] [64-bit] [smp:32:32] [ds:32:32:10] [async-threads:1] [jit:ns]
+rebar3: rebar 3.24.0 on Erlang/OTP 27 Erts 15.2.7
+target: Linux amd64
+build: rebar3 compile && rebar3 escriptize
+deploy_pin: none (RocksDB NIF is not relocatable from deploy/)
+live_argv0: /home/work/hashhog/beamchain/_build/default/bin/beamchain
+
+# Honest caveats
+The attested artifact is the in-tree escript. beamchain has no relocatable
+deploy pin — the NIF is loaded from _build/default/lib/rocksdb/priv/.
+/proc/<pid>/exe is the BEAM VM (beam.smp), not the escript. Path identity
+(argv[0]) is the closure; byte-identity of a live process vs this file is
+UNPROVEN if the on-disk escript was rebuilt after launch.
+A different OTP, zlib, or build path is expected to produce different
+bytes. Behavioural re-runs (R1 vectors, in-repo T1 eunit) are the
+stronger check. See scripts/reproducible-escript.sh.
+This script refreshes provenance + MANIFEST only. Frozen evidence in
+r1/ r2/ r4/ r5/ is not regenerated from outside this repository.

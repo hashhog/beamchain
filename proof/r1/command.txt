@@ -1,0 +1,18 @@
+# Re-run R1 (interpreter) for beamchain.
+#
+# In-repo (no meta-repo required) — these are what proof/verify.sh re-runs
+# the T1 control for; script + sighash are the in-tree vector suites:
+#   rebar3 eunit --module=script_vectors_tests
+#   rebar3 eunit --module=sighash_vectors_tests
+#
+# tx_valid / tx_invalid go through the Phase B shim (meta-repo):
+#   cd tools/phaseb-vectors
+#   python3 phaseb_vectors.py --driver='escript ./beamchain-shim/verifyscript_shim.escript'
+#   python3 phaseb_vectors.py --driver='escript ./beamchain-shim/verifyscript_shim.escript' --txvectors
+#   python3 phaseb_vectors.py --driver='escript ./beamchain-shim/verifyscript_shim.escript' --sighash
+#
+# Nightly reject-bar (PASS=30/30 on 2026-09-16):
+#   bash tools/phaseb-vectors/run-regression.sh
+#   # PASS  shim:beamchain:script
+#   # PASS  shim:beamchain:tx
+#   # PASS  shim:beamchain:sighash
