@@ -483,12 +483,14 @@ set_chain_tip(Hash, Height) when byte_size(Hash) =:= 32 ->
 %% @doc Get the current header tip (headers-only sync progress)
 -spec get_header_tip() -> {ok, #{hash => binary(), height => integer()}} | not_found.
 get_header_tip() ->
-    gen_server:call(?SERVER, get_header_tip).
+    %% Infinity: header_sync init/1 reads this on every boot (same class
+    %% as get_chain_tip). A slow rocksdb read must not kill header_sync.
+    gen_server:call(?SERVER, get_header_tip, infinity).
 
 %% @doc Set the header tip
 -spec set_header_tip(binary(), non_neg_integer()) -> ok.
 set_header_tip(Hash, Height) when byte_size(Hash) =:= 32 ->
-    gen_server:call(?SERVER, {set_header_tip, Hash, Height}).
+    gen_server:call(?SERVER, {set_header_tip, Hash, Height}, infinity).
 
 %% @doc Store transaction index entry
 -spec store_tx_index(binary(), binary(), non_neg_integer(),

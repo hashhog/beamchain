@@ -102,7 +102,10 @@
 %%% ===================================================================
 
 start_link() ->
-    gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
+    %% Infinity: peers.dets open + load can exceed the 5 s default on a
+    %% busy box (same class as chainstate start_link).
+    gen_server:start_link({local, ?SERVER}, ?MODULE, [],
+                          [{timeout, infinity}]).
 
 %% @doc Add a single address with its services and source (IPv4/IPv6).
 -spec add_address({inet:ip_address(), inet:port_number()},
@@ -149,19 +152,24 @@ select_address() ->
 %% Options: new_only => true to only select from new table
 -spec select_address(map()) -> {ok, {inet:ip_address(), inet:port_number()}} | empty.
 select_address(Opts) ->
-    gen_server:call(?SERVER, {select_address, Opts}).
+    %% Infinity: a busy addrman (dets flush, large get_addresses) must
+    %% not crash peer_manager's connect_tick. Live 2026-09-17T02:12:26Z:
+    %% {timeout,{gen_server,call,[beamchain_addrman,{select_address,#{}}]}}
+    %% reported as initial call beamchain_peer_manager:init/1. Core's
+    %% addrman.Select has no caller-side timeout.
+    gen_server:call(?SERVER, {select_address, Opts}, infinity).
 
 %% @doc Get N random addresses (for responding to getaddr).
 %% Returns IPv4/IPv6 addresses only (legacy addr format).
 -spec get_addresses(non_neg_integer()) -> [{inet:ip_address(), inet:port_number()}].
 get_addresses(N) ->
-    gen_server:call(?SERVER, {get_addresses, N}).
+    gen_server:call(?SERVER, {get_addresses, N}, infinity).
 
 %% @doc Get N random addresses in addrv2 format (all network types).
 %% Returns maps with network_id, suitable for addrv2 message.
 -spec get_addrv2_addresses(non_neg_integer()) -> [map()].
 get_addrv2_addresses(N) ->
-    gen_server:call(?SERVER, {get_addrv2_addresses, N}).
+    gen_server:call(?SERVER, {get_addrv2_addresses, N}, infinity).
 
 %% @doc Dump known addresses for the getnodeaddresses RPC.
 %%
@@ -178,7 +186,8 @@ get_addrv2_addresses(N) ->
 %%      network => NetStr }
 -spec get_node_addresses(non_neg_integer(), all | non_neg_integer()) -> [map()].
 get_node_addresses(Count, NetworkFilter) ->
-    gen_server:call(?SERVER, {get_node_addresses, Count, NetworkFilter}).
+    gen_server:call(?SERVER, {get_node_addresses, Count, NetworkFilter},
+                    infinity).
 
 %% @doc Insert a single address synchronously (for the addpeeraddress RPC).
 %%
@@ -192,12 +201,12 @@ get_node_addresses(Count, NetworkFilter) ->
         -> {ok, boolean()}.
 add_peer_address(Address, Services, Tried, NetworkId) ->
     gen_server:call(?SERVER, {add_peer_address, Address, Services, Tried,
-                              NetworkId}).
+                              NetworkId}, infinity).
 
 %% @doc Return count of new and tried addresses.
 -spec count() -> {non_neg_integer(), non_neg_integer()}.
 count() ->
-    gen_server:call(?SERVER, count).
+    gen_server:call(?SERVER, count, infinity).
 
 %% @doc Per-network {new, tried} address-manager counts for the
 %% getaddrmaninfo RPC.
@@ -217,7 +226,7 @@ count() ->
 -spec getaddrmaninfo() ->
     #{binary() => #{new => non_neg_integer(), tried => non_neg_integer()}}.
 getaddrmaninfo() ->
-    gen_server:call(?SERVER, getaddrmaninfo).
+    gen_server:call(?SERVER, getaddrmaninfo, infinity).
 
 %% @doc Get the netgroup for an address (exported for peer_manager).
 %% IPv4: /16 prefix; IPv6: /32 prefix
@@ -300,7 +309,7 @@ netgroup(Addr, _Asmap) ->
 %% @doc Get the secret key (for testing).
 -spec get_secret() -> binary().
 get_secret() ->
-    gen_server:call(?SERVER, get_secret).
+    gen_server:call(?SERVER, get_secret, infinity).
 
 %%% ===================================================================
 %%% gen_server callbacks

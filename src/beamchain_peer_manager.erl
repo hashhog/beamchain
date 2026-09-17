@@ -355,7 +355,12 @@
 %%% ===================================================================
 
 start_link() ->
-    gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
+    %% Infinity: init does file I/O (anchors, bans, netgroup secret) and
+    %% gen_tcp:listen; the 5 s start_link default is the same cliff as
+    %% chainstate. The live 2026-09-17 crash was a later connect_tick
+    %% call into addrman, but OTP still reports initial call init/1.
+    gen_server:start_link({local, ?SERVER}, ?MODULE, [],
+                          [{timeout, infinity}]).
 
 %% @doc Connect to a peer at the given address.
 -spec connect_to(inet:ip_address(), inet:port_number()) ->
