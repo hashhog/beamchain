@@ -1,6 +1,17 @@
 # Changelog
 
-## v1.0.1 (unreleased)
+## v1.0.2 — 2026-09-17
+
+- 41c97aa fix: reject wrong walletpassphrase instead of unlocking
+- d07827e test: load passthrough meck targets before meck:new
+- 0dc210c test: align eunit suite with Core CompactSize MAX_SIZE and current APIs
+- 67758f4 fix: snapshot graft uses trusted assumeutxo chainwork
+- 782cc46 fix: pin escript zip extras so three builds share one sha
+- 65d5f41 fix: stream assumeutxo snapshot load and HASH_SERIALIZED
+- 061fd04 fix: T1 RPC parity for GBT, testmempoolaccept, addnode, getnetworkhashps
+
+
+## v1.0.2 — 2026-09-17
 
 Changes since `v1.0.0`:
 
