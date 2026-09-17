@@ -407,7 +407,12 @@ rest_chaininfo(json) ->
             Network = beamchain_config:network(),
             %% Calculate verification progress (estimate)
             Progress = calculate_sync_progress(Height),
-            Json = #{
+            Floor = case catch beamchain_db:history_floor(Height) of
+                N when is_integer(N), N > 1 -> N;
+                _ -> undefined
+            end,
+            Pruned = beamchain_config:prune_enabled() orelse Floor =/= undefined,
+            Json0 = #{
                 <<"chain">> => atom_to_binary(Network, utf8),
                 <<"blocks">> => Height,
                 <<"headers">> => get_header_count(),
@@ -419,8 +424,12 @@ rest_chaininfo(json) ->
                 <<"initialblockdownload">> => not beamchain_chainstate:is_synced(),
                 <<"chainwork">> => get_chainwork(Hash),
                 <<"size_on_disk">> => get_disk_size(),
-                <<"pruned">> => beamchain_config:prune_enabled()
+                <<"pruned">> => Pruned
             },
+            Json = case Floor of
+                undefined -> Json0;
+                FloorH -> Json0#{<<"pruneheight">> => FloorH}
+            end,
             {ok, json, jsx:encode(Json)};
         not_found ->
             {error, ?HTTP_SERVICE_UNAVAILABLE, <<"Chain not available">>}

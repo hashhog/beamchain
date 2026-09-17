@@ -92,7 +92,7 @@
 %% Pruning
 -export([prune_block_files/0, prune_block_files_manual/1,
          is_block_pruned/1, trigger_pruning/1]).
--export([get_prune_state/0]).
+-export([get_prune_state/0, history_floor/1]).
 %% Exported for cross-module testing of the prune file-eligibility
 %% calculation (CORE-PARITY-AUDIT/_pruning-cross-impl-audit-2026-05-05.md
 %% Bug 1).
@@ -616,6 +616,25 @@ trigger_pruning(Height) ->
 -spec get_prune_state() -> map().
 get_prune_state() ->
     gen_server:call(?SERVER, get_prune_state).
+
+%% @doc Lowest height of the contiguous tip-connected block-BODY range
+%% when the node does not hold bodies from height 1.
+%%
+%% Bitcoin Core's block index is dense from genesis even on a pruned
+%% node — getblockhash(1) always resolves, and pruned/pruneheight
+%% describe missing *bodies*. beamchain snapshot-boot datadirs keep
+%% genesis plus a suffix of bodies and nothing in 1..floor-1. Live
+%% mainnet (2026-09-17): getblock misses at 1 / 500000 / 900000 / 940000
+%% and HAVEs from 960000, while getblockchaininfo claimed pruned:false.
+%%
+%% Returns `undefined` if Tip =:= 0 or height 1 has a body (no prefix
+%% hole). Otherwise the first height in 1..Tip whose body is stored, or
+%% Tip itself if even the tip body is missing.
+%%
+%% Honest-limitation detector only — does not backfill genesis→floor.
+-spec history_floor(non_neg_integer()) -> undefined | pos_integer().
+history_floor(Tip) when is_integer(Tip), Tip >= 0 ->
+    gen_server:call(?SERVER, {history_floor, Tip}, 30000).
 
 %%% ===================================================================
 %%% Direct-write API (bypasses gen_server for hot paths)
@@ -1273,6 +1292,9 @@ handle_call({prune_block_files_manual, TargetHeight}, _From, State) ->
 handle_call({is_block_pruned, Hash}, _From, State) ->
     Result = check_block_pruned(Hash, State),
     {reply, Result, State};
+
+handle_call({history_floor, Tip}, _From, State) ->
+    {reply, compute_history_floor(Tip, State), State};
 
 handle_call(get_prune_state, _From,
             #state{prune_target = TargetBytes,
@@ -2061,6 +2083,45 @@ find_max_height_in_file(FileNum) ->
 update_max_height(Height, undefined) -> Height;
 update_max_height(Height, Current) when Height > Current -> Height;
 update_max_height(_Height, Current) -> Current.
+
+%% @doc First height in 1..Tip whose block BODY is stored, if height 1
+%% has no body. See history_floor/1.
+-spec compute_history_floor(non_neg_integer(), #state{}) ->
+    undefined | pos_integer().
+compute_history_floor(Tip, _State) when Tip =:= 0 ->
+    undefined;
+compute_history_floor(Tip, State) ->
+    case has_body_at(1, State) of
+        true ->
+            undefined;
+        false ->
+            history_floor_search(1, Tip, State)
+    end.
+
+history_floor_search(Lo, Hi, State) when Lo < Hi ->
+    Mid = Lo + (Hi - Lo) div 2,
+    case has_body_at(Mid, State) of
+        true -> history_floor_search(Lo, Mid, State);
+        false -> history_floor_search(Mid + 1, Hi, State)
+    end;
+history_floor_search(Lo, _Hi, _State) ->
+    Lo.
+
+%% True iff the height index has a hash AND CF_BLOCKS holds that body.
+%% An index-only row (headers-first / assumeutxo hole) is not complete.
+-spec has_body_at(non_neg_integer(), #state{}) -> boolean().
+has_body_at(Height, #state{db_handle = Db, cf_blocks = BlocksCF,
+                           cf_block_idx = IdxCF}) ->
+    HeightKey = encode_height(Height),
+    case rocksdb:get(Db, IdxCF, HeightKey, []) of
+        {ok, <<Hash:32/binary, _/binary>>} ->
+            case rocksdb:get(Db, BlocksCF, Hash, []) of
+                {ok, _} -> true;
+                _ -> false
+            end;
+        _ ->
+            false
+    end.
 
 %% @doc Compute the lowest block height whose data is still on disk
 %% (i.e., NOT in the pruned-files set). This is the analogue of Bitcoin

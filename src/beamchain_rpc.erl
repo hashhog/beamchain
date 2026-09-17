@@ -1566,12 +1566,12 @@ rpc_getsyncstate() ->
 
 rpc_getblockchaininfo() ->
     Network = beamchain_config:network(),
-    PruneFields = build_prune_fields(),
     %% NB: Core v31.99 getblockchaininfo emits NEITHER `softforks` (dropped) nor
     %% `compact_filters_enabled` (never a Core field). Both are omitted here for
     %% byte-parity. Deployment/softfork state is available via getdeploymentinfo.
     case beamchain_chainstate:get_tip() of
         {ok, {TipHash, TipHeight}} ->
+            PruneFields = build_prune_fields(TipHeight),
             MTP = beamchain_chainstate:get_mtp(),
             Synced = beamchain_chainstate:is_synced(),
             %% Get chainwork and timestamp from block index
@@ -1630,6 +1630,7 @@ rpc_getblockchaininfo() ->
              replace_all_sentinels(
                jsx:encode(blockchaininfo_assemble(BaseInfo, PruneFields)))};
         not_found ->
+            PruneFields = build_prune_fields(0),
             BaseInfo = [
                 {<<"chain">>, network_name(Network)},
                 {<<"blocks">>, 0},
@@ -1695,31 +1696,49 @@ size_on_disk_file(Path) ->
 %% Returns an ORDERED proplist so the caller can ++ it inline into the
 %% getblockchaininfo result without disturbing key order. Core pushKV order:
 %% pruned, [pruneheight, automatic_pruning, prune_target_size].
-build_prune_fields() ->
+%%
+%% SNAPSHOT-BOOT HOLE: `-prune` off is not the same as "holds the full
+%% chain". A datadir that does not retain bodies from height 1 must still
+%% report pruned=true and pruneheight=first complete body. Do not invent
+%% prune_target_size / automatic_pruning when `-prune` is off.
+build_prune_fields(TipHeight) ->
     try beamchain_db:get_prune_state() of
-        #{enabled := false} ->
-            [{<<"pruned">>, false}];
-        #{enabled := true,
-          manual_mode := ManualMode,
-          automatic_pruning := AutoPruning,
-          target_bytes := TargetBytes,
-          prune_height := PruneHeight} ->
-            Base = [
-                {<<"pruned">>,            true},
-                {<<"pruneheight">>,       PruneHeight},
-                {<<"automatic_pruning">>, AutoPruning}
-            ],
-            %% Match Core: prune_target_size is reported only when an
-            %% automatic target is configured (i.e. NOT manual-only mode).
-            case ManualMode of
-                true  -> Base;
-                false -> Base ++ [{<<"prune_target_size">>, TargetBytes}]
-            end
+        PruneState ->
+            Floor = case catch beamchain_db:history_floor(TipHeight) of
+                N when is_integer(N), N > 1 -> N;
+                _ -> undefined
+            end,
+            assemble_prune_fields(PruneState, Floor)
     catch
         _:_ ->
             %% Defensive: if the db gen_server is busy / down, surface
             %% a "not pruned" answer rather than blocking the RPC call.
             [{<<"pruned">>, false}]
+    end.
+
+assemble_prune_fields(#{enabled := false}, undefined) ->
+    [{<<"pruned">>, false}];
+assemble_prune_fields(#{enabled := false}, Floor) ->
+    [{<<"pruned">>, true}, {<<"pruneheight">>, Floor}];
+assemble_prune_fields(#{enabled := true,
+                        manual_mode := ManualMode,
+                        automatic_pruning := AutoPruning,
+                        target_bytes := TargetBytes,
+                        prune_height := PruneHeight0}, Floor) ->
+    PruneHeight = case Floor of
+        undefined -> PruneHeight0;
+        _ -> erlang:max(PruneHeight0, Floor)
+    end,
+    Base = [
+        {<<"pruned">>,            true},
+        {<<"pruneheight">>,       PruneHeight},
+        {<<"automatic_pruning">>, AutoPruning}
+    ],
+    %% Match Core: prune_target_size is reported only when an
+    %% automatic target is configured (i.e. NOT manual-only mode).
+    case ManualMode of
+        true  -> Base;
+        false -> Base ++ [{<<"prune_target_size">>, TargetBytes}]
     end.
 
 %% getdeploymentinfo ( "blockhash" )
@@ -1923,12 +1942,28 @@ rpc_getblockhash([Height]) when is_integer(Height), not (Height >= -2147483648
     %% reaches the -8 domain test below.
     {error, ?RPC_MISC_ERROR, <<"JSON integer out of range">>};
 rpc_getblockhash([Height]) when is_integer(Height), Height >= 0 ->
-    case beamchain_db:get_block_index(Height) of
-        {ok, #{hash := Hash}} ->
-            {ok, hash_to_hex(Hash)};
-        not_found ->
+    %% Core: `nHeight < 0 || nHeight > active_chain.Height()` → -8
+    %% "Block height out of range" (rpc/blockchain.cpp::getblockhash).
+    %% A height inside 0..=tip that we simply do not retain is NOT a
+    %% bad parameter — Core would still return the hash because its
+    %% index is dense. beamchain's assumeutxo hole (missing index row)
+    %% is the latter; -8 there reads as "the caller asked for a height
+    %% that cannot exist". Use Core's pruned-data wording instead.
+    case rpc_tip_height() of
+        {ok, Tip} when Height > Tip ->
             {error, ?RPC_INVALID_PARAMETER,
-             <<"Block height out of range">>}
+             <<"Block height out of range">>};
+        TipAns ->
+            case beamchain_db:get_block_index(Height) of
+                {ok, #{hash := Hash}} ->
+                    {ok, hash_to_hex(Hash)};
+                not_found when TipAns =/= not_found ->
+                    {error, ?RPC_MISC_ERROR,
+                     <<"Block not available (pruned data)">>};
+                not_found ->
+                    {error, ?RPC_INVALID_PARAMETER,
+                     <<"Block height out of range">>}
+            end
     end;
 rpc_getblockhash([Height]) when is_integer(Height) ->
     %% Core getblockhash: a negative (i.e. out-of-range) height ->
@@ -1937,6 +1972,26 @@ rpc_getblockhash([Height]) when is_integer(Height) ->
     {error, ?RPC_INVALID_PARAMETER, <<"Block height out of range">>};
 rpc_getblockhash(_) ->
     {error, ?RPC_INVALID_PARAMS, <<"Usage: getblockhash height">>}.
+
+%% Best-effort tip height for getblockhash's in-range vs OOR split.
+%% Chainstate ETS first; durable db chain_tip if the gen_server / table
+%% is not up. `not_found` keeps the pre-fix missing-index → -8 behaviour
+%% so conversion-only eunit (no backend) is unchanged.
+rpc_tip_height() ->
+    try beamchain_chainstate:get_tip() of
+        {ok, {_, H}} when is_integer(H) -> {ok, H};
+        _ -> rpc_db_tip_height()
+    catch
+        _:_ -> rpc_db_tip_height()
+    end.
+
+rpc_db_tip_height() ->
+    try beamchain_db:get_chain_tip() of
+        {ok, #{height := H}} when is_integer(H) -> {ok, H};
+        _ -> not_found
+    catch
+        _:_ -> not_found
+    end.
 
 rpc_getblock([HashHex]) ->
     rpc_getblock([HashHex, 1]);
@@ -1983,7 +2038,17 @@ rpc_getblock_lookup(Hash, Verbosity) ->
                      <<"Invalid verbosity value">>}
             end;
         not_found ->
-            {error, ?RPC_INVALID_ADDRESS_OR_KEY, <<"Block not found">>}
+            %% Index present but body gone: Core GetBlockChecked
+            %% (rpc/blockchain.cpp) throws RPC_MISC_ERROR "Block not
+            %% available (pruned data)". A hash the node has never
+            %% seen stays -5 "Block not found".
+            case catch beamchain_db:get_block_index_by_hash(Hash) of
+                {ok, _} ->
+                    {error, ?RPC_MISC_ERROR,
+                     <<"Block not available (pruned data)">>};
+                _ ->
+                    {error, ?RPC_INVALID_ADDRESS_OR_KEY, <<"Block not found">>}
+            end
     end.
 
 rpc_getblockheader([HashHex]) ->

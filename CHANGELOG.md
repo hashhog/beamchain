@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fix: getblockchaininfo reports pruned:true + pruneheight when historical block bodies are absent (snapshot-boot hole); getblockhash of an in-range unretained height is -1 not -8
 - docs: CHARTER proof bundle (`proof/`; `bash proof/verify.sh`)
 
 ## v1.0.2 — 2026-09-17
