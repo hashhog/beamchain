@@ -181,6 +181,11 @@
     locked         :: boolean(),            %% true if wallet is locked (keys unavailable)
     encrypted_seed :: binary() | undefined, %% AES-256-CBC encrypted seed
     encryption_salt :: binary() | undefined, %% 16-byte salt for PBKDF2
+    %% HMAC-SHA256(MacKey, encrypted_seed). AES-CBC decrypt of a wrong
+    %% key does not fail, and unvalidated PKCS#7 unpad accepted ~13% of
+    %% those decrypts as a seed (walletpassphrase returned ok). Absent on
+    %% wallets encrypted before this field existed.
+    encryption_mac = undefined :: binary() | undefined,
     lock_timer_ref :: reference() | undefined,  %% auto-lock timer reference
     %% Locked coins (lockunspent / listlockunspent).  Memory-only set of
     %% {Txid, Vout} pairs that coin selection must skip.  Mirrors Core's
@@ -561,6 +566,7 @@ init([WalletName]) when is_binary(WalletName) ->
         locked       = false,
         encrypted_seed = undefined,
         encryption_salt = undefined,
+        encryption_mac = undefined,
         lock_timer_ref = undefined
     },
     %% Restart-persistence (requirements 2-4): auto-load the default
@@ -1974,7 +1980,8 @@ save_wallet(#wallet_state{addresses = Addrs,
                            next_receive = NextRecv, next_change = NextChg,
                            passphrase = Passphrase, wallet_file = File,
                            encrypted = Encrypted, encrypted_seed = EncSeed,
-                           encryption_salt = EncSalt, seed = Seed,
+                           encryption_salt = EncSalt, encryption_mac = EncMac,
+                           seed = Seed,
                            last_synced_height = LastSynced,
                            private_keys_enabled = PrivKeysEnabled}) ->
     %% For encrypted wallets, save the encrypted seed
@@ -1989,11 +1996,15 @@ save_wallet(#wallet_state{addresses = Addrs,
     },
     WalletData = case Encrypted of
         true ->
-            Common#{
+            Encoded = Common#{
                 <<"encrypted">>       => true,
                 <<"encrypted_seed">>  => hex_encode(EncSeed),
                 <<"encryption_salt">> => hex_encode(EncSalt)
-            };
+            },
+            case EncMac of
+                undefined -> Encoded;
+                _ -> Encoded#{<<"encryption_mac">> => hex_encode(EncMac)}
+            end;
         false ->
             Common#{<<"seed">> => hex_encode(Seed)}
     end,
@@ -2109,13 +2120,18 @@ apply_loaded_wallet(WalletData, FilePath, Passphrase, State) ->
         true ->
             EncSeed = hex_decode(maps:get(<<"encrypted_seed">>, WalletData)),
             EncSalt = hex_decode(maps:get(<<"encryption_salt">>, WalletData)),
+            EncMac = case maps:get(<<"encryption_mac">>, WalletData, undefined) of
+                Hex when is_binary(Hex), Hex =/= <<>> -> hex_decode(Hex);
+                _ -> undefined
+            end,
             Base#wallet_state{
                 master_key      = undefined,
                 seed            = undefined,
                 encrypted       = true,
                 locked          = true,
                 encrypted_seed  = EncSeed,
-                encryption_salt = EncSalt
+                encryption_salt = EncSalt,
+                encryption_mac  = EncMac
             };
         false ->
             Seed = hex_decode(maps:get(<<"seed">>, WalletData)),
@@ -2921,14 +2937,11 @@ hex_decode_str([H1, H2 | Rest], Acc) ->
 do_encrypt_wallet(#wallet_state{seed = Seed} = State, Passphrase) ->
     %% Generate random salt
     Salt = crypto:strong_rand_bytes(?PBKDF2_SALT_SIZE),
-    %% Derive encryption key using PBKDF2-SHA512
-    DerivedKey = derive_encryption_key(Passphrase, Salt),
-    %% Encrypt the seed using AES-256-CBC
-    %% IV is the first 16 bytes of the derived key material
-    <<Key:?AES_KEY_SIZE/binary, IV:?AES_IV_SIZE/binary>> = DerivedKey,
+    {Key, IV, MacKey} = derive_encryption_material(Passphrase, Salt),
     %% PKCS#7 padding for 32-byte seed to align to 16-byte block
     PaddedSeed = pkcs7_pad(Seed, 16),
     EncryptedSeed = crypto:crypto_one_time(aes_256_cbc, Key, IV, PaddedSeed, true),
+    Mac = crypto:mac(hmac, sha256, MacKey, EncryptedSeed),
     %% Clear the plaintext seed and master key from state
     NewState = State#wallet_state{
         seed = undefined,
@@ -2936,7 +2949,8 @@ do_encrypt_wallet(#wallet_state{seed = Seed} = State, Passphrase) ->
         encrypted = true,
         locked = true,
         encrypted_seed = EncryptedSeed,
-        encryption_salt = Salt
+        encryption_salt = Salt,
+        encryption_mac = Mac
     },
     logger:info("wallet: encrypted with passphrase (~B byte salt)",
                 [byte_size(Salt)]),
@@ -2948,32 +2962,36 @@ do_encrypt_wallet(#wallet_state{seed = Seed} = State, Passphrase) ->
     {ok, #wallet_state{}} | {error, term()}.
 do_unlock_wallet(#wallet_state{encrypted_seed = EncSeed,
                                 encryption_salt = Salt,
+                                encryption_mac = Mac,
                                 lock_timer_ref = OldRef} = State,
                   Passphrase, Timeout) ->
     %% Cancel any existing lock timer
     cancel_lock_timer(OldRef),
-    %% Derive the decryption key
-    DerivedKey = derive_encryption_key(Passphrase, Salt),
-    <<Key:?AES_KEY_SIZE/binary, IV:?AES_IV_SIZE/binary>> = DerivedKey,
-    %% Decrypt the seed
-    try
-        DecryptedPadded = crypto:crypto_one_time(aes_256_cbc, Key, IV, EncSeed, false),
-        Seed = pkcs7_unpad(DecryptedPadded),
-        %% Verify the seed is valid by deriving the master key
-        MasterKey = master_from_seed(Seed),
-        %% Set auto-lock timer
-        TimerRef = erlang:send_after(Timeout * 1000, self(), wallet_lock),
-        NewState = State#wallet_state{
-            seed = Seed,
-            master_key = MasterKey,
-            locked = false,
-            lock_timer_ref = TimerRef
-        },
-        logger:info("wallet: unlocked for ~B seconds", [Timeout]),
-        {ok, NewState}
-    catch
-        _:_ ->
-            {error, wrong_passphrase}
+    {Key, IV, MacKey} = derive_encryption_material(Passphrase, Salt),
+    case hmac_matches(Mac, MacKey, EncSeed) of
+        false ->
+            {error, wrong_passphrase};
+        true ->
+            try
+                DecryptedPadded = crypto:crypto_one_time(
+                    aes_256_cbc, Key, IV, EncSeed, false),
+                Seed = pkcs7_unpad(DecryptedPadded),
+                %% master_from_seed/1 already requires 16..64 bytes; a
+                %% failed guard is treated as wrong_passphrase below.
+                MasterKey = master_from_seed(Seed),
+                TimerRef = erlang:send_after(Timeout * 1000, self(), wallet_lock),
+                NewState = State#wallet_state{
+                    seed = Seed,
+                    master_key = MasterKey,
+                    locked = false,
+                    lock_timer_ref = TimerRef
+                },
+                logger:info("wallet: unlocked for ~B seconds", [Timeout]),
+                {ok, NewState}
+            catch
+                _:_ ->
+                    {error, wrong_passphrase}
+            end
     end.
 
 %% @doc Lock the wallet by clearing the decrypted seed from memory.
@@ -3001,9 +3019,28 @@ cancel_lock_timer(Ref) ->
 %% Returns 48 bytes: 32 for AES key + 16 for IV.
 -spec derive_encryption_key(binary(), binary()) -> binary().
 derive_encryption_key(Passphrase, Salt) ->
-    %% Use crypto:pbkdf2_hmac for key derivation
-    %% Returns 48 bytes: 32 for key + 16 for IV
-    crypto:pbkdf2_hmac(sha512, Passphrase, Salt, ?PBKDF2_ITERATIONS, 48).
+    %% First 48 bytes of dkLen=80 match a standalone dkLen=48 derive
+    %% (SHA-512 PBKDF2 block is 64 bytes). Kept exported for tests.
+    {Key, IV, _MacKey} = derive_encryption_material(Passphrase, Salt),
+    <<Key/binary, IV/binary>>.
+
+%% AES-256 key + IV + HMAC-SHA256 key. First 48 bytes are the historical
+%% derive_encryption_key/2 output so existing ciphertext still decrypts.
+-spec derive_encryption_material(binary(), binary()) ->
+          {binary(), binary(), binary()}.
+derive_encryption_material(Passphrase, Salt) ->
+    <<Key:?AES_KEY_SIZE/binary, IV:?AES_IV_SIZE/binary, MacKey:32/binary>> =
+        crypto:pbkdf2_hmac(sha512, Passphrase, Salt, ?PBKDF2_ITERATIONS, 80),
+    {Key, IV, MacKey}.
+
+hmac_matches(undefined, _MacKey, _EncSeed) ->
+    %% Pre-MAC wallets: fall through to PKCS#7 + seed-length checks.
+    true;
+hmac_matches(Mac, MacKey, EncSeed) when is_binary(Mac) ->
+    Expect = crypto:mac(hmac, sha256, MacKey, EncSeed),
+    byte_size(Mac) =:= byte_size(Expect) andalso crypto:hash_equals(Expect, Mac);
+hmac_matches(_Mac, _MacKey, _EncSeed) ->
+    false.
 
 %% @doc PKCS#7 padding for block cipher.
 -spec pkcs7_pad(binary(), pos_integer()) -> binary().
@@ -3012,9 +3049,23 @@ pkcs7_pad(Data, BlockSize) ->
     Padding = binary:copy(<<PadLen>>, PadLen),
     <<Data/binary, Padding/binary>>.
 
-%% @doc PKCS#7 unpadding.
+%% @doc AES-block PKCS#7 unpad. Padlen 1..16, every padding byte equals
+%% padlen, input a multiple of 16. The previous last-byte-only slice
+%% accepted AES-CBC decrypts of a wrong key as a wallet seed.
 -spec pkcs7_unpad(binary()) -> binary().
-pkcs7_unpad(Data) ->
+pkcs7_unpad(Data) when byte_size(Data) > 0, byte_size(Data) rem 16 =:= 0 ->
     PadLen = binary:last(Data),
-    DataLen = byte_size(Data) - PadLen,
-    binary:part(Data, 0, DataLen).
+    case PadLen >= 1 andalso PadLen =< 16 of
+        false ->
+            error(bad_padding);
+        true ->
+            DataLen = byte_size(Data) - PadLen,
+            <<Plain:DataLen/binary, Padding:PadLen/binary>> = Data,
+            Expected = binary:copy(<<PadLen>>, PadLen),
+            case Padding of
+                Expected -> Plain;
+                _ -> error(bad_padding)
+            end
+    end;
+pkcs7_unpad(_Data) ->
+    error(bad_padding).

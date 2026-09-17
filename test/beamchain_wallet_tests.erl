@@ -389,6 +389,21 @@ pkcs7_padding_test() ->
     Unpadded = beamchain_wallet:pkcs7_unpad(Padded),
     ?assertEqual(Data32, Unpadded).
 
+%% Last-byte-only unpad treated AES-CBC garbage as a seed. Reject it.
+pkcs7_unpad_rejects_invalid_test() ->
+    ?assertError(bad_padding, beamchain_wallet:pkcs7_unpad(<<>>)),
+    ?assertError(bad_padding, beamchain_wallet:pkcs7_unpad(<<1, 2, 3>>)),
+    %% padlen 0 is not PKCS#7
+    ?assertError(bad_padding, beamchain_wallet:pkcs7_unpad(<<0:128>>)),
+    %% padlen 17 is above the AES block size
+    Bad17 = <<0:248, 17>>,
+    ?assertEqual(32, byte_size(Bad17)),
+    ?assertError(bad_padding, beamchain_wallet:pkcs7_unpad(Bad17)),
+    %% padlen 16 but the other padding bytes are not 16
+    BadMix = <<0:248, 16>>,
+    ?assertEqual(32, byte_size(BadMix)),
+    ?assertError(bad_padding, beamchain_wallet:pkcs7_unpad(BadMix)).
+
 %% Test PKCS#7 padding edge case: already aligned
 pkcs7_padding_aligned_test() ->
     %% 16-byte data should pad to 32 bytes (adds full block of padding)
@@ -430,6 +445,18 @@ derive_encryption_key_passphrase_matters_test() ->
     Key1 = beamchain_wallet:derive_encryption_key(Passphrase1, Salt),
     Key2 = beamchain_wallet:derive_encryption_key(Passphrase2, Salt),
     ?assertNotEqual(Key1, Key2).
+
+%% Wrong passphrase must return {error,_}, never ok (AES-CBC decrypt of a
+%% wrong key is not an error; HMAC + PKCS#7 must reject it).
+wrong_passphrase_rejected_test() ->
+    {ok, Pid} = beamchain_wallet:start_link(<<"test_wrong_pass">>),
+    Seed = crypto:strong_rand_bytes(32),
+    {ok, _} = gen_server:call(Pid, {create, Seed, undefined}),
+    ok = gen_server:call(Pid, {encryptwallet, <<"testpassphrase">>}),
+    ?assertEqual({error, wrong_passphrase},
+                 gen_server:call(Pid, {walletpassphrase, <<"wrong">>, 60})),
+    ok = gen_server:call(Pid, {walletpassphrase, <<"testpassphrase">>, 60}),
+    gen_server:stop(Pid).
 
 %%% -------------------------------------------------------------------
 %%% Multi-wallet tests
