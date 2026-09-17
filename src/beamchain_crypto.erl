@@ -14,7 +14,7 @@
 
 %% Recoverable ECDSA (BIP137 / Bitcoin signed messages)
 -export([ecdsa_sign_recoverable/2, ecdsa_recover/3,
-         message_hash/1, sign_message/2, verify_message/3]).
+         message_hash/1, sign_message/2, sign_message/3, verify_message/3]).
 
 %% Public key operations (NIF-backed)
 -export([pubkey_from_privkey/1, pubkey_tweak_add/2,
@@ -413,16 +413,26 @@ message_hash(Message) when is_binary(Message) ->
     hash256(Buf).
 
 %% @doc Sign a UTF-8 message with SecKey32 and produce the base-64
-%% encoded signature used by Bitcoin's signmessage RPC. Always emits
-%% a 65-byte signature with the compressed-key header byte
-%% (27 + recid + 4).
+%% encoded signature used by Bitcoin's signmessage RPC. The 2-arity
+%% form emits a compressed-key header (27 + recid + 4). The 3-arity
+%% form takes the WIF compression flag: uncompressed keys use
+%% 27 + recid (Core signmessage.cpp / key.cpp CompactSignature).
 -spec sign_message(Message :: binary() | string(), SecKey :: binary()) ->
     {ok, binary()} | {error, term()}.
-sign_message(Message, SecKey) when byte_size(SecKey) =:= 32 ->
+sign_message(Message, SecKey) ->
+    sign_message(Message, SecKey, true).
+
+-spec sign_message(Message :: binary() | string(), SecKey :: binary(),
+                   Compressed :: boolean()) ->
+    {ok, binary()} | {error, term()}.
+sign_message(Message, SecKey, Compressed) when byte_size(SecKey) =:= 32 ->
     Hash = message_hash(Message),
     case ecdsa_sign_recoverable(Hash, SecKey) of
         {ok, <<RecId:8, RS:64/binary>>} ->
-            Header = 27 + RecId + 4,
+            Header = 27 + RecId + case Compressed of
+                                      true -> 4;
+                                      false -> 0
+                                  end,
             Sig65 = <<Header:8, RS/binary>>,
             {ok, base64:encode(Sig65)};
         {error, _} = Err ->

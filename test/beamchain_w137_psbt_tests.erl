@@ -728,13 +728,13 @@ gate29_joinpsbts_implemented_test() ->
 
 %%% ===================================================================
 %%% Gate 30 — utxoupdatepsbt RPC.
-%%% MISSING: not implemented — BUG-20.
+%%% FIXED: implemented — T2 R5 (rpc_utxoupdatepsbt/1).
 %%% ===================================================================
 
-gate30_utxoupdatepsbt_not_implemented_test() ->
+gate30_utxoupdatepsbt_implemented_test() ->
     Exports = beamchain_rpc:module_info(exports),
-    ?assertNot(lists:member({rpc_utxoupdatepsbt, 1}, Exports)),
-    ?assertNot(lists:member({rpc_utxoupdatepsbt, 2}, Exports)).
+    ?assert(lists:member({rpc_utxoupdatepsbt, 1}, Exports)),
+    ?assertMatch({error, _, _}, beamchain_rpc:rpc_utxoupdatepsbt([])).
 
 %%% ===================================================================
 %%% Supplementary: cross-pipeline coverage (BUG-5 dead-impl in wallet)

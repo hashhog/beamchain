@@ -14,7 +14,8 @@
 
 %% High-level address functions
 -export([script_to_address/2, address_to_script/2,
-         classify_script/1]).
+         classify_script/1,
+         invalid_address_error/2]).
 
 %% Bit conversion helpers (exported for testing)
 -export([convert_bits/4]).
@@ -159,6 +160,38 @@ address_to_script(Address, Network) ->
                 {ok, {Version, Payload}} ->
                     address_version_to_script(Version, Payload, Network);
                 {error, _} = E -> E
+            end
+    end.
+
+%% Core key_io.cpp DecodeDestination error_str for a string that is NOT
+%% a valid destination. Used by validateaddress's invalid branch.
+-spec invalid_address_error(string(), network()) -> binary().
+invalid_address_error(Address, Network) ->
+    Hrp = case Network of
+              mainnet  -> "bc";
+              testnet  -> "tb";
+              testnet4 -> "tb";
+              signet   -> "tb";
+              regtest  -> "bcrt"
+          end,
+    Lower = string:lowercase(Address),
+    IsBech32 = lists:prefix(Hrp, Lower),
+    case IsBech32 of
+        true ->
+            <<"Invalid or unsupported Segwit (Bech32) or Base58 encoding.">>;
+        false ->
+            case base58check_decode(Address) of
+                {ok, _} ->
+                    <<"Invalid or unsupported Base58-encoded address.">>;
+                {error, _} ->
+                    case decode_base58_str(Address) of
+                        {ok, _} ->
+                            <<"Invalid checksum or length of Base58 address "
+                              "(P2PKH or P2SH)">>;
+                        {error, _} ->
+                            <<"Invalid or unsupported Segwit (Bech32) or "
+                              "Base58 encoding.">>
+                    end
             end
     end.
 

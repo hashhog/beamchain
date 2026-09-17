@@ -134,6 +134,12 @@
 %% `handle_method(<<"converttopsbt"|"joinpsbts">>, ...)` calls these.
 -export([rpc_converttopsbt/1, rpc_joinpsbts/1]).
 
+%% utxoupdatepsbt / descriptorprocesspsbt / importmempool (T2 R5).
+%% Exported so the W137 gate30 audit-flip and T2 eunit can see the
+%% symbols and drive the handlers offline.
+-export([rpc_utxoupdatepsbt/1, rpc_descriptorprocesspsbt/1,
+         rpc_importmempool/1]).
+
 %% PayJoin RPCs (W119 BUG-1+BUG-2, FIX-66) — exported unconditionally
 %% so the W119 G26/G27 audit gates
 %% (`expect_rpc_method_missing(<<"getpayjoinrequest">>)` and
@@ -947,6 +953,7 @@ handle_method(<<"getorphantxs">>, P, _W) -> rpc_getorphantxs(P);
 handle_method(<<"savemempool">>, _, _W) -> rpc_dumpmempool();
 handle_method(<<"dumpmempool">>, _, _W) -> rpc_dumpmempool();
 handle_method(<<"loadmempool">>, _, _W) -> rpc_loadmempool();
+handle_method(<<"importmempool">>, P, _W) -> rpc_importmempool(P);
 
 %% -- Control --
 handle_method(<<"getmemoryinfo">>, P, _W) -> rpc_getmemoryinfo(P);
@@ -1046,6 +1053,8 @@ handle_method(<<"converttopsbt">>, P, _W) -> rpc_converttopsbt(P);
 handle_method(<<"joinpsbts">>, P, _W) -> rpc_joinpsbts(P);
 handle_method(<<"decodepsbt">>, P, _W) -> rpc_decodepsbt(P);
 handle_method(<<"combinepsbt">>, P, _W) -> rpc_combinepsbt(P);
+handle_method(<<"utxoupdatepsbt">>, P, _W) -> rpc_utxoupdatepsbt(P);
+handle_method(<<"descriptorprocesspsbt">>, P, _W) -> rpc_descriptorprocesspsbt(P);
 handle_method(<<"finalizepsbt">>, P, _W) -> rpc_finalizepsbt(P);
 handle_method(<<"analyzepsbt">>, P, _W) -> rpc_analyzepsbt(P);
 
@@ -1096,6 +1105,9 @@ rpc_help_lines() ->
         <<"getdifficulty">>,
         <<"gettxoutsetinfo ( \"hash_type\" )">>,
         <<"gettxspendingprevout [{\"txid\":\"hex\",\"vout\":n},...] ( {\"mempool_only\":bool,\"return_spending_tx\":bool,...} )">>,
+        <<"gettxoutproof [\"txid\",...] ( \"blockhash\" )">>,
+        <<"verifytxoutproof \"proof\"">>,
+        <<"getindexinfo ( \"index_name\" )">>,
         <<"invalidateblock \"blockhash\"">>,
         <<"reconsiderblock \"blockhash\"">>,
         <<"preciousblock \"blockhash\"">>,
@@ -1105,6 +1117,7 @@ rpc_help_lines() ->
         <<"flushchainstate">>,
         <<"scrubunspendable">>,
         <<"pruneblockchain height">>,
+        <<"scantxoutset \"action\" ( [scanobjects,...] )">>,
         <<"scanblocks \"action\" ( [scanobjects,...] start_height stop_height \"filtertype\" options )">>,
         <<"waitfornewblock ( timeout current_tip )">>,
         <<"waitforblock \"blockhash\" ( timeout )">>,
@@ -1137,6 +1150,7 @@ rpc_help_lines() ->
         <<"getmempoolinfo">>,
         <<"getorphantxs ( verbosity )">>,
         <<"getrawmempool ( verbose )">>,
+        <<"importmempool \"filepath\" ( options )">>,
         <<"loadmempool">>,
         <<"savemempool">>,
         <<"">>,
@@ -1160,9 +1174,11 @@ rpc_help_lines() ->
         <<"== Rawtransactions ==">>,
         <<"analyzepsbt \"psbt\"">>,
         <<"combinepsbt [\"psbt\",...]">>,
+        <<"combinerawtransaction [\"hexstring\",...]">>,
         <<"createpsbt [{\"txid\":\"hex\",\"vout\":n},...] [{\"address\":amount},...] ( locktime )">>,
         <<"createrawtransaction [{\"txid\":\"hex\",\"vout\":n},...] [{\"address\":amount},...] ( locktime replaceable )">>,
         <<"converttopsbt \"hexstring\" ( permitsigdata iswitness )">>,
+        <<"descriptorprocesspsbt \"psbt\" [\"descriptor\",...] ( sighashtype bip32derivs finalize )">>,
         <<"decoderawtransaction \"hexstring\"">>,
         <<"decodepsbt \"psbt\"">>,
         <<"decodescript \"hexstring\"">>,
@@ -1172,6 +1188,7 @@ rpc_help_lines() ->
         <<"sendrawtransaction \"hexstring\"">>,
         <<"submitpackage [\"rawtx\",...] ( maxfeerate maxburnamount )">>,
         <<"testmempoolaccept [\"rawtx\"]">>,
+        <<"utxoupdatepsbt \"psbt\" ( [\"descriptor\",...] )">>,
         <<"">>,
         <<"== Util ==">>,
         <<"createmultisig nrequired [\"key\",...] ( \"address_type\" )">>,
@@ -1389,9 +1406,14 @@ parse_wait_int(V, _Name) ->
 %% type_error_msg/1 — mirror Core UniValue::getInt's
 %% "JSON value of type X is not of expected type number".
 type_error_msg(V) ->
+    type_error_msg(V, <<"number">>).
+
+%% type_error_msg/2 — same UniValue wording for a named expected type
+%% (get_str() -> "string", getInt() -> "number").
+type_error_msg(V, Expected) ->
     TypeName = univalue_type_name(V),
     <<"JSON value of type ", TypeName/binary,
-      " is not of expected type number">>.
+      " is not of expected type ", Expected/binary>>.
 
 univalue_type_name(V) when is_boolean(V) -> <<"bool">>;
 univalue_type_name(V) when is_number(V)  -> <<"number">>;
@@ -2490,10 +2512,15 @@ rpc_scrubunspendable() ->
 %%   * Clamps the effective height to `tip - 288` to preserve the
 %%     reorg-safety window.
 %%   * Returns the height of the last block pruned.
-rpc_pruneblockchain([N]) when is_integer(N), N >= 0 ->
+rpc_pruneblockchain([N]) when is_integer(N) ->
     do_pruneblockchain(N);
-rpc_pruneblockchain([Other]) when is_float(Other), Other >= 0 ->
+rpc_pruneblockchain([Other]) when is_float(Other) ->
     do_pruneblockchain(trunc(Other));
+rpc_pruneblockchain([V]) ->
+    %% Core getInt<int>() type-check fires BEFORE the prune-mode gate
+    %% (rpc/blockchain.cpp pruneblockchain). ["zz"] -> -3 even on an
+    %% unpruned node.
+    {error, ?RPC_TYPE_ERROR, type_error_msg(V)};
 rpc_pruneblockchain(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"Usage: pruneblockchain height_or_unix_timestamp">>}.
@@ -2662,6 +2689,9 @@ do_getblockfilter(HashHex) ->
 %% error).  Empty / omitted arg = all running indices.
 rpc_getindexinfo([]) ->
     rpc_getindexinfo([<<>>]);
+rpc_getindexinfo([V]) when not is_binary(V) ->
+    %% Core get_str() on the optional index_name -> -3.
+    {error, ?RPC_TYPE_ERROR, type_error_msg(V, <<"string">>)};
 rpc_getindexinfo([IndexName]) when is_binary(IndexName) ->
     %% The active-chain tip height: each beamchain index is advanced
     %% synchronously inside the block-connect path (txindex is part of the
@@ -4214,12 +4244,9 @@ build_op_return_script(Data) ->
 %% guaranteed byte-identical to Core. The per-input single-sig pick — the
 %% dominant case — IS byte-identical and is what is verified.
 %%
-%% DEVIATION (flagged): Core resolves every input's prevout from its own UTXO +
-%% mempool CCoinsViewCache and throws RPC_VERIFY_ERROR (-25) "Input not found or
-%% already spent" when a coin is missing/spent. This handler does NOT consult
-%% chainstate — combine is a pure function of the provided variants here — so it
-%% does NOT raise -25 for unresolvable prevouts. The -22 empty / -22 decode-
-%% failure error paths DO match Core byte-for-byte.
+%% Core resolves every input's prevout from its own UTXO + mempool
+%% CCoinsViewCache and throws RPC_VERIFY_ERROR (-25) "Input not found or
+%% already spent" when a coin is missing/spent (rawtransaction.cpp:648).
 rpc_combinerawtransaction([Txs]) when is_list(Txs) ->
     %% 1. Decode every variant (witness-aware). Core: DecodeHexTx per idx; on
     %%    failure -> -22 "TX decode failed for tx %d. ..." (0-based idx). The
@@ -4240,15 +4267,16 @@ rpc_combinerawtransaction([Txs]) when is_list(Txs) ->
                      <<"Missing transactions">>};
                 [Template | _] ->
                     Merged = combine_variants(Template, Variants),
-                    %% Core re-encodes WITH witness (TX_WITH_WITNESS)
-                    %% unconditionally; the encoder only emits the segwit
-                    %% marker/flag when any input carries a non-empty witness
-                    %% (== Core CTransaction::HasWitness). encode_transaction/1
-                    %% picks witness vs no_witness via has_witness/1, so the
-                    %% marker is emitted iff any merged input has a witness.
-                    Hex = beamchain_serialize:hex_encode(
-                            beamchain_serialize:encode_transaction(Merged)),
-                    {ok, Hex}
+                    case combineraw_missing_input(Merged) of
+                        true ->
+                            {error, ?RPC_VERIFY_ERROR,
+                             <<"Input not found or already spent">>};
+                        false ->
+                            %% Core re-encodes WITH witness (TX_WITH_WITNESS).
+                            Hex = beamchain_serialize:hex_encode(
+                                    beamchain_serialize:encode_transaction(Merged)),
+                            {ok, Hex}
+                    end
             end
     end;
 rpc_combinerawtransaction([NonArray | _]) ->
@@ -4259,6 +4287,28 @@ rpc_combinerawtransaction([NonArray | _]) ->
 rpc_combinerawtransaction(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"Usage: combinerawtransaction [\"hexstring\",...]">>}.
+
+%% True when any merged input's prevout is missing from chainstate+mempool.
+%% A down chainstate (eunit, no node) is treated as missing — the R5
+%% unknown-input probe (txid aa*32) must still be -25.
+combineraw_missing_input(#transaction{inputs = Inputs}) ->
+    lists:any(fun(#tx_in{prev_out = #outpoint{hash = H, index = I}}) ->
+                      combineraw_lookup_coin(H, I) =:= not_found
+              end, Inputs).
+
+combineraw_lookup_coin(Hash, Index) ->
+    try beamchain_chainstate:get_utxo(Hash, Index) of
+        {ok, _} = Ok -> Ok;
+        not_found ->
+            try beamchain_mempool:get_mempool_utxo(Hash, Index) of
+                {ok, _} = Ok -> Ok;
+                _ -> not_found
+            catch
+                _:_ -> not_found
+            end
+    catch
+        _:_ -> not_found
+    end.
 
 %% Decode every variant hex into a #transaction{}, accumulating in order.
 %% Returns the list of decoded #transaction{} (in input order) or an
@@ -5486,6 +5536,10 @@ rpc_scantxoutset([<<"status">> | _]) ->
     {ok_raw_json, jsx:encode(null)};
 rpc_scantxoutset([<<"abort">> | _]) ->
     {ok, false};
+rpc_scantxoutset([Action | _]) when is_binary(Action) ->
+    %% Core rpc/blockchain.cpp: "Invalid action '<action>'" (-8).
+    {error, ?RPC_INVALID_PARAMETER,
+     <<"Invalid action '", Action/binary, "'">>};
 rpc_scantxoutset(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"scantxoutset \"action\" ( [scanobjects,...] )">>}.
@@ -5982,9 +6036,13 @@ do_prioritisetransaction(TxidHex, Dummy, FeeDelta) ->
              <<"Priority is no longer supported, dummy argument to "
                "prioritisetransaction must be 0.">>};
         true ->
-            Txid = hex_to_internal_hash(TxidHex),
-            _NewDelta = beamchain_mempool:prioritise_transaction(Txid, FeeDelta),
-            {ok, true}
+            try
+                Txid = parse_hash_v(TxidHex, <<"txid">>),
+                _NewDelta = beamchain_mempool:prioritise_transaction(Txid, FeeDelta),
+                {ok, true}
+            catch
+                throw:{rpc_error, Code, Msg} -> {error, Code, Msg}
+            end
     end.
 
 %% Core treats the dummy as null OR numeric-zero. Accept null, 0, 0.0.
@@ -6163,6 +6221,33 @@ rpc_loadmempool() ->
              list_to_binary(io_lib:format("loadmempool failed: ~p",
                                           [Reason]))}
     end.
+
+%% importmempool "filepath" ( options )
+%% Core rpc/mempool.cpp: a missing/unreadable file is RPC_MISC_ERROR (-1)
+%% "Unable to import mempool file, see debug log for details." and a
+%% successful import returns an empty object.
+rpc_importmempool([Path]) when is_binary(Path) ->
+    rpc_importmempool([Path, #{}]);
+rpc_importmempool([Path, _Opts]) when is_binary(Path) ->
+    File = binary_to_list(Path),
+    case filelib:is_regular(File) of
+        false ->
+            {error, ?RPC_MISC_ERROR,
+             <<"Unable to import mempool file, see debug log for details.">>};
+        true ->
+            case (catch beamchain_mempool_persist:load(File)) of
+                {ok, _} ->
+                    {ok, [{}]};
+                _ ->
+                    {error, ?RPC_MISC_ERROR,
+                     <<"Unable to import mempool file, see debug log for details.">>}
+            end
+    end;
+rpc_importmempool([V | _]) ->
+    {error, ?RPC_TYPE_ERROR, type_error_msg(V, <<"string">>)};
+rpc_importmempool(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"importmempool \"filepath\" ( options )">>}.
 
 %%% ===================================================================
 %%% Network methods
@@ -8123,11 +8208,13 @@ rpc_validateaddress([Address]) when is_binary(Address) ->
             end;
         {error, _} ->
             %% Core invalid branch (rpc/output_script.cpp:79) pushKV order is
-            %% isvalid, error_locations, error.
+            %% isvalid, error_locations, error. error_str comes from
+            %% DecodeDestination (key_io.cpp).
             {ok, [
                 {<<"isvalid">>, false},
                 {<<"error_locations">>, []},
-                {<<"error">>, <<"Invalid or unsupported Segwit (Bech32) or Base58 encoding.">>}
+                {<<"error">>,
+                 beamchain_address:invalid_address_error(AddrStr, NetType)}
             ]}
     end;
 rpc_validateaddress(_) ->
@@ -8136,11 +8223,12 @@ rpc_validateaddress(_) ->
 
 rpc_decodescript([HexStr]) when is_binary(HexStr) ->
     try
-        Script = beamchain_serialize:hex_decode(HexStr),
+        Script = parse_hex_v(HexStr, <<"argument">>),
         Network = beamchain_config:network(),
         NetType = Network,
         {ok, ds_build_result(Script, NetType)}
     catch
+        throw:{rpc_error, Code, Msg} -> {error, Code, Msg};
         _:_ ->
             {error, ?RPC_DESERIALIZATION_ERROR,
              <<"Script decode failed">>}
@@ -8301,12 +8389,19 @@ ds_build_result(Script, NetType) ->
 rpc_signmessagewithprivkey([WifKey, Message])
   when is_binary(WifKey), is_binary(Message) ->
     case wif_to_privkey(WifKey) of
-        {ok, {PrivKey, _Compressed}} ->
-            case beamchain_crypto:sign_message(Message, PrivKey) of
-                {ok, B64} -> {ok, B64};
-                {error, _} ->
+        {ok, {PrivKey, Compressed}} ->
+            case PrivKey =:= <<0:256>> of
+                true ->
                     {error, ?RPC_INVALID_ADDRESS_OR_KEY,
-                     <<"Sign failed">>}
+                     <<"Invalid private key">>};
+                false ->
+                    case beamchain_crypto:sign_message(Message, PrivKey,
+                                                       Compressed) of
+                        {ok, B64} -> {ok, B64};
+                        {error, _} ->
+                            {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+                             <<"Invalid private key">>}
+                    end
             end;
         {error, _} ->
             {error, ?RPC_INVALID_ADDRESS_OR_KEY,
@@ -8525,6 +8620,23 @@ is_hex_string(<<C, Rest/binary>>)
     is_hex_string(Rest);
 is_hex_string(_) ->
     false.
+
+%% ParseHexV — Core rpc/util.cpp ParseHexV. A non-hex (or odd-length)
+%% string is RPC_INVALID_PARAMETER (-8)
+%% "<name> must be hexadecimal string (not '<hex>')". Empty is not hex.
+parse_hex_v(HexStr, Name) when is_binary(HexStr) ->
+    case is_hex_string(HexStr) andalso (byte_size(HexStr) rem 2 =:= 0)
+         andalso byte_size(HexStr) > 0 of
+        true ->
+            beamchain_serialize:hex_decode(HexStr);
+        false ->
+            throw({rpc_error, ?RPC_INVALID_PARAMETER,
+                   <<Name/binary, " must be hexadecimal string (not '",
+                     HexStr/binary, "')">>})
+    end;
+parse_hex_v(_NotBinary, Name) ->
+    throw({rpc_error, ?RPC_INVALID_PARAMETER,
+           <<Name/binary, " must be hexadecimal string (not '')">>}).
 
 network_name(mainnet)  -> <<"main">>;
 network_name(testnet)  -> <<"test">>;
@@ -11748,6 +11860,8 @@ rpc_signrawtransactionwithkey([HexStr, WifKeys, PrevTxs])
         end,
         {ok, Result}
     catch
+        throw:{invalid_key, Msg} ->
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY, Msg};
         _:Err ->
             {error, ?RPC_DESERIALIZATION_ERROR,
              iolist_to_binary(io_lib:format("TX decode failed: ~p", [Err]))}
@@ -11762,26 +11876,29 @@ rpc_signrawtransactionwithkey(_) ->
        "( [{\"txid\":\"hex\",\"vout\":n,\"scriptPubKey\":\"hex\",...},...] "
        "\"sighashtype\" )">>}.
 
-%% Decode the WIF list into a keystore of derived key material. Invalid
-%% WIFs are silently skipped (Core: ParseWIFs ignores entries it can't
-%% decode and the input simply stays unsigned -> an errors[] entry).
+%% Decode the WIF list into a keystore of derived key material. Core
+%% DecodeSecret on any invalid entry throws RPC_INVALID_ADDRESS_OR_KEY
+%% "Invalid private key" (rawtransaction.cpp signrawtransactionwithkey).
 build_wif_keystore(WifKeys) ->
-    lists:filtermap(
+    lists:map(
         fun(Wif) when is_binary(Wif) ->
                 case wif_to_privkey(Wif) of
+                    {ok, {Priv, _Compressed}} when Priv =:= <<0:256>> ->
+                        throw({invalid_key, <<"Invalid private key">>});
                     {ok, {Priv, _Compressed}} ->
-                        try
-                            {ok, PubKey} =
-                                beamchain_crypto:pubkey_from_privkey(Priv),
-                            Pkh = beamchain_crypto:hash160(PubKey),
-                            <<_Prefix:8, XOnly:32/binary>> = PubKey,
-                            {true, {Priv, PubKey, Pkh, XOnly}}
-                        catch
-                            _:_ -> false
+                        case beamchain_crypto:pubkey_from_privkey(Priv) of
+                            {ok, PubKey} ->
+                                Pkh = beamchain_crypto:hash160(PubKey),
+                                <<_Prefix:8, XOnly:32/binary>> = PubKey,
+                                {Priv, PubKey, Pkh, XOnly};
+                            _ ->
+                                throw({invalid_key, <<"Invalid private key">>})
                         end;
-                    _ -> false
+                    _ ->
+                        throw({invalid_key, <<"Invalid private key">>})
                 end;
-           (_) -> false
+           (_) ->
+                throw({invalid_key, <<"Invalid private key">>})
         end, WifKeys).
 
 %% Sign a single input with a matching key from the temporary keystore.
@@ -12523,81 +12640,16 @@ rpc_importprivkey(_, _) ->
 %%% ===================================================================
 
 %% @doc Create a PSBT from inputs and outputs.
-%% createpsbt [{"txid":"hex","vout":n},...] [{"address":amount},...] (locktime)
-rpc_createpsbt([Inputs, Outputs]) ->
-    rpc_createpsbt([Inputs, Outputs, 0, undefined, undefined]);
-rpc_createpsbt([Inputs, Outputs, Locktime]) when is_list(Inputs) ->
-    rpc_createpsbt([Inputs, Outputs, Locktime, undefined, undefined]);
-rpc_createpsbt([Inputs, Outputs, Locktime, Replaceable]) when is_list(Inputs) ->
-    rpc_createpsbt([Inputs, Outputs, Locktime, Replaceable, undefined]);
 %% Core builds createpsbt from the SAME ConstructTransaction as
-%% createrawtransaction, so it takes the same 5th `version` argument
-%% (rpc/rawtransaction.cpp:1642).  There was no clause for it here either.
-rpc_createpsbt([Inputs, Outputs, Locktime, _Replaceable, Version0]) when is_list(Inputs),
-                                                   is_list(Outputs) ->
-    try
-        Network = beamchain_config:network(),
-        %% Build transaction inputs
-        TxIns = lists:map(fun(InputObj) ->
-            TxidHex = maps:get(<<"txid">>, InputObj),
-            Vout = maps:get(<<"vout">>, InputObj),
-            Txid = hex_to_internal_hash(TxidHex),
-            Seq = maps:get(<<"sequence">>, InputObj, 16#fffffffd),
-            #tx_in{
-                prev_out = #outpoint{hash = Txid, index = Vout},
-                script_sig = <<>>,
-                sequence = Seq,
-                witness = []
-            }
-        end, Inputs),
-        %% Build transaction outputs
-        TxOuts = lists:flatmap(fun(OutputObj) ->
-            maps:fold(fun(AddrBin, Amount, Acc) ->
-                Address = binary_to_list(AddrBin),
-                {ok, Script} = beamchain_address:address_to_script(Address, Network),
-                Satoshis = btc_to_satoshi(Amount),
-                [#tx_out{value = Satoshis, script_pubkey = Script} | Acc]
-            end, [], OutputObj)
-        end, Outputs),
-        %% Create unsigned transaction
-        PsbtVersion = parse_createraw_version(Version0),
-        %% Core builds createpsbt from the SAME ConstructTransaction as
-        %% createrawtransaction, so locktime is bounded to [0, LOCKTIME_MAX]
-        %% here too.  Taking it raw meant 4294967296 reached the serializer and
-        %% the caller got a SUCCESS reply describing a transaction it had not
-        %% asked for.
-        Tx = #transaction{
-            version = PsbtVersion,
-            inputs = TxIns,
-            outputs = TxOuts,
-            locktime = parse_createraw_locktime(Locktime)
-        },
-        %% Create PSBT
-        case beamchain_psbt:create(Tx) of
-            {ok, Psbt} ->
-                PsbtBin = beamchain_psbt:encode(Psbt),
-                PsbtB64 = base64:encode(PsbtBin),
-                {ok, PsbtB64};
-            {error, Reason} ->
-                {error, ?RPC_MISC_ERROR,
-                 iolist_to_binary(io_lib:format("PSBT creation failed: ~p", [Reason]))}
-        end
-    catch
-        %% Same two clauses createrawtransaction already carried: without them
-        %% a Core-shaped rejection from the SHARED argument parsers surfaced as
-        %% -32602 wrapping a raw Erlang term instead of Core's own code and
-        %% message.
-        throw:{invalid_parameter, PMsg} ->
-            {error, ?RPC_INVALID_PARAMETER, PMsg};
-        throw:{misc_error, MMsg} ->
-            {error, ?RPC_MISC_ERROR, MMsg};
-        _:Err ->
-            {error, ?RPC_INVALID_PARAMS,
-             iolist_to_binary(io_lib:format("Invalid parameters: ~p", [Err]))}
-    end;
-rpc_createpsbt(_) ->
-    {error, ?RPC_INVALID_PARAMS,
-     <<"createpsbt [{\"txid\":\"hex\",\"vout\":n},...] [{\"address\":amount},...] (locktime)">>}.
+%% createrawtransaction (rpc/rawtransaction.cpp:1642), then wraps the
+%% unsigned tx in a blank PSBT (converttopsbt of that hex).
+rpc_createpsbt(Args) ->
+    case rpc_createrawtransaction(Args) of
+        {ok, Hex} ->
+            rpc_converttopsbt([Hex]);
+        {error, _, _} = Err ->
+            Err
+    end.
 
 %% converttopsbt "hexstring" ( permitsigdata iswitness )
 %%
@@ -12802,6 +12854,8 @@ rpc_decodepsbt(_) ->
     {error, ?RPC_INVALID_PARAMS, <<"decodepsbt \"psbt\"">>}.
 
 %% @doc Combine multiple PSBTs into one.
+rpc_combinepsbt([[]]) ->
+    {error, ?RPC_INVALID_PARAMETER, <<"Parameter 'txs' cannot be empty">>};
 rpc_combinepsbt([Psbts]) when is_list(Psbts) ->
     try
         DecodedPsbts = lists:map(fun(PsbtB64) ->
@@ -12866,13 +12920,12 @@ rpc_finalizepsbt([PsbtB64, Extract]) when is_binary(PsbtB64) ->
                                     <<"complete">> => true
                                 }}
                         end;
-                    {error, Reason} ->
-                        %% Return incomplete PSBT
+                    {error, _Reason} ->
+                        %% Core finalizepsbt incomplete: {psbt, complete:false}
+                        %% with no error field (rawtransaction.cpp:1608-1613).
                         {ok, #{
                             <<"psbt">> => PsbtB64,
-                            <<"complete">> => false,
-                            <<"error">> => iolist_to_binary(
-                                io_lib:format("~p", [Reason]))
+                            <<"complete">> => false
                         }}
                 end;
             {error, Reason} ->
@@ -12919,13 +12972,124 @@ rpc_analyzepsbt([PsbtB64]) when is_binary(PsbtB64) ->
     catch
         error:badarg ->
             {error, ?RPC_DESERIALIZATION_ERROR,
-             <<"TX decode failed Invalid base64 encoding">>};
-        _:Err ->
-            {error, ?RPC_MISC_ERROR,
-             iolist_to_binary(io_lib:format("Error: ~p", [Err]))}
+             <<"TX decode failed">>};
+        _:_Err ->
+            {error, ?RPC_DESERIALIZATION_ERROR, <<"TX decode failed">>}
     end;
 rpc_analyzepsbt(_) ->
     {error, ?RPC_INVALID_PARAMS, <<"analyzepsbt \"psbt\"">>}.
+
+%% utxoupdatepsbt "psbt" ( descriptors )
+%% Fill segwit inputs from the UTXO set / mempool. Unknown inputs pass
+%% through unchanged (Core ProcessPSBT with hide_secret).
+rpc_utxoupdatepsbt([PsbtB64 | _Rest]) when is_binary(PsbtB64) ->
+    case decode_psbt_rpc(PsbtB64) of
+        {error, _, _} = Err ->
+            Err;
+        {ok, Psbt} ->
+            Tx = beamchain_psbt:get_unsigned_tx(Psbt),
+            Updated = utxoupdate_fill(Psbt, Tx#transaction.inputs, 0),
+            {ok, base64:encode(beamchain_psbt:encode(Updated))}
+    end;
+rpc_utxoupdatepsbt(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"utxoupdatepsbt \"psbt\" ( [\"descriptor\",...] )">>}.
+
+utxoupdate_fill(Psbt, [], _Idx) ->
+    Psbt;
+utxoupdate_fill(Psbt, [#tx_in{prev_out = #outpoint{hash = H, index = I}} | Rest],
+                Idx) ->
+    InMap0 = beamchain_psbt:get_input(Psbt, Idx),
+    InMap = case InMap0 of
+                undefined -> #{};
+                M -> M
+            end,
+    HasUtxo = maps:is_key(witness_utxo, InMap)
+              orelse maps:is_key(non_witness_utxo, InMap),
+    NewPsbt =
+        case HasUtxo of
+            true ->
+                Psbt;
+            false ->
+                case combineraw_lookup_coin(H, I) of
+                    {ok, #utxo{value = V, script_pubkey = SPK}} ->
+                        case is_witness_spk(SPK) of
+                            true ->
+                                beamchain_psbt:set_input(
+                                  Psbt, Idx,
+                                  InMap#{witness_utxo => {V, SPK}});
+                            false ->
+                                Psbt
+                        end;
+                    _ ->
+                        Psbt
+                end
+        end,
+    utxoupdate_fill(NewPsbt, Rest, Idx + 1).
+
+is_witness_spk(<<Op, Len, Rest/binary>>)
+  when (Op =:= 0 orelse (Op >= 16#51 andalso Op =< 16#60)),
+       Len >= 2, Len =< 40,
+       byte_size(Rest) =:= Len ->
+    true;
+is_witness_spk(_) ->
+    false.
+
+decode_psbt_rpc(PsbtB64) ->
+    try
+        case beamchain_psbt:decode(base64:decode(PsbtB64)) of
+            {ok, P} -> {ok, P};
+            {error, _} ->
+                {error, ?RPC_DESERIALIZATION_ERROR, <<"TX decode failed">>}
+        end
+    catch
+        _:_ ->
+            {error, ?RPC_DESERIALIZATION_ERROR, <<"TX decode failed">>}
+    end.
+
+%% descriptorprocesspsbt "psbt" [descriptors] ( sighashtype bip32derivs finalize )
+%% Invalid descriptors are -5 (EvalDescriptorStringOrObject). Without a
+%% resolvable UTXO the PSBT cannot be signed, so complete=false.
+rpc_descriptorprocesspsbt([PsbtB64, Descs | _Rest])
+  when is_binary(PsbtB64), is_list(Descs) ->
+    case decode_psbt_rpc(PsbtB64) of
+        {error, _, _} = Err ->
+            Err;
+        {ok, Psbt} ->
+            case parse_psbt_descriptors(Descs) of
+                {error, _, _} = Err ->
+                    Err;
+                ok ->
+                    {ok, #{<<"psbt">> =>
+                               base64:encode(beamchain_psbt:encode(Psbt)),
+                           <<"complete">> => false}}
+            end
+    end;
+rpc_descriptorprocesspsbt(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"descriptorprocesspsbt \"psbt\" [\"descriptor\",...] "
+       "( sighashtype bip32derivs finalize )">>}.
+
+parse_psbt_descriptors([]) ->
+    ok;
+parse_psbt_descriptors([D | Rest]) when is_binary(D) ->
+    case beamchain_descriptor:parse(D) of
+        {ok, _} ->
+            parse_psbt_descriptors(Rest);
+        {error, _} ->
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY, <<"Invalid descriptor">>}
+    end;
+parse_psbt_descriptors([M | Rest]) when is_map(M) ->
+    case maps:get(<<"desc">>, M, undefined) of
+        D when is_binary(D) ->
+            parse_psbt_descriptors([D | Rest]);
+        _ ->
+            {error, ?RPC_INVALID_PARAMETER,
+             <<"Descriptor needs to be provided in scan object">>}
+    end;
+parse_psbt_descriptors(_) ->
+    {error, ?RPC_INVALID_PARAMETER,
+     <<"Scan object needs to be either a string or an object">>}.
 
 %% Build the analyzepsbt response object. Pure function, exposed via
 %% rpc_analyzepsbt; no side effects so eunit can call it directly.
@@ -14579,6 +14743,8 @@ rpc_createmultisig(_) ->
 %% Parse and validate pubkeys, then build the output.
 cm_parse_keys(NRequired, Keys, AddrType) ->
     case cm_validate_keys(Keys, []) of
+        {error, _, _} = Err ->
+            Err;
         {error, _} = Err ->
             Err;
         {ok, PubKeys} ->
@@ -14591,7 +14757,7 @@ cm_parse_keys(NRequired, Keys, AddrType) ->
                               "not enough keys supplied (got ~b keys, "
                               "but need at least ~b to redeem)",
                               [NKeys, NRequired])),
-                    {error, ?RPC_INVALID_PARAMS, Msg};
+                    {error, ?RPC_INVALID_PARAMETER, Msg};
                 NKeys > 16 ->
                     {error, ?RPC_INVALID_PARAMS,
                      <<"Number of keys involved in the multisignature address "
@@ -14608,6 +14774,8 @@ cm_validate_keys([HexKey | Rest], Acc) when is_binary(HexKey) ->
     case cm_hex_to_pubkey(HexKey) of
         {ok, PubKeyBin} ->
             cm_validate_keys(Rest, [PubKeyBin | Acc]);
+        {error, _, _} = Err ->
+            Err;
         {error, _} = Err ->
             Err
     end;
@@ -14757,31 +14925,37 @@ cm_address_and_desc(<<"p2sh-segwit">>, RedeemScript, MultiInner, Network) ->
 
 %% deriveaddresses "descriptor" ( range )
 %% Derives one or more addresses from an output descriptor.
-rpc_deriveaddresses([DescStr]) ->
-    %% Non-ranged descriptor: derive single address
-    rpc_deriveaddresses([DescStr, 0]);
+%% Core Parse(..., require_checksum=true) -> -5 Missing checksum;
+%% a range on an un-ranged descriptor is -8.
+rpc_deriveaddresses([DescStr]) when is_binary(DescStr) ->
+    rpc_deriveaddresses_do(DescStr, undefined);
 rpc_deriveaddresses([DescStr, Range]) when is_binary(DescStr) ->
-    Network = beamchain_config:network(),
-    try
-        case beamchain_descriptor:parse(binary_to_list(DescStr)) of
-            {ok, Desc} ->
-                %% Bitcoin Core does NOT gate deriveaddresses on IsSolvable().
-                %% addr() and raw() are not solvable but can still expand to
-                %% a known script (and thus a known address).  Only reject if
-                %% Expand itself fails (e.g. ranged descriptor without keys).
-                derive_addresses_range(Desc, Range, Network);
-            {error, Reason} ->
-                {error, ?RPC_INVALID_PARAMETER,
-                 iolist_to_binary(io_lib:format("Invalid descriptor: ~p", [Reason]))}
-        end
-    catch
-        _:Err ->
-            {error, ?RPC_MISC_ERROR,
-             iolist_to_binary(io_lib:format("Error: ~p", [Err]))}
-    end;
+    rpc_deriveaddresses_do(DescStr, Range);
 rpc_deriveaddresses(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"deriveaddresses \"descriptor\" ( range )">>}.
+
+rpc_deriveaddresses_do(DescStr, Range) ->
+    Network = beamchain_config:network(),
+    case beamchain_descriptor:parse(DescStr, #{require_checksum => true}) of
+        {error, missing_checksum} ->
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY, <<"Missing checksum">>};
+        {error, bad_checksum} ->
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY, <<"Invalid checksum">>};
+        {error, Reason} ->
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+             iolist_to_binary(io_lib:format("~p", [Reason]))};
+        {ok, Desc} ->
+            IsRange = beamchain_descriptor:is_range(Desc),
+            case Range of
+                R when (is_list(R) orelse is_integer(R)), not IsRange,
+                       R =/= undefined, R =/= 0 ->
+                    {error, ?RPC_INVALID_PARAMETER,
+                     <<"Range should not be specified for an un-ranged descriptor">>};
+                _ ->
+                    derive_addresses_range(Desc, Range, Network)
+            end
+    end.
 
 derive_addresses_range(Desc, Range, Network) ->
     IsRange = beamchain_descriptor:is_range(Desc),
@@ -14802,6 +14976,8 @@ derive_addresses_range(Desc, Range, Network) ->
             end
     end.
 
+parse_range(undefined, _IsRange) ->
+    {0, 0};
 parse_range(N, _IsRange) when is_integer(N), N >= 0 ->
     %% Single index
     {N, N};
@@ -14826,37 +15002,36 @@ script_to_address_bin(Script, Network) ->
 
 %% getdescriptorinfo "descriptor"
 %% Analyses a descriptor string and returns information about it.
+%% Core CheckChecksum (require_checksum=false) still rejects a present
+%% but wrong checksum with -5; an unparseable body is also -5.
 rpc_getdescriptorinfo([DescStr]) when is_binary(DescStr) ->
-    try
-        DescStrList = binary_to_list(DescStr),
-        %% Strip checksum if present for computing the canonical descriptor
-        Stripped = case string:rchr(DescStrList, $#) of
-            0 -> DescStrList;
-            Pos -> string:substr(DescStrList, 1, Pos - 1)
-        end,
-        case beamchain_descriptor:parse(Stripped) of
-            {ok, Desc} ->
-                Checksum = beamchain_descriptor:checksum(Stripped),
-                WithChecksum = Stripped ++ "#" ++ Checksum,
-                %% ORDERED proplist (NOT a map): Core getdescriptorinfo
-                %% (rpc/output_script.cpp:205) pushKV order is descriptor,
-                %% checksum, isrange, issolvable, hasprivatekeys.
-                Result = [
-                    {<<"descriptor">>, list_to_binary(WithChecksum)},
-                    {<<"checksum">>, list_to_binary(Checksum)},
-                    {<<"isrange">>, beamchain_descriptor:is_range(Desc)},
-                    {<<"issolvable">>, beamchain_descriptor:is_solvable(Desc)},
-                    {<<"hasprivatekeys">>, beamchain_descriptor:has_private_keys(Desc)}
-                ],
-                {ok, Result};
-            {error, Reason} ->
-                {error, ?RPC_INVALID_PARAMETER,
-                 iolist_to_binary(io_lib:format("Invalid descriptor: ~p", [Reason]))}
-        end
-    catch
-        _:Err ->
-            {error, ?RPC_MISC_ERROR,
-             iolist_to_binary(io_lib:format("Error: ~p", [Err]))}
+    case beamchain_descriptor:parse(DescStr) of
+        {error, bad_checksum} ->
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY, <<"Invalid checksum">>};
+        {error, missing_checksum} ->
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY, <<"Missing checksum">>};
+        {error, Reason} ->
+            {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+             iolist_to_binary(io_lib:format("~p", [Reason]))};
+        {ok, Desc} ->
+            DescStrList = binary_to_list(DescStr),
+            Stripped = case string:rchr(DescStrList, $#) of
+                0 -> DescStrList;
+                Pos -> string:substr(DescStrList, 1, Pos - 1)
+            end,
+            Checksum = beamchain_descriptor:checksum(Stripped),
+            WithChecksum = Stripped ++ "#" ++ Checksum,
+            %% ORDERED proplist (NOT a map): Core getdescriptorinfo
+            %% (rpc/output_script.cpp:205) pushKV order is descriptor,
+            %% checksum, isrange, issolvable, hasprivatekeys.
+            Result = [
+                {<<"descriptor">>, list_to_binary(WithChecksum)},
+                {<<"checksum">>, list_to_binary(Checksum)},
+                {<<"isrange">>, beamchain_descriptor:is_range(Desc)},
+                {<<"issolvable">>, beamchain_descriptor:is_solvable(Desc)},
+                {<<"hasprivatekeys">>, beamchain_descriptor:has_private_keys(Desc)}
+            ],
+            {ok, Result}
     end;
 rpc_getdescriptorinfo(_) ->
     {error, ?RPC_INVALID_PARAMS, <<"getdescriptorinfo \"descriptor\"">>}.
@@ -15515,16 +15690,21 @@ chainwork_diff_float(_, _) ->
 rpc_gettxoutproof([TxidList]) ->
     rpc_gettxoutproof([TxidList, null]);
 rpc_gettxoutproof([TxidList, null]) ->
-    %% No blockhash given — look up via tx index
+    %% No blockhash given — look up via tx index. Core: missing tx is
+    %% RPC_INVALID_ADDRESS_OR_KEY (-5) "Transaction not yet in block".
     case TxidList of
-        [FirstTxHex | _] ->
-            FirstTxid = hex_to_internal_hash(FirstTxHex),
-            case beamchain_db:get_tx_location(FirstTxid) of
-                {ok, #{block_hash := BH}} ->
-                    rpc_gettxoutproof_with_block(TxidList, BH);
-                not_found ->
-                    {error, ?RPC_MISC_ERROR,
-                     <<"Transaction not found in block index">>}
+        [FirstTxHex | _] when is_binary(FirstTxHex) ->
+            try
+                FirstTxid = parse_hash_v(FirstTxHex, <<"txid">>),
+                case (catch beamchain_db:get_tx_location(FirstTxid)) of
+                    {ok, #{block_hash := BH}} ->
+                        rpc_gettxoutproof_with_block(TxidList, BH);
+                    _ ->
+                        {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+                         <<"Transaction not yet in block">>}
+                end
+            catch
+                throw:{rpc_error, Code, Msg} -> {error, Code, Msg}
             end;
         _ ->
             {error, ?RPC_INVALID_PARAMETER, <<"No txids provided">>}
@@ -15567,21 +15747,27 @@ rpc_gettxoutproof_with_block(TxidHexList, BlockHash) ->
 
 %% verifytxoutproof(ProofHex) -> list of matched txids.
 rpc_verifytxoutproof([ProofHex]) when is_binary(ProofHex) ->
-    Proof = beamchain_serialize:hex_decode(ProofHex),
-    case byte_size(Proof) < 84 of
-        true ->
-            {error, ?RPC_DESERIALIZATION_ERROR, <<"Proof too short">>};
-        false ->
-            <<_HeaderBin:80/binary, NTx:32/little, Rest/binary>> = Proof,
-            case NTx =:= 0 of
-                true -> {ok, []};
-                false ->
-                    case parse_proof_body(NTx, Rest) of
-                        {ok, Matched} -> {ok, Matched};
-                        {error, Msg}  ->
-                            {error, ?RPC_DESERIALIZATION_ERROR, Msg}
-                    end
-            end
+    try
+        Proof = parse_hex_v(ProofHex, <<"proof">>),
+        case byte_size(Proof) < 84 of
+            true ->
+                {error, ?RPC_DESERIALIZATION_ERROR, <<"Proof too short">>};
+            false ->
+                <<_HeaderBin:80/binary, NTx:32/little, Rest/binary>> = Proof,
+                case NTx =:= 0 of
+                    true -> {ok, []};
+                    false ->
+                        case parse_proof_body(NTx, Rest) of
+                            {ok, Matched} -> {ok, Matched};
+                            {error, Msg}  ->
+                                {error, ?RPC_DESERIALIZATION_ERROR, Msg}
+                        end
+                end
+        end
+    catch
+        throw:{rpc_error, Code, EMsg} -> {error, Code, EMsg};
+        _:_ ->
+            {error, ?RPC_DESERIALIZATION_ERROR, <<"Proof too short">>}
     end;
 rpc_verifytxoutproof(_) ->
     {error, ?RPC_INVALID_PARAMETER, <<"Invalid parameters">>}.
