@@ -123,16 +123,22 @@
 %% Flush tuning
 -define(DEFAULT_MAX_CACHE_MB, 450).
 -define(IBD_MAX_CACHE_MB, 4096).
--define(IBD_FLUSH_INTERVAL, 5000).
+%% Catch-up / IBD crash-recovery. 5000 let the 2026-09-17 mainnet
+%% catch-up connect 650 blocks without a durable tip write, then OOM
+%% rewound to 966303. Core FlushStateToDisk is size-driven plus a
+%% 50–70 min PERIODIC; at catch-up speed that is still hundreds of
+%% blocks. 64 keeps an OOM to a couple of minutes, not the whole run.
+-define(IBD_FLUSH_INTERVAL, 64).
 %% Crash-recovery checkpoints. maybe_flush inside do_connect_block is
-%% gated on IBD_FLUSH_INTERVAL (5000), which is why the 2026-09-17 live
-%% incident lost 310 connected blocks when a 5 s db call timed out 14
-%% min into roll-forward — none of them had been flushed. Checkpoint
-%% every recovered block so a crash mid-replay resumes at the last
-%% connected height. A recovery of a few hundred blocks is extra
-%% WriteBatches, not a 15-min crash loop. Core ConnectTip flushes
-%% IF_NEEDED / PERIODIC per block; ReplayBlocks is a different path
-%% (interrupted coins flush) and commits once at the end.
+%% gated on IBD_FLUSH_INTERVAL (now 64; was 5000), which is why the
+%% 2026-09-17 live incident lost 310 connected blocks when a 5 s db
+%% call timed out 14 min into roll-forward — none of them had been
+%% flushed. Checkpoint every recovered block so a crash mid-replay
+%% resumes at the last connected height. A recovery of a few hundred
+%% blocks is extra WriteBatches, not a 15-min crash loop. Core
+%% ConnectTip flushes IF_NEEDED / PERIODIC per block; ReplayBlocks is
+%% a different path (interrupted coins flush) and commits once at the
+%% end.
 -define(ROLL_FORWARD_FLUSH_INTERVAL, 1).
 
 %% Estimated cache entry count threshold (3 million entries ~ 450MB)
@@ -293,9 +299,26 @@ get_mtp() ->
     gen_server:call(?SERVER, get_mtp).
 
 %% @doc Check if the chain tip is within 24 hours of current time (matching Bitcoin Core's DEFAULT_MAX_TIP_AGE).
+%% ETS read — never a gen_server:call. During catch-up connect_block
+%% holds the chainstate loop for seconds; the 5 s default timed out and
+%% beamchain_sync crash-looped (live 2026-09-17, 8 CRASH REPORTs).
 -spec is_synced() -> boolean().
 is_synced() ->
-    gen_server:call(?SERVER, is_synced).
+    case ets:info(?CHAIN_META) of
+        undefined ->
+            false;
+        _ ->
+            case ets:lookup(?CHAIN_META, ibd) of
+                [{ibd, false}] -> true;
+                _ -> false
+            end
+    end.
+
+put_ibd_flag(IBD) ->
+    case ets:info(?CHAIN_META) of
+        undefined -> ok;
+        _ -> ets:insert(?CHAIN_META, {ibd, IBD}), ok
+    end.
 
 %% @doc Get just the tip height.
 -spec get_tip_height() -> {ok, integer()} | not_found.
@@ -848,7 +871,8 @@ init_chainstate(Role, SnapshotData) ->
             ensure_table(?UTXO_SPENT, [set, public, named_table,
                                        {write_concurrency, true}]),
             ensure_table(?CHAIN_META, [set, public, named_table,
-                                       {read_concurrency, true}]);
+                                       {read_concurrency, true}]),
+            put_ibd_flag(true);
         _ ->
             %% Snapshot and background chainstates reuse the main ETS tables
             ok
@@ -950,7 +974,8 @@ init_chainstate(Role, SnapshotData) ->
         {main, _} ->
             %% Crash recovery (roll-forward). beamchain persists the chain_tip +
             %% UTXO to rocksdb only on the periodic do_flush cadence (every
-            %% ~5000 blocks / 450MB pressure) — the UTXO working set lives in
+            %% IBD_FLUSH_INTERVAL blocks / cache-budget pressure) — the UTXO
+            %% working set lives in
             %% volatile ETS and set_chain_tip has no per-block caller. So an
             %% unclean exit (SIGKILL/OOM/power loss) leaves the durable chain_tip
             %% BEHIND the block bodies + block_index, which ARE WAL-backed and
@@ -1094,6 +1119,7 @@ handle_call(wipe_chainstate, _From, State) ->
     ets:delete_all_objects(?UTXO_FRESH),
     ets:delete_all_objects(?UTXO_SPENT),
     ets:delete_all_objects(?CHAIN_META),
+    put_ibd_flag(true),
     %% Clear all UTXO entries from RocksDB to prevent stale UTXOs
     %% from causing BIP30 false positives on resync. Previously only
     %% ETS caches were cleared, but has_utxo/get_utxo fall through
@@ -1616,12 +1642,15 @@ maybe_check_ibd(#state{ibd = true, mtp_timestamps = Ts} = State) ->
                         [State#state.tip_height, ?DEFAULT_MAX_CACHE_MB,
                          ?DEFAULT_MAX_CACHE_ENTRIES]),
             %% Flush and shrink cache for normal operation
+            put_ibd_flag(false),
             State2 = do_flush(State),
-            State2#state{
+            State3 = State2#state{
                 ibd = false,
                 max_cache_bytes = ?DEFAULT_MAX_CACHE_MB * 1024 * 1024,
                 max_cache_entries = ?DEFAULT_MAX_CACHE_ENTRIES
-            };
+            },
+            maybe_evict_cache(State3),
+            State3;
         false ->
             State
     end;
@@ -2625,7 +2654,8 @@ maybe_flush(#state{ibd = true, blocks_since_flush = N,
     %% Core's CoinsCacheSizeState (validation.cpp), where a flush is forced once
     %% CoinsTip().DynamicMemoryUsage() crosses LARGE/CRITICAL — Core's flush gate
     %% is size-driven, not purely periodic. Without this, eviction (which only
-    %% runs inside do_flush) never fires between 5000-block IBD flushes, so the
+    %% runs inside do_flush) never fires between IBD_FLUSH_INTERVAL-block
+    %% flushes, so the
     %% ETS cache grows unbounded within a window and blows past EVICT_HIGH_WATER
     %% (RSS/GC bloat + working set spills to disk). The entry-count check is the
     %% cheap O(1) primary gate (ets:info size is a counter read); cache_memory_usage
@@ -2691,6 +2721,7 @@ do_flush(#state{tip_hash = TipHash, tip_height = TipHeight,
                  <<TipHeight:64/big>>}
             ],
             beamchain_db:direct_write_batch(TipOps),
+            maybe_evict_cache(State),
             State#state{blocks_since_flush = 0};
         false ->
             %% Build write batch
@@ -2730,7 +2761,7 @@ do_flush(#state{tip_hash = TipHash, tip_height = TipHeight,
 
                     %% Evict clean entries if the cache is too large.
                     %% After flush, all remaining entries are clean (on disk).
-                    maybe_evict_cache(),
+                    maybe_evict_cache(State),
                     State#state{blocks_since_flush = 0,
                                 pending_undo_deletes = []};
                 {error, Reason} ->
@@ -2889,11 +2920,6 @@ snapshot_write_chunk(Ops) ->
             error({snapshot_flush_write_failed, Reason})
     end.
 
-%% @doc Evict clean UTXO cache entries after flush to bound memory.
-%% After a flush, dirty/fresh/spent tables are empty so every entry in
-%% UTXO_CACHE is clean (safely on disk in RocksDB). If the cache has
-%% more than EVICT_HIGH_WATER entries, delete entries until we reach
-%% EVICT_LOW_WATER. We walk the ETS table with first/next which gives
 %% Verify that a random sample of ETS cache entries exist in RocksDB.
 %% Called after flush to detect silent write failures.
 verify_flush_sample() ->
@@ -2945,31 +2971,51 @@ skip_entries(Key, 0) -> Key;
 skip_entries(Key, N) ->
     skip_entries(ets:next(?UTXO_CACHE, Key), N - 1).
 
-%% effectively random (hash) order -- good enough since there is no
-%% LRU tracking.
-maybe_evict_cache() ->
+%% Trim the clean UTXO cache to the configured budget. Previously eviction
+%% only fired at 8M entries, so a 32-entry / 64KiB test budget (or a
+%% MemoryMax-constrained --dbcache) never shrank the working set: flush
+%% wrote the tip but left every coin in ETS. Core's CoinsTip().Flush()
+%% drops the cache; we keep a 75% residency window for hit rate.
+maybe_evict_cache(#state{max_cache_entries = MaxEntries}) ->
     Size = ets:info(?UTXO_CACHE, size),
-    case Size > ?EVICT_HIGH_WATER of
+    Over = Size > MaxEntries orelse Size > ?EVICT_HIGH_WATER,
+    case Over of
         true ->
-            ToEvict = Size - ?EVICT_LOW_WATER,
-            Evicted = evict_entries(ets:first(?UTXO_CACHE), ToEvict, 0),
-            logger:info("chainstate: evicted ~B clean UTXO cache entries "
-                        "(~B -> ~B)",
-                        [Evicted, Size, ets:info(?UTXO_CACHE, size)]);
+            TargetEntries = max(1, min(MaxEntries * 3 div 4,
+                                       ?EVICT_LOW_WATER)),
+            Evicted = evict_until(ets:first(?UTXO_CACHE),
+                                  TargetEntries, 0),
+            case Evicted of
+                0 ->
+                    ok;
+                _ ->
+                    logger:info("chainstate: evicted ~B clean UTXO cache "
+                                "entries (~B -> ~B, ~.1fMB)",
+                                [Evicted, Size,
+                                 ets:info(?UTXO_CACHE, size),
+                                 cache_memory_usage() / 1024 / 1024])
+            end;
         false ->
             ok
     end.
 
-evict_entries('$end_of_table', _Remaining, Count) ->
+evict_until('$end_of_table', _TargetEntries, Count) ->
     Count;
-evict_entries(_Key, Remaining, Count) when Remaining =< 0 ->
-    Count;
-evict_entries(Key, Remaining, Count) ->
-    %% Grab the next key BEFORE deleting, since delete invalidates
-    %% the iterator position for the current key.
-    Next = ets:next(?UTXO_CACHE, Key),
-    ets:delete(?UTXO_CACHE, Key),
-    evict_entries(Next, Remaining - 1, Count + 1).
+evict_until(Key, TargetEntries, Count) ->
+    Size = ets:info(?UTXO_CACHE, size),
+    case Size =< TargetEntries of
+        true ->
+            Count;
+        false ->
+            Next = ets:next(?UTXO_CACHE, Key),
+            case ets:member(?UTXO_DIRTY, Key) of
+                true ->
+                    evict_until(Next, TargetEntries, Count);
+                false ->
+                    ets:delete(?UTXO_CACHE, Key),
+                    evict_until(Next, TargetEntries, Count + 1)
+            end
+    end.
 
 %% Encode UTXO to binary (same format as beamchain_db).
 encode_utxo(#utxo{value = Value, script_pubkey = Script,

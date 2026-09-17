@@ -628,12 +628,14 @@ test_ibd_false_initially() ->
 %% When the gen_server state has ibd=false (latch fired), is_synced() must
 %% return true — even if the tip timestamp is old.
 test_ibd_latched_to_false() ->
-    %% Use sys:replace_state to flip ibd without needing a real block.
-    %% ibd is element 10 in the #state{} tuple (tag at 1, then 8 fields before ibd).
+    %% is_synced reads the ETS latch (not a gen_server:call) so catch-up
+    %% connect_block cannot 5 s-timeout beamchain_sync. Keep the
+    %% gen_server flag in sync for handle_call callers.
+    ets:insert(beamchain_chain_meta, {ibd, false}),
     sys:replace_state(beamchain_chainstate,
         fun(S) -> setelement(10, S, false) end),
     ?assertEqual(true, beamchain_chainstate:is_synced()),
-    %% Restore so subsequent tests see the initial state
+    ets:insert(beamchain_chain_meta, {ibd, true}),
     sys:replace_state(beamchain_chainstate,
         fun(S) -> setelement(10, S, true) end).
 
@@ -641,7 +643,7 @@ test_ibd_latched_to_false() ->
 %% again — even if the tip age is old.
 %% Bitcoin Core provides the same guarantee: m_cached_is_ibd is latched once.
 test_ibd_no_revert() ->
-    %% Latch the ibd flag to false
+    ets:insert(beamchain_chain_meta, {ibd, false}),
     sys:replace_state(beamchain_chainstate,
         fun(S) -> setelement(10, S, false) end),
     ?assertEqual(true, beamchain_chainstate:is_synced()),
@@ -652,7 +654,7 @@ test_ibd_no_revert() ->
     %% even though it had previously caught up past the 24 h threshold.
     ?assertEqual(true, beamchain_chainstate:is_synced()),
 
-    %% Restore state for cleanup
+    ets:insert(beamchain_chain_meta, {ibd, true}),
     sys:replace_state(beamchain_chainstate,
         fun(S) -> setelement(10, S, true) end).
 

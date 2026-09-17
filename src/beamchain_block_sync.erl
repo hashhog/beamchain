@@ -37,7 +37,9 @@
          handle_blocktxn/2,
          get_status/0,
          is_too_far_ahead/2,
-         is_cmpctblock_too_deep/2]).
+         is_cmpctblock_too_deep/2,
+         max_downloaded_ahead/0,
+         max_downloaded_bytes/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -52,13 +54,18 @@
 %% overrides so the frontier-lifecycle tests (issue #34) can drive the
 %% gen_server callbacks directly with a scripted state.
 -export([do_handle_cmpctblock/5, test_new_state/0,
-         test_state/1, test_get/2]).
+         test_state/1, test_get/2,
+         admit_downloaded/3]).
 -endif.
 
 -define(SERVER, ?MODULE).
 
-%% Download limits
--define(MAX_IN_FLIGHT, 128).
+%% Download limits. Count+byte caps are global (decoded #block{} terms,
+%% not wire bytes). 256 decoded mainnet blocks at ~10× term overhead
+%% was several GB on top of the 4096MB UTXO cache and blew the 8G
+%% MemoryMax (live 2026-09-17). Core keeps
+%% MAX_BLOCKS_IN_TRANSIT_PER_PEER=16 (net_processing.cpp).
+-define(MAX_IN_FLIGHT, 32).
 -define(MAX_PER_PEER, 16).
 
 %% Stall detection
@@ -70,9 +77,12 @@
 -define(UTXO_FLUSH_INTERVAL, 1000).
 
 %% Memory cap: max blocks downloaded ahead of validation.
-%% Mainnet blocks average ~1.5 MB; 256 blocks ≈ 384 MB.
-%% Previous value of 5000 caused 5+ GB RSS on mainnet.
--define(MAX_DOWNLOADED_AHEAD, 256).
+%% Count is a safety net; MAX_DOWNLOADED_BYTES is the real RSS bound
+%% (erlang:external_size of decoded #block{} terms). Previous count of
+%% 256 with no byte cap held multi-GB of mainnet blocks.
+-define(MAX_DOWNLOADED_AHEAD, 32).
+-define(MAX_DOWNLOADED_BYTES, (64 * 1024 * 1024)).
+-define(DEADLOCK_HEADROOM, 8).
 
 %% Max blocks to validate per gen_server iteration (yield to process messages)
 -define(MAX_VALIDATE_BATCH, 50).
@@ -118,6 +128,8 @@
 
     %% Height -> #block{} — downloaded but not yet validated
     downloaded = #{}       :: #{non_neg_integer() => #block{}},
+    %% Running erlang:external_size of downloaded values (RSS bound).
+    downloaded_bytes = 0   :: non_neg_integer(),
 
     %% Next height that needs sequential validation
     next_to_validate = 0   :: non_neg_integer(),
@@ -196,7 +208,11 @@ test_state(Overrides) ->
         (download_queue, V, S)   -> S#state{download_queue = V};
         (in_flight, V, S)        -> S#state{in_flight = V};
         (hash_to_height, V, S)   -> S#state{hash_to_height = V};
-        (downloaded, V, S)       -> S#state{downloaded = V};
+        (downloaded, V, S) ->
+            Bytes = maps:fold(fun(_H, B, Acc) ->
+                                      Acc + block_mem_bytes(B)
+                              end, 0, V),
+            S#state{downloaded = V, downloaded_bytes = Bytes};
         (next_to_validate, V, S) -> S#state{next_to_validate = V};
         (target_height, V, S)    -> S#state{target_height = V};
         (peers, V, S)            -> S#state{peers = V};
@@ -213,6 +229,7 @@ test_get(download_queue, S)   -> S#state.download_queue;
 test_get(in_flight, S)        -> S#state.in_flight;
 test_get(hash_to_height, S)   -> S#state.hash_to_height;
 test_get(downloaded, S)       -> S#state.downloaded;
+test_get(downloaded_bytes, S) -> S#state.downloaded_bytes;
 test_get(next_to_validate, S) -> S#state.next_to_validate;
 test_get(target_height, S)    -> S#state.target_height;
 test_get(peers, S)            -> S#state.peers;
@@ -349,6 +366,7 @@ handle_cast({start_sync, Opts}, #state{status = idle,
         in_flight = #{},
         hash_to_height = #{},
         downloaded = #{},
+        downloaded_bytes = 0,
         next_to_validate = StartHeight,
         target_height = TargetHeight,
         peers = Peers,
@@ -403,6 +421,7 @@ handle_cast({start_sync, Opts}, #state{status = complete} = State) ->
                                      in_flight = #{},
                                      hash_to_height = #{},
                                      downloaded = #{},
+                                     downloaded_bytes = 0,
                                      stall_timer = undefined,
                                      progress_timer = undefined});
         false ->
@@ -434,7 +453,8 @@ handle_cast(stop_sync, State) ->
     State2 = cancel_timers(State),
     {noreply, State2#state{status = idle, in_flight = #{},
                             hash_to_height = #{},
-                            downloaded = #{}, download_queue = []}};
+                            downloaded = #{}, downloaded_bytes = 0,
+                            download_queue = []}};
 
 handle_cast({block, Peer, Block}, #state{status = syncing} = State) ->
     State2 = handle_block_received(Peer, Block, State),
@@ -680,6 +700,58 @@ gather_connected_peers() ->
     end, #{}, AllPeers).
 
 %%% ===================================================================
+%%% Internal: download-buffer budget (count + decoded term bytes)
+%%% ===================================================================
+
+max_downloaded_ahead() -> ?MAX_DOWNLOADED_AHEAD.
+max_downloaded_bytes() -> ?MAX_DOWNLOADED_BYTES.
+
+block_mem_bytes(Block) ->
+    erlang:external_size(Block).
+
+pipeline_full(#state{downloaded = D, in_flight = IF,
+                     downloaded_bytes = B}) ->
+    maps:size(D) + maps:size(IF) >= ?MAX_DOWNLOADED_AHEAD
+        orelse B >= ?MAX_DOWNLOADED_BYTES.
+
+%% Insert a decoded block into the ahead-of-validation buffer, or
+%% re-queue it when the count/byte budget is full. Always keep
+%% next_to_validate so sequential connect can make progress.
+admit_downloaded(#state{downloaded = D, downloaded_bytes = Bytes,
+                        next_to_validate = Next,
+                        download_queue = Queue} = State,
+                 Height, Block) ->
+    case maps:is_key(Height, D) of
+        true ->
+            State;
+        false ->
+            BlockBytes = block_mem_bytes(Block),
+            MustKeep = Height =:= Next,
+            Over = maps:size(D) >= ?MAX_DOWNLOADED_AHEAD
+                   orelse Bytes + BlockBytes > ?MAX_DOWNLOADED_BYTES,
+            case MustKeep orelse not Over of
+                true ->
+                    State#state{downloaded = maps:put(Height, Block, D),
+                                downloaded_bytes = Bytes + BlockBytes};
+                false ->
+                    Queue1 = [Height | lists:delete(Height, Queue)],
+                    State#state{download_queue = Queue1}
+            end
+    end.
+
+remove_downloaded(Height, #state{downloaded = D,
+                                 downloaded_bytes = Bytes} = State) ->
+    case maps:take(Height, D) of
+        {Block, D2} ->
+            State#state{
+                downloaded = D2,
+                downloaded_bytes = max(0, Bytes - block_mem_bytes(Block))
+            };
+        error ->
+            State
+    end.
+
+%%% ===================================================================
 %%% Internal: pipeline fill — request blocks from peers
 %%% ===================================================================
 
@@ -694,6 +766,8 @@ fill_pipeline(#state{status = syncing,
     DownloadedAhead = maps:size(Downloaded),
     NeedNext = not maps:is_key(NextH, Downloaded),
     NextInFlight = maps:is_key(NextH, State#state.in_flight),
+    BufferFull = pipeline_full(State),
+    Headroom = max(1, ?MAX_DOWNLOADED_AHEAD - ?DEADLOCK_HEADROOM),
 
     %% Deadlock detection — two cases:
     %% 1) Hard deadlock: in_flight=0, buffer full, needed block missing
@@ -701,25 +775,23 @@ fill_pipeline(#state{status = syncing,
     %%    but buffer is full so no new requests can be made
     IsHardDeadlock = NeedNext
                      andalso TotalInFlight =:= 0
-                     andalso DownloadedAhead >= (?MAX_DOWNLOADED_AHEAD - 32),
+                     andalso DownloadedAhead >= Headroom,
     IsSoftDeadlock = NeedNext
                      andalso (not NextInFlight)
-                     andalso DownloadedAhead >= ?MAX_DOWNLOADED_AHEAD,
+                     andalso BufferFull,
 
     State1 = case IsHardDeadlock orelse IsSoftDeadlock of
         true ->
             %% Evict enough of the highest buffered blocks to get below
             %% MAX_DOWNLOADED_AHEAD so the normal pipeline can resume.
-            %% Previous approach of evicting only 1 caused an infinite
-            %% evict-request-stall loop; evicting 32 was still not enough
-            %% when the buffer exceeded 256+32 due to arrival races.
-            EvictTarget = max(0, DownloadedAhead - (?MAX_DOWNLOADED_AHEAD - 64)),
-            EvictCount = max(EvictTarget, 32),
+            Keep = max(0, ?MAX_DOWNLOADED_AHEAD - 2 * ?DEADLOCK_HEADROOM),
+            EvictTarget = max(0, DownloadedAhead - Keep),
+            EvictCount = max(EvictTarget, ?DEADLOCK_HEADROOM),
             AllHeights = lists:sort(fun(A, B) -> A >= B end,
                                     maps:keys(Downloaded)),
             {ToEvict, _Keep} = take_from_queue(EvictCount, AllHeights),
-            Downloaded2 = lists:foldl(fun maps:remove/2, Downloaded, ToEvict),
-            OldQueue = State#state.download_queue,
+            StateEv = lists:foldl(fun remove_downloaded/2, State, ToEvict),
+            OldQueue = StateEv#state.download_queue,
             %% Remove NextH from queue if already there (avoid duplicates)
             CleanQueue = lists:delete(NextH, OldQueue),
             %% Put NextH at front, then re-queue evicted heights
@@ -729,8 +801,7 @@ fill_pipeline(#state{status = syncing,
                         "blast-requesting gap from all peers",
                         [NextH, length(ToEvict), TotalInFlight]),
             %% Blast-request NextH from ALL connected peers for redundancy
-            State_tmp = State#state{downloaded = Downloaded2,
-                                     download_queue = NewQueue},
+            State_tmp = StateEv#state{download_queue = NewQueue},
             blast_request_height(NextH, State_tmp);
         false ->
             State
@@ -741,31 +812,24 @@ fill_pipeline(#state{status = syncing,
         [] ->
             State1;
         _ ->
-            TotalInFlight2 = maps:size(State1#state.in_flight),
-            case TotalInFlight2 >= ?MAX_IN_FLIGHT of
+            case pipeline_full(State1) of
                 true ->
-                    State1;
-                false ->
-                    DownloadedAhead2 = maps:size(State1#state.downloaded),
-                    case DownloadedAhead2 >= ?MAX_DOWNLOADED_AHEAD of
+                    %% Buffer full — but if next_to_validate is
+                    %% missing and not in flight, force-request it
+                    %% to prevent starvation.
+                    NextH1 = State1#state.next_to_validate,
+                    NextMissing = not maps:is_key(NextH1,
+                                    State1#state.downloaded),
+                    NextNotInFlight = not maps:is_key(NextH1,
+                                        State1#state.in_flight),
+                    case NextMissing andalso NextNotInFlight of
                         true ->
-                            %% Buffer full — but if next_to_validate is
-                            %% missing and not in flight, force-request it
-                            %% to prevent starvation.
-                            NextH1 = State1#state.next_to_validate,
-                            NextMissing = not maps:is_key(NextH1,
-                                            State1#state.downloaded),
-                            NextNotInFlight = not maps:is_key(NextH1,
-                                                State1#state.in_flight),
-                            case NextMissing andalso NextNotInFlight of
-                                true ->
-                                    blast_request_height(NextH1, State1);
-                                false ->
-                                    State1
-                            end;
+                            blast_request_height(NextH1, State1);
                         false ->
-                            assign_blocks_to_peers(AvailablePeers, State1)
-                    end
+                            State1
+                    end;
+                false ->
+                    assign_blocks_to_peers(AvailablePeers, State1)
             end
     end;
 fill_pipeline(State) ->
@@ -860,8 +924,7 @@ assign_blocks_round_robin(_Peers, _AllPeers,
 assign_blocks_round_robin([Peer | RestPeers], AllPeers, State) ->
     TotalInFlight = maps:size(State#state.in_flight),
     DownloadedAhead = maps:size(State#state.downloaded),
-    case TotalInFlight >= ?MAX_IN_FLIGHT orelse
-         DownloadedAhead >= ?MAX_DOWNLOADED_AHEAD of
+    case pipeline_full(State) of
         true ->
             State;
         false ->
@@ -871,7 +934,8 @@ assign_blocks_round_robin([Peer | RestPeers], AllPeers, State) ->
             PeerCapacity = ?MAX_PER_PEER -
                            PeerStats#peer_stats.in_flight_count,
             GlobalCapacity = ?MAX_IN_FLIGHT - TotalInFlight,
-            MemCapacity = ?MAX_DOWNLOADED_AHEAD - DownloadedAhead,
+            MemCapacity = max(0, ?MAX_DOWNLOADED_AHEAD
+                                 - DownloadedAhead - TotalInFlight),
             BatchSize = min(PeerCapacity,
                             min(GlobalCapacity, MemCapacity)),
             case BatchSize > 0 of
@@ -973,16 +1037,13 @@ handle_block_received(Peer, Block, State) ->
                     AllStats = update_peer_block_received(
                         RequestPeer, ResponseMs, State#state.peer_stats),
 
-                    %% Store in downloaded map
-                    Downloaded2 = maps:put(Height, Block,
-                                           State#state.downloaded),
-
-                    State2 = State#state{
+                    State1 = State#state{
                         in_flight = InFlight2,
                         hash_to_height = H2H2,
-                        peer_stats = AllStats,
-                        downloaded = Downloaded2
+                        peer_stats = AllStats
                     },
+                    %% Store in downloaded map, or re-queue if over budget
+                    State2 = admit_downloaded(State1, Height, Block),
 
                     %% Try to validate as many sequential blocks as possible
                     State3 = validate_sequential(State2),
@@ -1135,13 +1196,12 @@ validate_sequential(#state{next_to_validate = NextH,
                                 [NextH, FFTarget + 1]),
                     StaleKeys = [K || K <- maps:keys(Downloaded),
                                       K =< FFTarget],
-                    Downloaded2 = lists:foldl(fun maps:remove/2,
-                                              Downloaded, StaleKeys),
-                    Queue2 = [H || H <- State#state.download_queue,
+                    StateFF = lists:foldl(fun remove_downloaded/2,
+                                          State, StaleKeys),
+                    Queue2 = [H || H <- StateFF#state.download_queue,
                                    H > FFTarget],
-                    State2 = State#state{
+                    State2 = StateFF#state{
                         next_to_validate = FFTarget + 1,
-                        downloaded = Downloaded2,
                         download_queue = Queue2
                     },
                     validate_sequential_inner(State2, Remaining);
@@ -1192,10 +1252,9 @@ validate_sequential_inner(#state{next_to_validate = NextH,
                                         "(fork still building)", [NextH])
                     end,
                     %% Remove from downloaded, advance counter
-                    Downloaded2 = maps:remove(NextH, State2#state.downloaded),
-                    State3 = State2#state{
+                    State3a = remove_downloaded(NextH, State2),
+                    State3 = State3a#state{
                         next_to_validate = NextH + 1,
-                        downloaded = Downloaded2,
                         blocks_validated = State2#state.blocks_validated + 1
                     },
                     %% Continue validating the next one
@@ -1209,14 +1268,13 @@ validate_sequential_inner(#state{next_to_validate = NextH,
                                 [NextH, SkipH]),
                     StaleKeys = [K || K <- maps:keys(Downloaded)
                                     , K < SkipH],
-                    Downloaded2 = lists:foldl(fun maps:remove/2,
-                                              Downloaded, StaleKeys),
+                    State2a = lists:foldl(fun remove_downloaded/2,
+                                          State2, StaleKeys),
                     %% Also clear any stale entries from download_queue
-                    Queue2 = [H || H <- State2#state.download_queue,
+                    Queue2 = [H || H <- State2a#state.download_queue,
                                    H >= SkipH],
-                    State3 = State2#state{
+                    State3 = State2a#state{
                         next_to_validate = SkipH,
-                        downloaded = Downloaded2,
                         download_queue = Queue2
                     },
                     validate_sequential_inner(State3, Remaining - 1);
@@ -1231,22 +1289,20 @@ validate_sequential_inner(#state{next_to_validate = NextH,
                                          [NextH, RetryCount, Reason]),
                             %% Stop sync entirely — operator must investigate.
                             %% Clear downloaded buffer for this height.
-                            Downloaded2 = maps:remove(NextH, State#state.downloaded),
-                            State#state{status = idle,
-                                        downloaded = Downloaded2,
-                                        download_queue = [],
-                                        validation_failures = Failures2};
+                            StateF = remove_downloaded(NextH, State),
+                            StateF#state{status = idle,
+                                         download_queue = [],
+                                         validation_failures = Failures2};
                         false ->
                             logger:error("block_sync: validation failed at height ~B: ~p "
                                          "(retry ~B/~B)",
                                          [NextH, Reason, RetryCount,
                                           ?MAX_VALIDATION_RETRIES]),
                             %% Re-queue the failed block for retry.
-                            Downloaded2 = maps:remove(NextH, State#state.downloaded),
-                            Queue = [NextH | State#state.download_queue],
-                            State#state{downloaded = Downloaded2,
-                                        download_queue = Queue,
-                                        validation_failures = Failures2}
+                            StateR = remove_downloaded(NextH, State),
+                            Queue = [NextH | StateR#state.download_queue],
+                            StateR#state{download_queue = Queue,
+                                         validation_failures = Failures2}
                     end
             end;
         error ->
