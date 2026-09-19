@@ -170,3 +170,27 @@ blockfilterindex_eq_zero_test() ->
     {start, Opts} = beamchain_cli:parse_args(
                       ["start", "-blockfilterindex=0"]),
     ?assertEqual(0, maps:get(cfilter, Opts)).
+
+%%% ===================================================================
+%%% --par=<n> / -par=<n>  (script-check threads, Core -par)
+%%% ===================================================================
+
+par_eq_form_test() ->
+    {start, Opts} = beamchain_cli:parse_args(["start", "--par=8"]),
+    ?assertEqual(8, maps:get(par, Opts)).
+
+par_space_form_test() ->
+    {start, Opts} = beamchain_cli:parse_args(["start", "--par", "4"]),
+    ?assertEqual(4, maps:get(par, Opts)).
+
+par_core_spelling_eq_test() ->
+    {start, Opts} = beamchain_cli:parse_args(["start", "-par=0"]),
+    ?assertEqual(0, maps:get(par, Opts)).
+
+par_negative_leave_cores_test() ->
+    {start, Opts} = beamchain_cli:parse_args(["start", "--par=-2"]),
+    ?assertEqual(-2, maps:get(par, Opts)).
+
+par_default_absent_test() ->
+    {start, Opts} = beamchain_cli:parse_args(["start"]),
+    ?assertEqual(undefined, maps:get(par, Opts, undefined)).

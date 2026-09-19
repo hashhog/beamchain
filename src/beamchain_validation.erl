@@ -1388,7 +1388,7 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
         %% UndoAcc is a reversed list of SpentCoins chunks (list of lists).
         %% ProcessedTxsAcc is a reversed list of processed txs.
         %% We flatten/reverse at the end to avoid O(n^2) ++ accumulation.
-        {TotalFees, UndoChunksRev, TotalSigopCost, ScriptJobs, _ProcessedTxsRev} = lists:foldl(
+        {TotalFees, UndoChunksRev, TotalSigopCost, ScriptJobsRev, _ProcessedTxsRev} = lists:foldl(
             fun(Tx, {FeesAcc, UndoAcc, SigopsAcc, JobsAcc, TxsAcc}) ->
                 IsCoinbase = is_coinbase_tx(Tx),
                 case IsCoinbase of
@@ -1505,11 +1505,15 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
         %% Flatten the reversed undo chunks into a single list
         AllUndoData = lists:append(lists:reverse(UndoChunksRev)),
 
-        %% 4b. verify scripts in parallel (one process per tx)
+        %% 4b. verify scripts on the bounded CCheckQueue pool (per-input,
+        %% -par workers). The fold prepends, so reverse to restore block
+        %% order: reject reasons pick the minimum {tx,in} and must not
+        %% depend on spawn order (W105 BUG-7).
         %% Update undo info with full transaction list for script-phase rollback.
         %% AllUndoData has the spent coins; Txs has the added outputs.
         put(connect_block_undo, {Txs, AllUndoData}),
 
+        ScriptJobs = lists:reverse(ScriptJobsRev),
         case ScriptJobs of
             [] -> ok;
             _ -> verify_scripts_parallel(ScriptJobs, Flags)
@@ -1886,82 +1890,14 @@ check_sequence_locks(Tx, InputCoins, Height, PrevIndex) ->
         false -> ok
     end.
 
-%% @doc Verify scripts for all inputs of a transaction.
-verify_tx_scripts(Tx, InputCoins, _Height, Flags) ->
-    Inputs = Tx#transaction.inputs,
-    %% Build prevouts list for taproot sighash (all inputs' amount + scriptPubKey)
-    AllPrevOuts = [{C#utxo.value, C#utxo.script_pubkey} || C <- InputCoins],
-    lists:foldl(fun({Input, Coin}, Idx) ->
-        ScriptSig = Input#tx_in.script_sig,
-        ScriptPubKey = Coin#utxo.script_pubkey,
-        Witness = Input#tx_in.witness,
-        Amount = Coin#utxo.value,
-        SigChecker = {Tx, Idx, Amount, AllPrevOuts},
-        case beamchain_script:verify_script(
-                ScriptSig, ScriptPubKey, Witness, Flags, SigChecker) of
-            true -> ok;
-            false ->
-                Txid = beamchain_serialize:tx_hash(Tx),
-                ScriptType = classify_script(ScriptPubKey),
-                logger:error("script_verify_failed: txid=~s input=~B type=~s "
-                             "scriptPubKey=~s scriptSig=~s witness_items=~B",
-                             [binary:encode_hex(Txid), Idx, ScriptType,
-                              binary:encode_hex(ScriptPubKey),
-                              binary:encode_hex(ScriptSig),
-                              length(Witness)]),
-                throw({script_verify_failed, Idx})
-        end,
-        Idx + 1
-    end, 0, lists:zip(Inputs, InputCoins)),
-    ok.
-
-%% Classify a scriptPubKey for diagnostic logging.
-classify_script(<<16#76, 16#a9, 16#14, _:20/binary, 16#88, 16#ac>>) -> <<"p2pkh">>;
-classify_script(<<16#a9, 16#14, _:20/binary, 16#87>>) -> <<"p2sh">>;
-classify_script(<<16#00, 16#14, _:20/binary>>) -> <<"p2wpkh">>;
-classify_script(<<16#00, 16#20, _:32/binary>>) -> <<"p2wsh">>;
-classify_script(<<16#51, 16#20, _:32/binary>>) -> <<"p2tr">>;
-classify_script(_) -> <<"other">>.
-
-%% @doc Verify scripts for multiple transactions in parallel.
-%% Spawns one process per transaction. Each process verifies all inputs.
-%% If any verification fails, throws the error.
+%% @doc Verify scripts for the block on the bounded CCheckQueue pool.
+%% Worker count is `-par` / BEAMCHAIN_PAR / config `par=` (0 = auto =
+%% every dirty-CPU scheduler, capped at 32). Per-input checks, ETS-backed
+%% queue so more workers cannot mean unbounded buffers, min-{tx,in} failure
+%% so reject reasons are identical at 1 worker and at N.
 verify_scripts_parallel(Jobs, Flags) ->
-    %% Spawn a worker per transaction.
-    %% Wrap in try/catch so that throw exits with the reason directly
-    %% (otherwise throw becomes {nocatch, Reason} which breaks pattern matching).
-    Workers = lists:map(fun({Tx, InputCoins}) ->
-        spawn_monitor(fun() ->
-            try
-                verify_tx_scripts(Tx, InputCoins, 0, Flags)
-            catch
-                throw:Reason -> exit(Reason)
-            end
-        end)
-    end, Jobs),
-    %% Collect results — all workers must complete normally
-    collect_script_results(Workers).
-
-collect_script_results([]) ->
-    ok;
-collect_script_results([{Pid, Ref} | Rest]) ->
-    receive
-        {'DOWN', Ref, process, Pid, normal} ->
-            collect_script_results(Rest);
-        {'DOWN', Ref, process, Pid, {script_verify_failed, _} = Reason} ->
-            %% Kill remaining workers
-            kill_remaining(Rest),
-            throw(Reason);
-        {'DOWN', Ref, process, Pid, Reason} ->
-            kill_remaining(Rest),
-            throw({script_verify_failed, Reason})
-    end.
-
-kill_remaining([]) -> ok;
-kill_remaining([{Pid, Ref} | Rest]) ->
-    erlang:demonitor(Ref, [flush]),
-    exit(Pid, kill),
-    kill_remaining(Rest).
+    beamchain_script_check_queue:verify(
+        Jobs, Flags, beamchain_config:scriptcheck_threads()).
 
 %% @doc Encode undo data (list of {outpoint, utxo} pairs) to binary.
 encode_undo_data(SpentCoins) ->

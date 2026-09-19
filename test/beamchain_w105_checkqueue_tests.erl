@@ -235,6 +235,7 @@ setup() ->
     code:ensure_loaded(beamchain_sig_cache),
     code:ensure_loaded(beamchain_crypto),
     code:ensure_loaded(beamchain_config),
+    code:ensure_loaded(beamchain_script_check_queue),
     %% Start the sig cache gen_server (used by crypto cached path).
     case whereis(beamchain_sig_cache) of
         undefined ->
@@ -444,38 +445,26 @@ bug3_sig_cache_key_no_nonce() ->
 %%% ===================================================================
 
 bug4_collect_fifo_no_early_abort() ->
-    %% Demonstrate FIFO by inspecting the source directly.
-    %% The collect_script_results/1 receive clause is:
-    %%   receive {'DOWN', Ref, process, Pid, ...}
-    %% with no selective-receive pattern matching any ref from the set.
-    %% This means the receive BLOCKS on the HEAD of the worker list.
-    %%
-    %% We verify the structural property: spawn 2 workers where worker-2
-    %% exits immediately with failure but worker-1 sleeps.  With FIFO
-    %% collection the failure arrives AFTER the first worker finishes.
-    %%
-    %% Note: we can't call collect_script_results directly (unexported) so
-    %% we document the bug via timing/ordering of internal messages.
-
-    %% Worker-1: slow (100ms)
-    {Pid1, Ref1} = spawn_monitor(fun() -> timer:sleep(50) end),
-    %% Worker-2: immediate failure
-    {Pid2, Ref2} = spawn_monitor(fun() -> exit(test_failure) end),
-
-    %% Flush both DOWN messages to avoid leaking into test framework
-    T0 = erlang:monotonic_time(millisecond),
-    receive {'DOWN', Ref2, process, Pid2, test_failure} -> ok end,
-    FailTime = erlang:monotonic_time(millisecond) - T0,
-    receive {'DOWN', Ref1, process, Pid1, normal} -> ok end,
-    SlowTime = erlang:monotonic_time(millisecond) - T0,
-
-    %% The failure (Pid2) is available much sooner than Pid1 finishes.
-    %% A FIFO collector waiting on Pid1 first would add at least 50ms latency.
-    ?assert(FailTime < SlowTime),
-    %% BUG: collect_script_results waits on Workers list head-first,
-    %% so even though Pid2 fails almost immediately, the collector would
-    %% first wait ~50ms for Pid1 before processing Pid2's failure.
-    ok.
+    %% FIX: the FIFO collector is gone. The CCheckQueue analogue waits
+    %% for every worker and keeps the minimum {tx,in} failure, so a
+    %% slow first job cannot hide a later-spawned reject. A passing
+    %% job that sleeps plus a failing job must still reject, at 1
+    %% worker and at 8, with the same reason.
+    Funs = [
+        fun() -> timer:sleep(30), ok end,
+        fun() -> {error, {script_verify_failed, 1}} end
+    ],
+    Catch = fun(N) ->
+        try
+            beamchain_script_check_queue:verify_funs(Funs, N)
+        catch
+            throw:Reason -> {error, Reason}
+        end
+    end,
+    D1 = Catch(1),
+    D8 = Catch(8),
+    ?assertEqual({error, {script_verify_failed, 1}}, D1),
+    ?assertEqual(D1, D8).
 
 %%% ===================================================================
 %%% BUG-5 (G5): sighash_witness_v0 recomputes hashPrevouts per-input
@@ -524,21 +513,24 @@ bug5_sighash_witness_v0_rehashes_prevouts() ->
 %%% ===================================================================
 
 bug6_unbounded_spawn_per_tx() ->
-    %% Confirm there is no -par / scriptcheck_threads configuration key
-    ?assertNot(erlang:function_exported(beamchain_config, scriptcheck_threads, 0)),
-    ?assertNot(erlang:function_exported(beamchain_config, par, 0)),
-    %% Confirm MAX_SCRIPTCHECK_THREADS constant is absent from beamchain
-    %% (If it existed it would be a macro in beamchain_protocol.hrl or similar)
-    %% We verify indirectly: no module exports a get_scriptcheck_threads/0
-    AllMods = [M || {M, _} <- code:all_loaded(), is_atom(M),
-                    lists:prefix("beamchain", atom_to_list(M))],
-    HasCap = lists:any(fun(M) ->
-                           erlang:function_exported(M, max_scriptcheck_threads, 0) orelse
-                           erlang:function_exported(M, scriptcheck_threads, 0)
-                       end, AllMods),
-    ?assertNot(HasCap),
-    %% Structural: verify_scripts_parallel is in beamchain_validation (not exported)
-    ?assertNot(erlang:function_exported(beamchain_validation, verify_scripts_parallel, 2)).
+    %% FIX: bounded CCheckQueue pool. -par / scriptcheck_threads exists,
+    %% worker count is clamped, and a 64-job run at 8 workers records
+    %% workers=8 not 64.
+    code:ensure_loaded(beamchain_script_check_queue),
+    ?assert(erlang:function_exported(beamchain_config, scriptcheck_threads, 0)),
+    ?assert(erlang:function_exported(beamchain_script_check_queue,
+                                     max_scriptcheck_threads, 0)),
+    Max = beamchain_script_check_queue:max_scriptcheck_threads(),
+    ?assertEqual(32, Max),
+    ?assertEqual(Max, beamchain_script_check_queue:resolve_threads(10_000)),
+    Funs = [fun() -> ok end || _ <- lists:seq(1, 64)],
+    ok = beamchain_script_check_queue:verify_funs(Funs, 8),
+    Stats = beamchain_script_check_queue:last_stats(),
+    ?assertEqual(8, maps:get(workers, Stats)),
+    ?assertEqual(64, maps:get(jobs, Stats)),
+    %% verify_scripts_parallel stays private; the pool is the public API.
+    ?assertNot(erlang:function_exported(beamchain_validation,
+                                        verify_scripts_parallel, 2)).
 
 %%% ===================================================================
 %%% BUG-7 (G7): Script jobs reversed
@@ -550,24 +542,38 @@ bug6_unbounded_spawn_per_tx() ->
 %%% ===================================================================
 
 bug7_jobs_reversed_order() ->
-    %% We cannot call the private fold directly, but we can confirm the
-    %% accumulation pattern by reading the exported API.  The bug is
-    %% structural: NewJobs = [{Tx, InputCoins} | JobsAcc] (prepend).
-    %% A correct implementation would use JobsAcc ++ [{Tx, InputCoins}]
-    %% (append, O(n^2)) or build in reverse and reverse at dispatch.
-    %% The current code does neither — it dispatches the reversed list.
-    %%
-    %% Demonstrate with a simple list accumulation to show what happens:
-    Txs = [tx1, tx2, tx3],
-    JobsAcc0 = [],
-    JobsAcc1 = lists:foldl(fun(Tx, Acc) -> [Tx | Acc] end, JobsAcc0, Txs),
-    %% JobsAcc1 is [tx3, tx2, tx1] — reversed
-    ?assertEqual([tx3, tx2, tx1], JobsAcc1),
-    %% connect_block dispatches JobsAcc1 directly to verify_scripts_parallel.
-    %% BUG: tx1 (first in block) is processed LAST; tx3 (last in block) first.
-    %% If tx1 has an invalid script and tx3 is valid, the error report
-    %% attributes the failure to the wrong position.
-    ?assertNotEqual([tx1, tx2, tx3], JobsAcc1).
+    %% FIX: connect_block still prepends in the fold (O(1)) but reverses
+    %% before dispatch, so verify() sees block order. Two failing txs:
+    %% tx0 has 3 inputs, fail at input 2; tx1 fails at input 0. Min order
+    %% is {0,2} → {script_verify_failed, 2}, not the later tx's input 0.
+    Mk = fun(SPKs) ->
+        Inputs = [#tx_in{
+            prev_out = #outpoint{hash = <<0:256>>, index = I},
+            script_sig = <<16#51>>,
+            sequence = 16#ffffffff,
+            witness = []
+        } || I <- lists:seq(0, length(SPKs) - 1)],
+        Coins = [#utxo{value = 2000, script_pubkey = SPK,
+                       is_coinbase = false, height = 1} || SPK <- SPKs],
+        Tx = #transaction{version = 1, inputs = Inputs,
+                          outputs = [#tx_out{value = 1000,
+                                             script_pubkey = <<16#51>>}],
+                          locktime = 0},
+        {Tx, Coins}
+    end,
+    Tx0 = Mk([<<16#51>>, <<16#51>>, <<0>>]),
+    Tx1 = Mk([<<0>>]),
+    Catch = fun(N) ->
+        try
+            beamchain_script_check_queue:verify([Tx0, Tx1], 0, N)
+        catch
+            throw:R -> {error, R}
+        end
+    end,
+    D1 = Catch(1),
+    D8 = Catch(8),
+    ?assertEqual({error, {script_verify_failed, 2}}, D1),
+    ?assertEqual(D1, D8).
 
 %%% ===================================================================
 %%% BUG-8 (G8): Sig-cache sized by entry count, not bytes
@@ -652,29 +658,13 @@ bug11_no_just_check_mode() ->
 %%% ===================================================================
 
 bug12_spawn_no_opts() ->
-    %% spawn_monitor/1 uses default BEAM process options (no max_heap_size,
-    %% no priority, no min_heap_size).  A pathological script could use
-    %% large stacks/heaps.  Demonstrate that spawn_opt would be the fix:
-    %%   spawn_opt(Fun, [{max_heap_size, #{size=>500000, kill=>true}}])
-    %%
-    %% Structural test: confirm spawn_opt is available and the current
-    %% code does NOT use it (no bounded worker processes).
-    ?assert(erlang:function_exported(erlang, spawn_opt, 2)),
-    %% spawn_opt with monitor+max_heap_size kills process on OOM:
-    %% Adding 'monitor' to spawn_opt returns {Pid, Ref} like spawn_monitor/1.
-    {Pid, Ref} = erlang:spawn_opt(fun() ->
-        %% Allocate a large binary — heap is bounded
-        _Big = lists:duplicate(10, crypto:strong_rand_bytes(100)),
-        ok
-    end, [monitor, {max_heap_size, #{size => 1_000_000, kill => true, error_logger => false}}]),
-    receive
-        {'DOWN', Ref, process, Pid, Reason} ->
-            %% Either normal (small enough) or killed (too large):
-            ?assert(Reason =:= normal orelse Reason =:= killed)
-    after 500 ->
-        erlang:demonitor(Ref, [flush]),
-        exit(Pid, kill)
-    end.
+    %% FIX: workers are spawn_opt with max_heap_size. last_stats records
+    %% the cap so a pool cannot grow unbounded heaps with worker count.
+    ok = beamchain_script_check_queue:verify_funs([fun() -> ok end], 1),
+    Stats = beamchain_script_check_queue:last_stats(),
+    ?assertEqual(beamchain_script_check_queue:worker_max_heap_words(),
+                 maps:get(max_heap_words, Stats)),
+    ?assert(maps:get(max_heap_words, Stats) > 0).
 
 %%% ===================================================================
 %%% G13: sig-cache lookup is direct ETS read (no gen_server roundtrip)

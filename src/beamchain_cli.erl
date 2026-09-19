@@ -331,6 +331,19 @@ parse_args(["--dbcache", Value | Rest], Cmd, Opts) ->
 parse_args(["--dbcache=" ++ Value | Rest], Cmd, Opts) ->
     parse_args(Rest, Cmd, Opts#{dbcache => parse_dbcache_arg(Value)});
 
+%% --par=<n> / -par=<n>: script verification threads. Core init.cpp:513.
+%% 0 = auto = every dirty-CPU scheduler; >0 = that many workers; <0 =
+%% leave |n| cores free. Routed through BEAMCHAIN_PAR so
+%% beamchain_config:scriptcheck_threads/0 sees it before ETS is up.
+parse_args(["--par", Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{par => list_to_integer(Value)});
+parse_args(["--par=" ++ Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{par => list_to_integer(Value)});
+parse_args(["-par", Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{par => list_to_integer(Value)});
+parse_args(["-par=" ++ Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{par => list_to_integer(Value)});
+
 %% Commands
 parse_args(["start" | Rest], undefined, Opts) ->
     parse_args(Rest, start, Opts);
@@ -410,6 +423,9 @@ print_usage() ->
         "                    (0=off default, 1=on; mirrors Core -coinstatsindex)~n"
         "  --dbcache=<MiB>   Total UTXO cache budget in MiB (default 4096 IBD /~n"
         "                    256 RocksDB block cache). Performance only.~n"
+        "  --par=<n>         script verification threads (0=auto=every core,~n"
+        "                    <0=leave that many cores free, default 0;~n"
+        "                    Core -par). Cap 32.~n"
         "  --noassumevalid   verify scripts for ALL history (disable the~n"
         "                    assumevalid skip; alias --assumevalid=0)~n"
         "  --listenonion=<n> 1 = register v3 hidden service via Tor control~n"
@@ -921,6 +937,13 @@ apply_opts(Opts) ->
         undefined -> ok;
         N when is_integer(N), N > 0 ->
             os:putenv("BEAMCHAIN_DBCACHE", integer_to_list(N))
+    end,
+    %% --par: route through BEAMCHAIN_PAR so scriptcheck_threads/0 sees
+    %% it whether or not the config ETS table exists yet.
+    case maps:get(par, Opts, undefined) of
+        undefined -> ok;
+        Par when is_integer(Par) ->
+            os:putenv("BEAMCHAIN_PAR", integer_to_list(Par))
     end,
     %% --listenonion / --torcontrol / --torpassword: route through the
     %% same BEAMCHAIN_* env vars that beamchain_config consults so the

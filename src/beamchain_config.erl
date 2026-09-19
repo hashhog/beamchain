@@ -40,7 +40,9 @@
          torcontrol_password/0,
          %% PayJoin (W119 FIX-67)
          payjoin_budget_ms/0,
-         payjoin_require_token/0]).
+         payjoin_require_token/0,
+         %% Script-check pool (Core -par)
+         scriptcheck_threads/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -66,6 +68,33 @@ start_link() ->
 -spec get(atom()) -> term() | undefined.
 get(Key) ->
     get(Key, undefined).
+
+%% @doc Script verification worker count. Core `-par`: 0 = auto (every
+%% dirty-CPU scheduler), >0 = that many workers, <0 = leave |n| cores
+%% free. Env `BEAMCHAIN_PAR` overrides config `par=`. Clamped to
+%% [1, max_scriptcheck_threads()].
+-spec scriptcheck_threads() -> pos_integer().
+scriptcheck_threads() ->
+    beamchain_script_check_queue:resolve_threads(par_raw()).
+
+par_raw() ->
+    case os:getenv("BEAMCHAIN_PAR") of
+        false ->
+            case get(par, 0) of
+                N when is_integer(N) -> N;
+                S when is_list(S) -> parse_par_int(S);
+                B when is_binary(B) -> parse_par_int(binary_to_list(B));
+                _ -> 0
+            end;
+        S ->
+            parse_par_int(S)
+    end.
+
+parse_par_int(S) ->
+    case catch list_to_integer(string:trim(S)) of
+        N when is_integer(N) -> N;
+        _ -> 0
+    end.
 
 %% @doc Get a config value by key with default. Returns the default if the
 %% config gen_server has not initialised its ETS table yet (early boot or a

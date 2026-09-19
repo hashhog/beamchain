@@ -21,6 +21,11 @@ port = 8333
 [mempool]
 # (Uses Bitcoin Core defaults internally)
 
+# Script verification threads (Bitcoin Core -par). 0 = auto = every
+# core; a positive N uses N workers; a negative N leaves |N| cores free.
+# Cap is 32. Does not change consensus decisions.
+# par = 0
+
 [logging]
 # Erlang/OTP logger configuration
 # See config/sys.config for detailed OTP settings
