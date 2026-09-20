@@ -14,6 +14,7 @@
 -export([load_campaign_assumeutxo/0, campaign_assumeutxo_registry/0,
          clear_campaign_assumeutxo/0]).
 -export([unsafe_snapshot_height/0, warn_unsafe_snapshot/3]).
+-export([maybe_log_assumevalid_disabled/0]).
 
 %% @doc Returns comprehensive chain parameters for the given network.
 %%
@@ -48,6 +49,26 @@ assume_valid_disabled() ->
         "false" -> true;
         "none"  -> true;
         _       -> false
+    end.
+
+%% Campaign scripts-on ack. A single INFO line naming the flag and what
+%% it turns off, emitted only when the knob actually zeroed mainnet
+%% assume_valid. Silent without the flag — an unconditional banner would
+%% let the harness certify a scripts-off run. Exact string the campaign
+%% should register:
+%%   assumevalid DISABLED (--noassumevalid): full script verification of all history
+-spec maybe_log_assumevalid_disabled() -> {logged, string()} | silent.
+maybe_log_assumevalid_disabled() ->
+    Disabled = assume_valid_disabled(),
+    AV = maps:get(assume_valid, params(mainnet)),
+    case {Disabled, AV} of
+        {true, <<0:256>>} ->
+            Msg = "assumevalid DISABLED (--noassumevalid): "
+                  "full script verification of all history",
+            logger:info("~s", [Msg]),
+            {logged, Msg};
+        _ ->
+            silent
     end.
 
 %% @doc Network params as declared in-source (before the assumevalid knob).

@@ -101,3 +101,54 @@ knob_forces_full_verify_below_av_height_test() ->
         ?assertNot(
             beamchain_validation:skip_scripts(BelowAvHeight, BlockHash, Params))
     end).
+
+%%% --- startup banner (campaign scripts_ack) --------------------------------
+%%%
+%%% CONTROL: the INFO line is returned (and logged) with the disable knob
+%%% and is absent without it. An unconditional banner is worse than none.
+
+-define(AV_BANNER,
+        "assumevalid DISABLED (--noassumevalid): "
+        "full script verification of all history").
+
+banner_logged_with_noassumevalid_test() ->
+    with_env("0", fun() ->
+        ?assertEqual(
+            {logged, ?AV_BANNER},
+            beamchain_chain_params:maybe_log_assumevalid_disabled())
+    end).
+
+banner_silent_without_flag_test() ->
+    with_env(unset, fun() ->
+        ?assertEqual(
+            silent,
+            beamchain_chain_params:maybe_log_assumevalid_disabled())
+    end).
+
+banner_silent_when_nonzero_test() ->
+    with_env("1", fun() ->
+        ?assertEqual(
+            silent,
+            beamchain_chain_params:maybe_log_assumevalid_disabled())
+    end).
+
+%% `--assumevalid=0` is the same disable knob (alias of --noassumevalid).
+assumevalid_eq_zero_emits_banner_test() ->
+    {start, Opts} = beamchain_cli:parse_args(["start", "--assumevalid=0"]),
+    ?assertEqual(true, maps:get(noassumevalid, Opts)),
+    with_env("0", fun() ->
+        ?assertEqual(
+            {logged, ?AV_BANNER},
+            beamchain_chain_params:maybe_log_assumevalid_disabled())
+    end).
+
+%% Parsing the flag without applying it must NOT log — otherwise a
+%% scripts-off process could still print the ack line.
+parse_alone_does_not_log_test() ->
+    {start, Opts} = beamchain_cli:parse_args(["start", "--noassumevalid"]),
+    ?assertEqual(true, maps:get(noassumevalid, Opts)),
+    with_env(unset, fun() ->
+        ?assertEqual(
+            silent,
+            beamchain_chain_params:maybe_log_assumevalid_disabled())
+    end).

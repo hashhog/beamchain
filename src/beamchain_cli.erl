@@ -472,6 +472,9 @@ do_start_node(Opts) ->
             maybe_setup_console_logger(Opts),
             write_pidfile(Opts),
             print_banner(),
+            %% After the logger handlers exist so this INFO line lands in
+            %% beamchain.log and (with --printtoconsole) the campaign node.log.
+            _ = beamchain_chain_params:maybe_log_assumevalid_disabled(),
             io:format("~s~n", [green("node started, press Ctrl-C to stop")]),
             %% Block forever -the OTP app runs in the background
             block_forever();
