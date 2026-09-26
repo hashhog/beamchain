@@ -6621,25 +6621,45 @@ networkinfo_net(Name, Reachable) ->
         {<<"proxy_randomize_credentials">>, false}
     ].
 
-%% Collect locally-bound P2P addresses for getnetworkinfo. Currently
-%% only the v3 .onion advertised by beamchain_torcontrol (when
-%% listenonion is enabled) makes it in; future wiring can add bound
-%% IPv4/IPv6 interfaces from the listener.
+%% getnetworkinfo.localaddresses (Core rpc/net.cpp: one {address, port,
+%% score} row per mapLocalHost entry). Sources: the peer manager's local
+%% address table (-externalip at score 4, plus addresses discovered from
+%% outbound peers' VERSION addr_recv, scored by distinct confirming
+%% netgroups) and the v3 .onion from beamchain_torcontrol (Core AddLocal
+%% LOCAL_MANUAL). Ports are the real P2P LISTEN port, not the chain default
+%% (the mainnet fleet listens on 8336, not 8333).
 local_addresses_for_getnetworkinfo() ->
+    {ListenPort, Rows} =
+        case catch beamchain_peer_manager:local_addresses() of
+            {LP, L} when is_integer(LP), is_list(L) -> {LP, L};
+            _ -> {listen_port_fallback(), []}
+        end,
+    %% ORDERED proplist: Core rpc/net.cpp localaddresses rec pushKV order
+    %% is address, port, score.
+    IpEntries = [[{<<"address">>, list_to_binary(inet:ntoa(IP))},
+                  {<<"port">>,    Port},
+                  {<<"score">>,   Score}] || {IP, Port, Score} <- Rows],
     OnionEntries =
         case catch beamchain_torcontrol:get_onion_address() of
             Addr when is_list(Addr), Addr =/= [] ->
-                Port = try beamchain_config:network_params() of
-                    NP -> NP#network_params.default_port
-                catch _:_ -> 8333 end,
-                %% ORDERED proplist: Core rpc/net.cpp localaddresses rec
-                %% pushKV order is address, port, score.
                 [[{<<"address">>, list_to_binary(Addr)},
-                  {<<"port">>,    Port},
+                  {<<"port">>,    ListenPort},
                   {<<"score">>,   4}]];
             _ -> []
         end,
-    OnionEntries.
+    IpEntries ++ OnionEntries.
+
+%% Listen port when the peer manager is unavailable: the configured
+%% p2pport, else the chain default.
+listen_port_fallback() ->
+    case catch beamchain_config:get(p2pport) of
+        P when is_integer(P) -> P;
+        P when is_list(P) -> try list_to_integer(P) catch _:_ -> 0 end;
+        _ ->
+            try beamchain_config:network_params() of
+                NP -> NP#network_params.default_port
+            catch _:_ -> 8333 end
+    end.
 
 rpc_getpeerinfo() ->
     Peers = beamchain_peer_manager:get_peers(),

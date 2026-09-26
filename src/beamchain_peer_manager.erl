@@ -46,6 +46,9 @@
 %% API
 -export([start_link/0,
          connect_to/2,
+         %% Self-address advertisement (Core mapLocalHost / MaybeSendAddr):
+         %% getnetworkinfo.localaddresses.
+         local_addresses/0,
          get_peers/0,
          get_peer/1,
          peer_count/0,
@@ -187,6 +190,11 @@
 %% When DNS is disabled and there is no other peer source, the fallback
 %% fires immediately instead (net.cpp:2620 `!dnsseed && !use_seednodes`).
 -define(FIXED_SEED_GRACE, 60).               %% 60 seconds (in seconds)
+
+%% Self-address advertisement timer (Core MaybeSendAddr runs every
+%% SendMessages pass; we check once a minute, which is fine against the 24h
+%% Poisson mean and bounds the post-IBD first-send delay to ~1 min).
+-define(LOCAL_ADDR_TICK_MS, 60000).
 
 -record(peer_entry, {
     pid         :: pid(),
@@ -347,7 +355,20 @@
     %% maybe_add_fixed_seeds, Core net.cpp:2351). When TRUE (the default) every
     %% gate is a no-op and behavior is byte-identical to before. Not persisted;
     %% resets to enabled on restart.
-    network_active = true :: boolean()
+    network_active = true :: boolean(),
+    %% Self-address advertisement (beamchain_localaddr; Core mapLocalHost,
+    %% fDiscover, GetListenPort, Peer::m_next_local_addr_send).
+    %%   local_addrs     — our own address table (-externalip + discovery).
+    %%   discover        — Core -discover (default on; off with -externalip
+    %%                     unless -discover is given explicitly).
+    %%   listen_port     — the bound P2P listen port, 0 when not listening.
+    %%   local_addr_next — Pid => unix ts of the next self-announcement;
+    %%                     absent = never sent (due now).
+    local_addrs = #{} :: map(),
+    discover = true :: boolean(),
+    listen_port = 0 :: non_neg_integer(),
+    local_addr_next = #{} :: #{pid() => integer()},
+    local_addr_timer :: reference() | undefined
 }).
 
 %%% ===================================================================
@@ -496,6 +517,13 @@ pick_announce_msg(true, Header, _BlockHash) ->
 pick_announce_msg(false, _Header, BlockHash) ->
     %% Pre-BIP-130 fallback: enumerate via inv, peer round-trips getheaders.
     {inv, #{items => [#{type => ?MSG_BLOCK, hash => BlockHash}]}}.
+
+%% @doc Our local address table for getnetworkinfo.localaddresses:
+%% {ListenPort, [{IP, Port, Score}]}.
+-spec local_addresses() -> {non_neg_integer(),
+                            [{inet:ip_address(), inet:port_number(), integer()}]}.
+local_addresses() ->
+    gen_server:call(?SERVER, local_addresses, 5000).
 
 %% @doc Send a getaddr to a specific peer.
 -spec request_addresses(pid()) -> ok.
@@ -820,6 +848,10 @@ init([]) ->
     Anchors = load_anchors(DataDir),
     %% Start listening for inbound connections
     {ListenSock, Acceptor} = start_listener(),
+    ListenPort = bound_listen_port(ListenSock),
+    {Discover, LocalAddrs} = init_local_addrs(ListenPort),
+    LocalAddrTimer = erlang:send_after(?LOCAL_ADDR_TICK_MS, self(),
+                                       local_addr_tick),
     %% Kick off DNS seed resolution and anchor connects
     self() ! bootstrap,
     %% Connection maintenance loop is NOT scheduled yet — the first
@@ -884,7 +916,11 @@ init([]) ->
                 connect_addrs = ConnectAddrs,
                 no_dns_seed = NoDnsSeed,
                 no_fixed_seed = NoFixedSeed,
-                start_time = Now}}.
+                start_time = Now,
+                local_addrs = LocalAddrs,
+                discover = Discover,
+                listen_port = ListenPort,
+                local_addr_timer = LocalAddrTimer}}.
 
 handle_call({connect_to, IP, Port}, _From, State) ->
     Address = {IP, Port},
@@ -980,6 +1016,12 @@ handle_call({clear_ban, IP}, _From, State) ->
 handle_call(get_state, _From, State) ->
     {reply, State, State};
 
+%% getnetworkinfo.localaddresses (Core rpc/net.cpp: mapLocalHost rows).
+handle_call(local_addresses, _From,
+            #state{local_addrs = T, listen_port = LP} = State) ->
+    {reply, {LP, beamchain_localaddr:list(T, erlang:system_time(second))},
+     State};
+
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_request}, State}.
 
@@ -1035,11 +1077,14 @@ handle_cast(_Msg, State) ->
 %% net_processing only requests addresses from full-relay outbounds).
 %% Critically: promotion happens ONLY on this success edge. A dial-fail or
 %% handshake-fail never reaches {peer_connected}, so it never promotes.
-handle_info({peer_connected, Pid, _Info},
+handle_info({peer_connected, Pid, FInfo},
             #state{feeler_in_flight = FPid} = State)
   when Pid =:= FPid ->
     case ets:lookup(?PEER_TABLE, Pid) of
         [#peer_entry{address = Addr, conn_type = feeler}] ->
+            %% A feeler's VERSION addr_recv is as good a discovery sample
+            %% as any other outbound peer's (blockbrew parity).
+            self() ! {local_addr_note, Addr, outbound, FInfo},
             beamchain_addrman:mark_tried(Addr),  %% promote NEW->TRIED
             logger:debug("peer manager: feeler probe to ~p succeeded, "
                          "promoted NEW->TRIED, disconnecting", [Addr]),
@@ -1077,6 +1122,11 @@ handle_info({peer_connected, Pid, Info}, State) ->
             end,
             logger:info("peer manager: ~p connected (~s)",
                         [Addr, maps:get(user_agent, Info, <<"unknown">>)]),
+            %% Self-address discovery from VERSION addr_recv, then the
+            %% initial self-announcement (Core MaybeSendAddr, first
+            %% SendMessages pass after the handshake).
+            State2b = maybe_send_local_addr(
+                        Pid, note_version_addr_recv(Addr, Dir, Info, State2)),
             %% Notify sync coordinator about the new peer
             beamchain_sync:notify_peer_connected(Pid, Info),
             %% Request addresses from new outbound peers.
@@ -1111,7 +1161,7 @@ handle_info({peer_connected, Pid, Info}, State) ->
                 inbound ->
                     ok
             end,
-            {noreply, State2};
+            {noreply, State2b};
         [] ->
             %% Unknown peer, ignore
             {noreply, State}
@@ -1204,6 +1254,21 @@ handle_info(connect_tick, State0) ->
 %% successful handshake, promotes the address NEW->TRIED (addrman.Good())
 %% then disconnects — keeping the TRIED table fresh, Core's primary
 %% eclipse-attack mitigation.
+%% Self-address re-announcement tick (Core MaybeSendAddr timer): every
+%% connected peer whose Poisson deadline passed gets our address again; a
+%% peer held back by IBD gets its FIRST announcement on the first tick after
+%% IBD ends.
+handle_info(local_addr_tick, State0) ->
+    Pids = ets:foldl(fun(#peer_entry{pid = P, connected = true}, Acc) -> [P | Acc];
+                        (_, Acc) -> Acc
+                     end, [], ?PEER_TABLE),
+    State = lists:foldl(fun maybe_send_local_addr/2, State0, Pids),
+    Timer = erlang:send_after(?LOCAL_ADDR_TICK_MS, self(), local_addr_tick),
+    {noreply, State#state{local_addr_timer = Timer}};
+
+handle_info({local_addr_note, Addr, Dir, Info}, State) ->
+    {noreply, note_version_addr_recv(Addr, Dir, Info, State)};
+
 handle_info(feeler_tick, State0) ->
     State = maybe_open_feeler(State0),
     Timer = erlang:send_after(?FEELER_INTERVAL_MS, self(), feeler_tick),
@@ -1972,9 +2037,11 @@ finalize_peer(Pid, State) ->
     %% This covers the handshake-FAIL path (the feeler process dies before
     %% {peer_connected} ever fires — no promotion happens, exactly as Core),
     %% as well as the normal post-promote disconnect.
-    State1 = case State#state.feeler_in_flight of
-        Pid -> State#state{feeler_in_flight = undefined};
-        _   -> State
+    State0 = State#state{local_addr_next =
+                             maps:remove(Pid, State#state.local_addr_next)},
+    State1 = case State0#state.feeler_in_flight of
+        Pid -> State0#state{feeler_in_flight = undefined};
+        _   -> State0
     end,
     remove_peer_and_update(Pid, State1).
 
@@ -2979,6 +3046,126 @@ start_listener() ->
         {error, Reason} ->
             logger:warning("failed to listen on port ~B: ~p", [Port, Reason]),
             {undefined, undefined}
+    end.
+
+%%% ===================================================================
+%%% Internal: self-address advertisement (see beamchain_localaddr)
+%%% ===================================================================
+
+%% @doc The port we actually accept connections on (Core GetListenPort);
+%% 0 when the listener did not come up (Core fListen false).
+bound_listen_port(undefined) -> 0;
+bound_listen_port(LSock) ->
+    case catch inet:port(LSock) of
+        {ok, P} when is_integer(P) -> P;
+        _ -> 0
+    end.
+
+%% @doc Build the local address table from -externalip (CLI env, repeatable,
+%% or `externalip=` in the config file; comma-separated allowed) and resolve
+%% -discover (Core init.cpp:815: -externalip soft-disables discovery).
+init_local_addrs(ListenPort) ->
+    Specs = beamchain_localaddr:parse_externalip_list(
+              [application:get_env(beamchain, externalip, []),
+               case beamchain_config:get(externalip) of
+                   undefined -> [];
+                   V -> [V]
+               end]),
+    DiscoverExplicit =
+        case application:get_env(beamchain, discover, undefined) of
+            B when is_boolean(B) -> B;
+            _ ->
+                case beamchain_config:get(discover) of
+                    undefined -> undefined;
+                    V2 -> lists:member(V2, ["1", "true", <<"1">>, <<"true">>, true, 1])
+                end
+        end,
+    Discover = beamchain_localaddr:discover_enabled(DiscoverExplicit, Specs),
+    Table = lists:foldl(
+              fun(Spec, T) ->
+                      case beamchain_localaddr:parse_externalip(Spec) of
+                          {ok, IP, Port0} ->
+                              Port = case Port0 of 0 -> ListenPort; _ -> Port0 end,
+                              case beamchain_localaddr:add_manual(T, IP, Port) of
+                                  {ok, T2} ->
+                                      logger:info("externalip: advertising ~s:~B",
+                                                  [inet:ntoa(IP), Port]),
+                                      T2;
+                                  {error, not_routable} ->
+                                      logger:warning("externalip: ~s is not publicly "
+                                                     "routable; ignored", [Spec]),
+                                      T
+                              end;
+                          {error, Why} ->
+                              logger:warning("externalip: cannot parse ~p (~p); "
+                                             "ignored", [Spec, Why]),
+                              T
+                      end
+              end, beamchain_localaddr:new(), Specs),
+    logger:info("self-advertise: listen_port=~B discover=~p externalip=~B",
+                [ListenPort, Discover, maps:size(Table)]),
+    {Discover, Table}.
+
+%% @doc Record the peer's VERSION addr_recv (discovery from outbound peers,
+%% SeenLocal-style scoring from inbound peers).
+note_version_addr_recv({PeerIP, _} = Addr, Dir, Info,
+                       #state{local_addrs = T, discover = D,
+                              listen_port = LP} = State) ->
+    case maps:get(addr_local, Info, undefined) of
+        {SeenIP, _SeenPort} ->
+            Group = beamchain_addrman:netgroup(Addr, get_asmap_binary()),
+            T2 = beamchain_localaddr:note_addr_recv(
+                   T, #{discover => D, listen_port => LP, peer_ip => PeerIP,
+                        peer_group => Group, inbound => Dir =:= inbound,
+                        addr_recv_ip => SeenIP,
+                        now => erlang:system_time(second)}),
+            State#state{local_addrs = T2};
+        _ ->
+            State
+    end;
+note_version_addr_recv(_, _, _, State) ->
+    State.
+
+%% @doc Core MaybeSendAddr self-announcement block for one peer.
+maybe_send_local_addr(Pid, #state{local_addrs = T, discover = D,
+                                  listen_port = LP,
+                                  local_addr_next = NextMap} = State) ->
+    case ets:lookup(?PEER_TABLE, Pid) of
+        [#peer_entry{connected = true, address = {PeerIP, _},
+                     direction = Dir, conn_type = CT, info = Info}] ->
+            Now = erlang:system_time(second),
+            Ctx = #{listening => LP > 0,
+                    ibd => not beamchain_chainstate:is_synced(),
+                    conn_type => CT,
+                    next_send => maps:get(Pid, NextMap, undefined),
+                    now => Now},
+            case beamchain_localaddr:announce_due(
+                   Ctx, fun beamchain_localaddr:next_delay/0) of
+                skip ->
+                    State;
+                {send, Next} ->
+                    case beamchain_localaddr:local_addr_for_peer(
+                           T, #{discover => D, listen_port => LP,
+                                peer_ip => PeerIP,
+                                inbound => Dir =:= inbound,
+                                addr_local => maps:get(addr_local, Info, undefined),
+                                now => Now}) of
+                        {ok, IP, Port} ->
+                            Msg = beamchain_localaddr:self_addr_message(
+                                    IP, Port,
+                                    beamchain_peer:advertised_services(), Now,
+                                    maps:get(wants_addrv2, Info, false) =:= true),
+                            logger:debug("self-advertise: ~s:~B to peer ~p (~p)",
+                                         [inet:ntoa(IP), Port, Pid,
+                                          element(1, Msg)]),
+                            beamchain_peer:send_message(Pid, Msg);
+                        none ->
+                            ok
+                    end,
+                    State#state{local_addr_next = NextMap#{Pid => Next}}
+            end;
+        _ ->
+            State
     end.
 
 spawn_acceptor(undefined) -> undefined;

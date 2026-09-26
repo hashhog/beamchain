@@ -107,6 +107,10 @@
     peer_relay = true       :: boolean(),
     peer_nonce              :: non_neg_integer() | undefined,
     peer_version_timestamp  :: integer() | undefined,  %% W49 tranche C: peer's nTime from their version msg, for getpeerinfo timeoffset
+    %% VERSION addr_recv: the address the peer sees us at (Core
+    %% CNode::GetAddrLocal / SetAddrLocal). Feeds self-address discovery
+    %% and GetLocalAddrForPeer in beamchain_localaddr.
+    peer_addr_recv = undefined :: {inet:ip_address(), inet:port_number()} | undefined,
     %% Feature negotiation
     wants_headers = false   :: boolean(),
     wants_cmpct = false     :: boolean(),
@@ -1430,7 +1434,6 @@ do_dispatch_message(Command, Payload, Data) ->
 %%% ===================================================================
 
 do_send_version(#peer_data{address = {IP, Port}, our_nonce = Nonce} = Data) ->
-    Params = beamchain_config:network_params(),
     %% BIP35: advertise NODE_BLOOM only when configured. Bitcoin Core gates
     %% acceptance of inbound `mempool` messages on whether we advertise this
     %% bit (see net_processing.cpp::ProcessMessage NetMsgType::MEMPOOL); the
@@ -1459,8 +1462,14 @@ do_send_version(#peer_data{address = {IP, Port}, our_nonce = Nonce} = Data) ->
         services    => Services,
         timestamp   => Now,
         addr_recv   => #{services => 0, ip => IP, port => Port},
-        addr_from   => #{services => Services, ip => {0,0,0,0},
-                         port => Params#network_params.default_port},
+        %% addr_from: Core sends an EMPTY CService here (net_processing.cpp
+        %% PushNodeVersion: CNetAddr::V1(CService{}) == [::]:0). We used to
+        %% put the chain default port (8333 on mainnet) here, which is wrong
+        %% whenever we listen elsewhere (mainnet fleet: 8336). Our real
+        %% address is advertised separately via addr/addrv2
+        %% (beamchain_localaddr, Core MaybeSendAddr).
+        addr_from   => #{services => Services, ip => {0,0,0,0,0,0,0,0},
+                         port => 0},
         nonce       => Nonce,
         user_agent  => <<"/beamchain:0.1.0/">>,
         start_height => StartHeight,
@@ -1526,7 +1535,7 @@ handle_version_msg(Payload, Data) ->
     case beamchain_p2p_msg:decode_payload(version, Payload) of
         {ok, #{version := V, services := Svc, user_agent := UA,
                start_height := Height, relay := Relay, nonce := PeerNonce,
-               timestamp := PeerTs}} ->
+               timestamp := PeerTs} = VMsg} ->
             %% Self-connection detection
             case PeerNonce =:= Data#peer_data.our_nonce of
                 true ->
@@ -1542,7 +1551,8 @@ handle_version_msg(Payload, Data) ->
                         peer_height = Height,
                         peer_relay = Relay,
                         peer_nonce = PeerNonce,
-                        peer_version_timestamp = PeerTs
+                        peer_version_timestamp = PeerTs,
+                        peer_addr_recv = version_addr_recv(VMsg)
                     },
                     %% Inbound: send our version if we haven't yet
                     Data3 = maybe_send_version(Data2),
@@ -1559,6 +1569,13 @@ handle_version_msg(Payload, Data) ->
             logger:warning("peer ~p bad version", [Data#peer_data.address]),
             {stop, bad_version}
     end.
+
+%% Extract VERSION addr_recv as {IP, Port}; undefined when malformed.
+version_addr_recv(#{addr_recv := #{ip := IP, port := Port}})
+  when is_tuple(IP), is_integer(Port) ->
+    {IP, Port};
+version_addr_recv(_) ->
+    undefined.
 
 maybe_send_version(#peer_data{direction = inbound, version_sent = false} = Data) ->
     do_send_version(Data);
@@ -1950,6 +1967,11 @@ build_info(#peer_data{} = D) ->
       %% in place of MSG_TX. Surfaced via info/1 so peer_manager can decide
       %% the inv type without poking the gen_statem state directly.
       wtxidrelay    => D#peer_data.wtxidrelay,
+      %% Self-address advertisement (beamchain_localaddr): the peer's view
+      %% of our address (VERSION addr_recv) and whether it asked for
+      %% addrv2 (BIP-155 sendaddrv2) so our self-announcement uses it.
+      addr_local    => D#peer_data.peer_addr_recv,
+      wants_addrv2  => D#peer_data.wants_addrv2,
       peer_version_timestamp => D#peer_data.peer_version_timestamp}.
 
 %%% ===================================================================

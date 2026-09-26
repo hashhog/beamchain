@@ -35,6 +35,8 @@
          getaddrmaninfo/0,
          netgroup/1,
          netgroup/2,
+         %% Core CNetAddr::IsRoutable; reused by beamchain_localaddr.
+         is_routable/2,
          get_secret/0,
          %% Exported for testing: bucket assignment helpers (pure, deterministic)
          get_new_bucket/3,

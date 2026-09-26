@@ -170,6 +170,24 @@ parse_args(["--connect", Value | Rest], Cmd, Opts) ->
 parse_args(["--connect=" ++ Value | Rest], Cmd, Opts) ->
     parse_args(Rest, Cmd, append_connect(Value, Opts));
 
+%% --externalip=<ip>[:port] (repeatable / comma-separated): our own public
+%% address to advertise to peers (Core -externalip, score LOCAL_MANUAL). A
+%% bare IP uses the P2P listen port. Implies --discover=0 unless --discover
+%% is given explicitly (Core init.cpp:815).
+parse_args(["--externalip", Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, append_externalip(Value, Opts));
+parse_args(["--externalip=" ++ Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, append_externalip(Value, Opts));
+
+%% --discover[=0|1] / --nodiscover: learn our public address from what
+%% outbound peers report in VERSION addr_recv (Core -discover).
+parse_args(["--discover=" ++ Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{discover => parse_bool(Value)});
+parse_args(["--discover" | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{discover => true});
+parse_args(["--nodiscover" | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{discover => false});
+
 %% --nodnsseed / --dnsseed=0: suppress DNS seed resolution independently
 %% of --connect. Mirrors bitcoin-core -dnsseed=0 / clearbit --nodnsseed
 %% (sets dns_seed=false). --dnsseed=1 re-enables (the default).
@@ -402,6 +420,11 @@ print_usage() ->
         "                    disables DNS seeds + addrman auto-outbound~n"
         "                    (Core -connect semantics)~n"
         "  --nodnsseed       do not resolve DNS seeds (alias --dnsseed=0)~n"
+        "  --externalip=<ip>[:port]  advertise this public address to peers~n"
+        "                    (repeatable; bare IP = P2P listen port; implies~n"
+        "                    --discover=0 unless given; Core -externalip)~n"
+        "  --discover[=0|1]  learn own address from outbound peers (default 1~n"
+        "                    unless --externalip; Core -discover)~n"
         "  --nofixedseeds    disable the fixed-seed fallback (alias~n"
         "                    --fixedseeds=0; Core -fixedseeds=0)~n"
         "  --pid=<file>      pid file path (default: <datadir>/beamchain.pid)~n"
@@ -846,6 +869,19 @@ apply_opts(Opts) ->
         Connect when is_list(Connect) ->
             application:set_env(beamchain, connect, Connect, [{persistent, true}])
     end,
+    %% --externalip / --discover (self-address advertisement). Read by
+    %% beamchain_peer_manager:init_local_addrs/1.
+    case maps:get(externalip, Opts, undefined) of
+        undefined -> ok;
+        []        -> ok;
+        Ext when is_list(Ext) ->
+            application:set_env(beamchain, externalip, Ext, [{persistent, true}])
+    end,
+    case maps:get(discover, Opts, undefined) of
+        undefined -> ok;
+        Disc when is_boolean(Disc) ->
+            application:set_env(beamchain, discover, Disc, [{persistent, true}])
+    end,
     %% --nodnsseed / --dnsseed=0: suppress DNS seed resolution independently
     %% of --connect.
     case maps:get(nodnsseed, Opts, undefined) of
@@ -977,6 +1013,10 @@ apply_opts(Opts) ->
 %% Accumulate a --connect=<ip:port> value into the opts map. Repeatable:
 %% each flag appends to a list (preserving order). Stored as raw strings;
 %% the peer manager resolves/parses them at init time.
+append_externalip(Value, Opts) ->
+    Existing = maps:get(externalip, Opts, []),
+    Opts#{externalip => Existing ++ [Value]}.
+
 append_connect(Value, Opts) ->
     Existing = maps:get(connect, Opts, []),
     Opts#{connect => Existing ++ [Value]}.
