@@ -232,8 +232,18 @@ encode_payload(getblocks, #{version := V, locators := Locators,
     LocBin = << <<H:32/binary>> || H <- Locators >>,
     <<V:32/little, Count/binary, LocBin/binary, Stop:32/binary>>;
 
+%% {no_witness, _} wrappers: getdata MSG_BLOCK / MSG_TX are served WITHOUT
+%% witness (Core ProcessGetBlockData TX_NO_WITNESS; ProcessGetData
+%% `inv.IsMsgTx() ? TX_NO_WITNESS : TX_WITH_WITNESS`).  A bare record keeps
+%% the witness-when-present encoding.
+encode_payload(block, {no_witness, Block}) ->
+    beamchain_serialize:encode_block(Block, no_witness);
+
 encode_payload(block, Block) ->
     beamchain_serialize:encode_block(Block);
+
+encode_payload(tx, {no_witness, Tx}) ->
+    beamchain_serialize:encode_transaction(Tx, no_witness);
 
 encode_payload(tx, Tx) ->
     beamchain_serialize:encode_transaction(Tx);

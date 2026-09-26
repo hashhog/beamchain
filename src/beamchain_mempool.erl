@@ -104,7 +104,7 @@
 
 %% Gate 2a/2b: BIP-339 wtxid/txid duplicate detection — exported for unit testing.
 %% Tests seed the ETS table directly (it is public) and call this helper.
--export([lookup_entry_by_wtxid/1]).
+-export([lookup_entry_by_wtxid/1, get_tx_by_wtxid/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -5476,6 +5476,15 @@ lookup_entry_by_wtxid(Wtxid) ->
         [{_, Entry}] -> {ok, Entry};
         []           -> not_found;
         _Many        -> not_found  %% defensive; wtxid must be unique
+    end.
+
+%% @doc Get a mempool transaction by wtxid (Core mapTxByWtxid lookup, used by
+%% getdata MSG_WTX / FindTxForGetData with a Wtxid GenTxid).
+-spec get_tx_by_wtxid(binary()) -> {ok, #transaction{}} | not_found.
+get_tx_by_wtxid(Wtxid) ->
+    case lookup_entry_by_wtxid(Wtxid) of
+        {ok, Entry} -> {ok, Entry#mempool_entry.tx};
+        not_found   -> not_found
     end.
 
 %%% ===================================================================

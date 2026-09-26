@@ -4541,10 +4541,10 @@ compute_tx_input_value(#transaction{inputs = Inputs}) ->
 
 %% Relay a transaction to all connected peers.
 relay_transaction(Txid) ->
+    %% Per-peer BIP-339 inv type (MSG_WTX+wtxid to wtxidrelay peers); a
+    %% MSG_TX+txid broadcast is silently dropped by every modern Core peer.
     try
-        beamchain_peer_manager:broadcast(inv, #{
-            items => [#{type => ?MSG_TX, hash => Txid}]
-        })
+        beamchain_peer_manager:announce_tx(Txid)
     catch
         _:_ -> ok
     end.

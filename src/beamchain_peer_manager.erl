@@ -66,6 +66,7 @@
          broadcast/2,
          broadcast/3,
          announce_block/2,
+         announce_tx/1,
          request_addresses/1,
          %% addnode added-node list (Core m_added_nodes parity)
          add_added_node/1,
@@ -89,6 +90,9 @@
 %% Exposed for testing (BIP35 mempool inv chunking; BIP-339 inv type selection)
 -export([chunk_inv_items/2, inv_items_from_pairs/2]).
 
+%% Exposed for testing (getdata per-inv-type serving decision)
+-export([getdata_tx_msg/4, getdata_block_msg/2]).
+
 %% Exposed for testing (BIP-130 announce branching)
 -export([pick_announce_msg/3]).
 
@@ -109,6 +113,7 @@
          maybe_open_feeler/1,
          test_ensure_peer_table/0,
          test_insert_peer/4,
+         test_set_peer_info/2,
          test_get_token_bucket/1,
          test_set_token_bucket/3,
          test_handle_addr/3,
@@ -2620,7 +2625,8 @@ handle_getdata_msg(Pid, Payload) ->
                             false ->
                                 case beamchain_db:get_block(Hash) of
                                     {ok, Block} ->
-                                        beamchain_peer:send_message(Pid, {block, Block}),
+                                        beamchain_peer:send_message(Pid,
+                                            getdata_block_msg(Type, Block)),
                                         false;
                                     not_found ->
                                         {true, #{type => Type, hash => Hash}};
@@ -2633,16 +2639,19 @@ handle_getdata_msg(Pid, Payload) ->
                                         {true, #{type => Type, hash => Hash}}
                                 end
                         end;
-                    T when T =:= ?MSG_TX; T =:= ?MSG_WITNESS_TX ->
-                        case beamchain_mempool:get_tx(Hash) of
-                            {ok, Tx} ->
-                                beamchain_peer:send_message(Pid, {tx, Tx}),
-                                false;
-                            not_found ->
-                                {true, #{type => Type, hash => Hash}}
-                        end;
                     _ ->
-                        {true, #{type => Type, hash => Hash}}
+                        %% Every non-block item (MSG_TX / MSG_WITNESS_TX /
+                        %% MSG_WTX, and unknown types → notfound) is decided
+                        %% by getdata_tx_msg/4 alone.
+                        case getdata_tx_msg(Type, Hash,
+                                            fun beamchain_mempool:get_tx/1,
+                                            fun beamchain_mempool:get_tx_by_wtxid/1) of
+                            {ok, Msg} ->
+                                beamchain_peer:send_message(Pid, Msg),
+                                false;
+                            notfound ->
+                                {true, #{type => Type, hash => Hash}}
+                        end
                 end
             end, Items),
             case NotFound of
@@ -2651,6 +2660,58 @@ handle_getdata_msg(Pid, Payload) ->
                         {notfound, #{items => NotFound}})
             end;
         _ ->
+            ok
+    end.
+
+%% @doc Decide the reply to one getdata tx item.  Mirrors Core
+%% net_processing.cpp ProcessGetData + FindTxForGetData:
+%%   MSG_WTX (5)          — hash is a WTXID; look up by wtxid, serve WITH witness
+%%   MSG_WITNESS_TX       — hash is a txid; serve WITH witness
+%%   MSG_TX (1)           — hash is a txid; serve WITHOUT witness
+%%                          (`inv.IsMsgTx() ? TX_NO_WITNESS : TX_WITH_WITNESS`)
+%% Anything not found → notfound (the caller batches it into a NOTFOUND).
+%% Lookups are injected so the decision is unit-testable without a mempool.
+-spec getdata_tx_msg(non_neg_integer(), binary(),
+                     fun((binary()) -> {ok, term()} | not_found),
+                     fun((binary()) -> {ok, term()} | not_found)) ->
+          {ok, {tx, term()}} | notfound.
+getdata_tx_msg(Type, Hash, ByTxid, ByWtxid) ->
+    {Lookup, Wrap} =
+        case Type of
+            ?MSG_WTX         -> {ByWtxid, fun(Tx) -> Tx end};
+            ?MSG_WITNESS_TX  -> {ByTxid,  fun(Tx) -> Tx end};
+            ?MSG_TX          -> {ByTxid,  fun(Tx) -> {no_witness, Tx} end};
+            _                -> {fun(_) -> not_found end, undefined}
+        end,
+    case Lookup(Hash) of
+        {ok, Tx} -> {ok, {tx, Wrap(Tx)}};
+        _        -> notfound
+    end.
+
+%% @doc The block message for a getdata block item.  Core
+%% ProcessGetBlockData: MSG_BLOCK → TX_NO_WITNESS, MSG_WITNESS_BLOCK →
+%% TX_WITH_WITNESS.
+-spec getdata_block_msg(non_neg_integer(), term()) -> {block, term()}.
+getdata_block_msg(?MSG_WITNESS_BLOCK, Block) -> {block, Block};
+getdata_block_msg(?MSG_BLOCK, Block)         -> {block, {no_witness, Block}}.
+
+%% @doc Announce a newly accepted mempool tx to every connected peer,
+%% choosing the inv type per peer (BIP-339): a wtxidrelay peer gets
+%% MSG_WTX + wtxid, any other peer MSG_TX + txid.  Core never sends MSG_TX
+%% invs to a wtxidrelay peer — it silently ignores them
+%% (net_processing.cpp INV: `if (peer.m_wtxid_relay) { if (inv.IsMsgTx())
+%% continue; }`), so a txid-only broadcast never reaches a modern Core node.
+-spec announce_tx(binary()) -> ok.
+announce_tx(Txid) ->
+    case beamchain_mempool:get_wtxid(Txid) of
+        {ok, Wtxid} ->
+            ets:foldl(fun(#peer_entry{pid = Pid, connected = true}, _) ->
+                Items = inv_items_from_pairs([{Txid, Wtxid}],
+                                             peer_uses_wtxid(Pid)),
+                beamchain_peer:send_message(Pid, {inv, #{items => Items}});
+            (_, _) -> ok
+            end, ok, ?PEER_TABLE);
+        not_found ->
             ok
     end.
 
@@ -3787,6 +3848,11 @@ test_insert_peer(Pid, Direction, ConnType, Perm) ->
         connect_time = 0,
         noban = NoBan,
         manual = Manual}),
+    ok.
+
+test_set_peer_info(Pid, Info) ->
+    [E] = ets:lookup(?PEER_TABLE, Pid),
+    ets:insert(?PEER_TABLE, E#peer_entry{info = Info}),
     ok.
 
 test_get_token_bucket(Pid) ->

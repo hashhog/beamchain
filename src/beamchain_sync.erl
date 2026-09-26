@@ -407,10 +407,9 @@ route_message(Peer, tx, Payload, State) ->
                 {ok, Txid} ->
                     logger:info("sync: accepted tx ~s from ~p",
                                 [beamchain_serialize:hex_encode(Txid), Peer]),
-                    %% Relay to all peers via inv
-                    beamchain_peer_manager:broadcast(inv, #{
-                        items => [#{type => ?MSG_TX, hash => Txid}]
-                    });
+                    %% Relay to all peers via inv (per-peer BIP-339
+                    %% MSG_WTX / MSG_TX choice)
+                    beamchain_peer_manager:announce_tx(Txid);
                 {error, Reason} ->
                     logger:debug("sync: rejected tx from ~p: ~p", [Peer, Reason])
             end;

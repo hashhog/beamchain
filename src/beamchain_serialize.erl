@@ -27,7 +27,7 @@
          encode_tx_out/1, decode_tx_out/1]).
 
 %% Full block
--export([encode_block/1, decode_block/1]).
+-export([encode_block/1, encode_block/2, decode_block/1]).
 
 %% Hashing
 -export([block_hash/1, tx_hash/1, wtx_hash/1,
@@ -384,6 +384,18 @@ decode_transaction_witness(Version, Bin) ->
 encode_block(#block{header = Header, transactions = Txs}) ->
     HeaderBin = encode_block_header(Header),
     TxsBin = encode_list(Txs, fun encode_transaction/1),
+    <<HeaderBin/binary, TxsBin/binary>>.
+
+%% @doc Encode a block with an explicit witness mode.  `no_witness` strips
+%% every tx's witness (legacy/BIP-144-unaware serialization); `witness` is
+%% the same as encode_block/1.  Core ProcessGetBlockData serves MSG_BLOCK
+%% as TX_NO_WITNESS(*pblock) and MSG_WITNESS_BLOCK as TX_WITH_WITNESS.
+-spec encode_block(#block{}, witness | no_witness) -> binary().
+encode_block(Block, witness) ->
+    encode_block(Block);
+encode_block(#block{header = Header, transactions = Txs}, no_witness) ->
+    HeaderBin = encode_block_header(Header),
+    TxsBin = encode_list(Txs, fun(Tx) -> encode_transaction(Tx, no_witness) end),
     <<HeaderBin/binary, TxsBin/binary>>.
 
 -spec decode_block(binary()) -> {#block{}, binary()}.
