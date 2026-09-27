@@ -18,6 +18,7 @@
 %% Chain queries
 -export([get_tip/0, get_mtp/0, is_synced/0]).
 -export([get_tip_height/0]).
+-export([should_announce_tip/2]).
 
 %% UTXO cache — module functions (direct ETS access, no gen_server call)
 -export([get_utxo/2, has_utxo/2, add_utxo/3, add_utxo_fresh/3, spend_utxo/2]).
@@ -1563,6 +1564,26 @@ do_connect_block_inner(#block{header = Header} = Block, PrevIndex,
 
                 %% Notify peer manager that our tip advanced (stale tip detection)
                 beamchain_peer_manager:notify_tip_updated(),
+
+                %% Block relay (BIP-130): announce the new tip to every peer --
+                %% `headers` to sendheaders peers, `inv` otherwise.  Core:
+                %% PeerManagerImpl::UpdatedBlockTip (net_processing.cpp:2158)
+                %% feeding SendMessages' announcement loop, skipped while
+                %% fInitialDownload (tip-age gate, see should_announce_tip/2).
+                %% announce_block used to be reached only from the miner, so
+                %% P2P-received blocks were connected but never relayed: two
+                %% Core peers linked only through beamchain never converged
+                %% (regtest relay test 2026-09-26).  announce_block is
+                %% ets:foldl + per-peer casts: non-blocking, safe from here.
+                case should_announce_tip(Header#block_header.timestamp,
+                                         erlang:system_time(second)) of
+                    true ->
+                        _ = (catch beamchain_peer_manager:announce_block(
+                                Header, BlockHash)),
+                        ok;
+                    false ->
+                        ok
+                end,
 
                 %% Pruning trigger (BIP-159 / Core auto-prune).
                 %%
@@ -4217,3 +4238,12 @@ tip_chainwork(#state{tip_hash = TipHash}) ->
         not_found ->
             0
     end.
+
+%% @doc Whether a freshly connected tip with header time TipTime should be
+%% relayed.  Core's PeerManagerImpl::UpdatedBlockTip returns early while
+%% fInitialDownload; on a synced node the deciding clause of
+%% IsInitialBlockDownload is the tip age vs DEFAULT_MAX_TIP_AGE (24h,
+%% kernel/chainstatemanager_opts.h:24).
+-spec should_announce_tip(non_neg_integer(), integer()) -> boolean().
+should_announce_tip(TipTime, NowSecs) ->
+    TipTime + 24 * 60 * 60 >= NowSecs.

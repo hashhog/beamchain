@@ -53,7 +53,7 @@
 %% test_state/1 + test_get/2 build/inspect a #state{} from a map of field
 %% overrides so the frontier-lifecycle tests (issue #34) can drive the
 %% gen_server callbacks directly with a scripted state.
--export([do_handle_cmpctblock/5, test_new_state/0,
+-export([do_handle_cmpctblock/5, unsolicited_connect_penalty/1, test_new_state/0,
          test_state/1, test_get/2,
          admit_downloaded/3]).
 -endif.
@@ -1125,18 +1125,38 @@ handle_unsolicited_block(Peer, Block, State) ->
                                                 [hash_hex(BlockHash), Height, Peer]),
                                     State;
                                 {error, Reason} ->
-                                    %% G16/G17 fix: connect_block failures include
-                                    %% BLOCK_MUTATED (defense-in-depth re-check at
-                                    %% connect time) and BLOCK_INVALID_HEADER
-                                    %% (contextual header check).  Bitcoin Core
-                                    %% calls Misbehaving(pfrom, 100, …) for both
-                                    %% (validation.cpp ProcessNewBlock).  Log at
-                                    %% warning so the event is visible, then penalise.
-                                    logger:warning("block_sync: unsolicited block ~s "
-                                                   "failed connect: ~p — penalising peer ~p",
-                                                   [hash_hex(BlockHash), Reason, Peer]),
-                                    beamchain_peer:add_misbehavior(Peer, 100),
-                                    State
+                                    case unsolicited_connect_penalty(Reason) of
+                                        0 ->
+                                            %% The block does not extend our
+                                            %% tip (parent unknown yet, or a
+                                            %% competing branch).  Core's
+                                            %% CMPCTBLOCK/HEADERS handling
+                                            %% (net_processing.cpp:4485) asks
+                                            %% for headers instead of DoSing:
+                                            %% the peer did nothing wrong.
+                                            %% Banning here dropped the ONLY
+                                            %% upstream peer mid-sync (regtest
+                                            %% relay test 2026-09-26).
+                                            logger:info("block_sync: unsolicited block ~s "
+                                                        "does not connect (~p) — requesting "
+                                                        "headers from ~p, not penalising",
+                                                        [hash_hex(BlockHash), Reason, Peer]),
+                                            _ = (catch beamchain_header_sync:probe_peer(Peer)),
+                                            State;
+                                        Score ->
+                                            %% G16/G17 fix: connect_block failures include
+                                            %% BLOCK_MUTATED (defense-in-depth re-check at
+                                            %% connect time) and BLOCK_INVALID_HEADER
+                                            %% (contextual header check).  Bitcoin Core
+                                            %% calls Misbehaving(pfrom, 100, …) for both
+                                            %% (validation.cpp ProcessNewBlock).  Log at
+                                            %% warning so the event is visible, then penalise.
+                                            logger:warning("block_sync: unsolicited block ~s "
+                                                           "failed connect: ~p — penalising peer ~p",
+                                                           [hash_hex(BlockHash), Reason, Peer]),
+                                            beamchain_peer:add_misbehavior(Peer, Score),
+                                            State
+                                    end
                             end;
                         {error, Reason} ->
                             logger:warning("block_sync: unsolicited block ~s "
@@ -2007,3 +2027,13 @@ hash_hex(_) ->
 
 binary_to_hex_str(Bin) ->
     lists:flatten([io_lib:format("~2.16.0b", [B]) || <<B:8>> <= Bin]).
+
+%% @doc Misbehavior score for an unsolicited block whose connect failed.
+%% `bad_prevblk` means the block does not extend our active tip -- its parent
+%% is not yet known, or it builds a competing branch.  That is not a protocol
+%% violation (Core requests headers for a non-connecting compact block,
+%% net_processing.cpp:4485), so it scores 0.  Everything else keeps the
+%% G16/G17 score of 100.
+-spec unsolicited_connect_penalty(term()) -> non_neg_integer().
+unsolicited_connect_penalty(bad_prevblk) -> 0;
+unsolicited_connect_penalty(_) -> 100.

@@ -88,7 +88,7 @@
          asmap_health_check/0]).
 
 %% Exposed for testing (BIP35 mempool inv chunking; BIP-339 inv type selection)
--export([chunk_inv_items/2, inv_items_from_pairs/2]).
+-export([chunk_inv_items/2, inv_items_from_pairs/2, getheaders_limit/2]).
 
 %% Exposed for testing (getdata per-inv-type serving decision)
 -export([getdata_tx_msg/4, getdata_block_msg/2]).
@@ -2608,7 +2608,14 @@ handle_getdata_msg(Pid, Payload) ->
                 end,
             NotFound = lists:filtermap(fun(#{type := Type, hash := Hash}) ->
                 case Type of
-                    T when T =:= ?MSG_BLOCK; T =:= ?MSG_WITNESS_BLOCK ->
+                    %% MSG_CMPCT_BLOCK: how a Core peer fetches a single
+                    %% directly-announced tip from a peer that sent sendcmpct
+                    %% (HeadersDirectFetchBlocks).  It used to fall to the
+                    %% tx branch and get notfound, so the peer never got the
+                    %% block (regtest relay test 2026-09-26).  Answered with
+                    %% the full witness block -- getdata_block_msg/2.
+                    T when T =:= ?MSG_BLOCK; T =:= ?MSG_WITNESS_BLOCK;
+                           T =:= ?MSG_CMPCT_BLOCK ->
                         BelowHorizon =
                             case PruneHorizon of
                                 -1 -> false;
@@ -2689,10 +2696,14 @@ getdata_tx_msg(Type, Hash, ByTxid, ByWtxid) ->
     end.
 
 %% @doc The block message for a getdata block item.  Core
-%% ProcessGetBlockData: MSG_BLOCK → TX_NO_WITNESS, MSG_WITNESS_BLOCK →
-%% TX_WITH_WITNESS.
+%% ProcessGetBlockData: MSG_BLOCK → TX_NO_WITNESS, MSG_WITNESS_BLOCK and
+%% MSG_CMPCT_BLOCK → TX_WITH_WITNESS.
 -spec getdata_block_msg(non_neg_integer(), term()) -> {block, term()}.
 getdata_block_msg(?MSG_WITNESS_BLOCK, Block) -> {block, Block};
+%% MSG_CMPCT_BLOCK: Core sends the full witness block itself when it will not
+%% build a compact block (ProcessGetBlockData, IsMsgCmpctBlk arm, outside
+%% MAX_CMPCTBLOCK_DEPTH); a full block always satisfies the in-flight request.
+getdata_block_msg(?MSG_CMPCT_BLOCK, Block)   -> {block, Block};
 getdata_block_msg(?MSG_BLOCK, Block)         -> {block, {no_witness, Block}}.
 
 %% @doc Announce a newly accepted mempool tx to every connected peer,
@@ -2723,16 +2734,40 @@ handle_getheaders_msg(Pid, Payload) ->
         {ok, #{locators := Locators, stop_hash := StopHash}} ->
             %% Find the best locator hash we have
             StartHeight = find_locator_intersection(Locators),
-            %% Collect up to 2000 headers starting after the intersection
-            Headers = collect_headers(StartHeight + 1, StopHash, 2000, []),
-            case Headers of
-                [] -> ok;
-                _  -> beamchain_peer:send_message(Pid,
-                        {headers, #{headers => Headers}})
-            end;
+            %% Collect up to 2000 headers starting after the intersection,
+            %% never past our CONNECTED tip.  Core serves getheaders from its
+            %% active chain only (ActiveChain().Next, net_processing.cpp
+            %% GETHEADERS handler).  The height index also holds header-only
+            %% entries ahead of the tip during sync; serving those made a peer
+            %% request bodies we did not have, get notfound, and stall on the
+            %% missing blocks until its download timeout (regtest relay test
+            %% 2026-09-26: Core B stuck at height 2).
+            Limit = getheaders_limit(StartHeight, tip_height_or_zero()),
+            Headers = collect_headers(StartHeight + 1, StopHash, Limit, []),
+            %% Always answer, with an EMPTY headers message when the peer is
+            %% already at our tip.  Core's GETHEADERS handler
+            %% (net_processing.cpp:4306-4385) always pushes HEADERS; staying
+            %% silent leaves the requester's m_last_getheaders_timestamp set,
+            %% so MaybeSendGetHeaders (:2829) suppresses its next getheaders
+            %% for HEADERS_RESPONSE_TIME (2 min) and every inv announcement in
+            %% that window is ignored (regtest relay test 2026-09-26).
+            beamchain_peer:send_message(Pid, {headers, #{headers => Headers}});
         _ ->
             ok
     end.
+
+tip_height_or_zero() ->
+    case beamchain_chainstate:get_tip() of
+        {ok, {_Hash, H}} -> H;
+        _ -> 0
+    end.
+
+%% @doc Number of headers to serve for a getheaders whose locator forks at
+%% StartHeight: at most MAX_HEADERS_RESULTS (2000), and never beyond the
+%% connected tip TipHeight.
+-spec getheaders_limit(integer(), non_neg_integer()) -> non_neg_integer().
+getheaders_limit(StartHeight, TipHeight) ->
+    max(0, min(2000, TipHeight - StartHeight)).
 
 %% Find the height of the best (first matching) locator hash.
 %% Returns -1 if none match (will start from genesis).
