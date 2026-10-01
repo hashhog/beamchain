@@ -21,6 +21,20 @@
 %%     so reject reasons are identical at 1 worker and at N (Core's first
 %%     writer wins, which is racy at N>1; we are stricter).
 %%
+%%   * A worker that dies is NEVER a script verdict. Workers carry a
+%%     max_heap_size guard, and the VM kills a worker whose heap (live
+%%     data PLUS not-yet-collected garbage, so the trip point depends on
+%%     GC timing, not on the script) crosses it. Block 969434 (a 1234-input
+%%     taproot tx; ~200K words per check from copying the tx in) tripped
+%%     it nondeterministically and the old collect/2 turned `killed` into
+%%     {script_verify_failed, killed}: a valid main-chain block rejected
+%%     for a resource reason. Core never rejects for a resource reason.
+%%     Now every check that a worker did not see PASS is re-run
+%%     synchronously in the caller (no heap cap) after the pool drains,
+%%     and that result is the verdict. Any other abnormal worker exit is
+%%     an internal error (error/1 -> connect_block {internal_error, _} ->
+%%     retry/halt), never valid and never invalid.
+%%
 %% The previous verify_scripts_parallel/2 spawned one process per
 %% transaction with a FIFO collector — unbounded, and a late-spawned
 %% failure waited on the head. That is the thing this module replaces.
@@ -34,7 +48,11 @@
 %% Core's cap is 15 extra threads. This box has 32 cores and the queue
 %% item is "use them"; 32 bounds RSS without leaving 17 cores idle.
 -define(MAX_SCRIPTCHECK_THREADS, 32).
--define(WORKER_MAX_HEAP_WORDS, 1_000_000).
+%% Memory guard only — tripping it costs a synchronous re-run in the
+%% caller, never a verdict. 4M words = 32 MB/worker (<= 1 GB at 32
+%% workers). 1M tripped on ordinary mainnet blocks (969399, 969434).
+-define(WORKER_MAX_HEAP_WORDS, 4_000_000).
+-define(PASSED, 1).
 -define(STATS_KEY, beamchain_script_check_queue_stats).
 
 -record(script_check, {
@@ -150,17 +168,24 @@ run_pool(Checks, NWorkers) ->
     %% 1..NJobs. Putting 1 here skipped job 1 — a 1-input block would
     %% have accepted without running its only script check.
     Counter = atomics:new(1, [{signed, false}]),
-    record_stats(#{workers => N,
-                   jobs => NJobs,
-                   ets_objects => ets:info(Tab, size),
-                   max_heap_words => ?WORKER_MAX_HEAP_WORDS}),
+    %% Per-job slot, set to ?PASSED by a worker only AFTER the check
+    %% returned ok. Anything else (failed, in flight when a worker was
+    %% killed, never claimed) is re-run by the caller if a worker dies.
+    Done = atomics:new(NJobs, [{signed, false}]),
+    Stats0 = #{workers => N,
+               jobs => NJobs,
+               ets_objects => ets:info(Tab, size),
+               max_heap_words => ?WORKER_MAX_HEAP_WORDS,
+               killed_workers => 0,
+               rerun_checks => 0},
+    record_stats(Stats0),
     try
-        spawn_and_collect(Tab, Counter, N)
+        spawn_and_collect(Tab, Counter, Done, N, NJobs, Stats0)
     after
         ets:delete(Tab)
     end.
 
-spawn_and_collect(Tab, Counter, N) ->
+spawn_and_collect(Tab, Counter, Done, N, NJobs, Stats0) ->
     SpawnOpts = [
         monitor,
         {max_heap_size, #{size => ?WORKER_MAX_HEAP_WORDS,
@@ -169,49 +194,86 @@ spawn_and_collect(Tab, Counter, N) ->
     ],
     Monitors = lists:foldl(fun(_, Acc) ->
         {_Pid, Ref} = erlang:spawn_opt(fun() ->
-            Fail = worker_drain(Tab, Counter, undefined),
+            Fail = worker_drain(Tab, Counter, Done, undefined),
             exit({check_ok, Fail})
         end, SpawnOpts),
         Acc#{Ref => true}
     end, #{}, lists:seq(1, N)),
-    case collect(Monitors, undefined) of
+    {Fail0, Killed, Crashes} = collect(Monitors, undefined, 0, []),
+    case Crashes of
+        [] -> ok;
+        [Crash | _] ->
+            %% Not a resource kill and not a script verdict: a bug in the
+            %% worker path. Do not accept, do not reject — internal error.
+            error({script_check_worker_crash, Crash})
+    end,
+    Fail = case Killed of
+        0 ->
+            record_stats(Stats0),
+            Fail0;
+        _ ->
+            %% Resource kill: the dead worker's in-flight check and any
+            %% failures it had accumulated are lost. Re-run every check
+            %% not marked PASSED, here, with no heap cap. Failures already
+            %% reported by healthy workers are re-derived too, so the
+            %% min-{tx,in} reason is unchanged.
+            Rerun = [I || I <- lists:seq(1, NJobs),
+                          atomics:get(Done, I) =/= ?PASSED],
+            RerunFail = lists:foldl(fun(I, Acc) ->
+                [{I, Check}] = ets:lookup(Tab, I),
+                case run_check(Check) of
+                    ok -> Acc;
+                    {error, Reason} ->
+                        min_fail(Acc, {Check#script_check.order, Reason})
+                end
+            end, undefined, Rerun),
+            record_stats(Stats0#{killed_workers => Killed,
+                                 rerun_checks => length(Rerun)}),
+            logger:warning("script_check_queue: ~B worker(s) killed at the "
+                           "~B-word heap guard; re-ran ~B of ~B checks "
+                           "synchronously (resource limit is not a verdict)",
+                           [Killed, ?WORKER_MAX_HEAP_WORDS, length(Rerun),
+                            NJobs]),
+            min_fail(Fail0, RerunFail)
+    end,
+    case Fail of
         undefined -> ok;
         {_Order, Reason} -> throw(Reason)
     end.
 
-worker_drain(Tab, Counter, Acc) ->
+worker_drain(Tab, Counter, Done, Acc) ->
     Idx = atomics:add_get(Counter, 1, 1),
     case ets:lookup(Tab, Idx) of
         [] ->
             Acc;
         [{Idx, Check}] ->
             Acc1 = case run_check(Check) of
-                ok -> Acc;
+                ok ->
+                    atomics:put(Done, Idx, ?PASSED),
+                    Acc;
                 {error, Reason} ->
                     min_fail(Acc, {Check#script_check.order, Reason})
             end,
-            worker_drain(Tab, Counter, Acc1)
+            worker_drain(Tab, Counter, Done, Acc1)
     end.
 
-collect(Map, Acc) when map_size(Map) =:= 0 ->
-    Acc;
-collect(Map, Acc) ->
+%% Returns {MinFail, KilledCount, OtherCrashReasons}. A worker's DOWN
+%% reason is only a verdict when it is {check_ok, _}.
+collect(Map, Acc, Killed, Crashes) when map_size(Map) =:= 0 ->
+    {Acc, Killed, lists:reverse(Crashes)};
+collect(Map, Acc, Killed, Crashes) ->
     receive
-        {'DOWN', Ref, process, _Pid, {check_ok, Fail}} ->
-            case maps:is_key(Ref, Map) of
-                true ->
-                    collect(maps:remove(Ref, Map), min_fail(Acc, Fail));
-                false ->
-                    collect(Map, Acc)
-            end;
-        {'DOWN', Ref, process, _Pid, Reason} ->
-            case maps:is_key(Ref, Map) of
-                true ->
-                    Crash = {{16#7fffffff, 16#7fffffff},
-                             {script_verify_failed, Reason}},
-                    collect(maps:remove(Ref, Map), min_fail(Acc, Crash));
-                false ->
-                    collect(Map, Acc)
+        {'DOWN', Ref, process, _Pid, Reason} when is_map_key(Ref, Map) ->
+            Map1 = maps:remove(Ref, Map),
+            case Reason of
+                {check_ok, Fail} ->
+                    collect(Map1, min_fail(Acc, Fail), Killed, Crashes);
+                killed ->
+                    %% max_heap_size guard (or an external kill): resource,
+                    %% not a script result.
+                    collect(Map1, Acc, Killed + 1, Crashes);
+                _ ->
+                    collect(Map1, Acc, Killed, [Reason | Crashes])
             end
     end.
 

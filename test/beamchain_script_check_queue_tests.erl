@@ -47,6 +47,20 @@ script_check_queue_test_() ->
            fun test_max_cap/0},
           {"workers do not leak after verify returns",
            fun test_no_process_leak/0},
+          %% Block 969434: a worker killed by the max_heap_size guard was
+          %% reported as {script_verify_failed, killed} — a valid block
+          %% rejected for a resource reason.
+          {timeout, 120,
+           {"HEAP GUARD: a passing check that trips the worker heap cap is accepted",
+            fun test_heap_kill_is_not_a_verdict/0}},
+          {timeout, 120,
+           {"HEAP GUARD: a genuinely false check still rejects next to a killed worker",
+            fun test_heap_kill_real_fail_still_rejects/0}},
+          {timeout, 120,
+           {"HEAP GUARD: a killed worker's own failure keeps min-{tx,in} order",
+            fun test_heap_kill_preserves_min_order/0}},
+          {"worker crash (non-resource) is an internal error, not a verdict",
+           fun test_worker_crash_is_internal_error/0},
           {timeout, 120,
            {"measured scaling 1/2/4/8 on 2048 unique P2WPKH inputs",
             fun test_measured_scaling/0}}
@@ -204,6 +218,68 @@ test_no_process_leak() ->
     %% processes (timers, the sig-cache gen_server) to jitter.
     After = erlang:system_info(process_count),
     ?assert(After =< Before + 4).
+
+%%% ===================================================================
+%%% Heap guard is a memory guard, never a script verdict
+%%% ===================================================================
+
+%% A check that holds > cap words live while it runs, then returns
+%% Result. In a capped worker the VM kills it before it returns.
+heavy_job(Result) ->
+    fun() ->
+        W = beamchain_script_check_queue:worker_max_heap_words(),
+        L = lists:seq(1, W),             %% 2*W words live > cap
+        case length(L) of
+            W -> Result
+        end
+    end.
+
+test_heap_kill_is_not_a_verdict() ->
+    %% Instrument check: the heavy job really does trip the guard in a
+    %% capped process (else every assert below is vacuous).
+    Cap = beamchain_script_check_queue:worker_max_heap_words(),
+    {P, R} = spawn_opt(fun() -> _ = (heavy_job(true))(), exit(survived) end,
+                       [monitor, {max_heap_size,
+                                  #{size => Cap, kill => true,
+                                    error_logger => false}}]),
+    receive {'DOWN', R, process, P, Why} -> ?assertEqual(killed, Why) end,
+    lists:foreach(fun(N) ->
+        Jobs = [true_job() || _ <- lists:seq(1, 8)] ++ [heavy_job(true)]
+               ++ [true_job() || _ <- lists:seq(1, 8)],
+        ?assertEqual(ok, beamchain_script_check_queue:verify(Jobs, 0, N)),
+        Stats = beamchain_script_check_queue:last_stats(),
+        ?assert(maps:get(killed_workers, Stats) >= 1),
+        ?assert(maps:get(rerun_checks, Stats) >= 1)
+    end, [1, 4]).
+
+test_heap_kill_real_fail_still_rejects() ->
+    lists:foreach(fun(N) ->
+        Jobs = [true_job() || _ <- lists:seq(1, 4)] ++ [heavy_job(true)]
+               ++ [true_job() || _ <- lists:seq(1, 4)] ++ [false_job()]
+               ++ [true_job() || _ <- lists:seq(1, 4)],
+        ?assertThrow({script_verify_failed, 0},
+                     beamchain_script_check_queue:verify(Jobs, 0, N))
+    end, [1, 4]).
+
+test_heap_kill_preserves_min_order() ->
+    %% Job 2 is heavy AND fails; job 10 fails cheaply. The earliest
+    %% failure is job 2, even though its worker died before reporting.
+    lists:foreach(fun(N) ->
+        Jobs = [true_job(), heavy_job({error, heavy_first})]
+               ++ [true_job() || _ <- lists:seq(1, 7)]
+               ++ [fun() -> {error, cheap_second} end]
+               ++ [true_job() || _ <- lists:seq(1, 4)],
+        ?assertThrow(heavy_first,
+                     beamchain_script_check_queue:verify(Jobs, 0, N))
+    end, [1, 4]).
+
+test_worker_crash_is_internal_error() ->
+    %% A non-kill exit signal takes the worker down outside run_check's
+    %% try. That is a bug, not a script result: error, not throw.
+    Crash = fun() -> exit(self(), worker_bug), true end,
+    Jobs = [true_job(), Crash, true_job()],
+    ?assertError({script_check_worker_crash, worker_bug},
+                 beamchain_script_check_queue:verify(Jobs, 0, 2)).
 
 %%% ===================================================================
 %%% Measured scaling — 2048 unique P2WPKH inputs (post-segwit shape)
