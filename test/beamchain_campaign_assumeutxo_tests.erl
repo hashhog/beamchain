@@ -245,3 +245,89 @@ malformed_json_refuses_test_() ->
         ?assertMatch({error, _}, beamchain_chain_params:load_campaign_assumeutxo()),
         file:delete(Path)
      end}.
+
+%%% ===================================================================
+%%% Built-in confirmation: an entry IDENTICAL to a built-in row (height,
+%%% blockhash, hash_serialized, m_chain_tx_count) is accepted; any
+%%% difference in the commitment is still refused.  The real 910,000
+%%% anchor (Core kernel/chainparams.cpp; tools/boundary-blocks/soak-910000).
+%%% ===================================================================
+
+-define(BH_910K, "0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821").
+-define(HS_910K, "4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1568").
+-define(TX_910K, 1226586151).
+-define(HDR_910K, "00a0572be06d4f01a2ed2228dec965539cc8b96512ccde7d2824010000000000000000006f28c30dc748f6b1430fb2b9a5a94b5b34a5df6e318c6cc5c310a1a35b432b59a3ab9d68b32c021719d103e9").
+-define(SOAK_910K, "/home/work/hashhog/tools/boundary-blocks/soak-910000/campaign-entry.json").
+
+identical_to_builtin_is_confirmation_test_() ->
+    {setup, fun setup/0, fun teardown/1,
+     fun() ->
+        {ok, Builtin} = beamchain_chain_params:get_assumeutxo(910000, mainnet),
+        %% Upper-case hex and an extra base_header: still the same commitment.
+        Json = iolist_to_binary(io_lib:format(
+            "[{\"height\": 910000, \"blockhash\": \"~s\", "
+            "\"hash_serialized\": \"~s\", \"m_chain_tx_count\": ~B, "
+            "\"base_header\": \"~s\", \"base_mtp\": 1755159732}]",
+            [string:uppercase(?BH_910K), ?HS_910K, ?TX_910K, ?HDR_910K])),
+        Path = write_campaign_file(Json),
+        os:putenv(?CAMPAIGN_ENV, Path),
+        ?assertEqual(ok, beamchain_chain_params:load_campaign_assumeutxo()),
+        {ok, Eff} = beamchain_chain_params:get_assumeutxo(910000, mainnet),
+        %% Commitment unchanged...
+        ?assertEqual(maps:with([block_hash, utxo_hash, chain_tx_count], Builtin),
+                     maps:with([block_hash, utxo_hash, chain_tx_count], Eff)),
+        %% ...and the ancestry the built-in row lacks is filled in.
+        ?assert(maps:is_key(base_header, Eff)),
+        ?assertEqual(1755159732, maps:get(base_mtp, Eff)),
+        file:delete(Path)
+     end}.
+
+real_soak_910000_fixture_is_confirmation_test_() ->
+    {setup, fun setup/0, fun teardown/1,
+     fun() ->
+        case filelib:is_regular(?SOAK_910K) of
+            false -> ok;   % fixture is gitignored; covered above
+            true ->
+                os:putenv(?CAMPAIGN_ENV, ?SOAK_910K),
+                ?assertEqual(ok, beamchain_chain_params:load_campaign_assumeutxo()),
+                {ok, Eff} = beamchain_chain_params:get_assumeutxo(910000, mainnet),
+                ?assertEqual(?TX_910K, maps:get(chain_tx_count, Eff)),
+                ?assert(maps:is_key(base_tail_headers, Eff)),
+                ?assert(maps:is_key(chainwork, Eff))
+        end
+     end}.
+
+different_hash_serialized_at_builtin_height_refuses_test_() ->
+    {setup, fun setup/0, fun teardown/1,
+     fun() ->
+        HS = "5daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1568",
+        Path = write_campaign_file(campaign_entry_json(910000, ?BH_910K, HS, ?TX_910K)),
+        os:putenv(?CAMPAIGN_ENV, Path),
+        ?assertMatch({error, {campaign_assumeutxo_collision, [910000]}},
+                     beamchain_chain_params:load_campaign_assumeutxo()),
+        ?assertEqual(#{}, beamchain_chain_params:campaign_assumeutxo_registry()),
+        file:delete(Path)
+     end}.
+
+different_chain_tx_count_at_builtin_height_refuses_test_() ->
+    {setup, fun setup/0, fun teardown/1,
+     fun() ->
+        Path = write_campaign_file(
+                 campaign_entry_json(910000, ?BH_910K, ?HS_910K, ?TX_910K + 1)),
+        os:putenv(?CAMPAIGN_ENV, Path),
+        ?assertMatch({error, {campaign_assumeutxo_collision, [910000]}},
+                     beamchain_chain_params:load_campaign_assumeutxo()),
+        ?assertEqual(#{}, beamchain_chain_params:campaign_assumeutxo_registry()),
+        file:delete(Path)
+     end}.
+
+builtin_blockhash_at_other_height_still_refuses_test_() ->
+    {setup, fun setup/0, fun teardown/1,
+     fun() ->
+        Path = write_campaign_file(
+                 campaign_entry_json(910001, ?BH_910K, ?HS_910K, ?TX_910K)),
+        os:putenv(?CAMPAIGN_ENV, Path),
+        ?assertMatch({error, {campaign_assumeutxo_collision, [910001]}},
+                     beamchain_chain_params:load_campaign_assumeutxo()),
+        file:delete(Path)
+     end}.

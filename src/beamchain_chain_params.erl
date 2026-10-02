@@ -789,13 +789,22 @@ validate_and_load_campaign(Path, RawEntries) ->
                     case check_no_builtin_collision(Parsed) of
                         {error, _} = Err ->
                             Err;
-                        ok ->
-                            install_campaign_entries(Parsed),
-                            Heights = lists:sort([H || {H, _} <- Parsed]),
+                        {ok, Installable, Confirmed} ->
+                            install_campaign_entries(Installable),
+                            Heights = lists:sort([H || {H, _} <- Installable]),
+                            lists:foreach(fun(H) ->
+                                logger:notice(
+                                  "[CAMPAIGN-ASSUMEUTXO] entry height ~B is "
+                                  "IDENTICAL to the built-in assumeutxo "
+                                  "commitment (blockhash, hash_serialized, "
+                                  "m_chain_tx_count) -- accepted as a "
+                                  "confirmation; commitment kept", [H])
+                            end, Confirmed),
                             logger:notice(
                                 "[CAMPAIGN-ASSUMEUTXO] loaded ~B entries "
-                                "from ~s heights=~p",
-                                [length(Parsed), Path, Heights]),
+                                "from ~s heights=~p (confirming built-in: ~p)",
+                                [length(Installable), Path, Heights,
+                                 lists:sort(Confirmed)]),
                             ok
                     end
             end
@@ -1031,17 +1040,73 @@ check_no_internal_duplicates(Parsed) ->
 %% it should have caught. Deliberately excludes the *runtime* regtest
 %% registry (register_regtest_assumeutxo/2,4) — that one is expected to
 %% be freely reassigned by tests/operators and isn't "production".
+%%
+%% The ONE non-refusal: an entry whose whole commitment -- height,
+%% block_hash, utxo_hash (hash_serialized) AND chain_tx_count
+%% (m_chain_tx_count) -- is IDENTICAL to every built-in row it touches is
+%% not an override but a second source agreeing with the first (Core keys
+%% an m_assumeutxo_data row by height+blockhash and checks the snapshot
+%% against its hash_serialized; a byte-identical row adds no new trust).
+%% The R4 rung at 910,000 was minted by dumping a Core clone there and
+%% equals Core's own hardcoded anchor (kernel/chainparams.cpp), so
+%% refusing it BLOCKED slice 910000-920000.  Hashes are compared as parsed
+%% binaries, so hex case cannot matter.
+%%
+%% Such an entry is installed as the built-in row with gaps filled: the
+%% campaign entry's optional ancestry (base_header, base_tail_headers,
+%% chainwork, base_mtp) -- which the built-in rows lack and import-utxo's
+%% graft_snapshot_base_index needs -- is kept, while every key the
+%% built-in row pins must agree (a contradiction refuses).  A different
+%% utxo_hash / chain_tx_count at a built-in height, or a built-in
+%% blockhash at any other height, is still refused.
+%%
+%% Returns {ok, Installable, ConfirmedHeights} | {error, _}.
 check_no_builtin_collision(Parsed) ->
-    BuiltIn = maps:merge(maps:merge(mainnet_assumeutxo(), testnet4_assumeutxo()),
-                          regtest_assumeutxo()),
-    BuiltInHashes = sets:from_list(
-        [maps:get(block_hash, V) || V <- maps:values(BuiltIn)]),
-    Collisions = [H || {H, #{block_hash := BH}} <- Parsed,
-                        (maps:is_key(H, BuiltIn)
-                         orelse sets:is_element(BH, BuiltInHashes))],
-    case Collisions of
-        [] -> ok;
-        _  -> {error, {campaign_assumeutxo_collision, Collisions}}
+    BuiltInRows = [{H, Row} || Tab <- [mainnet_assumeutxo(),
+                                        testnet4_assumeutxo(),
+                                        regtest_assumeutxo()],
+                               {H, Row} <- maps:to_list(Tab)],
+    resolve_builtin_overlap(Parsed, BuiltInRows, [], [], []).
+
+resolve_builtin_overlap([], _BuiltIn, [], Acc, Confirmed) ->
+    {ok, lists:reverse(Acc), lists:reverse(Confirmed)};
+resolve_builtin_overlap([], _BuiltIn, Collisions, _Acc, _Confirmed) ->
+    {error, {campaign_assumeutxo_collision, lists:reverse(Collisions)}};
+resolve_builtin_overlap([{H, #{block_hash := BH} = Data} | Rest], BuiltIn,
+                        Coll, Acc, Conf) ->
+    Touched = [{RowH, Row} || {RowH, Row} <- BuiltIn,
+                             RowH =:= H orelse maps:get(block_hash, Row) =:= BH],
+    case Touched of
+        [] ->
+            resolve_builtin_overlap(Rest, BuiltIn, Coll, [{H, Data} | Acc], Conf);
+        _ ->
+            case confirms_builtin(H, Data, Touched) of
+                {ok, Merged} ->
+                    resolve_builtin_overlap(Rest, BuiltIn, Coll,
+                                            [{H, Merged} | Acc], [H | Conf]);
+                false ->
+                    resolve_builtin_overlap(Rest, BuiltIn, [H | Coll], Acc, Conf)
+            end
+    end.
+
+%% Every touched built-in row must sit at the same height and carry the same
+%% commitment; every key a built-in row pins must equal the entry's value.
+confirms_builtin(H, Data, Touched) ->
+    Same = fun({RowH, Row}) ->
+               RowH =:= H andalso
+               maps:get(block_hash, Row) =:= maps:get(block_hash, Data) andalso
+               maps:get(utxo_hash, Row) =:= maps:get(utxo_hash, Data) andalso
+               maps:get(chain_tx_count, Row) =:= maps:get(chain_tx_count, Data) andalso
+               lists:all(fun({K, V}) ->
+                             maps:get(K, Data, V) =:= V
+                         end, maps:to_list(Row))
+           end,
+    case lists:all(Same, Touched) of
+        true ->
+            {ok, lists:foldl(fun({_, Row}, D) -> maps:merge(D, Row) end,
+                             Data, Touched)};
+        false ->
+            false
     end.
 
 install_campaign_entries(Parsed) ->
