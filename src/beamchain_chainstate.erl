@@ -10,7 +10,7 @@
 %% Dialyzer suppressions for false positives:
 %% is_descendant_of/3 and find_fork_point/3: dialyzer infers AllBlocks is []
 %% from one call-site path, making the non-false branch appear unreachable.
--dialyzer({nowarn_function, [is_descendant_of/3, find_fork_point/3]}).
+-dialyzer({nowarn_function, [find_fork_point/3]}).
 
 %% API
 -export([start_link/0, start_link/1, start_link/2]).
@@ -89,6 +89,7 @@
 -define(BLOCK_HAVE_DATA, 8).
 -define(BLOCK_HAVE_UNDO, 16).
 -define(BLOCK_FAILED_VALID, 32).
+-define(BLOCK_FAILED_CHILD, 64).
 
 %% Flush
 -export([flush/0]).
@@ -1017,6 +1018,32 @@ init_chainstate(Role, SnapshotData) ->
 %% resumes from this height, not from the pre-crash flush.
 roll_forward_from_disk(State) ->
     Next = State#state.tip_height + 1,
+    case roll_forward_blocked(Next) of
+        {blocked, BadHash} ->
+            %% invalidateblock: the block at this height is marked
+            %% BLOCK_FAILED_VALID in the persisted index.  Core's
+            %% LoadBlockIndex never re-activates a failed block; neither may
+            %% crash recovery.  Without this the first clean restart after
+            %% invalidateblock walked straight back onto the invalidated
+            %% branch (bodies + height index survive the disconnect).
+            logger:info("chainstate: roll-forward stops at height ~B: block ~s "
+                        "is marked invalid (invalidateblock/reconsiderblock)",
+                        [Next, hash_hex(BadHash)]),
+            State;
+        ok ->
+            roll_forward_connect(Next, State)
+    end.
+
+roll_forward_blocked(Height) ->
+    case beamchain_db:get_block_index(Height, infinity) of
+        {ok, #{hash := H, status := S}}
+          when (S band (?BLOCK_FAILED_VALID bor ?BLOCK_FAILED_CHILD)) =/= 0 ->
+            {blocked, H};
+        _ ->
+            ok
+    end.
+
+roll_forward_connect(Next, State) ->
     case beamchain_db:get_block_by_height(Next) of
         {ok, Block} ->
             case do_connect_block(Block, State) of
@@ -3777,21 +3804,7 @@ disconnect_to_height(TargetHeight, State) ->
 mark_block_invalid(Hash, BlockHeight) ->
     case lookup_block_index_anywhere(Hash) of
         {ok, #{status := Status}} ->
-            NewStatus = Status bor ?BLOCK_FAILED_VALID,
-            %% Try the height-indexed path first; fall back to side-branch update.
-            case beamchain_db:update_block_status(Hash, NewStatus) of
-                ok ->
-                    ok;
-                {error, _} ->
-                    %% Block is a side-branch entry — re-store with updated status.
-                    case beamchain_db:get_side_branch_index(Hash) of
-                        {ok, SideEntry} ->
-                            beamchain_db:store_side_branch_index(
-                                Hash, SideEntry#{status => NewStatus});
-                        _ ->
-                            ok
-                    end
-            end,
+            set_block_status(Hash, Status bor ?BLOCK_FAILED_VALID),
             logger:info("chainstate: marked block at height ~B as invalid",
                         [BlockHeight]),
 
@@ -3801,45 +3814,70 @@ mark_block_invalid(Hash, BlockHeight) ->
             ok
     end.
 
-%% Mark all descendants of a block as invalid
-mark_descendants_invalid(ParentHash, ParentHeight) ->
-    %% Get all block indexes to find descendants
-    case beamchain_db:get_all_block_indexes() of
-        {ok, AllBlocks} ->
-            %% Find blocks at height > ParentHeight that descend from ParentHash
-            Descendants = find_descendants(AllBlocks, ParentHash, ParentHeight),
-            lists:foreach(fun(#{hash := DescHash, status := Status}) ->
-                case (Status band ?BLOCK_FAILED_VALID) =:= 0 of
-                    true ->
-                        NewStatus = Status bor ?BLOCK_FAILED_VALID,
-                        beamchain_db:update_block_status(DescHash, NewStatus);
-                    false ->
-                        ok  %% Already marked invalid
-                end
-            end, Descendants),
+%% Persist a block-index status: the height-keyed entry when this block owns
+%% its height, else its side-branch entry.
+set_block_status(Hash, NewStatus) ->
+    case beamchain_db:update_block_status(Hash, NewStatus) of
+        ok ->
             ok;
         {error, _} ->
-            ok
+            case beamchain_db:get_side_branch_index(Hash) of
+                {ok, SideEntry} ->
+                    beamchain_db:store_side_branch_index(
+                      Hash, SideEntry#{status => NewStatus});
+                _ ->
+                    ok
+            end
     end.
 
-%% Find all blocks that are descendants of a given block
-find_descendants(AllBlocks, AncestorHash, AncestorHeight) ->
-    %% Filter blocks at greater height that have AncestorHash as an ancestor
-    [Block || Block = #{height := H, header := Hdr} <- AllBlocks,
-              H > AncestorHeight,
-              is_descendant_of(Hdr, AncestorHash, AllBlocks)].
+%% Mark all descendants of a block as invalid (Core marks every block whose
+%% ancestor at the invalidated height is the invalidated block).
+mark_descendants_invalid(ParentHash, ParentHeight) ->
+    lists:foreach(fun(#{hash := DescHash, status := Status}) ->
+        case (Status band ?BLOCK_FAILED_VALID) =:= 0 of
+            true  -> set_block_status(DescHash, Status bor ?BLOCK_FAILED_VALID);
+            false -> ok
+        end
+    end, find_descendants(ParentHash, ParentHeight)),
+    ok.
 
-%% Check if a block is a descendant of AncestorHash by walking back the chain
-is_descendant_of(#block_header{prev_hash = PrevHash}, AncestorHash, _AllBlocks)
-  when PrevHash =:= AncestorHash ->
-    true;
-is_descendant_of(#block_header{prev_hash = PrevHash}, AncestorHash, AllBlocks) ->
-    case lists:keyfind(PrevHash, 2, [{maps:get(hash, B), B} || B <- AllBlocks]) of
-        {_, #{header := ParentHdr}} ->
-            is_descendant_of(ParentHdr, AncestorHash, AllBlocks);
-        false ->
-            false
+%% All index entries descending from AncestorHash (height AncestorHeight):
+%%  - the height-keyed index holds one block per height, so its descendants
+%%    are the contiguous run above AncestorHeight whose prev links chain back;
+%%  - side-branch entries whose ancestor at AncestorHeight is AncestorHash.
+%% The previous implementation rebuilt a list of the WHOLE index for every
+%% parent hop of every entry — quadratic in the chain length, i.e. a hung
+%% chainstate on a mainnet-sized index.
+find_descendants(AncestorHash, AncestorHeight) ->
+    Run = index_run_above(AncestorHash, AncestorHeight + 1, []),
+    Side = case beamchain_db:get_all_side_branch_indexes() of
+        {ok, SB} ->
+            [E || E = #{height := H} <- SB, H > AncestorHeight,
+                  ancestor_at(E, AncestorHeight) =:= AncestorHash];
+        _ ->
+            []
+    end,
+    Run ++ Side.
+
+index_run_above(PrevHash, Height, Acc) ->
+    case beamchain_db:get_block_index(Height) of
+        {ok, #{hash := H, header := #block_header{prev_hash = PrevHash}} = E} ->
+            index_run_above(H, Height + 1, [E | Acc]);
+        _ ->
+            lists:reverse(Acc)
     end.
+
+%% Hash of the ancestor of index entry E at TargetHeight (or undefined).
+ancestor_at(#{hash := H, height := Ht}, TargetHeight) when Ht =:= TargetHeight ->
+    H;
+ancestor_at(#{height := Ht, header := #block_header{prev_hash = Prev}}, TargetHeight)
+  when Ht > TargetHeight ->
+    case lookup_block_index_anywhere(Prev) of
+        {ok, PE} -> ancestor_at(PE#{hash => Prev, height => Ht - 1}, TargetHeight);
+        not_found -> undefined
+    end;
+ancestor_at(_, _) ->
+    undefined.
 
 %% Find the best valid chain (most cumulative work among non-invalid blocks).
 %% Carries the active precious-seqid tiebreak map so that equal-work ties are
@@ -4025,7 +4063,7 @@ collect_chain_blocks(TargetHash, ForkHeight, AllBlocks, Acc) ->
 %% Clears the invalid flag from the block and all its descendants/ancestors,
 %% then checks if it should become the new best chain.
 do_reconsider_block(Hash, State) ->
-    case beamchain_db:get_block_index_by_hash(Hash) of
+    case lookup_block_index_anywhere(Hash) of
         {ok, #{height := BlockHeight, status := Status}} ->
             %% Check if the block is actually marked invalid
             case (Status band ?BLOCK_FAILED_VALID) =/= 0 of
@@ -4059,59 +4097,40 @@ do_reconsider_block_impl(Hash, BlockHeight, State) ->
     end.
 
 %% Clear invalid flags from a block and all its ancestors/descendants
+%% (Core ResetBlockFailureFlags).  Every write goes to the persisted index,
+%% so the reconsideration survives a restart.
 clear_invalid_flags(Hash, BlockHeight) ->
-    case beamchain_db:get_all_block_indexes() of
-        {ok, AllBlocks} ->
-            %% Clear flag on ancestors (blocks that are ancestors of Hash)
-            lists:foreach(fun(#{hash := BHash, height := BHeight, status := Status}) ->
-                case BHeight < BlockHeight andalso
-                     is_ancestor_of(BHash, Hash, AllBlocks) andalso
-                     (Status band ?BLOCK_FAILED_VALID) =/= 0 of
-                    true ->
-                        NewStatus = Status band (bnot ?BLOCK_FAILED_VALID),
-                        beamchain_db:update_block_status(BHash, NewStatus);
-                    false ->
-                        ok
-                end
-            end, AllBlocks),
-
-            %% Clear flag on the block itself
-            case find_block_by_hash(Hash, AllBlocks) of
-                #{status := BlockStatus} ->
-                    ClearedStatus = BlockStatus band (bnot ?BLOCK_FAILED_VALID),
-                    beamchain_db:update_block_status(Hash, ClearedStatus);
-                undefined ->
-                    ok
-            end,
-
-            %% Clear flag on descendants
-            Descendants = find_descendants(AllBlocks, Hash, BlockHeight),
+    case lookup_block_index_anywhere(Hash) of
+        {ok, #{status := BlockStatus} = Entry} ->
+            %% Ancestors: a flagged ancestor implies every block between it and
+            %% Hash is flagged too (descendants of a failed block are marked),
+            %% so the flagged ancestors are the run directly below Hash.
+            clear_flagged_ancestors(maps:get(header, Entry)),
+            set_block_status(Hash, BlockStatus band (bnot ?BLOCK_FAILED_VALID)),
             lists:foreach(fun(#{hash := DescHash, status := DescStatus}) ->
                 case (DescStatus band ?BLOCK_FAILED_VALID) =/= 0 of
                     true ->
-                        ClearedDescStatus = DescStatus band (bnot ?BLOCK_FAILED_VALID),
-                        beamchain_db:update_block_status(DescHash, ClearedDescStatus);
+                        set_block_status(DescHash,
+                                         DescStatus band (bnot ?BLOCK_FAILED_VALID));
                     false ->
                         ok
                 end
-            end, Descendants),
+            end, find_descendants(Hash, BlockHeight)),
             ok;
-        {error, _} ->
+        not_found ->
             ok
     end.
 
-%% Check if BlockHash is an ancestor of DescendantHash
-is_ancestor_of(BlockHash, DescendantHash, _AllBlocks) when BlockHash =:= DescendantHash ->
-    false;  %% A block is not its own ancestor
-is_ancestor_of(BlockHash, DescendantHash, AllBlocks) ->
-    case find_block_by_hash(DescendantHash, AllBlocks) of
-        #{header := #block_header{prev_hash = PrevHash}} when PrevHash =:= BlockHash ->
-            true;
-        #{header := #block_header{prev_hash = PrevHash}} ->
-            is_ancestor_of(BlockHash, PrevHash, AllBlocks);
-        undefined ->
-            false
-    end.
+clear_flagged_ancestors(#block_header{prev_hash = Prev}) ->
+    case lookup_block_index_anywhere(Prev) of
+        {ok, #{status := S, header := PHdr}} when (S band ?BLOCK_FAILED_VALID) =/= 0 ->
+            set_block_status(Prev, S band (bnot ?BLOCK_FAILED_VALID)),
+            clear_flagged_ancestors(PHdr);
+        _ ->
+            ok
+    end;
+clear_flagged_ancestors(_) ->
+    ok.
 
 %%% ===================================================================
 %%% Internal: preciousblock

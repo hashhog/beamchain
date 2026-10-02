@@ -29,7 +29,8 @@
 -export([scrub_unspendable/0]).
 
 %% Block index
--export([store_block_index/5, store_block_index/6, get_block_index/1, get_block_index_by_hash/1]).
+-export([store_block_index/5, store_block_index/6, get_block_index/1, get_block_index/2,
+         get_block_index_by_hash/1]).
 -export([update_block_status/2, get_all_block_indexes/0]).
 
 %% Side-branch (off-active-chain) block index, hash-keyed.
@@ -412,6 +413,14 @@ store_block_index(Height, Hash, Header, Chainwork, Status, NTx) ->
            chainwork => binary(), status => integer()}} | not_found.
 get_block_index(Height) ->
     gen_server:call(?SERVER, {get_block_index, Height}, 30000).
+
+%% @doc get_block_index/1 with an explicit call timeout (boot roll-forward
+%% uses `infinity`, like get_block_by_height/1: a slow rocksdb read must not
+%% kill chainstate init).
+-spec get_block_index(non_neg_integer(), timeout()) ->
+    {ok, map()} | not_found.
+get_block_index(Height, Timeout) ->
+    gen_server:call(?SERVER, {get_block_index, Height}, Timeout).
 
 %% @doc Get block index by hash (reverse lookup)
 -spec get_block_index_by_hash(binary()) ->
@@ -1068,8 +1077,18 @@ handle_call({get_block_index_by_hash, Hash}, _From,
             <<Height:64/big>> = HeightKey,
             case rocksdb:get(Db, CF, HeightKey, []) of
                 {ok, Bin} ->
-                    Entry = decode_block_index_entry(Bin),
-                    {ok, Entry#{height => Height}};
+                    case decode_block_index_entry(Bin) of
+                        #{hash := Hash} = Entry ->
+                            {ok, Entry#{height => Height}};
+                        _ ->
+                            %% The blkidx:<hash> reverse key is never deleted
+                            %% when another block takes over that height (a
+                            %% reorg, or a later block after invalidateblock).
+                            %% Answering with the block that now owns the
+                            %% height made invalidate/reconsider of the old
+                            %% block flip the NEW block's status.
+                            not_found
+                    end;
                 not_found ->
                     not_found
             end;
@@ -1335,11 +1354,19 @@ handle_call({update_block_status, Hash, NewStatus}, _From,
                 {ok, Bin} ->
                     Entry = decode_block_index_entry(Bin),
                     %% Re-encode with new status, preserving existing NTx
-                    #{hash := H, header := Header, chainwork := Chainwork, n_tx := NTx} = Entry,
-                    NewValue = encode_block_index_entry(H, Header, Chainwork, NewStatus, NTx),
-                    case rocksdb:put(Db, CF, HeightKey, NewValue, []) of
-                        ok -> ok;
-                        Error -> Error
+                    case Entry of
+                        #{hash := Hash, header := Header, chainwork := Chainwork,
+                          n_tx := NTx} ->
+                            NewValue = encode_block_index_entry(
+                                         Hash, Header, Chainwork, NewStatus, NTx),
+                            case rocksdb:put(Db, CF, HeightKey, NewValue, []) of
+                                ok -> ok;
+                                Error -> Error
+                            end;
+                        _ ->
+                            %% Stale reverse key: the height now belongs to
+                            %% a different block — never rewrite ITS status.
+                            {error, block_index_stale}
                     end;
                 not_found ->
                     {error, block_index_not_found}

@@ -309,7 +309,17 @@ bug2_invalidate_disconnects_without_containment_check() ->
     %%   blkidx:SideBranchHash → height 1 → height-1 slot has ActiveH1Hash ≠ SideBranchHash
     %% → returns false → disconnect is skipped.
     %% The active tip hash and height must be unchanged after the call.
-    ok = beamchain_chainstate:invalidate_block(SideBranchHash),
+    %% invalidateblock-persist (2026-10-02): the stale blkidx reverse key no
+    %% longer resolves to the block that now owns height 1, so the side-branch
+    %% hash (stored nowhere else) is simply unknown — Core answers "Block not
+    %% found" for it.  Either answer is fine here; what matters is that the
+    %% active chain is untouched and the ACTIVE block is not flagged (the old
+    %% lookup rewrote ActiveH1's entry with BLOCK_FAILED_VALID).
+    InvRes = beamchain_chainstate:invalidate_block(SideBranchHash),
+    ?assert(InvRes =:= ok orelse InvRes =:= {error, block_not_found}),
+    {ok, #{hash := ActiveH1Hash, status := ActiveStatus}} =
+        beamchain_db:get_block_index(1),
+    ?assertEqual(0, ActiveStatus band ?BLOCK_FAILED_VALID),
     {ok, {NewTipHash, NewHeight}} = beamchain_chainstate:get_tip(),
     ?assertEqual(GenesisTipHash, NewTipHash,
         "FIX BUG-2: active tip hash must be unchanged after invalidating "
