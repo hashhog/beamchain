@@ -54,6 +54,7 @@
 %% overrides so the frontier-lifecycle tests (issue #34) can drive the
 %% gen_server callbacks directly with a scripted state.
 -export([do_handle_cmpctblock/5, unsolicited_connect_penalty/1, test_new_state/0,
+         is_consensus_verdict/1,
          test_state/1, test_get/2,
          admit_downloaded/3]).
 -endif.
@@ -193,7 +194,21 @@
     %% blocks this way). Core analogue: m_stalling_since is cleared on
     %% every completed block request (net_processing.cpp:1199-1230), so
     %% stalling escalation never survives download progress.
-    stuck_height = -1      :: integer()
+    stuck_height = -1      :: integer(),
+
+    %% Height -> peer that delivered the downloaded block. A consensus-
+    %% invalid block is attributed to THIS peer (Core mapBlockSource ->
+    %% BlockChecked -> MaybePunishNodeForBlock), never to whichever peer
+    %% the height was last requested from.
+    block_source = #{}     :: #{non_neg_integer() => pid()},
+
+    %% Hash -> peers that answered `notfound` for it. Such a peer is not
+    %% asked for that block again (Core only requests a block from a peer
+    %% whose announced chain contains it, FindNextBlocksToDownload). Without
+    %% this the notfound handler re-queued the height at the front and the
+    %% very next fill_pipeline re-asked the SAME peer: ~232k getdata in
+    %% 2 min for a block only the other peer had (observed 2026-10-03).
+    notfound_from = #{}    :: #{binary() => [pid()]}
 }).
 
 -ifdef(TEST).
@@ -217,6 +232,7 @@ test_state(Overrides) ->
         (target_height, V, S)    -> S#state{target_height = V};
         (peers, V, S)            -> S#state{peers = V};
         (stuck_ticks, V, S)      -> S#state{stuck_ticks = V};
+        (block_source, V, S)     -> S#state{block_source = V};
         (peer_stats, V, S) ->
             S#state{peer_stats = maps:map(
                 fun(_Pid, Count) ->
@@ -233,7 +249,9 @@ test_get(downloaded_bytes, S) -> S#state.downloaded_bytes;
 test_get(next_to_validate, S) -> S#state.next_to_validate;
 test_get(target_height, S)    -> S#state.target_height;
 test_get(peers, S)            -> S#state.peers;
-test_get(stuck_ticks, S)      -> S#state.stuck_ticks.
+test_get(stuck_ticks, S)      -> S#state.stuck_ticks;
+test_get(validation_failures, S) -> S#state.validation_failures;
+test_get(notfound_from, S)    -> S#state.notfound_from.
 -endif.
 
 %%% ===================================================================
@@ -369,6 +387,8 @@ handle_cast({start_sync, Opts}, #state{status = idle,
         downloaded_bytes = 0,
         next_to_validate = StartHeight,
         target_height = TargetHeight,
+        block_source = #{},
+        notfound_from = #{},
         peers = Peers,
         peer_stats = maps:from_list(
             [{Pid, #peer_stats{}} || Pid <- maps:keys(Peers)]),
@@ -740,12 +760,14 @@ admit_downloaded(#state{downloaded = D, downloaded_bytes = Bytes,
     end.
 
 remove_downloaded(Height, #state{downloaded = D,
-                                 downloaded_bytes = Bytes} = State) ->
+                                 downloaded_bytes = Bytes,
+                                 block_source = Src} = State) ->
     case maps:take(Height, D) of
         {Block, D2} ->
             State#state{
                 downloaded = D2,
-                downloaded_bytes = max(0, Bytes - block_mem_bytes(Block))
+                downloaded_bytes = max(0, Bytes - block_mem_bytes(Block)),
+                block_source = maps:remove(Height, Src)
             };
         error ->
             State
@@ -857,7 +879,8 @@ blast_request_height(Height, #state{peers = Peers,
         {ok, #{hash := Hash}} ->
             Item = #{type => ?MSG_WITNESS_BLOCK, hash => Hash},
             Now = erlang:monotonic_time(millisecond),
-            PeerList = maps:keys(Peers),
+            PeerList = [P || P <- maps:keys(Peers),
+                             not said_notfound(P, Hash, State)],
             %% Pick the first peer as the "official" in_flight owner
             case PeerList of
                 [] ->
@@ -954,27 +977,40 @@ request_batch(Peer, BatchSize,
                      in_flight = InFlight,
                      hash_to_height = H2H,
                      peer_stats = AllStats} = State) ->
-    {Heights, RestQueue} = take_from_queue(BatchSize, Queue),
+    {Heights, RestQueue0} = take_from_queue(BatchSize, Queue),
     case Heights of
         [] ->
             State;
         _ ->
             Now = erlang:monotonic_time(millisecond),
             %% Look up hashes and build getdata items
-            {Items, InFlight2, H2H2, _Skipped} = lists:foldl(
-                fun(Height, {ItemsAcc, IFAcc, H2HAcc, SkipAcc}) ->
+            {Items, InFlight2, H2H2, _Skipped, NotHere} = lists:foldl(
+                fun(Height, {ItemsAcc, IFAcc, H2HAcc, SkipAcc, NHAcc}) ->
                     case beamchain_db:get_block_index(Height) of
                         {ok, #{hash := Hash}} ->
-                            Item = #{type => ?MSG_WITNESS_BLOCK, hash => Hash},
-                            IF = maps:put(Height, {Peer, Now, Hash}, IFAcc),
-                            H2HNew = maps:put(Hash, Height, H2HAcc),
-                            {[Item | ItemsAcc], IF, H2HNew, SkipAcc};
+                            case said_notfound(Peer, Hash, State) of
+                                true ->
+                                    %% This peer told us it does not have
+                                    %% the block: leave the height queued
+                                    %% for another peer.
+                                    {ItemsAcc, IFAcc, H2HAcc, SkipAcc,
+                                     [Height | NHAcc]};
+                                false ->
+                                    Item = #{type => ?MSG_WITNESS_BLOCK,
+                                             hash => Hash},
+                                    IF = maps:put(Height, {Peer, Now, Hash},
+                                                  IFAcc),
+                                    H2HNew = maps:put(Hash, Height, H2HAcc),
+                                    {[Item | ItemsAcc], IF, H2HNew, SkipAcc,
+                                     NHAcc}
+                            end;
                         not_found ->
                             logger:warning("block_sync: no block index "
                                            "for height ~B", [Height]),
-                            {ItemsAcc, IFAcc, H2HAcc, SkipAcc + 1}
+                            {ItemsAcc, IFAcc, H2HAcc, SkipAcc + 1, NHAcc}
                     end
-                end, {[], InFlight, H2H, 0}, Heights),
+                end, {[], InFlight, H2H, 0, []}, Heights),
+            RestQueue = lists:reverse(NotHere) ++ RestQueue0,
 
             %% Send getdata with all items at once
             case Items of
@@ -1040,7 +1076,11 @@ handle_block_received(Peer, Block, State) ->
                     State1 = State#state{
                         in_flight = InFlight2,
                         hash_to_height = H2H2,
-                        peer_stats = AllStats
+                        peer_stats = AllStats,
+                        block_source = maps:put(Height, Peer,
+                                                State#state.block_source),
+                        notfound_from = maps:remove(BlockHash,
+                                                    State#state.notfound_from)
                     },
                     %% Store in downloaded map, or re-queue if over budget
                     State2 = admit_downloaded(State1, Height, Block),
@@ -1299,36 +1339,128 @@ validate_sequential_inner(#state{next_to_validate = NextH,
                     },
                     validate_sequential_inner(State3, Remaining - 1);
                 {error, Reason} ->
-                    Failures = State#state.validation_failures,
-                    RetryCount = maps:get(NextH, Failures, 0) + 1,
-                    Failures2 = maps:put(NextH, RetryCount, Failures),
-                    case RetryCount >= ?MAX_VALIDATION_RETRIES of
+                    case is_consensus_verdict(Reason) of
                         true ->
-                            logger:error("block_sync: validation failed at height ~B "
-                                         "after ~B retries (~p), halting sync",
-                                         [NextH, RetryCount, Reason]),
-                            %% Stop sync entirely — operator must investigate.
-                            %% Clear downloaded buffer for this height.
-                            StateF = remove_downloaded(NextH, State),
-                            StateF#state{status = idle,
-                                         download_queue = [],
-                                         validation_failures = Failures2};
+                            invalid_block_found(NextH, Block, Reason, State);
                         false ->
-                            logger:error("block_sync: validation failed at height ~B: ~p "
-                                         "(retry ~B/~B)",
-                                         [NextH, Reason, RetryCount,
-                                          ?MAX_VALIDATION_RETRIES]),
-                            %% Re-queue the failed block for retry.
-                            StateR = remove_downloaded(NextH, State),
-                            Queue = [NextH | StateR#state.download_queue],
-                            StateR#state{download_queue = Queue,
-                                         validation_failures = Failures2}
+                            validation_retry_or_halt(NextH, Reason, State)
                     end
             end;
         error ->
             %% Not yet downloaded, nothing to do
             State
     end.
+
+%% A NON-verdict connect failure (local I/O / timeout, a killed script
+%% worker, a missing parent, a BLOCK_MUTATED body): unchanged behaviour --
+%% re-fetch and retry, halting after MAX_VALIDATION_RETRIES. The block is
+%% NOT marked invalid and nobody is punished: the next copy may be fine.
+validation_retry_or_halt(NextH, Reason, State) ->
+    Failures = State#state.validation_failures,
+    RetryCount = maps:get(NextH, Failures, 0) + 1,
+    Failures2 = maps:put(NextH, RetryCount, Failures),
+    case RetryCount >= ?MAX_VALIDATION_RETRIES of
+        true ->
+            logger:error("block_sync: validation failed at height ~B "
+                         "after ~B retries (~p), halting sync",
+                         [NextH, RetryCount, Reason]),
+            %% Stop sync entirely — operator must investigate.
+            %% Clear downloaded buffer for this height.
+            StateF = remove_downloaded(NextH, State),
+            StateF#state{status = idle,
+                         download_queue = [],
+                         validation_failures = Failures2};
+        false ->
+            logger:error("block_sync: validation failed at height ~B: ~p "
+                         "(retry ~B/~B)",
+                         [NextH, Reason, RetryCount,
+                          ?MAX_VALIDATION_RETRIES]),
+            %% Re-queue the failed block for retry.
+            StateR = remove_downloaded(NextH, State),
+            Queue = [NextH | StateR#state.download_queue],
+            StateR#state{download_queue = Queue,
+                         validation_failures = Failures2}
+    end.
+
+%% The block at NextH failed CONSENSUS validation. Core:
+%%   Chainstate::InvalidBlockFound -> BLOCK_FAILED_VALID (+ descendants via
+%%   InvalidChainFound / SetBlockFailureFlags), RecalculateBestHeader;
+%%   BlockChecked -> MaybePunishNodeForBlock(mapBlockSource peer).
+%% It is never re-requested (its header is refused from now on, see
+%% beamchain_header_sync), the peer that DELIVERED it is punished (a local
+%% peer is only disconnected -- beamchain_peer_manager:misbehaving/3 applies
+%% Core's IsLocal exemption), and the header chain is rewound so the valid
+%% competitor at this height is fetched. The old path re-requested the block
+%% MAX_VALIDATION_RETRIES times and then halted block download for good.
+invalid_block_found(NextH, Block, Reason, State) ->
+    Hash = beamchain_serialize:block_hash(Block#block.header),
+    Source = maps:get(NextH, State#state.block_source, undefined),
+    logger:warning("block_sync: block ~s at height ~B is invalid (~p), "
+                   "delivered by ~p -- marking failed, not re-requesting",
+                   [hash_hex(Hash), NextH, Reason, Source]),
+    _ = (catch beamchain_chainstate:invalid_block_found(Hash)),
+    case is_pid(Source) of
+        true ->
+            beamchain_peer_manager:misbehaving(
+              Source, 100,
+              iolist_to_binary(io_lib:format("invalid block: ~p", [Reason])));
+        false ->
+            ok
+    end,
+    _ = (catch beamchain_header_sync:invalid_block_found(Hash, NextH, Source)),
+    %% Everything queued / in flight / buffered at or above NextH was on the
+    %% failed branch. Go idle; the next headers_complete re-arms from the
+    %% (rewound) header chain.
+    State2 = cancel_timers(State),
+    State2#state{status = idle,
+                 download_queue = [],
+                 in_flight = #{},
+                 hash_to_height = #{},
+                 downloaded = #{},
+                 downloaded_bytes = 0,
+                 block_source = #{},
+                 validation_failures =
+                     maps:remove(NextH, State#state.validation_failures)}.
+
+%% Is a connect failure a VERDICT about the block itself (Core
+%% BLOCK_CONSENSUS / BLOCK_INVALID_HEADER as returned by ConnectBlock /
+%% ContextualCheckBlock(Header) / CheckBlock), as opposed to something that
+%% must not mark it invalid? An explicit allow-list: an unknown or new
+%% token stays a non-verdict (retry), never a false invalid mark.
+%% NON-verdicts, deliberately absent:
+%%   BLOCK_MUTATED (Core InvalidBlockFound skips these: another copy of
+%%     the same header may be valid) -- bad_merkle_root, mutated_merkle,
+%%     dup_txid, bad_witness_nonce_size, bad_witness_commitment,
+%%     unexpected_witness, missing_witness_commitment;
+%%   missing parent / ordering -- bad_prevblk, missing_prev_index;
+%%   BLOCK_TIME_FUTURE -- time_too_new (may become valid later);
+%%   local failures -- {exit_during_connect,_}, {internal_error,_},
+%%     {post_validation_failure,_}, script_check_worker_crash,
+%%     {script_verify_failed, NonInteger} (a killed/crashed worker, 30fdcfb),
+%%     missing_undo_data, undo_data_inconsistent, timeouts.
+-spec is_consensus_verdict(term()) -> boolean().
+is_consensus_verdict({check_block_failed, R}) ->
+    is_consensus_verdict(R);
+is_consensus_verdict({script_verify_failed, Idx}) when is_integer(Idx) ->
+    true;
+is_consensus_verdict(R) when is_atom(R) ->
+    lists:member(R, [bad_cb_amount, bad_cb_height, bad_coinbase_length,
+                     bad_txns_nonfinal, sequence_lock_not_met,
+                     bad_txns_bip30, missing_inputs, insufficient_input,
+                     premature_spend_of_coinbase, input_values_outofrange,
+                     fee_outofrange, accumulated_fee_outofrange,
+                     total_output_overflow, negative_output,
+                     output_too_large, duplicate_inputs, null_input,
+                     no_inputs, no_outputs, no_transactions,
+                     first_tx_not_coinbase, extra_coinbase,
+                     bad_blk_sigops, bad_blk_weight, bad_blk_length,
+                     bad_diffbits, time_too_old, time_timewarp_attack,
+                     high_hash]);
+is_consensus_verdict(_) ->
+    false.
+
+said_notfound(Peer, Hash, #state{notfound_from = NF}) ->
+    lists:member(Peer, maps:get(Hash, NF, [])).
 
 %% Validate and connect a single block.
 %% Delegates to beamchain_chainstate which manages the UTXO cache,
@@ -1681,11 +1813,15 @@ handle_notfound_items(Peer, Items, State) ->
                 Queue = [Height | AccState#state.download_queue],
                 AllStats = decrement_peer_in_flight(Peer,
                     AccState#state.peer_stats),
+                NF = AccState#state.notfound_from,
+                NF2 = maps:put(Hash, lists:usort([Peer | maps:get(Hash, NF, [])]),
+                               NF),
                 AccState#state{
                     in_flight = InFlight2,
                     hash_to_height = H2H2,
                     download_queue = Queue,
-                    peer_stats = AllStats
+                    peer_stats = AllStats,
+                    notfound_from = NF2
                 };
             error ->
                 AccState

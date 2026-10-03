@@ -80,6 +80,10 @@
 %% Block invalidation / reconsideration
 -export([invalidate_block/1, reconsider_block/1]).
 
+%% Consensus-invalid block delivered over P2P (Core InvalidBlockFound):
+%% mark it + descendants failed and remember the verdict by hash.
+-export([invalid_block_found/1, is_known_invalid/1]).
+
 %% Block preciousness (preciousblock RPC)
 -export([precious_block/1]).
 
@@ -481,6 +485,40 @@ wipe_chainstate() ->
 -spec invalidate_block(binary()) -> ok | {error, term()}.
 invalidate_block(Hash) when byte_size(Hash) =:= 32 ->
     gen_server:call(?SERVER, {invalidate_block, Hash}, 300000).
+
+%% @doc A block failed CONSENSUS validation while being connected (Core
+%% Chainstate::InvalidBlockFound, validation.cpp): set BLOCK_FAILED_VALID on
+%% it and on every known descendant (Core SetBlockFailureFlags), and record
+%% the verdict hash-keyed so it outlives the height-keyed index slot being
+%% taken over by the valid competitor. The block was never connected, so
+%% the active chain is untouched. Callers MUST only pass a block whose
+%% failure is a verdict about the block itself -- never a BLOCK_MUTATED
+%% result, a missing parent/body, or a local I/O / timeout error.
+-spec invalid_block_found(binary()) -> ok.
+invalid_block_found(Hash) when byte_size(Hash) =:= 32 ->
+    gen_server:call(?SERVER, {invalid_block_found, Hash}, 300000).
+
+%% @doc True when Hash (or, through invalid_block_found's descendant walk,
+%% one of its ancestors) was found consensus-invalid. Read by header sync
+%% to refuse re-accepting the header and so ever re-requesting the block
+%% (Core AcceptBlockHeader -> BLOCK_CACHED_INVALID "duplicate-invalid").
+%% Deliberately NOT derived from BLOCK_FAILED_VALID in the index: header
+%% sync's mark_orphaned_blocks writes that same bit on VALID blocks that
+%% merely lost a header reorg.
+-spec is_known_invalid(binary()) -> boolean().
+is_known_invalid(Hash) when byte_size(Hash) =:= 32 ->
+    case catch beamchain_db:get_meta(known_invalid_key(Hash)) of
+        {ok, <<1>>} -> true;
+        _ -> false
+    end;
+is_known_invalid(_) ->
+    false.
+
+known_invalid_key(Hash) ->
+    <<"invalidblk:", Hash/binary>>.
+
+set_known_invalid(Hash, Flag) when Flag =:= 0; Flag =:= 1 ->
+    beamchain_db:put_meta(known_invalid_key(Hash), <<Flag>>).
 
 %% @doc Clear the invalid status from a block and all its descendants.
 %% If the reconsidered chain has more work than the current tip, switch to it.
@@ -1249,6 +1287,9 @@ handle_call({invalidate_block, Hash}, _From, State) ->
         {error, Reason} ->
             {reply, {error, Reason}, State}
     end;
+
+handle_call({invalid_block_found, Hash}, _From, State) ->
+    {reply, do_invalid_block_found(Hash), State};
 
 %% Block reconsideration
 handle_call({reconsider_block, Hash}, _From, State) ->
@@ -3814,6 +3855,32 @@ mark_block_invalid(Hash, BlockHeight) ->
             ok
     end.
 
+%% P2P consensus-invalid verdict (see invalid_block_found/1). The block is
+%% not on the active chain (its connect just failed), so unlike
+%% do_invalidate_block nothing is disconnected; the index flags + the
+%% hash-keyed verdict are the whole effect.
+do_invalid_block_found(Hash) ->
+    _ = set_known_invalid(Hash, 1),
+    case lookup_block_index_anywhere(Hash) of
+        {ok, #{height := Height, status := Status}} ->
+            set_block_status(Hash, Status bor ?BLOCK_FAILED_VALID),
+            lists:foreach(fun(#{hash := DescHash, status := DS}) ->
+                _ = set_known_invalid(DescHash, 1),
+                case (DS band ?BLOCK_FAILED_VALID) =:= 0 of
+                    true  -> set_block_status(DescHash, DS bor ?BLOCK_FAILED_VALID);
+                    false -> ok
+                end
+            end, find_descendants(Hash, Height)),
+            logger:warning("chainstate: block ~s at height ~B is consensus-"
+                           "invalid; marked failed with its descendants",
+                           [hash_hex(Hash), Height]);
+        not_found ->
+            logger:warning("chainstate: block ~s is consensus-invalid "
+                           "(no index entry); verdict recorded",
+                           [hash_hex(Hash)])
+    end,
+    ok.
+
 %% Persist a block-index status: the height-keyed entry when this block owns
 %% its height, else its side-branch entry.
 set_block_status(Hash, NewStatus) ->
@@ -4107,7 +4174,9 @@ clear_invalid_flags(Hash, BlockHeight) ->
             %% so the flagged ancestors are the run directly below Hash.
             clear_flagged_ancestors(maps:get(header, Entry)),
             set_block_status(Hash, BlockStatus band (bnot ?BLOCK_FAILED_VALID)),
+            clear_known_invalid(Hash),
             lists:foreach(fun(#{hash := DescHash, status := DescStatus}) ->
+                clear_known_invalid(DescHash),
                 case (DescStatus band ?BLOCK_FAILED_VALID) =/= 0 of
                     true ->
                         set_block_status(DescHash,
@@ -4125,12 +4194,22 @@ clear_flagged_ancestors(#block_header{prev_hash = Prev}) ->
     case lookup_block_index_anywhere(Prev) of
         {ok, #{status := S, header := PHdr}} when (S band ?BLOCK_FAILED_VALID) =/= 0 ->
             set_block_status(Prev, S band (bnot ?BLOCK_FAILED_VALID)),
+            clear_known_invalid(Prev),
             clear_flagged_ancestors(PHdr);
         _ ->
             ok
     end;
 clear_flagged_ancestors(_) ->
     ok.
+
+%% reconsiderblock lifts a P2P verdict too (Core ResetBlockFailureFlags
+%% clears the same nStatus bits the verdict set). Only rewrite a key that
+%% exists, so reconsider never grows the meta CF.
+clear_known_invalid(Hash) ->
+    case is_known_invalid(Hash) of
+        true -> _ = set_known_invalid(Hash, 0), ok;
+        false -> ok
+    end.
 
 %%% ===================================================================
 %%% Internal: preciousblock

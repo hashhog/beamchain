@@ -223,7 +223,18 @@ connect(Address, Handler, Opts) ->
 -spec accept(gen_tcp:socket(), {inet:ip_address(), inet:port_number()}, pid()) ->
     {ok, pid()} | {error, term()}.
 accept(Socket, Address, Handler) ->
-    gen_statem:start_link(?MODULE, {inbound, Socket, Address, Handler}, []).
+    %% NOT start_link. The manager (Handler) does not trap exits, so a link
+    %% made every non-normal inbound-peer exit -- {shutdown, banned} from
+    %% check_ban, block_sync's exit(P, stall_unstick) -- kill the peer
+    %% manager, and beamchain_node_sup (rest_for_one) then restarted it and
+    %% every child after it: all OTHER peers were dropped and sync state was
+    %% reset because one inbound peer misbehaved (observed 2026-10-03,
+    %% p2p-invalid-block-feed: the attacker's ban dropped the honest peer).
+    %% Lifetime coupling is already covered without a link: the manager
+    %% monitors the peer (handle_inbound), and the peer monitors the manager
+    %% (handler_mon -> {shutdown, handler_down}), exactly like outbound peers
+    %% started with gen_statem:start/3 in connect/3.
+    gen_statem:start(?MODULE, {inbound, Socket, Address, Handler}, []).
 
 %% @doc Send a P2P message to this peer.
 %% The payload may be a map (common case) or any structured term (e.g.

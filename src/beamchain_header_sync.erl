@@ -28,6 +28,7 @@
          handle_peer_connected/2,
          handle_peer_disconnected/1,
          probe_peer/1,
+         invalid_block_found/3,
          get_status/0]).
 
 %% gen_server callbacks
@@ -36,7 +37,7 @@
 
 %% Test-only exports: pure internal decision functions.
 -ifdef(TEST).
--export([build_block_locator/2]).
+-export([build_block_locator/2, test_state/1, test_get/2]).
 -export([incoming_chain_wins/2,
          classify_deep_fork/4,
          select_next_probe_peer/2]).
@@ -103,6 +104,28 @@
     probe_attempted = []    :: [pid()]
 }).
 
+-ifdef(TEST).
+%% Build / inspect a #state{} for gen_server-callback tests.
+test_state(Overrides) ->
+    maps:fold(fun
+        (status, V, S)        -> S#state{status = V};
+        (sync_peer, V, S)     -> S#state{sync_peer = V};
+        (tip_height, V, S)    -> S#state{tip_height = V};
+        (tip_hash, V, S)      -> S#state{tip_hash = V};
+        (tip_chainwork, V, S) -> S#state{tip_chainwork = V};
+        (mtp_window, V, S)    -> S#state{mtp_window = V};
+        (params, V, S)        -> S#state{params = V};
+        (peer_heights, V, S)  -> S#state{peer_heights = V}
+    end, #state{}, Overrides).
+
+test_get(status, S)            -> S#state.status;
+test_get(sync_peer, S)         -> S#state.sync_peer;
+test_get(tip_height, S)        -> S#state.tip_height;
+test_get(tip_hash, S)          -> S#state.tip_hash;
+test_get(peer_heights, S)      -> S#state.peer_heights;
+test_get(peer_header_state, S) -> S#state.peer_header_state.
+-endif.
+
 %%% ===================================================================
 %%% API
 %%% ===================================================================
@@ -145,6 +168,18 @@ handle_peer_disconnected(Peer) ->
 -spec probe_peer(pid()) -> ok.
 probe_peer(Peer) ->
     gen_server:cast(?SERVER, {probe_peer, Peer}).
+
+%% @doc Block sync found the block at Height on our header chain consensus-
+%% invalid (already marked via beamchain_chainstate:invalid_block_found/1).
+%% Core InvalidChainFound -> RecalculateBestHeader: the best header can no
+%% longer be on that branch. This header chain is height-indexed (one
+%% branch), so rewind it to the failed block's parent and ask the other
+%% peers for headers -- the valid competitor at the same height then
+%% connects normally and is downloaded. Culprit (may be undefined) is the
+%% delivering peer; it is not asked.
+-spec invalid_block_found(binary(), non_neg_integer(), pid() | undefined) -> ok.
+invalid_block_found(Hash, Height, Culprit) ->
+    gen_server:cast(?SERVER, {invalid_block_found, Hash, Height, Culprit}).
 
 %% @doc Get current sync status.
 -spec get_status() -> map().
@@ -292,6 +327,9 @@ handle_cast({probe_peer, Peer}, State) ->
                 "progress (status ~p, sync_peer ~p)",
                 [Peer, State#state.status, State#state.sync_peer]),
     {noreply, State};
+
+handle_cast({invalid_block_found, Hash, Height, Culprit}, State) ->
+    {noreply, do_invalid_block_found(Hash, Height, Culprit, State)};
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -585,7 +623,18 @@ process_headers(Headers, Peer, #state{hss_state = HssSt} = State)
             handle_misbehaving_peer(Peer, 100, State2)
     end;
 
-process_headers(Headers, Peer, State) ->
+process_headers(Headers0, Peer, State) ->
+    case drop_known_headers(Headers0, State) of
+        [] ->
+            %% Everything in the batch is already on our header chain
+            %% (an announcement that repeats the shared prefix).
+            check_sync_complete(note_peer_height(Peer, State#state.tip_height,
+                                                 State));
+        Headers ->
+            process_new_headers(Headers, Peer, State)
+    end.
+
+process_new_headers(Headers, Peer, State) ->
     %% Check if headers connect to our chain
     FirstHeader = hd(Headers),
     case headers_connect_to_chain(FirstHeader, State) of
@@ -607,11 +656,96 @@ process_headers(Headers, Peer, State) ->
                                 [ForkHeight, State#state.tip_height]),
                     State3 = reset_unconnecting_count(Peer, State2),
                     process_connecting_headers(Headers, Peer, State3);
+                cached_invalid ->
+                    cached_invalid_headers(Peer, State);
+                known_fork ->
+                    %% A complete (< MAX_HEADERS_RESULTS) branch off a block
+                    %% we know, with no more work than our tip. Core stores
+                    %% such headers and simply does not switch to them; it is
+                    %% NOT "unconnecting" and the peer did nothing wrong.
+                    %% Treating it as unconnecting re-sent the same
+                    %% getheaders, got the same branch back, and banned the
+                    %% peer after 10 rounds. The peer's best is at most our
+                    %% tip's work, so stop treating it as "ahead".
+                    logger:info("header_sync: ~p offered a branch without "
+                                "more work than our tip -- not switching",
+                                [Peer]),
+                    State2 = reset_unconnecting_count(Peer, State),
+                    PH = maps:put(Peer, State2#state.tip_height,
+                                  State2#state.peer_heights),
+                    check_sync_complete(State2#state{peer_heights = PH});
                 no_reorg ->
                     %% Not a recognized reorg - handle as unconnecting
                     handle_unconnecting_headers(Headers, Peer, State)
             end
     end.
+
+%% Drop the leading headers that are already on our header chain (at or
+%% below the tip, hash-matched -- a stale height slot never matches). Core
+%% AcceptBlockHeader simply finds them in m_block_index; without this a
+%% re-sent shared prefix ([B1', B2'] when B1' is our tip) looked like a fork
+%% off B1''s parent and ran a needless rollback of B1'.
+drop_known_headers([], _State) ->
+    [];
+drop_known_headers([H | Rest] = Headers, #state{tip_height = TipHeight} = State) ->
+    Hash = beamchain_serialize:block_hash(H),
+    case beamchain_db:get_block_index_by_hash(Hash) of
+        {ok, #{height := Ht}} when Ht =< TipHeight ->
+            drop_known_headers(Rest, State);
+        _ ->
+            Headers
+    end.
+
+%% A batch carries a header we already found consensus-invalid (or one that
+%% builds on it). Core: AcceptBlockHeader -> BLOCK_CACHED_INVALID
+%% ("duplicate-invalid") and BLOCK_INVALID_PREV; MaybePunishNodeForBlock
+%% does not punish an INBOUND peer for a cached-invalid block, and the block
+%% is never requested again. We drop the batch, forget the peer's claimed
+%% height (so it is not re-picked as "ahead" in a getheaders loop) and do
+%% not punish.
+cached_invalid_headers(Peer, State) ->
+    logger:info("header_sync: ~p sent headers on a chain we already found "
+                "invalid -- ignored, not requested", [Peer]),
+    State2 = remove_peer_state(Peer, cancel_timer(State)),
+    pick_sync_peer_and_start(State2#state{sync_peer = undefined,
+                                          status = idle}).
+
+%% Rewind the header chain off a consensus-invalid block (see
+%% invalid_block_found/3).
+do_invalid_block_found(Hash, Height, Culprit,
+                       #state{tip_height = TipHeight, params = Params} = State)
+  when Height >= 1, TipHeight >= Height ->
+    case {beamchain_db:get_block_index(Height),
+          beamchain_db:get_block_index(Height - 1)} of
+        {{ok, #{hash := Hash}}, {ok, #{hash := PHash, chainwork := PCW}}} ->
+            logger:warning("header_sync: header chain rewound from ~B to ~B "
+                           "off invalid block at ~B", [TipHeight, Height - 1,
+                                                       Height]),
+            ok = beamchain_db:set_header_tip(PHash, Height - 1),
+            State2 = cancel_timer(State#state{
+                tip_height = Height - 1,
+                tip_hash = PHash,
+                tip_chainwork = PCW,
+                mtp_window = load_mtp_window(Height - 1, Params),
+                hss_state = undefined,
+                sync_peer = undefined,
+                status = idle}),
+            State3 = case Culprit of
+                undefined -> State2;
+                _ -> remove_peer_state(Culprit, State2)
+            end,
+            case select_next_probe_peer(State3#state.peer_heights, []) of
+                {ok, Peer} ->
+                    start_probe(Peer, State3);
+                none ->
+                    State3#state{status = complete}
+            end;
+        _ ->
+            %% Our header chain is no longer on that block.
+            State
+    end;
+do_invalid_block_found(_Hash, _Height, _Culprit, State) ->
+    State.
 
 %% Check if a header connects to our current chain tip
 headers_connect_to_chain(Header, #state{tip_hash = TipHash}) ->
@@ -637,8 +771,13 @@ handle_announced_headers(Peer, Headers, State) ->
             %% Re-announcement of headers we already have (e.g. several
             %% peers announcing the same new block). Nothing to process,
             %% but refresh the peer's known height so peer selection has
-            %% live data instead of the handshake-time snapshot.
-            {noreply, note_peer_height(Peer, KnownHeight, State)};
+            %% live data instead of the handshake-time snapshot -- unless
+            %% that block is one we found invalid (cached-invalid: do not
+            %% credit the peer with it, or it is picked as "ahead").
+            case beamchain_chainstate:is_known_invalid(LastHash) of
+                true -> {noreply, remove_peer_state(Peer, State)};
+                false -> {noreply, note_peer_height(Peer, KnownHeight, State)}
+            end;
         not_found ->
             case check_headers_pow_and_continuity(Headers, State) of
                 ok ->
@@ -702,9 +841,7 @@ note_announced_peer_height(Peer, Headers, State) ->
 %% Check if unconnecting headers represent a reorg (fork with more work).
 %% If the first header's prev_hash points to a known block in our index,
 %% the peer is offering an alternative chain from that fork point.
-check_reorg(FirstHeader, Headers, #state{tip_height = TipHeight,
-                                          tip_chainwork = TipCW,
-                                          params = Params} = State) ->
+check_reorg(FirstHeader, Headers, #state{tip_chainwork = TipCW} = State) ->
     PrevHash = FirstHeader#block_header.prev_hash,
     case beamchain_db:get_block_index_by_hash(PrevHash) of
         {ok, #{height := ForkHeight, chainwork := ForkCW}} ->
@@ -717,29 +854,50 @@ check_reorg(FirstHeader, Headers, #state{tip_height = TipHeight,
             ForkCWInt = binary:decode_unsigned(ForkCW, big),
             IncomingCWInt = ForkCWInt + NewWork,
             TipCWInt = binary:decode_unsigned(TipCW, big),
-            case incoming_chain_wins(IncomingCWInt, TipCWInt) of
+            AnyInvalid = lists:any(fun(H) ->
+                beamchain_chainstate:is_known_invalid(
+                  beamchain_serialize:block_hash(H))
+            end, Headers),
+            case AnyInvalid orelse
+                 beamchain_chainstate:is_known_invalid(PrevHash) of
                 true ->
-                    %% Strictly more work. Accept reorg.
-                    logger:info("header_sync: fork at height ~B "
-                                "(depth ~B), incoming work ~B vs tip ~B",
-                                [ForkHeight,
-                                 TipHeight - ForkHeight,
-                                 IncomingCWInt, TipCWInt]),
-                    %% Mark orphaned blocks as invalid in the index
-                    mark_orphaned_blocks(ForkHeight + 1, TipHeight),
-                    %% Roll back state to the fork point
-                    State2 = rollback_to(ForkHeight, PrevHash, ForkCW,
-                                          Params, State),
-                    {reorg, ForkHeight, PrevHash, ForkCW, State2};
+                    %% Never reorg the header chain onto a branch we already
+                    %% found invalid (Core: a FAILED block is never a
+                    %% best-header candidate).
+                    cached_invalid;
+                false when length(Headers) < ?MAX_HEADERS_RESULTS ->
+                    check_reorg_work(IncomingCWInt, TipCWInt, ForkHeight,
+                                     PrevHash, ForkCW, known_fork, State);
                 false ->
-                    %% Less work - don't reorg
-                    logger:debug("header_sync: ignoring fork at ~B "
-                                 "(less work)", [ForkHeight]),
-                    no_reorg
+                    check_reorg_work(IncomingCWInt, TipCWInt, ForkHeight,
+                                     PrevHash, ForkCW, no_reorg, State)
             end;
         not_found ->
             %% prev_hash not in our index at all
             no_reorg
+    end.
+
+check_reorg_work(IncomingCWInt, TipCWInt, ForkHeight, PrevHash, ForkCW,
+                 LessWork, #state{tip_height = TipHeight, params = Params} = State) ->
+    case incoming_chain_wins(IncomingCWInt, TipCWInt) of
+        true ->
+            %% Strictly more work. Accept reorg.
+            logger:info("header_sync: fork at height ~B "
+                        "(depth ~B), incoming work ~B vs tip ~B",
+                        [ForkHeight,
+                         TipHeight - ForkHeight,
+                         IncomingCWInt, TipCWInt]),
+            %% Mark orphaned blocks as invalid in the index
+            mark_orphaned_blocks(ForkHeight + 1, TipHeight),
+            %% Roll back state to the fork point
+            State2 = rollback_to(ForkHeight, PrevHash, ForkCW,
+                                  Params, State),
+            {reorg, ForkHeight, PrevHash, ForkCW, State2};
+        false ->
+            %% Less work - don't reorg
+            logger:debug("header_sync: ignoring fork at ~B "
+                         "(less work)", [ForkHeight]),
+            LessWork
     end.
 
 %% Chain selection is by CHAINWORK ALONE.
@@ -877,6 +1035,9 @@ process_connecting_headers(Headers, Peer, State) ->
                                  State3#state.tip_height]),
                     check_sync_complete(State3)
             end;
+        {error, cached_invalid, State2} ->
+            %% Headers before the invalid one (if any) were stored.
+            cached_invalid_headers(Peer, State2);
         {error, Reason, State2} ->
             logger:warning("header_sync: validation failed: ~p", [Reason]),
             %% Misbehaving peer, try another
@@ -1116,6 +1277,12 @@ validate_one_header(Header, #state{tip_height = TipHeight,
         %% 1. prev_hash must connect to our tip
         Header#block_header.prev_hash =:= TipHash
             orelse throw(bad_prev_hash),
+
+        %% 1b. Never re-accept (and so never re-download) a header whose
+        %% block we already found consensus-invalid (Core AcceptBlockHeader:
+        %% BLOCK_FAILED_MASK -> BLOCK_CACHED_INVALID "duplicate-invalid").
+        beamchain_chainstate:is_known_invalid(BlockHash)
+            andalso throw(cached_invalid),
 
         %% 2. PoW: block hash <= target, target <= pow_limit
         beamchain_pow:check_pow(BlockHash, Header#block_header.bits, PowLimit)
