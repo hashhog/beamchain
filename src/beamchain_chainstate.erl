@@ -881,6 +881,9 @@ spend_utxo(Txid, Vout) ->
     case ets:lookup(?UTXO_CACHE, Key) of
         [{Key, Utxo}] ->
             ets:delete(?UTXO_CACHE, Key),
+            %% Test seam (inert in production: one persistent_term:get):
+            %% the F0 reproducer runs a concurrent reader here.
+            _ = beamchain_fault:fire(coins_spend_window, [Key]),
             IsFresh = ets:member(?UTXO_FRESH, Key),
             case IsFresh of
                 true ->

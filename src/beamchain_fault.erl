@@ -16,12 +16,14 @@
 %%%   direct_write_batch   -- the chainstate flush WriteBatch
 %%%   direct_store_undo    -- the per-block undo write
 %%%   direct_atomic_connect_writes -- block body + index WriteBatch
+%%%   coins_spend_window   -- inside spend_utxo/2, between the two coin-table
+%%%                           updates (F0 interleaving seam; return ignored)
 
 -export([fire/2, set/2, clear/1, clear_all/0]).
 
 -define(POINTS, [ecdsa_verify_nif, schnorr_verify_nif, verify_script,
                  direct_write_batch, direct_store_undo,
-                 direct_atomic_connect_writes]).
+                 direct_atomic_connect_writes, coins_spend_window]).
 
 -spec fire(atom(), [term()]) -> passthrough | term().
 fire(Point, Args) ->
