@@ -34,10 +34,6 @@
 -export([update_block_status/2, raise_block_status/3, raised_status/3,
          get_all_block_indexes/0]).
 
-%% One-shot repair of block-index status bits clobbered by the pre-e64a3f9
-%% block_sync "step 5" (see beamchain_chainstate status_repair_v1).
--export([repair_status_chunk/4]).
-
 %% Side-branch (off-active-chain) block index, hash-keyed.
 %% Active-chain block_index is keyed by HEIGHT and so structurally cannot
 %% hold two blocks at the same height — so a side-branch's block-index
@@ -458,26 +454,6 @@ raise_block_status(Hash, Level, Flags)
     non_neg_integer().
 raised_status(Old, Level, Flags) ->
     (Old band (bnot 7)) bor max(Old band 7, Level) bor (Flags band (bnot 7)).
-
-%% @doc One chunk of the active-chain status repair sweep.
-%%
-%% Walks the height-keyed index DOWNWARD from Height, requiring each entry's
-%% hash to equal Expected (the previous entry's prev_hash, starting from the
-%% tip hash), so only the active chain is touched. For an entry with no
-%% FAILED bits it ORs in HAVE_DATA iff cf_blocks holds the body, HAVE_UNDO iff
-%% cf_undo holds the undo record, and raises the validity level to
-%% VALID_SCRIPTS only when both are present (raised_status/3: never lowers).
-%% Stops after MaxEntries entries or MaxBodyBytes of body reads, writes the
-%% changed entries in one WriteBatch and returns where to resume:
-%%   {continue, NextHeight, NextExpected, Scanned, Changed}
-%%   {done, genesis | gap | {mismatch, Height}, Scanned, Changed}
--spec repair_status_chunk(non_neg_integer(), binary(), pos_integer(),
-                          pos_integer()) ->
-    {continue, non_neg_integer(), binary(), non_neg_integer(), non_neg_integer()} |
-    {done, term(), non_neg_integer(), non_neg_integer()}.
-repair_status_chunk(Height, Expected, MaxEntries, MaxBodyBytes) ->
-    gen_server:call(?SERVER, {repair_status_chunk, Height, Expected,
-                              MaxEntries, MaxBodyBytes}, infinity).
 
 %% @doc Get all block index entries (for finding descendants)
 -spec get_all_block_indexes() -> {ok, [map()]} | {error, term()}.
@@ -1452,16 +1428,6 @@ handle_call({raise_block_status, Hash, Level, Flags}, _From,
     end,
     {reply, Result, State};
 
-handle_call({repair_status_chunk, Height, Expected, MaxEntries, MaxBodyBytes},
-            _From, State) ->
-    {Reply, Ops} = repair_status_walk(Height, Expected, MaxEntries, MaxBodyBytes,
-                                      0, 0, [], State),
-    case Ops of
-        [] -> ok;
-        _ -> ok = rocksdb:write(State#state.db_handle, Ops, [])
-    end,
-    {reply, Reply, State};
-
 %% Get all block indexes (for finding descendants during invalidation)
 handle_call(get_all_block_indexes, _From,
             #state{db_handle = Db, cf_block_idx = CF} = State) ->
@@ -1607,67 +1573,6 @@ decode_utxo(<<Value:64/little, Height:32/little, CoinbaseFlag:8,
         is_coinbase = CoinbaseFlag =:= 1,
         height = Height
     }.
-
-%% Body of repair_status_chunk/4 (runs inside the db process).
-repair_status_walk(Height, Expected, EntriesLeft, BytesLeft, Scanned, Changed,
-                   Ops, State) when EntriesLeft =< 0; BytesLeft =< 0 ->
-    {{continue, Height, Expected, Scanned, Changed}, Ops};
-repair_status_walk(Height, Expected, EntriesLeft, BytesLeft, Scanned, Changed,
-                   Ops, #state{db_handle = Db, cf_block_idx = IdxCF,
-                               cf_blocks = BlocksCF, cf_undo = UndoCF} = State) ->
-    HeightKey = encode_height(Height),
-    case rocksdb:get(Db, IdxCF, HeightKey, []) of
-        not_found ->
-            {{done, gap, Scanned, Changed}, Ops};
-        {ok, Bin} ->
-            case decode_block_index_entry(Bin) of
-                #{hash := Expected, header := Header, chainwork := CW,
-                  status := Old, n_tx := NTx} ->
-                    {Op, BodyBytes} =
-                        case Old band (?BLOCK_FAILED_VALID bor ?BLOCK_FAILED_CHILD) of
-                            0 ->
-                                {HaveData, Bytes} =
-                                    case rocksdb:get(Db, BlocksCF, Expected, []) of
-                                        {ok, Body} -> {true, byte_size(Body)};
-                                        not_found -> {false, 0}
-                                    end,
-                                HaveUndo = case rocksdb:get(Db, UndoCF, Expected, []) of
-                                    {ok, _} -> true;
-                                    not_found -> false
-                                end,
-                                Flags = (case HaveData of true -> ?BLOCK_HAVE_DATA; false -> 0 end)
-                                    bor (case HaveUndo of true -> ?BLOCK_HAVE_UNDO; false -> 0 end),
-                                Level = case HaveData andalso HaveUndo of
-                                    true -> ?BLOCK_VALID_SCRIPTS;
-                                    false -> 0
-                                end,
-                                case raised_status(Old, Level, Flags) of
-                                    Old -> {none, Bytes};
-                                    New -> {{put, IdxCF, HeightKey,
-                                             encode_block_index_entry(
-                                               Expected, Header, CW, New, NTx)},
-                                            Bytes}
-                                end;
-                            _ ->
-                                {none, 0}
-                        end,
-                    {Ops2, Changed2} = case Op of
-                        none -> {Ops, Changed};
-                        _ -> {[Op | Ops], Changed + 1}
-                    end,
-                    case Height of
-                        0 ->
-                            {{done, genesis, Scanned + 1, Changed2}, Ops2};
-                        _ ->
-                            repair_status_walk(
-                              Height - 1, Header#block_header.prev_hash,
-                              EntriesLeft - 1, BytesLeft - BodyBytes,
-                              Scanned + 1, Changed2, Ops2, State)
-                    end;
-                _ ->
-                    {{done, {mismatch, Height}, Scanned, Changed}, Ops}
-            end
-    end.
 
 %% @doc Encode a block index entry.
 %% Format: Hash (32) | HeaderBin (80) | CWLen (2) | Chainwork (variable) | Status (4) | NTx (4)

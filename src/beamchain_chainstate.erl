@@ -1041,89 +1041,7 @@ init_chainstate(Role, SnapshotData) ->
         _ ->
             State0
     end,
-    maybe_schedule_status_repair(Role, TipHash),
     {ok, State1}.
-
-%%% -------------------------------------------------------------------
-%%% status_repair_v1 — one-shot boot repair of block-index status bits.
-%%%
-%%% Before e64a3f9, block_sync's post-connect step overwrote the status of
-%%% every block connected over P2P with a plain 2, clearing HAVE_DATA,
-%%% HAVE_UNDO and the VALID_SCRIPTS level that the connect had just stored
-%%% (receipts/beamchain-status-bit-2026-10-04.md). The fix stops new damage;
-%%% this sweep repairs the entries already on disk, once, guarded by a meta
-%%% marker key.
-%%%
-%%% Scope: the ACTIVE chain only — a walk down from the tip following
-%%% prev_hash, so an entry is touched only if it is the tip's ancestor. For
-%%% each entry with no FAILED bits: OR in HAVE_DATA iff the body is stored,
-%%% HAVE_UNDO iff the undo record is stored, raise validity to VALID_SCRIPTS
-%%% only when both are present. NOTHING is ever lowered or cleared
-%%% (beamchain_db:raised_status/3). Snapshot-base / pre-base entries and
-%%% pruned blocks have no body, so they correctly stay without HAVE_DATA.
-%%%
-%%% It runs in this process in bounded chunks driven by self-messages AFTER
-%%% init returns: boot and RPC are not delayed, connects interleave between
-%%% chunks, and because every connect/disconnect is executed by this same
-%%% process a chunk can never interleave with a write to the entries it is
-%%% rewriting. A reorg between chunks that reaches below the cursor shows up
-%%% as a hash mismatch: the sweep stops WITHOUT setting the marker and runs
-%%% again on the next boot (it is idempotent).
-%%% -------------------------------------------------------------------
--define(STATUS_REPAIR_KEY, <<"status_repair_v1">>).
--define(STATUS_REPAIR_CHUNK_ENTRIES, 2000).
--define(STATUS_REPAIR_CHUNK_BYTES, (256 * 1024 * 1024)).
-
-maybe_schedule_status_repair(main, undefined) ->
-    %% Fresh datadir: every entry will be written by fixed code.
-    _ = beamchain_db:put_meta(?STATUS_REPAIR_KEY, <<"fresh">>),
-    ok;
-maybe_schedule_status_repair(main, _TipHash) ->
-    case beamchain_db:get_meta(?STATUS_REPAIR_KEY) of
-        {ok, _} -> ok;
-        not_found -> self() ! {status_repair_v1, start}, ok
-    end;
-maybe_schedule_status_repair(_Role, _TipHash) ->
-    ok.
-
-status_repair_step(Height, Expected, Scanned0, Changed0, T0) ->
-    case beamchain_db:repair_status_chunk(Height, Expected,
-                                          ?STATUS_REPAIR_CHUNK_ENTRIES,
-                                          ?STATUS_REPAIR_CHUNK_BYTES) of
-        {continue, NextH, NextExpected, S, C} ->
-            Scanned = Scanned0 + S,
-            Changed = Changed0 + C,
-            case Scanned div 100000 =/= Scanned0 div 100000 of
-                true ->
-                    logger:info("chainstate: status_repair_v1 progress: "
-                                "scanned ~B, changed ~B, at height ~B",
-                                [Scanned, Changed, NextH]);
-                false ->
-                    ok
-            end,
-            self() ! {status_repair_v1, NextH, NextExpected, Scanned, Changed, T0},
-            ok;
-        {done, Stop, S, C} ->
-            Scanned = Scanned0 + S,
-            Changed = Changed0 + C,
-            Ms = erlang:monotonic_time(millisecond) - T0,
-            case Stop of
-                {mismatch, H} ->
-                    logger:warning("chainstate: status_repair_v1 stopped at "
-                                   "height ~B (active chain changed under the "
-                                   "sweep); scanned ~B, changed ~B in ~B ms; "
-                                   "will rerun on next boot",
-                                   [H, Scanned, Changed, Ms]);
-                _ ->
-                    Summary = iolist_to_binary(
-                                io_lib:format("done scanned=~B changed=~B stop=~p ms=~B",
-                                              [Scanned, Changed, Stop, Ms])),
-                    ok = beamchain_db:put_meta(?STATUS_REPAIR_KEY, Summary),
-                    logger:info("chainstate: status_repair_v1 complete: "
-                                "scanned ~B, changed ~B, stopped at ~p, ~B ms",
-                                [Scanned, Changed, Stop, Ms])
-            end
-    end.
 
 %% roll_forward_from_disk/1 — re-connect block bodies persisted ahead of the
 %% loaded (flushed) chain tip, one height at a time, through do_connect_block.
@@ -1399,17 +1317,6 @@ handle_call(_Request, _From, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info({status_repair_v1, start},
-            #state{tip_hash = TipHash, tip_height = TipHeight} = State)
-  when is_binary(TipHash), TipHeight >= 0 ->
-    logger:info("chainstate: status_repair_v1 starting at tip height ~B",
-                [TipHeight]),
-    T0 = erlang:monotonic_time(millisecond),
-    ok = status_repair_step(TipHeight, TipHash, 0, 0, T0),
-    {noreply, State};
-handle_info({status_repair_v1, Height, Expected, Scanned, Changed, T0}, State) ->
-    ok = status_repair_step(Height, Expected, Scanned, Changed, T0),
-    {noreply, State};
 handle_info(_Info, State) ->
     {noreply, State}.
 
