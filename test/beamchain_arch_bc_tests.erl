@@ -295,6 +295,29 @@ bc1_test_() ->
                stop(), restore_env(Saved), os:cmd("rm -rf " ++ Dir)
            end
        end},
+      {"first_utxo_of_txid: prefix seek finds a tx's outputs, honours Keep, no neighbour leak",
+       fun() ->
+           with_db([], fun(_Dir) ->
+               A = <<16#aa:256>>, B = <<16#ab:256>>, Lo = <<16#a9:256>>,
+               U = fun(V) -> #utxo{value = V, script_pubkey = <<16#51>>,
+                                   is_coinbase = false, height = 7} end,
+               ok = beamchain_db:store_utxo(A, 1, U(101)),
+               ok = beamchain_db:store_utxo(A, 3, U(103)),
+               ok = beamchain_db:store_utxo(B, 0, U(200)),
+               ok = beamchain_db:store_utxo(Lo, 9, U(9)),
+               All = fun(_) -> true end,
+               ?assertMatch({ok, #utxo{value = 101, height = 7}},
+                            beamchain_db:first_utxo_of_txid(A, All)),
+               ?assertMatch({ok, #utxo{value = 103}},
+                            beamchain_db:first_utxo_of_txid(A, fun(V) -> V =/= 1 end)),
+               ?assertEqual(not_found,
+                            beamchain_db:first_utxo_of_txid(A, fun(_) -> false end)),
+               ?assertEqual(not_found,
+                            beamchain_db:first_utxo_of_txid(<<16#ac:256>>, All)),
+               ?assertMatch({ok, #utxo{value = 200}},
+                            beamchain_db:first_utxo_of_txid(B, All))
+           end)
+       end},
       {"--txindex flag overrides an inherited BEAMCHAIN_TXINDEX=0",
        fun() ->
            Saved = save_env(),

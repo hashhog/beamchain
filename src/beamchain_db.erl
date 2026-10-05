@@ -73,6 +73,7 @@
 %% Transaction index
 -export([store_tx_index/4, get_tx_location/1]).
 -export([txindex_status/0]).
+-export([first_utxo_of_txid/2]).
 
 %% Undo data
 -export([store_undo/2, get_undo/1, delete_undo/1]).
@@ -224,6 +225,30 @@ get_utxo(Txid, Vout) when byte_size(Txid) =:= 32 ->
         {ok, Bin} -> {ok, decode_utxo(Bin)};
         not_found -> not_found
     end.
+
+%% @doc First on-disk UTXO of Txid (lowest vout) whose vout passes Keep,
+%% via one prefix seek on the chainstate CF (keys are Txid||Vout:32/big).
+%% Direct read through the persistent_term handle — no gen_server hop.
+-spec first_utxo_of_txid(binary(), fun((non_neg_integer()) -> boolean())) ->
+    {ok, #utxo{}} | not_found.
+first_utxo_of_txid(Txid, Keep) when byte_size(Txid) =:= 32 ->
+    Db = persistent_term:get(beamchain_db_handle),
+    CF = persistent_term:get(beamchain_cf_chainstate),
+    {ok, It} = rocksdb:iterator(Db, CF, []),
+    try first_utxo_of_txid(rocksdb:iterator_move(It, {seek, <<Txid/binary, 0:32>>}),
+                           It, Txid, Keep)
+    after
+        rocksdb:iterator_close(It)
+    end.
+
+first_utxo_of_txid({ok, <<T:32/binary, Vout:32/big>>, Bin}, It, Txid, Keep)
+  when T =:= Txid ->
+    case Keep(Vout) of
+        true -> {ok, decode_utxo(Bin)};
+        false -> first_utxo_of_txid(rocksdb:iterator_move(It, next), It, Txid, Keep)
+    end;
+first_utxo_of_txid(_, _It, _Txid, _Keep) ->
+    not_found.
 
 %% @doc Store a UTXO
 -spec store_utxo(binary(), non_neg_integer(), #utxo{}) -> ok.

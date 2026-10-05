@@ -22,6 +22,7 @@
 
 %% UTXO cache — module functions (direct ETS access, no gen_server call)
 -export([get_utxo/2, has_utxo/2, add_utxo/3, add_utxo_fresh/3, spend_utxo/2]).
+-export([access_by_txid/1]).
 
 %% Predicate exported for use by ops tooling (scrubunspendable RPC) and
 %% the snapshot path. Mirrors Core's CScript::IsUnspendable().
@@ -652,6 +653,29 @@ get_utxo(Txid, Vout) ->
                             not_found
                     end
             end
+    end.
+
+%% @doc Core coins.cpp AccessByTxid: some unspent output of Txid in the
+%% coins view (ETS cache over RocksDB), or not_found. Used by
+%% gettxoutproof without a blockhash when -txindex is off. All outputs of a
+%% tx share its height, so any one names the block. Cost: one RocksDB prefix
+%% seek (outpoint keys are Txid||Vout, so a tx's outputs are adjacent) plus
+%% ETS probes up to MAX_OUTPUTS_PER_BLOCK — never that many disk gets.
+-spec access_by_txid(binary()) -> {ok, #utxo{}} | not_found.
+access_by_txid(Txid) when byte_size(Txid) =:= 32 ->
+    NotSpent = fun(V) -> not ets:member(?UTXO_SPENT, {Txid, V}) end,
+    case beamchain_db:first_utxo_of_txid(Txid, NotSpent) of
+        {ok, U} -> {ok, U};
+        not_found -> access_by_txid_cache(Txid, 0)
+    end.
+
+%% Core MAX_OUTPUTS_PER_BLOCK = MAX_BLOCK_WEIGHT / MIN_TRANSACTION_OUTPUT_WEIGHT.
+access_by_txid_cache(_Txid, N) when N >= 4000000 div 36 ->
+    not_found;
+access_by_txid_cache(Txid, N) ->
+    case ets:lookup(?UTXO_CACHE, {Txid, N}) of
+        [{_, Utxo}] -> {ok, Utxo};
+        [] -> access_by_txid_cache(Txid, N + 1)
     end.
 
 %% @doc Check if a UTXO exists. Checks ETS first.

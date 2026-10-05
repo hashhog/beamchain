@@ -9267,16 +9267,13 @@ txindex_lookup(Txid) ->
         false -> not_found
     end.
 
-%% Core MAX_OUTPUTS_PER_BLOCK = MAX_BLOCK_WEIGHT / MIN_TRANSACTION_OUTPUT_WEIGHT
-%% (consensus/consensus.h, coins.cpp AccessByTxid).
--define(MAX_OUTPUTS_PER_BLOCK, (4000000 div 36)).
-
-%% Core rpc/txoutproof.cpp: for each requested txid, the first unspent output
-%% found by AccessByTxid names the block (by the coin's height).
+%% Core rpc/txoutproof.cpp: for each requested txid, an unspent output found
+%% by AccessByTxid (beamchain_chainstate:access_by_txid/1) names the block,
+%% by the coin's height.
 txoutproof_block_from_utxo([]) ->
     not_found;
 txoutproof_block_from_utxo([Txid | Rest]) ->
-    case access_by_txid(Txid, 0) of
+    case beamchain_chainstate:access_by_txid(Txid) of
         {ok, #utxo{height = H}} ->
             case beamchain_db:get_block_index(H) of
                 {ok, #{hash := BH}} -> {ok, BH};
@@ -9284,14 +9281,6 @@ txoutproof_block_from_utxo([Txid | Rest]) ->
             end;
         not_found ->
             txoutproof_block_from_utxo(Rest)
-    end.
-
-access_by_txid(_Txid, N) when N >= ?MAX_OUTPUTS_PER_BLOCK ->
-    not_found;
-access_by_txid(Txid, N) ->
-    case beamchain_chainstate:get_utxo(Txid, N) of
-        {ok, U} -> {ok, U};
-        _ -> access_by_txid(Txid, N + 1)
     end.
 
 %% Find a transaction in the mempool or on-chain.
