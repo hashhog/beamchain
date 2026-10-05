@@ -56,7 +56,8 @@
 -export([do_handle_cmpctblock/5, unsolicited_connect_penalty/1, test_new_state/0,
          is_consensus_verdict/1,
          test_state/1, test_get/2,
-         admit_downloaded/3]).
+         admit_downloaded/3,
+         validate_and_connect/3]).
 -endif.
 
 -define(SERVER, ?MODULE).
@@ -233,6 +234,7 @@ test_state(Overrides) ->
         (peers, V, S)            -> S#state{peers = V};
         (stuck_ticks, V, S)      -> S#state{stuck_ticks = V};
         (block_source, V, S)     -> S#state{block_source = V};
+        (params, V, S)           -> S#state{params = V};
         (peer_stats, V, S) ->
             S#state{peer_stats = maps:map(
                 fun(_Pid, Count) ->
@@ -1590,19 +1592,26 @@ validate_and_connect(Height, Block,
                 %% re-wedging block_sync at h491872 (zero forward progress).
                 %% Removed: the atomic write already durably holds the index.
 
-                %% 5. Update block_index status to fully validated (status=2).
-                %% direct_atomic_connect_writes already stored the entry with
-                %% the correct NTx count; re-read and preserve it so we don't
-                %% clobber it with the default-zero written by
-                %% store_block_index/5.
-                case beamchain_db:get_block_index(Height) of
-                    {ok, #{hash := BH, header := Hdr, chainwork := CW, n_tx := NTx}} ->
-                        beamchain_db:store_block_index(Height, BH, Hdr, CW, 2, NTx);
-                    {ok, #{hash := BH, header := Hdr, chainwork := CW}} ->
-                        beamchain_db:store_block_index(Height, BH, Hdr, CW, 2);
-                    not_found ->
-                        ok
-                end
+                %% 5. Block-index status: ALREADY final — do not write it.
+                %%
+                %% This step used to re-read the height-keyed entry and
+                %% store it back with a plain status of 2 (BLOCK_VALID_TREE).
+                %% direct_atomic_connect_writes had just stored
+                %% VALID_SCRIPTS|HAVE_DATA|HAVE_UNDO (29) in the same
+                %% WriteBatch as the body (beamchain_chainstate.erl, FIX-33),
+                %% so the "update" was a DOWNGRADE that cleared HAVE_DATA,
+                %% HAVE_UNDO and the scripts validity level on every block
+                %% connected through this path — all of IBD and every block
+                %% at the tip. find_best_valid_chain filters on HAVE_DATA, so
+                %% reconsiderblock on a P2P-synced node left the tip stuck
+                %% below the reconsidered block.
+                %%
+                %% Core raises nStatus with RaiseValidity / `|= BLOCK_HAVE_*`
+                %% (chain.h, validation.cpp ConnectBlock / ReceivedBlock-
+                %% Transactions) and never assigns over the have-bits. Both
+                %% `active` and `reorg` funnel through do_connect_block_inner,
+                %% whose atomic write is the single, correct writer here.
+                ok
         end,
 
         %% 6. Log checkpoint every UTXO_FLUSH_INTERVAL blocks

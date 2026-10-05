@@ -39,6 +39,7 @@
 -ifdef(TEST).
 -export([build_block_locator/2, test_state/1, test_get/2]).
 -export([incoming_chain_wins/2,
+         mark_orphaned_blocks/2,
          classify_deep_fork/4,
          select_next_probe_peer/2]).
 -endif.
@@ -938,8 +939,13 @@ mark_orphaned_blocks(StartHeight, EndHeight) when StartHeight > EndHeight ->
 mark_orphaned_blocks(Height, EndHeight) ->
     case beamchain_db:get_block_index(Height) of
         {ok, #{hash := Hash}} ->
-            %% Mark as failed validation (orphaned)
-            beamchain_db:update_block_status(Hash, 32),
+            %% Mark as failed validation (orphaned). OR the FAILED_VALID bit
+            %% in (Core RaiseValidity / `nStatus |= BLOCK_FAILED_VALID`); the
+            %% old update_block_status(Hash, 32) ASSIGNED 32, wiping
+            %% HAVE_DATA, HAVE_UNDO and the validity level, so a later
+            %% reconsiderblock could never re-activate the block (it no
+            %% longer "had data") even though its body and undo are on disk.
+            _ = beamchain_db:raise_block_status(Hash, 0, 32),
             mark_orphaned_blocks(Height + 1, EndHeight);
         not_found ->
             ok

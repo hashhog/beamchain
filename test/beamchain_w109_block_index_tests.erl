@@ -137,9 +137,8 @@ w109_block_index_test_() ->
      fun teardown/1,
      fun(_Ctx) ->
          [
-          %% BUG-1: BLOCK_HAVE_DATA / BLOCK_HAVE_UNDO not set after ConnectBlock
-          {"BUG-1: status after connect_block lacks BLOCK_HAVE_DATA|BLOCK_HAVE_UNDO",
-           fun bug1_status_missing_have_data_have_undo/0},
+          %% BUG-1 (FIX-33) is driven through the real connect path in
+          %% w109_bug1_connect_test_/0 below, with its own chainstate fixture.
 
           %% BUG-4: header sync writes status=1 not status=2
           {"BUG-4: header index stored with status=1 instead of BLOCK_VALID_TREE(2)",
@@ -257,33 +256,95 @@ store_dummy_index(Height, Hash, Status) ->
 %%% BUG TESTS
 %%%===================================================================
 
-%% BUG-1 FIXED (FIX-33): After do_connect_block the status stored in the
-%% block index must include BLOCK_HAVE_DATA (8) | BLOCK_HAVE_UNDO (16) |
-%% BLOCK_VALID_SCRIPTS (5) = 29.  beamchain_chainstate:do_connect_block_inner
-%% now passes ConnectStatus = ?BLOCK_VALID_SCRIPTS bor ?BLOCK_HAVE_DATA bor
-%% ?BLOCK_HAVE_UNDO to direct_atomic_connect_writes (FIX-33).
-bug1_status_missing_have_data_have_undo() ->
-    Hash = fake_hash(16#BEEF01),
-    Hdr  = fake_header(fake_hash(0), 999),
-    CW   = <<1:256>>,
-    %% Simulate what the fixed direct_atomic_connect_writes now stores:
-    %% status = BLOCK_VALID_SCRIPTS | BLOCK_HAVE_DATA | BLOCK_HAVE_UNDO = 29
-    ConnectStatus = ?BLOCK_VALID_SCRIPTS bor ?BLOCK_HAVE_DATA bor ?BLOCK_HAVE_UNDO,
-    ok = beamchain_db:store_block_index(1, Hash, Hdr, CW, ConnectStatus, 1),
-    {ok, #{status := Status}} = beamchain_db:get_block_index_by_hash(Hash),
-    %% FIX VERIFIED: status must now contain both HAVE_DATA and HAVE_UNDO bits.
+%% BUG-1 FIXED (FIX-33): after a block is connected, its block-index status
+%% must include BLOCK_HAVE_DATA (8) | BLOCK_HAVE_UNDO (16) |
+%% BLOCK_VALID_SCRIPTS (5) = 29.
+%%
+%% This used to store 29 by hand and read 29 back, so it never touched the
+%% connect path — and it stayed green while block_sync's post-connect step
+%% overwrote every P2P-connected entry with 2
+%% (receipts/beamchain-status-bit-2026-10-04.md). It now DRIVES the connect:
+%% the block goes through beamchain_block_sync:validate_and_connect/3 (the
+%% P2P path, which is where the overwrite lived) against a real
+%% beamchain_db + beamchain_chainstate; only script/consensus validation is
+%% stubbed because the block is a dummy.
+w109_bug1_connect_test_() ->
+    {setup, fun bug1_setup/0, fun bug1_teardown/1,
+     fun(_) -> {timeout, 60, fun bug1_status_after_p2p_connect/0} end}.
+
+bug1_setup() ->
+    TmpDir = filename:join(["/tmp",
+        "beamchain_w109_bug1_test_" ++
+        integer_to_list(erlang:unique_integer([positive]))]),
+    ok = filelib:ensure_dir(filename:join(TmpDir, "dummy")),
+    application:ensure_all_started(crypto),
+    application:ensure_all_started(rocksdb),
+    application:set_env(beamchain, datadir, TmpDir),
+    application:set_env(beamchain, network, regtest),
+    catch gen_server:stop(beamchain_chainstate),
+    catch beamchain_db:stop(),
+    catch gen_server:stop(beamchain_config),
+    bug1_delete_ets(),
+    {ok, _} = beamchain_config:start_link(),
+    {ok, _} = beamchain_db:start_link(),
+    {module, beamchain_validation} = code:ensure_loaded(beamchain_validation),
+    ok = meck:new(beamchain_validation, [no_link, passthrough]),
+    ok = meck:expect(beamchain_validation, connect_block,
+                     fun(_Block, _Height, _Prev, _Params) -> ok end),
+    ok = meck:expect(beamchain_validation, check_block,
+                     fun(_Block, _Params) -> ok end),
+    {ok, Pid} = beamchain_chainstate:start_link(),
+    unlink(Pid),
+    TmpDir.
+
+bug1_teardown(TmpDir) ->
+    catch gen_server:stop(beamchain_chainstate),
+    catch meck:unload(beamchain_validation),
+    catch beamchain_db:stop(),
+    catch gen_server:stop(beamchain_config),
+    bug1_delete_ets(),
+    os:cmd("rm -rf " ++ TmpDir),
+    ok.
+
+bug1_delete_ets() ->
+    lists:foreach(fun(T) ->
+                      case ets:info(T) of
+                          undefined -> ok;
+                          _ -> ets:delete(T)
+                      end
+                  end,
+                  [beamchain_utxo_cache, beamchain_utxo_dirty,
+                   beamchain_utxo_fresh, beamchain_utxo_spent,
+                   beamchain_chain_meta]).
+
+bug1_status_after_p2p_connect() ->
+    {ok, {GenesisHash, 0}} = beamchain_chainstate:get_tip(),
+    Header = (fake_header(GenesisHash, 1))#block_header{version = 4},
+    Coinbase = #transaction{
+        version = 1,
+        inputs = [#tx_in{prev_out = #outpoint{hash = <<0:256>>,
+                                              index = 16#ffffffff},
+                         script_sig = <<1:32/little>>,
+                         sequence = 16#ffffffff, witness = []}],
+        outputs = [#tx_out{value = 5000000000, script_pubkey = <<16#51>>}],
+        locktime = 0},
+    Hash = beamchain_serialize:block_hash(Header),
+    Block = #block{header = Header, transactions = [Coinbase], hash = Hash},
+    State = beamchain_block_sync:test_state(
+              #{params => beamchain_chain_params:params(regtest)}),
+    {ok, active, _} = beamchain_block_sync:validate_and_connect(1, Block, State),
+    {ok, #{hash := Hash, status := Status, n_tx := NTx}} =
+        beamchain_db:get_block_index(1),
     Expected = ?BLOCK_VALID_SCRIPTS bor ?BLOCK_HAVE_DATA bor ?BLOCK_HAVE_UNDO,
     ?assertEqual(Expected, Status,
         "FIX-33: status must include BLOCK_HAVE_DATA|BLOCK_HAVE_UNDO after connect_block"),
-    %% Confirm HAVE_DATA bit individually
     ?assertNotEqual(0, Status band ?BLOCK_HAVE_DATA,
         "FIX-33: BLOCK_HAVE_DATA (8) must be set"),
-    %% Confirm HAVE_UNDO bit individually
     ?assertNotEqual(0, Status band ?BLOCK_HAVE_UNDO,
         "FIX-33: BLOCK_HAVE_UNDO (16) must be set"),
-    %% Confirm the validity level is still BLOCK_VALID_SCRIPTS (5)
     ?assertEqual(?BLOCK_VALID_SCRIPTS, Status band 7,
-        "FIX-33: validity level must remain BLOCK_VALID_SCRIPTS (5)").
+        "FIX-33: validity level must remain BLOCK_VALID_SCRIPTS (5)"),
+    ?assertEqual(1, NTx).
 
 %% BUG-4: header_sync stores status=1 (BLOCK_VALID_HEADER).  Core's
 %% AddToBlockIndex stores BLOCK_VALID_TREE (2) for any header whose parent

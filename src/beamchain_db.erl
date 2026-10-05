@@ -31,7 +31,8 @@
 %% Block index
 -export([store_block_index/5, store_block_index/6, get_block_index/1, get_block_index/2,
          get_block_index_by_hash/1]).
--export([update_block_status/2, get_all_block_indexes/0]).
+-export([update_block_status/2, raise_block_status/3, raised_status/3,
+         get_all_block_indexes/0]).
 
 %% Side-branch (off-active-chain) block index, hash-keyed.
 %% Active-chain block_index is keyed by HEIGHT and so structurally cannot
@@ -433,6 +434,26 @@ get_block_index_by_hash(Hash) when byte_size(Hash) =:= 32 ->
 -spec update_block_status(binary(), non_neg_integer()) -> ok | {error, term()}.
 update_block_status(Hash, NewStatus) when byte_size(Hash) =:= 32 ->
     gen_server:call(?SERVER, {update_block_status, Hash, NewStatus}, 30000).
+
+%% @doc Raise a block-index status without clearing anything (Core
+%% CBlockIndex::RaiseValidity plus `nStatus |= Flags`, chain.h). The validity
+%% level (low 3 bits) becomes max(current, Level); Flags (HAVE_DATA,
+%% HAVE_UNDO, FAILED_*) are OR-ed in. Read-modify-write happens inside the db
+%% process, so it cannot interleave with another gen_server status write.
+%% update_block_status/2 ASSIGNS and is kept for reconsiderblock, which must
+%% clear FAILED bits; every other status write should use this.
+-spec raise_block_status(binary(), 0..7, non_neg_integer()) ->
+    ok | {error, term()}.
+raise_block_status(Hash, Level, Flags)
+  when byte_size(Hash) =:= 32, Level >= 0, Level =< 7, Flags >= 0 ->
+    gen_server:call(?SERVER, {raise_block_status, Hash, Level, Flags}, 30000).
+
+%% @doc Pure status arithmetic behind raise_block_status/3 (exported for
+%% the boot repair sweep and tests). Never lowers a bit or the level.
+-spec raised_status(non_neg_integer(), 0..7, non_neg_integer()) ->
+    non_neg_integer().
+raised_status(Old, Level, Flags) ->
+    (Old band (bnot 7)) bor max(Old band 7, Level) bor (Flags band (bnot 7)).
 
 %% @doc Get all block index entries (for finding descendants)
 -spec get_all_block_indexes() -> {ok, [map()]} | {error, term()}.
@@ -1366,6 +1387,37 @@ handle_call({update_block_status, Hash, NewStatus}, _From,
                         _ ->
                             %% Stale reverse key: the height now belongs to
                             %% a different block — never rewrite ITS status.
+                            {error, block_index_stale}
+                    end;
+                not_found ->
+                    {error, block_index_not_found}
+            end;
+        not_found ->
+            {error, block_not_found}
+    end,
+    {reply, Result, State};
+
+%% Raise-only status write (RaiseValidity / |= flags). See raise_block_status/3.
+handle_call({raise_block_status, Hash, Level, Flags}, _From,
+            #state{db_handle = Db, cf_block_idx = CF, cf_meta = MetaCF} = State) ->
+    HashKey = <<"blkidx:", Hash/binary>>,
+    Result = case rocksdb:get(Db, MetaCF, HashKey, []) of
+        {ok, HeightKey} ->
+            case rocksdb:get(Db, CF, HeightKey, []) of
+                {ok, Bin} ->
+                    case decode_block_index_entry(Bin) of
+                        #{hash := Hash, header := Header, chainwork := Chainwork,
+                          status := Old, n_tx := NTx} ->
+                            case raised_status(Old, Level, Flags) of
+                                Old ->
+                                    ok;
+                                New ->
+                                    rocksdb:put(Db, CF, HeightKey,
+                                                encode_block_index_entry(
+                                                  Hash, Header, Chainwork, New, NTx),
+                                                [])
+                            end;
+                        _ ->
                             {error, block_index_stale}
                     end;
                 not_found ->
