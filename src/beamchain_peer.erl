@@ -27,6 +27,7 @@
 %% Advertised service bitset (single source of truth for both the wire
 %% version message and getnetworkinfo localservices).
 -export([advertised_services/0]).
+-export([serve_request/3, send_timeout_opts/0]).
 
 %% gen_statem callbacks
 -export([callback_mode/0, init/1, terminate/3]).
@@ -52,6 +53,9 @@
 -define(PING_INTERVAL, 120000).        %% 2 minutes
 -define(PONG_TIMEOUT, 1200000).        %% 20 minutes
 -define(INACTIVITY_TIMEOUT, 1800000).  %% 30 minutes
+%% A blocked send (peer not reading, kernel + port buffers full) gives up
+%% after this long; the socket is closed and the peer process stops.
+-define(PEER_SEND_TIMEOUT_MS, 30000).
 
 -define(BAN_SCORE, 100).
 
@@ -243,6 +247,29 @@ accept(Socket, Address, Handler) ->
 send_message(Pid, {Command, Payload}) ->
     gen_statem:cast(Pid, {send, Command, Payload}).
 
+%% @doc Serve a peer's data request (getdata, getheaders, mempool,
+%% getcf*) inside THAT peer's own process. The peer manager used to run
+%% these itself: a block read (beamchain_db gen_server, up to 30 s) or a
+%% 2000-header walk then blocked inbound accepts (check_inbound 5 s
+%% timeouts: 13 'acceptor died' on 2026-10-05) and every other peer.
+%% Core serves getdata per peer (ProcessGetData), one request at a time.
+-spec serve_request(pid(), atom(), binary()) -> ok.
+serve_request(Pid, Command, Payload) ->
+    gen_statem:cast(Pid, {serve, Command, Payload}).
+
+%% @doc Socket send options: a send that cannot make progress for
+%% peer_send_timeout_ms (default 30 s) fails with {error, timeout} and the
+%% socket is closed, so a peer that stops reading cannot park its process
+%% in gen_tcp:send forever while its mailbox grows (Core: such a peer is
+%% dropped by the send-side InactivityCheck / never blocks the node).
+-spec send_timeout_opts() -> [gen_tcp:option()].
+send_timeout_opts() ->
+    T = case application:get_env(beamchain, peer_send_timeout_ms) of
+            {ok, V} when is_integer(V), V > 0 -> V;
+            _ -> ?PEER_SEND_TIMEOUT_MS
+        end,
+    [{send_timeout, T}, {send_timeout_close, true}].
+
 %% @doc Add misbehavior points. Peer is banned at >= 100.
 -spec add_misbehavior(pid(), non_neg_integer()) -> ok.
 add_misbehavior(Pid, Score) ->
@@ -414,7 +441,8 @@ init({outbound, {Host, Port} = Addr, Handler, _Opts}) when is_list(Host); is_bin
     case beamchain_proxy:connect(HostStr, Port, ConnectOpts) of
         {ok, Socket} ->
             inet:setopts(Socket, [{active, once},
-                                   {recbuf, 262144}, {sndbuf, 262144}]),
+                                   {recbuf, 262144}, {sndbuf, 262144}
+                                   | send_timeout_opts()]),
             Data2 = Data#peer_data{
                 socket = Socket,
                 connected_at = erlang:system_time(millisecond)
@@ -444,8 +472,9 @@ init({outbound, {IP, Port} = Addr, Handler, _Opts}) ->
     },
     case gen_tcp:connect(IP, Port,
                          [binary, {active, false}, {packet, raw},
-                          {nodelay, true}, {send_timeout, 5000},
-                          {recbuf, 262144}, {sndbuf, 262144}],
+                          {nodelay, true},
+                          {recbuf, 262144}, {sndbuf, 262144}
+                          | send_timeout_opts()],
                          ?CONNECT_TIMEOUT) of
         {ok, Socket} ->
             inet:setopts(Socket, [{active, once}]),
@@ -468,7 +497,11 @@ init({inbound, Socket, Addr, Handler}) ->
     %% the socket's controlling process is still the peer manager at this
     %% point.  We wait for a socket_owner_transferred message (sent by
     %% the manager after gen_tcp:controlling_process/2) before activating.
-    inet:setopts(Socket, [{recbuf, 262144}, {sndbuf, 262144}]),
+    %% send_timeout(_close): inbound sockets inherited the listener's
+    %% options, which had none -- a non-reading inbound peer parked this
+    %% process in gen_tcp:send forever and its mailbox grew without bound.
+    inet:setopts(Socket, [{recbuf, 262144}, {sndbuf, 262144}
+                          | send_timeout_opts()]),
     Data = #peer_data{
         socket = Socket,
         address = Addr,
@@ -682,6 +715,17 @@ ready(info, {'DOWN', Ref, process, _, _}, #peer_data{handler_mon = Ref}) ->
 ready(cast, {send, Command, PayloadData}, Data) ->
     Data2 = do_send_msg(Command, PayloadData, Data),
     {keep_state, Data2};
+
+ready(cast, {serve, Command, Payload}, Data) ->
+    %% Runs in this peer's process (see serve_request/3). A slow read or a
+    %% failure here only delays/affects this peer.
+    try beamchain_peer_manager:serve_peer_request(self(), Command, Payload)
+    catch
+        Class:Why ->
+            logger:warning("peer ~p: serving ~p failed: ~p:~p",
+                           [Data#peer_data.address, Command, Class, Why])
+    end,
+    keep_state_and_data;
 
 ready(cast, disconnect, Data) ->
     Data#peer_data.handler ! {peer_disconnected, self(), requested},
@@ -1934,7 +1978,7 @@ do_send_raw(Command, Payload, #peer_data{v2_phase = ready,
                        "peer ~p v2 send ~p failed: ~p — leaving cipher "
                        "untouched; closing on next tcp_closed",
                        [Data#peer_data.address, Command, Reason]),
-            Data
+            maybe_stop_on_send_timeout(Reason, Data)
     end;
 do_send_raw(Command, Payload, #peer_data{socket = Socket, magic = Magic} = Data) ->
     Msg = beamchain_p2p_msg:encode_msg(Magic, Command, Payload),
@@ -1948,8 +1992,22 @@ do_send_raw(Command, Payload, #peer_data{socket = Socket, magic = Magic} = Data)
             logger:log(send_fail_log_level(Command),
                        "peer ~p v1 send ~p failed: ~p",
                        [Data#peer_data.address, Command, Reason]),
-            Data
+            maybe_stop_on_send_timeout(Reason, Data)
     end.
+
+%% The peer stopped reading for peer_send_timeout_ms: the socket is
+%% already closed (send_timeout_close). Stop now -- do not leave the
+%% process alive to block on (or drop) every further queued message.
+maybe_stop_on_send_timeout(timeout, Data) ->
+    logger:info("peer ~p: send blocked for ~p ms (peer not reading) -- "
+                "disconnecting", [Data#peer_data.address,
+                                  proplists:get_value(send_timeout,
+                                                      send_timeout_opts())]),
+    catch (Data#peer_data.handler !
+               {peer_disconnected, self(), send_timeout}),
+    exit({shutdown, send_timeout});
+maybe_stop_on_send_timeout(_Reason, Data) ->
+    Data.
 
 %%% ===================================================================
 %%% Internal: Helpers

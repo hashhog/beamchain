@@ -92,6 +92,8 @@
 
 %% Exposed for testing (getdata per-inv-type serving decision)
 -export([getdata_tx_msg/4, getdata_block_msg/2]).
+%% Data requests are served in the requesting peer's process (BC-S).
+-export([serve_peer_request/3]).
 
 %% Exposed for testing (BIP-130 announce branching)
 -export([pick_announce_msg/3]).
@@ -2102,6 +2104,20 @@ entry_to_map(#peer_entry{pid = Pid, address = Addr, direction = Dir,
 %%% Internal: message handling
 %%% ===================================================================
 
+%% Data requests (getdata, getheaders, mempool, getcf*) are NOT served
+%% here: they read blocks / headers / the mempool through other gen_servers
+%% (beamchain_db calls of up to 30 s under load) and used to block this
+%% process -- inbound accepts timed out (check_inbound) and every peer's
+%% traffic stalled behind one peer's request. Hand the request back to the
+%% requesting peer's own process (beamchain_peer:serve_request/3), which
+%% serves it via serve_peer_request/3 below: one request at a time per
+%% peer, never in the manager.
+handle_peer_message(Pid, Command, Payload, State)
+  when Command =:= getdata; Command =:= getheaders; Command =:= mempool;
+       Command =:= getcfilters; Command =:= getcfheaders;
+       Command =:= getcfcheckpt ->
+    beamchain_peer:serve_request(Pid, Command, Payload),
+    {noreply, State};
 handle_peer_message(Pid, addr, Payload, State) ->
     handle_addr_msg(Pid, Payload, State);
 handle_peer_message(Pid, addrv2, Payload, State) ->
@@ -2141,61 +2157,6 @@ handle_peer_message(Pid, blocktxn, Payload, State) ->
     {noreply, State};
 handle_peer_message(Pid, getblocktxn, Payload, State) ->
     beamchain_sync:handle_peer_message(Pid, getblocktxn, Payload),
-    {noreply, State};
-handle_peer_message(Pid, getdata, Payload, State) ->
-    handle_getdata_msg(Pid, Payload),
-    {noreply, State};
-handle_peer_message(Pid, getheaders, Payload, State) ->
-    handle_getheaders_msg(Pid, Payload),
-    {noreply, State};
-%% BIP35: peer requested our complete mempool. Respond with one or more inv
-%% messages enumerating every txid (or wtxid, if peer signaled wtxidrelay)
-%% currently in the mempool, chunked at MAX_INV_SIZE. Decode + the message
-%% type registry were wired in beamchain_p2p_msg, but no handler existed
-%% here — the message hit the catch-all below and was silently dropped,
-%% which the Category B (P2P) parity audit (2026-04-27) flagged as the
-%% beamchain BIP35 PARTIAL gap.
-%%
-%% Gating mirrors Bitcoin Core net_processing.cpp's NetMsgType::MEMPOOL:
-%% if we did NOT advertise NODE_BLOOM in our version handshake, ignore
-%% the request and disconnect the peer. Beamchain has no per-peer
-%% permission system yet, so the gate reduces to a single config flag
-%% (`peerbloomfilters`, default-true).
-handle_peer_message(Pid, mempool, _Payload, State) ->
-    case beamchain_config:node_bloom_enabled() of
-        true ->
-            handle_mempool_msg(Pid);
-        false ->
-            logger:debug("peer ~p sent mempool with bloom filters disabled, "
-                         "disconnecting", [Pid]),
-            beamchain_peer:disconnect(Pid)
-    end,
-    {noreply, State};
-%% -- BIP157 compact block filter requests --------------------------------
-%%
-%% Per BIP-157, peers that did NOT advertise NODE_COMPACT_FILTERS in
-%% their version handshake services bit are not obligated to answer
-%% these messages.  We gate on local advertisement (via the index
-%% being enabled) and silently ignore the message when the index is
-%% off.  When enabled, we forward to the per-message handler which
-%% queries beamchain_blockfilter_index.
-handle_peer_message(Pid, getcfilters, Payload, State) ->
-    case beamchain_blockfilter_index:is_enabled() of
-        true  -> handle_getcfilters_msg(Pid, Payload);
-        false -> ok
-    end,
-    {noreply, State};
-handle_peer_message(Pid, getcfheaders, Payload, State) ->
-    case beamchain_blockfilter_index:is_enabled() of
-        true  -> handle_getcfheaders_msg(Pid, Payload);
-        false -> ok
-    end,
-    {noreply, State};
-handle_peer_message(Pid, getcfcheckpt, Payload, State) ->
-    case beamchain_blockfilter_index:is_enabled() of
-        true  -> handle_getcfcheckpt_msg(Pid, Payload);
-        false -> ok
-    end,
     {noreply, State};
 handle_peer_message(_Pid, _Command, _Payload, State) ->
     {noreply, State}.
@@ -2587,6 +2548,59 @@ relay_addr_to_random_peers(SourcePid, Msg, _State) ->
             lists:foreach(fun(#peer_entry{pid = TargetPid}) ->
                 beamchain_peer:send_message(TargetPid, Msg)
             end, Targets)
+    end.
+
+%% @doc Serve one data request for peer Pid. Called in the PEER's process
+%% (beamchain_peer ready/3 {serve, ...}), never in this gen_server.
+-spec serve_peer_request(pid(), atom(), binary()) -> term().
+serve_peer_request(Pid, getdata, Payload) ->
+    handle_getdata_msg(Pid, Payload);
+serve_peer_request(Pid, getheaders, Payload) ->
+    handle_getheaders_msg(Pid, Payload);
+%% BIP35: peer requested our complete mempool. Respond with one or more inv
+%% messages enumerating every txid (or wtxid, if peer signaled wtxidrelay)
+%% currently in the mempool, chunked at MAX_INV_SIZE. Decode + the message
+%% type registry were wired in beamchain_p2p_msg, but no handler existed
+%% here — the message hit the catch-all below and was silently dropped,
+%% which the Category B (P2P) parity audit (2026-04-27) flagged as the
+%% beamchain BIP35 PARTIAL gap.
+%%
+%% Gating mirrors Bitcoin Core net_processing.cpp's NetMsgType::MEMPOOL:
+%% if we did NOT advertise NODE_BLOOM in our version handshake, ignore
+%% the request and disconnect the peer. Beamchain has no per-peer
+%% permission system yet, so the gate reduces to a single config flag
+%% (`peerbloomfilters`, default-true).
+serve_peer_request(Pid, mempool, _Payload) ->
+    case beamchain_config:node_bloom_enabled() of
+        true ->
+            handle_mempool_msg(Pid);
+        false ->
+            logger:debug("peer ~p sent mempool with bloom filters disabled, "
+                         "disconnecting", [Pid]),
+            beamchain_peer:disconnect(Pid)
+    end;
+%% -- BIP157 compact block filter requests --------------------------------
+%%
+%% Per BIP-157, peers that did NOT advertise NODE_COMPACT_FILTERS in
+%% their version handshake services bit are not obligated to answer
+%% these messages.  We gate on local advertisement (via the index
+%% being enabled) and silently ignore the message when the index is
+%% off.  When enabled, we forward to the per-message handler which
+%% queries beamchain_blockfilter_index.
+serve_peer_request(Pid, getcfilters, Payload) ->
+    case beamchain_blockfilter_index:is_enabled() of
+        true  -> handle_getcfilters_msg(Pid, Payload);
+        false -> ok
+    end;
+serve_peer_request(Pid, getcfheaders, Payload) ->
+    case beamchain_blockfilter_index:is_enabled() of
+        true  -> handle_getcfheaders_msg(Pid, Payload);
+        false -> ok
+    end;
+serve_peer_request(Pid, getcfcheckpt, Payload) ->
+    case beamchain_blockfilter_index:is_enabled() of
+        true  -> handle_getcfcheckpt_msg(Pid, Payload);
+        false -> ok
     end.
 
 handle_getdata_msg(Pid, Payload) ->
@@ -3131,7 +3145,8 @@ start_listener() ->
     end,
     case gen_tcp:listen(Port, [binary, {active, false}, {packet, raw},
                                 {reuseaddr, true}, {nodelay, true},
-                                {backlog, 128}]) of
+                                {backlog, 128}
+                                | beamchain_peer:send_timeout_opts()]) of
         {ok, LSock} ->
             logger:info("listening on port ~B", [Port]),
             Acceptor = spawn_acceptor(LSock),

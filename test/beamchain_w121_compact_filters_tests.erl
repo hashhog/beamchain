@@ -524,12 +524,14 @@ g28_peer_silent_drop_when_index_off_marker_test() ->
     {ok, Src} = file:read_file(
         filename:join([code:lib_dir(beamchain), "src",
                        "beamchain_peer_manager.erl"])),
+    %% (BC-S, 2026-10-05: the dispatches moved to serve_peer_request/3,
+    %% which runs in the requesting peer's process.)
     ?assertNotEqual(nomatch,
-        binary:match(Src, <<"handle_peer_message(Pid, getcfilters,">>)),
+        binary:match(Src, <<"serve_peer_request(Pid, getcfilters,">>)),
     ?assertNotEqual(nomatch,
-        binary:match(Src, <<"handle_peer_message(Pid, getcfheaders,">>)),
+        binary:match(Src, <<"serve_peer_request(Pid, getcfheaders,">>)),
     ?assertNotEqual(nomatch,
-        binary:match(Src, <<"handle_peer_message(Pid, getcfcheckpt,">>)),
+        binary:match(Src, <<"serve_peer_request(Pid, getcfcheckpt,">>)),
     ?assert(true).
 
 %% G29 — FINDING (PARTIAL): add_block/2 at connect-time reads undo
