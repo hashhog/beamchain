@@ -2525,6 +2525,8 @@ verify_script(ScriptSig, ScriptPubKey, Witness, Flags, SigChecker) ->
     end.
 
 do_verify_script(ScriptSig, ScriptPubKey, Witness, Flags, SigChecker) ->
+    %% gate-6 fault hook (beamchain_fault; inert in production).
+    _ = beamchain_fault:fire(verify_script, [ScriptSig, ScriptPubKey]),
     %% SIGPUSHONLY: scriptSig must contain only push ops
     case (Flags band ?SCRIPT_VERIFY_SIGPUSHONLY) =/= 0 of
         true ->

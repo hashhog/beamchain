@@ -714,6 +714,12 @@ history_floor(Tip) when is_integer(Tip), Tip >= 0 ->
 %% CF is one of: blocks, block_index, chainstate, tx_index, meta, undo
 -spec direct_write_batch([tuple()]) -> ok | {error, term()}.
 direct_write_batch(Ops) ->
+    case beamchain_fault:fire(direct_write_batch, [Ops]) of
+        passthrough -> direct_write_batch_real(Ops);
+        Injected -> Injected
+    end.
+
+direct_write_batch_real(Ops) ->
     Db = persistent_term:get(beamchain_db_handle),
     WriteActions = lists:map(fun(Op) -> resolve_direct_batch_op(Op) end, Ops),
     rocksdb:write(Db, WriteActions, []).
@@ -721,6 +727,12 @@ direct_write_batch(Ops) ->
 %% @doc Direct store undo data — bypasses gen_server.
 -spec direct_store_undo(binary(), binary()) -> ok | {error, term()}.
 direct_store_undo(BlockHash, UndoData) ->
+    case beamchain_fault:fire(direct_store_undo, [BlockHash, UndoData]) of
+        passthrough -> direct_store_undo_real(BlockHash, UndoData);
+        Injected -> Injected
+    end.
+
+direct_store_undo_real(BlockHash, UndoData) ->
     Db = persistent_term:get(beamchain_db_handle),
     CF = persistent_term:get(beamchain_cf_undo),
     rocksdb:put(Db, CF, BlockHash, UndoData, []).
@@ -730,6 +742,15 @@ direct_store_undo(BlockHash, UndoData) ->
 -spec direct_atomic_connect_writes(#block{}, non_neg_integer(), binary(),
                                    binary(), integer()) -> ok | {error, term()}.
 direct_atomic_connect_writes(Block, Height, Chainwork, BlockHash, Status) ->
+    case beamchain_fault:fire(direct_atomic_connect_writes,
+                              [Block, Height, Chainwork, BlockHash, Status]) of
+        passthrough ->
+            direct_atomic_connect_writes_real(Block, Height, Chainwork,
+                                              BlockHash, Status);
+        Injected -> Injected
+    end.
+
+direct_atomic_connect_writes_real(Block, Height, Chainwork, BlockHash, Status) ->
     Db = persistent_term:get(beamchain_db_handle),
     BlocksCF = persistent_term:get(beamchain_cf_blocks),
     IdxCF = persistent_term:get(beamchain_cf_block_idx),

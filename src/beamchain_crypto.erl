@@ -173,7 +173,7 @@ ecdsa_verify(Msg, Sig, PubKey) when byte_size(Msg) =:= 32 ->
     %% W95: catch nif_not_loaded for parity with schnorr_verify; a
     %% missing NIF must not crash the script evaluator. Returning
     %% false means "signature does not verify" — the safe default.
-    try ecdsa_verify_nif(Msg, Sig, PubKey) of
+    try ecdsa_verify_call(Msg, Sig, PubKey) of
         true  -> true;
         false -> false;
         {error, _} -> false
@@ -209,12 +209,26 @@ schnorr_verify(Msg, Sig, PubKey) when byte_size(Msg) =:= 32,
     %% script evaluator. Bitcoin consensus never relies on Erlang-side
     %% Schnorr verification, so the fallback is "always reject" — the
     %% same semantics ecdsa_verify uses on NIF failure.
-    try schnorr_verify_nif(Msg, Sig, PubKey) of
+    try schnorr_verify_call(Msg, Sig, PubKey) of
         true  -> true;
         false -> false;
         {error, _} -> false
     catch
         error:nif_not_loaded -> false
+    end.
+
+%% NIF call behind a gate-6 fault hook (beamchain_fault; inert in
+%% production: one persistent_term lookup, then the NIF).
+ecdsa_verify_call(Msg, Sig, PubKey) ->
+    case beamchain_fault:fire(ecdsa_verify_nif, [Msg, Sig, PubKey]) of
+        passthrough -> ecdsa_verify_nif(Msg, Sig, PubKey);
+        Injected -> Injected
+    end.
+
+schnorr_verify_call(Msg, Sig, PubKey) ->
+    case beamchain_fault:fire(schnorr_verify_nif, [Msg, Sig, PubKey]) of
+        passthrough -> schnorr_verify_nif(Msg, Sig, PubKey);
+        Injected -> Injected
     end.
 
 %%% -------------------------------------------------------------------
