@@ -169,9 +169,7 @@ ts(Height) ->
 
 coinbase(Height, Tag) ->
     HeightBin = beamchain_validation:encode_bip34_height(Height),
-    HLen = byte_size(HeightBin),
     TagBin = iolist_to_binary(Tag),
-    _ = HLen,
     ScriptSig = <<HeightBin/binary, (byte_size(TagBin)):8,
                   TagBin/binary, 0:32>>,
     #transaction{

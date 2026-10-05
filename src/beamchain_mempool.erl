@@ -991,7 +991,7 @@ do_add_transaction(Tx, PeerId, State) ->
         %% the current chain MTP (MEDIAN_TIME_PAST of the last 11 blocks) per BIP-113.
         %% Mirrors Bitcoin Core MemPoolAccept::PreChecks → CheckFinalTxAtTip.
         {ok, {TipHash, TipHeight}} = beamchain_chainstate:get_tip(),
-        Mtp = beamchain_chainstate:get_mtp(),
+        Mtp = tip_mtp(),
         beamchain_validation:is_final_tx(Tx, TipHeight + 1, Mtp)
             orelse throw(non_final),
 
@@ -1329,7 +1329,7 @@ do_add_transaction_dry_run(Tx, State) ->
 
         %% GATE 4: IsFinalTx
         {ok, {TipHash, TipHeight}} = beamchain_chainstate:get_tip(),
-        Mtp = beamchain_chainstate:get_mtp(),
+        Mtp = tip_mtp(),
         beamchain_validation:is_final_tx(Tx, TipHeight + 1, Mtp)
             orelse throw(non_final),
 
@@ -2791,6 +2791,19 @@ verify_scripts(Tx, InputCoins) ->
         Idx + 1
     end, 0, lists:zip(Inputs, InputCoins)),
     ok.
+
+%% Tip MTP for ATMP. beamchain_chainstate:get_mtp/0 answers from ETS (keyed
+%% by the tip hash); only a stale/missing entry falls back to a 5 s
+%% gen_server:call. If chainstate is busy past that, the tx is REFUSED as a
+%% system fault -- not admitted on an unknown MTP, not remembered as
+%% rejected -- and the mempool process keeps running (it used to crash on
+%% the timeout and lose every mempool table: live 2026-10-05, 10:24 and
+%% 10:45 EDT on 19878f4).
+tip_mtp() ->
+    try beamchain_chainstate:get_mtp()
+    catch
+        exit:Why -> throw({system_fault, {mtp_unavailable, Why}})
+    end.
 
 %% Gate 6: verify_script/5 raises error({script_internal, _}) for a system
 %% fault (NIF fault, badarg, ...). In the mempool that is neither a reject

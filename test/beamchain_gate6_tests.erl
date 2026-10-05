@@ -115,6 +115,8 @@ mempool_test_() ->
                                 fun mempool_script_internal/0}} end,
       fun(_) -> {timeout, 120, {"FAULT: chainstate busy (suspended) -> mempool survives, answers",
                                 fun mempool_survives_busy_chainstate/0}} end,
+      fun(_) -> {timeout, 120, {"FAULT: busy chainstate + no current MTP -> time-locked tx refused, mempool alive",
+                                fun mempool_busy_chainstate_unknown_mtp/0}} end,
       fun(_) -> {timeout, 120, {"FAULT: latched node -> mempool refuses",
                                 fun mempool_refuses_after_abort/0}} end,
       fun(_) -> {timeout, 120, {"CONTROL: valid spend accepted",
@@ -548,6 +550,25 @@ mempool_survives_busy_chainstate() ->
     ?assert(is_process_alive(MP)),
     ?assertMatch({ok, _}, R).
 
+mempool_busy_chainstate_unknown_mtp() ->
+    %% A time-locked tx (nLockTime = a recent timestamp) needs the MTP. The
+    %% published MTP is gone (as at boot / mid-publication) and chainstate
+    %% is busy: the mempool must neither crash nor admit the tx.
+    Tx0 = mempool_spend(2, valid),
+    Tx = Tx0#transaction{locktime = erlang:system_time(second) - 100000},
+    Txs = resign(Tx),
+    MP = whereis(beamchain_mempool),
+    catch ets:delete(beamchain_chain_meta, mtp),
+    ok = sys:suspend(beamchain_chainstate),
+    R = (catch beamchain_mempool:add_transaction(Txs)),
+    ok = sys:resume(beamchain_chainstate),
+    ?assertEqual(MP, whereis(beamchain_mempool)),
+    ?assert(is_process_alive(MP)),
+    ?assertMatch({error, {system_fault, _}}, R),
+    ?assertNot(beamchain_mempool:has_tx(beamchain_serialize:tx_hash(Txs))),
+    %% Chainstate answers again: the same tx is admitted (nothing remembered).
+    ?assertMatch({ok, _}, beamchain_mempool:add_transaction(Txs)).
+
 mempool_refuses_after_abort() ->
     Tx = mempool_spend(2, valid),
     ok = beamchain_fatal:abort_node(test_fault),
@@ -717,9 +738,7 @@ ts(Height) ->
 
 coinbase(Height, Tag) ->
     HeightBin = beamchain_validation:encode_bip34_height(Height),
-    HLen = byte_size(HeightBin),
     TagBin = iolist_to_binary(Tag),
-    _ = HLen,
     ScriptSig = <<HeightBin/binary, (byte_size(TagBin)):8,
                   TagBin/binary, 0:32>>,
     #transaction{
@@ -780,6 +799,18 @@ spend_coinbase_op_true(Height) ->
                          witness = []}],
         outputs = [#tx_out{value = 2400000000, script_pubkey = ?OP_TRUE}],
         locktime = 0}.
+
+%% Re-sign a mempool_spend/2 tx after its fields changed.
+resign(#transaction{inputs = [In]} = Tx0) ->
+    Amount = 2500000000,
+    Pub = pub(),
+    Tx1 = Tx0#transaction{inputs = [In#tx_in{witness = []}]},
+    ScriptCode = <<16#76, 16#a9, 20, (beamchain_crypto:hash160(Pub))/binary,
+                   16#88, 16#ac>>,
+    SigHash = beamchain_script:sighash_witness_v0(Tx1, 0, ScriptCode, Amount,
+                                                  ?SIGHASH_ALL),
+    {ok, Der} = beamchain_crypto:ecdsa_sign(SigHash, ?PRIV),
+    Tx1#transaction{inputs = [In#tx_in{witness = [<<Der/binary, ?SIGHASH_ALL>>, Pub]}]}.
 
 %% Spend output 1 (P2WPKH) of the coinbase at Height, signed.
 mempool_spend(Height, Kind) ->
