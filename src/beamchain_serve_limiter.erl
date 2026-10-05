@@ -12,7 +12,8 @@
 %%% block reads (or N x 2000 header reads) in front of header_sync and
 %%% chainstate -- the 2026-10-05 status-repair incident class (callers of
 %%% beamchain_db hitting the 30 s gen_server:call timeout). This process
-%%% hands out at most `serve_concurrency` (default 2) slots; a peer waits
+%%% hands out at most `serve_concurrency` (default 1, the old manager's
+%%% effective concurrency) slots; a peer waits
 %%% for one in its own process. Slots are released on return and on the
 %%% holder's death (monitor), so a killed peer can never leak one.
 %%%
@@ -23,7 +24,7 @@
 -export([start_link/0, with_slot/1, limit/0, stats/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
 
--define(DEFAULT_LIMIT, 2).
+-define(DEFAULT_LIMIT, 1).
 
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
