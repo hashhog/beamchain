@@ -111,6 +111,11 @@
          terminate/2]).
 
 -define(SERVER, ?MODULE).
+%% Core coins.h MEMPOOL_HEIGHT: the height ATMP gives a coin created by an
+%% unconfirmed (mempool or package) transaction. Only the sequence-lock
+%% check reads it, and maps it to tip+1 exactly as Core's
+%% CalculatePrevHeights does.
+-define(MEMPOOL_HEIGHT, 16#7FFFFFFF).
 
 %%% -------------------------------------------------------------------
 %%% Policy constants
@@ -1682,12 +1687,19 @@ evaluate_package_cpfp(DeferredTxs, AlreadyAccepted, State) ->
 
 %% Compute package metrics: total fee, total vsize, and entry data.
 compute_package_metrics(TxPairs, PackageTxMap, _State) ->
-    {ok, {_TipHash, TipHeight}} = beamchain_chainstate:get_tip(),
+    {ok, {TipHash, TipHeight}} = beamchain_chainstate:get_tip(),
     Now = erlang:system_time(second),
 
     lists:foldl(fun({Txid, Tx}, {FeeAcc, VSizeAcc, EntriesAcc}) ->
         %% Look up inputs (UTXO set + mempool + package)
         {InputCoins, SpendsCoinbase} = lookup_inputs_with_package(Tx, PackageTxMap),
+
+        %% Coinbase maturity + BIP-68 sequence locks for the package path
+        %% too (single-tx GATES 18/19). A deferred tx never reached those
+        %% gates in try_individual_accept, so without this a package child
+        %% skipped both checks entirely.
+        check_mempool_coinbase_maturity(InputCoins, TipHeight + 1),
+        check_mempool_sequence_locks(Tx, InputCoins, TipHash, TipHeight + 1),
 
         %% Sigops limit: per-tx cost must not exceed MAX_STANDARD_TX_SIGOPS_COST.
         %% Mirrors Bitcoin Core validation.cpp:908+941-943 applied to each
@@ -1802,12 +1814,14 @@ lookup_inputs_with_package(#transaction{inputs = Inputs}, PackageTxMap) ->
                 not_found ->
                     case get_mempool_utxo(H, I) of
                         {ok, Coin} ->
-                            {[Coin | Acc], Missing, Cb};
+                            {[Coin#utxo{height = ?MEMPOOL_HEIGHT} | Acc],
+                             Missing, Cb};
                         not_found ->
                             %% Check package outputs
                             case get_package_utxo(H, I, PackageTxMap) of
                                 {ok, Coin} ->
-                                    {[Coin | Acc], Missing, Cb};
+                                    {[Coin#utxo{height = ?MEMPOOL_HEIGHT} | Acc],
+                                     Missing, Cb};
                                 not_found ->
                                     {Acc, true, Cb}
                             end
@@ -2006,7 +2020,8 @@ lookup_inputs_for_tx(#transaction{inputs = Inputs} = Tx) ->
                     %% check mempool
                     case get_mempool_utxo(H, I) of
                         {ok, Coin} ->
-                            {[Coin | Acc], Missing, Cb};
+                            {[Coin#utxo{height = ?MEMPOOL_HEIGHT} | Acc],
+                             Missing, Cb};
                         not_found ->
                             {Acc, true, Cb}
                     end
@@ -2856,9 +2871,21 @@ check_mempool_sequence_locks(Tx, InputCoins, TipHash, NextHeight) ->
                 {ok, TI} -> TI;
                 not_found -> throw(missing_tip_index)
             end,
-            %% Calculate sequence lock pair for the next block
+            %% Core CalculateLockPointsAtTip / CalculatePrevHeights
+            %% (validation.cpp:201-218): a coin from an unconfirmed parent
+            %% (MEMPOOL_HEIGHT) is treated as created at tip+1 -- the height
+            %% of the block that would include this tx -- so a height lock
+            %% of N>=1 on it is NOT met, and its time lock starts at the
+            %% tip's MTP (GetAncestor(tip+1-1)). The old height 0 made every
+            %% such lock count from genesis: a child with a relative lock on
+            %% an unconfirmed parent was accepted early (and could enter a
+            %% block template).
+            LockCoins = [case C#utxo.height of
+                             ?MEMPOOL_HEIGHT -> C#utxo{height = NextHeight};
+                             _ -> C
+                         end || C <- InputCoins],
             {MinHeight, MinTime} = beamchain_validation:calculate_sequence_lock_pair(
-                Tx, InputCoins, TipIndex),
+                Tx, LockCoins, TipIndex),
             %% Get the MTP of the current tip (which is pprev for the next block)
             MTP = beamchain_validation:median_time_past(TipIndex),
             %% Check if locks are satisfied for the next block
