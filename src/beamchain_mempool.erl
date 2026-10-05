@@ -2884,7 +2884,8 @@ check_mempool_sequence_locks(Tx, InputCoins, TipHash, NextHeight) ->
                 {ok, TI} -> TI;
                 not_found -> throw(missing_tip_index)
             end,
-            %% Core CalculateLockPointsAtTip / CalculatePrevHeights
+            %% Core validation.cpp lock-point calculation at the tip /
+            %% CalculatePrevHeights
             %% (validation.cpp:201-218): a coin from an unconfirmed parent
             %% (MEMPOOL_HEIGHT) is treated as created at tip+1 -- the height
             %% of the block that would include this tx -- so a height lock

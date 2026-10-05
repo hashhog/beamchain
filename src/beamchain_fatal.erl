@@ -110,6 +110,10 @@ start_shutdown() ->
     end.
 
 shutdown() ->
+    %% Let in-flight replies go out first (the submitblock that hit the
+    %% fault answers -25 instead of a dropped connection). Everything is
+    %% already latched: no call can move the tip in this window.
+    timer:sleep(application:get_env(beamchain, fatal_reply_grace_ms, 2000)),
     _ = (catch beamchain_cli:remove_pidfile()),
     {Pid, Ref} = spawn_monitor(fun() -> application:stop(beamchain) end),
     receive
