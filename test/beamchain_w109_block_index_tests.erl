@@ -281,6 +281,9 @@ bug1_setup() ->
     application:ensure_all_started(rocksdb),
     application:set_env(beamchain, datadir, TmpDir),
     application:set_env(beamchain, network, regtest),
+    %% Another module may have left BEAMCHAIN_DATADIR set; it outranks the
+    %% application env and would point this fixture at a foreign datadir.
+    os:unsetenv("BEAMCHAIN_DATADIR"),
     catch gen_server:stop(beamchain_chainstate),
     catch beamchain_db:stop(),
     catch gen_server:stop(beamchain_config),
