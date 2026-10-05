@@ -464,23 +464,28 @@ g18_no_assumeutxo_interaction_test_() ->
 %%% G19 — BUG-19 (LOW): txindex enabled by default
 %%% ===================================================================
 
-g19_txindex_default_enabled_test_() ->
-    {"G19: BUG-19 (LOW) — beamchain defaults txindex to ENABLED. "
-     "Core defaults to DISABLED (DEFAULT_TXINDEX=false in txindex.h:19).",
+g19_txindex_default_disabled_test_() ->
+    {"G19: FIXED (ARCH-2 BC-1) — txindex defaults to DISABLED, matching "
+     "Core DEFAULT_TXINDEX=false (txindex.h). Env/flag 1 turns it on.",
      [
       ?_test(begin
-         %% Set the env explicitly absent.
-         os:unsetenv("BEAMCHAIN_TXINDEX"),
-         %% Note: beamchain_config:get/2 falls back to the proc-dict
-         %% default; the code reads `get(txindex, "1")` so a fresh
-         %% process sees txindex enabled.
-         %% Test by source-level inspection rather than runtime startup.
-         CfgSrc = read_src(beamchain_config_src()),
-         ?assertNotEqual(nomatch,
-             binary:match(CfgSrc, <<"get(txindex, \"1\")">>)),
-         %% Core-parity would be `get(txindex, "0")`.
-         ?assertEqual(nomatch,
-             binary:match(CfgSrc, <<"get(txindex, \"0\")">>))
+         Saved = os:getenv("BEAMCHAIN_TXINDEX"),
+         try
+             os:unsetenv("BEAMCHAIN_TXINDEX"),
+             %% No config table in this run: get/2 yields the default.
+             ?assertEqual(false, beamchain_config:txindex_enabled()),
+             os:putenv("BEAMCHAIN_TXINDEX", "1"),
+             ?assertEqual(true, beamchain_config:txindex_enabled()),
+             os:putenv("BEAMCHAIN_TXINDEX", "true"),
+             ?assertEqual(true, beamchain_config:txindex_enabled()),
+             os:putenv("BEAMCHAIN_TXINDEX", "0"),
+             ?assertEqual(false, beamchain_config:txindex_enabled())
+         after
+             case Saved of
+                 false -> os:unsetenv("BEAMCHAIN_TXINDEX");
+                 V -> os:putenv("BEAMCHAIN_TXINDEX", V)
+             end
+         end
        end)
      ]}.
 
@@ -641,11 +646,7 @@ g26_txindex_default_partial_test_() ->
              binary:match(CfgSrc, <<"os:getenv(\"BEAMCHAIN_TXINDEX\")">>)),
          ?assertNotEqual(nomatch,
              binary:match(CfgSrc, <<"get(txindex,">>)),
-         %% Defaults to enabled (BUG-19 surface). Source-level check
-         %% only — beamchain_config:txindex_enabled/0 depends on the
-         %% ?CONFIG_TABLE ETS table which is owned by the config
-         %% gen_server (not started in this EUnit run).
-         %% The string-match assertions above already pin the default to "1".
+         %% The default (off since ARCH-2 BC-1) is pinned at runtime by G19.
          _ = os:unsetenv("BEAMCHAIN_TXINDEX")
        end)
      ]}.
@@ -733,7 +734,7 @@ g30_tx_index_cf_created_present_test_() ->
                  <<"{create_missing_column_families, true}">>)),
          %% tx_index appears in the CFDescriptors list.
          ?assertNotEqual(nomatch,
-             binary:match(DbSrc, <<"{?CF_TX_INDEX, CFOpts}">>))
+             binary:match(DbSrc, <<"{?CF_TX_INDEX, TxIndexCFOpts}">>))
        end)
      ]}.
 

@@ -2820,14 +2820,18 @@ rpc_getindexinfo(_) ->
 %% txindex summary entry, or [] when the transaction index is not running.
 %% Name == Core's `GetName()` "txindex" (txindex.cpp:69).
 index_summary_txindex(ChainTipHeight) ->
-    case beamchain_config:txindex_enabled() of
-        false -> [];
-        true ->
+    case beamchain_db:txindex_status() of
+        off -> [];
+        synced ->
             %% The txindex is written atomically with each block connect, so
-            %% its best block IS the active-chain tip.  best_block_height =
-            %% the height the index reached (0 if no best block yet); synced
-            %% = index height has caught up to the tip.
-            index_summary_entry(<<"txindex">>, ChainTipHeight, ChainTipHeight)
+            %% its best block IS the active-chain tip.
+            index_summary_entry(<<"txindex">>, ChainTipHeight, ChainTipHeight);
+        {gap, From} ->
+            %% The index was off from height From while blocks connected: it
+            %% is contiguous only below From (beamchain_db:txindex_boot_marker).
+            %% Core's BaseIndex would background-sync from its best block;
+            %% beamchain has no backfill, so report it unsynced, truthfully.
+            index_summary_entry(<<"txindex">>, max(0, From - 1), ChainTipHeight)
     end.
 
 %% basic block filter index summary entry, or [] when it is not running.
@@ -3916,8 +3920,16 @@ rpc_sendrawtransaction([HexStr, MaxFeeRateBtcKvB]) when is_binary(HexStr) ->
                 ok
         end,
 
-        %% Check if already in blockchain
-        case beamchain_db:get_tx_location(Txid) of
+        %% Check if already in blockchain. Core node/transaction.cpp
+        %% BroadcastTransaction: any unspent output (txid, 0..n-1) in the
+        %% coins view -> ALREADY_IN_UTXO_SET. The txindex probe (only when
+        %% -txindex is on) additionally catches a fully-spent confirmed tx.
+        case lists:any(fun(N) -> beamchain_chainstate:has_utxo(Txid, N) end,
+                       lists:seq(0, length(Tx#transaction.outputs) - 1)) of
+            true -> throw({already_in_utxo_set, Txid});
+            false -> ok
+        end,
+        case txindex_lookup(Txid) of
             {ok, _} ->
                 throw({already_in_chain, Txid});
             not_found ->
@@ -3947,6 +3959,9 @@ rpc_sendrawtransaction([HexStr, MaxFeeRateBtcKvB]) when is_binary(HexStr) ->
         throw:{already_in_chain, _} ->
             {error, ?RPC_VERIFY_ALREADY_IN_CHAIN,
              <<"Transaction already in block chain">>};
+        throw:{already_in_utxo_set, _} ->
+            {error, ?RPC_VERIFY_ALREADY_IN_CHAIN,
+             <<"Transaction outputs already in utxo set">>};
         throw:{max_fee_exceeded, FeeRate} ->
             {error, ?RPC_VERIFY_REJECTED,
              iolist_to_binary(io_lib:format(
@@ -9244,6 +9259,41 @@ strip_witness(#transaction{inputs = Inputs} = Tx) ->
     Tx#transaction{inputs =
         [In#tx_in{witness = []} || In <- Inputs]}.
 
+%% Look a txid up in the transaction index, or not_found when -txindex is
+%% off (ARCH-2 BC-1: rows written during an earlier on period are partial).
+txindex_lookup(Txid) ->
+    case beamchain_config:txindex_enabled() of
+        true -> beamchain_db:get_tx_location(Txid);
+        false -> not_found
+    end.
+
+%% Core MAX_OUTPUTS_PER_BLOCK = MAX_BLOCK_WEIGHT / MIN_TRANSACTION_OUTPUT_WEIGHT
+%% (consensus/consensus.h, coins.cpp AccessByTxid).
+-define(MAX_OUTPUTS_PER_BLOCK, (4000000 div 36)).
+
+%% Core rpc/txoutproof.cpp: for each requested txid, the first unspent output
+%% found by AccessByTxid names the block (by the coin's height).
+txoutproof_block_from_utxo([]) ->
+    not_found;
+txoutproof_block_from_utxo([Txid | Rest]) ->
+    case access_by_txid(Txid, 0) of
+        {ok, #utxo{height = H}} ->
+            case beamchain_db:get_block_index(H) of
+                {ok, #{hash := BH}} -> {ok, BH};
+                _ -> txoutproof_block_from_utxo(Rest)
+            end;
+        not_found ->
+            txoutproof_block_from_utxo(Rest)
+    end.
+
+access_by_txid(_Txid, N) when N >= ?MAX_OUTPUTS_PER_BLOCK ->
+    not_found;
+access_by_txid(Txid, N) ->
+    case beamchain_chainstate:get_utxo(Txid, N) of
+        {ok, U} -> {ok, U};
+        _ -> access_by_txid(Txid, N + 1)
+    end.
+
 %% Find a transaction in the mempool or on-chain.
 %% Returns {ok, Tx, BlockHash | undefined, Height | -1, Position | -1}
 find_transaction(Txid) ->
@@ -9252,8 +9302,10 @@ find_transaction(Txid) ->
         {ok, Tx} ->
             {ok, Tx, undefined, -1, -1};
         not_found ->
-            %% Check tx index
-            case beamchain_db:get_tx_location(Txid) of
+            %% Check tx index — only when -txindex is on (Core GetTransaction
+            %% consults g_txindex only if it exists). With the index off, rows
+            %% left by an earlier on period are stale/partial; never read them.
+            case txindex_lookup(Txid) of
                 {ok, #{block_hash := BlockHash, height := Height,
                        position := Pos}} ->
                     case beamchain_db:get_block(BlockHash) of
@@ -16302,12 +16354,22 @@ rpc_gettxoutproof([TxidList, null]) ->
         [FirstTxHex | _] when is_binary(FirstTxHex) ->
             try
                 FirstTxid = parse_hash_v(FirstTxHex, <<"txid">>),
-                case (catch beamchain_db:get_tx_location(FirstTxid)) of
-                    {ok, #{block_hash := BH}} ->
-                        rpc_gettxoutproof_with_block(TxidList, BH);
+                %% Core rpc/txoutproof.cpp: first an unspent output of any
+                %% requested txid (AccessByTxid over the coins view), then
+                %% -txindex if enabled.
+                Txids = [parse_hash_v(T, <<"txid">>) || T <- TxidList,
+                                                         is_binary(T)],
+                case (catch txoutproof_block_from_utxo(Txids)) of
+                    {ok, UBH} ->
+                        rpc_gettxoutproof_with_block(TxidList, UBH);
                     _ ->
-                        {error, ?RPC_INVALID_ADDRESS_OR_KEY,
-                         <<"Transaction not yet in block">>}
+                        case (catch txindex_lookup(FirstTxid)) of
+                            {ok, #{block_hash := BH}} ->
+                                rpc_gettxoutproof_with_block(TxidList, BH);
+                            _ ->
+                                {error, ?RPC_INVALID_ADDRESS_OR_KEY,
+                                 <<"Transaction not yet in block">>}
+                        end
                 end
             catch
                 throw:{rpc_error, Code, Msg} -> {error, Code, Msg}

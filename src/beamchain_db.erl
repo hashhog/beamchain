@@ -72,6 +72,7 @@
 
 %% Transaction index
 -export([store_tx_index/4, get_tx_location/1]).
+-export([txindex_status/0]).
 
 %% Undo data
 -export([store_undo/2, get_undo/1, delete_undo/1]).
@@ -90,6 +91,7 @@
 %% Generic metadata and stats
 -export([get_meta/1, put_meta/2, get_db_stats/0]).
 -export([coins_db_cache_bytes/0]).
+-export([db_cf_options/2, db_bloom_bits/0]).
 
 %% Pruning
 -export([prune_block_files/0, prune_block_files_manual/1,
@@ -125,8 +127,8 @@
 -define(MAX_BLOCKFILE_SIZE, 134217728).  %% 128 MB
 -define(BLOCK_INDEX_ETS, beamchain_block_index).
 
-%% Coins-DB (on-disk chainstate) block-cache budget. This is the RocksDB
-%% block_cache_size applied to the chaindata DB in init/1 below — the
+%% Coins-DB (on-disk chainstate) block-cache budget. This is the shared
+%% RocksDB LRU block cache handed to every column family in init/1 — the
 %% equivalent of Bitcoin Core's Chainstate::m_coinsdb_cache_size_bytes
 %% (the LevelDB/CCoinsViewDB read cache). 256 MiB. Surfaced read-only via
 %% coins_db_cache_bytes/0 for the getchainstates RPC.
@@ -149,6 +151,9 @@
     cf_tx_index :: rocksdb:cf_handle() | undefined,
     cf_meta     :: rocksdb:cf_handle() | undefined,
     cf_undo     :: rocksdb:cf_handle() | undefined,
+    %% Shared RocksDB block cache. The DB's table factories hold their own
+    %% references; kept here so the handle visibly lives as long as the DB.
+    block_cache :: term(),
     data_dir    :: string(),
     %% Flat file state
     blocks_dir  :: string() | undefined,
@@ -722,29 +727,15 @@ direct_atomic_connect_writes(Block, Height, Chainwork, BlockHash, Status) ->
     RevKey = <<"blkidx:", BlockHash/binary>>,
     RevOp = {put, MetaCF, RevKey, HeightKey},
 
-    %% 4. Tx index entries — only when txindex is actually enabled.
-    %%
-    %% This was unconditional, so every block paid build_tx_index_ops for every
-    %% transaction, and that computes beamchain_serialize:tx_hash(Tx) — a FULL
-    %% re-serialize plus double-SHA256 per tx — purely to key an index the
-    %% operator may not have asked for. Core gates the equivalent on -txindex
-    %% and defaults it OFF.
-    %%
-    %% The knob already existed (beamchain_config:txindex_enabled/0) and the
-    %% READERS already honour it (beamchain_rpc.erl:2566/3381,
-    %% beamchain_rest.erl:807 all refuse when disabled) — only the writers
-    %% ignored it. So setting txindex=0 previously bought nothing: you lost the
-    %% queries and still paid for every write.
-    %%
-    %% The default is deliberately left at TRUE rather than flipped to match
-    %% Core. Flipping it would silently stop indexing on datadirs that already
-    %% hold a populated index, leaving it PARTIAL — old txids resolve, recent
-    %% ones do not — a worse failure than either consistent state. Operators
-    %% who want the IBD saving set BEAMCHAIN_TXINDEX=0 explicitly; the genesis
-    %% rigs do, since nothing queries a rig by txid.
+    %% 4. Tx index entries + the index's best-block marker — only when
+    %% txindex is enabled (Core: -txindex, DEFAULT_TXINDEX=false). Since
+    %% ARCH-2 BC-1 the default is OFF; see beamchain_config:txindex_enabled/0
+    %% and txindex_boot_marker/2 for how an off period is recorded so a
+    %% partial index is never reported as synced.
     TxOps = case beamchain_config:txindex_enabled() of
-                true  -> build_tx_index_ops(Block#block.transactions, BlockHash,
-                                            Height, 0, TxCF, []);
+                true  -> [txindex_best_op(MetaCF, BlockHash, Height)
+                          | build_tx_index_ops(Block#block.transactions, BlockHash,
+                                               Height, 0, TxCF, [])];
                 false -> []
             end,
 
@@ -818,6 +809,138 @@ effective_coins_db_cache_bytes() ->
             MiB * 1024 * 1024
     end.
 
+%% @doc Per-column-family RocksDB options (ARCH-2 BC-5): the shared block
+%% cache and a bloom filter, inside block_based_table_options, which is the
+%% only place the NIF reads them (see init/1). BloomBits =:= 0 leaves the
+%% filter off (filter_policy=nullptr) — the negative control and an
+%% operator escape hatch (BEAMCHAIN_DB_BLOOM_BITS=0).
+%%
+%% cache_index_and_filter_blocks stays at RocksDB's default (false): index
+%% and filter blocks live with the open table reader, outside the LRU, the
+%% way LevelDB's table cache holds them for Core. Putting them in a
+%% 64-512 MiB shared cache would make a live-sized chainstate's filters
+%% (~100+ MiB) and the data blocks evict each other — the NIF exposes no
+%% partitioned filters or L0 pinning to soften that.
+-spec db_cf_options(term(), non_neg_integer()) -> list().
+db_cf_options(BlockCache, BloomBits) ->
+    Filter = case BloomBits of
+                 0 -> [];
+                 N when is_integer(N), N > 0 -> [{bloom_filter_policy, N}]
+             end,
+    [{block_based_table_options, [{block_cache, BlockCache} | Filter]}].
+
+%%% -------------------------------------------------------------------
+%%% txindex best-block marker (ARCH-2 BC-1)
+%%% -------------------------------------------------------------------
+%%
+%% Core keeps each index in its own database with its own best block
+%% (BaseIndex); turning -txindex on later syncs it from that block. beamchain
+%% writes tx_index rows inside the per-block connect batch instead, so the
+%% equivalent bookkeeping is two meta keys:
+%%   txindex_best     <<Hash:32, Height:64/big>> — the last block indexed,
+%%                    written in the same atomic batch as its rows.
+%%   txindex_gap_from <<Height:64/big>> — the first height NOT indexed,
+%%                    written at boot when the index is off. Cleared at a
+%%                    later enabled boot only if no block was connected in
+%%                    between (chain tip still below it); otherwise the
+%%                    index has a hole and getindexinfo reports
+%%                    synced=false at best_block_height = gap - 1.
+%% There is no backfill (Core's background sync) yet: an operator who turns
+%% the index on after an off period must reindex to make it complete.
+-define(TXINDEX_BEST_KEY, <<"txindex_best">>).
+-define(TXINDEX_GAP_KEY, <<"txindex_gap_from">>).
+
+txindex_best_op(MetaCF, BlockHash, Height) ->
+    {put, MetaCF, ?TXINDEX_BEST_KEY, <<BlockHash:32/binary, Height:64/big>>}.
+
+%% @doc Boot-time txindex marker migration. Runs once in init/1, before the
+%% gen_server serves any call: at most one small meta put or delete.
+-spec txindex_boot_marker(rocksdb:db_handle(), rocksdb:cf_handle()) -> ok.
+txindex_boot_marker(Db, MetaCF) ->
+    TipH = case rocksdb:get(Db, MetaCF, <<"chain_tip">>, []) of
+               {ok, <<_:32/binary, H:64/big>>} -> H;
+               _ -> undefined
+           end,
+    Best = case rocksdb:get(Db, MetaCF, ?TXINDEX_BEST_KEY, []) of
+               {ok, <<BH:32/binary, BHt:64/big>>} -> {BH, BHt};
+               _ -> undefined
+           end,
+    Gap0 = case rocksdb:get(Db, MetaCF, ?TXINDEX_GAP_KEY, []) of
+               {ok, <<G:64/big>>} -> G;
+               _ -> undefined
+           end,
+    Gap = case beamchain_config:txindex_enabled() of
+        false when Gap0 =/= undefined ->
+            Gap0;
+        false ->
+            %% First boot with the index off: record where it stops. With a
+            %% best-block marker that is exact; without one the datadir
+            %% predates the marker and (default-on era) indexed every block
+            %% it connected, so the flushed tip is the conservative bound.
+            NewGap = case {Best, TipH} of
+                         {{_, BestH}, _} -> BestH + 1;
+                         {undefined, undefined} -> 0;
+                         {undefined, T} -> T + 1
+                     end,
+            ok = rocksdb:put(Db, MetaCF, ?TXINDEX_GAP_KEY, <<NewGap:64/big>>, []),
+            logger:info("beamchain_db: txindex off; first unindexed height "
+                        "recorded as ~B", [NewGap]),
+            NewGap;
+        true when Gap0 =/= undefined, TipH =/= undefined, TipH >= Gap0 ->
+            logger:warning("beamchain_db: txindex is ON but was off from height ~B "
+                           "while the chain advanced to ~B: transactions in that "
+                           "range are NOT indexed (getindexinfo reports "
+                           "synced=false). Reindex to rebuild a complete index.",
+                           [Gap0, TipH]),
+            Gap0;
+        true when Gap0 =/= undefined ->
+            %% Turned back on before any block was connected past the gap.
+            ok = rocksdb:delete(Db, MetaCF, ?TXINDEX_GAP_KEY, []),
+            logger:info("beamchain_db: txindex re-enabled with no unindexed "
+                        "blocks; gap marker cleared"),
+            undefined;
+        true when Best =:= undefined, TipH =/= undefined ->
+            %% Pre-marker datadir run with the index on: adopt it as synced
+            %% to the flushed tip (the next connect advances the marker).
+            {ok, <<TipHash:32/binary, _:64/big>>} =
+                rocksdb:get(Db, MetaCF, <<"chain_tip">>, []),
+            ok = rocksdb:put(Db, MetaCF, ?TXINDEX_BEST_KEY,
+                             <<TipHash:32/binary, TipH:64/big>>, []),
+            undefined;
+        true ->
+            undefined
+    end,
+    persistent_term:put(beamchain_txindex_gap_from, Gap),
+    ok.
+
+%% @doc The txindex's coverage for getindexinfo: `off`, `synced` (written
+%% atomically with every connect, so at the chain tip), or `{gap, From}`
+%% (first unindexed height; the index is contiguous only below it).
+-spec txindex_status() -> off | synced | {gap, non_neg_integer()}.
+txindex_status() ->
+    case beamchain_config:txindex_enabled() of
+        false -> off;
+        true ->
+            case persistent_term:get(beamchain_txindex_gap_from, undefined) of
+                undefined -> synced;
+                G -> {gap, G}
+            end
+    end.
+
+%% @doc Bloom bits per key for every CF: 10 (Core's LevelDB setting,
+%% dbwrapper.cpp NewBloomFilterPolicy(10)) unless BEAMCHAIN_DB_BLOOM_BITS
+%% overrides it (0 = no filter).
+-spec db_bloom_bits() -> non_neg_integer().
+db_bloom_bits() ->
+    case os:getenv("BEAMCHAIN_DB_BLOOM_BITS") of
+        false -> 10;
+        S ->
+            case catch list_to_integer(string:trim(S)) of
+                N when is_integer(N), N >= 0, N =< 64 -> N;
+                _ -> 10
+            end
+    end.
+
 %%% ===================================================================
 %%% gen_server callbacks
 %%% ===================================================================
@@ -829,37 +952,51 @@ init([]) ->
     ok = filelib:ensure_dir(filename:join(DbPath, "dummy")),
     ok = filelib:ensure_dir(filename:join(BlocksDir, "dummy")),
 
-    %% PERF-ONLY: RocksDB coins block-cache size. With --dbcache unset this is
-    %% ?COINS_DB_CACHE_BYTES (256 MiB), preserving current behavior; with
-    %% --dbcache set it is the coins portion of the total (see
-    %% beamchain_config:dbcache_mb/0 and _classB-beamchain-plan §4.1). Does not
-    %% affect validation — it only accelerates SST reads.
+    %% RocksDB tuning (ARCH-2 BC-5). The erlang-rocksdb NIF
+    %% (9.10.0-emqx-2) reads its options in two separate passes and silently
+    %% drops anything in the wrong one:
+    %%   * OpenWithCf applies ONLY parse_db_option to the DB-level list, so
+    %%     block_based_table_options / write_buffer_size / etc. placed there
+    %%     never reached the DB (c_src/erocksdb_db.cc OpenWithCf);
+    %%   * block_based_table_options is honoured only inside a CF's options,
+    %%     and inside it only {block_cache, CacheHandle} sets a cache — the
+    %%     old {block_cache_size, N} key is not parsed at all
+    %%     (parse_bbt_option);
+    %%   * a CF-level {bloom_filter_policy, N} is ignored; the filter is set
+    %%     only by the same key inside block_based_table_options.
+    %% Until this change every CF ran filter_policy=nullptr with a private
+    %% 32 MiB default cache (live OPTIONS-019186), while getchainstates
+    %% reported a 256 MiB cache that did not exist. db_cf_options/2 now puts
+    %% ONE shared LRU cache (sized by --dbcache, as getchainstates reports)
+    %% plus a bloom filter into EVERY column family. Write buffers are left at
+    %% the values the DB actually ran with (RocksDB defaults: 64 MiB x 2) —
+    %% moving to the intended x3 is a separate, memory-visible change.
+    %% Read-side and per-SST only: safe on an existing DB, safe to roll back.
     CoinsBlockCacheBytes = effective_coins_db_cache_bytes(),
+    {ok, BlockCache} = rocksdb:new_cache(lru, CoinsBlockCacheBytes),
+    BloomBits = db_bloom_bits(),
     DbOpts = [
         {create_if_missing, true},
         {create_missing_column_families, true},
-        {max_open_files, 256},
-        {write_buffer_size, 64 * 1024 * 1024},
-        {max_write_buffer_number, 3},
-        {target_file_size_base, 64 * 1024 * 1024},
-        {max_bytes_for_level_base, 256 * 1024 * 1024},
-        {block_based_table_options, [
-            {block_cache_size, CoinsBlockCacheBytes}
-        ]}
+        {max_open_files, 256}
     ],
-    CFOpts = [],
-    %% Chainstate CF gets bloom filter + optimized for point lookups
-    %% to reduce read amplification during UTXO lookups.
-    ChainstateCFOpts = [
-        {bloom_filter_policy, 10},
-        {optimize_filters_for_hits, true}
-    ],
+    CFOpts = db_cf_options(BlockCache, BloomBits),
+    %% Chainstate CF: point lookups that almost always hit (a spent prevout
+    %% must exist), so skip the bottommost level's filter — that level holds
+    %% most keys, and its filter would only ever answer "maybe".
+    ChainstateCFOpts = CFOpts ++ [{optimize_filters_for_hits, true}],
+    %% tx_index: lookups are by txids that are almost always present, and
+    %% the CF is large (~1 key per tx), so the same trade applies.
+    TxIndexCFOpts = ChainstateCFOpts,
+    logger:info("beamchain_db: rocksdb shared block cache ~B MiB, bloom ~B bits/key "
+                "on all column families",
+                [CoinsBlockCacheBytes div (1024 * 1024), BloomBits]),
     CFDescriptors = [
         {?CF_DEFAULT, CFOpts},
         {?CF_BLOCKS, CFOpts},
         {?CF_BLOCK_INDEX, CFOpts},
         {?CF_CHAINSTATE, ChainstateCFOpts},
-        {?CF_TX_INDEX, CFOpts},
+        {?CF_TX_INDEX, TxIndexCFOpts},
         {?CF_META, CFOpts},
         {?CF_UNDO, CFOpts}
     ],
@@ -945,6 +1082,7 @@ init([]) ->
                 cf_tx_index = TxIndexCF,
                 cf_meta = MetaCF,
                 cf_undo = UndoCF,
+                block_cache = BlockCache,
                 data_dir = DbPath,
                 blocks_dir = BlocksDir,
                 current_file = CurrentFile,
@@ -966,6 +1104,7 @@ init([]) ->
             persistent_term:put(beamchain_cf_tx_index, TxIndexCF),
             persistent_term:put(beamchain_cf_meta, MetaCF),
             persistent_term:put(beamchain_cf_undo, UndoCF),
+            ok = txindex_boot_marker(DbHandle, MetaCF),
             logger:info("beamchain_db: opened rocksdb at ~s, blocks at ~s (file ~p, pos ~p)",
                         [DbPath, BlocksDir, CurrentFile, CurrentPos]),
             {ok, State};
@@ -1216,29 +1355,15 @@ handle_call({atomic_connect_writes, Block, Height, Chainwork, BlockHash, Status}
     RevKey = <<"blkidx:", BlockHash/binary>>,
     RevOp = {put, MetaCF, RevKey, HeightKey},
 
-    %% 4. Tx index entries — only when txindex is actually enabled.
-    %%
-    %% This was unconditional, so every block paid build_tx_index_ops for every
-    %% transaction, and that computes beamchain_serialize:tx_hash(Tx) — a FULL
-    %% re-serialize plus double-SHA256 per tx — purely to key an index the
-    %% operator may not have asked for. Core gates the equivalent on -txindex
-    %% and defaults it OFF.
-    %%
-    %% The knob already existed (beamchain_config:txindex_enabled/0) and the
-    %% READERS already honour it (beamchain_rpc.erl:2566/3381,
-    %% beamchain_rest.erl:807 all refuse when disabled) — only the writers
-    %% ignored it. So setting txindex=0 previously bought nothing: you lost the
-    %% queries and still paid for every write.
-    %%
-    %% The default is deliberately left at TRUE rather than flipped to match
-    %% Core. Flipping it would silently stop indexing on datadirs that already
-    %% hold a populated index, leaving it PARTIAL — old txids resolve, recent
-    %% ones do not — a worse failure than either consistent state. Operators
-    %% who want the IBD saving set BEAMCHAIN_TXINDEX=0 explicitly; the genesis
-    %% rigs do, since nothing queries a rig by txid.
+    %% 4. Tx index entries + the index's best-block marker — only when
+    %% txindex is enabled (Core: -txindex, DEFAULT_TXINDEX=false). Since
+    %% ARCH-2 BC-1 the default is OFF; see beamchain_config:txindex_enabled/0
+    %% and txindex_boot_marker/2 for how an off period is recorded so a
+    %% partial index is never reported as synced.
     TxOps = case beamchain_config:txindex_enabled() of
-                true  -> build_tx_index_ops(Block#block.transactions, BlockHash,
-                                            Height, 0, TxCF, []);
+                true  -> [txindex_best_op(MetaCF, BlockHash, Height)
+                          | build_tx_index_ops(Block#block.transactions, BlockHash,
+                                               Height, 0, TxCF, [])];
                 false -> []
             end,
 

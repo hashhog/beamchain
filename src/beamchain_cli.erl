@@ -326,6 +326,23 @@ parse_args(["-blockfilterindex" | Rest], Cmd, Opts) ->
 parse_args(["--blockfilterindex" | Rest], Cmd, Opts) ->
     parse_args(Rest, Cmd, Opts#{cfilter => 1});
 
+%% --txindex[=0|1]: maintain the transaction index (default off, matching
+%% Core -txindex / DEFAULT_TXINDEX=false). Bare --txindex == on. Routed
+%% through BEAMCHAIN_TXINDEX by apply_opts/1, so an explicit flag wins over
+%% an inherited env var (the R4 slice launcher exports BEAMCHAIN_TXINDEX=0).
+parse_args(["--txindex", "0" | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{txindex => 0});
+parse_args(["--txindex", "1" | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{txindex => 1});
+parse_args(["--txindex" | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{txindex => 1});
+parse_args(["-txindex" | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{txindex => 1});
+parse_args(["--txindex=" ++ V | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{txindex => parse_index_bool(V)});
+parse_args(["-txindex=" ++ V | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{txindex => parse_index_bool(V)});
+
 %% --coinstatsindex[=0|1]: enable the persistent coinstatsindex (default
 %% off, matching Core -coinstatsindex). Bare --coinstatsindex == on.
 parse_args(["--coinstatsindex", "0" | Rest], Cmd, Opts) ->
@@ -441,6 +458,9 @@ print_usage() ->
         "  --cfilter=<n>     BIP-157/158 compact block filter index~n"
         "                    (0=off, 1=basic; mirrors Core -blockfilterindex)~n"
         "  -blockfilterindex[=basic]  alias for --cfilter=1 (Core spelling)~n"
+        "  --txindex[=n]     maintain a full transaction index, used by~n"
+        "                    getrawtransaction without a blockhash~n"
+        "                    (0=off default, 1=on; mirrors Core -txindex)~n"
         "  --coinstatsindex[=n] per-height UTXO-set commitment index for~n"
         "                    gettxoutsetinfo at historical heights~n"
         "                    (0=off default, 1=on; mirrors Core -coinstatsindex)~n"
@@ -969,6 +989,13 @@ apply_opts(Opts) ->
         0 -> os:putenv("BEAMCHAIN_COINSTATSINDEX", "0");
         1 -> os:putenv("BEAMCHAIN_COINSTATSINDEX", "1")
     end,
+    %% --txindex: route through BEAMCHAIN_TXINDEX (txindex_enabled/0 reads the
+    %% env var first). Overwrites an inherited value: the flag is explicit.
+    case maps:get(txindex, Opts, undefined) of
+        undefined -> ok;
+        0 -> os:putenv("BEAMCHAIN_TXINDEX", "0");
+        1 -> os:putenv("BEAMCHAIN_TXINDEX", "1")
+    end,
     %% --dbcache: route through BEAMCHAIN_DBCACHE so dbcache_mb/0 (read during
     %% chainstate/db init, before init_table/0 populates the config ETS) sees
     %% it. PERF-ONLY (see _classB-beamchain-plan §6).
@@ -1055,6 +1082,14 @@ parse_blockfilterindex_arg(Str) ->
         "true"  -> 1;
         "false" -> 0;
         _       -> parse_cfilter_arg(Str)
+    end.
+
+%% Core-style boolean for an index flag value: 1/true on, anything else off.
+parse_index_bool(V) ->
+    case string:lowercase(V) of
+        "1" -> 1;
+        "true" -> 1;
+        _ -> 0
     end.
 
 %% Parse a --dbcache MiB value; soft-warn + ignore on a non-positive / garbage

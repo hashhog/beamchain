@@ -141,22 +141,27 @@ magic() ->
     end.
 
 %% @doc Check if transaction index is enabled.
-%% Reads from config file (txindex=1) or env var (BEAMCHAIN_TXINDEX=1).
-%% Defaults to true (enabled).
+%% Precedence: BEAMCHAIN_TXINDEX env var (also set by the --txindex CLI flag,
+%% beamchain_cli:apply_opts/1) > config file `txindex=` > default.
+%%
+%% Default is OFF, matching Bitcoin Core's DEFAULT_TXINDEX = false
+%% (index/txindex.h, init.cpp `-txindex`). It used to default ON, so every
+%% block paid a per-tx tx_index put (and the tx_index CF compacted against
+%% the UTXO CF) on nodes nobody queried by txid. The datadir carries a
+%% per-index marker (beamchain_db: txindex_best / txindex_gap_from) so an
+%% index left PARTIAL by an off period is reported unsynced by getindexinfo
+%% instead of silently answering for some txids and not others.
 -spec txindex_enabled() -> boolean().
 txindex_enabled() ->
     case os:getenv("BEAMCHAIN_TXINDEX") of
-        "0" -> false;
-        "false" -> false;
-        _ ->
-            case get(txindex, "1") of
-                "0" -> false;
-                "false" -> false;
-                0 -> false;
-                false -> false;
-                _ -> true  %% Default to enabled
-            end
+        false -> txindex_conf_value(get(txindex, "0"));
+        V -> txindex_conf_value(V)
     end.
+
+txindex_conf_value(V) when V =:= "1"; V =:= "true"; V =:= 1; V =:= true ->
+    true;
+txindex_conf_value(_) ->
+    false.
 
 %% @doc Check if pruning is enabled (manual or automatic).
 %% Reads from config file (prune=<mb>) or env var (BEAMCHAIN_PRUNE=<mb>).
