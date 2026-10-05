@@ -101,7 +101,11 @@ daemon_children() ->
         child_spec(beamchain_wallet_sup, supervisor),
         child_spec(beamchain_wallet, worker),
         child_spec(beamchain_rpc, worker),
-        child_spec(beamchain_metrics, worker)
+        child_spec(beamchain_metrics, worker),
+        %% Bounds concurrent peer data-request serving (BC-S). Last, so a
+        %% crash here (rest_for_one) restarts nothing else; while it is
+        %% down peers serve unlimited (beamchain_serve_limiter:with_slot/1).
+        child_spec(beamchain_serve_limiter, worker)
     ],
     %% Optional REST HTTP server (default off, matches Bitcoin Core's
     %% -rest=0).  Enable with rest=1 in beamchain.conf or

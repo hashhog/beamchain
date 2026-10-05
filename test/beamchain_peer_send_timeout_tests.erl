@@ -81,6 +81,60 @@ collected(Pid) ->
     receive {collected, L} -> L after 5000 -> timeout end.
 
 %%% ===================================================================
+%%% Serving limiter: per-peer serving must not flood beamchain_db
+%%% ===================================================================
+
+serve_limiter_test_() ->
+    {foreach,
+     fun() ->
+         application:set_env(beamchain, serve_concurrency, 2),
+         catch gen_server:stop(beamchain_serve_limiter),
+         {ok, P} = beamchain_serve_limiter:start_link(),
+         unlink(P),
+         P
+     end,
+     fun(P) -> catch gen_server:stop(P),
+               application:unset_env(beamchain, serve_concurrency) end,
+     [fun(_) -> {"NEW: at most serve_concurrency requests are served at once",
+                 fun limiter_bounds_concurrency/0} end,
+      fun(_) -> {"NEW: a holder killed mid-serve releases its slot",
+                 fun limiter_releases_on_death/0} end]}.
+
+limiter_bounds_concurrency() ->
+    Cur = counters:new(2, []),     %% 1 = current, 2 = max seen
+    Self = self(),
+    Pids = [spawn(fun() ->
+                beamchain_serve_limiter:with_slot(fun() ->
+                    counters:add(Cur, 1, 1),
+                    C = counters:get(Cur, 1),
+                    case C > counters:get(Cur, 2) of
+                        true -> counters:put(Cur, 2, C);
+                        false -> ok
+                    end,
+                    timer:sleep(100),
+                    counters:sub(Cur, 1, 1)
+                end),
+                Self ! {done, self()}
+            end) || _ <- lists:seq(1, 10)],
+    [receive {done, P} -> ok after 10000 -> error(limiter_stuck) end || P <- Pids],
+    ?assertEqual(2, counters:get(Cur, 2)).
+
+limiter_releases_on_death() ->
+    Self = self(),
+    Holders = [spawn(fun() ->
+                   beamchain_serve_limiter:with_slot(fun() ->
+                       Self ! {holding, self()},
+                       receive never -> ok end
+                   end)
+               end) || _ <- [1, 2]],
+    [receive {holding, H} -> ok after 5000 -> error(no_slot) end || H <- Holders],
+    [exit(H, kill) || H <- Holders],
+    {Us, ok} = timer:tc(fun() ->
+        beamchain_serve_limiter:with_slot(fun() -> ok end)
+    end),
+    ?assert(Us < 1000000).
+
+%%% ===================================================================
 %%% Peer: a non-reading peer is dropped; a slow reader is not
 %%% ===================================================================
 

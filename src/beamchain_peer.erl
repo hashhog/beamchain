@@ -719,7 +719,13 @@ ready(cast, {send, Command, PayloadData}, Data) ->
 ready(cast, {serve, Command, Payload}, Data) ->
     %% Runs in this peer's process (see serve_request/3). A slow read or a
     %% failure here only delays/affects this peer.
-    try beamchain_peer_manager:serve_peer_request(self(), Command, Payload)
+    %% At most serve_concurrency requests are served at once node-wide
+    %% (beamchain_serve_limiter): the reads still go through beamchain_db,
+    %% which the manager used to see one serving read at a time.
+    Self = self(),
+    try beamchain_serve_limiter:with_slot(fun() ->
+            beamchain_peer_manager:serve_peer_request(Self, Command, Payload)
+        end)
     catch
         Class:Why ->
             logger:warning("peer ~p: serving ~p failed: ~p:~p",
