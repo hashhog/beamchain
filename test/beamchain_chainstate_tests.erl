@@ -340,7 +340,18 @@ test_cache_miss() ->
     ?assertEqual(750000, FromDb#utxo.value),
     ?assertEqual(<<16#52>>, FromDb#utxo.script_pubkey),
 
-    %% Verify it's now in cache (subsequent lookup is a hit)
+    %% F0: a lookup from a process other than the chainstate (this test
+    %% process, like the mempool / an RPC handler) is a non-populating read
+    %% (Core PeekCoin) -- it must NOT install the disk copy in the cache.
+    ?assertEqual([], ets:lookup(beamchain_utxo_cache, {Txid, 0})),
+
+    %% The same lookup from the chainstate process (the coins-cache owner,
+    %% serialized with every spend and flush) re-populates the cache.
+    Ref = make_ref(), Self = self(),
+    sys:replace_state(beamchain_chainstate, fun(S) ->
+        Self ! {Ref, beamchain_chainstate:get_utxo(Txid, 0)}, S end),
+    receive {Ref, {ok, Owned}} -> ?assertEqual(750000, Owned#utxo.value)
+    after 10000 -> error(owner_lookup_timeout) end,
     ?assertMatch([_], ets:lookup(beamchain_utxo_cache, {Txid, 0})),
 
     %% Clean up

@@ -205,8 +205,15 @@ g4_read_through_not_dirty() ->
     %% Evict from cache
     ets:delete(beamchain_utxo_cache, {Txid, 0}),
     ets:delete(beamchain_utxo_fresh, {Txid, 0}),
-    %% Read-through
+    %% A read from outside the chainstate process is non-populating (F0,
+    %% Core PeekCoin): the coin is returned but not installed.
     {ok, _} = beamchain_chainstate:get_utxo(Txid, 0),
+    ?assertNot(ets:member(beamchain_utxo_cache, {Txid, 0})),
+    %% Read-through by the coins-cache owner (the chainstate process)
+    Ref = make_ref(), Self = self(),
+    sys:replace_state(beamchain_chainstate, fun(S) ->
+        Self ! {Ref, beamchain_chainstate:get_utxo(Txid, 0)}, S end),
+    receive {Ref, {ok, _}} -> ok after 10000 -> error(owner_lookup_timeout) end,
     %% Entry populated into cache but NOT dirty, NOT fresh (it's on disk)
     ?assert(ets:member(beamchain_utxo_cache, {Txid, 0})),
     ?assertNot(ets:member(beamchain_utxo_dirty, {Txid, 0})),

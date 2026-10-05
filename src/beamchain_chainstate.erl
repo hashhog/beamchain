@@ -649,7 +649,20 @@ get_chainstate_meta() ->
 %%% ===================================================================
 
 %% @doc Look up a UTXO. Checks ETS cache first, falls through to RocksDB.
-%% Cache misses from RocksDB are added to cache (not dirty, not fresh).
+%%
+%% Only the chainstate process (the sole writer of the coins cache: every
+%% spend, add, flush and eviction runs in it) installs a RocksDB read into
+%% the cache. Any other process -- mempool ATMP, gettxout, REST, PSBT --
+%% gets a non-populating read (Core CCoinsViewCache::PeekCoin semantics).
+%%
+%% F0 coin-cache resurrection: a foreign reader that installed its disk copy
+%% could race a block that spent the coin (and a flush that committed the
+%% delete and cleared ?UTXO_SPENT): the pre-spend copy landed in ?UTXO_CACHE
+%% as clean+unspent, ?UTXO_CACHE is consulted before ?UTXO_SPENT, and a later
+%% block re-spending the coin was ACCEPTED (test/beamchain_f0_resurrection_
+%% tests.erl). Core never has this interleaving: FetchCoin fills the cache
+%% only under cs_main, serialized with ConnectBlock / FlushStateToDisk
+%% (coins.cpp:69-82), and a spent entry is never re-read from the base.
 -spec get_utxo(binary(), non_neg_integer()) -> {ok, #utxo{}} | not_found.
 get_utxo(Txid, Vout) ->
     Key = {Txid, Vout},
@@ -665,9 +678,14 @@ get_utxo(Txid, Vout) ->
                     %% Fall through to RocksDB (cache miss)
                     case beamchain_db:get_utxo(Txid, Vout) of
                         {ok, Utxo} ->
-                            %% Cache for future lookups. NOT dirty, NOT fresh
-                            %% since it already exists in RocksDB.
-                            add_utxo_from_disk(Txid, Vout, Utxo),
+                            %% Cache for future lookups (NOT dirty, NOT
+                            %% fresh: it exists in RocksDB) -- only when
+                            %% this read is serialized with every spend and
+                            %% flush, i.e. we ARE the chainstate process.
+                            case is_coins_writer() of
+                                true -> add_utxo_from_disk(Txid, Vout, Utxo);
+                                false -> ok
+                            end,
                             {ok, Utxo};
                         not_found ->
                             not_found
@@ -860,7 +878,14 @@ detach_spk(#utxo{script_pubkey = SPK} = Utxo) when byte_size(SPK) > ?ONHEAP_BIN_
 detach_spk(Utxo) ->
     Utxo.
 
+%% True iff the caller is the chainstate gen_server, the one process that
+%% mutates the coins cache. All roles register ?SERVER, and the name is
+%% registered before init/1 runs, so boot roll-forward counts as the writer.
+is_coins_writer() ->
+    whereis(?SERVER) =:= self().
+
 %% @doc Add a UTXO from disk (for cache miss fills). Not marked FRESH or DIRTY.
+%% Caller must be the coins writer (see get_utxo/2).
 -spec add_utxo_from_disk(binary(), non_neg_integer(), #utxo{}) -> ok.
 add_utxo_from_disk(Txid, Vout, Utxo) ->
     Key = {Txid, Vout},
@@ -880,11 +905,21 @@ spend_utxo(Txid, Vout) ->
     Key = {Txid, Vout},
     case ets:lookup(?UTXO_CACHE, Key) of
         [{Key, Utxo}] ->
+            %% Order matters for lock-free readers (get_utxo/has_utxo check
+            %% ?UTXO_CACHE, then ?UTXO_SPENT, then RocksDB): the SPENT
+            %% tombstone goes in BEFORE the cache entry goes away, so no
+            %% reader can see "not cached, not spent" and fall through to
+            %% the still-present disk copy (Core: SpendCoin is atomic under
+            %% cs_main, coins.cpp:142-171).
+            IsFresh = ets:member(?UTXO_FRESH, Key),
+            case IsFresh of
+                true -> ok;
+                false -> ets:insert(?UTXO_SPENT, {Key})
+            end,
             ets:delete(?UTXO_CACHE, Key),
             %% Test seam (inert in production: one persistent_term:get):
             %% the F0 reproducer runs a concurrent reader here.
             _ = beamchain_fault:fire(coins_spend_window, [Key]),
-            IsFresh = ets:member(?UTXO_FRESH, Key),
             case IsFresh of
                 true ->
                     %% FRESH optimization: UTXO was created in cache and never
@@ -894,9 +929,8 @@ spend_utxo(Txid, Vout) ->
                     ets:delete(?UTXO_FRESH, Key);
                 false ->
                     %% Not fresh: either loaded from RocksDB or modified.
-                    %% Schedule a DB delete on flush.
-                    ets:delete(?UTXO_DIRTY, Key),
-                    ets:insert(?UTXO_SPENT, {Key})
+                    %% DB delete scheduled above (?UTXO_SPENT).
+                    ets:delete(?UTXO_DIRTY, Key)
             end,
             {ok, Utxo};
         [] ->
