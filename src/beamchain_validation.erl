@@ -1544,9 +1544,14 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
             Idx + 1
         end, 0, CoinbaseTx#transaction.outputs),
 
-        %% 7. store undo data (direct write bypasses gen_server)
+        %% 7. store undo data (direct write bypasses gen_server).
+        %% Gate 6 / Core WriteUndoDataForBlock (node/blockstorage.cpp): a
+        %% failed undo write is FatalError, never ignored -- the caller sets
+        %% BLOCK_HAVE_UNDO on the strength of this write. Retry once, then
+        %% latch (AbortNode) and fail the connect as a non-verdict; the
+        %% catch below rolls the block's coin changes back.
         UndoBin = encode_undo_data(AllUndoData),
-        beamchain_db:direct_store_undo(BlockHash, UndoBin),
+        store_undo_or_abort(BlockHash, UndoBin),
 
         %% Chain tip is updated in ETS by chainstate:do_connect_block.
         %% The RocksDB chain_tip is written during flush (atomically with
@@ -1589,6 +1594,25 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
                 _ -> ok
             end,
             {error, {exit_during_connect, Reason3}}
+    end.
+
+store_undo_or_abort(BlockHash, UndoBin) ->
+    case beamchain_db:direct_store_undo(BlockHash, UndoBin) of
+        ok ->
+            ok;
+        {error, R1} ->
+            logger:error("validation: undo write failed (~p), retrying once",
+                         [R1]),
+            case beamchain_db:direct_store_undo(BlockHash, UndoBin) of
+                ok ->
+                    ok;
+                Err2 ->
+                    beamchain_fatal:abort_node({undo_write_failed, Err2}),
+                    error({system_fault, {undo_write_failed, Err2}})
+            end;
+        Other ->
+            beamchain_fatal:abort_node({undo_write_failed, Other}),
+            error({system_fault, {undo_write_failed, Other}})
     end.
 
 %% Roll back UTXO changes from a failed block validation.

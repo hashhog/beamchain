@@ -103,7 +103,12 @@ graceful_shutdown_on_signal(Sig) ->
     try beamchain_cli:remove_pidfile()
     catch _:_ -> ok end,
     _ = application:stop(beamchain),
-    init:stop().
+    %% Gate 6: after AbortNode the process must exit non-zero even when
+    %% the stop came from a signal (chainstate's flush was skipped).
+    case catch beamchain_fatal:is_aborted() of
+        true -> init:stop(1);
+        _ -> init:stop()
+    end.
 
 %% @doc SIGHUP: reopen the file handler installed by beamchain_cli's
 %% setup_file_logger/0 so log rotation tools can move the active file.

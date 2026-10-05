@@ -748,19 +748,13 @@ init([]) ->
     }}.
 
 handle_call({add_tx, Tx, PeerId}, _From, State) ->
-    case do_add_transaction(Tx, PeerId, State) of
-        {ok, Txid, State2} ->
-            %% Mirror Core AcceptToMemoryPool → LimitMempoolSize (validation.cpp):
-            %% after a successful single-tx admission, trim the pool back down to
-            %% the configured cap.  Relay policy only — never changes the validity
-            %% of the just-admitted tx (it may evict the lowest-feerate tails,
-            %% which can include this tx if it is the new worst).  Uses the
-            %% configured max_size (the live analogue of m_opts.max_size_bytes),
-            %% reusing do_trim_to_size/2 exactly as the trim_to_size RPC handler does.
-            State3 = do_trim_to_size(State2#state.max_size, State2),
-            {reply, {ok, Txid}, State3};
-        {error, Reason} ->
-            {reply, {error, Reason}, State}
+    case beamchain_fatal:is_aborted() of
+        true ->
+            %% Gate 6: latched node (beamchain_fatal, Core AbortNode) --
+            %% refuse; nothing remembered as rejected, nobody punished.
+            {reply, {error, beamchain_fatal:refusal()}, State};
+        false ->
+            handle_add_tx(Tx, PeerId, State)
     end;
 %% Backwards-compat clause for any in-flight {add_tx, Tx} message that crosses
 %% a code-upgrade boundary or an older external caller. Attributes to ?ORPHAN_LOCAL_PEER.
@@ -768,15 +762,12 @@ handle_call({add_tx, Tx}, From, State) ->
     handle_call({add_tx, Tx, ?ORPHAN_LOCAL_PEER}, From, State);
 
 handle_call({accept_package, Package}, _From, State) ->
-    case do_accept_package(Package, State) of
-        {ok, Txids, State2} ->
-            %% Mirror Core: package admission (ProcessNewPackage) is followed by
-            %% LimitMempoolSize.  Trim once, after the whole package has landed,
-            %% so we never double-apply per-tx within a single package operation.
-            State3 = do_trim_to_size(State2#state.max_size, State2),
-            {reply, {ok, Txids}, State3};
-        {error, Reason} ->
-            {reply, {error, Reason}, State}
+    case beamchain_fatal:is_aborted() of
+        true ->
+            %% Gate 6: latched node -- refuse (see add_tx above).
+            {reply, {error, beamchain_fatal:refusal()}, State};
+        false ->
+            handle_accept_package(Package, State)
     end;
 
 %% Dry-run: validate a single tx through all 21 ATMP gates without
@@ -848,6 +839,34 @@ handle_call(get_prioritised_transactions, _From, State) ->
 
 handle_call(_Request, _From, State) ->
     {reply, {error, not_implemented}, State}.
+
+handle_add_tx(Tx, PeerId, State) ->
+    case do_add_transaction(Tx, PeerId, State) of
+        {ok, Txid, State2} ->
+            %% Mirror Core AcceptToMemoryPool → LimitMempoolSize (validation.cpp):
+            %% after a successful single-tx admission, trim the pool back down to
+            %% the configured cap.  Relay policy only — never changes the validity
+            %% of the just-admitted tx (it may evict the lowest-feerate tails,
+            %% which can include this tx if it is the new worst).  Uses the
+            %% configured max_size (the live analogue of m_opts.max_size_bytes),
+            %% reusing do_trim_to_size/2 exactly as the trim_to_size RPC handler does.
+            State3 = do_trim_to_size(State2#state.max_size, State2),
+            {reply, {ok, Txid}, State3};
+        {error, Reason} ->
+            {reply, {error, Reason}, State}
+    end.
+
+handle_accept_package(Package, State) ->
+    case do_accept_package(Package, State) of
+        {ok, Txids, State2} ->
+            %% Mirror Core: package admission (ProcessNewPackage) is followed by
+            %% LimitMempoolSize.  Trim once, after the whole package has landed,
+            %% so we never double-apply per-tx within a single package operation.
+            State3 = do_trim_to_size(State2#state.max_size, State2),
+            {reply, {ok, Txids}, State3};
+        {error, Reason} ->
+            {reply, {error, Reason}, State}
+    end.
 
 %% Asynchronous remove_for_block (W93/B3 — invoked from chainstate's
 %% connect-block path to avoid the synchronous chainstate↔mempool
@@ -1249,7 +1268,15 @@ do_add_transaction(Tx, PeerId, State) ->
             add_orphan(Tx, Wtxid, Txid, PeerId),
             {error, orphan};
         throw:Reason ->
-            {error, Reason}
+            {error, Reason};
+        exit:Why ->
+            %% Gate 6: a gen_server:call timeout to chainstate/db (a busy
+            %% connect, a slow disk) is a local fault -- refuse the tx as a
+            %% system fault instead of crashing the mempool process (which
+            %% owns, and would take down, every mempool ETS table).
+            logger:warning("mempool: tx ~s refused, system fault: ~p",
+                           [short_hex(Txid), Why]),
+            {error, {system_fault, {exit, Why}}}
     end.
 
 %%% ===================================================================
@@ -2741,14 +2768,30 @@ verify_scripts(Tx, InputCoins) ->
         Witness = Input#tx_in.witness,
         Amount = Coin#utxo.value,
         SigChecker = {Tx, Idx, Amount, AllPrevOuts},
-        case beamchain_script:verify_script(
-                ScriptSig, ScriptPubKey, Witness, Flags, SigChecker) of
+        case verify_script_policy(ScriptSig, ScriptPubKey, Witness, Flags,
+                                  SigChecker) of
             true -> ok;
             false -> throw({script_verify_failed, Idx})
         end,
         Idx + 1
     end, 0, lists:zip(Inputs, InputCoins)),
     ok.
+
+%% Gate 6: verify_script/5 raises error({script_internal, _}) for a system
+%% fault (NIF fault, badarg, ...). In the mempool that is neither a reject
+%% verdict nor an accept: refuse the tx as a system fault (nothing is
+%% remembered as rejected, the relaying peer is not punished) and keep the
+%% mempool process alive.
+verify_script_policy(ScriptSig, ScriptPubKey, Witness, Flags, SigChecker) ->
+    try
+        beamchain_script:verify_script(ScriptSig, ScriptPubKey, Witness,
+                                       Flags, SigChecker)
+    catch
+        error:{script_internal, D} ->
+            logger:error("mempool: script verification INTERNAL fault ~p -- "
+                         "tx refused as a system fault, not a verdict", [D]),
+            throw({system_fault, {script_internal, D}})
+    end.
 
 all_standard_flags() ->
     ?SCRIPT_VERIFY_P2SH bor
@@ -5422,7 +5465,7 @@ consensus_script_checks(Tx, InputCoins) ->
             Witness = Input#tx_in.witness,
             Amount = Coin#utxo.value,
             SigChecker = {Tx, Idx, Amount, AllPrevOuts},
-            case beamchain_script:verify_script(
+            case verify_script_policy(
                     ScriptSig, ScriptPubKey, Witness, Flags, SigChecker) of
                 true -> Idx + 1;
                 false ->

@@ -1150,7 +1150,7 @@ handle_unsolicited_block(Peer, Block, State) ->
                             %% 2. Connect via chainstate — this does contextual
                             %%    validation, UTXO updates, block storage, block
                             %%    index, and tip update all in one call.
-                            case beamchain_chainstate:connect_block(Block) of
+                            case unsolicited_connect(Block) of
                                 ok ->
                                     {ok, {_, Height}} = beamchain_chainstate:get_tip(),
                                     %% Tx index entries are written atomically
@@ -1168,6 +1168,18 @@ handle_unsolicited_block(Peer, Block, State) ->
                                     State;
                                 {error, Reason} ->
                                     case unsolicited_connect_penalty(Reason) of
+                                        0 when Reason =/= bad_prevblk ->
+                                            %% Gate 6: a local fault (or an
+                                            %% unknown reason) is not the
+                                            %% peer's doing. No penalty, no
+                                            %% mark; the block is fetched
+                                            %% again by normal sync.
+                                            logger:warning("block_sync: unsolicited block ~s "
+                                                           "not connected (~p) -- local / "
+                                                           "non-verdict failure, peer ~p "
+                                                           "not penalised",
+                                                           [hash_hex(BlockHash), Reason, Peer]),
+                                            State;
                                         0 ->
                                             %% The block does not extend our
                                             %% tip (parent unknown yet, or a
@@ -1341,10 +1353,16 @@ validate_sequential_inner(#state{next_to_validate = NextH,
                     },
                     validate_sequential_inner(State3, Remaining - 1);
                 {error, Reason} ->
-                    case is_consensus_verdict(Reason) of
-                        true ->
+                    case {beamchain_fatal:is_aborted(),
+                          is_consensus_verdict(Reason)} of
+                        {true, _} ->
+                            %% Gate 6: the node is latched (AbortNode).
+                            %% Whatever this connect returned, it is not a
+                            %% verdict; stop, mark nothing, punish nobody.
+                            halt_sync_aborted(NextH, Reason, State);
+                        {false, true} ->
                             invalid_block_found(NextH, Block, Reason, State);
-                        false ->
+                        {false, false} ->
                             validation_retry_or_halt(NextH, Reason, State)
                     end
             end;
@@ -1352,6 +1370,22 @@ validate_sequential_inner(#state{next_to_validate = NextH,
             %% Not yet downloaded, nothing to do
             State
     end.
+
+%% The node latched (beamchain_fatal) during or before this connect: stop
+%% block download for good -- the VM is shutting down with status 1.
+halt_sync_aborted(NextH, Reason, State) ->
+    logger:emergency("block_sync: node aborted (~p); connect at height ~B "
+                     "returned ~p -- halting sync, block NOT marked, "
+                     "nobody punished",
+                     [beamchain_fatal:reason(), NextH, Reason]),
+    State2 = cancel_timers(State),
+    State2#state{status = idle,
+                 download_queue = [],
+                 in_flight = #{},
+                 hash_to_height = #{},
+                 downloaded = #{},
+                 downloaded_bytes = 0,
+                 block_source = #{}}.
 
 %% A NON-verdict connect failure (local I/O / timeout, a killed script
 %% worker, a missing parent, a BLOCK_MUTATED body): unchanged behaviour --
@@ -1643,11 +1677,12 @@ validate_and_connect(Height, Block,
         exit:Reason ->
             logger:error("block_sync: exit at height ~B: ~p",
                          [Height, Reason]),
-            {error, Reason};
+            %% Wrapped so no exit reason can ever look like a verdict token.
+            {error, {exit_during_connect, Reason}};
         error:Reason:Stack ->
             logger:error("block_sync: error at height ~B: ~p~n~p",
                          [Height, Reason, Stack]),
-            {error, Reason}
+            {error, {internal_error, Reason}}
     end.
 
 %% Pure predicate: true when an unrequested block is too far ahead of the
@@ -2177,8 +2212,45 @@ binary_to_hex_str(Bin) ->
 %% `bad_prevblk` means the block does not extend our active tip -- its parent
 %% is not yet known, or it builds a competing branch.  That is not a protocol
 %% violation (Core requests headers for a non-connecting compact block,
-%% net_processing.cpp:4485), so it scores 0.  Everything else keeps the
-%% G16/G17 score of 100.
+%% net_processing.cpp:4485), so it scores 0.
+%%
+%% Gate 6 (audit F12): this path used to give 100 to EVERYTHING else --
+%% {internal_error,_}, {exit_during_connect,{timeout,_}} (the 300 s connect
+%% call), {post_validation_failure,_} (disk full) -- banning the peer that
+%% delivered a valid block because OUR node failed. Core punishes only on a
+%% BlockValidationResult (MaybePunishNodeForBlock). Now the score is 100
+%% only for a consensus verdict (is_consensus_verdict/1, a strict
+%% allow-list) or a BLOCK_MUTATED token (Core punishes those too); any
+%% local fault or unknown reason scores 0.
 -spec unsolicited_connect_penalty(term()) -> non_neg_integer().
 unsolicited_connect_penalty(bad_prevblk) -> 0;
-unsolicited_connect_penalty(_) -> 100.
+unsolicited_connect_penalty(Reason) ->
+    case is_consensus_verdict(Reason) orelse is_mutation(Reason) of
+        true -> 100;
+        false -> 0
+    end.
+
+%% Punishable without being a marking verdict here: BLOCK_MUTATED (Core:
+%% punished, not marked invalid -- another copy of the header may be
+%% valid) and BLOCK_INVALID_HEADER / BLOCK_CHECKPOINT tokens this path
+%% sees (bad_version, checkpoint_mismatch). Allow-list.
+is_mutation({check_block_failed, R}) -> is_mutation(R);
+is_mutation({block_mutated, _}) -> true;
+is_mutation({bad_version, _}) -> true;
+is_mutation(checkpoint_mismatch) -> true;
+is_mutation(R) when is_atom(R) ->
+    lists:member(R, [bad_merkle_root, mutated_merkle, dup_txid,
+                     bad_witness_commitment, bad_witness_nonce,
+                     bad_witness_nonce_size, unexpected_witness,
+                     missing_witness_commitment]);
+is_mutation(_) ->
+    false.
+
+%% connect_block/1 for the unsolicited path: a gen_server:call exit (the
+%% 300 s timeout, a dead chainstate) is a local fault, returned as a
+%% non-verdict instead of crashing block_sync.
+unsolicited_connect(Block) ->
+    try beamchain_chainstate:connect_block(Block)
+    catch
+        exit:Why -> {error, {exit_during_connect, Why}}
+    end.

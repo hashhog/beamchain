@@ -21,6 +21,14 @@
 %%     so reject reasons are identical at 1 worker and at N (Core's first
 %%     writer wins, which is racy at N>1; we are stricter).
 %%
+%%   * Three outcomes per check (gate 6): OK, SCRIPT_ERROR (a verdict),
+%%     INTERNAL (verify_script raised -- a NIF fault, badarg, an
+%%     interpreter bug; never a verdict). An INTERNAL check is re-run once
+%%     in the caller; if it is INTERNAL again the node latches
+%%     (beamchain_fatal:abort_node/1, Core AbortNode) and this raises
+%%     error({script_internal, _}) -- the block is neither accepted nor
+%%     rejected, nobody is punished, the node halts.
+%%
 %%   * A worker that dies is NEVER a script verdict. Workers carry a
 %%     max_heap_size guard, and the VM kills a worker whose heap (live
 %%     data PLUS not-yet-collected garbage, so the trip point depends on
@@ -31,9 +39,9 @@
 %%     for a resource reason. Core never rejects for a resource reason.
 %%     Now every check that a worker did not see PASS is re-run
 %%     synchronously in the caller (no heap cap) after the pool drains,
-%%     and that result is the verdict. Any other abnormal worker exit is
-%%     an internal error (error/1 -> connect_block {internal_error, _} ->
-%%     retry/halt), never valid and never invalid.
+%%     and that result is the verdict. Any other abnormal worker exit
+%%     takes the same re-run (gate 6: retry once); an INTERNAL re-run
+%%     latches the node (never valid and never invalid).
 %%
 %% The previous verify_scripts_parallel/2 spawned one process per
 %% transaction with a FIFO collector — unbounded, and a late-spawned
@@ -53,6 +61,7 @@
 %% workers). 1M tripped on ordinary mainnet blocks (969399, 969434).
 -define(WORKER_MAX_HEAP_WORDS, 4_000_000).
 -define(PASSED, 1).
+-define(INTERNAL, 2).
 -define(STATS_KEY, beamchain_script_check_queue_stats).
 
 -record(script_check, {
@@ -200,46 +209,67 @@ spawn_and_collect(Tab, Counter, Done, N, NJobs, Stats0) ->
         Acc#{Ref => true}
     end, #{}, lists:seq(1, N)),
     {Fail0, Killed, Crashes} = collect(Monitors, undefined, 0, []),
-    case Crashes of
-        [] -> ok;
-        [Crash | _] ->
-            %% Not a resource kill and not a script verdict: a bug in the
-            %% worker path. Do not accept, do not reject — internal error.
-            error({script_check_worker_crash, Crash})
-    end,
-    Fail = case Killed of
-        0 ->
+    Internal = count_internal(Done, NJobs),
+    Fail = case {Killed, Crashes, Internal} of
+        {0, [], 0} ->
             record_stats(Stats0),
             Fail0;
         _ ->
-            %% Resource kill: the dead worker's in-flight check and any
-            %% failures it had accumulated are lost. Re-run every check
-            %% not marked PASSED, here, with no heap cap. Failures already
-            %% reported by healthy workers are re-derived too, so the
-            %% min-{tx,in} reason is unchanged.
+            %% Not a verdict yet. A worker killed at the heap guard (a
+            %% resource limit), a worker that crashed (a bug in the worker
+            %% path) and a check whose verify raised (INTERNAL) all leave
+            %% checks without a recorded result. Re-run every check not
+            %% marked PASSED, here, with no heap cap -- once. Failures
+            %% already reported by healthy workers are re-derived too, so
+            %% the min-{tx,in} reason is unchanged.
             Rerun = [I || I <- lists:seq(1, NJobs),
                           atomics:get(Done, I) =/= ?PASSED],
-            RerunFail = lists:foldl(fun(I, Acc) ->
+            {RerunFail, RerunInternal} = lists:foldl(fun(I, {FAcc, IAcc}) ->
                 [{I, Check}] = ets:lookup(Tab, I),
                 case run_check(Check) of
-                    ok -> Acc;
+                    ok -> {FAcc, IAcc};
                     {error, Reason} ->
-                        min_fail(Acc, {Check#script_check.order, Reason})
+                        {min_fail(FAcc, {Check#script_check.order, Reason}),
+                         IAcc};
+                    {internal, Detail} ->
+                        {FAcc, min_fail(IAcc, {Check#script_check.order,
+                                               Detail})}
                 end
-            end, undefined, Rerun),
+            end, {undefined, undefined}, Rerun),
             record_stats(Stats0#{killed_workers => Killed,
+                                 crashed_workers => length(Crashes),
+                                 internal_checks => Internal,
                                  rerun_checks => length(Rerun)}),
             logger:warning("script_check_queue: ~B worker(s) killed at the "
-                           "~B-word heap guard; re-ran ~B of ~B checks "
-                           "synchronously (resource limit is not a verdict)",
-                           [Killed, ?WORKER_MAX_HEAP_WORDS, length(Rerun),
-                            NJobs]),
+                           "~B-word heap guard, ~B crashed (~0p), ~B check(s) "
+                           "INTERNAL; re-ran ~B of ~B checks synchronously "
+                           "(a system fault is not a verdict)",
+                           [Killed, ?WORKER_MAX_HEAP_WORDS, length(Crashes),
+                            lists:sublist(Crashes, 3), Internal,
+                            length(Rerun), NJobs]),
+            case RerunInternal of
+                undefined ->
+                    ok;
+                {Order, Detail} ->
+                    %% INTERNAL twice for the same check: Core AbortNode.
+                    beamchain_fatal:abort_node(
+                      {script_internal, #{check => Order, detail => Detail}}),
+                    error({script_internal, Detail})
+            end,
             min_fail(Fail0, RerunFail)
     end,
     case Fail of
         undefined -> ok;
         {_Order, Reason} -> throw(Reason)
     end.
+
+count_internal(Done, NJobs) ->
+    lists:foldl(fun(I, N) ->
+        case atomics:get(Done, I) of
+            ?INTERNAL -> N + 1;
+            _ -> N
+        end
+    end, 0, lists:seq(1, NJobs)).
 
 worker_drain(Tab, Counter, Done, Acc) ->
     Idx = atomics:add_get(Counter, 1, 1),
@@ -252,7 +282,11 @@ worker_drain(Tab, Counter, Done, Acc) ->
                     atomics:put(Done, Idx, ?PASSED),
                     Acc;
                 {error, Reason} ->
-                    min_fail(Acc, {Check#script_check.order, Reason})
+                    min_fail(Acc, {Check#script_check.order, Reason});
+                {internal, _Detail} ->
+                    %% No result: the caller re-runs it (never a verdict).
+                    atomics:put(Done, Idx, ?INTERNAL),
+                    Acc
             end,
             worker_drain(Tab, Counter, Done, Acc1)
     end.
@@ -277,6 +311,9 @@ collect(Map, Acc, Killed, Crashes) ->
             end
     end.
 
+%% ok | {error, Reason} (SCRIPT_ERROR, a verdict) | {internal, Detail}
+%% (a raise: never a verdict). Only throw/1 is a script result; an
+%% error/exit-class exception is INTERNAL.
 run_check(#script_check{check_fun = Fun}) when is_function(Fun, 0) ->
     try Fun() of
         ok -> ok;
@@ -285,14 +322,19 @@ run_check(#script_check{check_fun = Fun}) when is_function(Fun, 0) ->
         false -> {error, {script_verify_failed, 0}}
     catch
         throw:Reason -> {error, Reason};
-        _Class:R -> {error, {script_verify_failed, R}}
+        error:{script_internal, D} -> {internal, D};
+        Class:R -> {internal, {Class, R}}
     end;
 run_check(#script_check{n_in = Idx, flags = Flags,
                         script_sig = ScriptSig, script_pubkey = SPK,
                         witness = Witness, sig_checker = Checker}) ->
-    case beamchain_script:verify_script(ScriptSig, SPK, Witness, Flags, Checker) of
+    try beamchain_script:verify_script(ScriptSig, SPK, Witness, Flags,
+                                       Checker) of
         true -> ok;
         false -> {error, {script_verify_failed, Idx}}
+    catch
+        error:{script_internal, D} -> {internal, D};
+        Class:R -> {internal, {Class, R}}
     end.
 
 min_fail(undefined, F) -> F;

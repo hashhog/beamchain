@@ -275,11 +275,22 @@ test_heap_kill_preserves_min_order() ->
 
 test_worker_crash_is_internal_error() ->
     %% A non-kill exit signal takes the worker down outside run_check's
-    %% try. That is a bug, not a script result: error, not throw.
-    Crash = fun() -> exit(self(), worker_bug), true end,
+    %% try. That is a bug, not a script result: never a throw (verdict).
+    %% Gate 6: the checks the dead worker left without a result are re-run
+    %% once in the caller; here the re-run passes, so the block is accepted
+    %% on the re-run's answer (the crash only happens inside a worker).
+    Caller = self(),
+    Crash = fun() ->
+        case self() of
+            Caller -> true;
+            _ -> exit(self(), worker_bug), true
+        end
+    end,
     Jobs = [true_job(), Crash, true_job()],
-    ?assertError({script_check_worker_crash, worker_bug},
-                 beamchain_script_check_queue:verify(Jobs, 0, 2)).
+    ?assertEqual(ok, beamchain_script_check_queue:verify(Jobs, 0, 2)),
+    Stats = beamchain_script_check_queue:last_stats(),
+    ?assertEqual(1, maps:get(crashed_workers, Stats)),
+    ?assert(maps:get(rerun_checks, Stats) >= 1).
 
 %%% ===================================================================
 %%% Measured scaling — 2048 unique P2WPKH inputs (post-segwit shape)

@@ -403,7 +403,14 @@ route_message(Peer, getblocktxn, Payload, State) ->
 route_message(Peer, tx, Payload, State) ->
     case beamchain_p2p_msg:decode_payload(tx, Payload) of
         {ok, Tx} ->
-            case beamchain_mempool:accept_to_memory_pool(Tx, Peer) of
+            %% Gate 6: the 30 s mempool call timing out (a busy mempool
+            %% behind a slow connect) is a local fault -- drop the tx, do
+            %% not crash beamchain_sync (live 2026-10-05 09:56) and do not
+            %% punish the peer.
+            AtmpResult = try beamchain_mempool:accept_to_memory_pool(Tx, Peer)
+                         catch exit:Why -> {error, {system_fault, {exit, Why}}}
+                         end,
+            case AtmpResult of
                 {ok, Txid} ->
                     logger:info("sync: accepted tx ~s from ~p",
                                 [beamchain_serialize:hex_encode(Txid), Peer]),

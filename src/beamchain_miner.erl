@@ -615,7 +615,12 @@ do_submit_decoded_block(Block) ->
     catch
         error:Reason2 ->
             logger:warning("miner: submit_block error: ~p", [Reason2]),
-            {error, Reason2}
+            %% Gate 6: an exception is a local fault, never a BIP-22 token
+            %% (submitblock answers -25 for {internal_error, _}).
+            {error, {internal_error, Reason2}};
+        exit:Why ->
+            logger:warning("miner: submit_block exit: ~p", [Why]),
+            {error, {exit_during_connect, Why}}
     end.
 
 %% Broadcast a newly mined block to all connected peers, branching on

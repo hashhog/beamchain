@@ -170,15 +170,19 @@ batch_schnorr_verify_nif(_Items) ->
 -spec ecdsa_verify(Msg :: binary(), Sig :: binary(),
                    PubKey :: binary()) -> boolean().
 ecdsa_verify(Msg, Sig, PubKey) when byte_size(Msg) =:= 32 ->
-    %% W95: catch nif_not_loaded for parity with schnorr_verify; a
-    %% missing NIF must not crash the script evaluator. Returning
-    %% false means "signature does not verify" — the safe default.
-    try ecdsa_verify_call(Msg, Sig, PubKey) of
-        true  -> true;
+    %% Gate 6: only an answer ABOUT THE SIGNATURE is false. Core
+    %% (pubkey.cpp CPubKey::Verify): an unparseable pubkey or DER signature
+    %% "does not verify". Anything else -- the NIF not loaded (W95 used to
+    %% read that as false), an unexpected error tuple, badarg -- is a node
+    %% fault and RAISES: returning false there made `<sig> <pk> CHECKSIG
+    %% NOT` pass, i.e. a fault became an ACCEPT. verify_script/5 turns the
+    %% raise into INTERNAL (never a verdict).
+    case ecdsa_verify_call(Msg, Sig, PubKey) of
+        true -> true;
         false -> false;
-        {error, _} -> false
-    catch
-        error:nif_not_loaded -> false
+        {error, invalid_pubkey} -> false;
+        {error, invalid_signature} -> false;
+        Other -> error({crypto_fault, {ecdsa_verify, Other}})
     end.
 
 %% @doc ECDSA verify with lax DER parsing.
@@ -204,17 +208,15 @@ ecdsa_verify_lax(Msg, Sig, PubKey) when byte_size(Msg) =:= 32 ->
 schnorr_verify(Msg, Sig, PubKey) when byte_size(Msg) =:= 32,
                                        byte_size(Sig) =:= 64,
                                        byte_size(PubKey) =:= 32 ->
-    %% W95: catch nif_not_loaded so a missing/broken NIF degrades to
-    %% "signature does not verify" instead of crashing the calling
-    %% script evaluator. Bitcoin consensus never relies on Erlang-side
-    %% Schnorr verification, so the fallback is "always reject" — the
-    %% same semantics ecdsa_verify uses on NIF failure.
-    try schnorr_verify_call(Msg, Sig, PubKey) of
-        true  -> true;
+    %% Gate 6: see ecdsa_verify/3. Core (pubkey.cpp
+    %% XOnlyPubKey::VerifySchnorr): an unparseable x-only key does not
+    %% verify. A missing/broken NIF is a node fault and raises (it used to
+    %% read as "does not verify" -- a fault became a script verdict).
+    case schnorr_verify_call(Msg, Sig, PubKey) of
+        true -> true;
         false -> false;
-        {error, _} -> false
-    catch
-        error:nif_not_loaded -> false
+        {error, invalid_pubkey} -> false;
+        Other -> error({crypto_fault, {schnorr_verify, Other}})
     end.
 
 %% NIF call behind a gate-6 fault hook (beamchain_fault; inert in

@@ -301,9 +301,29 @@ get_tip() ->
     end.
 
 %% @doc Get the median time past for the current chain tip.
+%% ETS read keyed by the tip hash -- never a gen_server:call while the
+%% published value matches the published tip. connect_block holds the
+%% chainstate loop for seconds under load; the mempool called this with
+%% the 5 s default from inside its own handle_call and crashed on the
+%% timeout (live 2026-10-05, 6 CRASH REPORTs; gate-6 audit D2).
 -spec get_mtp() -> non_neg_integer().
 get_mtp() ->
-    gen_server:call(?SERVER, get_mtp).
+    case {ets_lookup_safe(mtp), ets_lookup_safe(tip)} of
+        {[{mtp, Hash, Mtp}], [{tip, Hash, _H}]} ->
+            Mtp;
+        _ ->
+            gen_server:call(?SERVER, get_mtp)
+    end.
+
+ets_lookup_safe(Key) ->
+    try ets:lookup(?CHAIN_META, Key)
+    catch error:badarg -> []
+    end.
+
+%% Publish {mtp, TipHash, MTP} BEFORE the caller publishes {tip, ...}, so a
+%% reader that sees the new tip also sees its MTP.
+publish_mtp(TipHash, Timestamps) ->
+    ets:insert(?CHAIN_META, {mtp, TipHash, compute_mtp(Timestamps)}).
 
 %% @doc Check if the chain tip is within 24 hours of current time (matching Bitcoin Core's DEFAULT_MAX_TIP_AGE).
 %% ETS read — never a gen_server:call. During catch-up connect_block
@@ -994,6 +1014,11 @@ init_chainstate(Role, SnapshotData) ->
         background -> [];
         _ -> load_mtp_timestamps(TipHeight)
     end,
+    case {Role, TipHash} of
+        {background, _} -> ok;
+        {_, undefined} -> ok;
+        _ -> publish_mtp(TipHash, MTPTimestamps)
+    end,
 
     %% Start with large cache for IBD, shrink when caught up. The IBD ETS
     %% byte budget is the dbcache total minus the RocksDB coins-block-cache
@@ -1133,7 +1158,12 @@ maybe_checkpoint_roll_forward(#state{blocks_since_flush = N} = State)
 maybe_checkpoint_roll_forward(State) ->
     State.
 
-handle_call(get_mtp, _From, #state{mtp_timestamps = Ts} = State) ->
+handle_call(get_mtp, _From, #state{mtp_timestamps = Ts,
+                                   tip_hash = TipHash} = State) ->
+    case TipHash of
+        undefined -> ok;
+        _ -> publish_mtp(TipHash, Ts)
+    end,
     {reply, compute_mtp(Ts), State};
 
 handle_call(is_synced, _From, #state{ibd = IBD} = State) ->
@@ -1142,60 +1172,28 @@ handle_call(is_synced, _From, #state{ibd = IBD} = State) ->
     %% on a transient reorg that temporarily ages the tip.
     {reply, not IBD, State};
 
-handle_call({connect_block, Block}, _From, State) ->
-    case do_connect_block(Block, State) of
-        {ok, State2} ->
-            {reply, ok, State2};
-        {error, Reason} ->
-            {reply, {error, Reason}, State}
+%% Gate 6: once the node is latched (beamchain_fatal, Core AbortNode) no
+%% call may move the tip or touch the coins view -- refuse with a
+%% non-verdict.
+handle_call(Req, _From, State) when element(1, Req) =:= connect_block;
+                                    element(1, Req) =:= submit_block;
+                                    element(1, Req) =:= reorganize;
+                                    element(1, Req) =:= invalidate_block;
+                                    element(1, Req) =:= reconsider_block;
+                                    element(1, Req) =:= precious_block;
+                                    Req =:= disconnect_block ->
+    case beamchain_fatal:is_aborted() of
+        true ->
+            {reply, {error, beamchain_fatal:refusal()}, State};
+        false ->
+            handle_chain_call(Req, State)
     end;
-
-handle_call({submit_block, Block, MinPowChecked}, _From, State) ->
-    case do_submit_block(Block, MinPowChecked, State) of
-        {ok, {reorg, DisconnectedTxs}, State2} ->
-            %% Pattern B: surface disconnected non-coinbase txs to
-            %% caller for out-of-process mempool refill (avoids
-            %% chainstate↔mempool deadlock).
-            {reply, {ok, reorg, DisconnectedTxs}, State2};
-        {ok, Outcome, State2} ->
-            {reply, {ok, Outcome}, State2};
-        {error, Reason, RolledBackState} ->
-            %% Atomic-reorg rollback path (Pattern D) —
-            %% RolledBackState mirrors pre-reorg.
-            {reply, {error, Reason}, RolledBackState};
-        {error, Reason} ->
-            {reply, {error, Reason}, State}
-    end;
-
 handle_call({submit_header, Header}, _From, State) ->
     %% Header-only acceptance (submitheader RPC).  No state mutation other
     %% than the header-only block-index write, which lives in beamchain_db;
     %% the chainstate #state{} (tip/UTXO) is unchanged because a header does
     %% not connect a body.  See do_submit_header/2.
     {reply, do_submit_header(Header, State), State};
-
-handle_call(disconnect_block, _From, State) ->
-    case do_disconnect_block(State) of
-        {ok, State2} ->
-            {reply, ok, State2};
-        {error, Reason} ->
-            {reply, {error, Reason}, State}
-    end;
-
-handle_call({reorganize, NewBlocks}, _From, State) ->
-    case do_reorganize(NewBlocks, State) of
-        {ok, State2, DisconnectedTxs} ->
-            {reply, {ok, DisconnectedTxs}, State2};
-        {error, Reason, RolledBackState} ->
-            %% RolledBackState mirrors the pre-reorg snapshot — return
-            %% it so subsequent calls don't see the half-reorg ETS.
-            {reply, {error, Reason}, RolledBackState};
-        {error, Reason} ->
-            %% Defensive fallback for any path that still returns the
-            %% legacy 2-tuple error (e.g. MAX_REORG_DEPTH guard before
-            %% any state mutation).
-            {reply, {error, Reason}, State}
-    end;
 
 handle_call(flush, _From, State) ->
     State2 = do_flush(State),
@@ -1303,8 +1301,64 @@ handle_call({set_snapshot_validation, Result}, _From, State) ->
 handle_call(get_tip_height, _From, #state{tip_height = Height} = State) ->
     {reply, {ok, Height}, State};
 
+handle_call({invalid_block_found, Hash}, _From, State) ->
+    {reply, do_invalid_block_found(Hash), State};
+
+handle_call(_Request, _From, State) ->
+    {reply, {error, not_implemented}, State}.
+
+%% The tip-moving calls, reached only through the gate-6 latch check in
+%% handle_call/3.
+handle_chain_call({connect_block, Block}, State) ->
+    case do_connect_block(Block, State) of
+        {ok, State2} ->
+            {reply, ok, State2};
+        {error, Reason} ->
+            {reply, {error, Reason}, State}
+    end;
+
+handle_chain_call({submit_block, Block, MinPowChecked}, State) ->
+    case do_submit_block(Block, MinPowChecked, State) of
+        {ok, {reorg, DisconnectedTxs}, State2} ->
+            %% Pattern B: surface disconnected non-coinbase txs to
+            %% caller for out-of-process mempool refill (avoids
+            %% chainstate↔mempool deadlock).
+            {reply, {ok, reorg, DisconnectedTxs}, State2};
+        {ok, Outcome, State2} ->
+            {reply, {ok, Outcome}, State2};
+        {error, Reason, RolledBackState} ->
+            %% Atomic-reorg rollback path (Pattern D) —
+            %% RolledBackState mirrors pre-reorg.
+            {reply, {error, Reason}, RolledBackState};
+        {error, Reason} ->
+            {reply, {error, Reason}, State}
+    end;
+
+handle_chain_call(disconnect_block, State) ->
+    case do_disconnect_block(State) of
+        {ok, State2} ->
+            {reply, ok, State2};
+        {error, Reason} ->
+            {reply, {error, Reason}, State}
+    end;
+
+handle_chain_call({reorganize, NewBlocks}, State) ->
+    case do_reorganize(NewBlocks, State) of
+        {ok, State2, DisconnectedTxs} ->
+            {reply, {ok, DisconnectedTxs}, State2};
+        {error, Reason, RolledBackState} ->
+            %% RolledBackState mirrors the pre-reorg snapshot — return
+            %% it so subsequent calls don't see the half-reorg ETS.
+            {reply, {error, Reason}, RolledBackState};
+        {error, Reason} ->
+            %% Defensive fallback for any path that still returns the
+            %% legacy 2-tuple error (e.g. MAX_REORG_DEPTH guard before
+            %% any state mutation).
+            {reply, {error, Reason}, State}
+    end;
+
 %% Block invalidation
-handle_call({invalidate_block, Hash}, _From, State) ->
+handle_chain_call({invalidate_block, Hash}, State) ->
     case do_invalidate_block(Hash, State) of
         {ok, State2} ->
             {reply, ok, State2};
@@ -1312,11 +1366,8 @@ handle_call({invalidate_block, Hash}, _From, State) ->
             {reply, {error, Reason}, State}
     end;
 
-handle_call({invalid_block_found, Hash}, _From, State) ->
-    {reply, do_invalid_block_found(Hash), State};
-
 %% Block reconsideration
-handle_call({reconsider_block, Hash}, _From, State) ->
+handle_chain_call({reconsider_block, Hash}, State) ->
     case do_reconsider_block(Hash, State) of
         {ok, State2} ->
             {reply, ok, State2};
@@ -1325,7 +1376,7 @@ handle_call({reconsider_block, Hash}, _From, State) ->
     end;
 
 %% Block preciousness (preciousblock RPC)
-handle_call({precious_block, Hash}, _From, State) ->
+handle_chain_call({precious_block, Hash}, State) ->
     case do_precious_block(Hash, State) of
         {ok, reorg, DisconnectedTxs, State2} ->
             {reply, {ok, reorg, DisconnectedTxs}, State2};
@@ -1333,10 +1384,7 @@ handle_call({precious_block, Hash}, _From, State) ->
             {reply, ok, State2};
         {error, Reason} ->
             {reply, {error, Reason}, State}
-    end;
-
-handle_call(_Request, _From, State) ->
-    {reply, {error, not_implemented}, State}.
+    end.
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -1345,6 +1393,21 @@ handle_info(_Info, State) ->
     {noreply, State}.
 
 terminate(_Reason, State) ->
+    case beamchain_fatal:is_aborted() of
+        true ->
+            %% Gate 6 / Core AbortNode: after a fatal system fault the
+            %% in-memory coins view may be ahead of, or inconsistent with,
+            %% what the failed write left on disk. Do NOT flush it: the last
+            %% good flush is the recovery point (a restart rolls forward
+            %% from the stored blocks, exactly as after a crash).
+            logger:emergency("chainstate: node aborted (~p) -- skipping the "
+                             "shutdown flush", [beamchain_fatal:reason()]),
+            ok;
+        false ->
+            terminate_flush(State)
+    end.
+
+terminate_flush(State) ->
     %% If a connect_block was in progress when we crashed (e.g. due to
     %% a gen_server:call timeout in store_undo), the UTXO cache may
     %% contain partial changes from that block. Roll them back before
@@ -1518,15 +1581,17 @@ do_connect_block_inner(#block{header = Header} = Block, PrevIndex,
                 %% (beamchain_chainstate.erl:find_best_valid_chain) rejects every
                 %% connected block as a candidate, and prune eligibility is broken.
                 ConnectStatus = ?BLOCK_VALID_SCRIPTS bor ?BLOCK_HAVE_DATA bor ?BLOCK_HAVE_UNDO,
-                ok = beamchain_db:direct_atomic_connect_writes(
-                         Block, Height, NewCW, BlockHash, ConnectStatus),
-
-                %% Update chain tip in ETS for fast reads
-                ets:insert(?CHAIN_META, {tip, BlockHash, Height}),
+                ok = connect_writes_or_abort(Block, Height, NewCW, BlockHash,
+                                             ConnectStatus),
 
                 %% Update MTP sliding window
                 NewMTP = update_mtp_connect(Header#block_header.timestamp,
                                              State#state.mtp_timestamps),
+
+                %% Update chain tip in ETS for fast reads (MTP first, so
+                %% get_mtp/0 never pairs the new tip with the old MTP).
+                publish_mtp(BlockHash, NewMTP),
+                ets:insert(?CHAIN_META, {tip, BlockHash, Height}),
 
                 BlocksSinceFlush = State#state.blocks_since_flush + 1,
                 State2 = State#state{
@@ -1730,6 +1795,31 @@ do_connect_block_inner(#block{header = Header} = Block, PrevIndex,
             end;
         {error, Reason} ->
             {error, Reason}
+    end.
+
+%% Gate 6 / Core (validation.cpp AcceptBlock -> FatalError "Failed to
+%% write block"): the block body + index WriteBatch failing is a system
+%% fault. Retry once; then latch (AbortNode) and raise -- the caller's
+%% catch rolls the block's coin changes back and answers the non-verdict
+%% {post_validation_failure, _}. The tip is published only after this
+%% returns ok (write before forget).
+connect_writes_or_abort(Block, Height, NewCW, BlockHash, Status) ->
+    case beamchain_db:direct_atomic_connect_writes(Block, Height, NewCW,
+                                                   BlockHash, Status) of
+        ok ->
+            ok;
+        Err1 ->
+            logger:error("chainstate: block write failed at height ~B (~p), "
+                         "retrying once", [Height, Err1]),
+            case beamchain_db:direct_atomic_connect_writes(
+                   Block, Height, NewCW, BlockHash, Status) of
+                ok ->
+                    ok;
+                Err2 ->
+                    beamchain_fatal:abort_node({block_write_failed, Height,
+                                                Err2}),
+                    error({system_fault, {block_write_failed, Err2}})
+            end
     end.
 
 %% Append a new timestamp to the MTP window, keeping at most 11.
@@ -2326,11 +2416,12 @@ do_disconnect_block(#state{tip_hash = TipHash, tip_height = TipHeight,
                     PrevHash = Block#block.header#block_header.prev_hash,
                     PrevHeight = TipHeight - 1,
 
-                    ets:insert(?CHAIN_META, {tip, PrevHash, PrevHeight}),
-
                     %% Update MTP: drop newest, restore oldest if possible
                     NewMTP = update_mtp_disconnect(PrevHeight,
                                                     State#state.mtp_timestamps),
+
+                    publish_mtp(PrevHash, NewMTP),
+                    ets:insert(?CHAIN_META, {tip, PrevHash, PrevHeight}),
 
                     %% ZMQ notification for block disconnect
                     beamchain_zmq:notify_block(Block, disconnect),
@@ -2584,6 +2675,19 @@ do_reorganize_atomic(NewBlocks, State) ->
     %% Step 1: pre-flush so disk holds a known good fork-point baseline.
     %% If we crash before the final commit, restart sees this state.
     StateFlushed = do_flush(State),
+    case beamchain_fatal:is_aborted() of
+        true ->
+            %% Gate 6 (audit B3): the pre-flush failed and latched the node.
+            %% The rollback below assumes disk holds the pre-reorg state; it
+            %% does not, so wiping the ETS view would lose unflushed coins
+            %% and turn the next valid block into missing_inputs (a verdict
+            %% + a ban). Do not start the reorg; nothing has been mutated.
+            {error, beamchain_fatal:refusal(), State};
+        false ->
+            do_reorganize_flushed(NewBlocks, Snapshot, State, StateFlushed)
+    end.
+
+do_reorganize_flushed(NewBlocks, Snapshot, State, StateFlushed) ->
 
     %% Step 2: enter reorg mode — per-block flushes are suppressed.
     StateReorg = StateFlushed#state{reorg_in_progress = true},
@@ -2655,7 +2759,9 @@ rollback_reorg(Snapshot, OriginalState) ->
     SnapHeight = maps:get(tip_height, Snapshot),
     case SnapTip of
         undefined -> ets:delete(?CHAIN_META, tip);
-        _ -> ets:insert(?CHAIN_META, {tip, SnapTip, SnapHeight})
+        _ ->
+            publish_mtp(SnapTip, maps:get(mtp_timestamps, Snapshot)),
+            ets:insert(?CHAIN_META, {tip, SnapTip, SnapHeight})
     end,
 
     %% Return a state record matching the snapshot, with reorg flag
@@ -2814,8 +2920,43 @@ maybe_flush(State) ->
 %% full, or commits the post-flush state in full — never partial.
 do_flush(#state{tip_hash = undefined} = State) ->
     State;
-do_flush(#state{tip_hash = TipHash, tip_height = TipHeight,
-                pending_undo_deletes = PendingUndo} = State) ->
+do_flush(State) ->
+    case beamchain_fatal:is_aborted() of
+        true ->
+            %% Gate 6: never write the coins view after AbortNode (see
+            %% terminate/2). Covers every flush entry point: the flush
+            %% RPC / SIGTERM path, IBD-exit, compute_utxo_hash, reorg.
+            logger:error("chainstate: flush skipped -- node aborted (~p)",
+                         [beamchain_fatal:reason()]),
+            State;
+        false ->
+            do_flush_live(State)
+    end.
+
+%% Core FlushStateToDisk: the coins cache is cleared only after the batch
+%% write returned ok (write before forget -- already so here); a failed
+%% write is FatalError (validation.cpp:2779-2836). Retry the WriteBatch
+%% once; if it fails again, latch the node (AbortNode). The dirty/fresh/
+%% spent tables are left intact either way.
+flush_write_or_abort(Ops, TipHeight) ->
+    case beamchain_db:direct_write_batch(Ops) of
+        ok ->
+            ok;
+        Err1 ->
+            logger:error("chainstate: flush failed at height ~B (~p), "
+                         "retrying once", [TipHeight, Err1]),
+            case beamchain_db:direct_write_batch(Ops) of
+                ok ->
+                    ok;
+                Err2 ->
+                    beamchain_fatal:abort_node({flush_failed, TipHeight,
+                                                Err2}),
+                    {error, Err2}
+            end
+    end.
+
+do_flush_live(#state{tip_hash = TipHash, tip_height = TipHeight,
+                     pending_undo_deletes = PendingUndo} = State) ->
     DirtyCount = ets:info(?UTXO_DIRTY, size),
     SpentCount = ets:info(?UTXO_SPENT, size),
     FreshCount = ets:info(?UTXO_FRESH, size),
@@ -2833,9 +2974,13 @@ do_flush(#state{tip_hash = TipHash, tip_height = TipHeight,
                 {put, meta, <<"utxo_flush_height">>,
                  <<TipHeight:64/big>>}
             ],
-            beamchain_db:direct_write_batch(TipOps),
-            maybe_evict_cache(State),
-            State#state{blocks_since_flush = 0};
+            case flush_write_or_abort(TipOps, TipHeight) of
+                ok ->
+                    maybe_evict_cache(State),
+                    State#state{blocks_since_flush = 0};
+                {error, _} ->
+                    State
+            end;
         false ->
             %% Build write batch
             Ops = build_flush_ops(),
@@ -2852,7 +2997,7 @@ do_flush(#state{tip_hash = TipHash, tip_height = TipHeight,
                 {put, meta, <<"HEAD_BLOCKS">>, Marker}
             ],
 
-            case beamchain_db:direct_write_batch(AllOps) of
+            case flush_write_or_abort(AllOps, TipHeight) of
                 ok ->
                     %% Clear dirty/fresh/spent tracking tables.
                     %% After flush, all cached entries match RocksDB (clean).
@@ -2861,8 +3006,10 @@ do_flush(#state{tip_hash = TipHash, tip_height = TipHeight,
                     ets:delete_all_objects(?UTXO_FRESH),
                     ets:delete_all_objects(?UTXO_SPENT),
 
-                    %% Clear crash recovery marker (best-effort, not critical)
-                    beamchain_db:put_meta(<<"HEAD_BLOCKS">>, <<>>),
+                    %% Clear crash recovery marker (best-effort, not critical:
+                    %% a gen_server:call timeout here must not crash the
+                    %% chainstate after a successful flush).
+                    _ = (catch beamchain_db:put_meta(<<"HEAD_BLOCKS">>, <<>>)),
 
                     logger:debug("chainstate: flushed ~B dirty (~B fresh), "
                                  "~B spent, ~B undo-deletes at height ~B",
@@ -2878,6 +3025,8 @@ do_flush(#state{tip_hash = TipHash, tip_height = TipHeight,
                     State#state{blocks_since_flush = 0,
                                 pending_undo_deletes = []};
                 {error, Reason} ->
+                    %% Dirty/fresh/spent kept (nothing forgotten); the node
+                    %% is latched by flush_write_or_abort/2.
                     logger:error("chainstate: flush failed: ~p", [Reason]),
                     State
             end
@@ -3396,6 +3545,7 @@ finish_snapshot_load(State, Network, BaseHash, BaseHeight, NumCoins) ->
                         snapshot_validation = pending,
                         mtp_timestamps = MTPTimestamps
                     },
+                    publish_mtp(BaseHash, MTPTimestamps),
                     ets:insert(?CHAIN_META, {tip, BaseHash, BaseHeight}),
                     spawn(fun() -> start_background_validation(BaseHeight) end),
                     {ok, State2, BaseHeight}

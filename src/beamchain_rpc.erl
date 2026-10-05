@@ -7917,12 +7917,18 @@ rpc_submitblock([HexData]) when is_binary(HexData) ->
     %% rollback` rewind→dump→replay dance is in progress. Mirrors
     %% Core's NetworkDisable RAII around TemporaryRollback in
     %% rpc/blockchain.cpp::dumptxoutset.
-    case is_block_submission_paused() of
-        true ->
+    case {is_block_submission_paused(), beamchain_fatal:is_aborted()} of
+        {true, _} ->
             {ok, <<"rejected: block submission paused "
                    "(dumptxoutset rollback in progress)">>};
-        false ->
-            case beamchain_miner:submit_block(HexData) of
+        {false, true} ->
+            %% Gate 6: the node latched on a system fault (AbortNode) and is
+            %% shutting down. Core answers an RPC_VERIFY_ERROR, never a
+            %% BIP-22 result.
+            {error, ?RPC_VERIFY_ERROR, submitblock_fault_msg(
+                                         beamchain_fatal:refusal())};
+        {false, false} ->
+            case submitblock_call(HexData) of
                 ok ->
                     %% null = success per BIP-22
                     {ok, null};
@@ -7936,16 +7942,43 @@ rpc_submitblock([HexData]) when is_binary(HexData) ->
                     {error, ?RPC_DESERIALIZATION_ERROR,
                      <<"Block decode failed">>};
                 {error, Reason} ->
-                    %% Return the BIP-22 string as the result field,
-                    %% not as a JSON-RPC error.  Per BIP-22 and Bitcoin
-                    %% Core BIP22ValidationResult(), consensus rejections
-                    %% are result strings, not JSON-RPC error objects.
-                    {ok, bip22_result(Reason)}
+                    case beamchain_fatal:is_system_fault(Reason) orelse
+                         beamchain_fatal:is_aborted() of
+                        true ->
+                            %% Gate 6: a local system fault (I/O, timeout,
+                            %% dead worker, internal script error, latched
+                            %% node) is not a verdict about the block. Core:
+                            %% RPC_VERIFY_ERROR, not a BIP-22 token -- the old
+                            %% bip22_result(_) fallback answered "rejected".
+                            {error, ?RPC_VERIFY_ERROR,
+                             submitblock_fault_msg(Reason)};
+                        false ->
+                            %% Return the BIP-22 string as the result field,
+                            %% not as a JSON-RPC error.  Per BIP-22 and Bitcoin
+                            %% Core BIP22ValidationResult(), consensus rejections
+                            %% are result strings, not JSON-RPC error objects.
+                            {ok, bip22_result(Reason)}
+                    end
             end
     end;
 rpc_submitblock(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"Usage: submitblock \"hexdata\"">>}.
+
+%% beamchain_miner:submit_block/1 is a 60 s gen_server:call; its exit (a
+%% timeout behind a slow connect, a dead miner) is a local fault, not a
+%% block verdict.
+submitblock_call(HexData) ->
+    try beamchain_miner:submit_block(HexData)
+    catch
+        exit:Why -> {error, {exit_during_connect, Why}}
+    end.
+
+submitblock_fault_msg(Reason) ->
+    iolist_to_binary(io_lib:format(
+        "block not processed: local system fault (~0P); the block was "
+        "neither accepted nor rejected", [Reason, 12])).
+
 
 %% submitheader "hexdata"
 %%

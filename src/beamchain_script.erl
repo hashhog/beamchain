@@ -2514,14 +2514,35 @@ check_sig_encoding(SigBody, HashTypeByte, PubKey, Flags) ->
 %%% Top-level script verification
 %%% -------------------------------------------------------------------
 
+%% Three outcomes (gate 6; Core: a CScriptCheck reports a ScriptError, and
+%% anything else -- bad_alloc, a NIF/library fault -- is not a script
+%% result at all, it terminates):
+%%   true   -- the script verified;
+%%   false  -- SCRIPT_ERROR: the interpreter rejected the spend. The
+%%             interpreter reports every script failure as an explicit
+%%             {error, Atom} return or a throw/1 of a script-error token;
+%%   raises error({script_internal, {Class, Reason}}) -- INTERNAL: an
+%%             error/exit-class exception (a NIF fault, badarg from a
+%%             missing ETS table, system_limit, an interpreter bug). It is
+%%             NOT a verdict: callers re-run it, then halt (block path) or
+%%             refuse without remembering (mempool).
+%% The old `catch _:_ -> false` turned every INTERNAL into a script
+%% failure (a valid block marked invalid + its sender banned), and under a
+%% `<sig> <pk> CHECKSIG NOT` spend into an ACCEPT.
+%% Malformed script bytes must therefore never raise error-class
+%% exceptions: the interpreter is bounds-checked and answers {error, _}.
 -spec verify_script(binary(), binary(), [binary()],
                     non_neg_integer(), term()) -> boolean().
 verify_script(ScriptSig, ScriptPubKey, Witness, Flags, SigChecker) ->
     try
         do_verify_script(ScriptSig, ScriptPubKey, Witness, Flags, SigChecker)
     catch
-        _Class:_Reason:_Stack ->
-            false
+        throw:_ScriptError ->
+            false;
+        error:{script_internal, _} = Internal ->
+            error(Internal);
+        Class:Reason ->
+            error({script_internal, {Class, Reason}})
     end.
 
 do_verify_script(ScriptSig, ScriptPubKey, Witness, Flags, SigChecker) ->
