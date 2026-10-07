@@ -173,6 +173,9 @@
 -define(HEADERS_RESPONSE_TIMEOUT, 120000).   %% 2 minutes in milliseconds
 -define(PING_TIMEOUT, 1200000).              %% 20 minutes in milliseconds
 -define(MIN_CONNECT_TIME_FOR_EVICTION, 30).  %% 30 seconds
+%% Core net_processing.cpp CHAIN_SYNC_TIMEOUT (20 min) + HEADERS_RESPONSE_TIME
+%% (2 min): how long an outbound peer may stay behind our tip.
+-define(CHAIN_SYNC_EVICT_AFTER, (20 * 60 + 2 * 60)).
 
 %% Stale tip detection (Bitcoin Core: TipMayBeStale / CheckForStaleTipAndEvictPeers)
 -define(STALE_TIP_CHECK_INTERVAL, 600000).   %% 10 minutes in milliseconds
@@ -226,6 +229,11 @@
     keyed_netgroup = 0 :: non_neg_integer(),  %% hash of netgroup
     %% Stale peer tracking
     best_height = 0 :: non_neg_integer(),     %% peer's best known height
+    %% When we first saw this peer's best known height below our tip (0 =
+    %% not behind). Core CNodeState::m_chain_sync.m_timeout: an outbound
+    %% peer is only disconnected after CHAIN_SYNC_TIMEOUT (20 min) behind
+    %% plus HEADERS_RESPONSE_TIME (2 min), never on the first look.
+    behind_since = 0 :: non_neg_integer(),
     last_headers_time = 0 :: non_neg_integer(), %% last headers response time
     pending_getheaders = false :: boolean(),  %% waiting for headers response
     getheaders_sent_at = 0 :: non_neg_integer(), %% when getheaders was sent
@@ -3718,8 +3726,10 @@ check_stale_peers(Now) ->
     end, OutboundPeers).
 
 %% @doc Check if a specific peer should be evicted for staleness.
-check_peer_staleness(#peer_entry{pid = Pid, address = Addr, connect_time = ConnTime,
-                                  best_height = PeerHeight, pending_getheaders = PendingHdrs,
+check_peer_staleness(#peer_entry{pid = Pid, address = _Addr, connect_time = ConnTime,
+                                  best_height = PeerHeight,
+                                  behind_since = BehindSince,
+                                  pending_getheaders = PendingHdrs,
                                   getheaders_sent_at = HdrsSentAt, ping_latency = PingLatency,
                                   network_type = NetType},
                      OurTipHeight, Now, NowMs, HasCurrentPeer, ProtectedNetworks) ->
@@ -3744,35 +3754,45 @@ check_peer_staleness(#peer_entry{pid = Pid, address = Addr, connect_time = ConnT
                             self() ! {evict_peer, Pid, "ping timeout"},
                             ok;
                         _ ->
-                            %% Check stale tip (30 min behind when we have current peers)
+                            %% Stale tip (Core ConsiderEviction): only a peer
+                            %% that has stayed BEHIND our tip for the whole
+                            %% chain-sync timeout is dropped. best_height is
+                            %% what the peer has shown us (headers/
+                            %% announcements); it starts at 0, so the old
+                            %% "behind right now" test evicted every fresh
+                            %% outbound peer ~1 min after connecting as
+                            %% "stale tip (970370 blocks behind)" -- 352
+                            %% times in restart.log, gutting the outbound
+                            %% set that announces new blocks (2026-10-07
+                            %% wedges 4 and 5).
                             HeightDiff = OurTipHeight - PeerHeight,
-                            %% Convert block height difference to approximate time
-                            %% ~6 blocks per hour, so 30 min = ~3 blocks
-                            %% But we check based on actual time tracking
-                            case HasCurrentPeer andalso HeightDiff > 0 andalso
-                                 is_peer_stale(Addr, Now) of
-                                true when not IsProtected ->
+                            case HasCurrentPeer andalso HeightDiff > 0 of
+                                true when BehindSince =:= 0 ->
+                                    set_behind_since(Pid, Now);
+                                true when Now - BehindSince >
+                                          ?CHAIN_SYNC_EVICT_AFTER,
+                                          not IsProtected ->
                                     self() ! {evict_peer, Pid,
-                                              io_lib:format("stale tip (~B blocks behind)",
-                                                            [HeightDiff])};
-                                _ ->
+                                              io_lib:format("stale tip (~B blocks "
+                                                            "behind for ~B s)",
+                                                            [HeightDiff,
+                                                             Now - BehindSince])};
+                                true ->
+                                    ok;
+                                false when BehindSince =/= 0 ->
+                                    set_behind_since(Pid, 0);
+                                false ->
                                     ok
                             end
                     end
             end
     end.
 
-%% @doc Check if a peer's tip is stale based on last block time.
-is_peer_stale({_IP, _Port} = _Addr, Now) ->
-    %% For now, check last_block_time in the entry
-    %% A peer is stale if we haven't received a block announcement
-    %% from them in 30 minutes AND they're behind our tip
-    %% This is checked via the peer entry in the caller
-    %% Here we just verify the time threshold
-    _ = Now,
-    %% The actual staleness check happens in check_peer_staleness
-    %% where we have access to the peer entry
-    true.
+set_behind_since(Pid, T) ->
+    case ets:lookup(?PEER_TABLE, Pid) of
+        [E] -> ets:insert(?PEER_TABLE, E#peer_entry{behind_since = T}), ok;
+        [] -> ok
+    end.
 
 %% @doc Check if we have any peer with a current tip.
 %% A peer has a current tip if their best height is close to ours
