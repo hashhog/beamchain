@@ -253,10 +253,12 @@ g10_max_blocktxn_depth_constant_test() ->
 g11_no_optimistic_reconstruction_test() ->
     %% AUDIT MARKER: Core attempts a tempBlock reconstruction even when
     %% the block is already in flight from another peer (lines 4641-4653).
-    %% beamchain has no such path; the docstring at block_sync:1316-1320
-    %% explicitly defers it.
+    %% beamchain has no such path; block_sync's unsolicited-cmpctblock
+    %% handler explicitly defers it (a partial unsolicited reconstruction
+    %% now fetches the full block -- sync-wedge 2026-10-07 -- but the
+    %% optimistic in-flight path is still absent).
     ?assert(src_contains("beamchain_block_sync.erl",
-                         <<"Tracking partial reconstructions for unsolicited">>)),
+                         <<"optimistic reconstruction of a block already in">>)),
     ?assert(true).
 
 %%% ===================================================================

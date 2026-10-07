@@ -2049,7 +2049,10 @@ do_handle_unsolicited_cmpctblock(Peer, CmpctBlock, BlockHash, State) ->
                 {partial, _PartialState} ->
                     %% (2) Never drop it: fetch the whole block from the
                     %% announcer (Core would send getblocktxn; a full
-                    %% getdata is the simpler equivalent).
+                    %% getdata is the simpler equivalent). Still deferred:
+                    %% optimistic reconstruction of a block already in
+                    %% flight from another peer (Core
+                    %% net_processing.cpp:4641-4653, audit G11).
                     logger:info("block_sync: unsolicited cmpctblock ~s from "
                                 "~p missing txs -- requesting the full block",
                                 [hash_hex(BlockHash), Peer]),
