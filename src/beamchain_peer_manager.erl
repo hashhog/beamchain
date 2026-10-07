@@ -115,6 +115,7 @@
          maybe_open_feeler/1,
          test_ensure_peer_table/0,
          test_insert_peer/4,
+         test_send_periodic_getheaders/0,
          test_set_peer_info/2,
          test_get_token_bucket/1,
          test_set_token_bucket/3,
@@ -3649,10 +3650,26 @@ find_best_worst_peers(Peers) ->
 %% equal-height-to-us after IBD and no refresh ever happens. See
 %% wave40-2026-04-16/beamchain-stale-tip-rootcause.md.
 send_periodic_getheaders() ->
-    AllPeers = ets:foldl(fun
-        (#peer_entry{connected = true, pid = Pid}, Acc) -> [Pid | Acc];
+    %% Prefer OUTBOUND relay peers (peers we chose). A random pick over every
+    %% connection usually lands on an inbound crawler / seeder (height 0,
+    %% 350000, 923118 ...) that answers 0 headers -- on 2026-10-07 every
+    %% probe in a 31-minute stall did, and header_sync concluded "sync
+    %% complete" while 970354-970356 existed. Core's header fetches go to
+    %% outbound peers it can rely on.
+    Outbound = ets:foldl(fun
+        (#peer_entry{connected = true, direction = outbound, pid = Pid,
+                     conn_type = CT}, Acc) when CT =/= feeler -> [Pid | Acc];
         (_, Acc) -> Acc
     end, [], ?PEER_TABLE),
+    AllPeers = case Outbound of
+        [] ->
+            ets:foldl(fun
+                (#peer_entry{connected = true, pid = Pid}, Acc) -> [Pid | Acc];
+                (_, Acc) -> Acc
+            end, [], ?PEER_TABLE);
+        _ ->
+            Outbound
+    end,
     case AllPeers of
         [] ->
             ok;
@@ -3887,6 +3904,9 @@ test_ensure_peer_table() ->
 
 %% Insert a minimal peer_entry. Direction = inbound | outbound; ConnType =
 %% full_relay | block_relay | feeler; Perm = normal | noban | manual.
+test_send_periodic_getheaders() ->
+    send_periodic_getheaders().
+
 test_insert_peer(Pid, Direction, ConnType, Perm) ->
     {NoBan, Manual} = case Perm of
         noban  -> {true, false};
