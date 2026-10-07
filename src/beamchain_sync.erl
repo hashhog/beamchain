@@ -16,6 +16,7 @@
 %% API
 -export([start_link/0]).
 -export([handle_peer_message/3]).
+-export([process_tx/2]).
 -export([notify_peer_connected/2, notify_peer_disconnected/1]).
 -export([notify_headers_complete/1]).
 -export([notify_blocks_complete/1]).
@@ -59,7 +60,18 @@ start_link() ->
 
 %% @doc Route a peer message to the correct sync handler.
 %% Called by peer_manager when it gets a sync-related message.
+%%
+%% `tx` goes to beamchain_tx_ingest, never into this process's mailbox:
+%% AcceptToMemoryPool is a (up to 30 s) mempool call, and headers / blocks
+%% must not queue behind it (the 2026-10-07 mainnet wedges at 970297 and
+%% 970314: getheaders replies reached header_sync >20 s late for half an
+%% hour while this loop worked through a tx backlog).
 -spec handle_peer_message(pid(), atom(), binary()) -> ok.
+handle_peer_message(Peer, tx, Payload) ->
+    case beamchain_tx_ingest:submit(Peer, Payload) of
+        true -> ok;
+        false -> gen_server:cast(?SERVER, {peer_message, Peer, tx, Payload})
+    end;
 handle_peer_message(Peer, Command, Payload) ->
     gen_server:cast(?SERVER, {peer_message, Peer, Command, Payload}).
 
@@ -401,6 +413,16 @@ route_message(Peer, getblocktxn, Payload, State) ->
 %% attributed for per-peer DoS-score eviction (mirrors Core's
 %% PeerManagerImpl::ProcessMessage(NetMsgType::TX) → AddTx(tx, nodeid)).
 route_message(Peer, tx, Payload, State) ->
+    process_tx(Peer, Payload),
+    State;
+
+route_message(_Peer, _Command, _Payload, State) ->
+    State.
+
+%% @doc Validate a P2P tx (AcceptToMemoryPool) and relay it. Runs in
+%% beamchain_tx_ingest (or, when that is not running, in this process).
+-spec process_tx(pid(), binary()) -> ok.
+process_tx(Peer, Payload) ->
     case beamchain_p2p_msg:decode_payload(tx, Payload) of
         {ok, Tx} ->
             %% Gate 6: the 30 s mempool call timing out (a busy mempool
@@ -412,7 +434,13 @@ route_message(Peer, tx, Payload, State) ->
                          end,
             case AtmpResult of
                 {ok, Txid} ->
-                    logger:info("sync: accepted tx ~s from ~p",
+                    %% debug, not info: Core logs ATMP accepts only under
+                    %% -debug=mempool. At info this was 1.09M records (~2.2M of 5.0M
+                    %% lines of restart.log) and pushed the default handler into
+                    %% drop/sync mode (sync mode blocks EVERY logging
+                    %% process, header_sync included) during the
+                    %% 2026-10-07 wedges.
+                    logger:debug("sync: accepted tx ~s from ~p",
                                 [beamchain_serialize:hex_encode(Txid), Peer]),
                     %% Relay to all peers via inv (per-peer BIP-339
                     %% MSG_WTX / MSG_TX choice)
@@ -423,10 +451,7 @@ route_message(Peer, tx, Payload, State) ->
         _Error ->
             beamchain_peer:add_misbehavior(Peer, 20)
     end,
-    State;
-
-route_message(_Peer, _Command, _Payload, State) ->
-    State.
+    ok.
 
 %%% ===================================================================
 %%% Internal: mempool tx-relay ingest (inv -> getdata REQUEST leg)
