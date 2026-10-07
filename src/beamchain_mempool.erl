@@ -106,6 +106,11 @@
 %% Tests seed the ETS table directly (it is public) and call this helper.
 -export([lookup_entry_by_wtxid/1, get_tx_by_wtxid/1]).
 
+-ifdef(TEST).
+%% Drive the production entry writers (and so the wtxid index) from tests.
+-export([test_insert_entry/1, test_remove_entry/1]).
+-endif.
+
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2]).
@@ -164,6 +169,14 @@
 %%% -------------------------------------------------------------------
 
 -define(MEMPOOL_TXS, mempool_txs).           %% txid -> mempool_entry
+%% wtxid -> txid secondary index (Core mapTx's index_by_wtxid). Maintained by
+%% insert_entry/1 + remove_entry/1, the only writers that add or drop a
+%% ?MEMPOOL_TXS key. lookup_entry_by_wtxid/1 used to emulate it with a
+%% full-table ets:match_object: 8 ms at 20k entries, 32 ms at 80k, run by
+%% beamchain_sync for EVERY MSG_WTX inv item from EVERY peer -- under box
+%% load that alone outran the sync loop and wedged header/block download
+%% (mainnet 2026-10-07, 970297 and 970314).
+-define(MEMPOOL_WTXID, mempool_wtxid).
 -define(MEMPOOL_BY_FEE, mempool_by_fee).     %% ordered {fee_rate, txid}
 -define(MEMPOOL_OUTPOINTS, mempool_outpoints). %% {txid, vout} -> spending_txid
 -define(MEMPOOL_ORPHANS, mempool_orphans).         %% wtxid -> {tx, expiry, announcers, weight}  (BIP-339 primary key)
@@ -716,6 +729,9 @@ init([]) ->
     ensure_table(?MEMPOOL_TXS, [set, public, named_table,
                                 {read_concurrency, true},
                                 {write_concurrency, true}]),
+    ensure_table(?MEMPOOL_WTXID, [set, public, named_table,
+                                  {read_concurrency, true},
+                                  {write_concurrency, true}]),
     ensure_table(?MEMPOOL_BY_FEE, [ordered_set, public, named_table]),
     ensure_table(?MEMPOOL_OUTPOINTS, [set, public, named_table,
                                       {write_concurrency, true}]),
@@ -3563,6 +3579,10 @@ first_announcer([P | _]) -> P.
 %%% ===================================================================
 
 insert_entry(#mempool_entry{txid = Txid, fee_rate = FeeRate, tx = Tx} = Entry) ->
+    %% Index first: a lock-free reader that finds the txid entry can always
+    %% find it by wtxid too (the reverse order would let a wtxid probe miss
+    %% a tx that is already in ?MEMPOOL_TXS).
+    wtxid_index_put(Entry),
     ets:insert(?MEMPOOL_TXS, {Txid, Entry}),
     ets:insert(?MEMPOOL_BY_FEE, {{FeeRate, Txid}}),
     lists:foreach(fun(#tx_in{prev_out = #outpoint{hash = H, index = I}}) ->
@@ -3585,10 +3605,26 @@ remove_entry(Txid) ->
                 ets:delete(?MEMPOOL_EPHEMERAL, {H, I})
             end, Tx#transaction.inputs),
             ets:delete(?MEMPOOL_TXS, Txid),
+            wtxid_index_delete(Entry),
             Entry;
         [] ->
             not_found
     end.
+
+wtxid_index_put(#mempool_entry{txid = Txid, wtxid = Wtxid})
+  when is_binary(Wtxid) ->
+    catch ets:insert(?MEMPOOL_WTXID, {Wtxid, Txid}),
+    ok;
+wtxid_index_put(_) ->
+    ok.
+
+wtxid_index_delete(#mempool_entry{txid = Txid, wtxid = Wtxid})
+  when is_binary(Wtxid) ->
+    %% Only drop the index row if it still points at this txid.
+    catch ets:delete_object(?MEMPOOL_WTXID, {Wtxid, Txid}),
+    ok;
+wtxid_index_delete(_) ->
+    ok.
 
 %% @doc Remove an entry and send ZMQ notification.
 %% Returns {Entry, NewState} on success or {not_found, State} if not in mempool.
@@ -5549,12 +5585,41 @@ check_tx_already_known(#transaction{outputs = Outputs} = Tx) ->
     end.
 
 %% @doc Look up a mempool entry by wtxid (witness hash).
-%% Beamchain stores entries keyed by txid in ?MEMPOOL_TXS but also stamps each
-%% entry with its wtxid.  Core has two separate indices (mapTx + mapTxByWtxid);
-%% we emulate the wtxid index with a linear scan.  Mempool sizes are bounded
-%% so the cost is acceptable; if it becomes a hotspot a secondary ets index
-%% on wtxid → txid would be the right fix.
+%% O(1) through the ?MEMPOOL_WTXID index (Core mapTx index_by_wtxid). A hit
+%% is verified against ?MEMPOOL_TXS, so a stale index row can never return a
+%% tx that has left the pool. A miss is authoritative only while the index
+%% covers every entry (same size as ?MEMPOOL_TXS -- always true when entries
+%% go through insert_entry/remove_entry); if anything ever inserted into
+%% ?MEMPOOL_TXS directly the sizes differ and we fall back to the old scan,
+%% so the answer stays correct in every case and fast in production.
 lookup_entry_by_wtxid(Wtxid) ->
+    case wtxid_index_lookup(Wtxid) of
+        {ok, _} = Hit -> Hit;
+        miss ->
+            case wtxid_index_complete() of
+                true  -> not_found;
+                false -> lookup_entry_by_wtxid_scan(Wtxid)
+            end
+    end.
+
+wtxid_index_lookup(Wtxid) ->
+    try ets:lookup(?MEMPOOL_WTXID, Wtxid) of
+        [{Wtxid, Txid}] ->
+            case ets:lookup(?MEMPOOL_TXS, Txid) of
+                [{Txid, #mempool_entry{wtxid = Wtxid} = Entry}] -> {ok, Entry};
+                _ -> miss
+            end;
+        [] -> miss
+    catch error:badarg -> miss
+    end.
+
+wtxid_index_complete() ->
+    case {ets:info(?MEMPOOL_WTXID, size), ets:info(?MEMPOOL_TXS, size)} of
+        {N, N} when is_integer(N) -> true;
+        _ -> false
+    end.
+
+lookup_entry_by_wtxid_scan(Wtxid) ->
     case ets:match_object(?MEMPOOL_TXS,
                           {'_', #mempool_entry{wtxid = Wtxid, _ = '_'}}) of
         [{_, Entry}] -> {ok, Entry};
@@ -5658,3 +5723,8 @@ short_hex(<<H:4/binary, _/binary>>) ->
     beamchain_serialize:hex_encode(H);
 short_hex(Other) ->
     beamchain_serialize:hex_encode(Other).
+
+-ifdef(TEST).
+test_insert_entry(Entry) -> insert_entry(Entry).
+test_remove_entry(Txid) -> remove_entry(Txid).
+-endif.
