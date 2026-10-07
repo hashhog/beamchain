@@ -266,9 +266,47 @@ handle_cast({headers, Peer, Headers}, #state{status = Status} = State)
     %% blocks after IBD (2026-07-20 wedge: 92 blocks behind, 14h, 10 peers).
     catch beamchain_peer_manager:mark_headers_received(Peer),
     handle_announced_headers(Peer, Headers, State);
+handle_cast({headers, Peer, [First | _] = Headers},
+            #state{status = syncing, hss_state = undefined,
+                   tip_hash = TipHash} = State)
+  when First#block_header.prev_hash =:= TipHash ->
+    %% status = syncing, sender is NOT our sync peer, and the batch extends
+    %% our header tip. Core's ProcessHeadersMessage accepts connecting
+    %% headers from ANY peer at any time (net_processing.cpp); only the
+    %% initial low-work sync is pinned to one peer (HSS, excluded above).
+    %%
+    %% Dropping these was half of the 2026-10-07 mainnet wedge: replies
+    %% reached us >20 s after the getheaders, by which time the probe had
+    %% timed out and rotated to another peer, so EVERY reply (and every
+    %% BIP-130 announcement, since probing kept status = syncing) came
+    %% from a "non-sync peer" and was deferred -- 31 minutes with no new
+    %% header while 13 peers had them. Adopt the sender for this batch,
+    %% exactly as handle_announced_headers/3 does when idle.
+    catch beamchain_peer_manager:mark_headers_received(Peer),
+    case check_headers_pow_and_continuity(Headers, State) of
+        ok ->
+            logger:info("header_sync: ~B connecting headers from non-sync "
+                        "peer ~p (sync peer ~p) -- processing",
+                        [length(Headers), Peer, State#state.sync_peer]),
+            State2 = cancel_timer(State),
+            State3 = State2#state{sync_peer = Peer, probe_attempted = [],
+                                  headers_received = 0},
+            {noreply, process_headers(Headers, Peer, State3)};
+        {error, invalid_pow} ->
+            logger:warning("header_sync: peer ~p sent header with invalid PoW",
+                           [Peer]),
+            beamchain_peer:add_misbehavior(Peer, 100),
+            {noreply, remove_peer_state(Peer, State)};
+        {error, non_continuous} ->
+            logger:warning("header_sync: peer ~p sent non-continuous headers",
+                           [Peer]),
+            beamchain_peer:add_misbehavior(Peer, 20),
+            {noreply, remove_peer_state(Peer, State)}
+    end;
 handle_cast({headers, Peer, Headers}, State) ->
-    %% status = syncing but sender is not our sync peer. Don't interleave a
-    %% foreign batch with the active sequential sync — but don't lose the
+    %% status = syncing but sender is not our sync peer and the batch does
+    %% not extend our tip (or the HSS pipeline is active). Don't interleave
+    %% a foreign batch with the active sequential sync — but don't lose the
     %% information either: refresh the peer's known height (so peer
     %% selection stops lying) and log instead of silently dropping.
     catch beamchain_peer_manager:mark_headers_received(Peer),
