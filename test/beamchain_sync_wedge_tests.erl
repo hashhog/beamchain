@@ -253,6 +253,107 @@ tick(N, S) ->
     tick(N - 1, S2).
 
 %%% ===================================================================
+%%% Part 1b: wedge 4 (85ca6e9, 970353, 2026-10-07 15:11-15:41Z) -- new
+%%% blocks announced as cmpctblock (we ask every peer for BIP152 high
+%%% bandwidth) never reached header_sync: a partial reconstruction was
+%%% dropped, and Core never re-announces a block it sent as cmpctblock.
+%%% ===================================================================
+
+cmpct_setup() ->
+    Tab = bs_setup(),
+    ok = meck:new(beamchain_compact_block, [no_link]),
+    ok = meck:expect(beamchain_compact_block, init_compact_block,
+                     fun(_) -> {ok, cs} end),
+    ok = meck:new(beamchain_header_sync, [no_link]),
+    ok = meck:expect(beamchain_header_sync, handle_headers,
+                     fun(_, _) -> ok end),
+    ok = meck:expect(beamchain_header_sync, probe_peer, fun(_) -> ok end),
+    ok = meck:expect(beamchain_db, has_block, fun(_) -> false end),
+    ok = meck:expect(beamchain_db, get_block_index_by_hash,
+        fun(<<H:256>>) -> {ok, #{height => H}} end),
+    ok = meck:expect(beamchain_chainstate, get_tip_height,
+        fun() -> [{tip, {_, H}}] = ets:lookup(Tab, tip), {ok, H} end),
+    Tab.
+
+cmpct_teardown(Tab) ->
+    catch meck:unload(beamchain_compact_block),
+    catch meck:unload(beamchain_header_sync),
+    bs_teardown(Tab).
+
+cmpct_announce_test_() ->
+    {foreach, fun cmpct_setup/0, fun cmpct_teardown/1,
+     [fun(T) -> {"a partially reconstructable HB cmpctblock is NOT dropped: "
+                 "its header goes to header_sync and the block is fetched",
+                 fun() -> partial_cmpct_not_dropped(T) end} end,
+      fun(T) -> {"control: a fully reconstructable cmpctblock connects",
+                 fun() -> full_cmpct_connects(T) end} end]}.
+
+cmpct_msg(H) ->
+    #{header => mk_header(H), nonce => 0, short_ids => [<<1:48>>],
+      prefilled_txns => []}.
+
+partial_cmpct_not_dropped(_Tab) ->
+    put(getdata_seen, 0),
+    ok = meck:expect(beamchain_compact_block, try_reconstruct,
+                     fun(_, _) -> {partial, ps} end),
+    P1 = spawn(fun() -> receive stop -> ok end end),
+    S0 = complete_state(100, P1),
+    {noreply, _S1} = beamchain_block_sync:handle_cast(
+                       {cmpctblock, P1, cmpct_msg(101)}, S0),
+    %% Core ProcessNewBlockHeaders: the header reaches header_sync...
+    ?assert(meck:called(beamchain_header_sync, handle_headers,
+                        [P1, [mk_header(101)]])),
+    %% ...and the body is requested, not dropped.
+    ?assertEqual([height_hash(101)], collect_getdata()),
+    P1 ! stop.
+
+full_cmpct_connects(Tab) ->
+    ok = meck:expect(beamchain_compact_block, try_reconstruct,
+                     fun(_, _) -> {ok, mk_block(101)} end),
+    P1 = spawn(fun() -> receive stop -> ok end end),
+    S0 = complete_state(100, P1),
+    {noreply, _} = beamchain_block_sync:handle_cast(
+                     {cmpctblock, P1, cmpct_msg(101)}, S0),
+    ?assertMatch([{tip, {_, 101}}], ets:lookup(Tab, tip)),
+    P1 ! stop.
+
+%%% ===================================================================
+%%% Part 1c: the periodic probe asks a peer that has the chain
+%%% ===================================================================
+
+periodic_probe_prefers_outbound_test_() ->
+    {setup,
+     fun() ->
+         beamchain_peer_manager:test_ensure_peer_table(),
+         ets:delete_all_objects(beamchain_peers),
+         ok = meck:new(beamchain_header_sync, [no_link]),
+         ok = meck:expect(beamchain_header_sync, probe_peer, fun(_) -> ok end)
+     end,
+     fun(_) ->
+         catch meck:unload(beamchain_header_sync),
+         ets:delete_all_objects(beamchain_peers)
+     end,
+     fun() ->
+         Spawn = fun() -> spawn(fun() -> receive stop -> ok end end) end,
+         Inbound = [Spawn() || _ <- lists:seq(1, 6)],
+         Out = Spawn(),
+         Feeler = Spawn(),
+         [beamchain_peer_manager:test_insert_peer(P, inbound, full_relay,
+                                                  normal) || P <- Inbound],
+         beamchain_peer_manager:test_insert_peer(Out, outbound, full_relay,
+                                                 normal),
+         beamchain_peer_manager:test_insert_peer(Feeler, outbound, feeler,
+                                                 normal),
+         [beamchain_peer_manager:test_send_periodic_getheaders()
+          || _ <- lists:seq(1, 40)],
+         Probed = lists:usort([P || {_, {beamchain_header_sync, probe_peer,
+                                         [P]}, _} <-
+                                        meck:history(beamchain_header_sync)]),
+         ?assertEqual([Out], Probed),
+         [P ! stop || P <- [Out, Feeler | Inbound]]
+     end}.
+
+%%% ===================================================================
 %%% Part 2: header_sync -- late replies from a rotated-away peer (link 2)
 %%% ===================================================================
 
