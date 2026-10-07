@@ -2014,14 +2014,28 @@ handle_cmpctblock_received(Peer, CmpctBlock, State) ->
     end.
 
 %% Process a cmpctblock we did NOT request (high-bandwidth tip-follow).
-%% Reconstruct via mempool; on full success, validate+connect through
-%% handle_unsolicited_block. Partial / error cases drop the cmpctblock
-%% so the peer's BIP152 fallback can retry via the legacy inv path.
-%% Tracking partial reconstructions for unsolicited cmpctblocks would
-%% require an "unsolicited" flag in pending_compact and an alternate
-%% blocktxn-response path; deferred until tip blocks routinely miss
-%% mempool reconstruction (rare).
+%%
+%% We send sendcmpct(announce=true, v2) to every peer, so every Core peer
+%% announces new blocks to us ONLY as a cmpctblock -- it marks the block as
+%% announced and never follows up with headers or inv. Core's CMPCTBLOCK
+%% handler therefore (1) runs the header through ProcessNewBlockHeaders
+%% first, whatever happens to the body, and (2) on a partial reconstruction
+%% asks for the missing txs / the full block -- it never drops the
+%% announcement (net_processing.cpp ProcessMessage CMPCTBLOCK).
+%%
+%% beamchain dropped every partial reconstruction at debug level and never
+%% stored the header, so a block whose txs were not all in our mempool (the
+%% normal case) was simply never heard of: restart.log since 2026-10-05 has
+%% 0 blocks connected this way and every new block was learned from a newly
+%% connected peer's version height or the 5-minute random probe. That is
+%% the "headers stop advancing" half of every 2026-10-07 wedge (970353:
+%% 31 minutes, 3 blocks, no announcement reached header_sync).
 do_handle_unsolicited_cmpctblock(Peer, CmpctBlock, BlockHash, State) ->
+    #{header := Header} = CmpctBlock,
+    %% (1) The header goes to header_sync first (Core ProcessNewBlockHeaders):
+    %% if it extends our header chain it is stored and block download
+    %% follows through the normal path, whatever the body does here.
+    _ = (catch beamchain_header_sync:handle_headers(Peer, [Header])),
     case beamchain_compact_block:init_compact_block(CmpctBlock) of
         {ok, CompactState} ->
             RecentTxns = State#state.recent_txns,
@@ -2033,15 +2047,18 @@ do_handle_unsolicited_cmpctblock(Peer, CmpctBlock, BlockHash, State) ->
                                 [hash_hex(BlockHash), Peer]),
                     handle_unsolicited_block(Peer, Block, State);
                 {partial, _PartialState} ->
-                    logger:debug("block_sync: unsolicited cmpctblock ~s "
-                                 "missing txs; dropping (peer will fall "
-                                 "back to inv path)",
-                                 [hash_hex(BlockHash)]),
-                    State;
+                    %% (2) Never drop it: fetch the whole block from the
+                    %% announcer (Core would send getblocktxn; a full
+                    %% getdata is the simpler equivalent).
+                    logger:info("block_sync: unsolicited cmpctblock ~s from "
+                                "~p missing txs -- requesting the full block",
+                                [hash_hex(BlockHash), Peer]),
+                    request_full_block(Peer, BlockHash, State);
                 {error, Reason} ->
-                    logger:debug("block_sync: unsolicited cmpctblock "
-                                 "reconstruct error: ~p", [Reason]),
-                    State
+                    logger:info("block_sync: unsolicited cmpctblock ~s "
+                                "reconstruct error ~p -- requesting the full "
+                                "block", [hash_hex(BlockHash), Reason]),
+                    request_full_block(Peer, BlockHash, State)
             end;
         {error, Reason} ->
             logger:debug("block_sync: unsolicited cmpctblock init error: ~p",
