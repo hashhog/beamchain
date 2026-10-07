@@ -354,6 +354,84 @@ periodic_probe_prefers_outbound_test_() ->
      end}.
 
 %%% ===================================================================
+%%% Part 1d: wedge 5 (970370) -- outbound peers evicted as "stale tip
+%%% (970370 blocks behind)" ~1 min after connecting: best_height starts at
+%%% 0 and is only raised by headers WE asked them for, so a fresh Core peer
+%%% looks 970370 blocks behind. 352 such evictions in restart.log.
+%%% ===================================================================
+
+-define(TIP, 970370).
+
+stale_setup() ->
+    beamchain_peer_manager:test_ensure_peer_table(),
+    ets:delete_all_objects(beamchain_peers),
+    ok = meck:new(beamchain_chainstate, [no_link]),
+    ok = meck:expect(beamchain_chainstate, get_tip_height,
+                     fun() -> {ok, ?TIP} end),
+    flush_all(),
+    ok.
+
+stale_teardown(_) ->
+    catch meck:unload(beamchain_chainstate),
+    ets:delete_all_objects(beamchain_peers),
+    flush_all().
+
+evictions() ->
+    receive {evict_peer, P, Why} -> [{P, lists:flatten(Why)} | evictions()]
+    after 0 -> []
+    end.
+
+stale_peer_eviction_test_() ->
+    {foreach, fun stale_setup/0, fun stale_teardown/1,
+     [fun(_) -> {"a fresh outbound peer that has not served us headers is "
+                 "NOT evicted as stale on the next pass",
+                 fun fresh_peer_not_evicted/0} end,
+      fun(_) -> {"control: a peer still behind after the chain-sync "
+                 "timeout (Core 20 min + 2 min) IS evicted",
+                 fun behind_peer_evicted_after_timeout/0} end,
+      fun(_) -> {"a peer one block behind that catches up is never evicted",
+                 fun lagging_peer_that_catches_up_kept/0} end]}.
+
+spawn_peer() -> spawn(fun() -> receive stop -> ok end end).
+
+two_peers() ->
+    A = spawn_peer(), B = spawn_peer(),
+    beamchain_peer_manager:test_insert_peer(A, outbound, full_relay, normal),
+    beamchain_peer_manager:test_insert_peer(B, outbound, full_relay, normal),
+    %% A served us the tip (a "current" peer exists).
+    beamchain_peer_manager:update_peer_height(A, ?TIP),
+    {A, B}.
+
+fresh_peer_not_evicted() ->
+    {A, B} = two_peers(),
+    Now = erlang:system_time(second),
+    beamchain_peer_manager:test_check_stale_peers(Now),
+    Ev = evictions(),
+    ?debugFmt("evictions on first pass: ~p", [Ev]),
+    ?assertEqual([], Ev),
+    A ! stop, B ! stop.
+
+behind_peer_evicted_after_timeout() ->
+    {A, B} = two_peers(),
+    Now = erlang:system_time(second),
+    beamchain_peer_manager:test_check_stale_peers(Now),
+    _ = evictions(),
+    beamchain_peer_manager:test_check_stale_peers(Now + 23 * 60),
+    ?assertMatch([{B, _}], evictions()),
+    A ! stop, B ! stop.
+
+lagging_peer_that_catches_up_kept() ->
+    {A, B} = two_peers(),
+    beamchain_peer_manager:update_peer_height(B, ?TIP - 1),
+    Now = erlang:system_time(second),
+    beamchain_peer_manager:test_check_stale_peers(Now),
+    ?assertEqual([], evictions()),
+    beamchain_peer_manager:update_peer_height(B, ?TIP),
+    beamchain_peer_manager:test_check_stale_peers(Now + 23 * 60),
+    ?assertEqual([], evictions()),
+    A ! stop, B ! stop.
+
+%%% ===================================================================
 %%% Part 2: header_sync -- late replies from a rotated-away peer (link 2)
 %%% ===================================================================
 
