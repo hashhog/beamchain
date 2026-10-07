@@ -116,6 +116,7 @@
          test_ensure_peer_table/0,
          test_insert_peer/4,
          test_send_periodic_getheaders/0,
+         test_check_stale_peers/1,
          test_set_peer_info/2,
          test_get_token_bucket/1,
          test_set_token_bucket/3,
@@ -3690,9 +3691,11 @@ send_periodic_getheaders() ->
 %% 3. Peers with ping latency exceeding 20 minutes
 %% Protects at least one peer per network type (IPv4, IPv6, Tor).
 check_stale_peers() ->
+    check_stale_peers(erlang:system_time(second)).
+
+check_stale_peers(Now) ->
     OurTipHeight = get_our_tip_height(),
-    Now = erlang:system_time(second),
-    NowMs = erlang:system_time(millisecond),
+    NowMs = Now * 1000 + erlang:system_time(millisecond) rem 1000,
 
     %% Collect all outbound peers
     OutboundPeers = ets:foldl(fun
@@ -3904,6 +3907,11 @@ test_ensure_peer_table() ->
 
 %% Insert a minimal peer_entry. Direction = inbound | outbound; ConnType =
 %% full_relay | block_relay | feeler; Perm = normal | noban | manual.
+%% Run one stale-peer pass as of NowSec; eviction requests land in the
+%% caller's mailbox as {evict_peer, Pid, Reason}.
+test_check_stale_peers(NowSec) ->
+    check_stale_peers(NowSec).
+
 test_send_periodic_getheaders() ->
     send_periodic_getheaders().
 
