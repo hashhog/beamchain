@@ -1440,6 +1440,11 @@ handle_info(check_stale_tip, #state{last_tip_update = LastUpdate} = State) ->
             %% Our tip is stale — send getheaders to best peer, disconnect worst
             logger:warning("peer_manager: potential stale tip detected "
                            "(last tip update: ~B seconds ago)", [StaleDuration]),
+            %% Self-heal block download: if headers are ahead of the tip,
+            %% block_sync rebuilds its frontier from chain state (a no-op
+            %% when there is no gap). The 2026-10-07 wedges sat 87 and 45
+            %% minutes in a state only a restart cleared.
+            catch beamchain_block_sync:stale_tip_rearm(),
             handle_stale_tip_detected(State);
         false ->
             State

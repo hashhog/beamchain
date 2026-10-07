@@ -29,6 +29,7 @@
 -export([start_link/0,
          start_sync/1,
          stop_sync/0,
+         stale_tip_rearm/0,
          handle_block/2,
          handle_notfound/2,
          handle_peer_connected/2,
@@ -274,6 +275,20 @@ start_sync(Opts) ->
 stop_sync() ->
     gen_server:cast(?SERVER, stop_sync).
 
+%% @doc Stale-tip self-heal (peer_manager's 30-min stale-tip check). If our
+%% header chain is ahead of the connected tip, throw away ALL download
+%% bookkeeping (queue, in-flight assignments, buffered blocks) and start
+%% over from chainstate tip + 1 to the header tip. After 30 min without a
+%% new tip nothing in that bookkeeping is worth keeping, and whatever slip
+%% left a block un-requested cannot survive a rebuild from chain state.
+%% Core: a stalled download never outlives the block download timeout --
+%% the peer is dropped and every block it held becomes eligible for
+%% FindNextBlocksToDownload again (net_processing.cpp, m_downloading_since /
+%% BLOCK_DOWNLOAD_TIMEOUT_BASE, FinalizeNode). No-op when there is no gap.
+-spec stale_tip_rearm() -> ok.
+stale_tip_rearm() ->
+    gen_server:cast(?SERVER, stale_tip_rearm).
+
 %% @doc Handle a received block from a peer.
 -spec handle_block(pid(), #block{}) -> ok.
 handle_block(Peer, Block) ->
@@ -346,7 +361,7 @@ handle_call(_Request, _From, State) ->
 
 handle_cast({start_sync, Opts}, #state{status = idle,
                                          assume_valid = AV} = State) ->
-    TargetHeight = maps:get(target_height, Opts, 0),
+    TargetHeight = clamp_to_header_tip(maps:get(target_height, Opts, 0)),
     ProgressCb = maps:get(progress_cb, Opts, undefined),
 
     %% Determine where to start: after last fully validated block
@@ -422,7 +437,8 @@ handle_cast({start_sync, Opts}, #state{status = idle,
 %% is invoked unconditionally per peer-message tick; IBD is a dynamic predicate.
 handle_cast({start_sync, Opts}, #state{status = complete} = State) ->
     StartHeight = find_start_height(),
-    TargetHeight = maps:get(target_height, Opts, State#state.target_height),
+    TargetHeight = clamp_to_header_tip(
+                     maps:get(target_height, Opts, State#state.target_height)),
     %% `>=`, not `>`: re-arm even for a single-block advance (StartHeight ==
     %% TargetHeight), otherwise the block that extends the tip by exactly one
     %% (the common post-reorg follow-up case, tip 107 -> announced 108) is
@@ -456,7 +472,7 @@ handle_cast({start_sync, Opts}, #state{status = complete} = State) ->
 handle_cast({start_sync, Opts}, #state{status = syncing,
                                        target_height = OldTarget,
                                        download_queue = Queue} = State) ->
-    NewTarget = maps:get(target_height, Opts, OldTarget),
+    NewTarget = clamp_to_header_tip(maps:get(target_height, Opts, OldTarget)),
     case NewTarget > OldTarget of
         true ->
             Extra = lists:seq(OldTarget + 1, NewTarget),
@@ -468,6 +484,35 @@ handle_cast({start_sync, Opts}, #state{status = syncing,
             State3 = fill_pipeline(State2),
             {noreply, State3};
         false ->
+            {noreply, State}
+    end;
+
+handle_cast(stale_tip_rearm, State) ->
+    ChainTip = case beamchain_chainstate:get_tip() of
+        {ok, {_, H}} -> H;
+        _ -> undefined
+    end,
+    case header_tip_height() of
+        HT when is_integer(HT), is_integer(ChainTip), HT > ChainTip ->
+            logger:warning("block_sync: stale tip ~B, header tip ~B -- "
+                           "rebuilding block download from chain state "
+                           "(was status=~p queue=~B in_flight=~B "
+                           "downloaded=~B)",
+                           [ChainTip, HT, State#state.status,
+                            length(State#state.download_queue),
+                            maps:size(State#state.in_flight),
+                            maps:size(State#state.downloaded)]),
+            State2 = cancel_timers(State),
+            handle_cast({start_sync, #{target_height => HT}},
+                        State2#state{status = idle,
+                                     download_queue = [],
+                                     in_flight = #{},
+                                     hash_to_height = #{},
+                                     downloaded = #{},
+                                     downloaded_bytes = 0,
+                                     stall_timer = undefined,
+                                     progress_timer = undefined});
+        _ ->
             {noreply, State}
     end;
 
@@ -534,7 +579,8 @@ handle_cast(_Msg, State) ->
     {noreply, State}.
 
 handle_info(stall_check, #state{status = syncing,
-                                next_to_validate = NextH} = State) ->
+                                next_to_validate = NextH} = State0) ->
+    State = recover_orphaned_frontier(State0),
     State2 = check_stalls(State),
     %% Also try to validate — the next block may have arrived since
     %% the last validate_sequential call but no event triggered it.
@@ -612,6 +658,57 @@ terminate(_Reason, State) ->
 %%% ===================================================================
 %%% Internal: sync lifecycle
 %%% ===================================================================
+
+%% Never aim block download past the best header we have. Core downloads
+%% toward pindexBestKnownBlock -- a header it holds -- never toward a
+%% peer's advertised height (net_processing.cpp FindNextBlocksToDownload).
+%% The peer_manager stale-tip path passes the best PEER's height; before
+%% this clamp that armed heights with no header, which request_batch then
+%% dropped for good (2026-10-07 mainnet wedges). If the header tip cannot
+%% be read the target is used as given (request_batch keeps unindexed
+%% heights queued, so that is still safe).
+clamp_to_header_tip(Target) when is_integer(Target) ->
+    case header_tip_height() of
+        H when is_integer(H), H >= 0, Target > H ->
+            logger:info("block_sync: target ~B is past our header tip ~B "
+                        "-- clamped (blocks above it are requested once "
+                        "their headers arrive)", [Target, H]),
+            H;
+        _ ->
+            Target
+    end;
+clamp_to_header_tip(Target) ->
+    Target.
+
+header_tip_height() ->
+    try beamchain_db:get_header_tip() of
+        {ok, #{height := H}} when is_integer(H) -> H;
+        _ -> undefined
+    catch _:_ -> undefined
+    end.
+
+%% Liveness backstop for the request frontier (Core: the download window is
+%% re-derived from chain state on every pass, so no bookkeeping slip can
+%% hide a block forever). If we are `syncing` with nothing queued, nothing
+%% in flight and nothing buffered, yet next_to_validate has not passed the
+%% target, some path lost the heights in between: re-queue them. Without
+%% this the state is terminal -- maybe_complete/1 never fires and a
+%% start_sync with the same target is a no-op.
+recover_orphaned_frontier(#state{download_queue = [], next_to_validate = NextH,
+                                 target_height = Target} = State)
+  when is_integer(NextH), is_integer(Target), NextH =< Target ->
+    case maps:size(State#state.in_flight) =:= 0
+         andalso maps:size(State#state.downloaded) =:= 0 of
+        true ->
+            logger:warning("block_sync: frontier lost -- heights ~B..~B "
+                           "neither queued, in flight nor downloaded; "
+                           "re-queueing", [NextH, Target]),
+            State#state{download_queue = lists:seq(NextH, Target)};
+        false ->
+            State
+    end;
+recover_orphaned_frontier(State) ->
+    State.
 
 %% Find the height to start downloading from.
 %%
@@ -930,9 +1027,13 @@ blast_request_height(Height, #state{peers = Peers,
                                 download_queue = Queue2}
             end;
         not_found ->
+            %% Same frontier invariant as request_batch: the caller already
+            %% took Height out of in_flight, so put it back in the queue.
             logger:warning("block_sync: blast_request — no block index "
-                           "for height ~B", [Height]),
-            State
+                           "for height ~B, kept queued", [Height]),
+            Queue0 = State#state.download_queue,
+            State#state{download_queue =
+                            [Height | lists:delete(Height, Queue0)]}
     end.
 
 %% Assign blocks from the queue to available peers.
@@ -1007,12 +1108,25 @@ request_batch(Peer, BatchSize,
                                      NHAcc}
                             end;
                         not_found ->
-                            logger:warning("block_sync: no block index "
-                                           "for height ~B", [Height]),
-                            {ItemsAcc, IFAcc, H2HAcc, SkipAcc + 1, NHAcc}
+                            %% No header for this height YET. Keep it in
+                            %% the frontier: dropping it here (the old
+                            %% code) left it neither queued, in flight
+                            %% nor downloaded, so validation could never
+                            %% pass it and every later start_sync with the
+                            %% same target was a no-op -- the permanent
+                            %% half of the 2026-10-07 mainnet wedges
+                            %% (970298-970301 and 970315-970320 dropped
+                            %% here, node stuck until restart). Core's
+                            %% FindNextBlocksToDownload simply re-walks to
+                            %% the best known header on the next pass.
+                            logger:debug("block_sync: no block index for "
+                                         "height ~B yet -- kept queued",
+                                         [Height]),
+                            {ItemsAcc, IFAcc, H2HAcc, SkipAcc + 1,
+                             [Height | NHAcc]}
                     end
                 end, {[], InFlight, H2H, 0, []}, Heights),
-            RestQueue = lists:reverse(NotHere) ++ RestQueue0,
+            RestQueue = lists:sort(NotHere) ++ RestQueue0,
 
             %% Send getdata with all items at once
             case Items of
