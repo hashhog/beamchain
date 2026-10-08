@@ -35,6 +35,10 @@
 -export([remove_for_block/1, remove_for_block_async/1]).
 %% Block interaction with full tx data (preferred — enables proper conflict eviction)
 -export([remove_for_block_with_txs/1, remove_for_block_with_txs_async/1]).
+%% Reorg / invalidateblock: Core MaybeUpdateMempoolForReorg (+ the ConnectTip
+%% removeForBlock calls of the same activation step), run synchronously by
+%% beamchain_chainstate under its gen_server (the chain lock).
+-export([update_for_reorg/2]).
 
 %% Orphan cleanup — W103 BUG-10 + BUG-13 fix
 -export([erase_orphans_for_block/1, erase_orphans_for_peer/1]).
@@ -543,6 +547,36 @@ remove_for_block_with_txs_async([]) ->
 remove_for_block_with_txs_async(Txs) ->
     gen_server:cast(?SERVER, {remove_for_block_with_txs, Txs}).
 
+%% @doc Bring the mempool back in line with the chain after blocks were
+%% disconnected (reorg, invalidateblock, a header-driven rollback) and/or
+%% connected as part of the same activation step.
+%%
+%% ConnectedBlocks: the NON-coinbase txs of every block connected in this
+%% step, one list per block, in connect order (Core ConnectTip ->
+%% removeForBlock, run here because beamchain defers it to the end of an
+%% atomic reorg). Disconnected: the non-coinbase txs of the disconnected
+%% blocks, EARLIEST CONFIRMED FIRST (Core iterates the disconnectpool in
+%% reverse: queuedTx.get<insertion_order>().rbegin()).
+%%
+%% Mirrors Core validation.cpp MaybeUpdateMempoolForReorg(fAddToMempool=true):
+%%   1. each disconnected tx not confirmed again is re-accepted through the
+%%      normal ATMP with bypass_limits (no fee floor / cluster limit, every
+%%      other check); a tx that fails is removeRecursive'd -- its in-mempool
+%%      descendants go with it;
+%%   2. UpdateTransactionsFromBlock: in-mempool children of re-added txs are
+%%      kept and re-linked to their re-added parents;
+%%   3. removeForReorg: every entry that is non-final at tip+1 (BIP113),
+%%      sequence-locked at tip+1 (BIP68), spends an immature coinbase or a
+%%      coin that no longer exists is removed with all its descendants;
+%%   4. LimitMempoolSize.
+%% Synchronous: when this returns, the mempool agrees with the chain tip.
+-spec update_for_reorg([[#transaction{}]], [#transaction{}]) -> ok.
+update_for_reorg([], []) ->
+    ok;
+update_for_reorg(ConnectedBlocks, Disconnected) ->
+    gen_server:call(?SERVER, {update_for_reorg, ConnectedBlocks, Disconnected},
+                    600000).
+
 %% @doc Trim mempool to fit within MaxBytes.
 -spec trim_to_size(non_neg_integer()) -> ok.
 trim_to_size(MaxBytes) ->
@@ -830,6 +864,9 @@ handle_call({remove_for_block_with_txs, Txs}, _From, State) ->
     State2 = do_remove_for_block_with_txs(Txs, State),
     {reply, ok, State2};
 
+handle_call({update_for_reorg, ConnectedBlocks, Disconnected}, _From, State) ->
+    {reply, ok, do_update_for_reorg(ConnectedBlocks, Disconnected, State)};
+
 handle_call({trim_to_size, MaxBytes}, _From, State) ->
     State2 = do_trim_to_size(MaxBytes, State),
     {reply, ok, State2};
@@ -968,6 +1005,18 @@ do_add_transaction(Tx, State) ->
     do_add_transaction(Tx, ?ORPHAN_LOCAL_PEER, State).
 
 do_add_transaction(Tx, PeerId, State) ->
+    do_add_transaction(Tx, PeerId, State, #{}).
+
+%% Opts:
+%%   bypass_limits => true  -- Core ATMP m_bypass_limits, used only for the
+%%       reorg re-accept (MaybeUpdateMempoolForReorg): no fee-rate floor, no
+%%       cluster limit (LimitMempoolSize runs afterwards), and a tx with a
+%%       missing input is a plain failure, never an orphan.
+%%   notify => false        -- re-linking an entry that was already in the
+%%       pool (UpdateTransactionsFromBlock): no ZMQ add / fee-estimator track.
+do_add_transaction(Tx, PeerId, State, Opts) ->
+    Bypass = maps:get(bypass_limits, Opts, false),
+    Notify = maps:get(notify, Opts, true),
     Txid = beamchain_serialize:tx_hash(Tx),
     Wtxid = beamchain_serialize:wtx_hash(Tx),
 
@@ -1107,6 +1156,10 @@ do_add_transaction(Tx, PeerId, State) ->
             {has_ephemeral, _} ->
                 %% Zero-fee ephemeral parent — defer for package evaluation.
                 throw(ephemeral_anchor_needs_spending);
+            none when Bypass ->
+                %% Core m_bypass_limits: CheckFeeRate is skipped for the
+                %% reorg re-accept.
+                State;
             none ->
                 %% Core CheckFeeRate composition:
                 %%   mempool_reject_fee = GetMinFee().GetFee(vsize)   (rolling)
@@ -1162,7 +1215,7 @@ do_add_transaction(Tx, PeerId, State) ->
         %% which queries the pending changeset; we compute it eagerly from parent
         %% clusters.  This is the ONLY size bound on a cluster and therefore MUST be
         %% present before the ancestor/descendant bounds are dropped below.
-        check_cluster_limits(Tx, AdjWeight),
+        Bypass orelse check_cluster_limits(Tx, AdjWeight),
 
         %% W96 GATE 17: ancestor/descendant STATISTICS (no longer a gate).
         %% Core v31 replaced -limitancestorcount / -limitdescendantcount with the
@@ -1269,15 +1322,19 @@ do_add_transaction(Tx, PeerId, State) ->
         State4b = reprocess_orphans(Txid, State4),
 
         %% 20. ZMQ notification for mempool acceptance
-        ZmqSeq = State4b#state.zmq_seq,
-        beamchain_zmq:notify_transaction(Tx, mempool_add, ZmqSeq),
-        State5 = State4b#state{zmq_seq = ZmqSeq + 1},
-
-        %% 21. Fee estimator: record this tx so that when it is confirmed
-        %% in a block, process_block/2 can compute its confirmation latency.
-        %% FeeRate is in sat/vB (float); TipHeight is the mempool admission height.
-        %% Uses the gen_server cast (non-blocking) to avoid delaying admission.
-        beamchain_fee_estimator:track_tx(Txid, FeeRate, TipHeight),
+        State5 = case Notify of
+            true ->
+                ZmqSeq = State4b#state.zmq_seq,
+                beamchain_zmq:notify_transaction(Tx, mempool_add, ZmqSeq),
+                %% 21. Fee estimator: record this tx so that when it is
+                %% confirmed in a block, process_block/2 can compute its
+                %% confirmation latency. FeeRate is in sat/vB (float);
+                %% TipHeight is the mempool admission height. Cast.
+                beamchain_fee_estimator:track_tx(Txid, FeeRate, TipHeight),
+                State4b#state{zmq_seq = ZmqSeq + 1};
+            false ->
+                State4b
+        end,
 
         logger:debug("mempool: accepted ~s (fee_rate=~.1f sat/vB, ~B vB)",
                      [short_hex(Txid), FeeRate, VSize]),
@@ -1285,6 +1342,10 @@ do_add_transaction(Tx, PeerId, State) ->
     catch
         throw:{validation, Reason} ->
             {error, Reason};
+        throw:orphan when Bypass ->
+            %% Reorg re-accept: a missing input is a failure (Core
+            %% removeRecursive), never an orphan-pool entry.
+            {error, 'bad-txns-inputs-missingorspent'};
         throw:orphan ->
             add_orphan(Tx, Wtxid, Txid, PeerId),
             {error, orphan};
@@ -3727,6 +3788,22 @@ do_remove_for_block(Txids, State) ->
 %% Mirrors Bitcoin Core CTxMemPool::removeForBlock(vtx, height)
 %% (txmempool.cpp:405): per-tx removeUnchecked + removeConflicts.
 do_remove_for_block_with_txs(Txs, State) ->
+    State4 = remove_for_block_core(Txs, State),
+    %% Mirror Bitcoin Core ConnectTip → LimitMempoolSize (validation.cpp), which
+    %% runs Expire(now - expiry) THEN TrimToSize(max_size) on every block connect
+    %% (txmempool.cpp).  Wire the EXISTING live-path-dead helpers in that exact
+    %% order: expire time-aged txs first (frees space and removes their
+    %% descendants), then trim the remaining worst-feerate tails to the cap.
+    %% Relay policy only — does not affect block/consensus validation.  Each
+    %% helper returns the updated State; thread it through.  block_since_bump was
+    %% already set true at the top of remove_for_block_core, so a subsequent
+    %% get_min_fee will begin decaying the rolling minimum fee from this block.
+    {_ExpiredN, State5} = do_expire_old(State4),
+    do_trim_to_size(State5#state.max_size, State5).
+
+%% Core CTxMemPool::removeForBlock(vtx) proper: confirmed txs out, their
+%% conflicts out with descendants. No expiry / trim (the caller decides).
+remove_for_block_core(Txs, State) ->
     Now = erlang:system_time(second),
     State0 = State#state{block_since_bump = true, last_fee_update = Now},
 
@@ -3780,21 +3857,212 @@ do_remove_for_block_with_txs(Txs, State) ->
                          [TotalCount, RemovedCount, ConflictCount]);
         false -> ok
     end,
-    State4 = State3#state{
+    State3#state{
         total_bytes = max(0, State3#state.total_bytes - TotalBytes),
         total_count = max(0, State3#state.total_count - TotalCount)
-    },
-    %% Mirror Bitcoin Core ConnectTip → LimitMempoolSize (validation.cpp), which
-    %% runs Expire(now - expiry) THEN TrimToSize(max_size) on every block connect
-    %% (txmempool.cpp).  Wire the EXISTING live-path-dead helpers in that exact
-    %% order: expire time-aged txs first (frees space and removes their
-    %% descendants), then trim the remaining worst-feerate tails to the cap.
-    %% Relay policy only — does not affect block/consensus validation.  Each
-    %% helper returns the updated State; thread it through.  block_since_bump was
-    %% already set true at the top of this function (State0), so a subsequent
-    %% get_min_fee will begin decaying the rolling minimum fee from this block.
+    }.
+
+%%% ===================================================================
+%%% Internal: reorg / invalidateblock (Core MaybeUpdateMempoolForReorg)
+%%% ===================================================================
+
+%% See update_for_reorg/2.
+do_update_for_reorg(ConnectedBlocks, Disconnected, State0) ->
+    %% 1. ConnectTip -> removeForBlock for every connected block, in order.
+    %%    A disconnected tx confirmed again by the new branch leaves the
+    %%    disconnect pool (Core removeForBlock -> disconnectpool.removeForBlock).
+    {State1, Confirmed} = lists:foldl(
+        fun(BlockTxs, {St, Set}) ->
+            St2 = remove_for_block_core(BlockTxs, St),
+            {St2, lists:foldl(fun(T, S) ->
+                                  sets:add_element(beamchain_serialize:tx_hash(T), S)
+                              end, Set, BlockTxs)}
+        end, {State0, sets:new([{version, 2}])}, ConnectedBlocks),
+    %% Re-accept candidates: not confirmed again, not already in the pool
+    %% (a header-driven rollback hands the same txs back once more when it
+    %% completes), deduplicated, earliest confirmed first.
+    {ReAdd, _} = lists:foldl(
+        fun(Tx, {Acc, Seen}) ->
+            Txid = beamchain_serialize:tx_hash(Tx),
+            case sets:is_element(Txid, Confirmed)
+                 orelse sets:is_element(Txid, Seen)
+                 orelse ets:member(?MEMPOOL_TXS, Txid) of
+                true -> {Acc, Seen};
+                false -> {[Tx | Acc], sets:add_element(Txid, Seen)}
+            end
+        end, {[], sets:new([{version, 2}])}, Disconnected),
+    ReAddTxs = lists:reverse(ReAdd),
+    %% 2. UpdateTransactionsFromBlock: in-pool descendants of a tx being
+    %%    re-added were admitted against the old chain, where the parent was
+    %%    confirmed. Take them out (keeping their admission time) and put them
+    %%    back after their parents, so ancestor state and clusters are
+    %%    rebuilt; one whose parent is not re-accepted cannot come back
+    %%    (Core removeRecursive of the failed parent).
+    {Pulled, State2} = pull_descendants_of(ReAddTxs, State1),
+    %% 3. Re-accept, bypass_limits, earliest first, then the pulled children.
+    {Added, Failed, State3} = lists:foldl(
+        fun({Tx, Notify, OrigTime}, {A, F, St}) ->
+            case do_add_transaction(Tx, ?ORPHAN_LOCAL_PEER, St,
+                                    #{bypass_limits => true,
+                                      notify => Notify}) of
+                {ok, Txid, St2} ->
+                    restore_time_added(Txid, OrigTime),
+                    {A + 1, F, St2};
+                {error, _} ->
+                    St2 = case Notify of
+                        true -> St;
+                        false -> notify_removed(Tx, St)
+                    end,
+                    {A, F + 1, St2}
+            end
+        end, {0, 0, State2},
+        [{T, true, undefined} || T <- ReAddTxs] ++
+        [{T, false, Time} || {T, Time} <- Pulled]),
+    %% 4. removeForReorg over the whole pool at the new tip.
+    {Dropped, State4} = remove_for_reorg(State3),
+    case ConnectedBlocks =/= [] orelse Disconnected =/= [] of
+        true ->
+            logger:info("mempool: reorg update -- ~B connected block(s), "
+                        "re-added ~B / failed ~B of ~B disconnected+relinked "
+                        "txs, removeForReorg dropped ~B",
+                        [length(ConnectedBlocks), Added, Failed,
+                         length(ReAddTxs) + length(Pulled), Dropped]);
+        false ->
+            ok
+    end,
+    %% 5. LimitMempoolSize.
     {_ExpiredN, State5} = do_expire_old(State4),
     do_trim_to_size(State5#state.max_size, State5).
+
+%% Remove every in-pool descendant of Txs (the txs about to be re-added) and
+%% return them parents-first as [{Tx, TimeAdded}].
+pull_descendants_of([], State) ->
+    {[], State};
+pull_descendants_of(Txs, State) ->
+    Children = lists:usort(lists:flatmap(
+        fun(#transaction{outputs = Outs} = Tx) ->
+            Txid = beamchain_serialize:tx_hash(Tx),
+            lists:filtermap(fun(Vout) ->
+                case ets:lookup(?MEMPOOL_OUTPOINTS, {Txid, Vout}) of
+                    [{_, C}] -> {true, C};
+                    [] -> false
+                end
+            end, lists:seq(0, length(Outs) - 1))
+        end, Txs)),
+    All = lists:usort(Children ++
+                      lists:flatmap(fun get_all_descendants/1, Children)),
+    Entries = [E || T <- All, [{_, E}] <- [ets:lookup(?MEMPOOL_TXS, T)]],
+    Ordered = topo_order_entries(Entries),
+    State2 = lists:foldl(fun(#mempool_entry{txid = T, vsize = VS}, St) ->
+        case remove_entry(T) of
+            #mempool_entry{} ->
+                St2 = cluster_remove_tx(T, St),
+                St2#state{total_bytes = max(0, St2#state.total_bytes - VS),
+                          total_count = max(0, St2#state.total_count - 1)};
+            not_found ->
+                St
+        end
+    end, State, Ordered),
+    {[{E#mempool_entry.tx, E#mempool_entry.time_added} || E <- Ordered],
+     State2}.
+
+%% Parents before children within a set of mempool entries.
+topo_order_entries(Entries) ->
+    InSet = sets:from_list([E#mempool_entry.txid || E <- Entries],
+                           [{version, 2}]),
+    topo_order_entries(Entries, InSet, sets:new([{version, 2}]), []).
+
+topo_order_entries([], _InSet, _Done, Acc) ->
+    lists:reverse(Acc);
+topo_order_entries(Pending, InSet, Done, Acc) ->
+    {Ready, Rest} = lists:partition(fun(#mempool_entry{tx = Tx}) ->
+        lists:all(fun(P) ->
+                      not sets:is_element(P, InSet) orelse sets:is_element(P, Done)
+                  end, get_parent_txids(Tx))
+    end, Pending),
+    case Ready of
+        [] ->
+            %% Not possible for a valid pool (no cycles); keep the rest as is.
+            lists:reverse(Acc) ++ Rest;
+        _ ->
+            Done2 = lists:foldl(fun(E, D) ->
+                                    sets:add_element(E#mempool_entry.txid, D)
+                                end, Done, Ready),
+            topo_order_entries(Rest, InSet, Done2, lists:reverse(Ready) ++ Acc)
+    end.
+
+restore_time_added(_Txid, undefined) ->
+    ok;
+restore_time_added(Txid, Time) ->
+    case ets:lookup(?MEMPOOL_TXS, Txid) of
+        [{Txid, E}] ->
+            ets:insert(?MEMPOOL_TXS, {Txid, E#mempool_entry{time_added = Time}}),
+            ok;
+        [] ->
+            ok
+    end.
+
+notify_removed(Tx, #state{zmq_seq = Seq} = State) ->
+    beamchain_zmq:notify_transaction(Tx, mempool_remove, Seq),
+    beamchain_fee_estimator:remove_tx(beamchain_serialize:tx_hash(Tx)),
+    State#state{zmq_seq = Seq + 1}.
+
+%% Core CTxMemPool::removeForReorg(chain, filter_final_and_mature): drop every
+%% entry (with all descendants) that cannot go in the block at tip+1 --
+%% non-final (CheckFinalTxAtTip, BIP113), sequence-locked
+%% (CheckSequenceLocksAtTip, BIP68), spending an immature coinbase -- or whose
+%% input no longer exists anywhere. Returns {RemovedCount, State}.
+remove_for_reorg(State) ->
+    case beamchain_chainstate:get_tip() of
+        {ok, {TipHash, TipHeight}} ->
+            Mtp = try tip_mtp() catch throw:_ -> undefined end,
+            Bad = ets:foldl(fun({Txid, #mempool_entry{tx = Tx}}, Acc) ->
+                case entry_valid_at_tip(Tx, TipHash, TipHeight, Mtp) of
+                    true -> Acc;
+                    false -> [Txid | Acc]
+                end
+            end, [], ?MEMPOOL_TXS),
+            remove_recursive(Bad, State);
+        _ ->
+            {0, State}
+    end.
+
+entry_valid_at_tip(_Tx, _TipHash, _TipHeight, undefined) ->
+    %% MTP unavailable (chainstate busy) -- cannot judge; keep.
+    true;
+entry_valid_at_tip(Tx, TipHash, TipHeight, Mtp) ->
+    try
+        beamchain_validation:is_final_tx(Tx, TipHeight + 1, Mtp)
+            orelse throw(non_final),
+        {Coins, _SpendsCb} = lookup_inputs(Tx),
+        check_mempool_coinbase_maturity(Coins, TipHeight + 1),
+        check_mempool_sequence_locks(Tx, Coins, TipHash, TipHeight + 1),
+        true
+    catch
+        throw:_ -> false
+    end.
+
+%% Core removeRecursive for each txid in Txids: the entry and every in-pool
+%% descendant. Returns {RemovedCount, State}.
+remove_recursive(Txids, State) ->
+    {Bytes, Count, State2} = lists:foldl(fun(Txid, {B0, C0, St0}) ->
+        case ets:member(?MEMPOOL_TXS, Txid) of
+            true ->
+                lists:foldl(fun(RTxid, {B, C, St}) ->
+                    case remove_entry_with_zmq(RTxid, mempool_remove, St) of
+                        {#mempool_entry{vsize = VS}, St2} ->
+                            {B + VS, C + 1, cluster_remove_tx(RTxid, St2)};
+                        {not_found, St2} ->
+                            {B, C, St2}
+                    end
+                end, {B0, C0, St0}, [Txid | get_all_descendants(Txid)]);
+            false ->
+                {B0, C0, St0}
+        end
+    end, {0, 0, State}, Txids),
+    {Count, State2#state{
+              total_bytes = max(0, State2#state.total_bytes - Bytes),
+              total_count = max(0, State2#state.total_count - Count)}}.
 
 %% Legacy txid-only conflict eviction (used by the deprecated
 %% remove_for_block/1 path).  This is intentionally a no-op:
