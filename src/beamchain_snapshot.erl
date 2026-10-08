@@ -43,7 +43,8 @@
 %% compute_utxo_hash_from_list/1 is the in-memory helper for tests and
 %% small fixtures, not the 188M-coin production hasher.
 -export([fold_snapshot_groups/3, fold_snapshot_groups_validated/5]).
--export([fold_utxo_txid_groups/2, compute_utxo_hash_stream/0]).
+-export([fold_utxo_txid_groups/2, fold_utxo_txid_groups/3, compute_utxo_hash_stream/0]).
+-export([compute_utxo_stats/2, write_snapshot_from_view/5]).
 -export([compute_utxo_stats/1, verify_hash_serialized/3]).
 %% MuHash3072 helpers — used by `gettxoutsetinfo hash_type=muhash` (NOT by
 %% the loadtxoutset strict-content-hash check, which is HASH_SERIALIZED /
@@ -333,6 +334,66 @@ serialize_snapshot(BaseBlockHash, Network) ->
     CoinsBin = serialize_grouped_coins(GroupedCoins),
 
     <<Header/binary, CoinsBin/binary>>.
+
+%% @doc Core WriteUTXOSnapshot (rpc/blockchain.cpp) over ONE coins view:
+%% ReadOpts names a RocksDB snapshot taken by
+%% beamchain_chainstate:prepare_utxo_snapshot/0, so the HASH_SERIALIZED
+%% commitment, the coin count in the header and the coins written all describe
+%% the same point in time (the base). Streams one txid group at a time to
+%% TmpPath (never materialises the set), fsyncs, renames to FinalPath.
+%% Returns {ok, #{coins_written, hash}} | {error, Reason}.
+-spec write_snapshot_from_view(string(), string(), binary(), atom(), list()) ->
+    {ok, #{coins_written := non_neg_integer(), hash := binary()}} |
+    {error, term()}.
+write_snapshot_from_view(TmpPath, FinalPath, BaseBlockHash, Network, ReadOpts) ->
+    #{magic := NetworkMagic} = beamchain_chain_params:params(Network),
+    {Hash, #{txouts := NumCoins}} = compute_utxo_stats(hash_serialized, ReadOpts),
+    case file:open(TmpPath, [write, binary, raw, delayed_write]) of
+        {ok, Fd} ->
+            Res = try
+                ok = file:write(Fd, serialize_metadata(NetworkMagic,
+                                                       BaseBlockHash, NumCoins)),
+                Written = case fold_utxo_txid_groups(
+                        fun(Txid, Outs, N) ->
+                            ok = file:write(Fd, serialize_grouped_tx({Txid, Outs})),
+                            N + length(Outs)
+                        end, 0, ReadOpts) of
+                    {ok, W, _Peak} -> W;
+                    {error, R} -> throw({walk, R})
+                end,
+                Written =:= NumCoins orelse throw({coin_count_mismatch, Written, NumCoins}),
+                {ok, Written}
+            catch
+                throw:T -> {error, T};
+                error:{badmatch, {error, WR}} -> {error, {write, WR}}
+            end,
+            case Res of
+                {ok, Count} ->
+                    SyncRes = file:sync(Fd),
+                    CloseRes = file:close(Fd),
+                    case {SyncRes, CloseRes} of
+                        {ok, ok} ->
+                            case file:rename(TmpPath, FinalPath) of
+                                ok -> {ok, #{coins_written => Count, hash => Hash}};
+                                {error, RenR} ->
+                                    _ = file:delete(TmpPath),
+                                    {error, {rename, RenR}}
+                            end;
+                        {{error, SyncR}, _} ->
+                            _ = file:delete(TmpPath),
+                            {error, {sync, SyncR}};
+                        {_, {error, CloseR}} ->
+                            _ = file:delete(TmpPath),
+                            {error, {close, CloseR}}
+                    end;
+                {error, _} = E ->
+                    _ = file:close(Fd),
+                    _ = file:delete(TmpPath),
+                    E
+            end;
+        {error, OpenR} ->
+            {error, {open, OpenR}}
+    end.
 
 %% @doc Return the fixed metadata-header size in bytes (51).
 -spec metadata_size() -> non_neg_integer().
@@ -1037,6 +1098,10 @@ compute_utxo_hash_stream() ->
        total_amount := integer(),
        transactions := non_neg_integer()}}.
 compute_utxo_stats(HashType) ->
+    compute_utxo_stats(HashType, []).
+
+%% compute_utxo_stats/2: ReadOpts as for beamchain_db:fold_utxos/3.
+compute_utxo_stats(HashType, ReadOpts) ->
     Acc0 = #{hash => init_stats_hash(HashType),
              txouts => 0,
              bogosize => 0,
@@ -1044,7 +1109,7 @@ compute_utxo_stats(HashType) ->
              transactions => 0},
     case fold_utxo_txid_groups(fun(Txid, Outs, Acc) ->
                                        stats_visit_group(HashType, Txid, Outs, Acc)
-                               end, Acc0) of
+                               end, Acc0, ReadOpts) of
         {ok, Acc, _Peak} ->
             Hash = finalize_stats_hash(HashType, maps:get(hash, Acc)),
             Stats = maps:with([txouts, bogosize, total_amount, transactions], Acc),
@@ -1098,8 +1163,11 @@ hash_group(none, _Txid, _Outs, Acc) ->
                             Acc) ->
     {ok, Acc, non_neg_integer()} | {error, term()}.
 fold_utxo_txid_groups(Fun, Acc0) when is_function(Fun, 3) ->
+    fold_utxo_txid_groups(Fun, Acc0, []).
+
+fold_utxo_txid_groups(Fun, Acc0, ReadOpts) when is_function(Fun, 3) ->
     case beamchain_db:fold_utxos(fun utxo_group_visit/2,
-                                 {undefined, [], Acc0, Fun, 0}) of
+                                 {undefined, [], Acc0, Fun, 0}, ReadOpts) of
         {error, _} = E ->
             E;
         {undefined, [], Acc, _Fun, Peak} ->

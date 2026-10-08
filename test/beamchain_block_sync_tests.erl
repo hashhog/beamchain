@@ -398,6 +398,9 @@ setup() ->
     Tab = ets:new(frontier_test_tip, [set, public]),
     ets:insert(Tab, {tip, {height_hash(99), 99}}),
     lists:foreach(fun(M) -> ok = meck:new(M, [no_link]) end, ?MOCKED),
+    %% dumptxoutset chain pause (beamchain_chainstate:is_chain_paused/0) is
+    %% read by block_sync before it connects; never paused in these tests.
+    ok = meck:expect(beamchain_chainstate, is_chain_paused, fun() -> false end),
     ok = meck:expect(beamchain_db, get_block_index,
         fun(H) ->
             {ok, #{hash => height_hash(H), header => mk_header(H),

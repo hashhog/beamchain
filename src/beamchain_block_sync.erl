@@ -1397,6 +1397,34 @@ validate_sequential(State, 0) ->
     refresh_in_flight_timestamps(State);
 validate_sequential(#state{next_to_validate = NextH,
                             downloaded = Downloaded} = State, Remaining) ->
+    case beamchain_chainstate:is_chain_paused() of
+        true ->
+            %% dumptxoutset rollback in progress (Core NetworkDisable): the
+            %% chainstate is rewound below the tip and refuses connects. Park
+            %% the downloaded blocks and look again shortly; nothing is
+            %% counted as a validation failure.
+            park_for_chain_pause(State);
+        false ->
+            validate_sequential_unpaused(State, NextH, Downloaded, Remaining)
+    end.
+
+park_for_chain_pause(State) ->
+    %% One pending re-check at a time (block arrivals during the pause would
+    %% otherwise each start their own 250 ms chain of timers).
+    case get(chain_pause_timer) of
+        T when is_reference(T) ->
+            case erlang:read_timer(T) of
+                false -> put(chain_pause_timer,
+                             erlang:send_after(250, self(), continue_validation));
+                _ -> ok
+            end;
+        _ ->
+            put(chain_pause_timer,
+                erlang:send_after(250, self(), continue_validation))
+    end,
+    refresh_in_flight_timestamps(State).
+
+validate_sequential_unpaused(State, NextH, Downloaded, Remaining) ->
     %% Fast-forward: if next_to_validate is behind the chainstate tip,
     %% skip directly to tip+1 (avoids re-downloading already-connected
     %% blocks). But only over heights where the connected chainstate
@@ -1500,6 +1528,10 @@ validate_sequential_inner(#state{next_to_validate = NextH,
                         download_queue = Queue2
                     },
                     validate_sequential_inner(State3, Remaining - 1);
+                {error, chain_paused} ->
+                    %% The pause began between the check above and the
+                    %% connect: keep the block buffered, retry after it.
+                    park_for_chain_pause(State);
                 {error, Reason} ->
                     case {beamchain_fatal:is_aborted(),
                           is_consensus_verdict(Reason)} of

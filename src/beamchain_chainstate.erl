@@ -95,6 +95,11 @@
 %% Flush
 -export([flush/0]).
 
+%% dumptxoutset: chain pause (Core NetworkDisable) + one consistent coins
+%% snapshot at the tip (Core PrepareUTXOSnapshot).
+-export([begin_chain_pause/0, end_chain_pause/0, is_chain_paused/0,
+         prepare_utxo_snapshot/0]).
+
 
 %% Wipe chainstate (ETS caches + RocksDB tip) for full resync
 -export([wipe_chainstate/0]).
@@ -259,8 +264,19 @@
     %% unaffected.
     last_precious_chainwork = 0 :: non_neg_integer(),
     block_reverse_sequence_id = -1 :: integer(),
-    precious_seqids = #{} :: #{binary() => integer()}
+    precious_seqids = #{} :: #{binary() => integer()},
+
+    %% dumptxoutset rollback pause (Core NetworkDisable + TemporaryRollback,
+    %% rpc/blockchain.cpp dumptxoutset). While set, every tip-moving call
+    %% from any process other than the owner is refused with
+    %% {error, chain_paused} (block_sync waits and retries), so nothing can
+    %% connect over the rewound chainstate between rewind and restore.
+    %% Monitored: if the owner dies the pause is released.
+    rollback_owner = undefined :: pid() | undefined,
+    rollback_mon = undefined :: reference() | undefined
 }).
+
+-define(CHAIN_PAUSED_KEY, {beamchain_chainstate, chain_paused}).
 
 %%% ===================================================================
 %%% API
@@ -483,6 +499,31 @@ refill_mempool_after_reorg(Txs) ->
 -spec flush() -> ok.
 flush() ->
     gen_server:call(?SERVER, flush, 60000).
+
+%% @doc Pause every tip-moving call except the caller's (Core NetworkDisable
+%% for the dumptxoutset rollback -> dump -> restore window). Returns the tip
+%% as seen at the moment the pause took effect.
+-spec begin_chain_pause() -> {ok, {binary(), integer()}} | {error, term()}.
+begin_chain_pause() ->
+    gen_server:call(?SERVER, begin_chain_pause, 60000).
+
+-spec end_chain_pause() -> ok.
+end_chain_pause() ->
+    gen_server:call(?SERVER, end_chain_pause, 60000).
+
+-spec is_chain_paused() -> boolean().
+is_chain_paused() ->
+    persistent_term:get(?CHAIN_PAUSED_KEY, false) =:= true.
+
+%% @doc Core PrepareUTXOSnapshot (rpc/blockchain.cpp): under the chainstate
+%% lock flush the coins cache, take a RocksDB snapshot and read the tip, so
+%% the caller can walk a coins view that is exactly the tip it is labelled
+%% with, even if the chain moves afterwards. The caller must release the
+%% snapshot with beamchain_db:release_utxo_snapshot/1.
+-spec prepare_utxo_snapshot() ->
+    {ok, term(), {binary(), integer()}} | {error, term()}.
+prepare_utxo_snapshot() ->
+    gen_server:call(?SERVER, prepare_utxo_snapshot, 600000).
 
 %% @doc Wipe the entire chainstate: clear all UTXO ETS caches and reset
 %% the chain tip to genesis (height -1). Used when disconnect_block fails
@@ -1208,18 +1249,44 @@ handle_call(is_synced, _From, #state{ibd = IBD} = State) ->
 %% Gate 6: once the node is latched (beamchain_fatal, Core AbortNode) no
 %% call may move the tip or touch the coins view -- refuse with a
 %% non-verdict.
-handle_call(Req, _From, State) when element(1, Req) =:= connect_block;
+handle_call(Req, {Caller, _}, State) when element(1, Req) =:= connect_block;
                                     element(1, Req) =:= submit_block;
                                     element(1, Req) =:= reorganize;
                                     element(1, Req) =:= invalidate_block;
                                     element(1, Req) =:= reconsider_block;
                                     element(1, Req) =:= precious_block;
                                     Req =:= disconnect_block ->
-    case beamchain_fatal:is_aborted() of
-        true ->
+    case {beamchain_fatal:is_aborted(), paused_for(Caller, State)} of
+        {true, _} ->
             {reply, {error, beamchain_fatal:refusal()}, State};
-        false ->
+        {false, true} ->
+            {reply, {error, chain_paused}, State};
+        {false, false} ->
             handle_chain_call(Req, State)
+    end;
+handle_call(begin_chain_pause, {Caller, _},
+            #state{rollback_owner = undefined} = State) ->
+    Mon = erlang:monitor(process, Caller),
+    persistent_term:put(?CHAIN_PAUSED_KEY, true),
+    logger:info("chainstate: chain paused by ~p (dumptxoutset rollback)",
+                [Caller]),
+    {reply, {ok, {State#state.tip_hash, State#state.tip_height}},
+     State#state{rollback_owner = Caller, rollback_mon = Mon}};
+handle_call(begin_chain_pause, _From, State) ->
+    {reply, {error, already_paused}, State};
+handle_call(end_chain_pause, {Caller, _},
+            #state{rollback_owner = Caller} = State) ->
+    {reply, ok, clear_chain_pause(State)};
+handle_call(end_chain_pause, _From, State) ->
+    {reply, ok, State};
+handle_call(prepare_utxo_snapshot, _From, State) ->
+    State2 = do_flush(State),
+    case beamchain_db:utxo_snapshot() of
+        {ok, Snap} ->
+            {reply, {ok, Snap, {State2#state.tip_hash,
+                                State2#state.tip_height}}, State2};
+        {error, _} = E ->
+            {reply, E, State2}
     end;
 handle_call({submit_header, Header}, _From, State) ->
     %% Header-only acceptance (submitheader RPC).  No state mutation other
@@ -1232,6 +1299,10 @@ handle_call(flush, _From, State) ->
     State2 = do_flush(State),
     {reply, ok, State2};
 
+handle_call(wipe_chainstate, {Caller, _}, State) when
+        State#state.rollback_owner =/= undefined,
+        State#state.rollback_owner =/= Caller ->
+    {reply, {error, chain_paused}, State};
 handle_call(wipe_chainstate, _From, State) ->
     logger:warning("chainstate: wiping entire UTXO set and resetting tip to genesis"),
     %% Clear all ETS caches
@@ -1422,8 +1493,26 @@ handle_chain_call({precious_block, Hash}, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
+handle_info({'DOWN', Mon, process, Pid, Why},
+            #state{rollback_mon = Mon} = State) when Mon =/= undefined ->
+    logger:warning("chainstate: chain-pause owner ~p exited (~p); "
+                   "releasing the pause", [Pid, Why]),
+    {noreply, clear_chain_pause(State)};
 handle_info(_Info, State) ->
     {noreply, State}.
+
+paused_for(_Caller, #state{rollback_owner = undefined}) -> false;
+paused_for(Caller, #state{rollback_owner = Caller}) -> false;
+paused_for(_Caller, _State) -> true.
+
+clear_chain_pause(#state{rollback_mon = Mon} = State) ->
+    case Mon of
+        undefined -> ok;
+        _ -> erlang:demonitor(Mon, [flush])
+    end,
+    _ = persistent_term:erase(?CHAIN_PAUSED_KEY),
+    logger:info("chainstate: chain pause released"),
+    State#state{rollback_owner = undefined, rollback_mon = undefined}.
 
 terminate(_Reason, State) ->
     case beamchain_fatal:is_aborted() of

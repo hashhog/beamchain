@@ -15878,9 +15878,10 @@ rpc_dumptxoutset([Path, Type, Options])
                     case resolve_dump_target(Type, Options, TipHash,
                                              TipHeight, Network) of
                         {ok, {TipHash, TipHeight}} ->
-                            %% Target == tip: simple dump, no rollback dance.
-                            do_dump_at_tip(Path, TipHash, TipHeight,
-                                           Network);
+                            %% Target == tip: simple dump, no rollback dance
+                            %% (Core: `latest` never rolls back). Labelled from
+                            %% the coins view itself, not this earlier read.
+                            do_dump_at_tip(Path, any, Network);
                         {ok, {TargetHash, TargetHeight}} ->
                             do_dump_with_rollback(Path, TargetHash,
                                                   TargetHeight, TipHash,
@@ -16003,38 +16004,61 @@ resolve_rollback_to_value(_, _, _) ->
      <<"Invalid rollback parameter (expected height integer or block hash hex)">>}.
 
 %% Dump the UTXO set at the current tip — no rollback dance.
-do_dump_at_tip(Path, TipHash, TipHeight, Network) ->
+%%
+%% Core PrepareUTXOSnapshot + WriteUTXOSnapshot (rpc/blockchain.cpp): under
+%% the chainstate lock flush, take ONE point-in-time coins view and read the
+%% tip from it; then (lock released) hash, count and write that one view. The
+%% label (base_hash/base_height/nchaintx) comes from the same view as the
+%% content, so a block connected meanwhile cannot tear the dump. ExpectHash:
+%% `any` for `latest` (label = whatever tip the view captured), or the
+%% rollback target -- the view must be at exactly that block (Core:
+%% "Could not roll back to requested height.").
+do_dump_at_tip(Path, ExpectHash, Network) ->
     PathStr = binary_to_list(Path),
-    ok = beamchain_chainstate:flush(),
-    SnapshotBin = beamchain_snapshot:serialize_snapshot(TipHash, Network),
-    UtxoHash = beamchain_snapshot:compute_utxo_hash(),
-    %% Atomic-write protocol: write to "<path>.incomplete", fsync the fd
-    %% via file:sync, then atomically rename to <path>. Mirrors Bitcoin
-    %% Core's flow in rpc/blockchain.cpp::dumptxoutset (temppath = path
-    %% + ".incomplete"; write; fsync via Fdatasync/close; rename). On
-    %% any error we best-effort delete the .incomplete temp so a crashed
-    %% dump never leaves a torn <path> behind — only the .incomplete
-    %% artifact, which can be cleaned up out-of-band.
-    TmpPathStr = PathStr ++ ".incomplete",
-    case write_snapshot_atomic(TmpPathStr, PathStr, SnapshotBin) of
-        ok ->
-            {ok, #{
-                <<"coins_written">> => count_coins_in_snapshot(SnapshotBin),
-                <<"base_hash">> =>
-                    beamchain_serialize:hex_encode(
-                      beamchain_serialize:reverse_bytes(TipHash)),
-                <<"base_height">> => TipHeight,
-                <<"path">> => Path,
-                <<"txoutset_hash">> =>
-                    beamchain_serialize:hex_encode(
-                      beamchain_serialize:reverse_bytes(UtxoHash)),
-                <<"nchaintx">> =>
-                    chain_tx_count_for_height(TipHeight, Network)
-            }};
+    case beamchain_chainstate:prepare_utxo_snapshot() of
+        {ok, Snap, {BaseHash, BaseHeight}} ->
+            try
+                case ExpectHash =:= any orelse ExpectHash =:= BaseHash of
+                    false ->
+                        logger:warning("dumptxoutset failed to roll back to "
+                                       "requested height, reverting to tip"),
+                        {error, ?RPC_MISC_ERROR,
+                         <<"Could not roll back to requested height.">>};
+                    true ->
+                        ReadOpts = [{snapshot, Snap}],
+                        NChainTx = chain_tx_count_for(BaseHash, BaseHeight,
+                                                      Network, ReadOpts),
+                        TmpPathStr = PathStr ++ ".incomplete",
+                        case beamchain_snapshot:write_snapshot_from_view(
+                               TmpPathStr, PathStr, BaseHash, Network,
+                               ReadOpts) of
+                            {ok, #{coins_written := N, hash := UtxoHash}} ->
+                                {ok, #{
+                                    <<"coins_written">> => N,
+                                    <<"base_hash">> =>
+                                        beamchain_serialize:hex_encode(
+                                          beamchain_serialize:reverse_bytes(BaseHash)),
+                                    <<"base_height">> => BaseHeight,
+                                    <<"path">> => Path,
+                                    <<"txoutset_hash">> =>
+                                        beamchain_serialize:hex_encode(
+                                          beamchain_serialize:reverse_bytes(UtxoHash)),
+                                    <<"nchaintx">> => NChainTx
+                                }};
+                            {error, Reason} ->
+                                {error, ?RPC_MISC_ERROR,
+                                 iolist_to_binary(
+                                   io_lib:format("Failed to write snapshot: ~p",
+                                                 [Reason]))}
+                        end
+                end
+            after
+                beamchain_db:release_utxo_snapshot(Snap)
+            end;
         {error, Reason} ->
             {error, ?RPC_MISC_ERROR,
              iolist_to_binary(
-               io_lib:format("Failed to write snapshot: ~p", [Reason]))}
+               io_lib:format("Failed to open a coins snapshot: ~p", [Reason]))}
     end.
 
 %% Atomic write helper used by do_dump_at_tip. Bytes go to TmpPath, the
@@ -16124,64 +16148,129 @@ do_dump_with_rollback(Path, TargetHash, TargetHeight,
     end.
 
 do_dump_with_rollback_unchecked(Path, TargetHash, TargetHeight,
-                                OrigTipHash, OrigTipHeight, Network) ->
-    %% NetworkDisable RAII (Erlang try/after). Mirrors Bitcoin Core's
-    %% NetworkDisable wrapper around TemporaryRollback in
-    %% rpc/blockchain.cpp::dumptxoutset. Pause inbound block acceptance
-    %% for the duration of the rewind→dump→replay dance and restore on
-    %% every exit path (success, error, exception). The `after` clause
-    %% guarantees cleanup even if a callee throws.
+                                OrigTipHash, _OrigTipHeight, Network) ->
+    %% Core: NetworkDisable + TemporaryRollback (rpc/blockchain.cpp
+    %% dumptxoutset) around PrepareUTXOSnapshot/WriteUTXOSnapshot.
+    %%
+    %% The pause lives in the chainstate process (begin_chain_pause/0): from
+    %% the moment it takes effect every tip-moving call from any other process
+    %% (block_sync's P2P connect + side-branch submit/reorg, submitblock,
+    %% generate*, invalidate/reconsider/precious, header_sync's disconnect) is
+    %% refused with chain_paused, and block_sync parks until it is released.
+    %% It is held from the rewind through the dump to the restore, released on
+    %% every exit path (after-clause; the chainstate also monitors this
+    %% process). The old flag only gated RPC submitblock, so P2P kept
+    %% connecting over the rewound chainstate (audit BC-4).
     set_block_submission_paused(true),
     try
-        case rewind_to(TargetHash, TargetHeight, OrigTipHeight, []) of
-            {ok, Disconnected} ->
-                %% Disconnected = [#block{}], oldest-first (so reversing gives
-                %% replay order from TargetHeight+1 → OrigTipHeight).
-                DumpResult = do_dump_at_tip(Path, TargetHash, TargetHeight,
-                                            Network),
-                %% Always try to forward-replay even if the dump itself
-                %% failed, so we leave the node where the operator left it.
-                case replay_forward(Disconnected) of
-                    ok ->
-                        DumpResult;
-                    {error, ReplayReason} ->
-                        logger:error(
-                          "dumptxoutset: forward replay failed at "
-                          "height after ~B (target=~B, orig_tip=~B): ~p",
-                          [TargetHeight, TargetHeight, OrigTipHeight,
-                           ReplayReason]),
-                        case DumpResult of
-                            {ok, _} ->
-                                {error, ?RPC_MISC_ERROR,
-                                 iolist_to_binary(
-                                   io_lib:format(
-                                     "Snapshot written but forward replay failed: ~p",
-                                     [ReplayReason]))};
-                            Err ->
-                                Err
-                        end
-                end;
-            {error, Code, Msg} ->
-                _ = mark_orig_tip_for_log(OrigTipHash),
-                {error, Code, Msg}
+        case beamchain_chainstate:begin_chain_pause() of
+            {ok, {CurHash, CurHeight}} ->
+                rollback_dump_restore(Path, TargetHash, TargetHeight,
+                                      CurHash, CurHeight, OrigTipHash, Network);
+            {error, already_paused} ->
+                {error, ?RPC_MISC_ERROR,
+                 <<"Another dumptxoutset rollback is in progress">>};
+            {error, R} ->
+                {error, ?RPC_MISC_ERROR,
+                 iolist_to_binary(io_lib:format("Could not pause the chain: ~p", [R]))}
         end
     after
+        _ = (catch beamchain_chainstate:end_chain_pause()),
         set_block_submission_paused(false)
     end.
 
-%% Rewind the chain to TargetHash/TargetHeight, capturing the disconnected
-%% blocks (oldest-first) for later forward replay. We re-fetch each block
-%% from the DB before disconnecting so replay does not depend on
-%% block-index lookups after the rewind.
+%% Runs with the chain paused. The tip may have moved between the RPC's first
+%% read and the pause, so the target is re-checked against the active chain
+%% as of the pause.
+rollback_dump_restore(Path, TargetHash, TargetHeight, CurHash, CurHeight,
+                      OrigTipHash, Network) ->
+    OnActive = case beamchain_db:get_block_index(TargetHeight) of
+                   {ok, #{hash := TargetHash}} -> TargetHeight =< CurHeight;
+                   _ -> false
+               end,
+    case OnActive of
+        false ->
+            {error, ?RPC_MISC_ERROR,
+             <<"Could not roll back to requested height.">>};
+        true when TargetHash =:= CurHash ->
+            do_dump_at_tip(Path, TargetHash, Network);
+        true ->
+            %% Core TemporaryRollback: disconnect tip-first down to the
+            %% target (InvalidateBlock of the first block above it).
+            {RewindRes, Disconnected} =
+                case rewind_to(TargetHash, TargetHeight, CurHeight, []) of
+                    {ok, D} -> {ok, D};
+                    {error, C, M, D} -> {{error, C, M}, D}
+                end,
+            maybe_test_hook("dump.rewound"),
+            DumpResult =
+                case RewindRes of
+                    ok ->
+                        try do_dump_at_tip(Path, TargetHash, Network)
+                        catch Cls:Why ->
+                            {error, ?RPC_MISC_ERROR,
+                             iolist_to_binary(
+                               io_lib:format("dumptxoutset failed: ~p:~p",
+                                             [Cls, Why]))}
+                        end;
+                    Err -> Err
+                end,
+            %% Restore on EVERY path (Core ~TemporaryRollback ->
+            %% ReconsiderBlock): reconnect upward, oldest first.
+            case replay_forward(Disconnected) of
+                ok ->
+                    DumpResult;
+                {error, ReplayReason} ->
+                    logger:error(
+                      "dumptxoutset: forward replay failed (target=~B, "
+                      "tip before rollback=~B): ~p",
+                      [TargetHeight, CurHeight, ReplayReason]),
+                    _ = mark_orig_tip_for_log(OrigTipHash),
+                    case DumpResult of
+                        {ok, _} ->
+                            {error, ?RPC_MISC_ERROR,
+                             iolist_to_binary(
+                               io_lib:format(
+                                 "Snapshot written but forward replay failed: ~p",
+                                 [ReplayReason]))};
+                        Err2 ->
+                            Err2
+                    end
+            end
+    end.
+
+%% Inert unless BEAMCHAIN_TEST_HOOK_DIR is set and <dir>/<Name> exists: then
+%% sleeps the number of ms in that file (touching <Name>.hit first). Lets a
+%% regtest reproducer hold the rollback window open deterministically.
+maybe_test_hook(Name) ->
+    case os:getenv("BEAMCHAIN_TEST_HOOK_DIR") of
+        false -> ok;
+        "" -> ok;
+        Dir ->
+            F = filename:join(Dir, Name),
+            case file:read_file(F) of
+                {ok, Bin} ->
+                    _ = file:write_file(F ++ ".hit", <<>>),
+                    Ms = try binary_to_integer(string:trim(Bin)) catch _:_ -> 0 end,
+                    timer:sleep(Ms);
+                _ -> ok
+            end
+    end.
+
+%% Rewind the chain to TargetHash/TargetHeight, tip first, capturing the
+%% disconnected blocks (oldest-first) for the restore. On a failure part-way
+%% the blocks already disconnected are returned too, so the caller restores
+%% them (the old code dropped them and left the chain lowered).
 rewind_to(_TargetHash, TargetHeight, CurHeight, Acc)
   when CurHeight =:= TargetHeight ->
     {ok, Acc};
-rewind_to(_TargetHash, TargetHeight, CurHeight, _Acc)
+rewind_to(_TargetHash, TargetHeight, CurHeight, Acc)
   when CurHeight < TargetHeight ->
     {error, ?RPC_MISC_ERROR,
      iolist_to_binary(
        io_lib:format(
-         "rewind underflow: cur=~B target=~B", [CurHeight, TargetHeight]))};
+         "rewind underflow: cur=~B target=~B", [CurHeight, TargetHeight])),
+     Acc};
 rewind_to(TargetHash, TargetHeight, CurHeight, Acc) ->
     case beamchain_chainstate:get_tip() of
         {ok, {CurHash, CurHeight}} ->
@@ -16196,14 +16285,16 @@ rewind_to(TargetHash, TargetHeight, CurHeight, Acc) ->
                              iolist_to_binary(
                                io_lib:format(
                                  "disconnect_block failed at height ~B: ~p",
-                                 [CurHeight, Reason]))}
+                                 [CurHeight, Reason])),
+                             Acc}
                     end;
                 not_found ->
                     {error, ?RPC_MISC_ERROR,
                      iolist_to_binary(
                        io_lib:format(
                          "block data missing at height ~B during rewind",
-                         [CurHeight]))}
+                         [CurHeight])),
+                     Acc}
             end;
         {ok, {OtherHash, OtherHeight}} ->
             {error, ?RPC_MISC_ERROR,
@@ -16213,10 +16304,11 @@ rewind_to(TargetHash, TargetHeight, CurHeight, Acc) ->
                  "got height ~B (hash ~s)",
                  [CurHeight, OtherHeight,
                   beamchain_serialize:hex_encode(
-                    beamchain_serialize:reverse_bytes(OtherHash))]))};
+                    beamchain_serialize:reverse_bytes(OtherHash))])),
+             Acc};
         not_found ->
             {error, ?RPC_MISC_ERROR,
-             <<"Chain tip disappeared during rewind">>}
+             <<"Chain tip disappeared during rewind">>, Acc}
     end.
 
 %% Replay the captured blocks (oldest-first) back through connect_block/1.
@@ -16235,22 +16327,21 @@ mark_orig_tip_for_log(OrigTipHash) ->
                       beamchain_serialize:reverse_bytes(OrigTipHash))]),
     ok.
 
-%% Read the coins_count field out of the metadata header we just wrote.
-%% Cheap and avoids re-iterating the chainstate.
-count_coins_in_snapshot(SnapshotBin) ->
-    case beamchain_snapshot:parse_metadata(SnapshotBin) of
-        {ok, #{num_coins := N}, _Rest} -> N;
-        _ -> 0
-    end.
-
-%% Best-effort chain_tx_count lookup. If the height matches an
-%% m_assumeutxo_data entry we report the canonical Core value; otherwise
-%% the base block index is consulted, falling back to 0 when neither is
-%% available (regtest / pre-snapshot dev runs).
-chain_tx_count_for_height(Height, Network) ->
-    case beamchain_chain_params:get_assumeutxo(Height, Network) of
-        {ok, #{chain_tx_count := N}} -> N;
-        not_found -> 0
+%% Core: result.nchaintx = tip->m_chain_tx_count of the dumped base. Read
+%% the cumulative counter ("cumtx:<height>", maintained atomically with each
+%% connect) through the dump's own snapshot. The old code returned the
+%% m_assumeutxo_data entry for the HEIGHT whatever block was there (on regtest
+%% Core's height-110 entry, 111, for an unrelated chain) and 0 otherwise. The
+%% chainparams value is only a fallback when the counter is absent (a
+%% snapshot-loaded base) and the entry is for this very block.
+chain_tx_count_for(BaseHash, Height, Network, ReadOpts) ->
+    case beamchain_db:cumulative_tx_count_at(Height, ReadOpts) of
+        N when is_integer(N), N > 0 -> N;
+        _ ->
+            case beamchain_chain_params:get_assumeutxo(Height, Network) of
+                {ok, #{chain_tx_count := N, block_hash := BaseHash}} -> N;
+                _ -> 0
+            end
     end.
 
 %%% ===================================================================

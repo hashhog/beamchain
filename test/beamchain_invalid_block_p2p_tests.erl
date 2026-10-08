@@ -66,6 +66,9 @@ bs_setup() ->
     ets:insert(Tab, {tip, {height_hash(99), 99}}),
     ets:insert(Tab, {connect_result, ok}),
     lists:foreach(fun(M) -> ok = meck:new(M, [no_link]) end, ?BS_MOCKED),
+    %% dumptxoutset chain pause (beamchain_chainstate:is_chain_paused/0) is
+    %% read by block_sync before it connects; never paused in these tests.
+    ok = meck:expect(beamchain_chainstate, is_chain_paused, fun() -> false end),
     ok = meck:expect(beamchain_db, get_block_index,
         fun(H) ->
             {ok, #{hash => height_hash(H), header => mk_header(H),
@@ -290,6 +293,9 @@ hs_setup() ->
     Tab = ets:new(ibp2p_hs, [set, public]),
     ets:insert(Tab, {invalid, []}),
     lists:foreach(fun(M) -> ok = meck:new(M, [no_link]) end, ?HS_MOCKED),
+    %% dumptxoutset chain pause (beamchain_chainstate:is_chain_paused/0) is
+    %% read by block_sync before it connects; never paused in these tests.
+    ok = meck:expect(beamchain_chainstate, is_chain_paused, fun() -> false end),
     %% Main chain known up to 22 in the height index.
     ok = meck:expect(beamchain_db, get_block_index,
         fun(H) when H =< 22 ->
