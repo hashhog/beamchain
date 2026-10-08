@@ -49,6 +49,9 @@ bs_setup() ->
     ets:insert(Tab, {tip, {height_hash(100), 100}}),
     ets:insert(Tab, {header_tip, 100}),
     lists:foreach(fun(M) -> ok = meck:new(M, [no_link]) end, ?BS_MOCKED),
+    %% dumptxoutset chain pause (beamchain_chainstate:is_chain_paused/0) is
+    %% read by block_sync before it connects; never paused in these tests.
+    ok = meck:expect(beamchain_chainstate, is_chain_paused, fun() -> false end),
     %% The height index only holds headers we actually have.
     ok = meck:expect(beamchain_db, get_block_index,
         fun(H) ->
@@ -366,6 +369,9 @@ stale_setup() ->
     beamchain_peer_manager:test_ensure_peer_table(),
     ets:delete_all_objects(beamchain_peers),
     ok = meck:new(beamchain_chainstate, [no_link]),
+    %% dumptxoutset chain pause (beamchain_chainstate:is_chain_paused/0) is
+    %% read by block_sync before it connects; never paused in these tests.
+    ok = meck:expect(beamchain_chainstate, is_chain_paused, fun() -> false end),
     ok = meck:expect(beamchain_chainstate, get_tip_height,
                      fun() -> {ok, ?TIP} end),
     flush_all(),
