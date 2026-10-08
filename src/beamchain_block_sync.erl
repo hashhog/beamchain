@@ -30,6 +30,7 @@
          start_sync/1,
          stop_sync/0,
          stale_tip_rearm/0,
+         chain_invalidated/0,
          handle_block/2,
          handle_notfound/2,
          handle_peer_connected/2,
@@ -289,6 +290,16 @@ stop_sync() ->
 stale_tip_rearm() ->
     gen_server:cast(?SERVER, stale_tip_rearm).
 
+%% @doc invalidateblock failed a branch.  Everything queued, in flight or
+%% buffered above the (lowered) tip was planned off the old best header,
+%% i.e. on the failed branch: drop it and go idle.  Core
+%% FindNextBlocksToDownload recomputes from the best VALID header each pass;
+%% header sync re-arms block download (headers_complete) from the
+%% recomputed best header.
+-spec chain_invalidated() -> ok.
+chain_invalidated() ->
+    gen_server:cast(?SERVER, chain_invalidated).
+
 %% @doc Handle a received block from a peer.
 -spec handle_block(pid(), #block{}) -> ok.
 handle_block(Peer, Block) ->
@@ -515,6 +526,16 @@ handle_cast(stale_tip_rearm, State) ->
         _ ->
             {noreply, State}
     end;
+
+handle_cast(chain_invalidated, State) ->
+    State2 = cancel_timers(State),
+    {noreply, State2#state{status = idle,
+                           download_queue = [],
+                           in_flight = #{},
+                           hash_to_height = #{},
+                           downloaded = #{},
+                           downloaded_bytes = 0,
+                           block_source = #{}}};
 
 handle_cast(stop_sync, State) ->
     State2 = cancel_timers(State),
@@ -976,6 +997,10 @@ blast_request_height(Height, #state{peers = Peers,
                                      peer_stats = AllStats} = State) ->
     case beamchain_db:get_block_index(Height) of
         {ok, #{hash := Hash}} ->
+          case failed_block(Hash) of
+            failed ->
+                State;
+            false ->
             Item = #{type => ?MSG_WITNESS_BLOCK, hash => Hash},
             Now = erlang:monotonic_time(millisecond),
             PeerList = [P || P <- maps:keys(Peers),
@@ -1025,7 +1050,8 @@ blast_request_height(Height, #state{peers = Peers,
                                 hash_to_height = H2H2,
                                 peer_stats = AllStats2,
                                 download_queue = Queue2}
-            end;
+            end
+          end;
         not_found ->
             %% Same frontier invariant as request_batch: the caller already
             %% took Height out of in_flight, so put it back in the queue.
@@ -1091,7 +1117,15 @@ request_batch(Peer, BatchSize,
                 fun(Height, {ItemsAcc, IFAcc, H2HAcc, SkipAcc, NHAcc}) ->
                     case beamchain_db:get_block_index(Height) of
                         {ok, #{hash := Hash}} ->
-                            case said_notfound(Peer, Hash, State) of
+                            case said_notfound(Peer, Hash, State) orelse
+                                 failed_block(Hash) of
+                                failed ->
+                                    %% Core: a BLOCK_FAILED block is never
+                                    %% requested.  The height is dropped
+                                    %% from this plan; header sync has
+                                    %% moved the best header off it.
+                                    {ItemsAcc, IFAcc, H2HAcc, SkipAcc + 1,
+                                     NHAcc};
                                 true ->
                                     %% This peer told us it does not have
                                     %% the block: leave the height queued
@@ -1476,6 +1510,8 @@ validate_sequential_inner(#state{next_to_validate = NextH,
                             halt_sync_aborted(NextH, Reason, State);
                         {false, true} ->
                             invalid_block_found(NextH, Block, Reason, State);
+                        {false, false} when Reason =:= duplicate_invalid ->
+                            cached_invalid_block(NextH, Block, State);
                         {false, false} ->
                             validation_retry_or_halt(NextH, Reason, State)
                     end
@@ -1572,6 +1608,31 @@ invalid_block_found(NextH, Block, Reason, State) ->
                  validation_failures =
                      maps:remove(NextH, State#state.validation_failures)}.
 
+%% The block at NextH is already failed (invalidateblock or an earlier
+%% verdict): Core BLOCK_CACHED_INVALID.  Nothing to mark and -- the block was
+%% asked for by us, off a header chain that was still on the failed branch --
+%% nobody to punish (Core discourages only an outbound peer that is ON an
+%% invalid chain, and our request is the cause here).  Never retried: the
+%% header chain is rewound off it and download goes idle until it re-arms
+%% from the recomputed best header.
+cached_invalid_block(NextH, Block, State) ->
+    Hash = beamchain_serialize:block_hash(Block#block.header),
+    logger:warning("block_sync: block ~s at height ~B is marked invalid "
+                   "(duplicate-invalid) -- not connected, not re-requested",
+                   [hash_hex(Hash), NextH]),
+    _ = (catch beamchain_header_sync:invalid_block_found(Hash, NextH,
+                                                         undefined)),
+    State2 = cancel_timers(State),
+    State2#state{status = idle,
+                 download_queue = [],
+                 in_flight = #{},
+                 hash_to_height = #{},
+                 downloaded = #{},
+                 downloaded_bytes = 0,
+                 block_source = #{},
+                 validation_failures =
+                     maps:remove(NextH, State#state.validation_failures)}.
+
 %% Is a connect failure a VERDICT about the block itself (Core
 %% BLOCK_CONSENSUS / BLOCK_INVALID_HEADER as returned by ConnectBlock /
 %% ContextualCheckBlock(Header) / CheckBlock), as opposed to something that
@@ -1608,6 +1669,14 @@ is_consensus_verdict(R) when is_atom(R) ->
                      high_hash]);
 is_consensus_verdict(_) ->
     false.
+
+%% `failed` when Hash was failed (invalidateblock or a consensus verdict, or
+%% a descendant of one), else false.
+failed_block(Hash) ->
+    case catch beamchain_chainstate:is_known_invalid(Hash) of
+        true -> failed;
+        _ -> false
+    end.
 
 said_notfound(Peer, Hash, #state{notfound_from = NF}) ->
     lists:member(Peer, maps:get(Hash, NF, [])).

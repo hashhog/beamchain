@@ -7,10 +7,6 @@
 -include("beamchain.hrl").
 -include("beamchain_protocol.hrl").
 
-%% Dialyzer suppressions for false positives:
-%% is_descendant_of/3 and find_fork_point/3: dialyzer infers AllBlocks is []
-%% from one call-site path, making the non-false branch appear unreachable.
--dialyzer({nowarn_function, [find_fork_point/3]}).
 
 %% API
 -export([start_link/0, start_link/1, start_link/2]).
@@ -1509,7 +1505,17 @@ do_connect_block(#block{header = Header} = Block,
         false ->
             {error, bad_prevblk};
         true ->
-            do_connect_block_inner(Block, State)
+            %% Core AcceptBlock / FindMostWorkChain: a block marked failed
+            %% (invalidateblock, a P2P consensus verdict, or a descendant of
+            %% either) is never connected again -- every connect path (block
+            %% download, submitblock, reorg, crash roll-forward) comes
+            %% through here.  Until reconsiderblock clears it.
+            case is_known_invalid(beamchain_serialize:block_hash(Header)) of
+                true ->
+                    {error, duplicate_invalid};
+                false ->
+                    do_connect_block_inner(Block, State)
+            end
     end.
 
 do_connect_block_inner(Block, State) ->
@@ -1918,9 +1924,32 @@ maybe_check_ibd(State) ->
 %%% (Pattern Y) and the rustoshi reference fix at 68a422b.
 %%% ===================================================================
 
-do_submit_block(#block{header = Header} = Block, MinPowChecked,
-                #state{tip_hash = TipHash, tip_height = TipHeight,
-                       params = Params} = State) ->
+do_submit_block(#block{header = Header} = Block, MinPowChecked, State) ->
+    case failed_block_or_parent(Header) of
+        ok ->
+            do_submit_block_unfailed(Block, MinPowChecked, State);
+        {error, _} = Failed ->
+            Failed
+    end.
+
+%% Core AcceptBlockHeader (validation.cpp): a block already marked failed
+%% answers BLOCK_CACHED_INVALID "duplicate-invalid"; a block whose parent is
+%% failed answers BLOCK_INVALID_PREV "bad-prevblk".  The failed set is the
+%% hash-keyed verdict (is_known_invalid/1) that invalidateblock and P2P
+%% verdicts write for the block and every descendant.
+failed_block_or_parent(#block_header{prev_hash = PrevHash} = Header) ->
+    case is_known_invalid(beamchain_serialize:block_hash(Header)) of
+        true -> {error, duplicate_invalid};
+        false ->
+            case is_known_invalid(PrevHash) of
+                true -> {error, invalid_prevblk};
+                false -> ok
+            end
+    end.
+
+do_submit_block_unfailed(#block{header = Header} = Block, MinPowChecked,
+                         #state{tip_hash = TipHash, tip_height = TipHeight,
+                                params = Params} = State) ->
     PrevHash = Header#block_header.prev_hash,
     %% G8 (W97): min_pow_checked gate.
     %% Mirror Core validation.cpp:4229-4232: if !min_pow_checked, reject with
@@ -1979,6 +2008,14 @@ do_submit_block(#block{header = Header} = Block, MinPowChecked,
 do_submit_header(#block_header{prev_hash = PrevHash} = Header,
                  #state{params = Params}) ->
     BlockHash = beamchain_serialize:block_hash(Header),
+    %% (0) Core AcceptBlockHeader: duplicate-invalid / bad-prevblk for a
+    %% failed block or a child of one.
+    case failed_block_or_parent(Header) of
+        ok -> do_submit_header_unfailed(Header, BlockHash, PrevHash, Params);
+        {error, _} = Failed -> Failed
+    end.
+
+do_submit_header_unfailed(Header, BlockHash, PrevHash, Params) ->
     %% (1) Idempotency.  Core's AcceptBlockHeader returns the existing index
     %% entry (success) when the header is already known.  Any index hit
     %% (active or side-branch, header-only or with body) counts as known.
@@ -2102,8 +2139,17 @@ do_side_branch_accept(#block{header = Header} = Block, State) ->
     end.
 
 do_side_branch_accept_with_parent(#block{header = Header} = Block,
-                                   ParentEntry,
-                                   #state{params = Params} = State) ->
+                                   ParentEntry, State) ->
+    case failed_block_or_parent(Header) of
+        ok ->
+            do_side_branch_accept_unfailed(Block, ParentEntry, State);
+        {error, _} = Failed ->
+            Failed
+    end.
+
+do_side_branch_accept_unfailed(#block{header = Header} = Block,
+                               ParentEntry,
+                               #state{params = Params} = State) ->
     BlockHash = beamchain_serialize:block_hash(Header),
     %% Idempotency: skip ONLY when the block's BODY is already stored
     %% (BLOCK_HAVE_DATA) — i.e. it was actually connected/activated.
@@ -2274,7 +2320,8 @@ active_tip_chainwork(TipHash) ->
 %% (in do_connect_block_inner), so the side-branch index entries for
 %% the now-active blocks are stale and should be removed.
 do_promote_side_branch(NewTipHash, State) ->
-    case build_side_branch_chain_to_active(NewTipHash, State#state.tip_hash) of
+    case build_side_branch_chain_to_active(NewTipHash, State#state.tip_hash,
+                                           State#state.tip_height) of
         {ok, []} ->
             %% Already on the active chain.  Shouldn't happen given
             %% the chainwork comparison above, but defend anyway.
@@ -2330,10 +2377,10 @@ do_promote_side_branch(NewTipHash, State) ->
 %% until we find a hash that's on the active chain (i.e. its hash
 %% matches the active block_index entry at its height).  Returns the
 %% blocks in fork→tip order, loaded from cf_blocks.
-build_side_branch_chain_to_active(StartHash, ConnTipHash) ->
-    build_side_branch_chain_to_active(StartHash, ConnTipHash, []).
+build_side_branch_chain_to_active(StartHash, ConnTipHash, ConnTipHeight) ->
+    build_side_branch_chain_to_active(StartHash, ConnTipHash, ConnTipHeight, []).
 
-build_side_branch_chain_to_active(Hash, ConnTipHash, Acc) ->
+build_side_branch_chain_to_active(Hash, ConnTipHash, ConnTipHeight, Acc) ->
     case beamchain_db:get_block(Hash) of
         {ok, Block} ->
             PrevHash = (Block#block.header)#block_header.prev_hash,
@@ -2345,7 +2392,8 @@ build_side_branch_chain_to_active(Hash, ConnTipHash, Acc) ->
             %% so is_on_active_chain/1 (which reads it) would report the
             %% unconnected fork itself as "active" and stop the walk at a bogus
             %% fork point (the reorg_walk_failed / ForkPointNotInIndex bug).
-            case is_on_connected_chain(PrevHash, ConnTipHash) of
+            case is_on_connected_chain_at(PrevHash, ConnTipHash,
+                                          ConnTipHeight) of
                 true ->
                     %% Found fork point — PrevHash is the last common
                     %% ancestor.  Acc was prepended on each recursion
@@ -2359,7 +2407,8 @@ build_side_branch_chain_to_active(Hash, ConnTipHash, Acc) ->
                     case lookup_block_index_anywhere(PrevHash) of
                         {ok, _} ->
                             build_side_branch_chain_to_active(
-                              PrevHash, ConnTipHash, [Block | Acc]);
+                              PrevHash, ConnTipHash, ConnTipHeight,
+                              [Block | Acc]);
                         not_found ->
                             %% Broken chain — parent gone.
                             {error, {broken_chain, PrevHash}}
@@ -2391,6 +2440,33 @@ is_on_connected_chain(Hash, ConnTipHash) ->
                 N        -> N + 1   %% preserve the historical +1 pruned bound
             end,
     walk_connected_chain(ConnTipHash, Hash, 0, Limit).
+
+%% Same answer as is_on_connected_chain/2, bounded by the target's height:
+%% the connected block at height H is exactly ConnTipHeight - H body hops
+%% below the tip, so a target above the tip is answered without a walk and
+%% any other target with at most that many hops.  The unbounded walk ran to
+%% GENESIS for every off-chain hash on an archive node -- once per block of
+%% the branch being promoted (reconsiderblock / side-branch reorg cost
+%% O(branch x chain height)).
+is_on_connected_chain_at(<<0:256>>, _ConnTipHash, _ConnTipHeight) ->
+    true;
+is_on_connected_chain_at(Hash, ConnTipHash, ConnTipHeight)
+  when is_integer(ConnTipHeight) ->
+    case lookup_block_index_anywhere(Hash) of
+        {ok, #{height := H}} when is_integer(H), H > ConnTipHeight ->
+            false;
+        {ok, #{height := H}} when is_integer(H) ->
+            Bound = ConnTipHeight - H,
+            Limit = case reorg_depth_limit() of
+                        infinity -> Bound;
+                        N        -> min(Bound, N + 1)
+                    end,
+            walk_connected_chain(ConnTipHash, Hash, 0, Limit);
+        _ ->
+            is_on_connected_chain(Hash, ConnTipHash)
+    end;
+is_on_connected_chain_at(Hash, ConnTipHash, _) ->
+    is_on_connected_chain(Hash, ConnTipHash).
 
 walk_connected_chain(_Cur, _Target, Depth, Limit)
   when is_integer(Limit), Depth > Limit ->
@@ -3991,8 +4067,13 @@ do_invalidate_block(Hash, State) ->
                 0 ->
                     {error, cannot_invalidate_genesis};
                 _ ->
-                    %% Check if already invalidated
-                    case (Status band ?BLOCK_FAILED_VALID) =/= 0 of
+                    %% Already invalidated?  FAILED_VALID alone is not
+                    %% enough: header sync's mark_orphaned_blocks writes the
+                    %% same bit on VALID blocks that lost a header reorg, so
+                    %% the hash-keyed verdict (is_known_invalid) is what
+                    %% says "this block was failed".
+                    case (Status band ?BLOCK_FAILED_VALID) =/= 0
+                         andalso is_known_invalid(Hash) of
                         true ->
                             %% Already invalid, nothing to do
                             {ok, State};
@@ -4021,20 +4102,80 @@ do_invalidate_block_impl(Hash, BlockHeight, #state{tip_height = TipHeight} = Sta
     end,
 
     %% Step 2: Mark the block and all its descendants as invalid
+    %% (BLOCK_FAILED_VALID in the index AND the hash-keyed verdict that
+    %% header sync, block download and every connect path honour).
     mark_block_invalid(Hash, BlockHeight),
 
-    %% Step 3: Find and switch to the best valid chain
-    case find_best_valid_chain(State2) of
-        {ok, BestChain} when BestChain =/= [] ->
-            %% Connect the new best chain
-            connect_blocks(BestChain, State2);
-        {ok, []} ->
-            %% No better chain found, stay at current tip
-            {ok, State2};
-        {error, Reason} ->
-            %% Failed to find alternative chain
-            logger:error("chainstate: failed to find alternative chain: ~p", [Reason]),
-            {ok, State2}
+    %% Step 3: Find and switch to the best valid chain.  Core keeps
+    %% setBlockIndexCandidates in memory; InvalidateBlock only adds the
+    %% out-of-chain blocks with at least the new tip's work.  Here the
+    %% descendants of the invalidated block are failed, so the only possible
+    %% candidates are side-branch entries -- never a walk of the whole
+    %% block index (the old find_best_valid_chain read every index entry and
+    %% then searched that list linearly per hop).
+    {ok, State3} = activate_best_candidate(side_branch_entries(), State2),
+
+    %% Step 4: Core InvalidChainFound -> RecalculateBestHeader.  The best
+    %% header can no longer be on the failed branch; without this the header
+    %% tip stayed at the old tip, block download (find_start_height /
+    %% stale_tip_rearm) re-fetched the invalidated blocks by height and the
+    %% next announcement reconnected them (BC-1).
+    notify_chain_invalidated(State3),
+    {ok, State3}.
+
+%% Tell header sync and block download that a branch was failed by
+%% invalidateblock.  Casts: chainstate never waits on either.
+notify_chain_invalidated(#state{tip_hash = TipHash, tip_height = TipHeight}) ->
+    _ = (catch beamchain_header_sync:best_header_invalidated(TipHash, TipHeight)),
+    _ = (catch beamchain_block_sync:chain_invalidated()),
+    ok.
+
+side_branch_entries() ->
+    case beamchain_db:get_all_side_branch_indexes() of
+        {ok, SB} -> SB;
+        _ -> []
+    end.
+
+%% Core ActivateBestChain over an explicit candidate set: the most-work
+%% candidate that has its body, is not failed, and has strictly more work
+%% than the active tip is promoted (do_promote_side_branch walks back to the
+%% connected chain by block bodies and runs the atomic reorg, whose connects
+%% refuse any known-invalid block).  Cost: O(candidates + promoted branch).
+activate_best_candidate(Candidates, State) ->
+    TipWork = tip_chainwork(State),
+    Eligible = lists:filtermap(fun(#{hash := H}) ->
+        case lookup_block_index_anywhere(H) of
+            {ok, #{status := S, chainwork := CW} = E}
+              when (S band ?BLOCK_HAVE_DATA) =/= 0,
+                   (S band ?BLOCK_FAILED_VALID) =:= 0 ->
+                W = binary:decode_unsigned(CW, big),
+                case W > TipWork andalso not is_known_invalid(H) of
+                    true -> {true, {W, E#{hash => H}}};
+                    false -> false
+                end;
+            _ ->
+                false
+        end
+    end, Candidates),
+    case Eligible of
+        [] ->
+            {ok, State};
+        _ ->
+            {_, #{hash := Best}} = lists:foldl(fun({W, _} = C, {AW, _} = Acc) ->
+                case W > AW of true -> C; false -> Acc end
+            end, hd(Eligible), tl(Eligible)),
+            case do_promote_side_branch(Best, State) of
+                {ok, _, State2} ->
+                    {ok, State2};
+                {error, Reason, RolledBack} ->
+                    logger:warning("chainstate: activating best chain "
+                                   "failed: ~p (rolled back)", [Reason]),
+                    {ok, RolledBack};
+                {error, Reason} ->
+                    logger:warning("chainstate: activating best chain "
+                                   "failed: ~p", [Reason]),
+                    {ok, State}
+            end
     end.
 
 %% Disconnect blocks until tip is at TargetHeight
@@ -4056,6 +4197,7 @@ disconnect_to_height(TargetHeight, State) ->
 mark_block_invalid(Hash, BlockHeight) ->
     case lookup_block_index_anywhere(Hash) of
         {ok, #{status := Status}} ->
+            _ = set_known_invalid(Hash, 1),
             set_block_status(Hash, Status bor ?BLOCK_FAILED_VALID),
             logger:info("chainstate: marked block at height ~B as invalid",
                         [BlockHeight]),
@@ -4112,6 +4254,10 @@ set_block_status(Hash, NewStatus) ->
 %% ancestor at the invalidated height is the invalidated block).
 mark_descendants_invalid(ParentHash, ParentHeight) ->
     lists:foreach(fun(#{hash := DescHash, status := Status}) ->
+        %% Core BLOCK_FAILED_CHILD / SetBlockFailureFlags: a descendant of a
+        %% failed block is failed too -- recorded hash-keyed so its header
+        %% is refused and it is never requested or connected again.
+        _ = set_known_invalid(DescHash, 1),
         case (Status band ?BLOCK_FAILED_VALID) =:= 0 of
             true  -> set_block_status(DescHash, Status bor ?BLOCK_FAILED_VALID);
             false -> ok
@@ -4157,185 +4303,11 @@ ancestor_at(#{height := Ht, header := #block_header{prev_hash = Prev}}, TargetHe
 ancestor_at(_, _) ->
     undefined.
 
-%% Find the best valid chain (most cumulative work among non-invalid blocks).
-%% Carries the active precious-seqid tiebreak map so that equal-work ties are
-%% broken in favour of any block marked precious (preciousblock), matching
-%% Core's CBlockIndexWorkComparator nSequenceId rule. With an empty map this
-%% is identical to the prior chainwork-only selection.
-find_best_valid_chain(#state{precious_seqids = Precious} = State) ->
-    find_best_valid_chain(State, Precious).
-
-find_best_valid_chain(#state{tip_hash = TipHash}, Precious) ->
-    case beamchain_db:get_all_block_indexes() of
-        {ok, AllBlocks} ->
-            %% Filter to valid blocks that also have block data on disk.
-            %% BUG-1 + BUG-9 fix: require BLOCK_HAVE_DATA (bit 8) in addition
-            %% to the BLOCK_FAILED_VALID check.  Core's FindMostWorkChain skips
-            %% any candidate where !(pindexTest->nStatus & BLOCK_HAVE_DATA),
-            %% adding those entries to m_blocks_unlinked and erasing them from
-            %% setBlockIndexCandidates.  Without this guard a VALID_TREE entry
-            %% (status=2, no body) with high chainwork would be selected here,
-            %% causing collect_chain_blocks to silently drop it and
-            %% connect_blocks to receive an incomplete chain.
-            ValidBlocks = [B || B = #{status := S} <- AllBlocks,
-                               (S band ?BLOCK_FAILED_VALID) =:= 0,
-                               (S band ?BLOCK_HAVE_DATA)    =/= 0],
-            %% Find the block with most cumulative work
-            case ValidBlocks of
-                [] ->
-                    {ok, []};
-                _ ->
-                    BestBlock = lists:foldl(fun(B, Acc) ->
-                        case compare_work_precious(B, Acc, Precious) of
-                            greater -> B;
-                            _ -> Acc
-                        end
-                    end, hd(ValidBlocks), tl(ValidBlocks)),
-
-                    %% If best block is current tip, no change needed
-                    case maps:get(hash, BestBlock) =:= TipHash of
-                        true ->
-                            {ok, []};
-                        false ->
-                            %% Build the chain from fork point to best block
-                            build_chain_to_block(BestBlock, ValidBlocks, TipHash)
-                    end
-            end;
-        Error ->
-            Error
-    end.
-
-%% Compare cumulative work of two blocks
-compare_work(#{chainwork := W1}, #{chainwork := W2}) ->
-    %% Chainwork is stored as big-endian binary
-    W1Int = binary:decode_unsigned(W1),
-    W2Int = binary:decode_unsigned(W2),
-    if
-        W1Int > W2Int -> greater;
-        W1Int < W2Int -> less;
-        true -> equal
-    end.
-
-%% Compare two block-index entries the way Core's CBlockIndexWorkComparator
-%% does: more cumulative work wins; on an exact tie the block with the LOWER
-%% sequence id wins. Normally-received blocks carry no precious seqid and are
-%% treated as +infinity (the atom `infinity`, which sorts after every integer
-%% in Erlang term order), while a precious block carries a negative reverse
-%% seqid — so a precious block always beats an equal-work non-precious one, and
-%% a later preciousblock call (a more-negative seqid) beats an earlier one.
-%% Returns greater when B1 is preferred over B2.
-compare_work_precious(B1, B2, Precious) ->
-    case compare_work(B1, B2) of
-        greater -> greater;
-        less    -> less;
-        equal   ->
-            S1 = precious_seqid(B1, Precious),
-            S2 = precious_seqid(B2, Precious),
-            if
-                S1 < S2 -> greater;   %% lower seqid is preferred
-                S1 > S2 -> less;
-                true    -> equal
-            end
-    end.
-
-%% Effective sequence id of a block-index entry for tiebreaking. A block that
-%% has been marked precious returns its (negative) reverse seqid; any other
-%% block returns the atom `infinity`, which is greater than every integer in
-%% Erlang's standard term ordering (number < atom), so non-precious blocks
-%% always lose equal-work ties to precious ones.
-precious_seqid(#{hash := H}, Precious) ->
-    maps:get(H, Precious, infinity).
-
-%% Build a list of blocks from fork point to target block
-build_chain_to_block(TargetBlock, AllBlocks, CurrentTipHash) ->
-    %% Walk back from target to find fork point with current chain
-    #{hash := TargetHash, height := _TargetHeight} = TargetBlock,
-    case find_fork_point(TargetHash, CurrentTipHash, AllBlocks) of
-        {ok, _ForkHash, ForkHeight} ->
-            %% Collect blocks from fork_height+1 to target
-            Blocks = collect_chain_blocks(TargetHash, ForkHeight, AllBlocks, []),
-            {ok, Blocks};
-        {error, Reason} ->
-            {error, Reason}
-    end.
-
-%% Find the common ancestor of two chains
-find_fork_point(Hash1, Hash2, AllBlocks) when Hash1 =:= Hash2 ->
-    case lists:keyfind(Hash1, 2, [{maps:get(hash, B), B} || B <- AllBlocks]) of
-        {_, #{height := H}} -> {ok, Hash1, H};
-        false -> {error, hash_not_found}
-    end;
-find_fork_point(Hash1, Hash2, AllBlocks) ->
-    %% Get heights of both blocks
-    Block1 = find_block_by_hash(Hash1, AllBlocks),
-    Block2 = find_block_by_hash(Hash2, AllBlocks),
-    case {Block1, Block2} of
-        {undefined, _} -> {error, {hash_not_found, Hash1}};
-        {_, undefined} -> {error, {hash_not_found, Hash2}};
-        {#{height := H1, header := Hdr1}, #{height := H2, header := Hdr2}} ->
-            %% Walk the higher chain down to same height, then walk both
-            find_fork_point_impl(Hash1, H1, Hdr1, Hash2, H2, Hdr2, AllBlocks)
-    end.
-
-find_fork_point_impl(_Hash1, H1, Hdr1, Hash2, H2, Hdr2, AllBlocks) when H1 > H2 ->
-    %% Walk Hash1 back one step
-    PrevHash = Hdr1#block_header.prev_hash,
-    case find_block_by_hash(PrevHash, AllBlocks) of
-        undefined -> {error, {broken_chain, PrevHash}};
-        #{header := PrevHdr} ->
-            find_fork_point_impl(PrevHash, H1 - 1, PrevHdr, Hash2, H2, Hdr2, AllBlocks)
-    end;
-find_fork_point_impl(Hash1, H1, Hdr1, _Hash2, H2, Hdr2, AllBlocks) when H2 > H1 ->
-    %% Walk Hash2 back one step
-    PrevHash = Hdr2#block_header.prev_hash,
-    case find_block_by_hash(PrevHash, AllBlocks) of
-        undefined -> {error, {broken_chain, PrevHash}};
-        #{header := PrevHdr} ->
-            find_fork_point_impl(Hash1, H1, Hdr1, PrevHash, H2 - 1, PrevHdr, AllBlocks)
-    end;
-find_fork_point_impl(Hash1, H1, _Hdr1, Hash2, _H2, _Hdr2, _AllBlocks) when Hash1 =:= Hash2 ->
-    %% Found the fork point
-    {ok, Hash1, H1};
-find_fork_point_impl(_Hash1, H1, Hdr1, _Hash2, H2, Hdr2, AllBlocks) ->
-    %% Same height but different hashes, walk both back
-    PrevHash1 = Hdr1#block_header.prev_hash,
-    PrevHash2 = Hdr2#block_header.prev_hash,
-    case {find_block_by_hash(PrevHash1, AllBlocks),
-          find_block_by_hash(PrevHash2, AllBlocks)} of
-        {undefined, _} -> {error, {broken_chain, PrevHash1}};
-        {_, undefined} -> {error, {broken_chain, PrevHash2}};
-        {#{header := PrevHdr1}, #{header := PrevHdr2}} ->
-            find_fork_point_impl(PrevHash1, H1 - 1, PrevHdr1,
-                                 PrevHash2, H2 - 1, PrevHdr2, AllBlocks)
-    end.
-
-find_block_by_hash(Hash, AllBlocks) ->
-    case [B || B = #{hash := H} <- AllBlocks, H =:= Hash] of
-        [Block | _] -> Block;
-        [] -> undefined
-    end.
-
-%% Collect block data from fork_height+1 to target
-collect_chain_blocks(TargetHash, ForkHeight, AllBlocks, Acc) ->
-    case find_block_by_hash(TargetHash, AllBlocks) of
-        #{height := H} when H =< ForkHeight ->
-            %% Reached or passed fork point, return accumulated blocks
-            Acc;
-        #{height := H, header := Hdr} ->
-            %% Load the actual block data
-            case beamchain_db:get_block(TargetHash) of
-                {ok, Block} ->
-                    PrevHash = Hdr#block_header.prev_hash,
-                    collect_chain_blocks(PrevHash, ForkHeight, AllBlocks, [Block | Acc]);
-                not_found ->
-                    %% Block data not available, can't switch to this chain
-                    logger:warning("chainstate: block data not found for ~s at height ~B",
-                                   [hash_hex(TargetHash), H]),
-                    Acc
-            end;
-        undefined ->
-            Acc
-    end.
+%% (find_best_valid_chain, which read EVERY block-index entry and then
+%% searched that list linearly per hop, is gone: invalidate / reconsider
+%% activate through activate_best_candidate/2 over an explicit O(fork)
+%% candidate set -- Core InvalidateBlock / ResetBlockFailureFlags +
+%% ActivateBestChain.)
 
 %% @doc Reconsider a previously invalidated block.
 %% Clears the invalid flag from the block and all its descendants/ancestors,
@@ -4357,22 +4329,34 @@ do_reconsider_block(Hash, State) ->
 
 do_reconsider_block_impl(Hash, BlockHeight, State) ->
     %% Step 1: Clear invalid flag from this block and all related blocks
-    clear_invalid_flags(Hash, BlockHeight),
+    %% (Core ResetBlockFailureFlags: the block, its descendants, its
+    %% ancestors).  Returns the cleared descendants.
+    Cleared = clear_invalid_flags(Hash, BlockHeight),
 
-    %% Step 2: Find the best chain and switch to it if needed
-    case find_best_valid_chain(State) of
-        {ok, BestChain} when BestChain =/= [] ->
-            logger:info("chainstate: reconsidering block at height ~B, "
-                        "switching to better chain (~B blocks)",
-                        [BlockHeight, length(BestChain)]),
-            connect_blocks(BestChain, State);
-        {ok, []} ->
-            %% Current chain is still best
-            {ok, State};
-        {error, Reason} ->
-            logger:error("chainstate: reconsider failed to find best chain: ~p", [Reason]),
-            {ok, State}
-    end.
+    %% Step 2: ActivateBestChain.  The candidates are exactly the blocks
+    %% whose failure was just lifted (the block and its descendants) plus
+    %% the side branches -- O(fork), not a walk of the whole block index.
+    {ok, State2} = activate_best_candidate(
+                     [#{hash => Hash} | Cleared] ++ side_branch_entries(),
+                     State),
+    case State2#state.tip_hash =/= State#state.tip_hash of
+        true ->
+            logger:info("chainstate: reconsidered block at height ~B; "
+                        "tip now ~B", [BlockHeight, State2#state.tip_height]);
+        false ->
+            ok
+    end,
+
+    %% Step 3: Core RecalculateBestHeader: the best header may now be a
+    %% reconsidered header beyond the connected tip.
+    BestHdr = lists:foldl(fun(#{hash := H, height := Ht, chainwork := CW}, {_, _, BW} = Acc) ->
+        W = binary:decode_unsigned(CW, big),
+        case W > BW of true -> {H, Ht, W}; false -> Acc end
+    end, {State2#state.tip_hash, State2#state.tip_height, tip_chainwork(State2)},
+       [E || E = #{chainwork := _} <- Cleared]),
+    {BH, BHt, _} = BestHdr,
+    _ = (catch beamchain_header_sync:best_header_reconsidered(BH, BHt)),
+    {ok, State2}.
 
 %% Clear invalid flags from a block and all its ancestors/descendants
 %% (Core ResetBlockFailureFlags).  Every write goes to the persisted index,
@@ -4386,6 +4370,7 @@ clear_invalid_flags(Hash, BlockHeight) ->
             clear_flagged_ancestors(maps:get(header, Entry)),
             set_block_status(Hash, BlockStatus band (bnot ?BLOCK_FAILED_VALID)),
             clear_known_invalid(Hash),
+            Descendants = find_descendants(Hash, BlockHeight),
             lists:foreach(fun(#{hash := DescHash, status := DescStatus}) ->
                 clear_known_invalid(DescHash),
                 case (DescStatus band ?BLOCK_FAILED_VALID) =/= 0 of
@@ -4395,10 +4380,10 @@ clear_invalid_flags(Hash, BlockHeight) ->
                     false ->
                         ok
                 end
-            end, find_descendants(Hash, BlockHeight)),
-            ok;
+            end, Descendants),
+            Descendants;
         not_found ->
-            ok
+            []
     end.
 
 clear_flagged_ancestors(#block_header{prev_hash = Prev}) ->

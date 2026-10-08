@@ -29,6 +29,8 @@
          handle_peer_disconnected/1,
          probe_peer/1,
          invalid_block_found/3,
+         best_header_invalidated/2,
+         best_header_reconsidered/2,
          get_status/0]).
 
 %% gen_server callbacks
@@ -181,6 +183,25 @@ probe_peer(Peer) ->
 -spec invalid_block_found(binary(), non_neg_integer(), pid() | undefined) -> ok.
 invalid_block_found(Hash, Height, Culprit) ->
     gen_server:cast(?SERVER, {invalid_block_found, Hash, Height, Culprit}).
+
+%% @doc invalidateblock failed a branch (chainstate has already marked the
+%% block and every known descendant failed and activated the best remaining
+%% chain, whose tip is ChainTipHash/ChainTipHeight).  Core InvalidChainFound
+%% -> RecalculateBestHeader: if our best header is on the failed branch, it
+%% becomes the active tip.  Unlike invalid_block_found/3 no peer is blamed
+%% and none is probed -- nobody sent us anything invalid.
+-spec best_header_invalidated(binary(), integer()) -> ok.
+best_header_invalidated(ChainTipHash, ChainTipHeight) ->
+    gen_server:cast(?SERVER, {best_header_invalidated, ChainTipHash,
+                              ChainTipHeight}).
+
+%% @doc reconsiderblock lifted a failure (Core ResetBlockFailureFlags +
+%% RecalculateBestHeader): Hash at Height is the most-work header among the
+%% reconsidered blocks and the active tip; adopt it as the best header when
+%% it has more work than the current one.
+-spec best_header_reconsidered(binary(), integer()) -> ok.
+best_header_reconsidered(Hash, Height) ->
+    gen_server:cast(?SERVER, {best_header_reconsidered, Hash, Height}).
 
 %% @doc Get current sync status.
 -spec get_status() -> map().
@@ -369,6 +390,10 @@ handle_cast({probe_peer, Peer}, State) ->
 
 handle_cast({invalid_block_found, Hash, Height, Culprit}, State) ->
     {noreply, do_invalid_block_found(Hash, Height, Culprit, State)};
+handle_cast({best_header_invalidated, ChainTipHash, ChainTipHeight}, State) ->
+    {noreply, do_best_header_invalidated(ChainTipHash, ChainTipHeight, State)};
+handle_cast({best_header_reconsidered, Hash, Height}, State) ->
+    {noreply, do_best_header_reconsidered(Hash, Height, State)};
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -785,6 +810,72 @@ do_invalid_block_found(Hash, Height, Culprit,
     end;
 do_invalid_block_found(_Hash, _Height, _Culprit, State) ->
     State.
+
+%% invalidateblock (see best_header_invalidated/2).  The header tip is on
+%% the failed branch iff it is itself failed: chainstate marks the
+%% invalidated block and every descendant in the height-indexed header
+%% chain hash-keyed failed before this cast is sent.
+do_best_header_invalidated(ChainTipHash, ChainTipHeight,
+                           #state{tip_hash = TipHash} = State)
+  when ChainTipHeight >= 0 ->
+    case beamchain_chainstate:is_known_invalid(TipHash) of
+        true ->
+            case header_entry(ChainTipHash, ChainTipHeight) of
+                {ok, CW} ->
+                    logger:warning("header_sync: best header ~B is on an "
+                                   "invalidated branch; best header is now "
+                                   "the active tip ~B",
+                                   [State#state.tip_height, ChainTipHeight]),
+                    set_best_header(ChainTipHash, ChainTipHeight, CW,
+                                    State);
+                not_found ->
+                    State
+            end;
+        false ->
+            State
+    end;
+do_best_header_invalidated(_, _, State) ->
+    State.
+
+%% reconsiderblock (see best_header_reconsidered/2).  Only a header that
+%% IS the height-indexed header chain's entry at its height is adopted, so
+%% the header chain stays one connected, height-indexed branch.
+do_best_header_reconsidered(Hash, Height,
+                            #state{tip_chainwork = TipCW} = State)
+  when Height >= 0 ->
+    case header_entry(Hash, Height) of
+        {ok, CW} ->
+            case binary:decode_unsigned(CW, big) >
+                 binary:decode_unsigned(TipCW, big) of
+                true ->
+                    logger:info("header_sync: reconsidered header ~B is "
+                                "the best header", [Height]),
+                    set_best_header(Hash, Height, CW, State);
+                false ->
+                    State
+            end;
+        not_found ->
+            State
+    end;
+do_best_header_reconsidered(_, _, State) ->
+    State.
+
+header_entry(Hash, Height) ->
+    case beamchain_db:get_block_index(Height) of
+        {ok, #{hash := Hash, chainwork := CW}} -> {ok, CW};
+        _ -> not_found
+    end.
+
+set_best_header(Hash, Height, CW, #state{params = Params} = State) ->
+    ok = beamchain_db:set_header_tip(Hash, Height),
+    cancel_timer(State#state{
+        tip_height = Height,
+        tip_hash = Hash,
+        tip_chainwork = CW,
+        mtp_window = load_mtp_window(Height, Params),
+        hss_state = undefined,
+        sync_peer = undefined,
+        status = complete}).
 
 %% Check if a header connects to our current chain tip
 headers_connect_to_chain(Header, #state{tip_hash = TipHash}) ->
