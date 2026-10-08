@@ -25,7 +25,8 @@
 %% UTXO set
 -export([get_utxo/2, store_utxo/3, spend_utxo/2, has_utxo/2]).
 -export([clear_chainstate_cf/0]).
--export([fold_utxos/2]).
+-export([fold_utxos/2, fold_utxos/3]).
+-export([utxo_snapshot/0, release_utxo_snapshot/1, cumulative_tx_count_at/2]).
 -export([scrub_unspendable/0]).
 
 %% Block index
@@ -297,9 +298,15 @@ has_utxo(Txid, Vout) when byte_size(Txid) =:= 32 ->
 -spec fold_utxos(fun(({binary(), non_neg_integer(), #utxo{}}, Acc) -> Acc),
                  Acc) -> Acc | {error, term()}.
 fold_utxos(Fun, Acc0) when is_function(Fun, 2) ->
+    fold_utxos(Fun, Acc0, []).
+
+%% fold_utxos/3: ReadOpts is passed to the iterator, e.g. [{snapshot, Snap}]
+%% from utxo_snapshot/0 so a whole-set walk sees ONE point-in-time view
+%% (Core PrepareUTXOSnapshot's CCoinsViewCursor).
+fold_utxos(Fun, Acc0, ReadOpts) when is_function(Fun, 2), is_list(ReadOpts) ->
     Db = persistent_term:get(beamchain_db_handle),
     CF = persistent_term:get(beamchain_cf_chainstate),
-    case rocksdb:iterator(Db, CF, []) of
+    case rocksdb:iterator(Db, CF, ReadOpts) of
         {ok, Iter} ->
             try
                 fold_utxos_loop(rocksdb:iterator_move(Iter, first), Iter,
@@ -329,6 +336,30 @@ fold_utxos_loop({ok, OtherKey, _ValueBin}, Iter, Fun, Acc) ->
     logger:warning("beamchain_db: fold_utxos skipping non-outpoint key "
                    "(~B bytes)", [byte_size(OtherKey)]),
     fold_utxos_loop(rocksdb:iterator_move(Iter, next), Iter, Fun, Acc).
+
+%% @doc Point-in-time RocksDB snapshot for dumptxoutset. Call only from
+%% beamchain_chainstate:prepare_utxo_snapshot/0 (after a flush, under the
+%% chainstate process) so the snapshot matches the tip it is labelled with.
+-spec utxo_snapshot() -> {ok, term()} | {error, term()}.
+utxo_snapshot() ->
+    rocksdb:snapshot(persistent_term:get(beamchain_db_handle)).
+
+-spec release_utxo_snapshot(term()) -> ok.
+release_utxo_snapshot(Snap) ->
+    _ = (catch rocksdb:release_snapshot(Snap)),
+    ok.
+
+%% @doc Core CBlockIndex::m_chain_tx_count of the active block at Height,
+%% read through ReadOpts (e.g. the dump's snapshot). undefined if absent.
+-spec cumulative_tx_count_at(integer(), list()) -> non_neg_integer() | undefined.
+cumulative_tx_count_at(Height, ReadOpts) ->
+    Db = persistent_term:get(beamchain_db_handle),
+    MetaCF = persistent_term:get(beamchain_cf_meta),
+    Key = <<"cumtx:", (integer_to_binary(Height))/binary>>,
+    case rocksdb:get(Db, MetaCF, Key, ReadOpts) of
+        {ok, <<Count:64/big>>} -> Count;
+        _ -> undefined
+    end.
 
 %% @doc One-shot scrub of orphan unspendable UTXOs from the chainstate CF.
 %%
