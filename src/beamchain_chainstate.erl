@@ -4074,6 +4074,7 @@ do_scan_utxos(ScriptSet) ->
     {CacheMatches, Seen} =
         ets:foldl(
           fun({{Txid, Vout}, #utxo{script_pubkey = SPK} = U}, {Acc, S}) ->
+                  scantxoutset_fold_hook({Txid, Vout}),
                   S1 = sets:add_element({Txid, Vout}, S),
                   case sets:is_element(SPK, ScriptSet) of
                       true  -> {[{Txid, Vout, U} | Acc], S1};
@@ -4085,6 +4086,7 @@ do_scan_utxos(ScriptSet) ->
     DiskMatches =
         case beamchain_db:fold_utxos(
                fun({Txid, Vout, #utxo{script_pubkey = SPK} = U}, Acc) ->
+                       scantxoutset_fold_hook({Txid, Vout}),
                        Key = {Txid, Vout},
                        case (not sets:is_element(Key, Seen))
                             andalso (not ets:member(?UTXO_SPENT, Key))
@@ -4097,6 +4099,42 @@ do_scan_utxos(ScriptSet) ->
             L when is_list(L) -> L
         end,
     CacheMatches ++ DiskMatches.
+
+%% Park point for the scantxoutset coin walk. Inert unless a test arms
+%% beamchain_fault:scantxoutset_fold or BEAMCHAIN_TEST_HOOK_DIR names a
+%% scantxoutset.fold file (the regtest reproducer deletes that file to
+%% release the first coin).
+scantxoutset_fold_hook(Coin) ->
+    _ = beamchain_fault:fire(scantxoutset_fold, [Coin]),
+    scantxoutset_file_hook().
+
+scantxoutset_file_hook() ->
+    case get(scantxoutset_file_hook_done) of
+        true -> ok;
+        _ ->
+            case os:getenv("BEAMCHAIN_TEST_HOOK_DIR") of
+                false -> ok;
+                "" -> ok;
+                Dir ->
+                    F = filename:join(Dir, "scantxoutset.fold"),
+                    case filelib:is_file(F) of
+                        false -> ok;
+                        true ->
+                            put(scantxoutset_file_hook_done, true),
+                            _ = file:write_file(F ++ ".hit", <<>>),
+                            wait_scantxoutset_hook_file(F)
+                    end
+            end
+    end.
+
+wait_scantxoutset_hook_file(F) ->
+    case filelib:is_file(F) of
+        true ->
+            timer:sleep(20),
+            wait_scantxoutset_hook_file(F);
+        false ->
+            ok
+    end.
 
 %% @doc Run the REAL AssumeUTXO background validation for a loaded
 %% snapshot at BaseHeight. This rebuilds the UTXO set from genesis to the

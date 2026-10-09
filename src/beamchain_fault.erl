@@ -18,12 +18,16 @@
 %%%   direct_atomic_connect_writes -- block body + index WriteBatch
 %%%   coins_spend_window   -- inside spend_utxo/2, between the two coin-table
 %%%                           updates (F0 interleaving seam; return ignored)
+%%%   scantxoutset_fold    -- each coin of a scantxoutset walk (return ignored)
+%%%   utxo_snapshot_release -- beamchain_db:release_utxo_snapshot/1 (return
+%%%                           ignored; fires after the RocksDB release)
 
 -export([fire/2, set/2, clear/1, clear_all/0]).
 
 -define(POINTS, [ecdsa_verify_nif, schnorr_verify_nif, verify_script,
                  direct_write_batch, direct_store_undo,
-                 direct_atomic_connect_writes, coins_spend_window]).
+                 direct_atomic_connect_writes, coins_spend_window,
+                 scantxoutset_fold, utxo_snapshot_release]).
 
 -spec fire(atom(), [term()]) -> passthrough | term().
 fire(Point, Args) ->
