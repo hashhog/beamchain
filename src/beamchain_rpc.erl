@@ -5578,69 +5578,31 @@ compute_utxo_set_stats_no_commitment() ->
 %%% ===================================================================
 
 %% scantxoutset "action" [ scanobjects ]
-%% Only the "start" action is supported; it performs a synchronous scan of
-%% the entire UTXO set for the given scan objects. Each scan object is
-%% either a descriptor string ("addr(<address>)", "raw(<hex-spk>)",
-%% "combo(<address>)") or a bare address / raw-hex string. Mirrors Bitcoin
-%% Core's scantxoutset (rpc/blockchain.cpp) shape:
+%% "start" flushes and snapshots under the chainstate actor, then folds
+%% the snapshot in this process (Core: cs_main only for the cursor).
+%% "status" / "abort" are the CoinsViewScanReserver actions. One scan
+%% at a time. txouts is every coin visited, not the match count
+%% (FindScriptPubKey's count).
 %%   { success, txouts, height, bestblock, unspents:[...], total_amount }
+-define(SCAN_TAB, beamchain_scantxoutset).
+
 rpc_scantxoutset([<<"start">>, ScanObjects]) when is_list(ScanObjects) ->
-    Network = beamchain_config:network(),
-    case build_scan_script_set(ScanObjects, Network) of
-        {error, Reason} ->
-            {error, ?RPC_INVALID_PARAMS, Reason};
-        {ok, ScriptSet, DescMap} ->
-            Matches = beamchain_chainstate:scan_utxos(ScriptSet),
-            {TipHeight, BestHash} =
-                case beamchain_chainstate:get_tip() of
-                    {ok, {H, Ht}} -> {Ht, hash_to_hex(H)};
-                    _ -> {0, hash_to_hex(<<0:256>>)}
-                end,
-            {Unspents, Total} = lists:foldl(
-                fun({Txid, Vout, #utxo{value = Value, script_pubkey = SPK,
-                                       height = CoinHeight,
-                                       is_coinbase = CB}}, {Acc, Sum}) ->
-                    %% blockhash: hash of the block at the coin's height, in
-                    %% big-endian DISPLAY hex (Core:
-                    %% tip->GetAncestor(coin.nHeight)->GetBlockHash().GetHex()).
-                    BlockHash =
-                        case beamchain_db:get_block_index(CoinHeight) of
-                            {ok, #{hash := BH}} -> hash_to_hex(BH);
-                            _                   -> hash_to_hex(<<0:256>>)
-                        end,
-                    U = #{
-                        <<"txid">>          => hash_to_hex(Txid),
-                        <<"vout">>          => Vout,
-                        <<"scriptPubKey">>  => beamchain_serialize:hex_encode(SPK),
-                        <<"desc">>          => maps:get(SPK, DescMap, <<>>),
-                        <<"amount">>        => format_amount_sentinel(Value),
-                        <<"coinbase">>      => CB,
-                        <<"height">>        => CoinHeight,
-                        <<"blockhash">>     => BlockHash,
-                        %% Core: tip->nHeight - coin.nHeight + 1.
-                        <<"confirmations">> => TipHeight - CoinHeight + 1
-                    },
-                    {[U | Acc], Sum + Value}
-                end, {[], 0}, Matches),
-            Result = #{
-                <<"success">>      => true,
-                <<"txouts">>       => length(Matches),
-                <<"height">>       => TipHeight,
-                <<"bestblock">>    => BestHash,
-                <<"unspents">>     => lists:reverse(Unspents),
-                <<"total_amount">> => format_amount_sentinel(Total)
-            },
-            {ok_raw_json, replace_btc_sentinels(jsx:encode(Result))}
+    case reserve_scan() of
+        false ->
+            {error, ?RPC_INVALID_PARAMETER,
+             <<"Scan already in progress, use action \"abort\" or \"status\"">>};
+        {true, Guard} ->
+            try do_scantxoutset_start(ScanObjects)
+            after
+                Guard ! {done, self()}
+            end
     end;
 rpc_scantxoutset([<<"start">>]) ->
     rpc_scantxoutset([<<"start">>, []]);
-rpc_scantxoutset([<<"status">>]) ->
-    %% Scans are synchronous, so there is never one in progress.
-    {ok_raw_json, jsx:encode(null)};
 rpc_scantxoutset([<<"status">> | _]) ->
-    {ok_raw_json, jsx:encode(null)};
+    scan_status();
 rpc_scantxoutset([<<"abort">> | _]) ->
-    {ok, false};
+    scan_abort();
 rpc_scantxoutset([Action | _]) when is_binary(Action) ->
     %% Core rpc/blockchain.cpp: "Invalid action '<action>'" (-8).
     {error, ?RPC_INVALID_PARAMETER,
@@ -5648,6 +5610,156 @@ rpc_scantxoutset([Action | _]) when is_binary(Action) ->
 rpc_scantxoutset(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"scantxoutset \"action\" ( [scanobjects,...] )">>}.
+
+do_scantxoutset_start(ScanObjects) ->
+    Network = beamchain_config:network(),
+    case build_scan_script_set(ScanObjects, Network) of
+        {error, Reason} ->
+            {error, ?RPC_INVALID_PARAMS, Reason};
+        {ok, ScriptSet, DescMap} ->
+            Opts = #{aborted => fun scan_abort_requested/0,
+                     progress => fun set_scan_progress/1},
+            case beamchain_chainstate:scan_utxos(ScriptSet, Opts) of
+                {ok, #{success := Success, scanned := Scanned,
+                       matches := Matches, height := TipHeight,
+                       bestblock := BestHash}} ->
+                    format_scan_result(Success, Scanned, Matches,
+                                       TipHeight, BestHash, DescMap);
+                {error, Reason} ->
+                    {error, ?RPC_MISC_ERROR,
+                     iolist_to_binary(
+                       io_lib:format("Scan failed: ~p", [Reason]))}
+            end
+    end.
+
+format_scan_result(Success, Scanned, Matches, TipHeight, BestHash, DescMap) ->
+    {Unspents, Total} = lists:foldl(
+        fun({Txid, Vout, #utxo{value = Value, script_pubkey = SPK,
+                               height = CoinHeight,
+                               is_coinbase = CB}}, {Acc, Sum}) ->
+            %% blockhash: hash of the block at the coin's height, in
+            %% big-endian DISPLAY hex (Core:
+            %% tip->GetAncestor(coin.nHeight)->GetBlockHash().GetHex()).
+            BlockHash =
+                case beamchain_db:get_block_index(CoinHeight) of
+                    {ok, #{hash := BH}} -> hash_to_hex(BH);
+                    _                   -> hash_to_hex(<<0:256>>)
+                end,
+            U = #{
+                <<"txid">>          => hash_to_hex(Txid),
+                <<"vout">>          => Vout,
+                <<"scriptPubKey">>  => beamchain_serialize:hex_encode(SPK),
+                <<"desc">>          => maps:get(SPK, DescMap, <<>>),
+                <<"amount">>        => format_amount_sentinel(Value),
+                <<"coinbase">>      => CB,
+                <<"height">>        => CoinHeight,
+                <<"blockhash">>     => BlockHash,
+                %% Core: tip->nHeight - coin.nHeight + 1, tip from the
+                %% snapshot, not a tip that moved during the walk.
+                <<"confirmations">> => TipHeight - CoinHeight + 1
+            },
+            {[U | Acc], Sum + Value}
+        end, {[], 0}, Matches),
+    Result = #{
+        <<"success">>      => Success,
+        <<"txouts">>       => Scanned,
+        <<"height">>       => TipHeight,
+        <<"bestblock">>    => hash_to_hex(BestHash),
+        <<"unspents">>     => lists:reverse(Unspents),
+        <<"total_amount">> => format_amount_sentinel(Total)
+    },
+    {ok_raw_json, replace_btc_sentinels(jsx:encode(Result))}.
+
+ensure_scan_tab() ->
+    case ets:whereis(?SCAN_TAB) of
+        undefined ->
+            try ets:new(?SCAN_TAB, [named_table, public, set])
+            catch error:badarg -> ?SCAN_TAB
+            end;
+        Tab ->
+            Tab
+    end.
+
+%% One scan at a time. The token guard clears the reservation if this
+%% process exits without running the after-clause (kill).
+reserve_scan() ->
+    ensure_scan_tab(),
+    Token = make_ref(),
+    case ets:insert_new(?SCAN_TAB, {in_progress, Token}) of
+        true ->
+            ets:insert(?SCAN_TAB, [{abort, false}, {progress, 0}]),
+            Parent = self(),
+            Guard = spawn(fun() -> scan_reserver_guard(Parent, Token) end),
+            {true, Guard};
+        false ->
+            false
+    end.
+
+scan_reserver_guard(Parent, Token) ->
+    Ref = monitor(process, Parent),
+    receive
+        {done, Parent} -> ok;
+        {'DOWN', Ref, process, Parent, _} -> ok
+    end,
+    release_scan(Token).
+
+release_scan(Token) ->
+    case ets:whereis(?SCAN_TAB) of
+        undefined ->
+            ok;
+        _ ->
+            case ets:delete_object(?SCAN_TAB, {in_progress, Token}) of
+                true ->
+                    case ets:lookup(?SCAN_TAB, in_progress) of
+                        [] ->
+                            ets:insert(?SCAN_TAB,
+                                       [{abort, false}, {progress, 0}]);
+                        _ ->
+                            ok
+                    end;
+                false ->
+                    ok
+            end
+    end.
+
+scan_status() ->
+    ensure_scan_tab(),
+    case ets:lookup(?SCAN_TAB, in_progress) of
+        [] ->
+            {ok_raw_json, jsx:encode(null)};
+        _ ->
+            Pct = case ets:lookup(?SCAN_TAB, progress) of
+                      [{progress, P}] when is_integer(P) -> P;
+                      _ -> 0
+                  end,
+            {ok_raw_json, jsx:encode(#{<<"progress">> => Pct})}
+    end.
+
+scan_abort() ->
+    ensure_scan_tab(),
+    case ets:lookup(?SCAN_TAB, in_progress) of
+        [] ->
+            {ok, false};
+        _ ->
+            ets:insert(?SCAN_TAB, {abort, true}),
+            {ok, true}
+    end.
+
+scan_abort_requested() ->
+    case ets:whereis(?SCAN_TAB) of
+        undefined -> false;
+        _ ->
+            case ets:lookup(?SCAN_TAB, abort) of
+                [{abort, true}] -> true;
+                _ -> false
+            end
+    end.
+
+set_scan_progress(Pct) when is_integer(Pct) ->
+    case ets:whereis(?SCAN_TAB) of
+        undefined -> ok;
+        _ -> ets:insert(?SCAN_TAB, {progress, Pct}), ok
+    end.
 
 %% Build a sets:set/0 of raw scriptPubKey binaries from the scan objects,
 %% together with a #{SPK => DescriptorString} map so each matched unspent can

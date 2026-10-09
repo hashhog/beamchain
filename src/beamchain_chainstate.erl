@@ -108,7 +108,7 @@
 -export([cache_stats/0, cache_memory_usage/0]).
 
 %% scantxoutset support: scan the whole UTXO set by scriptPubKey set.
--export([scan_utxos/1]).
+-export([scan_utxos/1, scan_utxos/2]).
 
 %% assumeUTXO support
 -export([load_snapshot/1, compute_utxo_hash/0, compute_utxo_muhash/0]).
@@ -641,17 +641,45 @@ compute_utxo_hash() ->
 compute_utxo_muhash() ->
     gen_server:call(?SERVER, compute_utxo_muhash, 3600000).
 
-%% @doc Scan the entire UTXO set for outputs whose scriptPubKey is a member
-%% of ScriptSet (a sets:set/0 of raw scriptPubKey binaries). Returns the
-%% matching coins as {Txid, Vout, #utxo{}} tuples. Mirrors Bitcoin Core's
-%% `scantxoutset` UTXO traversal (rpc/blockchain.cpp ScanCoins): it walks
-%% the whole coins view, not just wallet-tracked scripts. Merges the
-%% write-behind ETS cache with the on-disk chainstate exactly the way
-%% get_utxo/2 does (cache wins; ?UTXO_SPENT masks disk coins) so coins that
-%% have not yet been flushed to RocksDB are still found.
--spec scan_utxos(sets:set(binary())) -> [{binary(), non_neg_integer(), #utxo{}}].
+%% @doc Scan the UTXO set for outputs whose scriptPubKey is in ScriptSet.
+%%
+%% Core scantxoutset (rpc/blockchain.cpp): cs_main only long enough to
+%% ForceFlushStateToDisk and open a CoinsDB cursor, then the walk runs
+%% unlocked. Here the chainstate process flushes and takes one RocksDB
+%% snapshot (prepare_utxo_snapshot/0); the caller folds that snapshot.
+%% height/bestblock are the tip the snapshot was labelled with, so a
+%% block connected during the walk cannot tear the result.
+%%
+%% Opts:
+%%   aborted  => fun(() -> boolean())   checked on each coin
+%%   progress => fun((0..100) -> any()) approximate percent, every 256 coins
+%%
+%% The snapshot is released when the fold returns, when it is aborted,
+%% and if this process dies mid-fold (a guard monitors the caller).
+-spec scan_utxos(sets:set(binary())) -> {ok, map()} | {error, term()}.
 scan_utxos(ScriptSet) ->
-    gen_server:call(?SERVER, {scan_utxos, ScriptSet}, 3600000).
+    scan_utxos(ScriptSet, #{}).
+
+-spec scan_utxos(sets:set(binary()), map()) -> {ok, map()} | {error, term()}.
+scan_utxos(ScriptSet, Opts) when is_map(Opts) ->
+    case prepare_utxo_snapshot() of
+        {error, Reason} ->
+            {error, Reason};
+        {ok, Snap, {TipHash, TipHeight}} ->
+            with_utxo_snapshot(Snap, fun() ->
+                {Success, Scanned, Matches} =
+                    fold_scan_snapshot(Snap, ScriptSet, Opts),
+                case Success of
+                    true -> scan_note_progress(Opts, 100);
+                    false -> ok
+                end,
+                {ok, #{success => Success,
+                       scanned => Scanned,
+                       matches => Matches,
+                       height => TipHeight,
+                       bestblock => TipHash}}
+            end)
+    end.
 
 %% @doc Check if this chainstate was loaded from a snapshot.
 -spec is_snapshot_chainstate() -> boolean().
@@ -1362,10 +1390,6 @@ handle_call(compute_utxo_muhash, _From, State) ->
     State2 = do_flush(State),
     {MuHash, _Stats} = beamchain_snapshot:compute_utxo_stats(muhash),
     {reply, MuHash, State2};
-
-handle_call({scan_utxos, ScriptSet}, _From, State) ->
-    Matches = do_scan_utxos(ScriptSet),
-    {reply, Matches, State};
 
 handle_call(is_snapshot_chainstate, _From,
             #state{chainstate_role = Role} = State) ->
@@ -4063,42 +4087,80 @@ record_snapshot_base_tx_count(BaseHeight, AuData) ->
 %% Those walk the chainstate CF one txid group at a time. Do not tab2list
 %% ?UTXO_CACHE or call compute_utxo_hash_from_list/1 on this path.
 
-%% @private Scan the full UTXO set for outputs matching ScriptSet.
-%% Walks the write-behind ETS cache first, then the on-disk chainstate,
-%% skipping disk coins that are shadowed by the cache or masked by
-%% ?UTXO_SPENT. Returns matching {Txid, Vout, #utxo{}} tuples.
-do_scan_utxos(ScriptSet) ->
-    %% 1. Cache pass: collect matches and record every cached outpoint so
-    %%    the disk pass does not double-count entries already materialized
-    %%    in the cache (which holds the authoritative, possibly-newer copy).
-    {CacheMatches, Seen} =
-        ets:foldl(
-          fun({{Txid, Vout}, #utxo{script_pubkey = SPK} = U}, {Acc, S}) ->
-                  scantxoutset_fold_hook({Txid, Vout}),
-                  S1 = sets:add_element({Txid, Vout}, S),
-                  case sets:is_element(SPK, ScriptSet) of
-                      true  -> {[{Txid, Vout, U} | Acc], S1};
-                      false -> {Acc, S1}
-                  end
-          end, {[], sets:new()}, ?UTXO_CACHE),
-    %% 2. Disk pass: include disk coins that are neither in the cache nor
-    %%    in the pending-spent set. Defensive against fold errors.
-    DiskMatches =
-        case beamchain_db:fold_utxos(
-               fun({Txid, Vout, #utxo{script_pubkey = SPK} = U}, Acc) ->
-                       scantxoutset_fold_hook({Txid, Vout}),
-                       Key = {Txid, Vout},
-                       case (not sets:is_element(Key, Seen))
-                            andalso (not ets:member(?UTXO_SPENT, Key))
-                            andalso sets:is_element(SPK, ScriptSet) of
-                           true  -> [{Txid, Vout, U} | Acc];
-                           false -> Acc
-                       end
-               end, []) of
-            {error, _} -> [];
-            L when is_list(L) -> L
-        end,
-    CacheMatches ++ DiskMatches.
+%% Walk one flushed coins snapshot. Runs in the caller, not the
+%% chainstate process. {Success, CoinsVisited, Matches}.
+fold_scan_snapshot(Snap, ScriptSet, Opts) ->
+    try beamchain_db:fold_utxos(
+           fun(Coin, Acc) -> scan_visit(Coin, Acc, ScriptSet, Opts) end,
+           {0, []},
+           [{snapshot, Snap}]) of
+        {error, Reason} ->
+            error({utxo_scan_failed, Reason});
+        {N, Matches} ->
+            {true, N, lists:reverse(Matches)}
+    catch
+        throw:{scantxoutset_abort, {N, Matches}} ->
+            {false, N, lists:reverse(Matches)}
+    end.
+
+scan_visit({Txid, Vout, #utxo{script_pubkey = SPK} = U}, {N, Acc},
+           ScriptSet, Opts) ->
+    scantxoutset_fold_hook({Txid, Vout}),
+    case scan_aborted(Opts) of
+        true ->
+            throw({scantxoutset_abort, {N, Acc}});
+        false ->
+            N1 = N + 1,
+            scan_progress(N1, Txid, Opts),
+            Acc1 = case sets:is_element(SPK, ScriptSet) of
+                       true -> [{Txid, Vout, U} | Acc];
+                       false -> Acc
+                   end,
+            {N1, Acc1}
+    end.
+
+scan_aborted(#{aborted := Fun}) when is_function(Fun, 0) ->
+    Fun() =:= true;
+scan_aborted(_) ->
+    false.
+
+scan_progress(N, <<B0:8, B1:8, _/binary>>, #{progress := Fun})
+  when is_function(Fun, 1), N rem 256 =:= 0 ->
+    Pct = round((B0 * 256 + B1) * 100 / 65536),
+    _ = (catch Fun(Pct)),
+    ok;
+scan_progress(_, _, _) ->
+    ok.
+
+scan_note_progress(#{progress := Fun}, Pct) when is_function(Fun, 1) ->
+    _ = (catch Fun(Pct)),
+    ok;
+scan_note_progress(_, _) ->
+    ok.
+
+%% Holds Snap until Fun returns, or until the caller dies.
+with_utxo_snapshot(Snap, Fun) ->
+    Parent = self(),
+    Guard = spawn(fun() -> utxo_snapshot_guard(Parent, Snap) end),
+    MRef = monitor(process, Guard),
+    try Fun()
+    after
+        Guard ! {release, Parent},
+        receive
+            {'DOWN', MRef, process, Guard, _} -> ok
+        after 10000 ->
+            exit(Guard, kill),
+            beamchain_db:release_utxo_snapshot(Snap)
+        end
+    end.
+
+utxo_snapshot_guard(Parent, Snap) ->
+    Ref = monitor(process, Parent),
+    receive
+        {release, Parent} -> ok;
+        {'DOWN', Ref, process, Parent, _} -> ok
+    end,
+    beamchain_db:release_utxo_snapshot(Snap).
 
 %% Park point for the scantxoutset coin walk. Inert unless a test arms
 %% beamchain_fault:scantxoutset_fold or BEAMCHAIN_TEST_HOOK_DIR names a
