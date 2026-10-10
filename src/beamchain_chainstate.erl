@@ -25,7 +25,7 @@
 -export([is_unspendable_script/1]).
 
 %% Block connection / disconnection
--export([connect_block/1, disconnect_block/0, reorganize/1]).
+-export([connect_block/1, disconnect_block/0, disconnect_block/1, reorganize/1]).
 
 %% Block submission entry point. Handles three outcomes:
 %%   {ok, active}       — block extends the active tip (happy path)
@@ -273,7 +273,21 @@
     %% connect over the rewound chainstate between rewind and restore.
     %% Monitored: if the owner dies the pause is released.
     rollback_owner = undefined :: pid() | undefined,
-    rollback_mon = undefined :: reference() | undefined
+    rollback_mon = undefined :: reference() | undefined,
+
+    %% Header-driven rollback in progress (beamchain_header_sync rolls the
+    %% chainstate back to the fork point through disconnect_block/1, and
+    %% block_sync connects the heavier branch later, block by block). Core
+    %% has no such window -- ActivateBestChainStep disconnects and connects
+    %% under one cs_main hold and runs MaybeUpdateMempoolForReorg once at
+    %% the end. To give the same end state, the disconnected txs are kept
+    %% here (earliest confirmed first) with the chainwork of the tip the
+    %% rollback started from; when a connect takes the tip past that work
+    %% the rollback is complete and the mempool update runs again over
+    %% them at the new tip. undefined when no rollback is pending.
+    disconnect_pool = undefined :: undefined |
+                                   #{txs := [#transaction{}],
+                                     work := non_neg_integer()}
 }).
 
 -define(CHAIN_PAUSED_KEY, {beamchain_chainstate, chain_paused}).
@@ -379,6 +393,17 @@ connect_block(Block) ->
 disconnect_block() ->
     gen_server:call(?SERVER, disconnect_block, 30000).
 
+%% @doc disconnect_block/0 for a header-driven reorg (beamchain_header_sync
+%% rolling back to the fork point of a heavier header chain): the mempool is
+%% updated for the disconnected block before the call returns (Core
+%% InvalidateBlock / DisconnectTip + MaybeUpdateMempoolForReorg), and the
+%% block's txs are held until the heavier branch is connected, when they are
+%% offered to the mempool again at the new tip (Core runs
+%% MaybeUpdateMempoolForReorg once, after the whole activation step).
+-spec disconnect_block(header_reorg) -> ok | {error, term()}.
+disconnect_block(header_reorg) ->
+    gen_server:call(?SERVER, {disconnect_block, header_reorg}, 120000).
+
 %% @doc Reorganize to a new chain.
 %% NewBlocks = ordered list from fork point+1 to new tip.
 %% Returns {ok, DisconnectedTxs} where DisconnectedTxs are the
@@ -392,15 +417,14 @@ reorganize(NewBlocks) ->
 %% candidates for a future reorg, rather than being silently dropped
 %% on arrival.
 %%
-%% On a reorg outcome, the public-API caller is responsible for
-%% feeding the disconnected non-coinbase txs back to the mempool —
-%% the gen_server itself cannot do this synchronously because
-%% beamchain_mempool's accept_to_memory_pool calls back into
-%% chainstate (get_tip / get_mtp / get_utxo), which would deadlock.
-%% The refill is performed here, in the caller's process, before
-%% returning.  See
-%% CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md
-%% (Pattern B1 closure for beamchain).
+%% On a reorg outcome the mempool has already been brought in line with
+%% the new chain inside the chainstate call (Core
+%% MaybeUpdateMempoolForReorg under cs_main): the new branch's txs and
+%% conflicts removed, the disconnected txs re-accepted earliest first.
+%% The mempool reads tip / MTP / coins from ETS; its only call back into
+%% this gen_server is get_mtp/0's stale-entry fallback (5 s timeout, the
+%% mempool refuses that tx as a system fault and carries on), so the
+%% chainstate -> mempool call cannot deadlock.
 -spec submit_block(#block{}) -> {ok, active | side_branch | reorg} |
                                 {error, term()}.
 submit_block(Block) ->
@@ -429,8 +453,9 @@ submit_block(Block) ->
     {ok, active | side_branch | reorg} | {error, term()}.
 submit_block(Block, MinPowChecked) when is_boolean(MinPowChecked) ->
     case gen_server:call(?SERVER, {submit_block, Block, MinPowChecked}, 300000) of
-        {ok, reorg, DisconnectedTxs} ->
-            refill_mempool_after_reorg(DisconnectedTxs),
+        {ok, reorg, _DisconnectedTxs} ->
+            %% The mempool was already brought in line with the new chain
+            %% inside the chainstate call (mempool_update_for_reorg/2).
             {ok, reorg};
         Other ->
             Other
@@ -461,6 +486,12 @@ submit_block(Block, MinPowChecked) when is_boolean(MinPowChecked) ->
 submit_header(Header) ->
     gen_server:call(?SERVER, {submit_header, Header}, 60000).
 
+%% LEGACY helper, no production caller: the reorg paths now update the
+%% mempool inside the chainstate call (finish_reorg_mempool/3 ->
+%% beamchain_mempool:update_for_reorg/2), which also removes the new
+%% branch's txs and conflicts and re-accepts earliest first. Kept for the
+%% unit tests that pin its contract.
+%%
 %% Re-feed the non-coinbase txs of the disconnected blocks to the
 %% mempool.  Mirrors Bitcoin Core's MaybeUpdateMempoolForReorg
 %% (validation.cpp) and camlcoin's reference helper at
@@ -598,8 +629,8 @@ reconsider_block(Hash) when byte_size(Hash) =:= 32 ->
 -spec precious_block(binary()) -> ok | {error, term()}.
 precious_block(Hash) when byte_size(Hash) =:= 32 ->
     case gen_server:call(?SERVER, {precious_block, Hash}, 300000) of
-        {ok, reorg, DisconnectedTxs} ->
-            refill_mempool_after_reorg(DisconnectedTxs),
+        {ok, reorg, _DisconnectedTxs} ->
+            %% Mempool already updated inside the chainstate call.
             ok;
         Other ->
             Other
@@ -1283,6 +1314,7 @@ handle_call(Req, {Caller, _}, State) when element(1, Req) =:= connect_block;
                                     element(1, Req) =:= invalidate_block;
                                     element(1, Req) =:= reconsider_block;
                                     element(1, Req) =:= precious_block;
+                                    element(1, Req) =:= disconnect_block;
                                     Req =:= disconnect_block ->
     case {beamchain_fatal:is_aborted(), paused_for(Caller, State)} of
         {true, _} ->
@@ -1466,6 +1498,25 @@ handle_chain_call(disconnect_block, State) ->
     case do_disconnect_block(State) of
         {ok, State2} ->
             {reply, ok, State2};
+        {error, Reason} ->
+            {reply, {error, Reason}, State}
+    end;
+
+handle_chain_call({disconnect_block, header_reorg}, State) ->
+    StartWork = case State#state.disconnect_pool of
+        undefined -> tip_chainwork(State);
+        #{work := W} -> W
+    end,
+    case disconnect_tip_update_mempool(State) of
+        {ok, State2, Txs} ->
+            Pool0 = case State2#state.disconnect_pool of
+                undefined -> [];
+                #{txs := P} -> P
+            end,
+            %% The block just disconnected was confirmed before every block
+            %% disconnected earlier in this rollback: earliest first.
+            {reply, ok, State2#state{disconnect_pool = #{txs => Txs ++ Pool0,
+                                                          work => StartWork}}};
         {error, Reason} ->
             {reply, {error, Reason}, State}
     end;
@@ -1775,22 +1826,30 @@ do_connect_block_inner(#block{header = Header} = Block, PrevIndex,
                 %% Mempool: remove confirmed transactions
                 %% (W93/B3 — Core ConnectTip step at validation.cpp:3073-3076).
                 %% Mirrors `m_mempool->removeForBlock(block.vtx, height)`.
-                %% Uses the async cast variant to avoid a chainstate ↔ mempool
-                %% gen_server deadlock (mempool may concurrently call back into
-                %% chainstate during accept_to_memory_pool).  We skip the
-                %% coinbase tx (it can never appear in the mempool) and skip
-                %% entirely during reorg (do_reorganize_atomic batches
-                %% disconnects+connects and then refills via the
-                %% refill_mempool_after_reorg path, which is the symmetric
-                %% Core "DisconnectPool" mechanic).
+                %% We skip the coinbase tx (it can never appear in the
+                %% mempool). Inside an atomic reorg the connects defer it:
+                %% do_reorganize_flushed runs removeForBlock for every new
+                %% block and then the disconnected-tx re-accept in one
+                %% mempool call after the final flush (finish_reorg_mempool,
+                %% Core MaybeUpdateMempoolForReorg) -- the coins view is not
+                %% committed until then and may still be rolled back.
                 %%
                 %% Pass the full block transactions (not just txids) so the
                 %% mempool can compute the set of outpoints spent by the
                 %% block and properly evict mempool double-spends — see
                 %% beamchain_mempool:do_remove_for_block_with_txs/2 and
                 %% Core txmempool.cpp:419 (removeConflicts).
-                case State4#state.reorg_in_progress of
-                    true  -> ok;
+                %%
+                %% SYNCHRONOUS (Core: ConnectTip runs removeForBlock under
+                %% cs_main): when connect_block / submitblock returns, the
+                %% block's txs and their conflicts are out of the pool, so
+                %% no RPC (getblocktemplate) can see them next to the new
+                %% tip. The mempool reads tip, MTP and coins from ETS (only
+                %% get_mtp/0's stale-entry fallback calls back here, bounded
+                %% by a 5 s timeout the mempool survives), so
+                %% chainstate -> mempool is a safe lock order.
+                State4p = case State4#state.reorg_in_progress of
+                    true  -> State4;
                     false ->
                         {RegularTxs, ConfirmedTxids} = case Block#block.transactions of
                             [] -> {[], []};
@@ -1798,11 +1857,12 @@ do_connect_block_inner(#block{header = Header} = Block, PrevIndex,
                                 {Rest,
                                  [beamchain_serialize:tx_hash(T) || T <- Rest]}
                         end,
-                        beamchain_mempool:remove_for_block_with_txs_async(RegularTxs),
+                        mempool_call(remove_for_block_with_txs, [RegularTxs]),
                         %% Fee estimator: update confirmation latency stats for
                         %% every non-coinbase tx in this block.  Cast is
                         %% non-blocking so it cannot delay the connect path.
-                        beamchain_fee_estimator:process_block(Height, ConfirmedTxids)
+                        beamchain_fee_estimator:process_block(Height, ConfirmedTxids),
+                        note_connect_for_disconnect_pool(ConfirmedTxids, State4)
                 end,
 
                 %% ZMQ notification for block connect
@@ -1932,7 +1992,7 @@ do_connect_block_inner(#block{header = Header} = Block, PrevIndex,
                         ok
                 end,
 
-                {ok, State4}
+                {ok, State4p}
             catch
                 Class:Reason2:Stack ->
                     %% A post-validation step failed (e.g. atomic_connect_writes
@@ -2931,7 +2991,15 @@ do_reorganize_flushed(NewBlocks, Snapshot, State, StateFlushed) ->
                             %% Step 5: ONE final atomic commit.
                             State4 = State3#state{reorg_in_progress = false},
                             State5 = do_flush(State4),
-                            {ok, State5, DisconnectedTxs};
+                            %% Step 5b: Core ConnectTip -> removeForBlock for
+                            %% every connected block, then
+                            %% MaybeUpdateMempoolForReorg -- here, inside the
+                            %% chainstate call, so the mempool agrees with
+                            %% the new tip before any caller sees the reorg.
+                            State6 = finish_reorg_mempool(NewBlocks,
+                                                          DisconnectedTxs,
+                                                          State5),
+                            {ok, State6, DisconnectedTxs};
                         {error, ConnectErr} ->
                             {error, {reorg_connect_failed, ConnectErr}}
                     end;
@@ -3015,12 +3083,102 @@ disconnect_to(TargetHash, State, AccTxs) ->
                          not beamchain_validation:is_coinbase_tx(Tx)],
             case do_disconnect_block(State) of
                 {ok, State2} ->
-                    disconnect_to(TargetHash, State2, AccTxs ++ NonCbTxs);
+                    %% Earliest confirmed first: this block was confirmed
+                    %% before every block disconnected so far.
+                    disconnect_to(TargetHash, State2, NonCbTxs ++ AccTxs);
                 {error, Reason} ->
                     {error, Reason}
             end;
         not_found ->
             {error, tip_block_not_found}
+    end.
+
+%%% ===================================================================
+%%% Internal: mempool consistency (Core MaybeUpdateMempoolForReorg)
+%%% ===================================================================
+
+non_coinbase_txs(#block{transactions = [_Cb | Rest]}) -> Rest;
+non_coinbase_txs(_) -> [].
+
+%% Synchronous call into the mempool from inside this gen_server (Core:
+%% cs_main -> mempool.cs). Never raises: a missing or wedged mempool must
+%% not crash the chainstate (rest_for_one would take sync and peers down).
+mempool_call(Fun, Args) ->
+    try
+        apply(beamchain_mempool, Fun, Args)
+    catch
+        exit:{noproc, _} -> ok;
+        exit:{{nodedown, _}, _} -> ok;
+        Class:Reason ->
+            logger:warning("chainstate: mempool ~p failed: ~p:~p",
+                           [Fun, Class, Reason]),
+            ok
+    end.
+
+mempool_update_for_reorg(ConnectedBlocks, DisconnectedTxs) ->
+    case {ConnectedBlocks, DisconnectedTxs} of
+        {[], []} -> ok;
+        _ ->
+            mempool_call(update_for_reorg,
+                         [[non_coinbase_txs(B) || B <- ConnectedBlocks],
+                          DisconnectedTxs])
+    end.
+
+%% DisconnectTip + the per-block mempool update (InvalidateBlock shape).
+%% Returns {ok, State2, NonCoinbaseTxs} | {error, Reason}.
+disconnect_tip_update_mempool(#state{tip_hash = TipHash} = State) ->
+    Txs = case TipHash of
+        undefined -> [];
+        _ ->
+            case beamchain_db:get_block(TipHash) of
+                {ok, Block} -> non_coinbase_txs(Block);
+                not_found -> []
+            end
+    end,
+    case do_disconnect_block(State) of
+        {ok, State2} ->
+            mempool_update_for_reorg([], Txs),
+            {ok, State2, Txs};
+        {error, _} = Err ->
+            Err
+    end.
+
+%% After an atomic reorg: the new blocks' removeForBlock, then the re-accept
+%% of the disconnected txs (plus any header-driven rollback still pending,
+%% whose txs were confirmed before these), in one mempool call.
+finish_reorg_mempool(NewBlocks, DisconnectedTxs, State) ->
+    {Pool, State2} = case State#state.disconnect_pool of
+        #{txs := P, work := W} ->
+            case tip_chainwork(State) > W of
+                true -> {P, State#state{disconnect_pool = undefined}};
+                false -> {[], State}
+            end;
+        undefined ->
+            {[], State}
+    end,
+    mempool_update_for_reorg(NewBlocks, Pool ++ DisconnectedTxs),
+    State2.
+
+%% A block was connected outside an atomic reorg. If a header-driven
+%% rollback is pending: its txs confirmed by this block leave the pool, and
+%% once the tip has more work than the tip the rollback started from, the
+%% activation step is complete -- offer the rest to the mempool at the new
+%% tip (Core MaybeUpdateMempoolForReorg at the end of ActivateBestChainStep).
+note_connect_for_disconnect_pool(_ConfirmedTxids,
+                                 #state{disconnect_pool = undefined} = State) ->
+    State;
+note_connect_for_disconnect_pool(ConfirmedTxids,
+                                 #state{disconnect_pool = #{txs := Txs,
+                                                            work := W}} = State) ->
+    Confirmed = sets:from_list(ConfirmedTxids, [{version, 2}]),
+    Txs2 = [T || T <- Txs,
+                 not sets:is_element(beamchain_serialize:tx_hash(T), Confirmed)],
+    case tip_chainwork(State) > W of
+        true ->
+            mempool_update_for_reorg([], Txs2),
+            State#state{disconnect_pool = undefined};
+        false ->
+            State#state{disconnect_pool = #{txs => Txs2, work => W}}
     end.
 
 %% Connect a list of blocks in order.
@@ -4372,8 +4530,10 @@ disconnect_to_height(TargetHeight, #state{tip_height = TipHeight} = State)
   when TipHeight =< TargetHeight ->
     State;
 disconnect_to_height(TargetHeight, State) ->
-    case do_disconnect_block(State) of
-        {ok, State2} ->
+    %% Core InvalidateBlock: DisconnectTip, then MaybeUpdateMempoolForReorg
+    %% after EACH disconnected block.
+    case disconnect_tip_update_mempool(State) of
+        {ok, State2, _Txs} ->
             disconnect_to_height(TargetHeight, State2);
         {error, Reason} ->
             logger:error("chainstate: disconnect failed during invalidation: ~p", [Reason]),
