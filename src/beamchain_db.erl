@@ -347,6 +347,7 @@ utxo_snapshot() ->
 -spec release_utxo_snapshot(term()) -> ok.
 release_utxo_snapshot(Snap) ->
     _ = (catch rocksdb:release_snapshot(Snap)),
+    _ = beamchain_fault:fire(utxo_snapshot_release, [Snap]),
     ok.
 
 %% @doc Core CBlockIndex::m_chain_tx_count of the active block at Height,
