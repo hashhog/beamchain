@@ -5591,14 +5591,32 @@ rpc_scantxoutset([<<"start">>, ScanObjects]) when is_list(ScanObjects) ->
         false ->
             {error, ?RPC_INVALID_PARAMETER,
              <<"Scan already in progress, use action \"abort\" or \"status\"">>};
-        {true, Guard} ->
+        {true, Guard, Token} ->
             try do_scantxoutset_start(ScanObjects)
             after
+                %% Release before returning. The guard also releases, but
+                %% only after it is scheduled, and the next start can lose
+                %% the insert_new race (CoinsViewScanReserver is synchronous).
+                release_scan(Token),
                 Guard ! {done, self()}
             end
     end;
 rpc_scantxoutset([<<"start">>]) ->
-    rpc_scantxoutset([<<"start">>, []]);
+    %% CoinsViewScanReserver is taken before the missing-argument check
+    %% (blockchain.cpp scantxoutset). An in-progress scan wins.
+    case reserve_scan() of
+        false ->
+            {error, ?RPC_INVALID_PARAMETER,
+             <<"Scan already in progress, use action \"abort\" or \"status\"">>};
+        {true, Guard, Token} ->
+            try
+                {error, ?RPC_MISC_ERROR,
+                 <<"scanobjects argument is required for the start action">>}
+            after
+                release_scan(Token),
+                Guard ! {done, self()}
+            end
+    end;
 rpc_scantxoutset([<<"status">> | _]) ->
     scan_status();
 rpc_scantxoutset([<<"abort">> | _]) ->
@@ -5614,8 +5632,8 @@ rpc_scantxoutset(_) ->
 do_scantxoutset_start(ScanObjects) ->
     Network = beamchain_config:network(),
     case build_scan_script_set(ScanObjects, Network) of
-        {error, Reason} ->
-            {error, ?RPC_INVALID_PARAMS, Reason};
+        {error, Code, Reason} ->
+            {error, Code, Reason};
         {ok, ScriptSet, DescMap} ->
             Opts = #{aborted => fun scan_abort_requested/0,
                      progress => fun set_scan_progress/1},
@@ -5645,29 +5663,30 @@ format_scan_result(Success, Scanned, Matches, TipHeight, BestHash, DescMap) ->
                     {ok, #{hash := BH}} -> hash_to_hex(BH);
                     _                   -> hash_to_hex(<<0:256>>)
                 end,
-            U = #{
-                <<"txid">>          => hash_to_hex(Txid),
-                <<"vout">>          => Vout,
-                <<"scriptPubKey">>  => beamchain_serialize:hex_encode(SPK),
-                <<"desc">>          => maps:get(SPK, DescMap, <<>>),
-                <<"amount">>        => format_amount_sentinel(Value),
-                <<"coinbase">>      => CB,
-                <<"height">>        => CoinHeight,
-                <<"blockhash">>     => BlockHash,
-                %% Core: tip->nHeight - coin.nHeight + 1, tip from the
-                %% snapshot, not a tip that moved during the walk.
-                <<"confirmations">> => TipHeight - CoinHeight + 1
-            },
+            %% pushKV order from scantxoutset (blockchain.cpp). A proplist
+            %% keeps that order; a map would be sorted by jsx.
+            U = [
+                {<<"txid">>,          hash_to_hex(Txid)},
+                {<<"vout">>,          Vout},
+                {<<"scriptPubKey">>,  beamchain_serialize:hex_encode(SPK)},
+                {<<"desc">>,          maps:get(SPK, DescMap, <<>>)},
+                {<<"amount">>,        format_amount_sentinel(Value)},
+                {<<"coinbase">>,      CB},
+                {<<"height">>,        CoinHeight},
+                {<<"blockhash">>,     BlockHash},
+                %% tip->nHeight - coin.nHeight + 1, tip from the snapshot.
+                {<<"confirmations">>, TipHeight - CoinHeight + 1}
+            ],
             {[U | Acc], Sum + Value}
         end, {[], 0}, Matches),
-    Result = #{
-        <<"success">>      => Success,
-        <<"txouts">>       => Scanned,
-        <<"height">>       => TipHeight,
-        <<"bestblock">>    => hash_to_hex(BestHash),
-        <<"unspents">>     => lists:reverse(Unspents),
-        <<"total_amount">> => format_amount_sentinel(Total)
-    },
+    Result = [
+        {<<"success">>,      Success},
+        {<<"txouts">>,       Scanned},
+        {<<"height">>,       TipHeight},
+        {<<"bestblock">>,    hash_to_hex(BestHash)},
+        {<<"unspents">>,     lists:reverse(Unspents)},
+        {<<"total_amount">>, format_amount_sentinel(Total)}
+    ],
     {ok_raw_json, replace_btc_sentinels(jsx:encode(Result))}.
 
 ensure_scan_tab() ->
@@ -5690,7 +5709,7 @@ reserve_scan() ->
             ets:insert(?SCAN_TAB, [{abort, false}, {progress, 0}]),
             Parent = self(),
             Guard = spawn(fun() -> scan_reserver_guard(Parent, Token) end),
-            {true, Guard};
+            {true, Guard, Token};
         false ->
             false
     end.
@@ -5761,88 +5780,110 @@ set_scan_progress(Pct) when is_integer(Pct) ->
         _ -> ets:insert(?SCAN_TAB, {progress, Pct}), ok
     end.
 
-%% Build a sets:set/0 of raw scriptPubKey binaries from the scan objects,
-%% together with a #{SPK => DescriptorString} map so each matched unspent can
-%% report the descriptor that produced it (mirrors Core's
-%% `descriptors[txo.scriptPubKey]`, rpc/blockchain.cpp scantxoutset).
+%% needles is a set; the descriptor map is filled with emplace so the
+%% first scan object that produced a script wins (blockchain.cpp
+%% scantxoutset). Each object's provider is independent.
 build_scan_script_set(ScanObjects, Network) ->
     try
         {Set, DescMap} = lists:foldl(
             fun(Obj, {Acc, DAcc}) ->
-                case scan_object_to_script(Obj, Network) of
-                    {ok, SPK} ->
-                        {sets:add_element(SPK, Acc),
-                         maps:put(SPK, scan_object_descriptor(Obj), DAcc)};
-                    {error, R} -> throw({scan_err, R})
+                case eval_scan_object(Obj, Network) of
+                    {ok, Pairs} ->
+                        add_scan_pairs(Pairs, Acc, DAcc);
+                    {error, _, _} = E ->
+                        throw({scan_err, E})
                 end
             end, {sets:new(), #{}}, ScanObjects),
         {ok, Set, DescMap}
     catch
-        throw:{scan_err, R} -> {error, R}
+        throw:{scan_err, E} -> E
     end.
 
-%% Canonical descriptor string for a scan object, with any "#checksum" suffix
-%% stripped (Core normalizes the inferred descriptor the same way).
-scan_object_descriptor(Obj) when is_map(Obj) ->
-    case maps:get(<<"desc">>, Obj, undefined) of
-        undefined -> <<>>;
-        Desc      -> scan_object_descriptor(Desc)
-    end;
-scan_object_descriptor(Obj) when is_binary(Obj) ->
-    hd(binary:split(Obj, [<<"#">>])).
+add_scan_pairs([], Set, DescMap) ->
+    {Set, DescMap};
+add_scan_pairs([{SPK, Infer} | Rest], Set, DescMap) ->
+    case maps:is_key(SPK, DescMap) of
+        true ->
+            add_scan_pairs(Rest, sets:add_element(SPK, Set), DescMap);
+        false ->
+            add_scan_pairs(Rest, sets:add_element(SPK, Set),
+                           DescMap#{SPK => Infer})
+    end.
 
-%% A scan object may be given as a plain string or as a JSON object
-%% {"desc": "...", "range": N}. We accept both and reduce to a descriptor
-%% string, then to a scriptPubKey.
-scan_object_to_script(Obj, Network) when is_map(Obj) ->
-    case maps:get(<<"desc">>, Obj, undefined) of
-        undefined -> {error, <<"Scan object missing 'desc'">>};
-        Desc      -> descriptor_to_script(Desc, Network)
-    end;
-scan_object_to_script(Obj, Network) when is_binary(Obj) ->
-    descriptor_to_script(Obj, Network).
-
-%% Reduce a descriptor / address / raw-hex string to a scriptPubKey.
-descriptor_to_script(Desc, Network) when is_binary(Desc) ->
-    %% Strip an optional "#checksum" suffix as Core does.
-    Bare = hd(binary:split(Desc, [<<"#">>])),
-    case Bare of
-        <<"addr(", Rest/binary>> ->
-            address_descriptor_to_script(strip_close_paren(Rest), Network);
-        <<"combo(", Rest/binary>> ->
-            address_descriptor_to_script(strip_close_paren(Rest), Network);
-        <<"raw(", Rest/binary>> ->
-            raw_descriptor_to_script(strip_close_paren(Rest));
-        _ ->
-            %% Bare value: try address first, then raw hex.
-            case address_descriptor_to_script(Bare, Network) of
-                {ok, _} = Ok -> Ok;
-                {error, _}   -> raw_descriptor_to_script(Bare)
+%% EvalDescriptorStringOrObject (rpc/util.cpp). A string uses the default
+%% range 0..1000; a non-range descriptor then forces 0..0 inside eval_scan.
+%% Missing desc is checked before the range, and get_str's type error is
+%% checked before ParseDescriptorRange.
+eval_scan_object(Obj, Network) when is_binary(Obj) ->
+    wrap_scan_eval(beamchain_descriptor:eval_scan(Obj, {0, 1000}, Network));
+eval_scan_object(Obj, Network) when is_map(Obj) ->
+    case maps:get(<<"desc">>, Obj, null) of
+        null ->
+            {error, ?RPC_INVALID_PARAMETER,
+             <<"Descriptor needs to be provided in scan object">>};
+        Desc when not is_binary(Desc) ->
+            {error, ?RPC_TYPE_ERROR, type_error_msg(Desc, <<"string">>)};
+        Desc ->
+            case maps:get(<<"range">>, Obj, null) of
+                null ->
+                    wrap_scan_eval(
+                      beamchain_descriptor:eval_scan(Desc, {0, 1000}, Network));
+                Range ->
+                    case parse_descriptor_range(Range) of
+                        {ok, R} ->
+                            wrap_scan_eval(
+                              beamchain_descriptor:eval_scan(Desc, R, Network));
+                        {error, _, _} = E ->
+                            E
+                    end
             end
-    end.
+    end;
+eval_scan_object(_, _) ->
+    {error, ?RPC_INVALID_PARAMETER,
+     <<"Scan object needs to be either a string or an object">>}.
 
-strip_close_paren(Bin) ->
-    %% Remove a single trailing ")" if present.
-    Sz = byte_size(Bin),
-    case Sz > 0 andalso binary:at(Bin, Sz - 1) =:= $) of
-        true  -> binary:part(Bin, 0, Sz - 1);
-        false -> Bin
-    end.
+wrap_scan_eval({ok, Pairs}) ->
+    {ok, Pairs};
+wrap_scan_eval({error, Msg}) when is_binary(Msg) ->
+    {error, ?RPC_INVALID_ADDRESS_OR_KEY, Msg}.
 
-address_descriptor_to_script(AddrBin, Network) ->
-    case beamchain_address:address_to_script(binary_to_list(AddrBin), Network) of
-        {ok, SPK}  -> {ok, SPK};
-        {error, _} -> {error, iolist_to_binary(
-                                [<<"Invalid address in scan object: ">>, AddrBin])}
-    end.
+%% ParseRange then ParseDescriptorRange (rpc/util.cpp). isNum() covers
+%% integers and floats; getInt throws "JSON integer out of range" (-1)
+%% only once both ends are numbers. A float mixed with a non-number is
+%% the -8 shape error, because the array branch requires both isNum().
+parse_descriptor_range(V) when is_integer(V) ->
+    range_bounds(0, V);
+parse_descriptor_range(V) when is_float(V) ->
+    {error, ?RPC_MISC_ERROR, <<"JSON integer out of range">>};
+parse_descriptor_range([A, B]) ->
+    case {is_number(A), is_number(B)} of
+        {true, true} ->
+            case {is_float(A), is_float(B)} of
+                {false, false} when A > B ->
+                    {error, ?RPC_INVALID_PARAMETER,
+                     <<"Range specified as [begin,end] must not have begin after end">>};
+                {false, false} ->
+                    range_bounds(A, B);
+                _ ->
+                    {error, ?RPC_MISC_ERROR, <<"JSON integer out of range">>}
+            end;
+        _ ->
+            {error, ?RPC_INVALID_PARAMETER,
+             <<"Range must be specified as end or as [begin,end]">>}
+    end;
+parse_descriptor_range(_) ->
+    {error, ?RPC_INVALID_PARAMETER,
+     <<"Range must be specified as end or as [begin,end]">>}.
 
-raw_descriptor_to_script(HexBin) ->
-    try beamchain_serialize:hex_decode(HexBin) of
-        SPK when is_binary(SPK), byte_size(SPK) > 0 -> {ok, SPK};
-        _ -> {error, <<"Invalid raw scriptPubKey hex in scan object">>}
-    catch
-        _:_ -> {error, <<"Invalid raw scriptPubKey hex in scan object">>}
-    end.
+range_bounds(Low, _High) when Low < 0 ->
+    {error, ?RPC_INVALID_PARAMETER,
+     <<"Range should be greater or equal than 0">>};
+range_bounds(_Low, High) when (High bsr 31) =/= 0 ->
+    {error, ?RPC_INVALID_PARAMETER, <<"End of range is too high">>};
+range_bounds(Low, High) when High >= Low + 1000000 ->
+    {error, ?RPC_INVALID_PARAMETER, <<"Range is too large">>};
+range_bounds(Low, High) ->
+    {ok, {Low, High}}.
 
 %%% ===================================================================
 %%% scanblocks — scan the BIP-157 basic block filter index by script
@@ -5960,8 +6001,8 @@ do_scanblocks(ScanObjects, StartHeightArg, StopHeightArg) ->
                     %% is already proven by the scantxoutset differential).
                     Network = beamchain_config:network(),
                     case build_scanblocks_needles(ScanObjects, Network) of
-                        {error, Reason} ->
-                            {error, ?RPC_INVALID_PARAMS, Reason};
+                        {error, Code, Reason} ->
+                            {error, Code, Reason};
                         {ok, Needles} ->
                             run_scanblocks(Needles, Start, Stop)
                     end
@@ -5975,14 +6016,18 @@ build_scanblocks_needles(ScanObjects, Network) ->
     try
         Set = lists:foldl(
                 fun(Obj, Acc) ->
-                    case scan_object_to_script(Obj, Network) of
-                        {ok, SPK}  -> sets:add_element(SPK, Acc);
-                        {error, R} -> throw({scan_err, R})
+                    case eval_scan_object(Obj, Network) of
+                        {ok, Pairs} ->
+                            lists:foldl(fun({SPK, _}, A) ->
+                                                sets:add_element(SPK, A)
+                                        end, Acc, Pairs);
+                        {error, _, _} = E ->
+                            throw({scan_err, E})
                     end
                 end, sets:new(), ScanObjects),
         {ok, sets:to_list(Set)}
     catch
-        throw:{scan_err, R} -> {error, R}
+        throw:{scan_err, E} -> E
     end.
 
 %% Walk [Start, Stop], match each block's GCS filter against the needle set,
