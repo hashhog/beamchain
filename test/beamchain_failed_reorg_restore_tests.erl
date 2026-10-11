@@ -18,6 +18,16 @@
 %%% hash-keyed block index intact, marks 4' BLOCK_FAILED_VALID and goes back
 %%% to the original chain.
 %%%
+%%% KB-176: when the failed branch's valid prefix has more work than the old
+%%% tip, Core stays on the prefix.  InvalidChainFound marks the failing block
+%%% and ActivateBestChain/FindMostWorkChain picks the most-work candidate that
+%%% is not failed, which is the prefix (validation.cpp:3161-3216, 3433-3442).
+%%%   active   G - 1 - 2 - 3a - 4a - 5a
+%%%   side             \- 3' - 4' - 5''   (5'' pays 51 BTC: bad-cb-amount)
+%%% invalidateblock 4a leaves 3a as the tip with 5'' as the best candidate.
+%%% Core v31.1 connects 3', 4', fails 5'' and ends on 4' (getchaintips: 4'
+%%% active, 5'' invalid), also after a restart.
+%%%
 %%%   rebar3 eunit --module=beamchain_failed_reorg_restore_tests
 
 -include_lib("eunit/include/eunit.hrl").
@@ -36,7 +46,11 @@ failed_reorg_restore_test_() ->
           {"the failing side block is marked invalid, its valid parent is not",
            fun failing_block_marked_invalid/0},
           {"a system fault during the reorg marks nothing",
-           fun system_fault_marks_nothing/0}]]}.
+           fun system_fault_marks_nothing/0},
+          {"a failed reorg stays on a valid prefix with more work",
+           fun failed_reorg_keeps_heavier_prefix/0},
+          {"the heavier prefix survives a restart",
+           fun heavier_prefix_survives_restart/0}]]}.
 
 %%% ===================================================================
 %%% Tests
@@ -94,6 +108,34 @@ system_fault_marks_nothing() ->
     ?assertNot(beamchain_chainstate:is_known_invalid(S3#block.hash)),
     ?assertNot(beamchain_chainstate:is_known_invalid(S4#block.hash)).
 
+failed_reorg_keeps_heavier_prefix() ->
+    #{side3 := S3, side4 := S4, side5 := S5} = failed_prefix_reorg(),
+    ?assertEqual({ok, {S4#block.hash, 4}}, beamchain_chainstate:get_tip()),
+    ?assertMatch({ok, #{hash := H3}} when H3 =:= S3#block.hash,
+                 beamchain_db:get_block_index(3)),
+    ?assertMatch({ok, #{hash := H4}} when H4 =:= S4#block.hash,
+                 beamchain_db:get_block_index(4)),
+    ?assert(beamchain_chainstate:is_known_invalid(S5#block.hash)),
+    ?assertNot(beamchain_chainstate:is_known_invalid(S3#block.hash)),
+    ?assertNot(beamchain_chainstate:is_known_invalid(S4#block.hash)),
+    ?assertEqual({error, duplicate_invalid},
+                 beamchain_chainstate:submit_block(S5)),
+    T5 = next_block([]),
+    ?assertEqual({ok, active}, beamchain_chainstate:submit_block(T5)),
+    ?assertEqual({ok, {T5#block.hash, 5}}, beamchain_chainstate:get_tip()).
+
+heavier_prefix_survives_restart() ->
+    #{side4 := S4, side5 := S5} = failed_prefix_reorg(),
+    restart(),
+    ?assertEqual({ok, {S4#block.hash, 4}}, beamchain_chainstate:get_tip()),
+    ?assertMatch({ok, #{hash := H4}} when H4 =:= S4#block.hash,
+                 beamchain_db:get_block_index(4)),
+    ?assert(beamchain_chainstate:is_known_invalid(S5#block.hash)),
+    T5 = next_block([]),
+    ?assertEqual({ok, active}, beamchain_chainstate:submit_block(T5)),
+    restart(),
+    ?assertEqual({ok, {T5#block.hash, 5}}, beamchain_chainstate:get_tip()).
+
 %%% ===================================================================
 %%% Helpers
 %%% ===================================================================
@@ -112,6 +154,25 @@ failed_side_reorg() ->
     ?assertMatch({error, _}, R),
     ?assertEqual({ok, {T3, 3}}, beamchain_chainstate:get_tip()),
     #{tip => {T3, 3}, side3 => S3, side4 => S4}.
+
+%% Active chain to 5, side branch 3' 4' 5'' (5'' bad-cb-amount) on 2, all
+%% stored without a reorg (5'' only ties 5a).  invalidateblock 4a.
+failed_prefix_reorg() ->
+    build_chain(5),
+    {ok, #{hash := T2}} = beamchain_db:get_block_index(2),
+    {ok, #{hash := A4}} = beamchain_db:get_block_index(4),
+    S3 = mine_block(T2, 3, [coinbase(3, <<"s3">>, 5000000000)], ts(3) + 1),
+    S4 = mine_block(S3#block.hash, 4, [coinbase(4, <<"s4">>, 5000000000)],
+                    ts(4) + 1),
+    S5 = mine_block(S4#block.hash, 5, [coinbase(5, <<"s5">>, 5100000000)],
+                    ts(5) + 1),
+    [?assertEqual({ok, side_branch}, beamchain_chainstate:submit_block(B))
+     || B <- [S3, S4, S5]],
+    R = beamchain_chainstate:invalidate_block(A4),
+    io:format(user, "~n  [KB-176] invalidateblock 4a -> ~p, tip ~p~n",
+              [R, beamchain_chainstate:get_tip()]),
+    ?assertEqual(ok, R),
+    #{side3 => S3, side4 => S4, side5 => S5}.
 
 restart() ->
     ok = gen_server:stop(beamchain_chainstate),
