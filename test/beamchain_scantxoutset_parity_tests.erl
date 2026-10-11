@@ -161,7 +161,7 @@ error_table() ->
       <<"Cannot have 0 keys in multisig; must have between 1 and 20 keys, inclusive">>},
      {"multi expected comma",
       [<<"start">>, [<<"multi(0)()">>]], -5,
-      <<"Multi: expected \',\' got \')\'">>},
+      <<"Multi: expected ',', got ')'">>},
      {"p2sh script too large",
       [<<"start">>, [bin(p2sh_too_large(Pk))]], -5,
       <<"P2SH script is too large, 547 bytes is larger than 520 bytes">>},
@@ -437,7 +437,7 @@ tr_trees() ->
       [{2, L2}, {2, L3}, {1, L1}],
       "tr(" ++ origin_xonly(X) ++ ",{{" ++
           "pk(" ++ origin_xonly(K2) ++ "),pk(" ++ origin_xonly(K3) ++ ")},pk(" ++
-          origin_xonly(X) ++ "))"},
+          origin_xonly(X) ++ ")})"},
      {"tr(" ++ ?X1 ++ ",{pk(" ++ ?X2 ++ "),{pk(" ++ ?X3 ++ "),pk(" ++ ?X1 ++ ")}})",
       [{1, L2}, {2, L3}, {2, L1}],
       "tr(" ++ origin_xonly(X) ++ ",{pk(" ++ origin_xonly(K2) ++ "),{pk(" ++
