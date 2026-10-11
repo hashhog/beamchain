@@ -831,7 +831,8 @@ direct_atomic_connect_writes_real(Block, Height, Chainwork, BlockHash, Status) -
     CumKey = <<"cumtx:", (integer_to_binary(Height))/binary>>,
     CumOp = {put, MetaCF, CumKey, <<NewCum:64/big>>},
 
-    AllOps = [BlockOp, IdxOp, RevOp, CumOp | TxOps],
+    AllOps = [BlockOp, IdxOp, RevOp, CumOp | TxOps] ++
+        displaced_entry_ops(Db, IdxCF, MetaCF, Height, BlockHash),
     rocksdb:write(Db, AllOps, []).
 
 %% @doc Raw copy of the height-keyed index slots From..To and their
@@ -884,14 +885,41 @@ height_slot_ops({H, Idx, Cum}) ->
             [{delete, block_index, HeightKey}];
         Bin ->
             #{hash := Hash} = decode_block_index_entry(Bin),
+            %% Back in its slot, so drop the copy displaced_entry_ops/5
+            %% made when the failed reorg took the slot.
             [{put, block_index, HeightKey, Bin},
-             {put, meta, <<"blkidx:", Hash/binary>>, HeightKey}]
+             {put, meta, <<"blkidx:", Hash/binary>>, HeightKey},
+             {delete, meta, <<"sbidx:", Hash/binary>>}]
     end,
     CumOps = case Cum of
         not_found -> [{delete, meta, cumtx_key(H)}];
         CumBin -> [{put, meta, cumtx_key(H), CumBin}]
     end,
     IdxOps ++ CumOps.
+
+%% Core keys its block index by hash (BlockManager::m_block_index), so a block
+%% that leaves the active chain stays reachable: getblockheader/getblock answer
+%% for it and reconsiderblock finds it.  Here an active block's entry lives
+%% only in its height slot, and get_block_index_by_hash refuses it once another
+%% block owns the slot (KB-190).  Before a different block takes Height, copy
+%% the old entry, if its body is stored, into the hash-keyed side-branch index.
+%% Header-only entries are left as before.
+displaced_entry_ops(Db, IdxCF, MetaCF, Height, NewHash) ->
+    case rocksdb:get(Db, IdxCF, encode_height(Height), []) of
+        {ok, Bin} ->
+            case decode_block_index_entry(Bin) of
+                #{hash := NewHash} ->
+                    [];
+                #{hash := Old, status := S} = E
+                  when (S band ?BLOCK_HAVE_DATA) =/= 0 ->
+                    [{put, MetaCF, <<"sbidx:", Old/binary>>,
+                      encode_side_branch_index_entry(Old, E#{height => Height})}];
+                _ ->
+                    []
+            end;
+        _ ->
+            []
+    end.
 
 cumtx_key(Height) ->
     <<"cumtx:", (integer_to_binary(Height))/binary>>.
@@ -1351,11 +1379,12 @@ handle_call({store_block_index, Height, Hash, Header, Chainwork, Status, NTx},
                           cf_meta = MetaCF} = State) ->
     HeightKey = encode_height(Height),
     Value = encode_block_index_entry(Hash, Header, Chainwork, Status, NTx),
-    rocksdb:put(Db, CF, HeightKey, Value, []),
     %% Reverse index: hash -> height for lookup by hash
     HashKey = <<"blkidx:", Hash/binary>>,
-    rocksdb:put(Db, MetaCF, HashKey, HeightKey, []),
-    {reply, ok, State};
+    Result = rocksdb:write(Db, displaced_entry_ops(Db, CF, MetaCF, Height, Hash) ++
+                               [{put, CF, HeightKey, Value},
+                                {put, MetaCF, HashKey, HeightKey}], []),
+    {reply, Result, State};
 
 handle_call({get_block_index, Height}, _From,
             #state{db_handle = Db, cf_block_idx = CF} = State) ->
@@ -1508,7 +1537,8 @@ handle_call({atomic_connect_writes, Block, Height, Chainwork, BlockHash, Status}
                 false -> []
             end,
 
-    AllOps = [BlockOp, IdxOp, RevOp | TxOps],
+    AllOps = [BlockOp, IdxOp, RevOp | TxOps] ++
+        displaced_entry_ops(Db, IdxCF, MetaCF, Height, BlockHash),
     Result = rocksdb:write(Db, AllOps, []),
     {reply, Result, State};
 

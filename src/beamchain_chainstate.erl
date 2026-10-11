@@ -88,6 +88,7 @@
 -define(BLOCK_VALID_HEADER, 1).
 -define(BLOCK_VALID_SCRIPTS, 5).
 -define(BLOCK_HAVE_DATA, 8).
+-define(MAX_BLOCK_SEQS, 16384).
 -define(BLOCK_HAVE_UNDO, 16).
 -define(BLOCK_FAILED_VALID, 32).
 -define(BLOCK_FAILED_CHILD, 64).
@@ -266,6 +267,15 @@
     block_reverse_sequence_id = -1 :: integer(),
     precious_seqids = #{} :: #{binary() => integer()},
 
+    %% Core nSequenceId for blocks received in this process
+    %% (ReceivedBlockTransactions, validation.cpp:3857, counting from
+    %% SEQ_ID_INIT_FROM_DISK + 1 = 2).  Blocks loaded from disk have none:
+    %% the tip counts as 0 (SEQ_ID_BEST_CHAIN_FROM_DISK, :4624), anything else
+    %% as 1.  Breaks equal-work ties in best_candidate/2.  Bounded by
+    %% note_received/2.
+    block_seqs = #{} :: #{binary() => pos_integer()},
+    block_seq_next = 2 :: pos_integer(),
+
     %% dumptxoutset rollback pause (Core NetworkDisable + TemporaryRollback,
     %% rpc/blockchain.cpp dumptxoutset). While set, every tip-moving call
     %% from any process other than the owner is refused with
@@ -432,6 +442,9 @@ submit_block(Block, MinPowChecked) when is_boolean(MinPowChecked) ->
         {ok, reorg, DisconnectedTxs} ->
             refill_mempool_after_reorg(DisconnectedTxs),
             {ok, reorg};
+        {error, Reason, DisconnectedTxs} ->
+            refill_mempool_after_reorg(DisconnectedTxs),
+            {error, Reason};
         Other ->
             Other
     end.
@@ -1437,7 +1450,8 @@ handle_call(_Request, _From, State) ->
 
 %% The tip-moving calls, reached only through the gate-6 latch check in
 %% handle_call/3.
-handle_chain_call({connect_block, Block}, State) ->
+handle_chain_call({connect_block, Block}, State0) ->
+    State = note_received(Block, State0),
     case do_connect_block(Block, State) of
         {ok, State2} ->
             {reply, ok, State2};
@@ -1445,7 +1459,8 @@ handle_chain_call({connect_block, Block}, State) ->
             {reply, {error, Reason}, State}
     end;
 
-handle_chain_call({submit_block, Block, MinPowChecked}, State) ->
+handle_chain_call({submit_block, Block, MinPowChecked}, State0) ->
+    State = note_received(Block, State0),
     case do_submit_block(Block, MinPowChecked, State) of
         {ok, {reorg, DisconnectedTxs}, State2} ->
             %% Pattern B: surface disconnected non-coinbase txs to
@@ -1458,6 +1473,10 @@ handle_chain_call({submit_block, Block, MinPowChecked}, State) ->
             %% Atomic-reorg rollback path (Pattern D) —
             %% RolledBackState mirrors pre-reorg.
             {reply, {error, Reason}, RolledBackState};
+        {error, Reason, DisconnectedTxs, State2} ->
+            %% The reorg failed, then the best valid candidate (its prefix)
+            %% was activated: the error stands, the old chain's txs go back.
+            {reply, {error, Reason, DisconnectedTxs}, State2};
         {error, Reason} ->
             {reply, {error, Reason}, State}
     end;
@@ -2440,6 +2459,7 @@ do_promote_side_branch(NewTipHash, State) ->
             %% the chainwork comparison above, but defend anyway.
             {ok, side_branch, State};
         {ok, NewBlocks} ->
+            KnownBad = known_invalid_hashes(NewBlocks),
             case do_reorganize(NewBlocks, State) of
                 {ok, State2, DisconnectedTxs} ->
                     %% The promoted blocks now have entries in the
@@ -2472,7 +2492,10 @@ do_promote_side_branch(NewTipHash, State) ->
                     %% candidate block, so a future call may retry.
                     logger:warning("chainstate: side-branch reorg "
                                    "failed: ~p (rolled back)", [Reason]),
-                    {error, {reorg_failed, Reason}, RolledBackState};
+                    activate_after_failed_reorg(
+                      {reorg_failed, Reason},
+                      known_invalid_hashes(NewBlocks) -- KnownBad,
+                      RolledBackState);
                 {error, Reason} ->
                     %% Defensive: legacy error path (e.g. from the
                     %% MAX_REORG_DEPTH guard before any state mutation).
@@ -2485,6 +2508,46 @@ do_promote_side_branch(NewTipHash, State) ->
                            "failed: ~p", [Reason]),
             {error, {reorg_walk_failed, Reason}}
     end.
+
+%% Core ActivateBestChain (validation.cpp:3418-3442): when
+%% ActivateBestChainStep reports fInvalidFound, pindexMostWork is cleared and
+%% the next pass asks FindMostWorkChain (:3161-3216) again, which returns the
+%% most-work candidate with no BLOCK_FAILED_VALID block on its path.  When the
+%% failed branch's valid prefix has more work than the old tip, that is the
+%% prefix.  Core never leaves it: ActivateBestChainStep returns after the first
+%% connect that beats the old tip (:3302-3306), and a failing ConnectTip only
+%% marks the block (InvalidBlockFound :3090, InvalidChainFound :3284-3291).
+%% beamchain's reorg is atomic and has rolled back to the old tip, so promoting
+%% the best remaining candidate reaches the same chain.
+%%
+%% Only when this reorg marked a block invalid (NewlyBad).  A system error
+%% marks nothing and Core returns false without another pass (:3292-3298,
+%% :3433-3436); each retry marks a new block, so the recursion ends.  The
+%% submit still answers the original error.
+activate_after_failed_reorg(Err, [], State) ->
+    {error, Err, State};
+activate_after_failed_reorg(Err, _NewlyBad, State) ->
+    case best_candidate(side_branch_entries(), State) of
+        none ->
+            {error, Err, State};
+        Best ->
+            case do_promote_side_branch(Best, State) of
+                {ok, {reorg, DisconnectedTxs}, State2} ->
+                    {error, Err, DisconnectedTxs, State2};
+                {error, _, DisconnectedTxs, State2} ->
+                    {error, Err, DisconnectedTxs, State2};
+                {ok, _, State2} ->
+                    {error, Err, State2};
+                {error, _, State2} ->
+                    {error, Err, State2};
+                {error, _} ->
+                    {error, Err, State}
+            end
+    end.
+
+known_invalid_hashes(Blocks) ->
+    [H || #block{header = Hdr} <- Blocks,
+          is_known_invalid(H = beamchain_serialize:block_hash(Hdr))].
 
 %% Walk from NewTipHash back through side-branch / active entries
 %% until we find a hash that's on the active chain (i.e. its hash
@@ -4384,30 +4447,17 @@ side_branch_entries() ->
 %% connected chain by block bodies and runs the atomic reorg, whose connects
 %% refuse any known-invalid block).  Cost: O(candidates + promoted branch).
 activate_best_candidate(Candidates, State) ->
-    TipWork = tip_chainwork(State),
-    Eligible = lists:filtermap(fun(#{hash := H}) ->
-        case lookup_block_index_anywhere(H) of
-            {ok, #{status := S, chainwork := CW} = E}
-              when (S band ?BLOCK_HAVE_DATA) =/= 0,
-                   (S band ?BLOCK_FAILED_VALID) =:= 0 ->
-                W = binary:decode_unsigned(CW, big),
-                case W > TipWork andalso not is_known_invalid(H) of
-                    true -> {true, {W, E#{hash => H}}};
-                    false -> false
-                end;
-            _ ->
-                false
-        end
-    end, Candidates),
-    case Eligible of
-        [] ->
+    case best_candidate(Candidates, State) of
+        none ->
             {ok, State};
-        _ ->
-            {_, #{hash := Best}} = lists:foldl(fun({W, _} = C, {AW, _} = Acc) ->
-                case W > AW of true -> C; false -> Acc end
-            end, hd(Eligible), tl(Eligible)),
+        Best ->
             case do_promote_side_branch(Best, State) of
                 {ok, _, State2} ->
+                    {ok, State2};
+                {error, Reason, _DisconnectedTxs, State2} ->
+                    logger:warning("chainstate: activating best chain "
+                                   "failed: ~p (on the best valid prefix)",
+                                   [Reason]),
                     {ok, State2};
                 {error, Reason, RolledBack} ->
                     logger:warning("chainstate: activating best chain "
@@ -4419,6 +4469,75 @@ activate_best_candidate(Candidates, State) ->
                     {ok, State}
             end
     end.
+
+%% The most-work eligible candidate, or none.
+%% Core CBlockIndexWorkComparator (node/blockstorage.cpp:174-192): more work
+%% wins, then the lower nSequenceId.  So an equal-work candidate beats the tip
+%% when it was received first (reconsiderblock of a block that was displaced
+%% by an equal-work branch goes back to it, KB-190).
+best_candidate(Candidates, #state{tip_hash = TipHash} = State) ->
+    Tip = {tip_chainwork(State), -seq_id(TipHash, State)},
+    Eligible = lists:filtermap(fun(#{hash := H}) ->
+        case H =/= TipHash andalso lookup_block_index_anywhere(H) of
+            {ok, #{status := S, chainwork := CW}}
+              when (S band ?BLOCK_FAILED_VALID) =:= 0 ->
+                Key = {binary:decode_unsigned(CW, big), -seq_id(H, State)},
+                case Key > Tip andalso not is_known_invalid(H)
+                     andalso have_block_data(H, S) of
+                    true -> {true, {Key, H}};
+                    false -> false
+                end;
+            _ ->
+                false
+        end
+    end, Candidates),
+    case Eligible of
+        [] -> none;
+        _ -> element(2, lists:max(Eligible))
+    end.
+
+seq_id(Hash, #state{tip_hash = TipHash, block_seqs = Seqs,
+                    precious_seqids = Precious}) ->
+    case Precious of
+        #{Hash := P} -> P;
+        _ ->
+            case Seqs of
+                #{Hash := N} -> N;
+                _ when Hash =:= TipHash -> 0;
+                _ -> 1
+            end
+    end.
+
+%% Give a newly received block the next sequence id.  Only the newest
+%% ?MAX_BLOCK_SEQS ids are kept; an older block falls back to the
+%% from-disk value, which can only matter for an equal-work tie that deep.
+note_received(#block{header = Header}, #state{block_seqs = Seqs,
+                                              block_seq_next = N} = State) ->
+    Hash = beamchain_serialize:block_hash(Header),
+    case Seqs of
+        #{Hash := _} ->
+            State;
+        _ ->
+            Seqs1 = case map_size(Seqs) >= ?MAX_BLOCK_SEQS of
+                true ->
+                    maps:filter(fun(_, V) -> V > N - ?MAX_BLOCK_SEQS div 2 end,
+                                Seqs);
+                false ->
+                    Seqs
+            end,
+            State#state{block_seqs = Seqs1#{Hash => N},
+                        block_seq_next = N + 1}
+    end.
+
+%% Core FindMostWorkChain skips a candidate without BLOCK_HAVE_DATA
+%% (validation.cpp:3187), and ReceivedBlockTransactions sets that bit as soon
+%% as the body is written (:3832).  A submitted side-branch block is stored
+%% with its body but its index entry only says VALID_TREE
+%% (persist_side_branch_block/4), so ask the block store as well.
+have_block_data(_Hash, Status) when (Status band ?BLOCK_HAVE_DATA) =/= 0 ->
+    true;
+have_block_data(Hash, _Status) ->
+    beamchain_db:has_block(Hash) =:= true.
 
 %% Disconnect blocks until tip is at TargetHeight
 disconnect_to_height(TargetHeight, #state{tip_height = TipHeight} = State)
@@ -4745,6 +4864,12 @@ do_precious_block_impl(Hash, TipWork,
                     %% build_side_branch_chain_to_active found nothing to connect
                     %% (block already effectively active) — no tip change.
                     {ok, State2};
+                {error, Reason, DisconnectedTxs, State2} ->
+                    %% The reorg failed and the best valid prefix was
+                    %% activated instead: a tip change all the same.
+                    logger:warning("chainstate: preciousblock reorg failed: "
+                                   "~p (on the best valid prefix)", [Reason]),
+                    {ok, reorg, DisconnectedTxs, State2};
                 {error, Reason, RolledBack} ->
                     %% Atomic reorg failed and rolled back to the pre-reorg tip;
                     %% keep the seqid mark (precious persists for a retry).  The
