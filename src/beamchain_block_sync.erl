@@ -47,6 +47,10 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2]).
 
+%% The verdict allow-list is also what the chainstate's failed-reorg
+%% rollback uses to decide whether to mark the failing block.
+-export([is_consensus_verdict/1]).
+
 -ifdef(TEST).
 %% Test-only: expose the internal cmpctblock handler + a default #state{}
 %% so the BIP152 reconstruction-failure behaviour (collision -> full-block
@@ -56,7 +60,6 @@
 %% overrides so the frontier-lifecycle tests (issue #34) can drive the
 %% gen_server callbacks directly with a scripted state.
 -export([do_handle_cmpctblock/5, unsolicited_connect_penalty/1, test_new_state/0,
-         is_consensus_verdict/1,
          test_state/1, test_get/2,
          admit_downloaded/3,
          validate_and_connect/3]).
