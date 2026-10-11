@@ -86,6 +86,7 @@
 -export([direct_write_batch/1]).
 -export([direct_store_undo/2]).
 -export([direct_atomic_connect_writes/5]).
+-export([read_height_slots/2, restore_height_slots/1]).
 
 %% Atomic block connect (block + index + tx_index in single WriteBatch)
 -export([atomic_connect_writes/5]).
@@ -832,6 +833,68 @@ direct_atomic_connect_writes_real(Block, Height, Chainwork, BlockHash, Status) -
 
     AllOps = [BlockOp, IdxOp, RevOp, CumOp | TxOps],
     rocksdb:write(Db, AllOps, []).
+
+%% @doc Raw copy of the height-keyed index slots From..To and their
+%% cumtx:<height> counters, for undoing a failed reorg. Connecting a block
+%% writes both straight to RocksDB (direct_atomic_connect_writes/5), outside
+%% the reorg's deferred flush, so a reorg that fails after connecting part
+%% of the new branch leaves those slots naming side-branch blocks. Each
+%% element is {Height, IdxBin | not_found, CumBin | not_found}. A read error
+%% is returned as {error, _}, never folded into not_found.
+-spec read_height_slots(integer(), integer()) ->
+    {ok, [{non_neg_integer(), binary() | not_found, binary() | not_found}]} |
+    {error, term()}.
+read_height_slots(From, To) when To < From ->
+    {ok, []};
+read_height_slots(From, To) ->
+    Db = persistent_term:get(beamchain_db_handle),
+    IdxCF = persistent_term:get(beamchain_cf_block_idx),
+    MetaCF = persistent_term:get(beamchain_cf_meta),
+    read_height_slots(Db, IdxCF, MetaCF, max(From, 0), To, []).
+
+read_height_slots(_Db, _IdxCF, _MetaCF, H, To, Acc) when H > To ->
+    {ok, lists:reverse(Acc)};
+read_height_slots(Db, IdxCF, MetaCF, H, To, Acc) ->
+    case {rocksdb:get(Db, IdxCF, encode_height(H), []),
+          rocksdb:get(Db, MetaCF, cumtx_key(H), [])} of
+        {{error, _} = E, _} -> E;
+        {_, {error, _} = E} -> E;
+        {Idx, Cum} ->
+            read_height_slots(Db, IdxCF, MetaCF, H + 1, To,
+                              [{H, slot_value(Idx), slot_value(Cum)} | Acc])
+    end.
+
+slot_value({ok, Bin}) -> Bin;
+slot_value(not_found) -> not_found.
+
+%% @doc Put back slots captured by read_height_slots/2 in one WriteBatch:
+%% the height entry (or its absence), the blkidx:<hash> reverse key of the
+%% restored entry, and the cumtx counter.
+-spec restore_height_slots([{non_neg_integer(), binary() | not_found,
+                             binary() | not_found}]) -> ok | {error, term()}.
+restore_height_slots([]) ->
+    ok;
+restore_height_slots(Slots) ->
+    direct_write_batch(lists:flatmap(fun height_slot_ops/1, Slots)).
+
+height_slot_ops({H, Idx, Cum}) ->
+    HeightKey = encode_height(H),
+    IdxOps = case Idx of
+        not_found ->
+            [{delete, block_index, HeightKey}];
+        Bin ->
+            #{hash := Hash} = decode_block_index_entry(Bin),
+            [{put, block_index, HeightKey, Bin},
+             {put, meta, <<"blkidx:", Hash/binary>>, HeightKey}]
+    end,
+    CumOps = case Cum of
+        not_found -> [{delete, meta, cumtx_key(H)}];
+        CumBin -> [{put, meta, cumtx_key(H), CumBin}]
+    end,
+    IdxOps ++ CumOps.
+
+cumtx_key(Height) ->
+    <<"cumtx:", (integer_to_binary(Height))/binary>>.
 
 %% @doc Direct (gen_server-bypassing) read of the cumulative tx count at a
 %% height, for use inside direct_atomic_connect_writes on the IBD-hot path.

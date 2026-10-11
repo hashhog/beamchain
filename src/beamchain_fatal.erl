@@ -85,6 +85,9 @@ is_system_fault({system_fault, _}) -> true;
 is_system_fault({reorg_connect_failed, R}) -> is_system_fault(R);
 is_system_fault({reorg_disconnect_failed, R}) -> is_system_fault(R);
 is_system_fault({reorg_exception, _}) -> true;
+is_system_fault({reorg_failed, R}) -> is_system_fault(R);
+is_system_fault({reorg_snapshot_failed, _}) -> true;
+is_system_fault({reorg_restore_failed, _}) -> true;
 is_system_fault({timeout, _}) -> true;
 is_system_fault(_) -> false.
 

@@ -2836,7 +2836,7 @@ do_reorganize(NewBlocks, State) ->
                     logger:info("chainstate: reorganizing to fork point ~s "
                                 "(disconnect=~B, connect=~B; atomic-batch mode)",
                                 [hash_hex(ForkHash), DiscDepth, ConnDepth]),
-                    do_reorganize_atomic(NewBlocks, State);
+                    do_reorganize_atomic(NewBlocks, DiscDepth, State);
                 {error, Reason} ->
                     {error, {reorg_walk_failed, Reason}}
             end
@@ -2890,12 +2890,30 @@ count_disconnect_depth(ForkHash, Hash, Depth, Limit) ->
 
 %% Run the multi-block disconnect+reconnect under a single atomic
 %% commit. See do_reorganize/2 docstring.
-do_reorganize_atomic(NewBlocks, State) ->
+do_reorganize_atomic(NewBlocks, DiscDepth,
+                     #state{tip_height = TipHeight} = State) ->
+    %% Connecting a block writes its height-keyed index slot, blkidx:
+    %% reverse key and cumtx counter straight to RocksDB, not through the
+    %% deferred flush. Copy every slot the walk can touch (fork+1 up to the
+    %% higher of the old tip and the new branch's tip) so a failed reorg
+    %% can put the old chain's entries back (KB-165).
+    ForkHeight = TipHeight - DiscDepth,
+    LastHeight = max(TipHeight, ForkHeight + length(NewBlocks)),
+    case beamchain_db:read_height_slots(ForkHeight + 1, LastHeight) of
+        {ok, Slots} ->
+            do_reorganize_atomic_snap(NewBlocks, Slots, State);
+        {error, ReadErr} ->
+            %% Nothing mutated yet; a read failure is a system fault.
+            {error, {reorg_snapshot_failed, ReadErr}}
+    end.
+
+do_reorganize_atomic_snap(NewBlocks, Slots, State) ->
     %% Snapshot pre-reorg in-memory state for rollback on failure.
     Snapshot = #{
         tip_hash       => State#state.tip_hash,
         tip_height     => State#state.tip_height,
-        mtp_timestamps => State#state.mtp_timestamps
+        mtp_timestamps => State#state.mtp_timestamps,
+        height_slots   => Slots
     },
 
     %% Step 1: pre-flush so disk holds a known good fork-point baseline.
@@ -2932,8 +2950,9 @@ do_reorganize_flushed(NewBlocks, Snapshot, State, StateFlushed) ->
                             State4 = State3#state{reorg_in_progress = false},
                             State5 = do_flush(State4),
                             {ok, State5, DisconnectedTxs};
-                        {error, ConnectErr} ->
-                            {error, {reorg_connect_failed, ConnectErr}}
+                        {error, ConnectErr, FailedHash} ->
+                            {error, {reorg_connect_failed, ConnectErr},
+                             FailedHash}
                     end;
                 {error, DiscErr} ->
                     {error, {reorg_disconnect_failed, DiscErr}}
@@ -2947,28 +2966,59 @@ do_reorganize_flushed(NewBlocks, Snapshot, State, StateFlushed) ->
     case Result of
         {ok, _, _} = Ok ->
             Ok;
+        {error, {reorg_connect_failed, ConnErr} = ErrReason, BadHash} ->
+            rollback_failed_reorg(ErrReason, Snapshot, State,
+                                  {ConnErr, BadHash});
         {error, ErrReason} ->
-            %% Step 6: rollback on failure. The on-disk state still
-            %% holds the pre-reorg tip + UTXO + undo (because the
-            %% pre-flush ran in step 1 and no further commit landed),
-            %% so wiping the ETS pollution from the partial walk and
-            %% restoring the tip pointer is sufficient.
-            logger:error("chainstate: reorg failed (~p), rolling back to "
-                         "pre-reorg snapshot at ~s/~B",
-                         [ErrReason,
-                          hash_hex(maps:get(tip_hash, Snapshot)),
-                          maps:get(tip_height, Snapshot)]),
-            RolledBack = rollback_reorg(Snapshot, State),
-            {error, ErrReason, RolledBack}
+            rollback_failed_reorg(ErrReason, Snapshot, State, none)
+    end.
+
+%% Step 6: rollback on failure. The UTXO set, tip and undo data on disk are
+%% still the pre-reorg ones (the pre-flush ran in step 1 and no further
+%% commit landed), so wiping the ETS pollution from the partial walk and
+%% restoring the tip pointer covers them. The block-index slots the connect
+%% side wrote directly are put back from the snapshot.
+%%
+%% Core ActivateBestChainStep (validation.cpp): when ConnectTip fails with
+%% state.IsInvalid(), InvalidChainFound marks the failing block (and through
+%% SetBlockFailureFlags its descendants) BLOCK_FAILED_VALID, and the chain
+%% goes back to the best valid candidate. A system error (state.IsError())
+%% returns false and marks nothing. So only a consensus verdict about the
+%% failing block marks it, and only once the restore has landed.
+rollback_failed_reorg(ErrReason, Snapshot, State, Failed) ->
+    logger:error("chainstate: reorg failed (~p), rolling back to "
+                 "pre-reorg snapshot at ~s/~B",
+                 [ErrReason,
+                  hash_hex(maps:get(tip_hash, Snapshot)),
+                  maps:get(tip_height, Snapshot)]),
+    RolledBack = rollback_reorg(Snapshot, State),
+    case beamchain_db:restore_height_slots(maps:get(height_slots, Snapshot)) of
+        ok ->
+            case Failed of
+                {ConnectErr, FailedHash} ->
+                    case beamchain_block_sync:is_consensus_verdict(ConnectErr) of
+                        true  -> do_invalid_block_found(FailedHash);
+                        false -> ok
+                    end;
+                none ->
+                    ok
+            end,
+            {error, ErrReason, RolledBack};
+        RestoreErr ->
+            %% The old chain's index could not be put back: a resource
+            %% error, never a verdict. Latch the node instead of running on
+            %% an index that no longer names the tip.
+            beamchain_fatal:abort_node({reorg_restore_failed, RestoreErr}),
+            {error, {reorg_restore_failed, RestoreErr}, RolledBack}
     end.
 
 %% Roll back the in-memory state to the pre-reorg snapshot. The on-disk
 %% state still holds the pre-reorg tip + UTXO + undo data because
-%% do_reorganize_atomic pre-flushed before mutating; the *only* thing
-%% we need to undo is the in-memory ETS pollution from the partial
-%% reorg walk (UTXO_CACHE entries that were spent/added, dirty/fresh/
-%% spent tracking, the in-progress pending_undo_deletes accumulator,
-%% and the CHAIN_META tip pointer).
+%% do_reorganize_atomic pre-flushed before mutating; what is left here is
+%% the in-memory ETS pollution from the partial reorg walk (UTXO_CACHE
+%% entries that were spent/added, dirty/fresh/spent tracking, the
+%% in-progress pending_undo_deletes accumulator, and the CHAIN_META tip
+%% pointer). The block-index slots are restored by rollback_failed_reorg/4.
 rollback_reorg(Snapshot, OriginalState) ->
     %% Wipe ALL ETS UTXO state. UTXO_CACHE may contain entries that
     %% reflect the partial reorg walk (some UTXOs were spent by the
@@ -3032,16 +3082,19 @@ disconnect_to(TargetHash, State, AccTxs) ->
 %% pipeline (validation.cpp CheckBlock → ConnectBlock).
 connect_blocks([], State) ->
     {ok, State};
-connect_blocks([Block | Rest], #state{params = Params} = State) ->
+connect_blocks([#block{header = Header} = Block | Rest],
+               #state{params = Params} = State) ->
+    %% A failure names the block that failed so the caller can mark it.
     case beamchain_validation:check_block(Block, Params) of
         {error, CheckErr} ->
-            {error, {check_block_failed, CheckErr}};
+            {error, {check_block_failed, CheckErr},
+             beamchain_serialize:block_hash(Header)};
         ok ->
             case do_connect_block(Block, State) of
                 {ok, State2} ->
                     connect_blocks(Rest, State2);
                 {error, Reason} ->
-                    {error, Reason}
+                    {error, Reason, beamchain_serialize:block_hash(Header)}
             end
     end.
 
