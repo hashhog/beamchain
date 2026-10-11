@@ -2272,7 +2272,7 @@ scan_is_space(C) ->
         C =:= $\v orelse C =:= $\f orelse C =:= $\r.
 
 scan_is_hex(Str) ->
-    (length(Str) rem 2 =:= 0) andalso
+    Str =/= [] andalso (length(Str) rem 2 =:= 0) andalso
         lists:all(fun scan_is_hex_char/1, Str).
 
 scan_is_hex_char(C) ->
