@@ -2064,7 +2064,7 @@ rpc_getblockheader(_) ->
      <<"Usage: getblockheader \"hash\" ( verbose )">>}.
 
 rpc_getblockheader_lookup(Hash, _HashHex, Verbose) ->
-    case beamchain_db:get_block_index_by_hash(Hash) of
+    case block_index_any(Hash) of
         {ok, #{height := Height, header := Header, chainwork := Chainwork, n_tx := RawNTx}} ->
             case Verbose of
                 false ->
@@ -3692,6 +3692,15 @@ find_tx_in_list(Txid, [Tx | Rest], Pos) ->
     end.
 
 %% Check if a block hash is in the active chain
+%% Block index entry by hash wherever it lives: the height slot it owns, or
+%% the hash-keyed side-branch index (side blocks and blocks displaced from
+%% the active chain, KB-181).  Core: BlockManager::LookupBlockIndex.
+block_index_any(Hash) ->
+    case beamchain_db:get_block_index_by_hash(Hash) of
+        {ok, _} = Ok -> Ok;
+        _ -> beamchain_db:get_side_branch_index(Hash)
+    end.
+
 is_block_in_active_chain(BlockHash) ->
     case beamchain_db:get_block_index_by_hash(BlockHash) of
         {ok, #{height := Height}} ->
@@ -9191,17 +9200,21 @@ block_mtp(Height) ->
 %% Format a block as JSON (verbosity 1 or 2).
 format_block_json(#block{header = Header, transactions = Txs} = Block,
                   Hash, DecodeTxs) ->
-    Height = case beamchain_db:get_block_index_by_hash(Hash) of
-        {ok, #{height := H}} -> H;
-        _ -> Block#block.height
+    {Height, Chainwork} = case block_index_any(Hash) of
+        {ok, #{height := H, chainwork := CW}} -> {H, CW};
+        _ -> {Block#block.height, <<0:256>>}
     end,
-    Chainwork = case beamchain_db:get_block_index_by_hash(Hash) of
-        {ok, #{chainwork := CW}} -> CW;
-        _ -> <<0:256>>
-    end,
-    NextHash = case beamchain_db:get_block_index(Height + 1) of
-        {ok, #{hash := NH}} -> hash_to_hex(NH);
-        not_found -> null
+    %% Core ComputeNextBlockAndDepth (rpc/blockchain.cpp): a block off the
+    %% active chain has confirmations -1 and no nextblockhash.
+    {Confirmations, NextHash} = case is_block_in_active_chain(Hash) of
+        true ->
+            {confirmations(Height),
+             case beamchain_db:get_block_index(Height + 1) of
+                 {ok, #{hash := NH}} -> hash_to_hex(NH);
+                 not_found -> null
+             end};
+        false ->
+            {-1, null}
     end,
     Bits = Header#block_header.bits,
     %% Compute block size and weight
@@ -9276,7 +9289,7 @@ format_block_json(#block{header = Header, transactions = Txs} = Block,
     end,
     HeaderFields = [
         {<<"hash">>, hash_to_hex(Hash)},
-        {<<"confirmations">>, confirmations(Height, Hash)},
+        {<<"confirmations">>, Confirmations},
         {<<"height">>, Height},
         {<<"version">>, Header#block_header.version},
         {<<"versionHex">>, beamchain_serialize:hex_encode(

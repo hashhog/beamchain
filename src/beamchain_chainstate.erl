@@ -88,6 +88,7 @@
 -define(BLOCK_VALID_HEADER, 1).
 -define(BLOCK_VALID_SCRIPTS, 5).
 -define(BLOCK_HAVE_DATA, 8).
+-define(MAX_BLOCK_SEQS, 16384).
 -define(BLOCK_HAVE_UNDO, 16).
 -define(BLOCK_FAILED_VALID, 32).
 -define(BLOCK_FAILED_CHILD, 64).
@@ -265,6 +266,15 @@
     last_precious_chainwork = 0 :: non_neg_integer(),
     block_reverse_sequence_id = -1 :: integer(),
     precious_seqids = #{} :: #{binary() => integer()},
+
+    %% Core nSequenceId for blocks received in this process
+    %% (ReceivedBlockTransactions, validation.cpp:3857, counting from
+    %% SEQ_ID_INIT_FROM_DISK + 1 = 2).  Blocks loaded from disk have none:
+    %% the tip counts as 0 (SEQ_ID_BEST_CHAIN_FROM_DISK, :4624), anything else
+    %% as 1.  Breaks equal-work ties in best_candidate/2.  Bounded by
+    %% note_received/2.
+    block_seqs = #{} :: #{binary() => pos_integer()},
+    block_seq_next = 2 :: pos_integer(),
 
     %% dumptxoutset rollback pause (Core NetworkDisable + TemporaryRollback,
     %% rpc/blockchain.cpp dumptxoutset). While set, every tip-moving call
@@ -1440,7 +1450,8 @@ handle_call(_Request, _From, State) ->
 
 %% The tip-moving calls, reached only through the gate-6 latch check in
 %% handle_call/3.
-handle_chain_call({connect_block, Block}, State) ->
+handle_chain_call({connect_block, Block}, State0) ->
+    State = note_received(Block, State0),
     case do_connect_block(Block, State) of
         {ok, State2} ->
             {reply, ok, State2};
@@ -1448,7 +1459,8 @@ handle_chain_call({connect_block, Block}, State) ->
             {reply, {error, Reason}, State}
     end;
 
-handle_chain_call({submit_block, Block, MinPowChecked}, State) ->
+handle_chain_call({submit_block, Block, MinPowChecked}, State0) ->
+    State = note_received(Block, State0),
     case do_submit_block(Block, MinPowChecked, State) of
         {ok, {reorg, DisconnectedTxs}, State2} ->
             %% Pattern B: surface disconnected non-coinbase txs to
@@ -4459,16 +4471,20 @@ activate_best_candidate(Candidates, State) ->
     end.
 
 %% The most-work eligible candidate, or none.
-best_candidate(Candidates, State) ->
-    TipWork = tip_chainwork(State),
+%% Core CBlockIndexWorkComparator (node/blockstorage.cpp:174-192): more work
+%% wins, then the lower nSequenceId.  So an equal-work candidate beats the tip
+%% when it was received first (reconsiderblock of a block that was displaced
+%% by an equal-work branch goes back to it, KB-181).
+best_candidate(Candidates, #state{tip_hash = TipHash} = State) ->
+    Tip = {tip_chainwork(State), -seq_id(TipHash, State)},
     Eligible = lists:filtermap(fun(#{hash := H}) ->
-        case lookup_block_index_anywhere(H) of
-            {ok, #{status := S, chainwork := CW} = E}
+        case H =/= TipHash andalso lookup_block_index_anywhere(H) of
+            {ok, #{status := S, chainwork := CW}}
               when (S band ?BLOCK_FAILED_VALID) =:= 0 ->
-                W = binary:decode_unsigned(CW, big),
-                case W > TipWork andalso not is_known_invalid(H)
+                Key = {binary:decode_unsigned(CW, big), -seq_id(H, State)},
+                case Key > Tip andalso not is_known_invalid(H)
                      andalso have_block_data(H, S) of
-                    true -> {true, {W, E#{hash => H}}};
+                    true -> {true, {Key, H}};
                     false -> false
                 end;
             _ ->
@@ -4476,13 +4492,41 @@ best_candidate(Candidates, State) ->
         end
     end, Candidates),
     case Eligible of
-        [] ->
-            none;
+        [] -> none;
+        _ -> element(2, lists:max(Eligible))
+    end.
+
+seq_id(Hash, #state{tip_hash = TipHash, block_seqs = Seqs,
+                    precious_seqids = Precious}) ->
+    case Precious of
+        #{Hash := P} -> P;
         _ ->
-            {_, #{hash := Best}} = lists:foldl(fun({W, _} = C, {AW, _} = Acc) ->
-                case W > AW of true -> C; false -> Acc end
-            end, hd(Eligible), tl(Eligible)),
-            Best
+            case Seqs of
+                #{Hash := N} -> N;
+                _ when Hash =:= TipHash -> 0;
+                _ -> 1
+            end
+    end.
+
+%% Give a newly received block the next sequence id.  Only the newest
+%% ?MAX_BLOCK_SEQS ids are kept; an older block falls back to the
+%% from-disk value, which can only matter for an equal-work tie that deep.
+note_received(#block{header = Header}, #state{block_seqs = Seqs,
+                                              block_seq_next = N} = State) ->
+    Hash = beamchain_serialize:block_hash(Header),
+    case Seqs of
+        #{Hash := _} ->
+            State;
+        _ ->
+            Seqs1 = case map_size(Seqs) >= ?MAX_BLOCK_SEQS of
+                true ->
+                    maps:filter(fun(_, V) -> V > N - ?MAX_BLOCK_SEQS div 2 end,
+                                Seqs);
+                false ->
+                    Seqs
+            end,
+            State#state{block_seqs = Seqs1#{Hash => N},
+                        block_seq_next = N + 1}
     end.
 
 %% Core FindMostWorkChain skips a candidate without BLOCK_HAVE_DATA
