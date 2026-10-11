@@ -28,7 +28,7 @@
 %%% Core v31.1 connects 3', 4', fails 5'' and ends on 4' (getchaintips: 4'
 %%% active, 5'' invalid), also after a restart.
 %%%
-%%% KB-181: a block that loses its height slot (4a after the node moves to
+%%% KB-190: a block that loses its height slot (4a after the node moves to
 %%% 4') must stay reachable by hash, as in Core's hash-keyed block index.
 %%%   active   G - 1 - 2 - 3a - 4a [- 5a]
 %%%   side             \- 3' - 4'          (valid, ties 4a)

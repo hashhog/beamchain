@@ -3694,7 +3694,7 @@ find_tx_in_list(Txid, [Tx | Rest], Pos) ->
 %% Check if a block hash is in the active chain
 %% Block index entry by hash wherever it lives: the height slot it owns, or
 %% the hash-keyed side-branch index (side blocks and blocks displaced from
-%% the active chain, KB-181).  Core: BlockManager::LookupBlockIndex.
+%% the active chain, KB-190).  Core: BlockManager::LookupBlockIndex.
 block_index_any(Hash) ->
     case beamchain_db:get_block_index_by_hash(Hash) of
         {ok, _} = Ok -> Ok;

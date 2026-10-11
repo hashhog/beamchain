@@ -901,7 +901,7 @@ height_slot_ops({H, Idx, Cum}) ->
 %% that leaves the active chain stays reachable: getblockheader/getblock answer
 %% for it and reconsiderblock finds it.  Here an active block's entry lives
 %% only in its height slot, and get_block_index_by_hash refuses it once another
-%% block owns the slot (KB-181).  Before a different block takes Height, copy
+%% block owns the slot (KB-190).  Before a different block takes Height, copy
 %% the old entry, if its body is stored, into the hash-keyed side-branch index.
 %% Header-only entries are left as before.
 displaced_entry_ops(Db, IdxCF, MetaCF, Height, NewHash) ->

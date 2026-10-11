@@ -4474,7 +4474,7 @@ activate_best_candidate(Candidates, State) ->
 %% Core CBlockIndexWorkComparator (node/blockstorage.cpp:174-192): more work
 %% wins, then the lower nSequenceId.  So an equal-work candidate beats the tip
 %% when it was received first (reconsiderblock of a block that was displaced
-%% by an equal-work branch goes back to it, KB-181).
+%% by an equal-work branch goes back to it, KB-190).
 best_candidate(Candidates, #state{tip_hash = TipHash} = State) ->
     Tip = {tip_chainwork(State), -seq_id(TipHash, State)},
     Eligible = lists:filtermap(fun(#{hash := H}) ->
