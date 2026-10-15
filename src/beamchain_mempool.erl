@@ -21,6 +21,9 @@
          accept_package/1]).
 %% Dry-run variants (testmempoolaccept — validate without mutating mempool)
 -export([accept_to_memory_pool_dry_run/1, accept_package_dry_run/1]).
+%% accept_package/1 plus which txs were admitted together as a CPFP package
+%% (submitpackage reports their shared effective feerate).
+-export([accept_package_info/1]).
 
 %% Queries
 -export([has_tx/1, get_tx/1, get_entry/1, get_wtxid/1]).
@@ -327,6 +330,14 @@ add_transaction(Tx, PeerId) ->
     {ok, [binary()]} | {error, term()}.
 accept_package(Package) ->
     gen_server:call(?SERVER, {accept_package, Package}, 60000).
+
+%% @doc accept_package/1 that also reports how the package was admitted.
+%% Info is #{cpfp := {Txids, Fee, VSize}} when some txs only entered as a
+%% package (they failed the mempool min fee on their own), else #{}.
+-spec accept_package_info([#transaction{}]) ->
+    {ok, [binary()], map()} | {error, term()}.
+accept_package_info(Package) ->
+    gen_server:call(?SERVER, {accept_package_info, Package}, 60000).
 
 %% @doc Dry-run single-tx validation (testmempoolaccept).
 %% Runs all 21 ATMP gates but does NOT insert into any ETS table.
@@ -788,7 +799,15 @@ handle_call({accept_package, Package}, _From, State) ->
             %% Gate 6: latched node -- refuse (see add_tx above).
             {reply, {error, beamchain_fatal:refusal()}, State};
         false ->
-            handle_accept_package(Package, State)
+            handle_accept_package(Package, State, false)
+    end;
+
+handle_call({accept_package_info, Package}, _From, State) ->
+    case beamchain_fatal:is_aborted() of
+        true ->
+            {reply, {error, beamchain_fatal:refusal()}, State};
+        false ->
+            handle_accept_package(Package, State, true)
     end;
 
 %% Dry-run: validate a single tx through all 21 ATMP gates without
@@ -877,14 +896,17 @@ handle_add_tx(Tx, PeerId, State) ->
             {reply, {error, Reason}, State}
     end.
 
-handle_accept_package(Package, State) ->
+handle_accept_package(Package, State, WithInfo) ->
     case do_accept_package(Package, State) of
-        {ok, Txids, State2} ->
+        {ok, Txids, Info, State2} ->
             %% Mirror Core: package admission (ProcessNewPackage) is followed by
             %% LimitMempoolSize.  Trim once, after the whole package has landed,
             %% so we never double-apply per-tx within a single package operation.
             State3 = do_trim_to_size(State2#state.max_size, State2),
-            {reply, {ok, Txids}, State3};
+            case WithInfo of
+                true  -> {reply, {ok, Txids, Info}, State3};
+                false -> {reply, {ok, Txids}, State3}
+            end;
         {error, Reason} ->
             {reply, {error, Reason}, State}
     end.
@@ -1530,7 +1552,7 @@ do_accept_package(Package, State) ->
         %% 4. If no deferred transactions, we're done
         case DeferredTxs of
             [] ->
-                {ok, AcceptedTxids, State2};
+                {ok, AcceptedTxids, #{}, State2};
             _ ->
                 %% 5. Evaluate deferred transactions as a package (CPFP)
                 evaluate_package_cpfp(DeferredTxs, AcceptedTxids, State2)
@@ -1699,7 +1721,8 @@ evaluate_package_cpfp(DeferredTxs, AlreadyAccepted, State) ->
     AcceptedTxids = AlreadyAccepted ++ [Txid || {Txid, _} <- DeferredTxs],
     logger:debug("mempool: accepted package of ~B txs (pkg_fee_rate=~.1f sat/vB)",
                  [length(DeferredTxs), PackageFeeRate]),
-    {ok, AcceptedTxids, State2}.
+    Info = #{cpfp => {[Txid || {Txid, _} <- DeferredTxs], TotalFee, TotalVSize}},
+    {ok, AcceptedTxids, Info, State2}.
 
 %% Compute package metrics: total fee, total vsize, and entry data.
 compute_package_metrics(TxPairs, PackageTxMap, _State) ->

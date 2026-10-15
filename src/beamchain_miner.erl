@@ -310,7 +310,8 @@ do_create_template(CoinbaseScriptPubKey, _Opts,
                 <<"vbrequired">> => VbRequired,
                 <<"previousblockhash">> => hash_to_hex(TipHash),
                 <<"transactions">> => TxEntries,
-                <<"coinbaseaux">> => #{<<"flags">> => <<>>},
+                %% Core 31 builds coinbaseaux as an empty object (no flags key).
+                <<"coinbaseaux">> => #{},
                 <<"coinbasevalue">> => CoinbaseValue,
                 <<"longpollid">> => LongPollId,
                 <<"target">> => target_to_hex(Target),
@@ -385,7 +386,7 @@ build_gbt_rules_and_vbavailable(Network, TipHeight) ->
 
     %% "csv" is always listed in rules once active (Core hardcodes it).
     %% We build rules dynamically for all deployments to handle any network.
-    lists:foldl(fun(Dep, {Rules, VbAvail}) ->
+    {RulesRev, VbAvailable} = lists:foldl(fun(Dep, {Rules, VbAvail}) ->
         NameAtom = maps:get(name_atom, Dep),
         NameBin  = maps:get(name, Dep),        %% binary, e.g. <<"segwit">>
         Bit      = maps:get(bit, Dep),
@@ -417,7 +418,10 @@ build_gbt_rules_and_vbavailable(Network, TipHeight) ->
                 %% defined / failed: not reported.
                 {Rules, VbAvail}
         end
-    end, {[], #{}}, Deployments).
+    end, {[], #{}}, Deployments),
+    %% Core lists the rules in deployment order (csv, !segwit, taproot); the
+    %% fold above prepends.
+    {lists:reverse(RulesRev), VbAvailable}.
 
 %% BUG8 FIX: compute_minimum_time/3 — equivalent of Core's GetMinimumTime().
 %%
