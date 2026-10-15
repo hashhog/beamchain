@@ -38,6 +38,16 @@
 %%% invalidate and reconsider the tip 4' is loaded with nSequenceId 0 and 4a
 %%% with 1, so Core stays on 4'.
 %%%
+%%% KB-195: invalidateblock of the tip with no side branch to move to
+%%% leaves the old tip's height slot in place (slots above the tip are not
+%%% deleted on disconnect).  The slot alone must not put the block on the
+%%% active chain.
+%%%   active   G - 1 - 2 - 3a - 4a
+%%% Core v31.1: invalidateblock 4a -> tip 3a; getblockheader/getblock 4a
+%%% give confirmations -1 and no nextblockhash, and 3a has confirmations 1
+%%% and no nextblockhash (ComputeNextBlockAndDepth, rpc/blockchain.cpp).
+%%% reconsiderblock 4a -> tip 4a, and 3a's nextblockhash is 4a again.
+%%%
 %%%   rebar3 eunit --module=beamchain_failed_reorg_restore_tests
 
 -include_lib("eunit/include/eunit.hrl").
@@ -66,7 +76,13 @@ failed_reorg_restore_test_() ->
           {"invalidate/reconsider round trip, heavier original branch",
            fun reconsider_heavier_returns/0},
           {"invalidate, restart, reconsider: the tip from disk keeps the tie",
-           fun reconsider_after_restart_keeps_tip/0}]]}.
+           fun reconsider_after_restart_keeps_tip/0},
+          {"an invalidated tip that keeps its height slot is off the chain",
+           fun invalidated_tip_slot_off_chain/0},
+          {"the invalidated tip stays off the chain across a restart",
+           fun invalidated_tip_slot_off_chain_restart/0},
+          {"an invalidated tip a heavier branch replaces stays off the chain",
+           fun invalidated_tip_heavier_side_off_chain/0}]]}.
 
 %%% ===================================================================
 %%% Tests
@@ -187,9 +203,87 @@ reconsider_after_restart_keeps_tip() ->
     ?assertEqual({ok, {S4#block.hash, 4}}, beamchain_chainstate:get_tip()),
     assert_off_chain(A4, 4).
 
+invalidated_tip_slot_off_chain() ->
+    #{a3 := A3, a4 := A4} = invalidated_tip(),
+    assert_off_chain(A4, 4),
+    assert_active_tip(A3, 3),
+    ?assertEqual(ok, beamchain_chainstate:reconsider_block(A4)),
+    ?assertEqual({ok, {A4, 4}}, beamchain_chainstate:get_tip()),
+    assert_active_tip(A4, 4),
+    assert_next(A3, A4).
+
+invalidated_tip_slot_off_chain_restart() ->
+    #{a3 := A3, a4 := A4} = invalidated_tip(),
+    restart(),
+    ?assertEqual({ok, {A3, 3}}, beamchain_chainstate:get_tip()),
+    assert_off_chain(A4, 4),
+    assert_active_tip(A3, 3),
+    ?assertEqual(ok, beamchain_chainstate:reconsider_block(A4)),
+    ?assertEqual({ok, {A4, 4}}, beamchain_chainstate:get_tip()),
+    assert_next(A3, A4),
+    restart(),
+    assert_active_tip(A4, 4),
+    assert_next(A3, A4).
+
+%% Harness failed_reorg scenario D: invalidateblock 4a with no side branch
+%% (tip 3a), then 3' 4' 5' arrive and win; reconsiderblock 4a keeps 5'.
+invalidated_tip_heavier_side_off_chain() ->
+    #{a4 := A4} = invalidated_tip(),
+    {ok, #{hash := T2}} = beamchain_db:get_block_index(2),
+    S3 = mine_block(T2, 3, [coinbase(3, <<"s3">>, 5000000000)], ts(3) + 1),
+    S4 = mine_block(S3#block.hash, 4, [coinbase(4, <<"s4">>, 5000000000)],
+                    ts(4) + 1),
+    S5 = mine_block(S4#block.hash, 5, [coinbase(5, <<"s5">>, 5000000000)],
+                    ts(5) + 1),
+    [beamchain_chainstate:submit_block(B) || B <- [S3, S4, S5]],
+    ?assertEqual({ok, {S5#block.hash, 5}}, beamchain_chainstate:get_tip()),
+    assert_off_chain(A4, 4),
+    ?assertEqual(ok, beamchain_chainstate:reconsider_block(A4)),
+    ?assertEqual({ok, {S5#block.hash, 5}}, beamchain_chainstate:get_tip()),
+    assert_off_chain(A4, 4),
+    assert_active_tip(S5#block.hash, 5),
+    assert_next(S4#block.hash, S5#block.hash).
+
 %%% ===================================================================
 %%% Helpers
 %%% ===================================================================
+
+%% Active chain to 4, then invalidateblock 4a with nothing else to move to:
+%% the tip drops to 3a and 4a's height slot is left in place.
+invalidated_tip() ->
+    build_chain(4),
+    {ok, #{hash := A3}} = beamchain_db:get_block_index(3),
+    {ok, #{hash := A4}} = beamchain_db:get_block_index(4),
+    ?assertEqual(ok, beamchain_chainstate:invalidate_block(A4)),
+    ?assertEqual({ok, {A3, 3}}, beamchain_chainstate:get_tip()),
+    #{a3 => A3, a4 => A4}.
+
+%% getblockheader / getblock JSON for Hash, both verbose forms.
+block_jsons(Hash) ->
+    Hex = hash_hex(Hash),
+    [begin
+         ?assertMatch({ok_raw_json, _}, Resp),
+         {ok_raw_json, Json} = Resp,
+         jsx:decode(Json, [return_maps])
+     end || Resp <- [beamchain_rpc:rpc_getblockheader([Hex, true]),
+                     beamchain_rpc:rpc_getblock([Hex, 1])]].
+
+hash_hex(Hash) ->
+    beamchain_serialize:hex_encode(beamchain_serialize:reverse_bytes(Hash)).
+
+%% The active tip: confirmations 1, its height, no nextblockhash.
+assert_active_tip(Hash, Height) ->
+    lists:foreach(fun(M) ->
+        ?assertEqual(1, maps:get(<<"confirmations">>, M)),
+        ?assertEqual(Height, maps:get(<<"height">>, M)),
+        ?assertNot(maps:is_key(<<"nextblockhash">>, M))
+    end, block_jsons(Hash)).
+
+%% An active block whose successor on the active chain is Next.
+assert_next(Hash, Next) ->
+    lists:foreach(fun(M) ->
+        ?assertEqual(hash_hex(Next), maps:get(<<"nextblockhash">>, M, missing))
+    end, block_jsons(Hash)).
 
 %% Active chain to height 3, then 3' (valid) and 4' (bad-cb-amount) on 2.
 failed_side_reorg() ->
