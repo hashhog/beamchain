@@ -2100,8 +2100,8 @@ rpc_getblockheader_lookup(Hash, _HashHex, Verbose) ->
                         case InActiveChain of
                             true ->
                                 {confirmations(Height),
-                                 case beamchain_db:get_block_index(Height + 1) of
-                                     {ok, #{hash := NH}} -> hash_to_hex(NH);
+                                 case active_next_hash(Height) of
+                                     {ok, NH} -> hash_to_hex(NH);
                                      not_found -> undefined
                                  end};
                             false ->
@@ -3703,15 +3703,41 @@ block_index_any(Hash) ->
         _ -> beamchain_db:get_side_branch_index(Hash)
     end.
 
+%% Core: chain.Contains(pindex), i.e. tip->GetAncestor(height) == pindex.
+%% Owning the height slot is not enough: invalidateblock of the tip with no
+%% branch to move to leaves the old tip's slot in place above the new tip
+%% (KB-195), so the height must also be at or below the tip.
 is_block_in_active_chain(BlockHash) ->
     case beamchain_db:get_block_index_by_hash(BlockHash) of
         {ok, #{height := Height}} ->
-            %% Verify the block at this height has the same hash
-            case beamchain_db:get_block_index(Height) of
-                {ok, #{hash := Hash}} -> Hash =:= BlockHash;
-                _ -> false
-            end;
+            at_or_below_tip(Height) andalso
+                %% Verify the block at this height has the same hash
+                case beamchain_db:get_block_index(Height) of
+                    {ok, #{hash := Hash}} -> Hash =:= BlockHash;
+                    _ -> false
+                end;
         _ -> false
+    end.
+
+%% Hash of the active-chain block after Height, Core's
+%% tip->GetAncestor(height + 1): none past the tip, even if a stale slot
+%% above the tip still names a block (KB-195).
+active_next_hash(Height) ->
+    case at_or_below_tip(Height + 1) of
+        true ->
+            case beamchain_db:get_block_index(Height + 1) of
+                {ok, #{hash := NH}} -> {ok, NH};
+                not_found -> not_found
+            end;
+        false ->
+            not_found
+    end.
+
+%% No known tip keeps the slot-only answer.
+at_or_below_tip(Height) ->
+    case rpc_tip_height() of
+        {ok, Tip} -> Height =< Tip;
+        not_found -> true
     end.
 
 %% Format getrawtransaction result based on verbosity
@@ -9304,8 +9330,8 @@ format_block_json(#block{header = Header, transactions = Txs} = Block,
     {Confirmations, NextHash} = case is_block_in_active_chain(Hash) of
         true ->
             {confirmations(Height),
-             case beamchain_db:get_block_index(Height + 1) of
-                 {ok, #{hash := NH}} -> hash_to_hex(NH);
+             case active_next_hash(Height) of
+                 {ok, NH} -> hash_to_hex(NH);
                  not_found -> null
              end};
         false ->
