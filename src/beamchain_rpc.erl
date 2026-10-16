@@ -79,6 +79,8 @@
 %% two formerly-stripped fields are present, in Core's pushKV order, with
 %% confirmations = tip_height - coin_height + 1 (0 for mempool coins).
 -export([format_utxo_result/4]).
+%% Test-only exports — output-shape helpers (submitpackage / testmempoolaccept).
+-export([package_msg/1, package_tx_error/1, feerate_btc_per_kvb/2]).
 %% Test-only exports — ParseHashV txid/blockhash parse-boundary guard
 %% (Core rpc/util.cpp ParseHashV: malformed hash -> -8 at the parse boundary,
 %% well-formed-but-absent -> the handler's -5/null). The eunit suite drives the
@@ -3959,7 +3961,10 @@ rpc_sendrawtransaction([HexStr, MaxFeeRateBtcKvB]) when is_binary(HexStr) ->
                 relay_transaction(AcceptedTxid),
                 {ok, hash_to_hex(AcceptedTxid)};
             {error, Reason} ->
-                format_mempool_error(Reason, Txid)
+                case reject_details(Reason, Tx) of
+                    undefined -> format_mempool_error(Reason, Txid);
+                    Details   -> {error, ?RPC_VERIFY_REJECTED, Details}
+                end
         end
     catch
         throw:{already_in_mempool, _} ->
@@ -4649,6 +4654,8 @@ format_mempool_error(rbf_spends_conflicting_tx, _Txid) ->
     %% Core policy/rbf.cpp EntriesAndTxidsDisjoint → validation.cpp
     %% state.Invalid(TX_CONSENSUS, "bad-txns-spends-conflicting-tx", ...).
     {error, ?RPC_VERIFY_REJECTED, <<"bad-txns-spends-conflicting-tx">>};
+format_mempool_error(premature_spend_of_coinbase, _Txid) ->
+    {error, ?RPC_VERIFY_REJECTED, <<"bad-txns-premature-spend-of-coinbase">>};
 format_mempool_error({script_verify_failed, Idx}, _Txid) ->
     {error, ?RPC_VERIFY_ERROR,
      iolist_to_binary(io_lib:format("mandatory-script-verify-flag-failed (input ~B)", [Idx]))};
@@ -4737,6 +4744,50 @@ mempool_reject_reason(Reason, Txid) ->
         _ -> iolist_to_binary(io_lib:format("~p", [Reason]))
     end.
 
+%% A testmempoolaccept result row for a rejected tx: reject-reason plus
+%% reject-details when the rejection carries a debug message (Core
+%% state.GetDebugMessage()).
+reject_result(Tx, Txid, Wtxid, Reason) ->
+    Row = #{<<"txid">>          => hash_to_hex(Txid),
+            <<"wtxid">>         => hash_to_hex(Wtxid),
+            <<"allowed">>       => false,
+            <<"reject-reason">> => mempool_reject_reason(Reason, Txid)},
+    case reject_details(Reason, Tx) of
+        undefined -> Row;
+        Details   -> Row#{<<"reject-details">> => Details}
+    end.
+
+tx_by_txid(Txid, Txs) ->
+    case [T || T <- Txs, beamchain_serialize:tx_hash(T) =:= Txid] of
+        [Tx | _] -> Tx;
+        []       -> undefined
+    end.
+
+%% Core ConnectInputs/CheckTxInputs debug string for an immature coinbase
+%% spend: "<token>, tried to spend coinbase at depth <n>" with n measured
+%% against the next block (consensus/tx_verify.cpp).  Only the depth is
+%% derived here, from the UTXO set; the rejection itself was decided by the
+%% mempool.
+reject_details(premature_spend_of_coinbase, #transaction{inputs = Ins}) ->
+    case beamchain_chainstate:get_tip() of
+        {ok, {_Hash, TipHeight}} ->
+            Depths = [TipHeight + 1 - H
+                      || #tx_in{prev_out = #outpoint{hash = PH, index = PI}} <- Ins,
+                         {ok, #utxo{is_coinbase = true, height = H}}
+                             <- [beamchain_chainstate:get_utxo(PH, PI)],
+                         TipHeight + 1 - H < ?COINBASE_MATURITY],
+            case Depths of
+                [D | _] ->
+                    iolist_to_binary(io_lib:format(
+                        "bad-txns-premature-spend-of-coinbase, "
+                        "tried to spend coinbase at depth ~B", [D]));
+                [] -> undefined
+            end;
+        _ -> undefined
+    end;
+reject_details(_Reason, _Tx) ->
+    undefined.
+
 %% @doc testmempoolaccept — dry-run validation without mutating the mempool.
 %%
 %% FIX-54 / W116 BUG-1: the previous implementation called
@@ -4766,22 +4817,20 @@ rpc_testmempoolaccept([RawTxs]) when is_list(RawTxs) ->
                 Txid  = beamchain_serialize:tx_hash(Tx),
                 Wtxid = beamchain_serialize:wtx_hash(Tx),
                 case beamchain_mempool:accept_to_memory_pool_dry_run(Tx) of
-                    {ok, Txid, _Wtxid, Fee, VSize, FeeRate} ->
+                    {ok, Txid, DryWtxid, Fee, VSize, _FeeRate} ->
                         [#{<<"txid">>    => hash_to_hex(Txid),
-                           <<"wtxid">>   => hash_to_hex(_Wtxid),
+                           <<"wtxid">>   => hash_to_hex(DryWtxid),
                            <<"allowed">> => true,
                            <<"vsize">>   => VSize,
                            <<"fees">>    => #{
                                <<"base">> => Fee / 100000000.0,
                                <<"effective-feerate">> =>
-                                   FeeRate * 1000.0 / 100000000.0
+                                   feerate_btc_per_kvb(Fee, VSize),
+                               <<"effective-includes">> =>
+                                   [hash_to_hex(DryWtxid)]
                            }}];
                     {error, Reason} ->
-                        [#{<<"txid">>          => hash_to_hex(Txid),
-                           <<"wtxid">>         => hash_to_hex(Wtxid),
-                           <<"allowed">>       => false,
-                           <<"reject-reason">> =>
-                               mempool_reject_reason(Reason, Txid)}]
+                        [reject_result(Tx, Txid, Wtxid, Reason)]
                 end;
             _ ->
                 %% Multi-tx path — dry-run via accept_package_dry_run/1.
@@ -4790,7 +4839,6 @@ rpc_testmempoolaccept([RawTxs]) when is_list(RawTxs) ->
                     {ok, EntryList} ->
                         lists:map(fun
                             ({ok, Txid, Wtxid, Fee, VSize}) ->
-                                FeeRate = Fee / max(1, VSize),
                                 #{<<"txid">>    => hash_to_hex(Txid),
                                   <<"wtxid">>   => hash_to_hex(Wtxid),
                                   <<"allowed">> => true,
@@ -4798,14 +4846,13 @@ rpc_testmempoolaccept([RawTxs]) when is_list(RawTxs) ->
                                   <<"fees">>    => #{
                                       <<"base">> => Fee / 100000000.0,
                                       <<"effective-feerate">> =>
-                                          FeeRate * 1000.0 / 100000000.0
+                                          feerate_btc_per_kvb(Fee, VSize),
+                                      <<"effective-includes">> =>
+                                          [hash_to_hex(Wtxid)]
                                   }};
                             ({error, Txid, Wtxid, Reason}) ->
-                                #{<<"txid">>          => hash_to_hex(Txid),
-                                  <<"wtxid">>         => hash_to_hex(Wtxid),
-                                  <<"allowed">>       => false,
-                                  <<"reject-reason">> =>
-                                      mempool_reject_reason(Reason, Txid)}
+                                Tx = tx_by_txid(Txid, Decoded),
+                                reject_result(Tx, Txid, Wtxid, Reason)
                         end, EntryList);
                     {error, Reason} ->
                         %% Structural package error — report for every tx
@@ -4916,22 +4963,22 @@ rpc_submitpackage([RawTxs, MaxFeeRate, MaxBurnAmount]) when is_list(RawTxs) ->
 
                 %% 5. Hand off to the package validator. accept_package/1
                 %%    enforces topology + atomicity in beamchain_mempool.
-                {PackageMsg, AcceptedSet} =
-                    case beamchain_mempool:accept_package(Txs) of
-                        {ok, AcceptedTxids} ->
-                            {<<"success">>, sets:from_list(AcceptedTxids)};
+                {PackageMsg, AcceptedSet, PkgInfo, PkgFailure} =
+                    case beamchain_mempool:accept_package_info(Txs) of
+                        {ok, AcceptedTxids, Info} ->
+                            {<<"success">>, sets:from_list(AcceptedTxids),
+                             Info, none};
                         {error, Reason} ->
-                            ReasonBin = iolist_to_binary(
-                                io_lib:format("~p", [Reason])),
-                            {ReasonBin, sets:new()}
+                            {package_msg(Reason), sets:new(), #{}, Reason}
                         end,
 
                 %% 6. Per-tx result map keyed by wtxid (Core shape).
                 TxResultMap = lists:foldl(
                     fun({Tx, Wtxid, Txid}, Acc) ->
                         WtxidHex = hash_to_hex(Wtxid),
-                        Inner = build_pkg_tx_result(Tx, Txid, AcceptedSet,
-                                                     PackageMsg),
+                        Inner = build_pkg_tx_result(Tx, Txid, Wtxid, Wtxids,
+                                                     Txids, AcceptedSet,
+                                                     PkgInfo, PkgFailure),
                         maps:put(WtxidHex, Inner, Acc)
                     end,
                     #{},
@@ -4992,37 +5039,85 @@ decode_package_tx(Hex) when is_binary(Hex) ->
 decode_package_tx(_) ->
     throw({decode_failed, <<"<non-string>">>}).
 
+%% Core's PackageValidationState reject reasons for the structural package
+%% checks (policy/packages.cpp IsWellFormedPackage), spelled as Core spells
+%% them.  Any other failure is a per-transaction one: submitpackage reports
+%% PCKG_TX as "transaction failed" and puts the reason on the transaction.
+package_msg(empty_package)                 -> <<"package-empty">>;
+package_msg(package_too_many_transactions) -> <<"package-too-many-transactions">>;
+package_msg(package_too_large)             -> <<"package-too-large">>;
+package_msg(package_contains_duplicates)   -> <<"package-contains-duplicates">>;
+package_msg(package_not_sorted)            -> <<"package-not-sorted">>;
+package_msg(conflict_in_package)           -> <<"conflict-in-package">>;
+package_msg(package_not_child_with_parents) -> <<"package-not-child-with-parents">>;
+package_msg(package_fee_too_low)           -> <<"package-fee-too-low">>;
+package_msg(_)                             -> <<"transaction failed">>.
+
+%% Per-transaction reject string for a tx-results "error" entry.
+package_tx_error({tx_failed, _Txid, Reason}) -> package_tx_error(Reason);
+package_tx_error(Reason) when Reason =:= orphan;
+                              Reason =:= missing_inputs;
+                              Reason =:= 'bad-txns-inputs-missingorspent' ->
+    <<"bad-txns-inputs-missingorspent">>;
+package_tx_error(Reason) ->
+    mempool_reject_reason(Reason, undefined).
+
+%% CFeeRate(fee, size).GetFeePerK() in BTC/kvB: integer sat/kvB, truncated,
+%% then 8 decimal places (ValueFromAmount).
+feerate_btc_per_kvb(Fee, VSize) when VSize > 0 ->
+    (Fee * 1000 div VSize) / 100000000.0;
+feerate_btc_per_kvb(_Fee, _VSize) ->
+    0.0.
+
 %% Build the inner "tx-results" entry for one transaction.
 %% Accepted txs report vsize + fees (Core's MempoolAcceptResult::VALID
-%% shape); rejected txs report an error string. When the package was
-%% rejected before any tx was even probed (e.g. structural failure),
-%% Core emits "package-not-validated" and we mirror that here.
-build_pkg_tx_result(Tx, Txid, AcceptedSet, PackageMsg) ->
+%% shape, with effective-feerate and effective-includes); rejected txs report
+%% an error string.  A package-level failure leaves every tx unvalidated.
+build_pkg_tx_result(Tx, Txid, Wtxid, Wtxids, Txids, AcceptedSet, PkgInfo,
+                    PkgFailure) ->
     Base = #{<<"txid">> => hash_to_hex(Txid)},
     case sets:is_element(Txid, AcceptedSet) of
         true ->
             %% Accepted: pull fee/vsize from the mempool entry that
             %% accept_package just inserted.
-            case beamchain_mempool:get_entry(Txid) of
-                {ok, #mempool_entry{vsize = VSize, fee = Fee}} ->
-                    Fees = #{<<"base">> => satoshi_to_btc(Fee)},
-                    Base#{<<"vsize">> => VSize,
-                          <<"fees">>  => Fees};
+            {VSize, Fee} = case beamchain_mempool:get_entry(Txid) of
+                {ok, #mempool_entry{vsize = V, fee = F}} -> {V, F};
                 not_found ->
                     %% Should not happen on the success path, but stay
-                    %% defensive — emit txid + minimal vsize fallback.
-                    VSize = beamchain_serialize:tx_vsize(Tx),
-                    Base#{<<"vsize">> => VSize,
-                          <<"fees">>  => #{<<"base">> => 0.0}}
-            end;
+                    %% defensive: txid + vsize with a zero fee.
+                    {beamchain_serialize:tx_vsize(Tx), 0}
+            end,
+            %% A tx that only got in as part of a CPFP package is priced, and
+            %% "includes" its package mates, at the package feerate.
+            {Rate, Includes} = case maps:get(cpfp, PkgInfo, undefined) of
+                {CpfpTxids, PkgFee, PkgVSize} ->
+                    case lists:member(Txid, CpfpTxids) of
+                        true ->
+                            {feerate_btc_per_kvb(PkgFee, PkgVSize),
+                             [hash_to_hex(W) || {T, W} <- lists:zip(Txids, Wtxids),
+                                                lists:member(T, CpfpTxids)]};
+                        false ->
+                            {feerate_btc_per_kvb(Fee, VSize), [hash_to_hex(Wtxid)]}
+                    end;
+                undefined ->
+                    {feerate_btc_per_kvb(Fee, VSize), [hash_to_hex(Wtxid)]}
+            end,
+            Base#{<<"vsize">> => VSize,
+                  <<"fees">>  => #{<<"base">> => satoshi_to_btc(Fee),
+                                   <<"effective-feerate">> => Rate,
+                                   <<"effective-includes">> => Includes}};
         false ->
-            %% Rejected. If the package aborted before per-tx
-            %% processing (PackageMsg ≠ "success" and there are no
-            %% accepted txs), report Core's "package-not-validated"
-            %% sentinel.
-            ErrorStr = case PackageMsg of
-                <<"success">> -> <<"package-not-validated">>;
-                _             -> PackageMsg
+            %% Rejected.  The failing tx carries its own reason; the others
+            %% were never validated.
+            ErrorStr = case PkgFailure of
+                {tx_failed, Txid, _} -> package_tx_error(PkgFailure);
+                {tx_failed, _, _}    -> <<"package-not-validated">>;
+                none                 -> <<"package-not-validated">>;
+                Structural           ->
+                    case package_msg(Structural) of
+                        <<"transaction failed">> -> package_tx_error(Structural);
+                        Msg                      -> Msg
+                    end
             end,
             Base#{<<"error">> => ErrorStr}
     end.
@@ -9656,6 +9751,7 @@ format_mempool_entry(#mempool_entry{txid = Txid, wtxid = Wtxid,
     %% Flat top-level fee/modifiedfee/descendantfees/ancestorfees fields
     %% removed — Core does NOT emit them. Only the nested fees{} object.
     ModFee = max(0, Fee + beamchain_mempool:get_fee_delta(Txid)),
+    {Depends, SpentBy, {ChunkWeight, ChunkFee}} = mempool_entry_links(Txid, Weight, ModFee),
     #{
         <<"vsize">> => Vsize,
         <<"weight">> => Weight,
@@ -9666,14 +9762,16 @@ format_mempool_entry(#mempool_entry{txid = Txid, wtxid = Wtxid,
         <<"ancestorcount">> => AncCount,
         <<"ancestorsize">> => AncSize,
         <<"wtxid">> => hash_to_hex(Wtxid),
+        <<"chunkweight">> => ChunkWeight,
         <<"fees">> => #{
             <<"base">> => format_amount_sentinel(Fee),
             <<"modified">> => format_amount_sentinel(ModFee),
             <<"ancestor">> => format_amount_sentinel(AncFee),
-            <<"descendant">> => format_amount_sentinel(DescFee)
+            <<"descendant">> => format_amount_sentinel(DescFee),
+            <<"chunk">> => format_amount_sentinel(ChunkFee)
         },
-        <<"depends">> => [],
-        <<"spentby">> => [],
+        <<"depends">> => Depends,
+        <<"spentby">> => SpentBy,
         <<"bip125-replaceable">> => Bip125,
         %% TODO: track unbroadcast set (Core CTxMemPool::m_unbroadcast_txids)
         %% and return pool.IsUnbroadcastTx(tx.GetHash()) here. Until then,
@@ -9682,6 +9780,54 @@ format_mempool_entry(#mempool_entry{txid = Txid, wtxid = Wtxid,
     };
 format_mempool_entry(_) ->
     #{<<"error">> => <<"failed to format entry">>}.
+
+%% depends / spentby / chunk of one mempool entry (Core entryToJSON,
+%% rpc/mempool.cpp).  depends = txids of in-mempool parents, spentby = txids
+%% of in-mempool children, both sorted; chunk = {weight, modified fee} of the
+%% cluster chunk holding the tx.  Read-only over the mempool tables.
+%% A tx evicted between the caller's lookup and this one falls back to its
+%% own weight and fee as a singleton chunk.
+mempool_entry_links(Txid, OwnWeight, OwnFee) ->
+    try
+        Members = mempool_cluster_members([Txid], #{}),
+        Nodes = maps:from_list(
+            [begin
+                 {ok, E} = beamchain_mempool:get_entry(T),
+                 {ok, MF} = beamchain_mempool:get_modified_fee(T),
+                 {T, {MF, E#mempool_entry.weight,
+                      mempool_parents(T, Members)}}
+             end || T <- maps:keys(Members)]),
+        {_, _, Parents} = maps:get(Txid, Nodes),
+        Children = [C || {C, {_, _, Ps}} <- maps:to_list(Nodes),
+                         lists:member(Txid, Ps)],
+        {[hash_to_hex(P) || P <- hex_sorted(Parents)],
+         [hash_to_hex(C) || C <- hex_sorted(Children)],
+         beamchain_mempool_chunks:chunk_of(Txid, Nodes)}
+    catch
+        _:_ -> {[], [], {OwnWeight, OwnFee}}
+    end.
+
+hex_sorted(Txids) ->
+    [T || {_, T} <- lists:sort([{hash_to_hex(T), T} || T <- Txids])].
+
+%% Connected component of the in-mempool spend graph that holds the seeds.
+mempool_cluster_members([], Seen) -> Seen;
+mempool_cluster_members([T | Rest], Seen) ->
+    case maps:is_key(T, Seen) orelse not beamchain_mempool:has_tx(T) of
+        true -> mempool_cluster_members(Rest, Seen);
+        false ->
+            Rel = beamchain_mempool:get_ancestors(T)
+                ++ beamchain_mempool:get_descendants(T),
+            mempool_cluster_members(Rel ++ Rest, Seen#{T => true})
+    end.
+
+mempool_parents(Txid, Members) ->
+    case beamchain_mempool:get_tx(Txid) of
+        {ok, #transaction{inputs = Ins}} ->
+            lists:usort([H || #tx_in{prev_out = #outpoint{hash = H}} <- Ins,
+                              maps:is_key(H, Members)]);
+        not_found -> []
+    end.
 
 %%% ===================================================================
 %%% Wallet methods
