@@ -28,8 +28,14 @@ Thumbs.db
 # NIF dependencies
 c_src/secp256k1/
 
-# Crash dumps
+# Crash dumps and logs
 erl_crash.dump
+*.crashdump
+*.log
+
+# Local node state
+peers.json
+anchors.dat
 
 .claude/skills/
 
