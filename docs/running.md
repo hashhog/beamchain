@@ -121,8 +121,9 @@ set these variables, so an option wins over an inherited variable.
 The Prometheus endpoint is on port 9332 for every network. Every listener binds all
 interfaces. Run beside another node on the same machine with `--rpc-port` and
 `--p2p-port`. If port 9332 is busy, startup retries for about 30 seconds and then
-continues without metrics. To move or turn off the metrics endpoint, set the OTP
-application variable through `ERL_FLAGS`:
+continues without metrics. RPC and P2P are already up by then, but services started
+after metrics, such as REST, wait for those 30 seconds. To move or turn off the
+metrics endpoint, set the OTP application variable through `ERL_FLAGS`:
 
 ```bash
 ERL_FLAGS="-beamchain metrics_port 19332" ./_build/default/bin/beamchain start --network=regtest --datadir="$DATADIR"
