@@ -4,6 +4,16 @@
 -include("beamchain.hrl").
 -include("beamchain_protocol.hrl").
 
+%% Mirrors the record re-defined in beamchain_miner.erl.
+-record(mempool_entry, {
+    txid, wtxid, tx, fee, size, vsize, weight, fee_rate,
+    time_added, height_added,
+    ancestor_count, ancestor_size, ancestor_fee,
+    descendant_count, descendant_size, descendant_fee,
+    spends_coinbase, rbf_signaling,
+    adj_weight
+}).
+
 %%% ===================================================================
 %%% Witness commitment format tests
 %%% ===================================================================
@@ -414,3 +424,46 @@ le_minimal_acc(0, Acc) -> Acc;
 le_minimal_acc(N, Acc) ->
     Byte = N band 16#ff,
     le_minimal_acc(N bsr 8, <<Acc/binary, Byte:8>>).
+
+%%% ===================================================================
+%%% GBT default_witness_commitment is present without witness txs
+%%% ===================================================================
+
+gbt_legacy_tx() ->
+    #transaction{
+        version = 2,
+        inputs = [#tx_in{prev_out = #outpoint{hash = <<7:256>>, index = 0},
+                         script_sig = <<1, 2, 3>>,
+                         sequence = 16#fffffffe, witness = []}],
+        outputs = [#tx_out{value = 1000, script_pubkey = <<16#51>>}],
+        locktime = 0
+    }.
+
+gbt_commitment_script(Entries) ->
+    Wtxids = [<<0:256>> | [beamchain_serialize:wtx_hash(E#mempool_entry.tx)
+                           || E <- Entries]],
+    C = beamchain_serialize:compute_witness_commitment(Wtxids, <<0:256>>),
+    <<16#6a, 16#24, 16#aa, 16#21, 16#a9, 16#ed, C/binary>>.
+
+%% Empty template: no commitment output in the coinbase, yet the field must be
+%% the BIP 141 commitment over [coinbase wtxid 0] with a zero nonce.
+gbt_default_witness_commitment_empty_template_test() ->
+    Cb = beamchain_miner:build_coinbase(101, <<16#51>>, 5000000000, false, []),
+    Script = beamchain_miner:gbt_default_witness_commitment(Cb, []),
+    ?assertEqual(gbt_commitment_script([]), Script),
+    ?assertEqual(38, byte_size(Script)).
+
+%% Legacy-only template: txs selected but none has witness data.
+gbt_default_witness_commitment_legacy_only_test() ->
+    Entries = [#mempool_entry{tx = gbt_legacy_tx()}],
+    Cb = beamchain_miner:build_coinbase(101, <<16#51>>, 5000000000, false, Entries),
+    Script = beamchain_miner:gbt_default_witness_commitment(Cb, Entries),
+    ?assertEqual(gbt_commitment_script(Entries), Script).
+
+%% Witness template: field equals coinbase output[1] scriptPubKey.
+gbt_default_witness_commitment_matches_coinbase_output_test() ->
+    Entries = [#mempool_entry{tx = gbt_legacy_tx()}],
+    Cb = beamchain_miner:build_coinbase(101, <<16#51>>, 5000000000, true, Entries),
+    [_, #tx_out{script_pubkey = CbScript}] = Cb#transaction.outputs,
+    ?assertEqual(CbScript, beamchain_miner:gbt_default_witness_commitment(Cb, Entries)),
+    ?assertEqual(gbt_commitment_script(Entries), CbScript).

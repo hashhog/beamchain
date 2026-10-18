@@ -24,6 +24,9 @@
 %% assert the decode/validate SPLIT without standing up the miner gen_server.
 -export([decode_block_hex/1]).
 -export([build_gbt_rules_and_vbavailable/2]).
+%% Exported for testing: the GBT default_witness_commitment script and the
+%% coinbase builder it is checked against.
+-export([gbt_default_witness_commitment/2, build_coinbase/5]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -332,23 +335,13 @@ do_create_template(CoinbaseScriptPubKey, _Opts,
                 <<"_total_weight">> => TotalWeight,
                 <<"_total_sigops">> => TotalSigops
             },
-            Template = case HasWitnessTx of
-                true ->
-                    %% Extract the witness commitment script from coinbase output[1]
-                    CommitOutputs = CoinbaseTx#transaction.outputs,
-                    CommitScript = case CommitOutputs of
-                        [_, #tx_out{script_pubkey = S} | _] -> S;
-                        _ -> undefined
-                    end,
-                    case CommitScript of
-                        undefined -> TemplateBase;
-                        CS -> maps:put(<<"default_witness_commitment">>,
-                                       beamchain_serialize:hex_encode(CS),
-                                       TemplateBase)
-                    end;
-                false ->
-                    TemplateBase
-            end,
+            %% Core emits default_witness_commitment whenever segwit is active
+            %% (rpc/mining.cpp), including for empty and legacy-only templates.
+            Template = maps:put(<<"default_witness_commitment">>,
+                                beamchain_serialize:hex_encode(
+                                    gbt_default_witness_commitment(
+                                        CoinbaseTx, SelectedEntries)),
+                                TemplateBase),
 
             State2 = State#state{template = Template, tip_hash = TipHash},
             {ok, Template, State2};
@@ -942,6 +935,18 @@ build_coinbase(Height, CoinbaseScriptPubKey, CoinbaseValue,
         outputs = Outputs,
         locktime = Locktime
     }.
+
+%% scriptPubKey for the GBT default_witness_commitment field.  When the
+%% coinbase already carries the commitment output (witness template) that
+%% script is returned; otherwise it is computed from the selected txs exactly
+%% as witness_commitment_output/2 would (all-zero witness nonce).  The coinbase
+%% itself is not altered.
+gbt_default_witness_commitment(#transaction{outputs = [_, #tx_out{script_pubkey = S} | _]},
+                               _SelectedEntries) ->
+    S;
+gbt_default_witness_commitment(_CoinbaseTx, SelectedEntries) ->
+    CbInput = #tx_in{witness = [<<0:256>>]},
+    (witness_commitment_output(SelectedEntries, CbInput))#tx_out.script_pubkey.
 
 %% Build the OP_RETURN witness commitment output (BIP 141).
 %% commitment = SHA256d(witness_root || witness_nonce)
