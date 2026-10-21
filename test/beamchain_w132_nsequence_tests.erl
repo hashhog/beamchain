@@ -563,56 +563,36 @@ g37_rbf_signalling_via_sequence_test_() ->
 %%% Reorg / mempool re-eval gaps — G38..G40 (BUG-1 / BUG-2 / BUG-3)
 %%% ===================================================================
 
-g38_remove_for_reorg_missing_test_() ->
-    %% G38 = BUG-1: MISSING.
-    %% beamchain_chainstate.erl has no symbol for re-evaluating EXISTING
-    %% mempool entries against the new tip after a reorg. Only
-    %% disconnected-block txs are re-fed via refill_mempool_after_reorg.
-    %% This is the documented divergence from Core's RemoveForReorg.
-    {"G38 BUG-1: existing mempool entries are never re-eval'd post-reorg",
+g38_remove_for_reorg_present_test_() ->
+    %% G38 = BUG-1: FIXED (mempool-reorg, BC-2). Existing mempool entries
+    %% are re-evaluated at the new tip after every reorg / invalidate step:
+    %% beamchain_mempool:remove_for_reorg/1 (Core removeForReorg), driven by
+    %% update_for_reorg/2 from inside the chainstate. Behaviour is pinned
+    %% end-to-end by beamchain_mempool_reorg_tests; this keeps the wiring.
+    {"G38: existing mempool entries are re-eval'd post-reorg (removeForReorg)",
      [
       ?_test(begin
+        {ok, Mp} = file:read_file(
+                     filename:join(beamchain_src_dir(), "beamchain_mempool.erl")),
+        ?assert(binary:match(Mp, <<"remove_for_reorg(State) ->">>) =/= nomatch),
         {ok, Src} = file:read_file(beamchain_chainstate_src()),
-        %% refill_mempool_after_reorg exists (closure of W90b Pattern B1)
-        ?assert(binary:match(Src, <<"refill_mempool_after_reorg">>) =/= nomatch),
-        %% but no equivalent of RemoveForReorg / re-eval-existing logic
-        ?assertEqual(nomatch, binary:match(Src, <<"remove_for_reorg">>)),
-        ?assertEqual(nomatch, binary:match(Src, <<"RemoveForReorg">>)),
-        ?assertEqual(nomatch, binary:match(Src,
-            <<"reeval_existing_mempool_entries">>)),
-        %% Source guard for the missing helper — flips to PRESENT once the
-        %% fix wave lands a function named `recheck_mempool_after_reorg`
-        %% or similar.
-        true
+        ?assert(binary:match(Src, <<"mempool_call(update_for_reorg">>)
+                =/= nomatch)
       end)
      ]}.
 
-g39_disconnected_txs_forward_order_partial_test_() ->
-    %% G39 = BUG-2: PARTIAL.
-    %% refill_mempool_after_reorg uses foldl over the list given by
-    %% submit_block's {ok, reorg, DisconnectedTxs}. Order is whatever the
-    %% rollback loop produced (reverse block order). No re-sort here.
-    {"G39 BUG-2: disconnected txs re-admitted in non-forward order",
+g39_disconnected_txs_forward_order_test_() ->
+    %% G39 = BUG-2: FIXED. disconnect_to/3 accumulates the disconnected txs
+    %% earliest confirmed first (Core iterates the disconnect pool in
+    %% reverse), so a parent is re-accepted before its child.
+    {"G39: disconnected txs re-admitted earliest first",
      [
       ?_test(begin
         {ok, Src} = file:read_file(beamchain_chainstate_src()),
-        ?assert(binary:match(Src, <<"refill_mempool_after_reorg(Txs) ->">>)
+        ?assert(binary:match(Src,
+                    <<"disconnect_to(TargetHash, State2, NonCbTxs ++ AccTxs)">>)
                 =/= nomatch),
-        ?assert(binary:match(Src, <<"lists:foldl(">>) =/= nomatch),
-        %% No `lists:reverse(Txs)` or topo-sort step before the fold.
-        case binary:matches(Src, <<"refill_mempool_after_reorg">>) of
-            [] -> ?assert(false);
-            _Matches ->
-                %% Snip the function body and check there is no reverse / sort
-                Snippet = case re:run(Src,
-                    <<"refill_mempool_after_reorg\\(Txs\\) ->.*?\\.">>,
-                    [dotall, {capture, first, binary}]) of
-                    {match, [B]} -> B;
-                    _ -> <<>>
-                end,
-                ?assertEqual(nomatch, binary:match(Snippet,
-                    <<"lists:reverse(Txs)">>))
-        end
+        ?assertEqual(nomatch, binary:match(Src, <<"AccTxs ++ NonCbTxs">>))
       end)
      ]}.
 
