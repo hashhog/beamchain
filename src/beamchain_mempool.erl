@@ -582,8 +582,6 @@ remove_for_block_with_txs_async(Txs) ->
 %%   4. LimitMempoolSize.
 %% Synchronous: when this returns, the mempool agrees with the chain tip.
 -spec update_for_reorg([[#transaction{}]], [#transaction{}]) -> ok.
-update_for_reorg([], []) ->
-    ok;
 update_for_reorg(ConnectedBlocks, Disconnected) ->
     gen_server:call(?SERVER, {update_for_reorg, ConnectedBlocks, Disconnected},
                     600000).

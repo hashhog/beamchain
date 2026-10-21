@@ -45,6 +45,9 @@ reorg_mempool_test_() ->
       fun(_) -> {timeout, 180, {"header-driven rollback + linear connect of the "
                                 "heavier branch ends where Core ends",
                                 fun header_rollback_reorg/0}} end,
+      fun(_) -> {timeout, 180, {"invalidateblock of a block with no spends "
+                                "still runs removeForReorg (immature at tip+1)",
+                                fun invalidate_empty_block_drops_immature/0}} end,
       fun(_) -> {timeout, 180, {"CONTROL: a branch that conflicts nothing keeps "
                                 "every mempool tx",
                                 fun control_no_conflict/0}} end]}.
@@ -136,6 +139,23 @@ invalidate_then_reconsider() ->
     ?assertEqual(lists:sort(['A', 'P', 'C', 'M', 'M3']), pool()),
     ok = beamchain_chainstate:reconsider_block(H111),
     ?assertEqual({ok, 112}, beamchain_chainstate:get_tip_height()),
+    ?assertEqual(['M', 'M3'], pool()).
+
+%% Core MaybeUpdateMempoolForReorg runs removeForReorg even when the
+%% disconnected block carried no non-coinbase tx. cb14 is spendable only in a
+%% block at height >= 114: valid in the pool at tip 113, immature once the
+%% (spend-free) block 113 is invalidated.
+invalidate_empty_block_drops_immature() ->
+    ok = beamchain_chainstate:connect_block(next_block([])),
+    ?assertEqual({ok, 113}, beamchain_chainstate:get_tip_height()),
+    Imm = spend(cb_txid(14), 0, subsidy(), 16#fffffffe, 0, 0),
+    ?assertMatch({ok, _}, beamchain_mempool:add_transaction(Imm)),
+    ImmId = beamchain_serialize:tx_hash(Imm),
+    ?assert(lists:member(ImmId, beamchain_mempool:get_all_txids())),
+    {ok, #{hash := H113}} = beamchain_db:get_block_index(113),
+    ok = beamchain_chainstate:invalidate_block(H113),
+    ?assertEqual({ok, 112}, beamchain_chainstate:get_tip_height()),
+    ?assertNot(lists:member(ImmId, beamchain_mempool:get_all_txids())),
     ?assertEqual(['M', 'M3'], pool()).
 
 side_branch_reorg() ->

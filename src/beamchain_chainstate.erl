@@ -3228,14 +3228,13 @@ mempool_call(Fun, Args) ->
             ok
     end.
 
+%% Always runs, even with nothing to connect or re-add: Core's
+%% MaybeUpdateMempoolForReorg still does removeForReorg, and a disconnected
+%% block with no spends can leave a pool tx immature or non-final at tip+1.
 mempool_update_for_reorg(ConnectedBlocks, DisconnectedTxs) ->
-    case {ConnectedBlocks, DisconnectedTxs} of
-        {[], []} -> ok;
-        _ ->
-            mempool_call(update_for_reorg,
-                         [[non_coinbase_txs(B) || B <- ConnectedBlocks],
-                          DisconnectedTxs])
-    end.
+    mempool_call(update_for_reorg,
+                 [[non_coinbase_txs(B) || B <- ConnectedBlocks],
+                  DisconnectedTxs]).
 
 %% DisconnectTip + the per-block mempool update (InvalidateBlock shape).
 %% Returns {ok, State2, NonCoinbaseTxs} | {error, Reason}.
