@@ -1124,7 +1124,11 @@ disconnect_chainstate_to(TargetHeight) ->
 disconnect_chainstate_loop(TargetHeight) ->
     case beamchain_chainstate:get_tip() of
         {ok, {_Hash, TipHeight}} when TipHeight > TargetHeight ->
-            case beamchain_chainstate:disconnect_block() of
+            %% header_reorg: the chainstate updates the mempool for each
+            %% disconnected block and re-offers the disconnected txs once
+            %% the heavier branch is connected (Core
+            %% MaybeUpdateMempoolForReorg).
+            case beamchain_chainstate:disconnect_block(header_reorg) of
                 ok ->
                     disconnect_chainstate_loop(TargetHeight);
                 {error, Reason} ->
