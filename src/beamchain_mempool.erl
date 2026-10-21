@@ -3924,12 +3924,12 @@ do_update_for_reorg(ConnectedBlocks, Disconnected, State0) ->
     {Pulled, State2} = pull_descendants_of(ReAddTxs, State1),
     %% 3. Re-accept, bypass_limits, earliest first, then the pulled children.
     {Added, Failed, State3} = lists:foldl(
-        fun({Tx, Notify, OrigTime}, {A, F, St}) ->
+        fun({Tx, Notify, Orig}, {A, F, St}) ->
             case do_add_transaction(Tx, ?ORPHAN_LOCAL_PEER, St,
                                     #{bypass_limits => true,
                                       notify => Notify}) of
                 {ok, Txid, St2} ->
-                    restore_time_added(Txid, OrigTime),
+                    restore_admission(Txid, Orig),
                     {A + 1, F, St2};
                 {error, _} ->
                     St2 = case Notify of
@@ -3940,7 +3940,7 @@ do_update_for_reorg(ConnectedBlocks, Disconnected, State0) ->
             end
         end, {0, 0, State2},
         [{T, true, undefined} || T <- ReAddTxs] ++
-        [{T, false, Time} || {T, Time} <- Pulled]),
+        [{T, false, Orig} || {T, Orig} <- Pulled]),
     %% 4. removeForReorg over the whole pool at the new tip.
     {Dropped, State4} = remove_for_reorg(State3),
     case ConnectedBlocks =/= [] orelse Disconnected =/= [] of
@@ -3958,7 +3958,7 @@ do_update_for_reorg(ConnectedBlocks, Disconnected, State0) ->
     do_trim_to_size(State5#state.max_size, State5).
 
 %% Remove every in-pool descendant of Txs (the txs about to be re-added) and
-%% return them parents-first as [{Tx, TimeAdded}].
+%% return them parents-first as [{Tx, {TimeAdded, HeightAdded}}].
 pull_descendants_of([], State) ->
     {[], State};
 pull_descendants_of(Txs, State) ->
@@ -3986,7 +3986,8 @@ pull_descendants_of(Txs, State) ->
                 St
         end
     end, State, Ordered),
-    {[{E#mempool_entry.tx, E#mempool_entry.time_added} || E <- Ordered],
+    {[{E#mempool_entry.tx, {E#mempool_entry.time_added,
+                           E#mempool_entry.height_added}} || E <- Ordered],
      State2}.
 
 %% Parents before children within a set of mempool entries.
@@ -4014,12 +4015,15 @@ topo_order_entries(Pending, InSet, Done, Acc) ->
             topo_order_entries(Rest, InSet, Done2, lists:reverse(Ready) ++ Acc)
     end.
 
-restore_time_added(_Txid, undefined) ->
+%% A relinked descendant was never out of Core's pool (UpdateTransactionsFromBlock
+%% only rebuilds its ancestor state), so it keeps its admission time and height.
+restore_admission(_Txid, undefined) ->
     ok;
-restore_time_added(Txid, Time) ->
+restore_admission(Txid, {Time, Height}) ->
     case ets:lookup(?MEMPOOL_TXS, Txid) of
         [{Txid, E}] ->
-            ets:insert(?MEMPOOL_TXS, {Txid, E#mempool_entry{time_added = Time}}),
+            ets:insert(?MEMPOOL_TXS, {Txid, E#mempool_entry{time_added = Time,
+                                                            height_added = Height}}),
             ok;
         [] ->
             ok
