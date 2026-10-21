@@ -1030,8 +1030,9 @@ do_add_transaction(Tx, PeerId, State) ->
 %% Opts:
 %%   bypass_limits => true  -- Core ATMP m_bypass_limits, used only for the
 %%       reorg re-accept (MaybeUpdateMempoolForReorg): no fee-rate floor, no
-%%       cluster limit (LimitMempoolSize runs afterwards), and a tx with a
-%%       missing input is a plain failure, never an orphan.
+%%       cluster limit unless enforce_cluster_limits => true (LimitMempoolSize
+%%       runs afterwards), and a tx with a missing input is a plain failure,
+%%       never an orphan.
 %%   notify => false        -- re-linking an entry that was already in the
 %%       pool (UpdateTransactionsFromBlock): no ZMQ add / fee-estimator track.
 do_add_transaction(Tx, PeerId, State, Opts) ->
@@ -1235,7 +1236,8 @@ do_add_transaction(Tx, PeerId, State, Opts) ->
         %% which queries the pending changeset; we compute it eagerly from parent
         %% clusters.  This is the ONLY size bound on a cluster and therefore MUST be
         %% present before the ancestor/descendant bounds are dropped below.
-        Bypass orelse check_cluster_limits(Tx, AdjWeight),
+        (Bypass andalso not maps:get(enforce_cluster_limits, Opts, false))
+            orelse check_cluster_limits(Tx, AdjWeight),
 
         %% W96 GATE 17: ancestor/descendant STATISTICS (no longer a gate).
         %% Core v31 replaced -limitancestorcount / -limitdescendantcount with the
@@ -3925,6 +3927,12 @@ do_update_for_reorg(ConnectedBlocks, Disconnected, State0) ->
         fun({Tx, Notify, Orig}, {A, F, St}) ->
             case do_add_transaction(Tx, ?ORPHAN_LOCAL_PEER, St,
                                     #{bypass_limits => true,
+                                      %% Core ATMP bypass_limits skips fee and
+                                      %% size limits, never the cluster limit:
+                                      %% re-adding a parent under 64 children
+                                      %% must shed the cheapest, not make a
+                                      %% 65-tx cluster.
+                                      enforce_cluster_limits => true,
                                       notify => Notify}) of
                 {ok, Txid, St2} ->
                     restore_admission(Txid, Orig),
@@ -3973,7 +3981,12 @@ pull_descendants_of(Txs, State) ->
     All = lists:usort(Children ++
                       lists:flatmap(fun get_all_descendants/1, Children)),
     Entries = [E || T <- All, [{_, E}] <- [ets:lookup(?MEMPOOL_TXS, T)]],
-    Ordered = topo_order_entries(Entries),
+    %% Highest feerate first (stable), so when the re-add hits the cluster
+    %% limit it is the cheapest descendants that do not come back.
+    ByRate = lists:sort(fun(A, B) ->
+                            A#mempool_entry.fee_rate >= B#mempool_entry.fee_rate
+                        end, Entries),
+    Ordered = topo_order_entries(ByRate),
     State2 = lists:foldl(fun(#mempool_entry{txid = T, vsize = VS}, St) ->
         case remove_entry(T) of
             #mempool_entry{} ->
