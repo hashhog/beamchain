@@ -1600,17 +1600,6 @@ dry_run_one_member(Txid, Tx, State) ->
                     dry_run_expose_outputs(Txid, Tx),
                     {ok, Txid, Wtxid, Fee, VSize};
                 {error, Reason} ->
-                    %% A parent that fails only on feerate may still be
-                    %% rescued by its child (CPFP): keep its outputs
-                    %% visible so the child is judged on its own merits
-                    %% instead of reporting missing inputs.
-                    case Reason of
-                        'mempool min fee not met' ->
-                            dry_run_expose_outputs(Txid, Tx);
-                        'min relay fee not met' ->
-                            dry_run_expose_outputs(Txid, Tx);
-                        _ -> ok
-                    end,
                     Wtxid = beamchain_serialize:wtx_hash(Tx),
                     {error, Txid, Wtxid, Reason}
             end
