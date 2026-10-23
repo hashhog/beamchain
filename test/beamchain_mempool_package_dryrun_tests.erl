@@ -18,7 +18,7 @@ package_dryrun_test_() ->
     {foreach, fun setup/0, fun teardown/1,
      [fun(_) -> {timeout, 120, {"FIX: package child of an unconfirmed parent is allowed (dry run)",
                                 fun child_sees_parent/0}} end,
-      fun(_) -> {timeout, 120, {"FIX: three-deep chain in one package is allowed (dry run)",
+      fun(_) -> {timeout, 120, {"CONTROL: three-deep chain is not child-with-parents (package error)",
                                 fun chain_of_three/0}} end,
       fun(_) -> {timeout, 120, {"CONTROL: dry run writes nothing to the mempool",
                                 fun dry_run_is_readonly/0}} end,
@@ -49,8 +49,8 @@ chain_of_three() ->
     Parent = spend_coinbase_p2wpkh(2, 16#fffffffd, 1),
     Mid = spend_prev(Parent, 0, 16#fffffffd),
     Child = spend_prev(Mid, 0, 16#fffffffd),
-    {ok, Rs} = beamchain_mempool:accept_package_dry_run([Parent, Mid, Child]),
-    ?assertMatch([{ok, _, _, _, _}, {ok, _, _, _, _}, {ok, _, _, _, _}], Rs).
+    ?assertEqual({error, package_not_child_with_parents},
+                 beamchain_mempool:accept_package_dry_run([Parent, Mid, Child])).
 
 dry_run_is_readonly() ->
     Parent = spend_coinbase_p2wpkh(2, 16#fffffffd, 2),

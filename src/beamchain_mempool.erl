@@ -20,6 +20,8 @@
          add_transaction/1, add_transaction/2,
          accept_package/1]).
 %% Dry-run variants (testmempoolaccept — validate without mutating mempool)
+%% Process-dictionary key for testmempoolaccept package-member outputs.
+-define(DRY_RUN_PKG_COINS, beamchain_dry_run_pkg_coins).
 -export([accept_to_memory_pool_dry_run/1, accept_package_dry_run/1]).
 %% accept_package/1 plus which txs were admitted together as a CPFP package
 %% (submitpackage reports their shared effective feerate).
@@ -1568,27 +1570,71 @@ do_accept_package_dry_run(Package, State) ->
 %% Each entry is tagged: {ok, Txid, Wtxid, Fee, VSize} or
 %%                       {error, Txid, Wtxid, Reason}.
 dry_run_individual_accept(TxidTxPairs, State) ->
-    lists:map(fun({Txid, Tx}) ->
-        case ets:member(?MEMPOOL_TXS, Txid) of
-            true ->
-                case get_entry(Txid) of
-                    {ok, E} ->
-                        {ok, Txid, E#mempool_entry.wtxid,
-                         E#mempool_entry.fee, E#mempool_entry.vsize};
-                    not_found ->
-                        Wtxid = beamchain_serialize:wtx_hash(Tx),
-                        {ok, Txid, Wtxid, 0, 0}
-                end;
-            false ->
-                case do_add_transaction_dry_run(Tx, State) of
-                    {ok, Txid, Wtxid, Fee, VSize, _FeeRate} ->
-                        {ok, Txid, Wtxid, Fee, VSize};
-                    {error, Reason} ->
-                        Wtxid = beamchain_serialize:wtx_hash(Tx),
-                        {error, Txid, Wtxid, Reason}
-                end
-        end
-    end, TxidTxPairs).
+    %% Earlier members' outputs are visible to later members through the
+    %% process-dictionary overlay read by lookup_inputs_for_tx/1 (Core
+    %% PackageMempoolAccept evaluates against a CCoinsViewMemPool that has
+    %% the package's earlier transactions added). Nothing touches ETS.
+    put(?DRY_RUN_PKG_COINS, #{}),
+    try
+        lists:map(fun({Txid, Tx}) ->
+            dry_run_one_member(Txid, Tx, State)
+        end, TxidTxPairs)
+    after
+        erase(?DRY_RUN_PKG_COINS)
+    end.
+
+dry_run_one_member(Txid, Tx, State) ->
+    case ets:member(?MEMPOOL_TXS, Txid) of
+        true ->
+            case get_entry(Txid) of
+                {ok, E} ->
+                    {ok, Txid, E#mempool_entry.wtxid,
+                     E#mempool_entry.fee, E#mempool_entry.vsize};
+                not_found ->
+                    Wtxid = beamchain_serialize:wtx_hash(Tx),
+                    {ok, Txid, Wtxid, 0, 0}
+            end;
+        false ->
+            case do_add_transaction_dry_run(Tx, State) of
+                {ok, Txid, Wtxid, Fee, VSize, _FeeRate} ->
+                    dry_run_expose_outputs(Txid, Tx),
+                    {ok, Txid, Wtxid, Fee, VSize};
+                {error, Reason} ->
+                    %% A parent that fails only on feerate may still be
+                    %% rescued by its child (CPFP): keep its outputs
+                    %% visible so the child is judged on its own merits
+                    %% instead of reporting missing inputs.
+                    case Reason of
+                        'mempool min fee not met' ->
+                            dry_run_expose_outputs(Txid, Tx);
+                        'min relay fee not met' ->
+                            dry_run_expose_outputs(Txid, Tx);
+                        _ -> ok
+                    end,
+                    Wtxid = beamchain_serialize:wtx_hash(Tx),
+                    {error, Txid, Wtxid, Reason}
+            end
+    end.
+
+dry_run_expose_outputs(Txid, #transaction{outputs = Outputs}) ->
+    Coins = get(?DRY_RUN_PKG_COINS),
+    {Coins2, _} = lists:foldl(fun(#tx_out{value = V, script_pubkey = Spk}, {Acc, I}) ->
+        {Acc#{{Txid, I} => #utxo{value = V, script_pubkey = Spk,
+                                 is_coinbase = false,
+                                 height = ?MEMPOOL_HEIGHT}}, I + 1}
+    end, {Coins, 0}, Outputs),
+    put(?DRY_RUN_PKG_COINS, Coins2),
+    ok.
+
+dry_run_pkg_utxo(H, I) ->
+    case get(?DRY_RUN_PKG_COINS) of
+        undefined -> not_found;
+        Coins ->
+            case maps:find({H, I}, Coins) of
+                {ok, C} -> {ok, C};
+                error -> not_found
+            end
+    end.
 
 %%% ===================================================================
 %%% Internal: package acceptance
@@ -2123,7 +2169,12 @@ lookup_inputs_for_tx(#transaction{inputs = Inputs} = Tx) ->
                             {[Coin#utxo{height = ?MEMPOOL_HEIGHT} | Acc],
                              Missing, Cb};
                         not_found ->
-                            {Acc, true, Cb}
+                            case dry_run_pkg_utxo(H, I) of
+                                {ok, Coin} ->
+                                    {[Coin | Acc], Missing, Cb};
+                                not_found ->
+                                    {Acc, true, Cb}
+                            end
                     end
             end
         end,
