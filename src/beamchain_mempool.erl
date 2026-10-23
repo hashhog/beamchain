@@ -22,6 +22,11 @@
 %% Dry-run variants (testmempoolaccept — validate without mutating mempool)
 %% Process-dictionary key for testmempoolaccept package-member outputs.
 -define(DRY_RUN_PKG_COINS, beamchain_dry_run_pkg_coins).
+%% ...and the same members as mempool entries (txid -> #mempool_entry{}) and
+%% the cluster each would join (txid -> [txid]), for the parent/TRUC/cluster
+%% gates. Live only for the duration of dry_run_individual_accept/2.
+-define(DRY_RUN_PKG_ENTRIES, beamchain_dry_run_pkg_entries).
+-define(DRY_RUN_PKG_CLUSTERS, beamchain_dry_run_pkg_clusters).
 -export([accept_to_memory_pool_dry_run/1, accept_package_dry_run/1]).
 %% accept_package/1 plus which txs were admitted together as a CPFP package
 %% (submitpackage reports their shared effective feerate).
@@ -1400,6 +1405,17 @@ do_add_transaction(Tx, PeerId, State, Opts) ->
 %% is omitted — the function returns after Gate 21 without touching
 %% any ETS table.  State is never threaded out (caller keeps original).
 do_add_transaction_dry_run(Tx, State) ->
+    case dry_run_atmp(Tx, State) of
+        {ok, Txid, Wtxid, Fee, VSize, FeeRate, _AdjWeight} ->
+            {ok, Txid, Wtxid, Fee, VSize, FeeRate};
+        {error, _} = Err ->
+            Err
+    end.
+
+%% do_add_transaction_dry_run/2 plus the sigop-adjusted weight, which a
+%% package dry run needs to count an accepted member in a later member's
+%% cluster.
+dry_run_atmp(Tx, State) ->
     Txid = beamchain_serialize:tx_hash(Tx),
     Wtxid = beamchain_serialize:wtx_hash(Tx),
 
@@ -1537,7 +1553,7 @@ do_add_transaction_dry_run(Tx, State) ->
         ok = consensus_script_checks(Tx, InputCoins),
 
         %% All gates passed — return validation result WITHOUT touching ETS
-        {ok, Txid, Wtxid, Fee, VSize, FeeRate}
+        {ok, Txid, Wtxid, Fee, VSize, FeeRate, AdjWeight}
     catch
         throw:{validation, Reason} ->
             {error, Reason};
@@ -1573,14 +1589,22 @@ dry_run_individual_accept(TxidTxPairs, State) ->
     %% Earlier members' outputs are visible to later members through the
     %% process-dictionary overlay read by lookup_inputs_for_tx/1 (Core
     %% PackageMempoolAccept evaluates against a CCoinsViewMemPool that has
-    %% the package's earlier transactions added). Nothing touches ETS.
+    %% the package's earlier transactions added). The same members are seen
+    %% as unconfirmed parents by the parent-txid, TRUC and cluster gates
+    %% through mempool_entry_lookup/1, so a child is policed against its
+    %% in-package parents exactly as accept_package/1 polices it once they
+    %% are inserted. Nothing touches ETS.
     put(?DRY_RUN_PKG_COINS, #{}),
+    put(?DRY_RUN_PKG_ENTRIES, #{}),
+    put(?DRY_RUN_PKG_CLUSTERS, #{}),
     try
         lists:map(fun({Txid, Tx}) ->
             dry_run_one_member(Txid, Tx, State)
         end, TxidTxPairs)
     after
-        erase(?DRY_RUN_PKG_COINS)
+        erase(?DRY_RUN_PKG_COINS),
+        erase(?DRY_RUN_PKG_ENTRIES),
+        erase(?DRY_RUN_PKG_CLUSTERS)
     end.
 
 dry_run_one_member(Txid, Tx, State) ->
@@ -1595,8 +1619,10 @@ dry_run_one_member(Txid, Tx, State) ->
                     {ok, Txid, Wtxid, 0, 0}
             end;
         false ->
-            case do_add_transaction_dry_run(Tx, State) of
-                {ok, Txid, Wtxid, Fee, VSize, _FeeRate} ->
+            case dry_run_atmp(Tx, State) of
+                {ok, Txid, Wtxid, Fee, VSize, FeeRate, AdjWeight} ->
+                    dry_run_add_member(Txid, Wtxid, Tx, Fee, VSize, FeeRate,
+                                       AdjWeight),
                     dry_run_expose_outputs(Txid, Tx),
                     {ok, Txid, Wtxid, Fee, VSize};
                 {error, Reason} ->
@@ -1614,6 +1640,58 @@ dry_run_expose_outputs(Txid, #transaction{outputs = Outputs}) ->
     end, {Coins, 0}, Outputs),
     put(?DRY_RUN_PKG_COINS, Coins2),
     ok.
+
+%% Record an accepted member as a would-be mempool entry. Computed before
+%% the member itself is visible, so its ancestors and cluster are those it
+%% would get on insertion. Descendant stats of its parents are not bumped:
+%% in a child-with-parents package every member is a parent of the last,
+%% and a later member that also reads such a parent's descendant count
+%% already has two unconfirmed parents, which the gates reject first.
+dry_run_add_member(Txid, Wtxid, Tx, Fee, VSize, FeeRate, AdjWeight) ->
+    {AncCount, AncSize, AncFee} = compute_ancestors(Tx, Fee, VSize),
+    %% Only the fields the policy gates read are filled in.
+    Entry = #mempool_entry{
+        txid = Txid, wtxid = Wtxid, tx = Tx, fee = Fee,
+        vsize = VSize, fee_rate = FeeRate,
+        ancestor_count = AncCount, ancestor_size = AncSize,
+        ancestor_fee = AncFee,
+        descendant_count = 1, descendant_size = VSize, descendant_fee = Fee,
+        adj_weight = AdjWeight},
+    Cluster = lists:usort([Txid | cluster_members_for(Tx)]),
+    put(?DRY_RUN_PKG_ENTRIES, maps:put(Txid, Entry, get(?DRY_RUN_PKG_ENTRIES))),
+    %% Every package member in the merged cluster now shares it.
+    Clusters = get(?DRY_RUN_PKG_CLUSTERS),
+    Entries = get(?DRY_RUN_PKG_ENTRIES),
+    put(?DRY_RUN_PKG_CLUSTERS,
+        lists:foldl(fun(T, Acc) ->
+            case maps:is_key(T, Entries) of
+                true -> Acc#{T => Cluster};
+                false -> Acc
+            end
+        end, Clusters, Cluster)),
+    ok.
+
+%% A package member accepted earlier in the current dry run.
+dry_run_pkg_entry(Txid) ->
+    case get(?DRY_RUN_PKG_ENTRIES) of
+        undefined -> not_found;
+        Entries ->
+            case maps:find(Txid, Entries) of
+                {ok, E} -> {ok, E};
+                error -> not_found
+            end
+    end.
+
+dry_run_pkg_cluster(Txid) ->
+    maps:get(Txid, get(?DRY_RUN_PKG_CLUSTERS)).
+
+%% Mempool entry by txid, as the policy gates must see it: ETS, then (only
+%% inside a package dry run) the members accepted earlier in that package.
+mempool_entry_lookup(Txid) ->
+    case ets:lookup(?MEMPOOL_TXS, Txid) of
+        [{_, E}] -> {ok, E};
+        [] -> dry_run_pkg_entry(Txid)
+    end.
 
 dry_run_pkg_utxo(H, I) ->
     case get(?DRY_RUN_PKG_COINS) of
@@ -3062,12 +3140,12 @@ compute_ancestors(#transaction{inputs = Inputs}, Fee, VSize) ->
     ParentTxids = get_parent_txids_from_inputs(Inputs),
     lists:foldl(
         fun(ParentTxid, {AC, AS, AF}) ->
-            case ets:lookup(?MEMPOOL_TXS, ParentTxid) of
-                [{_, Parent}] ->
+            case mempool_entry_lookup(ParentTxid) of
+                {ok, Parent} ->
                     {AC + Parent#mempool_entry.ancestor_count,
                      AS + Parent#mempool_entry.ancestor_size,
                      AF + Parent#mempool_entry.ancestor_fee};
-                [] ->
+                not_found ->
                     {AC, AS, AF}
             end
         end,
@@ -3172,7 +3250,23 @@ check_desc_limits_walk([Txid | Rest], VSize, Visited) ->
 %% We read existing cluster data from the ETS table; the new tx is not yet
 %% inserted, so its AdjWeight must be added explicitly.
 check_cluster_limits(Tx, AdjWeight) ->
+    Members = cluster_members_for(Tx),
+    %% the new tx itself counts as 1 tx, AdjWeight weight units
+    CombinedCount = 1 + length(Members),
+    CombinedWeight = AdjWeight + lists:sum([entry_adj_weight(T) || T <- Members]),
+    CombinedCount =< ?MAX_CLUSTER_COUNT
+        orelse throw(too_large_cluster),
+    CombinedWeight =< ?MAX_CLUSTER_WEIGHT
+        orelse throw(too_large_cluster),
+    ok.
+
+%% @doc The txids Tx's cluster would hold besides Tx: the union of its
+%% unconfirmed parents' clusters.  A parent accepted earlier in a package dry
+%% run brings the cluster it would have joined (dry_run_add_member/7).
+cluster_members_for(Tx) ->
     ParentTxids = get_parent_txids_from_inputs(Tx#transaction.inputs),
+    {PkgParents, MempoolParents} = lists:partition(
+        fun(P) -> not ets:member(?MEMPOOL_TXS, P) end, ParentTxids),
     %% Collect the unique cluster ids that would be merged.
     %% For each in-mempool parent, resolve its cluster root (the ETS key).
     %% The union-find is gen_server-private, so we scan ETS cluster records.
@@ -3183,8 +3277,8 @@ check_cluster_limits(Tx, AdjWeight) ->
                 [{_, _}] -> {true, Root};
                 []       -> false
             end
-        end, ParentTxids)),
-    %% Sum up count and sigop-adjusted WEIGHT across all clusters that will merge.
+        end, MempoolParents)),
+    %% Count and sigop-adjusted WEIGHT are summed over these members.
     %%
     %% Membership is taken from ?MEMPOOL_TXS, NOT from the cached cluster
     %% totals.  Core evaluates the limits against the pending CHANGESET, so
@@ -3195,33 +3289,28 @@ check_cluster_limits(Tx, AdjWeight) ->
     %% here would therefore count already-evicted members and reject a
     %% replacement that in fact FREES cluster room (corpus: cluster-rbf-frees-room).
     %% Bounded work: a live cluster is capped at MAX_CLUSTER_COUNT members.
-    {CombinedCount, CombinedWeight} = lists:foldl(
-        fun(ClusterId, {AC, AW}) ->
+    Live = lists:append(lists:map(
+        fun(ClusterId) ->
             case ets:lookup(?MEMPOOL_CLUSTERS, ClusterId) of
                 [{_, CD}] ->
-                    LiveTxids = [T || T <- CD#cluster_data.txids,
-                                      ets:member(?MEMPOOL_TXS, T)],
-                    {AC + length(LiveTxids),
-                     AW + lists:sum([entry_adj_weight(T) || T <- LiveTxids])};
+                    [T || T <- CD#cluster_data.txids,
+                          ets:member(?MEMPOOL_TXS, T)];
                 [] ->
-                    {AC, AW}
+                    []
             end
-        end,
-        %% start: the new tx itself counts as 1 tx, AdjWeight weight units
-        {1, AdjWeight},
-        ParentClusterIds),
-    CombinedCount =< ?MAX_CLUSTER_COUNT
-        orelse throw(too_large_cluster),
-    CombinedWeight =< ?MAX_CLUSTER_WEIGHT
-        orelse throw(too_large_cluster),
-    ok.
+        end, ParentClusterIds)),
+    Pkg = lists:append([dry_run_pkg_cluster(P) || P <- PkgParents]),
+    case Pkg of
+        [] -> Live;
+        _ -> lists:usort(Live ++ Pkg)
+    end.
 
 %% @doc Sigop-adjusted weight of an in-mempool transaction, by txid.
 %% Falls back to vsize * 4 for entries written before adj_weight existed.
 entry_adj_weight(Txid) ->
-    case ets:lookup(?MEMPOOL_TXS, Txid) of
-        [{_, #mempool_entry{adj_weight = W}}] when is_integer(W) -> W;
-        [{_, #mempool_entry{vsize = V}}] when is_integer(V) ->
+    case mempool_entry_lookup(Txid) of
+        {ok, #mempool_entry{adj_weight = W}} when is_integer(W) -> W;
+        {ok, #mempool_entry{vsize = V}} when is_integer(V) ->
             V * ?WITNESS_SCALE_FACTOR;
         _ -> 0
     end.
@@ -3251,7 +3340,8 @@ find_cluster_for_txid(Txid) ->
 get_parent_txids_from_inputs(Inputs) ->
     lists:usort(lists:filtermap(
         fun(#tx_in{prev_out = #outpoint{hash = H}}) ->
-            case ets:member(?MEMPOOL_TXS, H) of
+            case ets:member(?MEMPOOL_TXS, H)
+                 orelse dry_run_pkg_entry(H) =/= not_found of
                 true -> {true, H};
                 false -> false
             end
@@ -4620,8 +4710,8 @@ check_truc_rules(Tx, VSize, MempoolParentTxids, DirectConflicts) ->
 check_non_truc_parents([]) ->
     ok;
 check_non_truc_parents([ParentTxid | Rest]) ->
-    case ets:lookup(?MEMPOOL_TXS, ParentTxid) of
-        [{_, Entry}] ->
+    case mempool_entry_lookup(ParentTxid) of
+        {ok, Entry} ->
             ParentTx = Entry#mempool_entry.tx,
             case ParentTx#transaction.version of
                 ?TRUC_VERSION ->
@@ -4629,7 +4719,7 @@ check_non_truc_parents([ParentTxid | Rest]) ->
                 _ ->
                     check_non_truc_parents(Rest)
             end;
-        [] ->
+        not_found ->
             check_non_truc_parents(Rest)
     end.
 
@@ -4660,15 +4750,15 @@ check_truc_v3_ancestry(Tx, VSize, MempoolParentTxids, DirectConflicts) ->
             %% Rule 2b: the parent itself must have no unconfirmed ancestors
             %% (ancestor_count == 1 means only itself; > 1 means it has parents).
             %% Core truc_policy.cpp:214-221: GetAncestorCount(parent) + 1 > TRUC_ANCESTOR_LIMIT
-            case ets:lookup(?MEMPOOL_TXS, ParentTxid) of
-                [{_, ParentEntry}] ->
+            case mempool_entry_lookup(ParentTxid) of
+                {ok, ParentEntry} ->
                     case ParentEntry#mempool_entry.ancestor_count + 1 > ?TRUC_ANCESTOR_LIMIT of
                         true ->
                             {error, {truc_violation, too_many_ancestors}};
                         false ->
                             check_truc_v3_child_rules(Tx, VSize, ParentTxid, DirectConflicts)
                     end;
-                [] ->
+                not_found ->
                     %% Parent not tracked (should not happen); proceed to child checks
                     check_truc_v3_child_rules(Tx, VSize, ParentTxid, DirectConflicts)
             end
@@ -4687,8 +4777,8 @@ check_truc_v3_child_rules(_Tx, VSize, ParentTxid, DirectConflicts) ->
 check_truc_parent_version(ParentTxid, VSize, DirectConflicts) ->
     %% Rule 4: v3 child can only spend from v3 parent
     %% Core truc_policy.cpp:185-190 (inheritance check loop)
-    case ets:lookup(?MEMPOOL_TXS, ParentTxid) of
-        [{_, Entry}] ->
+    case mempool_entry_lookup(ParentTxid) of
+        {ok, Entry} ->
             ParentTx = Entry#mempool_entry.tx,
             case ParentTx#transaction.version of
                 ?TRUC_VERSION ->
@@ -4696,7 +4786,7 @@ check_truc_parent_version(ParentTxid, VSize, DirectConflicts) ->
                 _ ->
                     {error, {truc_violation, truc_spends_non_truc}}
             end;
-        [] ->
+        not_found ->
             %% Parent not in mempool (should not happen if called correctly)
             ok
     end.
