@@ -25,7 +25,29 @@ package_dryrun_test_() ->
       fun(_) -> {timeout, 120, {"CONTROL: child alone (parent absent) still lacks inputs",
                                 fun child_alone_missing/0}} end,
       fun(_) -> {timeout, 120, {"CONTROL: out-of-order package is a package error",
-                                fun out_of_order/0}} end]}.
+                                fun out_of_order/0}} end,
+      %% Every gate that asks "is this prevout's parent unconfirmed?" must see
+      %% the earlier package members, not only lookup_inputs_for_tx/1.
+      %% Each case also runs the real accept_package/1 last, so the dry-run
+      %% reason is pinned to what submission would say.
+      fun(_) -> {timeout, 120, {"FIX: v3 child > 1000 vB of an in-package v3 parent is too large",
+                                fun truc_child_too_large/0}} end,
+      fun(_) -> {timeout, 120, {"FIX: v3 child of an in-package v2 parent is refused",
+                                fun truc_spends_non_truc/0}} end,
+      fun(_) -> {timeout, 120, {"FIX: v2 child of an in-package v3 parent is refused",
+                                fun non_truc_spends_truc/0}} end,
+      fun(_) -> {timeout, 120, {"FIX: child joining a 64-tx cluster via an in-package parent is too large",
+                                fun cluster_limit_through_package_parent/0}} end,
+      fun(_) -> {timeout, 120, {"CONTROL: small v3 child of an in-package v3 parent is allowed",
+                                fun truc_child_small_ok/0}} end,
+      fun(_) -> {timeout, 120, {"CONTROL: in-package parent joining a 62-tx cluster leaves room",
+                                fun cluster_room_through_package_parent/0}} end,
+      fun(_) -> {timeout, 120, {"CONTROL: two members spending one outpoint is conflict_in_package",
+                                fun same_outpoint_conflict/0}} end,
+      fun(_) -> {timeout, 120, {"CONTROL: a rejected parent exposes no outputs to its child",
+                                fun rejected_parent_hides_outputs/0}} end,
+      fun(_) -> {timeout, 120, {"CONTROL: allowed parent + failing child leaves nothing behind",
+                                fun failing_child_leaves_nothing/0}} end]}.
 
 setup() ->
     TmpDir = chain_setup(),
@@ -74,6 +96,94 @@ out_of_order() ->
     Child = spend_prev(Parent, 0, 16#fffffffd),
     ?assertEqual({error, package_not_sorted},
                  beamchain_mempool:accept_package_dry_run([Child, Parent])).
+
+truc_child_too_large() ->
+    Parent = spend_coinbase(2, 3, 1),
+    Child = spend_prev(Parent, 0, 16#fffffffd, 35, 3),
+    {ok, [R1, R2]} = beamchain_mempool:accept_package_dry_run([Parent, Child]),
+    ?assertMatch({ok, _, _, _, _}, R1),
+    {error, _, _, Reason} = R2,
+    ?assertMatch({truc_violation, {child_too_large, _, 1000}}, Reason),
+    assert_mempool_empty([Parent, Child]),
+    assert_real_accept_agrees(Parent, Child, Reason).
+
+truc_spends_non_truc() ->
+    Parent = spend_coinbase(2, 2, 1),
+    Child = spend_prev(Parent, 0, 16#fffffffd, 1, 3),
+    {ok, [R1, R2]} = beamchain_mempool:accept_package_dry_run([Parent, Child]),
+    ?assertMatch({ok, _, _, _, _}, R1),
+    ?assertMatch({error, _, _, {truc_violation, truc_spends_non_truc}}, R2),
+    assert_mempool_empty([Parent, Child]),
+    assert_real_accept_agrees(Parent, Child, {truc_violation, truc_spends_non_truc}).
+
+non_truc_spends_truc() ->
+    Parent = spend_coinbase(2, 3, 1),
+    Child = spend_prev(Parent, 0, 16#fffffffd, 1, 2),
+    {ok, [R1, R2]} = beamchain_mempool:accept_package_dry_run([Parent, Child]),
+    ?assertMatch({ok, _, _, _, _}, R1),
+    ?assertMatch({error, _, _, {truc_violation, non_truc_spends_truc}}, R2),
+    assert_mempool_empty([Parent, Child]),
+    assert_real_accept_agrees(Parent, Child, {truc_violation, non_truc_spends_truc}).
+
+%% Mempool fan of 1 + 62 = 63 txs; the package parent joins it (64, the
+%% limit) and the child would make 65.
+cluster_limit_through_package_parent() ->
+    {Parent, Child} = fan_and_package(62),
+    {ok, [R1, R2]} = beamchain_mempool:accept_package_dry_run([Parent, Child]),
+    ?assertMatch({ok, _, _, _, _}, R1),
+    ?assertMatch({error, _, _, too_large_cluster}, R2),
+    assert_mempool_empty([Parent, Child]),
+    ?assertEqual(63, mempool_size()),
+    assert_real_accept_agrees(Parent, Child, too_large_cluster).
+
+cluster_room_through_package_parent() ->
+    {Parent, Child} = fan_and_package(61),
+    {ok, [R1, R2]} = beamchain_mempool:accept_package_dry_run([Parent, Child]),
+    ?assertMatch({ok, _, _, _, _}, R1),
+    ?assertMatch({ok, _, _, _, _}, R2),
+    assert_mempool_empty([Parent, Child]),
+    ?assertEqual(62, mempool_size()).
+
+truc_child_small_ok() ->
+    Parent = spend_coinbase(2, 3, 1),
+    Child = spend_prev(Parent, 0, 16#fffffffd, 1, 3),
+    {ok, [R1, R2]} = beamchain_mempool:accept_package_dry_run([Parent, Child]),
+    ?assertMatch({ok, _, _, _, _}, R1),
+    ?assertMatch({ok, _, _, _, _}, R2),
+    assert_mempool_empty([Parent, Child]).
+
+same_outpoint_conflict() ->
+    A = spend_coinbase_p2wpkh(2, 16#fffffffd, 1),
+    B = spend_coinbase_p2wpkh(2, 16#fffffffd, 2),
+    ?assertEqual({error, conflict_in_package},
+                 beamchain_mempool:accept_package_dry_run([A, B])),
+    assert_mempool_empty([A, B]),
+    ?assertEqual(0, mempool_size()).
+
+rejected_parent_hides_outputs() ->
+    Txid = coinbase_txid_at(2),
+    %% Signed over the wrong amount: the script check fails.
+    Parent = sign_p2wpkh(Txid, 1, 2500000000, 16#fffffffd, 1, 2, 2400000000),
+    Child = spend_prev(Parent, 0, 16#fffffffd),
+    {ok, [R1, R2]} = beamchain_mempool:accept_package_dry_run([Parent, Child]),
+    ?assertMatch({error, _, _, _}, R1),
+    ?assertMatch({error, _, _, 'bad-txns-inputs-missingorspent'}, R2),
+    assert_mempool_empty([Parent, Child]),
+    assert_no_overlay().
+
+failing_child_leaves_nothing() ->
+    Parent = spend_coinbase_p2wpkh(2, 16#fffffffd, 1),
+    #tx_out{value = V} = hd(Parent#transaction.outputs),
+    Child = sign_p2wpkh(beamchain_serialize:tx_hash(Parent), 0, V,
+                        16#fffffffd, 1, 2, V - 1),
+    {ok, [R1, R2]} = beamchain_mempool:accept_package_dry_run([Parent, Child]),
+    ?assertMatch({ok, _, _, _, _}, R1),
+    {error, _, _, ChildReason} = R2,
+    ?assertNotEqual('bad-txns-inputs-missingorspent', ChildReason),
+    assert_mempool_empty([Parent, Child]),
+    assert_no_overlay(),
+    ?assertEqual({error, 'bad-txns-inputs-missingorspent'},
+                 beamchain_mempool:accept_to_memory_pool_dry_run(Child)).
 
 %%% ===================================================================
 %%% Fixture + helpers (same regtest chain as beamchain_mempool_bip68_tests)
@@ -199,24 +309,73 @@ spend_coinbase_p2wpkh(Height, Seq, NOut) ->
     Txid = coinbase_txid_at(Height),
     sign_p2wpkh(Txid, 1, 2500000000, Seq, NOut).
 
+%% Same, with an explicit tx version.
+spend_coinbase(Height, Version, NOut) ->
+    Txid = coinbase_txid_at(Height),
+    sign_p2wpkh(Txid, 1, 2500000000, 16#fffffffd, NOut, Version, 2500000000).
+
 %% Spend output Vout of an unconfirmed P2WPKH tx.
 spend_prev(Prev, Vout, Seq) ->
+    spend_prev(Prev, Vout, Seq, 1, 2).
+
+spend_prev(Prev, Vout, Seq, NOut, Version) ->
     #tx_out{value = V} = lists:nth(Vout + 1, Prev#transaction.outputs),
-    sign_p2wpkh(beamchain_serialize:tx_hash(Prev), Vout, V, Seq, 1).
+    sign_p2wpkh(beamchain_serialize:tx_hash(Prev), Vout, V, Seq, NOut,
+                Version, V).
+
+%% A fan in the mempool: one tx with NChildren + 1 outputs and
+%% NChildren children spending all but the last. Returns a package whose
+%% parent spends that last output, plus its child.
+fan_and_package(NChildren) ->
+    Fan = spend_coinbase_p2wpkh(2, 16#fffffffd, NChildren + 1),
+    {ok, _} = beamchain_mempool:add_transaction(Fan),
+    lists:foreach(fun(I) ->
+        {ok, _} = beamchain_mempool:add_transaction(spend_prev(Fan, I, 16#fffffffd))
+    end, lists:seq(0, NChildren - 1)),
+    Parent = spend_prev(Fan, NChildren, 16#fffffffd),
+    {Parent, spend_prev(Parent, 0, 16#fffffffd)}.
+
+mempool_size() ->
+    ets:info(mempool_txs, size).
+
+assert_mempool_empty(Txs) ->
+    [?assertNot(beamchain_mempool:has_tx(beamchain_serialize:tx_hash(T)))
+     || T <- Txs],
+    ok.
+
+%% The dry-run package view lives in the mempool server's process
+%% dictionary only for the duration of one call.
+assert_no_overlay() ->
+    {dictionary, D} = erlang:process_info(whereis(beamchain_mempool),
+                                          dictionary),
+    ?assertEqual([], [K || {K, _} <- D,
+                           is_atom(K),
+                           lists:prefix("beamchain_dry_run",
+                                        atom_to_list(K))]).
+
+%% Real submission of the same package rejects the child for the same reason.
+assert_real_accept_agrees(Parent, Child, Reason) ->
+    ChildTxid = beamchain_serialize:tx_hash(Child),
+    ?assertEqual({error, {tx_failed, ChildTxid, Reason}},
+                 beamchain_mempool:accept_package([Parent, Child])).
 
 sign_p2wpkh(Txid, Vout, Amount, Seq, NOut) ->
+    sign_p2wpkh(Txid, Vout, Amount, Seq, NOut, 2, Amount).
+
+%% SignAmount =/= Amount produces a signature that fails the script check.
+sign_p2wpkh(Txid, Vout, Amount, Seq, NOut, Version, SignAmount) ->
     Pub = pub(),
     In = #tx_in{prev_out = #outpoint{hash = Txid, index = Vout},
                 script_sig = <<>>, sequence = Seq, witness = []},
     Each = (Amount - 20000) div NOut,
-    Tx0 = #transaction{version = 2, inputs = [In],
+    Tx0 = #transaction{version = Version, inputs = [In],
                        outputs = [#tx_out{value = Each,
                                           script_pubkey = p2wpkh_spk()}
                                   || _ <- lists:seq(1, NOut)],
                        locktime = 0},
     ScriptCode = <<16#76, 16#a9, 20, (beamchain_crypto:hash160(Pub))/binary,
                    16#88, 16#ac>>,
-    SigHash = beamchain_script:sighash_witness_v0(Tx0, 0, ScriptCode, Amount,
+    SigHash = beamchain_script:sighash_witness_v0(Tx0, 0, ScriptCode, SignAmount,
                                                   ?SIGHASH_ALL),
     {ok, Der} = beamchain_crypto:ecdsa_sign(SigHash, ?PRIV),
     Tx0#transaction{inputs = [In#tx_in{witness = [<<Der/binary, ?SIGHASH_ALL>>,
