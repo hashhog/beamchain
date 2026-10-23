@@ -3300,9 +3300,27 @@ cluster_members_for(Tx) ->
             end
         end, ParentClusterIds)),
     Pkg = lists:append([dry_run_pkg_cluster(P) || P <- PkgParents]),
-    case Pkg of
-        [] -> Live;
-        _ -> lists:usort(Live ++ Pkg)
+    case get(?DRY_RUN_PKG_CLUSTERS) of
+        undefined ->
+            Live;
+        Recorded ->
+            %% An earlier package member that is not Tx's parent still shares
+            %% Tx's cluster when both hang off the same in-mempool ancestor:
+            %% accept_package/1 has inserted it by the time Tx is checked.
+            merge_pkg_clusters(lists:usort(Live ++ Pkg), maps:values(Recorded))
+    end.
+
+%% Union into Members every recorded package cluster that shares a txid with
+%% it, until no further cluster joins.
+merge_pkg_clusters(Members, Recorded) ->
+    Set = sets:from_list(Members),
+    {Joined, Rest} = lists:partition(
+        fun(C) -> lists:any(fun(T) -> sets:is_element(T, Set) end, C) end,
+        Recorded),
+    case Joined of
+        [] -> Members;
+        _ -> merge_pkg_clusters(lists:usort(Members ++ lists:append(Joined)),
+                                Rest)
     end.
 
 %% @doc Sigop-adjusted weight of an in-mempool transaction, by txid.
