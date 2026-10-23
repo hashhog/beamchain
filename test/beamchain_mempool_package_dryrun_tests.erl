@@ -47,7 +47,20 @@ package_dryrun_test_() ->
       fun(_) -> {timeout, 120, {"CONTROL: a rejected parent exposes no outputs to its child",
                                 fun rejected_parent_hides_outputs/0}} end,
       fun(_) -> {timeout, 120, {"CONTROL: allowed parent + failing child leaves nothing behind",
-                                fun failing_child_leaves_nothing/0}} end]}.
+                                fun failing_child_leaves_nothing/0}} end,
+      %% Two package parents that do not spend each other still share one
+      %% cluster when they spend the same in-mempool ancestor; accept_package/1
+      %% has inserted the first by the time it checks the second.
+      fun(_) -> {timeout, 120, {"FIX: second parent sharing a 63-tx mempool cluster is too large",
+                                fun sibling_parents_cluster_count/0}} end,
+      fun(_) -> {timeout, 120, {"FIX: second parent pushing the shared cluster past 404000 WU is too large",
+                                fun sibling_parents_cluster_weight/0}} end,
+      fun(_) -> {timeout, 120, {"CONTROL: sibling parents in a 62-tx cluster fit; the child does not",
+                                fun sibling_parents_cluster_room/0}} end,
+      fun(_) -> {timeout, 120, {"CONTROL: sibling parents under 404000 WU together are allowed",
+                                fun sibling_parents_weight_room/0}} end,
+      fun(_) -> {timeout, 120, {"CONTROL: parents spending unrelated confirmed coins are allowed",
+                                fun unrelated_parents_ok/0}} end]}.
 
 setup() ->
     TmpDir = chain_setup(),
@@ -184,6 +197,67 @@ failing_child_leaves_nothing() ->
     assert_no_overlay(),
     ?assertEqual({error, 'bad-txns-inputs-missingorspent'},
                  beamchain_mempool:accept_to_memory_pool_dry_run(Child)).
+
+%% Mempool fan of 1 + 62 = 63; A takes the cluster to 64, so B (which
+%% spends a different fan output, not A) would make 65.
+sibling_parents_cluster_count() ->
+    {A, B, Child} = fan_and_two_parents(62),
+    Btxid = beamchain_serialize:tx_hash(B),
+    {ok, [RA, RB, _RC]} = beamchain_mempool:accept_package_dry_run([A, B, Child]),
+    ?assertMatch({ok, _, _, _, _}, RA),
+    ?assertMatch({error, Btxid, _, too_large_cluster}, RB),
+    assert_mempool_empty([A, B, Child]),
+    ?assertEqual(63, mempool_size()),
+    assert_no_overlay(),
+    ?assertEqual({error, {tx_failed, Btxid, too_large_cluster}},
+                 beamchain_mempool:accept_package([A, B, Child])).
+
+%% Fan 1 + 61 = 62: A makes 63, B makes 64 (the limit), the child 65.
+sibling_parents_cluster_room() ->
+    {A, B, Child} = fan_and_two_parents(61),
+    {ok, [RA, RB, RC]} = beamchain_mempool:accept_package_dry_run([A, B, Child]),
+    ?assertMatch({ok, _, _, _, _}, RA),
+    ?assertMatch({ok, _, _, _, _}, RB),
+    ?assertMatch({error, _, _, too_large_cluster}, RC),
+    assert_mempool_empty([A, B, Child]),
+    ?assertEqual(62, mempool_size()),
+    assert_real_accept_agrees(A, B, Child, too_large_cluster).
+
+%% One heavy mempool tx (~149k WU). A and B (~131k WU each) each fit next to
+%% it alone (~280k), but together the shared cluster is ~411k > 404000.
+%% The package itself (~262k) is under MAX_PACKAGE_WEIGHT.
+sibling_parents_cluster_weight() ->
+    {A, B, Child} = heavy_fan_and_two_parents(1200, 1050),
+    Btxid = beamchain_serialize:tx_hash(B),
+    {ok, [RA, RB, _RC]} = beamchain_mempool:accept_package_dry_run([A, B, Child]),
+    ?assertMatch({ok, _, _, _, _}, RA),
+    ?assertMatch({error, Btxid, _, too_large_cluster}, RB),
+    assert_mempool_empty([A, B, Child]),
+    ?assertEqual(1, mempool_size()),
+    ?assertEqual({error, {tx_failed, Btxid, too_large_cluster}},
+                 beamchain_mempool:accept_package([A, B, Child])).
+
+%% Same shape with A and B at ~124k WU: ~399k in all, under the limit.
+sibling_parents_weight_room() ->
+    {A, B, Child} = heavy_fan_and_two_parents(1200, 1000),
+    {ok, [RA, RB, RC]} = beamchain_mempool:accept_package_dry_run([A, B, Child]),
+    ?assertMatch({ok, _, _, _, _}, RA),
+    ?assertMatch({ok, _, _, _, _}, RB),
+    ?assertMatch({ok, _, _, _, _}, RC),
+    assert_mempool_empty([A, B, Child]),
+    ?assertEqual(1, mempool_size()).
+
+unrelated_parents_ok() ->
+    %% Coinbases at heights 1 and 2: the only mature ones at tip 101.
+    A = spend_coinbase_p2wpkh(1, 16#fffffffd, 1),
+    B = spend_coinbase_p2wpkh(2, 16#fffffffd, 1),
+    Child = spend_two(A, B),
+    {ok, [RA, RB, RC]} = beamchain_mempool:accept_package_dry_run([A, B, Child]),
+    ?assertMatch({ok, _, _, _, _}, RA),
+    ?assertMatch({ok, _, _, _, _}, RB),
+    ?assertMatch({ok, _, _, _, _}, RC),
+    assert_mempool_empty([A, B, Child]),
+    ?assertEqual(0, mempool_size()).
 
 %%% ===================================================================
 %%% Fixture + helpers (same regtest chain as beamchain_mempool_bip68_tests)
@@ -335,6 +409,35 @@ fan_and_package(NChildren) ->
     Parent = spend_prev(Fan, NChildren, 16#fffffffd),
     {Parent, spend_prev(Parent, 0, 16#fffffffd)}.
 
+%% Like fan_and_package/1, but the fan keeps two outputs back: A spends one,
+%% B the other, and the child spends A:0 and B:0.
+fan_and_two_parents(NChildren) ->
+    Fan = spend_coinbase_p2wpkh(2, 16#fffffffd, NChildren + 2),
+    {ok, _} = beamchain_mempool:add_transaction(Fan),
+    lists:foreach(fun(I) ->
+        {ok, _} = beamchain_mempool:add_transaction(spend_prev(Fan, I, 16#fffffffd))
+    end, lists:seq(0, NChildren - 1)),
+    A = spend_prev(Fan, NChildren, 16#fffffffd),
+    B = spend_prev(Fan, NChildren + 1, 16#fffffffd),
+    {A, B, spend_two(A, B)}.
+
+%% One mempool tx with FanOut outputs; A and B spend its outputs 0 and 1
+%% into ParentOut outputs each, and the child spends A:0 and B:0.
+heavy_fan_and_two_parents(FanOut, ParentOut) ->
+    Fan = sign_inputs([{coinbase_txid_at(2), 1, 2500000000}], FanOut, 200000),
+    {ok, _} = beamchain_mempool:add_transaction(Fan),
+    A = sign_inputs([prevout(Fan, 0)], ParentOut, 200000),
+    B = sign_inputs([prevout(Fan, 1)], ParentOut, 200000),
+    {A, B, spend_two(A, B)}.
+
+prevout(Tx, Vout) ->
+    #tx_out{value = V} = lists:nth(Vout + 1, Tx#transaction.outputs),
+    {beamchain_serialize:tx_hash(Tx), Vout, V}.
+
+spend_two(A, B) ->
+    %% Small fee: the heavy parents' outputs are under 2000 sat each.
+    sign_inputs([prevout(A, 0), prevout(B, 0)], 1, 1000).
+
 mempool_size() ->
     ets:info(mempool_txs, size).
 
@@ -358,6 +461,38 @@ assert_real_accept_agrees(Parent, Child, Reason) ->
     ChildTxid = beamchain_serialize:tx_hash(Child),
     ?assertEqual({error, {tx_failed, ChildTxid, Reason}},
                  beamchain_mempool:accept_package([Parent, Child])).
+
+%% Same as assert_real_accept_agrees/3 for a two-parent package.
+assert_real_accept_agrees(A, B, Child, Reason) ->
+    ChildTxid = beamchain_serialize:tx_hash(Child),
+    ?assertEqual({error, {tx_failed, ChildTxid, Reason}},
+                 beamchain_mempool:accept_package([A, B, Child])).
+
+%% Spend v2 P2WPKH prevouts [{Txid, Vout, Amount}] into NOut equal
+%% outputs, paying Fee.
+sign_inputs(Prevouts, NOut, Fee) ->
+    Pub = pub(),
+    Ins = [#tx_in{prev_out = #outpoint{hash = T, index = V},
+                  script_sig = <<>>, sequence = 16#fffffffd, witness = []}
+           || {T, V, _} <- Prevouts],
+    Total = lists:sum([Amt || {_, _, Amt} <- Prevouts]),
+    Each = (Total - Fee) div NOut,
+    Tx0 = #transaction{version = 2, inputs = Ins,
+                       outputs = [#tx_out{value = Each,
+                                          script_pubkey = p2wpkh_spk()}
+                                  || _ <- lists:seq(1, NOut)],
+                       locktime = 0},
+    ScriptCode = <<16#76, 16#a9, 20, (beamchain_crypto:hash160(Pub))/binary,
+                   16#88, 16#ac>>,
+    Witnesses = [begin
+        SigHash = beamchain_script:sighash_witness_v0(Tx0, I, ScriptCode, Amt,
+                                                      ?SIGHASH_ALL),
+        {ok, Der} = beamchain_crypto:ecdsa_sign(SigHash, ?PRIV),
+        [<<Der/binary, ?SIGHASH_ALL>>, Pub]
+    end || {I, {_, _, Amt}} <- lists:zip(lists:seq(0, length(Prevouts) - 1),
+                                         Prevouts)],
+    Tx0#transaction{inputs = [In#tx_in{witness = W}
+                              || {In, W} <- lists:zip(Ins, Witnesses)]}.
 
 sign_p2wpkh(Txid, Vout, Amount, Seq, NOut) ->
     sign_p2wpkh(Txid, Vout, Amount, Seq, NOut, 2, Amount).
