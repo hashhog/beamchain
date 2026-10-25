@@ -296,49 +296,52 @@ skip_prefilled(Idx, PrefilledIdxs) ->
 %% rather than the prompt getblocktxn fallback Core takes (Core never re-fills
 %% because it keeps have_txn=true even after the slot pointer is cleared,
 %% blockencodings.cpp:124-136).
+%%
+%% Only the {txid, wtxid} pairs are scanned; a tx is copied out of the
+%% mempool only when its short id is in the block. This runs once per
+%% announcing peer per block, and the old tab2list of every entry plus a
+%% get_tx + re-serialize of every tx put several full mempool copies on the
+%% block_sync heap per block (mainnet oom-kill at 16G, 2026-10-21).
 match_mempool_txns(ShortIdMap, K0, K1, TxnAvailable) ->
-    Txids = beamchain_mempool:get_all_txids(),
-    lists:foldl(
-        fun(Txid, {Arr, AccCount, Touched}) ->
-            case beamchain_mempool:get_tx(Txid) of
-                {ok, Tx} ->
-                    Wtxid = beamchain_serialize:wtx_hash(Tx),
-                    ShortId = compute_short_id(K0, K1, Wtxid),
-                    case maps:find(ShortId, ShortIdMap) of
-                        {ok, Idx} ->
-                            case {array:get(Idx, Arr),
-                                  sets:is_element(Idx, Touched)} of
-                                {undefined, false} ->
-                                    %% First match: fill the slot, mark touched.
-                                    {array:set(Idx, Tx, Arr),
-                                     AccCount + 1,
-                                     sets:add_element(Idx, Touched)};
-                                {_, false} ->
-                                    %% Already filled (e.g. by prefill) — collision.
-                                    %% Should be unreachable because prefilled
-                                    %% indices were skipped from ShortIdMap, but
-                                    %% defensive: clear + mark touched.
-                                    {array:set(Idx, undefined, Arr),
-                                     AccCount - 1,
-                                     sets:add_element(Idx, Touched)};
-                                {_, true} ->
-                                    %% Slot was previously filled by some mempool
-                                    %% tx (and possibly already cleared by a
-                                    %% collision).  Keep it cleared and do NOT
-                                    %% re-fill; Count was already decremented on
-                                    %% the first collision.
-                                    {array:set(Idx, undefined, Arr),
-                                     AccCount, Touched}
-                            end;
-                        error ->
-                            {Arr, AccCount, Touched}
-                    end;
-                not_found ->
-                    {Arr, AccCount, Touched}
+    beamchain_mempool:fold_id_pairs(
+        fun({Txid, Wtxid}, Acc) ->
+            case maps:find(compute_short_id(K0, K1, Wtxid), ShortIdMap) of
+                {ok, Idx} -> match_mempool_tx(Txid, Idx, Acc);
+                error -> Acc
             end
         end,
-        {TxnAvailable, 0, sets:new([{version, 2}])},
-        Txids).
+        {TxnAvailable, 0, sets:new([{version, 2}])}).
+
+match_mempool_tx(Txid, Idx, {Arr, AccCount, Touched} = Acc) ->
+    case beamchain_mempool:get_tx(Txid) of
+        {ok, Tx} ->
+            case {array:get(Idx, Arr), sets:is_element(Idx, Touched)} of
+                {undefined, false} ->
+                    %% First match: fill the slot, mark touched.
+                    {array:set(Idx, Tx, Arr),
+                     AccCount + 1,
+                     sets:add_element(Idx, Touched)};
+                {_, false} ->
+                    %% Already filled (e.g. by prefill) — collision.
+                    %% Should be unreachable because prefilled
+                    %% indices were skipped from ShortIdMap, but
+                    %% defensive: clear + mark touched.
+                    {array:set(Idx, undefined, Arr),
+                     AccCount - 1,
+                     sets:add_element(Idx, Touched)};
+                {_, true} ->
+                    %% Slot was previously filled by some mempool
+                    %% tx (and possibly already cleared by a
+                    %% collision).  Keep it cleared and do NOT
+                    %% re-fill; Count was already decremented on
+                    %% the first collision.
+                    {array:set(Idx, undefined, Arr),
+                     AccCount, Touched}
+            end;
+        not_found ->
+            %% Evicted between the id scan and this fetch.
+            Acc
+    end.
 
 %% Match extra transactions against short ids.
 %% Core InitData extra_txn loop (lines 147-176).

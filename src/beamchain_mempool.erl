@@ -36,6 +36,7 @@
 -export([has_tx/1, get_tx/1, get_entry/1, get_wtxid/1]).
 -export([find_spending_tx/2]).
 -export([get_all_txids/0, get_all_entries/0, get_all_id_pairs/0, get_info/0]).
+-export([fold_id_pairs/2]).
 -export([get_all_orphans/0]).
 -export([get_sorted_by_fee/0]).
 -export([get_tx_fee_rate/1]).
@@ -183,6 +184,8 @@
 %%% -------------------------------------------------------------------
 
 -define(MEMPOOL_TXS, mempool_txs).           %% txid -> mempool_entry
+%% Rows per ets:select/3 chunk in fold_id_pairs/2.
+-define(ID_SCAN_CHUNK, 1000).
 %% wtxid -> txid secondary index (Core mapTx's index_by_wtxid). Maintained by
 %% insert_entry/1 + remove_entry/1, the only writers that add or drop a
 %% ?MEMPOOL_TXS key. lookup_entry_by_wtxid/1 used to emulate it with a
@@ -446,6 +449,25 @@ get_all_entries() ->
 get_all_id_pairs() ->
     [{E#mempool_entry.txid, E#mempool_entry.wtxid}
      || {_Txid, E} <- ets:tab2list(?MEMPOOL_TXS)].
+
+%% @doc Fold Fun over every {Txid, Wtxid} in the mempool, in chunks of
+%% ?ID_SCAN_CHUNK, without copying any #mempool_entry{} or its tx out of ETS.
+%% The match spec projects the two id binaries inside ETS, so the caller's
+%% heap holds at most one chunk of pairs at a time, however large the mempool.
+%% Used by compact-block reconstruction, which runs once per announcing peer
+%% per block and only needs a tx when its short id matches (Core
+%% PartiallyDownloadedBlock::InitData walks txmempool's wtxid vector the
+%% same way). select/3 continuations fix the table for the traversal, so each
+%% entry is visited at most once under concurrent mempool writes.
+-spec fold_id_pairs(fun(({binary(), binary()}, Acc) -> Acc), Acc) -> Acc.
+fold_id_pairs(Fun, Acc0) ->
+    MS = [{{'$1', #mempool_entry{wtxid = '$2', _ = '_'}}, [], [{{'$1', '$2'}}]}],
+    fold_id_chunks(ets:select(?MEMPOOL_TXS, MS, ?ID_SCAN_CHUNK), Fun, Acc0).
+
+fold_id_chunks('$end_of_table', _Fun, Acc) ->
+    Acc;
+fold_id_chunks({Pairs, Cont}, Fun, Acc) ->
+    fold_id_chunks(ets:select(Cont), Fun, lists:foldl(Fun, Acc, Pairs)).
 
 %% @doc Get all orphan-pool entries (BIP-339 wtxid-keyed). Returns the raw
 %% records as stored by insert_orphan_entry/6:
