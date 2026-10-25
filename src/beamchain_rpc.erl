@@ -2176,20 +2176,11 @@ rpc_getdifficulty() ->
     end.
 
 rpc_getchaintips() ->
-    %% We only track the active chain, so return one tip. ORDERED proplist
-    %% (NOT a map): Core getchaintips (rpc/blockchain.cpp) pushKV order is
-    %% height, hash, branchlen, status.
-    case beamchain_chainstate:get_tip() of
-        {ok, {Hash, Height}} ->
-            {ok, [[
-                {<<"height">>, Height},
-                {<<"hash">>, hash_to_hex(Hash)},
-                {<<"branchlen">>, 0},
-                {<<"status">>, <<"active">>}
-            ]]};
-        not_found ->
-            {ok, []}
-    end.
+    %% Every block-index leaf plus the active tip, with Core's status and
+    %% branchlen (rpc/blockchain.cpp getchaintips) -- see beamchain_chaintips.
+    %% ORDERED proplists (NOT maps): Core pushKV order is height, hash,
+    %% branchlen, status.
+    {ok, beamchain_chaintips:tips()}.
 
 %% @doc getchainstates — information about this node's chainstate(s).
 %%
