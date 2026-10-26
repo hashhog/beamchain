@@ -34,6 +34,7 @@
          get_block_index_by_hash/1]).
 -export([update_block_status/2, raise_block_status/3, raised_status/3,
          get_all_block_indexes/0]).
+-export([fold_height_slots_from/3]).
 
 %% Side-branch (off-active-chain) block index, hash-keyed.
 %% Active-chain block_index is keyed by HEIGHT and so structurally cannot
@@ -522,6 +523,32 @@ raised_status(Old, Level, Flags) ->
 -spec get_all_block_indexes() -> {ok, [map()]} | {error, term()}.
 get_all_block_indexes() ->
     gen_server:call(?SERVER, get_all_block_indexes, 60000).
+
+%% @doc Fold Fun(Entry, Acc) over the height slots at Height and above, in
+%% height order (Entry carries height).  Direct RocksDB iterator: it does not
+%% go through (or block) the db gen_server, and keeps nothing per entry, so a
+%% caller can stream a range as long as the whole header chain.  Read-only;
+%% used by getchaintips (beamchain_chaintips) for the slots above the tip.
+-spec fold_height_slots_from(non_neg_integer(),
+                             fun((map(), Acc) -> Acc), Acc) -> Acc.
+fold_height_slots_from(Height, Fun, Acc0)
+  when is_integer(Height), Height >= 0, is_function(Fun, 2) ->
+    Db = persistent_term:get(beamchain_db_handle),
+    CF = persistent_term:get(beamchain_cf_block_idx),
+    {ok, Iter} = rocksdb:iterator(Db, CF, []),
+    try
+        fold_slots(rocksdb:iterator_move(Iter, {seek, encode_height(Height)}),
+                   Iter, Fun, Acc0)
+    after
+        _ = rocksdb:iterator_close(Iter)
+    end.
+
+fold_slots({ok, <<H:64/big>>, Value}, Iter, Fun, Acc) ->
+    Entry = decode_block_index_entry(Value),
+    fold_slots(rocksdb:iterator_move(Iter, next), Iter, Fun,
+               Fun(Entry#{height => H}, Acc));
+fold_slots(_, _Iter, _Fun, Acc) ->
+    Acc.
 
 %% @doc Store a side-branch block index entry (hash-keyed in meta CF).
 %% Entry must include height, hash, header, chainwork, status, n_tx.
