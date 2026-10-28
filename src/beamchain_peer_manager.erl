@@ -2742,16 +2742,9 @@ getdata_reply(Type, _Hash, Block) ->
 %% @doc MSG_CMPCT_BLOCK reply.  Core ProcessGetBlockData: a block within
 %% MAX_CMPCTBLOCK_DEPTH (5) of the tip is sent as a BIP-152 cmpctblock; a
 %% deeper one as the full witness block.
--spec getdata_cmpct_msg(term(), integer(), integer()) ->
-          {cmpctblock, map()} | {block, term()}.
+-spec getdata_cmpct_msg(term(), integer(), integer()) -> {atom(), term()}.
 getdata_cmpct_msg(Block, BlockH, TipH) ->
-    case BlockH >= 0 andalso BlockH >= TipH - 5 of
-        true ->
-            Nonce = rand:uniform(1 bsl 64) - 1,
-            {cmpctblock, beamchain_compact_block:build_compact_block(Block, Nonce)};
-        false ->
-            {block, Block}
-    end.
+    beamchain_compact_block:getdata_reply(Block, BlockH, TipH).
 
 %% @doc The block message for a getdata block item.  Core
 %% ProcessGetBlockData: MSG_BLOCK → TX_NO_WITNESS, MSG_WITNESS_BLOCK and
