@@ -91,7 +91,7 @@
 -export([chunk_inv_items/2, inv_items_from_pairs/2, getheaders_limit/2]).
 
 %% Exposed for testing (getdata per-inv-type serving decision)
--export([getdata_tx_msg/4, getdata_block_msg/2]).
+-export([getdata_tx_msg/4, getdata_block_msg/2, getdata_cmpct_msg/3]).
 %% Data requests are served in the requesting peer's process (BC-S).
 -export([serve_peer_request/3]).
 
@@ -2662,7 +2662,7 @@ handle_getdata_msg(Pid, Payload) ->
                                 case beamchain_db:get_block(Hash) of
                                     {ok, Block} ->
                                         beamchain_peer:send_message(Pid,
-                                            getdata_block_msg(Type, Block)),
+                                            getdata_reply(Type, Hash, Block)),
                                         false;
                                     not_found ->
                                         {true, #{type => Type, hash => Hash}};
@@ -2722,6 +2722,35 @@ getdata_tx_msg(Type, Hash, ByTxid, ByWtxid) ->
     case Lookup(Hash) of
         {ok, Tx} -> {ok, {tx, Wrap(Tx)}};
         _        -> notfound
+    end.
+
+%% Reply for one found block item.  MSG_CMPCT_BLOCK needs the block's height
+%% and the tip height to pick cmpctblock vs full block.
+getdata_reply(?MSG_CMPCT_BLOCK, Hash, Block) ->
+    TipH = case beamchain_chainstate:get_tip_height() of
+        {ok, H} -> H;
+        _ -> -1
+    end,
+    BlockH = case beamchain_db:get_block_index_by_hash(Hash) of
+        {ok, #{height := BH}} -> BH;
+        _ -> -1
+    end,
+    getdata_cmpct_msg(Block, BlockH, TipH);
+getdata_reply(Type, _Hash, Block) ->
+    getdata_block_msg(Type, Block).
+
+%% @doc MSG_CMPCT_BLOCK reply.  Core ProcessGetBlockData: a block within
+%% MAX_CMPCTBLOCK_DEPTH (5) of the tip is sent as a BIP-152 cmpctblock; a
+%% deeper one as the full witness block.
+-spec getdata_cmpct_msg(term(), integer(), integer()) ->
+          {cmpctblock, map()} | {block, term()}.
+getdata_cmpct_msg(Block, BlockH, TipH) ->
+    case BlockH >= 0 andalso BlockH >= TipH - 5 of
+        true ->
+            Nonce = rand:uniform(1 bsl 64) - 1,
+            {cmpctblock, beamchain_compact_block:build_compact_block(Block, Nonce)};
+        false ->
+            {block, Block}
     end.
 
 %% @doc The block message for a getdata block item.  Core
