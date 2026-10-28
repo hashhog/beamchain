@@ -14,7 +14,9 @@
 -include("beamchain_protocol.hrl").
 
 %% API
--export([init_compact_block/1,
+-export([build_compact_block/2,
+         getdata_reply/3,
+         init_compact_block/1,
          try_reconstruct/2,
          fill_block/2,
          get_missing_indices/1,
@@ -50,6 +52,31 @@
 %%% ===================================================================
 %%% API
 %%% ===================================================================
+
+%% @doc Build the cmpctblock message for a full block (the serving side).
+%% Core blockencodings.cpp CBlockHeaderAndShortTxIDs: the coinbase is the only
+%% prefilled tx (index 0); every other tx is a 6-byte SipHash short id of its
+%% WTXID under the key derived from header + nonce.
+-spec build_compact_block(#block{}, non_neg_integer()) -> map().
+build_compact_block(#block{header = Header, transactions = [Coinbase | Rest]}, Nonce) ->
+    {K0, K1} = derive_siphash_key(Header, Nonce),
+    ShortIds = [compute_short_id(K0, K1, beamchain_serialize:wtx_hash(Tx))
+                || Tx <- Rest],
+    #{header => Header, nonce => Nonce, short_ids => ShortIds,
+      prefilled_txns => [#{index => 0, tx => Coinbase}]}.
+
+%% @doc Reply to getdata(MSG_CMPCT_BLOCK).  Core ProcessGetBlockData: a block
+%% within MAX_CMPCTBLOCK_DEPTH (5) of the tip is sent as a cmpctblock; a deeper
+%% one (or one with no known height) as the full witness block.
+-spec getdata_reply(#block{}, integer(), integer()) -> {atom(), term()}.
+getdata_reply(Block, BlockH, TipH) ->
+    case BlockH >= 0 andalso BlockH >= TipH - 5 of
+        true ->
+            Nonce = rand:uniform(1 bsl 64) - 1,
+            {cmpctblock, build_compact_block(Block, Nonce)};
+        false ->
+            {block, Block}
+    end.
 
 %% @doc Initialize compact block state from a cmpctblock message.
 %% Returns {ok, State} or {error, Reason}.
