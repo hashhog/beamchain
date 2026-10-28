@@ -736,6 +736,14 @@ init([]) ->
             end
     end,
 
+    %% --rpcbind=<addr> (CLI, via application env) overrides rpcbind= from
+    %% the config file. Unset in both = loopback (beamchain_rpc:rpc_bind_ip/1).
+    case application:get_env(beamchain, rpcbind) of
+        {ok, RPCBind} when is_list(RPCBind), RPCBind =/= "" ->
+            ets:insert(?CONFIG_TABLE, {rpcbind, RPCBind});
+        _ -> ok
+    end,
+
     %% W119 FIX-64: RPC HTTPS termination cert+key paths.
     %% CLI (apply_opts via application:set_env) overrides config file.
     case application:get_env(beamchain, rpc_tls_cert) of
