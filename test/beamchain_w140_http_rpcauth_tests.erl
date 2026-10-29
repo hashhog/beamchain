@@ -82,24 +82,29 @@ g03_warmup_only_at_health_test() ->
     ?assertEqual(nomatch,
                  binary:match(Src, <<"-28, <<\"Loading">>)).
 
-%% G04 MISSING — **P0-SEC** bind on 0.0.0.0 with no ACL.  BUG-1.
+%% G04 PARTIAL — **P0-SEC** bind on 0.0.0.0 with no ACL.  BUG-1.
+%% Bind half FLIPPED (fix-beamchain-rpc-bind-loopback): socket_opts now
+%% carry {ip, _} from rpc_bind_ip/0, default 127.0.0.1; the real-socket
+%% check lives in beamchain_rpcbind_tests.  ACL half still open.
 g04_listener_binds_all_interfaces_test() ->
     Src = rpc_module_src(),
-    %% Confirm the bug shape: socket_opts has port + reuseaddr but NO
-    %% {ip, ...} option.  ranch_tcp defaults to INADDR_ANY.
-    ?assert(contains(Src,
-                     <<"[{port, Port}, {reuseaddr, true}]">>)),
-    %% No application-level allow-list / ClientAllowed equivalent.
-    ?assertEqual(nomatch, binary:match(Src, <<"rpcallowip">>)),
+    %% Fixed shape: both listeners build socket_opts via rpc_socket_opts/2
+    %% (which sets {ip, _}); the old ip-less list is gone.
+    ?assertEqual(nomatch,
+                 binary:match(Src, <<"[{port, Port}, {reuseaddr, true}]">>)),
+    ?assert(contains(Src, <<"rpc_socket_opts(BindIp, Port)">>)),
+    ?assertEqual({ok, {127, 0, 0, 1}}, beamchain_rpc:rpc_bind_ip(undefined)),
+    %% Still no application-level allow-list / ClientAllowed equivalent.
     ?assertEqual(nomatch, binary:match(Src, <<"client_allowed">>)),
-    %% The log message literally claims "0.0.0.0".
-    ?assert(contains(Src, <<"0.0.0.0">>)).
+    %% The log message no longer hard-codes "0.0.0.0".
+    ?assertEqual(nomatch, binary:match(Src, <<"~s://0.0.0.0:">>)).
 
-%% G05 PARTIAL — no -rpcbind flag.  BUG-5 (shared with G14).
+%% G05 FLIPPED — --rpcbind / rpcbind= now exist.  BUG-5 (shared with G14).
 g05_rpcbind_missing_test() ->
     Src = rpc_module_src(),
-    ?assertEqual(nomatch, binary:match(Src, <<"-rpcbind">>)),
-    ?assertEqual(nomatch, binary:match(Src, <<"rpcbind">>)).
+    ?assert(contains(Src, <<"rpcbind">>)),
+    {start, Opts} = beamchain_cli:parse_args(["start", "--rpcbind=0.0.0.0"]),
+    ?assertEqual("0.0.0.0", maps:get(rpc_bind, Opts)).
 
 %% G06 MISSING — auxiliary listeners replicate the bind bug.  BUG-4.
 g06_aux_listeners_also_unbound_test() ->

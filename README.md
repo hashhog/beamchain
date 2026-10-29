@@ -63,9 +63,9 @@ Mainnet uses the data directory itself; every other network gets a subdirectory
 | signet | 38333 | 38332 |
 | regtest | 18444 | 18443 |
 
-The RPC and P2P listeners bind all interfaces (`0.0.0.0`). RPC requires the cookie or
-`rpcuser`/`rpcpassword`, but firewall the RPC port if the machine is reachable from
-outside. A Prometheus endpoint listens on port 9332; if that port is busy the node
+RPC binds `127.0.0.1` unless you pass `--rpcbind=<addr>` (or set `rpcbind=` in the
+config file). The P2P listener binds all interfaces (`0.0.0.0`). RPC requires the cookie
+or `rpcuser`/`rpcpassword`; if you set `--rpcbind=0.0.0.0`, firewall the RPC port. A Prometheus endpoint listens on port 9332; if that port is busy the node
 retries for about 30 seconds, then carries on without metrics.
 
 A mainnet node keeps every block unless you set `prune=<MiB>` (550 or more) in the

@@ -20,6 +20,10 @@
 %% API
 -export([start_link/0]).
 
+%% Exported for testing — RPC listen address (--rpcbind / rpcbind=) and the
+%% socket options the listener is started with.
+-export([rpc_bind_ip/0, rpc_bind_ip/1, rpc_socket_opts/2]).
+
 %% Exported for testing — shared deployment-state helper.
 -export([build_deployment_map/3]).
 
@@ -428,11 +432,22 @@ init([]) ->
     %% warning. Keep it on the clear path (where it covers the SIGTERM ->
     %% restart TIME_WAIT race documented in beamchain_listener) and omit
     %% on the TLS path.
+    %% Listen address: loopback unless --rpcbind / rpcbind= says otherwise.
+    %% Before this the socket_opts carried no {ip, _}, so ranch_tcp bound
+    %% INADDR_ANY and the RPC port was reachable from every interface.
+    %% Core's default is loopback too (httpserver.cpp HTTPBindAddresses).
+    BindIp = case rpc_bind_ip() of
+        {ok, Ip} -> Ip;
+        {error, BindErr} ->
+            logger:error("rpc: invalid rpcbind: ~p", [BindErr]),
+            exit({rpc_bind_invalid, BindErr})
+    end,
     TlsResult = resolve_tls_config(),
     {ListenerLaunch, LogScheme} = case TlsResult of
         {ok, none} ->
             TransportOpts0 = #{socket_opts =>
-                                 [{port, Port}, {reuseaddr, true}]},
+                                 rpc_socket_opts(BindIp, Port) ++
+                                 [{reuseaddr, true}]},
             LaunchFun0 = fun() ->
                 beamchain_listener:start_clear_with_retry(
                     beamchain_rpc_listener, TransportOpts0, ProtoOpts, "rpc")
@@ -440,8 +455,8 @@ init([]) ->
             {LaunchFun0, "http"};
         {ok, {tls, CertFile, KeyFile}} ->
             TransportOpts1 = #{socket_opts =>
-                                 [{port, Port},
-                                  {certfile, CertFile},
+                                 rpc_socket_opts(BindIp, Port) ++
+                                 [{certfile, CertFile},
                                   {keyfile, KeyFile}]},
             LaunchFun1 = fun() ->
                 beamchain_listener:start_tls_with_retry(
@@ -456,8 +471,8 @@ init([]) ->
     end,
     case ListenerLaunch() of
         {ok, _} ->
-            logger:info("rpc: listening on ~s://0.0.0.0:~B",
-                        [LogScheme, Port]);
+            logger:info("rpc: listening on ~s://~s:~B",
+                        [LogScheme, inet:ntoa(BindIp), Port]);
         {error, Reason} ->
             logger:error("rpc: failed to bind port ~B after retries: ~p",
                          [Port, Reason]),
@@ -8953,6 +8968,48 @@ rpc_port(Params) ->
         P when is_integer(P) -> P;
         P when is_list(P) -> list_to_integer(P)
     end.
+
+%% RPC listen address. Source is the `rpcbind` config key: --rpcbind=<addr>
+%% (beamchain_cli -> app env -> beamchain_config ETS) or rpcbind=<addr> in
+%% beamchain.conf. Unset means 127.0.0.1, Core's default. The value is an
+%% address only (IPv4, IPv6 with or without brackets, or a resolvable name);
+%% the port still comes from --rpc-port. An unparsable value is an error, never
+%% a silent fall back to some other interface.
+%%
+%% Core's -rpcbind is ignored unless -rpcallowip is also set; beamchain has no
+%% -rpcallowip, so an explicit --rpcbind is honoured as given.
+-spec rpc_bind_ip() -> {ok, inet:ip_address()} | {error, term()}.
+rpc_bind_ip() ->
+    rpc_bind_ip(beamchain_config:get(rpcbind)).
+
+-spec rpc_bind_ip(term()) -> {ok, inet:ip_address()} | {error, term()}.
+rpc_bind_ip(undefined) -> {ok, {127, 0, 0, 1}};
+rpc_bind_ip(V) when is_binary(V) -> rpc_bind_ip(binary_to_list(V));
+rpc_bind_ip(V) when is_list(V) ->
+    Host = case string:trim(V) of
+        [$[ | Rest] -> string:trim(Rest, trailing, "]");
+        H -> H
+    end,
+    case Host of
+        "" -> {error, {invalid_rpcbind, V}};
+        _ ->
+            case inet:parse_strict_address(Host) of
+                {ok, Ip} -> {ok, Ip};
+                {error, _} ->
+                    case inet:getaddr(Host, inet) of
+                        {ok, Ip} -> {ok, Ip};
+                        {error, _} -> {error, {invalid_rpcbind, V}}
+                    end
+            end
+    end;
+rpc_bind_ip(V) -> {error, {invalid_rpcbind, V}}.
+
+%% Socket options common to the plaintext and TLS RPC listeners.
+-spec rpc_socket_opts(inet:ip_address(), inet:port_number()) -> list().
+rpc_socket_opts(Ip, Port) when tuple_size(Ip) =:= 8 ->
+    [inet6, {ip, Ip}, {port, Port}];
+rpc_socket_opts(Ip, Port) ->
+    [{ip, Ip}, {port, Port}].
 
 %% W119 FIX-64: resolve RPC TLS termination config.
 %% Returns:

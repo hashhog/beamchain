@@ -34,6 +34,7 @@ Every option accepts `--name=value` and `--name value`.
 | `--datadir=<dir>` | `~/.beamchain` | Base data directory. Networks other than mainnet use `<dir>/<network>`. |
 | `--conf=<file>` | `<network datadir>/beamchain.conf` | Config file (see below). |
 | `--rpc-port=<n>` | per network | JSON-RPC port. |
+| `--rpcbind=<addr>` | `127.0.0.1` | Address the JSON-RPC listener binds. An IPv4 or IPv6 address (brackets optional) or a host name; no port. `0.0.0.0` exposes RPC on every interface. |
 | `--p2p-port=<n>` | per network | P2P listen port. |
 | `--connect=<ip:port>` | none | Connect only to this peer; repeatable. Turns off DNS seeds and automatic outbound connections. |
 | `--nodnsseed`, `--dnsseed=0` | seeds on | Do not resolve DNS seeds. |
@@ -72,6 +73,7 @@ the data directory cannot be set here; use the options or environment variables.
 | Key | Default | Meaning |
 |---|---|---|
 | `rpcport`, `p2pport` | per network | Same as `--rpc-port` / `--p2p-port` (the options win). The `status` and `stop` commands do not read this file, so pass `--rpc-port` to them as well. |
+| `rpcbind` | `127.0.0.1` | Same as `--rpcbind` (the option wins). |
 | `rpcuser`, `rpcpassword` | unset | RPC credentials, accepted in addition to the cookie. |
 | `rpctlscert`, `rpctlskey` | unset | Same as `--rpc-tls-cert` / `--rpc-tls-key`. |
 | `prune` | 0 | 0 = keep all blocks, 1 = prune only via `pruneblockchain`, 550 or more = target size in MiB. |
@@ -118,8 +120,8 @@ set these variables, so an option wins over an inherited variable.
 | signet | 38333 | 38332 | 38342 |
 | regtest | 18444 | 18443 | 18453 |
 
-The Prometheus endpoint is on port 9332 for every network. Every listener binds all
-interfaces. Run beside another node on the same machine with `--rpc-port` and
+The Prometheus endpoint is on port 9332 for every network. RPC binds `127.0.0.1`
+(see `--rpcbind`); every other listener binds all interfaces. Run beside another node on the same machine with `--rpc-port` and
 `--p2p-port`. If port 9332 is busy, startup retries for about 30 seconds and then
 continues without metrics. RPC and P2P are already up by then, but services started
 after metrics, such as REST, wait for those 30 seconds. To move or turn off the
