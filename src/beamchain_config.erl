@@ -6,6 +6,9 @@
 -include("beamchain.hrl").
 -include("beamchain_protocol.hrl").
 
+%% Core HIGH_TX_FEE_PER_KB (wallet/wallet.h): COIN / 100 sat/kvB.
+-define(HIGH_TX_FEE_PER_KB, 1000000).
+
 %% API
 -export([start_link/0,
          get/1,
@@ -17,6 +20,8 @@
          magic/0,
          txindex_enabled/0,
          fallbackfee_satvb/0,
+         check_fallbackfee/0,
+         parse_money/1,
          prune_enabled/0,
          prune_target/0,
          prune_manual_mode/0,
@@ -161,25 +166,86 @@ txindex_enabled() ->
 
 %% @doc Core `-fallbackfee` (BTC/kvB, DEFAULT_FALLBACK_FEE = 0 = disabled),
 %% returned as sat/vB. Env BEAMCHAIN_FALLBACKFEE overrides config `fallbackfee=`.
+%% An unparsable value is refused at startup (check_fallbackfee/0 from init/1),
+%% so reaching the error clause here means the startup gate was bypassed.
 -spec fallbackfee_satvb() -> number().
 fallbackfee_satvb() ->
+    case fallbackfee_sat_kvb() of
+        {ok, SatKvb} -> SatKvb / 1000;
+        {error, Msg} -> error({invalid_fallbackfee, Msg})
+    end.
+
+%% {ok, sat/kvB} | {error, Core's startup error text}.
+fallbackfee_sat_kvb() ->
     Raw = case os:getenv("BEAMCHAIN_FALLBACKFEE") of
-        false -> get(fallbackfee, "0");
+        false -> get(fallbackfee, undefined);
         V -> V
     end,
-    parse_fallbackfee(Raw).
-
-parse_fallbackfee(V) when is_number(V), V > 0 -> V * 100000;
-parse_fallbackfee(V) when is_list(V) ->
-    case string:to_float(V) of
-        {F, []} -> parse_fallbackfee(F);
+    case Raw of
+        undefined -> {ok, 0};
         _ ->
-            case string:to_integer(V) of
-                {I, []} -> parse_fallbackfee(I);
-                _ -> 0
+            case parse_money(Raw) of
+                {ok, Sat} -> {ok, Sat};
+                error ->
+                    {error, iolist_to_binary(
+                              io_lib:format("Invalid amount for -fallbackfee=<amount>: '~ts'",
+                                            [Raw]))}
+            end
+    end.
+
+%% @doc Core wallet.cpp startup handling of -fallbackfee: an amount ParseMoney
+%% refuses stops startup; one above HIGH_TX_FEE_PER_KB (0.01 BTC/kvB) is kept
+%% and only warned about.
+-spec check_fallbackfee() -> ok | {warning, binary()} | {error, binary()}.
+check_fallbackfee() ->
+    case fallbackfee_sat_kvb() of
+        {error, _} = E -> E;
+        {ok, Sat} when Sat > ?HIGH_TX_FEE_PER_KB ->
+            {warning, <<"-fallbackfee is set very high! This is the transaction "
+                        "fee you may pay when fee estimates are not available.">>};
+        {ok, _} -> ok
+    end.
+
+%% @doc Core ParseMoney (util/moneystr.cpp): BTC string -> satoshis. Trims
+%% " \f\n\r\t\v"; then only digits with at most one '.', at most 8 decimals,
+%% at most 10 whole digits, and a result inside MoneyRange (0..21e6 BTC).
+%% No sign, no exponent, no internal space. "." / "1." / ".5" are accepted.
+-spec parse_money(string() | binary()) -> {ok, non_neg_integer()} | error.
+parse_money(B) when is_binary(B) -> parse_money(binary_to_list(B));
+parse_money(S) when is_list(S) ->
+    case lists:member(0, S) of
+        true -> error;
+        false ->
+            case money_trim(S) of
+                "" -> error;
+                T -> money_whole(T, [])
             end
     end;
-parse_fallbackfee(_) -> 0.
+parse_money(_) -> error.
+
+money_trim(S) ->
+    IsWs = fun(C) -> lists:member(C, " \f\n\r\t\v") end,
+    lists:reverse(lists:dropwhile(IsWs,
+                                  lists:reverse(lists:dropwhile(IsWs, S)))).
+
+money_whole([$. | T], W) -> money_frac(T, W, 0, 10000000);
+money_whole([C | T], W) when C >= $0, C =< $9 -> money_whole(T, [C | W]);
+money_whole([_ | _], _) -> error;
+money_whole([], W) -> money_finish(lists:reverse(W), 0).
+
+money_frac([C | T], W, U, M) when C >= $0, C =< $9, M > 0 ->
+    money_frac(T, W, U + M * (C - $0), M div 10);
+money_frac([], W, U, _) -> money_finish(lists:reverse(W), U);
+money_frac(_, _, _, _) -> error.
+
+money_finish(W, _) when length(W) > 10 -> error;
+money_finish(W, U) ->
+    Whole = case W of [] -> 0; _ -> list_to_integer(W) end,
+    V = Whole * 100000000 + U,
+    case V =< 21000000 * 100000000 of
+        true -> {ok, V};
+        false -> error
+    end.
 
 txindex_conf_value(V) when V =:= "1"; V =:= "true"; V =:= 1; V =:= true ->
     true;
@@ -785,7 +851,17 @@ init([]) ->
         datadir = DataDir,
         config_map = ConfigMap
     },
-    {ok, State}.
+    %% Core wallet.cpp refuses to start on an unparsable -fallbackfee.
+    case check_fallbackfee() of
+        ok -> {ok, State};
+        {warning, Warn} ->
+            logger:warning("~ts", [Warn]),
+            io:format(standard_error, "Warning: ~ts~n", [Warn]),
+            {ok, State};
+        {error, Msg} ->
+            io:format(standard_error, "Error: ~ts~n", [Msg]),
+            {stop, {invalid_fallbackfee, Msg}}
+    end.
 
 handle_call({get, Key, Default}, _From, State) ->
     Value = case ets:lookup(?CONFIG_TABLE, Key) of

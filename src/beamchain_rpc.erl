@@ -78,7 +78,7 @@
 %% Test-only exports — confirmations helpers (Pattern C1 regression tests).
 -ifdef(TEST).
 -export([confirmations/1, confirmations/2, is_block_in_active_chain/1]).
--export([wallet_default_fee_rate/0]).
+-export([wallet_default_fee_rate/1, wallet_min_fee_rate/3]).
 %% Test-only export — gettxout result builder. Core ALWAYS emits bestblock +
 %% confirmations (rpc/blockchain.cpp gettxout); the regression test asserts the
 %% two formerly-stripped fields are present, in Core's pushKV order, with
@@ -3944,6 +3944,8 @@ rpc_decoderawtransaction(_) ->
 -define(DEFAULT_MAX_RAW_TX_FEE_RATE, 10000000).
 %% Core DEFAULT_TX_CONFIRM_TARGET (wallet/wallet.h).
 -define(WALLET_CONF_TARGET, 6).
+%% Core DEFAULT_TRANSACTION_MINFEE (wallet/wallet.h), sat/kvB: CWallet::m_min_fee.
+-define(WALLET_MIN_TX_FEE, 1000).
 
 rpc_sendrawtransaction([HexStr]) when is_binary(HexStr) ->
     rpc_sendrawtransaction([HexStr, ?DEFAULT_MAX_RAW_TX_FEE_RATE / 100000000.0]);
@@ -10298,25 +10300,52 @@ send_validate_destinations(OutMaps) ->
       end, OutMaps).
 
 send_fee_rate([_, _, FR | _]) when is_number(FR) -> FR;
-send_fee_rate(_) -> wallet_default_fee_rate().
+%% Core send() funds through FundTransaction, which reports a
+%% CreateTransaction failure as RPC_WALLET_ERROR (-4).
+send_fee_rate(_) -> wallet_default_fee_rate(?RPC_WALLET_ERROR).
 
-%% Core GetMinimumFeeRate (wallet/fees.cpp): fee estimator first; when it has
-%% no data use -fallbackfee; with neither, fail -6 (RPC_WALLET_ERROR).
-wallet_default_fee_rate() ->
+%% Wallet fee rate (sat/vB) when the caller gave none. ErrCode is the code the
+%% calling RPC reports the "fallback disabled" failure under in Core: -6
+%% (RPC_WALLET_INSUFFICIENT_FUNDS) from sendtoaddress/sendmany via SendMoney,
+%% -4 (RPC_WALLET_ERROR) from send/fundrawtransaction via FundTransaction.
+wallet_default_fee_rate(ErrCode) ->
     Est = try beamchain_fee_estimator:estimate_fee(?WALLET_CONF_TARGET)
           catch _:_ -> {error, no_estimator}
           end,
-    case Est of
-        {ok, Rate} when is_number(Rate), Rate > 0 ->
-            Rate;
-        _ ->
-            case beamchain_config:fallbackfee_satvb() of
-                Fb when Fb > 0 -> Fb;
-                _ ->
-                    throw({rpc_error, ?RPC_WALLET_INSUFFICIENT_FUNDS,
-                           <<"Fee estimation failed. Fallbackfee is disabled. "
-                             "Wait a few blocks or enable -fallbackfee.">>})
-            end
+    Fallback = case Est of
+        {ok, R} when is_number(R), R > 0 -> 0;
+        _ -> beamchain_config:fallbackfee_satvb()
+    end,
+    case wallet_min_fee_rate(Est, Fallback, wallet_mempool_min_fee()) of
+        {ok, Rate} -> Rate;
+        fallback_disabled ->
+            throw({rpc_error, ErrCode,
+                   <<"Fee estimation failed. Fallbackfee is disabled. "
+                     "Wait a few blocks or enable -fallbackfee.">>})
+    end.
+
+%% Core GetMinimumFeeRate (wallet/fees.cpp), all rates sat/vB: the estimate,
+%% else -fallbackfee; a zero fallback returns at once (the caller errors);
+%% otherwise raise to the mempool minimum fee, then to the required fee
+%% (max of the wallet minimum fee and the relay minimum).
+wallet_min_fee_rate(Est, Fallback, MempoolMin) ->
+    Needed = case Est of
+        {ok, R} when is_number(R), R > 0 -> R;
+        _ -> Fallback
+    end,
+    case Needed > 0 of
+        false -> fallback_disabled;
+        true ->
+            Required = max(?WALLET_MIN_TX_FEE, ?DEFAULT_MIN_RELAY_TX_FEE) / 1000,
+            {ok, max(max(Needed, MempoolMin), Required)}
+    end.
+
+%% Core chain().mempoolMinFee(): max(mempool GetMinFee, -minrelaytxfee), sat/vB.
+wallet_mempool_min_fee() ->
+    Relay = ?DEFAULT_MIN_RELAY_TX_FEE / 1000,
+    case catch beamchain_mempool:get_info() of
+        #{min_fee := F} when is_number(F) -> max(F, Relay);
+        _ -> Relay
     end.
 
 do_send(Pid, OutMaps, FeeRate, WalletName) ->
@@ -10864,8 +10893,9 @@ rpc_sendtoaddress_spend(Address, AmountBtc, Pid) ->
                 {ok, TipHeight} -> beamchain_wallet:get_spendable_utxos(TipHeight);
                 not_found       -> beamchain_wallet:get_wallet_utxos()
             end,
-            %% Fee rate (sat/vB): estimator, else -fallbackfee, else -6 (Core).
-            FeeRate = wallet_default_fee_rate(),
+            %% Fee rate (sat/vB): estimator, else -fallbackfee, else -6
+            %% (Core SendMoney maps the CreateTransaction failure to -6).
+            FeeRate = wallet_default_fee_rate(?RPC_WALLET_INSUFFICIENT_FUNDS),
             case beamchain_wallet:select_coins(Amount, FeeRate,
                                                exclude_mempool_spent(Utxos)) of
                 {ok, Selected, Change} ->
