@@ -333,6 +333,18 @@ parse_args(["-blockfilterindex" | Rest], Cmd, Opts) ->
 parse_args(["--blockfilterindex" | Rest], Cmd, Opts) ->
     parse_args(Rest, Cmd, Opts#{cfilter => 1});
 
+%% Core `-fallbackfee=<BTC/kvB>` (default 0 = disabled). Routed through
+%% BEAMCHAIN_FALLBACKFEE by apply_opts/1; needed by tools/regtest-harness.sh
+%% --r5-lane (`--fallbackfee=0.0002`), else the unknown-option clause halts.
+parse_args(["-fallbackfee=" ++ V | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{fallbackfee => V});
+parse_args(["--fallbackfee=" ++ V | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{fallbackfee => V});
+parse_args(["-fallbackfee", V | Rest], Cmd, Opts) when V =/= [], hd(V) =/= $- ->
+    parse_args(Rest, Cmd, Opts#{fallbackfee => V});
+parse_args(["--fallbackfee", V | Rest], Cmd, Opts) when V =/= [], hd(V) =/= $- ->
+    parse_args(Rest, Cmd, Opts#{fallbackfee => V});
+
 %% --txindex[=0|1]: maintain the transaction index (default off, matching
 %% Core -txindex / DEFAULT_TXINDEX=false). Bare --txindex == on. Routed
 %% through BEAMCHAIN_TXINDEX by apply_opts/1, so an explicit flag wins over
@@ -466,6 +478,8 @@ print_usage() ->
         "  --cfilter=<n>     BIP-157/158 compact block filter index~n"
         "                    (0=off, 1=basic; mirrors Core -blockfilterindex)~n"
         "  -blockfilterindex[=basic]  alias for --cfilter=1 (Core spelling)~n"
+        "  -fallbackfee=<btc/kvB> fee rate used when estimation has no data~n"
+        "                    (default 0 = disabled, like Core)~n"
         "  --txindex[=n]     maintain a full transaction index, used by~n"
         "                    getrawtransaction without a blockhash~n"
         "                    (0=off default, 1=on; mirrors Core -txindex)~n"
@@ -1000,6 +1014,10 @@ apply_opts(Opts) ->
         undefined -> ok;
         0 -> os:putenv("BEAMCHAIN_COINSTATSINDEX", "0");
         1 -> os:putenv("BEAMCHAIN_COINSTATSINDEX", "1")
+    end,
+    case maps:get(fallbackfee, Opts, undefined) of
+        undefined -> ok;
+        FbFee -> os:putenv("BEAMCHAIN_FALLBACKFEE", FbFee)
     end,
     %% --txindex: route through BEAMCHAIN_TXINDEX (txindex_enabled/0 reads the
     %% env var first). Overwrites an inherited value: the flag is explicit.

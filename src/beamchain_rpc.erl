@@ -78,6 +78,7 @@
 %% Test-only exports — confirmations helpers (Pattern C1 regression tests).
 -ifdef(TEST).
 -export([confirmations/1, confirmations/2, is_block_in_active_chain/1]).
+-export([wallet_default_fee_rate/0]).
 %% Test-only export — gettxout result builder. Core ALWAYS emits bestblock +
 %% confirmations (rpc/blockchain.cpp gettxout); the regression test asserts the
 %% two formerly-stripped fields are present, in Core's pushKV order, with
@@ -3941,6 +3942,8 @@ rpc_decoderawtransaction(_) ->
 
 %% Default max fee rate: 0.10 BTC/kvB = 10,000,000 sat/kvB
 -define(DEFAULT_MAX_RAW_TX_FEE_RATE, 10000000).
+%% Core DEFAULT_TX_CONFIRM_TARGET (wallet/wallet.h).
+-define(WALLET_CONF_TARGET, 6).
 
 rpc_sendrawtransaction([HexStr]) when is_binary(HexStr) ->
     rpc_sendrawtransaction([HexStr, ?DEFAULT_MAX_RAW_TX_FEE_RATE / 100000000.0]);
@@ -10246,10 +10249,13 @@ rpc_send([Outputs | Rest], WalletName) ->
         {ok, []} ->
             {error, ?RPC_INVALID_PARAMETER, <<"No destination specified">>};
         {ok, OutMaps} ->
-            FeeRate = send_fee_rate(Rest),
             case resolve_wallet(WalletName) of
                 {ok, Pid} ->
                     try
+                        %% Core parses/validates destinations before it
+                        %% resolves the fee rate: bad address -> -5 first.
+                        send_validate_destinations(OutMaps),
+                        FeeRate = send_fee_rate(Rest),
                         do_send(Pid, OutMaps, FeeRate, WalletName)
                     catch
                         throw:{send_error, C, M} -> {error, C, M};
@@ -10273,8 +10279,45 @@ normalize_send_outputs(Map) when is_map(Map) ->
 normalize_send_outputs(_) ->
     {error, ?RPC_TYPE_ERROR, <<"Invalid outputs">>}.
 
+send_validate_destinations(OutMaps) ->
+    Network = cfg_network(),
+    lists:foreach(
+      fun(M) ->
+          lists:foreach(
+            fun(<<"data">>) -> ok;
+               (Addr) when is_binary(Addr) ->
+                   case beamchain_address:address_to_script(
+                            binary_to_list(Addr), Network) of
+                       {ok, _} -> ok;
+                       {error, _} ->
+                           throw({rpc_error, ?RPC_INVALID_ADDRESS_OR_KEY,
+                                  <<"Invalid Bitcoin address: ", Addr/binary>>})
+                   end;
+               (_) -> ok
+            end, maps:keys(M))
+      end, OutMaps).
+
 send_fee_rate([_, _, FR | _]) when is_number(FR) -> FR;
-send_fee_rate(_) -> 5.
+send_fee_rate(_) -> wallet_default_fee_rate().
+
+%% Core GetMinimumFeeRate (wallet/fees.cpp): fee estimator first; when it has
+%% no data use -fallbackfee; with neither, fail -6 (RPC_WALLET_ERROR).
+wallet_default_fee_rate() ->
+    Est = try beamchain_fee_estimator:estimate_fee(?WALLET_CONF_TARGET)
+          catch _:_ -> {error, no_estimator}
+          end,
+    case Est of
+        {ok, Rate} when is_number(Rate), Rate > 0 ->
+            Rate;
+        _ ->
+            case beamchain_config:fallbackfee_satvb() of
+                Fb when Fb > 0 -> Fb;
+                _ ->
+                    throw({rpc_error, ?RPC_WALLET_INSUFFICIENT_FUNDS,
+                           <<"Fee estimation failed. Fallbackfee is disabled. "
+                             "Wait a few blocks or enable -fallbackfee.">>})
+            end
+    end.
 
 do_send(Pid, OutMaps, FeeRate, WalletName) ->
     Options = #{<<"fee_rate">> => FeeRate},
@@ -10821,15 +10864,10 @@ rpc_sendtoaddress_spend(Address, AmountBtc, Pid) ->
                 {ok, TipHeight} -> beamchain_wallet:get_spendable_utxos(TipHeight);
                 not_found       -> beamchain_wallet:get_wallet_utxos()
             end,
-            %% Fee rate (sat/vB) used for coin-selection's fee reservation.
-            %% The select_coins vsize model slightly undershoots the true tx
-            %% size, so at exactly the 1 sat/vB relay floor the resulting fee
-            %% rounds just under min-relay and the broadcast is rejected with
-            %% "mempool min fee not met".  Use a modest default above the floor
-            %% (Core's wallet likewise pads above min-relay) so a default send
-            %% reliably clears relay; regtest fees are inconsequential.
-            FeeRate = 5,
-            case beamchain_wallet:select_coins(Amount, FeeRate, Utxos) of
+            %% Fee rate (sat/vB): estimator, else -fallbackfee, else -6 (Core).
+            FeeRate = wallet_default_fee_rate(),
+            case beamchain_wallet:select_coins(Amount, FeeRate,
+                                               exclude_mempool_spent(Utxos)) of
                 {ok, Selected, Change} ->
                     %% Build and sign transaction
                     Outputs = [{binary_to_list(Address), Amount}],
@@ -14588,6 +14626,18 @@ wcfp_fee_rate(Options) ->
             end
     end.
 
+%% Core's wallet treats a coin spent by an in-mempool tx as spent
+%% (CWallet::IsSpent / mapTxSpends). The wallet UTXO ledger only updates on
+%% block connect, so without this a second send re-selects the first send's
+%% input and goes out as an RBF replacement that fails at a higher fee rate.
+exclude_mempool_spent(Utxos) ->
+    [U || {Txid, Vout, _} = U <- Utxos,
+          try beamchain_mempool:find_spending_tx(Txid, Vout) of
+              not_found -> true;
+              {ok, _}   -> false
+          catch _:_ -> true
+          end].
+
 wcfp_select_coins(Pid, ManualInputs, OutputTotal, FeeRate) ->
     %% Wallet-owned UTXOs minus the manual inputs and any locked coins.
     %% Use the maturity-filtered spendable set so auto coin-selection never
@@ -14607,7 +14657,7 @@ wcfp_select_coins(Pid, ManualInputs, OutputTotal, FeeRate) ->
         Key = {Txid, Vout},
         not lists:member(Key, ManualKeys)
             andalso not sets:is_element(Key, Locked)
-    end, All),
+    end, exclude_mempool_spent(All)),
     %% Subtract manual inputs from the target so coin-selection tops up.
     ManualValue = lists:sum([U#utxo.value || {_, _, U} <- ManualInputs]),
     EffectiveTarget = max(OutputTotal - ManualValue, 0),

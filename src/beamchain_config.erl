@@ -16,6 +16,7 @@
          datadir/0,
          magic/0,
          txindex_enabled/0,
+         fallbackfee_satvb/0,
          prune_enabled/0,
          prune_target/0,
          prune_manual_mode/0,
@@ -157,6 +158,28 @@ txindex_enabled() ->
         false -> txindex_conf_value(get(txindex, "0"));
         V -> txindex_conf_value(V)
     end.
+
+%% @doc Core `-fallbackfee` (BTC/kvB, DEFAULT_FALLBACK_FEE = 0 = disabled),
+%% returned as sat/vB. Env BEAMCHAIN_FALLBACKFEE overrides config `fallbackfee=`.
+-spec fallbackfee_satvb() -> number().
+fallbackfee_satvb() ->
+    Raw = case os:getenv("BEAMCHAIN_FALLBACKFEE") of
+        false -> get(fallbackfee, "0");
+        V -> V
+    end,
+    parse_fallbackfee(Raw).
+
+parse_fallbackfee(V) when is_number(V), V > 0 -> V * 100000;
+parse_fallbackfee(V) when is_list(V) ->
+    case string:to_float(V) of
+        {F, []} -> parse_fallbackfee(F);
+        _ ->
+            case string:to_integer(V) of
+                {I, []} -> parse_fallbackfee(I);
+                _ -> 0
+            end
+    end;
+parse_fallbackfee(_) -> 0.
 
 txindex_conf_value(V) when V =:= "1"; V =:= "true"; V =:= 1; V =:= true ->
     true;
