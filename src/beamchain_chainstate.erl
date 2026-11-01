@@ -2173,6 +2173,7 @@ do_submit_block_unfailed(#block{header = Header} = Block, MinPowChecked,
                             %% evaluation needed.
                             {ok, active, State2};
                         {error, Reason} ->
+                            index_failed_tip_extension(Block, Reason, State),
                             {error, Reason}
                     end;
                 false ->
@@ -2183,6 +2184,62 @@ do_submit_block_unfailed(#block{header = Header} = Block, MinPowChecked,
         {error, _} = Err ->
             Err
     end.
+
+%% A submitted block extending the active tip failed to connect.  Core
+%% (validation.cpp) has already indexed it by then: AcceptBlock (:4298) runs
+%% AcceptBlockHeader -> AddToBlockIndex (:4233) and writes the body (:4373)
+%% before ConnectTip, and a verdict from CheckBlock/ContextualCheckBlock
+%% (:4349) or ConnectBlock (:3043) goes to InvalidBlockFound (:1988), which
+%% sets BLOCK_FAILED_VALID unless the result is BLOCK_MUTATED.  So keep the
+%% block as a failed side-branch entry: getchaintips lists it `invalid`, and a
+%% resubmit answers duplicate-invalid (failed_block_or_parent/1).
+%%
+%% Only a verdict about the block body (beamchain_block_sync's allow-list)
+%% does this.  A header verdict leaves no entry, as in Core, where
+%% CheckBlockHeader / ContextualCheckBlockHeader fail in AcceptBlockHeader
+%% before AddToBlockIndex (:4224).  A mutated body, a missing parent, or a
+%% local fault is not a verdict and marks nothing.
+index_failed_tip_extension(#block{header = Header} = Block, Reason,
+                           #state{tip_height = TipHeight} = State) ->
+    case is_body_verdict(Reason) of
+        false ->
+            ok;
+        true ->
+            BlockHash = beamchain_serialize:block_hash(Header),
+            case build_prev_index(State) of
+                {ok, PrevIndex} ->
+                    PrevCWInt = binary:decode_unsigned(
+                                  maps:get(chainwork, PrevIndex, <<0:256>>),
+                                  big),
+                    BlockWork = beamchain_pow:compute_work(
+                                  Header#block_header.bits),
+                    NewCW = encode_chainwork(PrevCWInt + BlockWork),
+                    case persist_side_branch_block(Block, BlockHash,
+                                                   TipHeight + 1, NewCW) of
+                        ok ->
+                            do_invalid_block_found(BlockHash);
+                        Err ->
+                            logger:warning("chainstate: could not index "
+                                           "rejected block ~s: ~p",
+                                           [hash_hex(BlockHash), Err]),
+                            ok
+                    end;
+                not_found ->
+                    ok
+            end
+    end.
+
+is_body_verdict({check_block_failed, R}) ->
+    is_body_verdict(R);
+is_body_verdict(R) ->
+    not is_header_verdict(R) andalso
+        beamchain_block_sync:is_consensus_verdict(R).
+
+%% CheckBlockHeader (high-hash) and ContextualCheckBlockHeader (bad-diffbits,
+%% time-too-old, time-timewarp-attack) verdicts.
+is_header_verdict(R) ->
+    lists:member(R, [high_hash, bad_diffbits, time_too_old,
+                     time_timewarp_attack]).
 
 %% Header-only acceptance, mirroring Bitcoin Core AcceptBlockHeader
 %% (validation.cpp).  Used by the submitheader RPC.  No body, no UTXO
