@@ -948,6 +948,7 @@ handle_method(<<"verifychain">>, P, _W) -> rpc_verifychain(P);
 handle_method(<<"getblockfilter">>, P, _W) -> rpc_getblockfilter(P);
 handle_method(<<"getindexinfo">>, P, _W) -> rpc_getindexinfo(P);
 handle_method(<<"invalidateblock">>, P, _W) -> rpc_invalidateblock(P);
+handle_method(<<"setmocktime">>, P, _W) -> rpc_setmocktime(P);
 handle_method(<<"reconsiderblock">>, P, _W) -> rpc_reconsiderblock(P);
 handle_method(<<"preciousblock">>, P, _W) -> rpc_preciousblock(P);
 handle_method(<<"flushchainstate">>, _, _W) -> rpc_flushchainstate();
@@ -1301,6 +1302,37 @@ rpc_uptime() ->
     StartTime = gen_server:call(?SERVER, get_start_time),
     Now = erlang:system_time(second),
     {ok, Now - StartTime}.
+
+%% @doc setmocktime - set the node clock (regtest only), 0 restores system time.
+%% Mirrors bitcoin-core/src/rpc/node.cpp setmocktime (a "hidden" command, so
+%% it is deliberately absent from the help listing). The value feeds the same
+%% `beamchain_mocktime' persistent_term that beamchain_validation:adjusted_time_now/0
+%% reads, the analogue of Core's SetMockTime/GetTime.
+rpc_setmocktime([Time]) when is_integer(Time) ->
+    case beamchain_config:network() of
+        regtest ->
+            Max = 9223372036,   %% Ticks<seconds>(nanoseconds::max())
+            if
+                Time < 0 orelse Time > Max ->
+                    {error, ?RPC_INVALID_PARAMETER,
+                     iolist_to_binary(
+                       io_lib:format("Mocktime must be in the range [0, ~B], not ~B.",
+                                     [Max, Time]))};
+                Time =:= 0 ->
+                    persistent_term:erase(beamchain_mocktime),
+                    {ok, null};
+                true ->
+                    persistent_term:put(beamchain_mocktime, Time),
+                    {ok, null}
+            end;
+        _ ->
+            {error, ?RPC_MISC_ERROR,
+             <<"setmocktime is for regression testing (-regtest mode) only">>}
+    end;
+rpc_setmocktime([_]) ->
+    {error, -3, <<"JSON value is not an integer as expected">>};
+rpc_setmocktime(_) ->
+    {error, ?RPC_INVALID_PARAMS, <<"Usage: setmocktime timestamp">>}.
 
 %%% ===================================================================
 %%% Blockchain methods
