@@ -24,6 +24,7 @@
 %% assert the decode/validate SPLIT without standing up the miner gen_server.
 -export([decode_block_hex/1]).
 -export([build_gbt_rules_and_vbavailable/2]).
+-export([topological_sort/1]).
 %% Exported for testing: the GBT default_witness_commitment script and the
 %% coinbase builder it is checked against.
 -export([gbt_default_witness_commitment/2, build_coinbase/5]).
@@ -780,7 +781,7 @@ greedy_select([Entry | Rest], MaxW, MaxS, LockTimeCutoff, Height, Seen, Acc,
                                     end, Seen2, AllNew),
                                     greedy_select(
                                         Rest, MaxW, MaxS, LockTimeCutoff, Height, Seen3,
-                                        AllNew ++ Acc,
+                                        lists:reverse(AllNew) ++ Acc,
                                         Fees + Entry#mempool_entry.fee + ParentFees,
                                         NewWeight, NewSigops, 0)
                             end
@@ -835,39 +836,28 @@ topological_sort(Entries) ->
     TxMap = maps:from_list(
         [{E#mempool_entry.txid, E} || E <- Entries]),
     TxidSet = sets:from_list(maps:keys(TxMap), [{version, 2}]),
+    %% Depth-first in input order: each entry is emitted right after its
+    %% in-block parents, so an input that is already parent-first comes out
+    %% unchanged.  Core's getblocktemplate lists transactions in the order the
+    %% block assembler added them (best chunk feerate first); ordering by txid
+    %% here made beamchain's template differ from Core's for the same mempool.
+    {_Done, Acc} = lists:foldl(fun(E, State) ->
+        topo_visit(E, TxMap, TxidSet, State)
+    end, {sets:new([{version, 2}]), []}, Entries),
+    lists:reverse(Acc).
 
-    %% Build in-degree map and children adjacency
-    {InDegree, Children} = lists:foldl(fun(E, {InD, Ch}) ->
-        Txid = E#mempool_entry.txid,
-        Parents = in_block_parents(E#mempool_entry.tx, TxidSet),
-        InD2 = maps:put(Txid, length(Parents), InD),
-        Ch2 = lists:foldl(fun(P, C) ->
-            maps:update_with(P,
-                fun(Existing) -> [Txid | Existing] end,
-                [Txid], C)
-        end, Ch, Parents),
-        {InD2, Ch2}
-    end, {#{}, #{}}, Entries),
-
-    %% Start with zero in-degree nodes
-    Queue = [Txid || Txid <- maps:keys(TxMap),
-                     maps:get(Txid, InDegree, 0) =:= 0],
-    topo_loop(Queue, InDegree, Children, TxMap, []).
-
-topo_loop([], _InDegree, _Children, _TxMap, Acc) ->
-    lists:reverse(Acc);
-topo_loop([Txid | Rest], InDegree, Children, TxMap, Acc) ->
-    Entry = maps:get(Txid, TxMap),
-    ChildList = maps:get(Txid, Children, []),
-    {NewQueue, InDegree2} = lists:foldl(fun(Child, {Q, ID}) ->
-        NewDeg = maps:get(Child, ID, 1) - 1,
-        ID2 = maps:put(Child, NewDeg, ID),
-        case NewDeg of
-            0 -> {Q ++ [Child], ID2};
-            _ -> {Q, ID2}
-        end
-    end, {Rest, InDegree}, ChildList),
-    topo_loop(NewQueue, InDegree2, Children, TxMap, [Entry | Acc]).
+topo_visit(E, TxMap, TxidSet, {Done, Acc} = State) ->
+    Txid = E#mempool_entry.txid,
+    case sets:is_element(Txid, Done) of
+        true -> State;
+        false ->
+            Done1 = sets:add_element(Txid, Done),
+            {Done2, Acc2} = lists:foldl(fun(P, St) ->
+                topo_visit(maps:get(P, TxMap), TxMap, TxidSet, St)
+            end, {Done1, Acc},
+                in_block_parents(E#mempool_entry.tx, TxidSet)),
+            {Done2, [E | Acc2]}
+    end.
 
 %% Get parent txids of a tx that are in the selected set.
 in_block_parents(#transaction{inputs = Inputs}, TxidSet) ->
