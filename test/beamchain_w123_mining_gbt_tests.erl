@@ -285,16 +285,11 @@ g19_is_final_tx_per_entry_test() ->
 %%% ===================================================================
 
 %% G20 [P0] duplicate-block detection (already-valid / failed / inconclusive)
-%% — MISSING for active-chain dup.
-%% Core uses new_block out-param + submitblock_StateCatcher.
-%% beamchain's do_submit_block has no LookupBlockIndex(block.hash) gate
-%% before do_connect_block; an active-chain dup tries to reconnect a
-%% block whose UTXOs are already spent and the rejection reason is
-%% wrong.  Side-branch dup → "inconclusive" is correctly wired.
+%% — FIXED.  A block whose body is already stored (active or side branch)
+%% answers "duplicate", Core's `!new_block && accepted`; exercised end to end
+%% in beamchain_submit_duplicate_tests.
 g20_submitblock_active_chain_dup_no_precheck_test() ->
-    ActiveChainDupReturnsDuplicate = false,  %% MISSING
-    ?assertNot(ActiveChainDupReturnsDuplicate),
-    %% Side-branch dup correctness is preserved:
+    ?assertEqual(<<"duplicate">>, beamchain_rpc:bip22_result(duplicate)),
     ?assertEqual(<<"inconclusive">>,
                  beamchain_rpc:bip22_result(inconclusive)).
 
@@ -306,13 +301,11 @@ g21_submitblock_no_update_uncommitted_test() ->
     UpdateUncommittedCalled = false,  %% MISSING
     ?assertNot(UpdateUncommittedCalled).
 
-%% G22 [P0] !new_block && accepted → "duplicate" — MISSING.
+%% G22 [P0] !new_block && accepted → "duplicate" — FIXED.
+%% beamchain_chainstate:submit_block/1 returns {ok, duplicate} for a block
+%% already stored; see beamchain_submit_duplicate_tests.
 g22_submitblock_new_block_flag_missing_test() ->
-    %% beamchain_chainstate:submit_block/1 returns
-    %% {ok, active | reorg | side_branch} but never the equivalent of
-    %% "already known but processed cleanly".
-    NewBlockFlagDistinguished = false,  %% MISSING
-    ?assertNot(NewBlockFlagDistinguished).
+    ?assertEqual(<<"duplicate">>, beamchain_rpc:bip22_result(duplicate)).
 
 %% G23 [P0] BIP22ValidationResult canonical strings — PRESENT.
 g23_bip22_result_canonical_strings_test() ->

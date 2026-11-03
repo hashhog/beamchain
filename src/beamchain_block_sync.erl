@@ -1794,6 +1794,9 @@ validate_and_connect(Height, Block,
                     {ok, active}      -> active;
                     {ok, reorg}       -> reorg;
                     {ok, side_branch} -> side_branch;
+                    %% Already stored, tip unchanged: same no-op as before
+                    %% submit_block told the two apart.
+                    {ok, duplicate}   -> side_branch;
                     {error, E2}       -> throw(E2)
                 end
         end,
