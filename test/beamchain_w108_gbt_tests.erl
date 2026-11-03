@@ -432,14 +432,13 @@ gbt_coinbase_height_256_no_padding_test() ->
 %%%===================================================================
 
 gbt_submitblock_duplicate_check_absent_test() ->
-    %% Core: LookupBlockIndex(hash) → if found → return "duplicate" or variant.
-    %% beamchain: do_submit_block goes straight to check_block + submit_block.
-    DuplicateCheckBeforeProcess = false,
-    ?assertNot(DuplicateCheckBeforeProcess).
+    %% FIXED: an already-stored block answers "duplicate" (Core AcceptBlock
+    %% fAlreadyHave -> submitblock `!new_block && accepted`); exercised end
+    %% to end in beamchain_submit_duplicate_tests.
+    ?assertEqual(<<"duplicate">>, beamchain_rpc:bip22_result(duplicate)).
 
-%% The bip22_result mapping for 'duplicate' is present (used for side-branch
-%% inconclusive path), but the entry-point never returns it for an already-known
-%% identical block.
+%% The bip22_result mapping for 'duplicate'; the submit path now returns it
+%% for an already-known identical block.
 gbt_bip22_result_duplicate_mapping_test() ->
     %% Verify the atom→string mapping exists for 'duplicate'.
     ?assertEqual(<<"duplicate">>, beamchain_rpc:bip22_result(duplicate)).

@@ -587,6 +587,11 @@ do_submit_decoded_block(Block) ->
                         logger:info("miner: accepted block ~s (~p)",
                                     [short_hex(BlockHash), Outcome]),
                         ok;
+                    {ok, duplicate} ->
+                        %% Body already stored, tip unchanged: Core
+                        %% submitblock's `!new_block && accepted` ->
+                        %% "duplicate" (rpc/mining.cpp:1097-1099).
+                        {error, duplicate};
                     {ok, side_branch} ->
                         %% Block stored as side-branch — no tip flip,
                         %% no mempool churn, no broadcast.  Surface as

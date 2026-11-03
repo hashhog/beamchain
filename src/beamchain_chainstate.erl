@@ -435,8 +435,10 @@ reorganize(NewBlocks) ->
 %% this gen_server is get_mtp/0's stale-entry fallback (5 s timeout, the
 %% mempool refuses that tx as a system fault and carries on), so the
 %% chainstate -> mempool call cannot deadlock.
--spec submit_block(#block{}) -> {ok, active | side_branch | reorg} |
-                                {error, term()}.
+%% `duplicate`: the body was already stored and the tip did not move (Core
+%% submitblock's "duplicate", rpc/mining.cpp:1097-1099).
+-spec submit_block(#block{}) ->
+    {ok, active | side_branch | reorg | duplicate} | {error, term()}.
 submit_block(Block) ->
     submit_block(Block, false).
 
@@ -460,7 +462,7 @@ submit_block(Block) ->
 %% with too_little_chainwork.  MinPowChecked = false keeps the existing
 %% behaviour for the p2p path.
 -spec submit_block(#block{}, boolean()) ->
-    {ok, active | side_branch | reorg} | {error, term()}.
+    {ok, active | side_branch | reorg | duplicate} | {error, term()}.
 submit_block(Block, MinPowChecked) when is_boolean(MinPowChecked) ->
     case gen_server:call(?SERVER, {submit_block, Block, MinPowChecked}, 300000) of
         {ok, reorg, _DisconnectedTxs} ->
@@ -2414,11 +2416,20 @@ do_side_branch_accept_unfailed(#block{header = Header} = Block,
     %% blocker).  Checking HAVE_DATA lets the body-arrival run the reorg
     %% evaluation while still being idempotent for genuinely-connected
     %% blocks.
+    %% Core AcceptBlock (validation.cpp:4318,4335) returns early for
+    %% fAlreadyHave without setting new_block, and submitblock then answers
+    %% "duplicate" (rpc/mining.cpp:1097-1099).  A side-branch body stored
+    %% earlier counts too: Core gave it BLOCK_HAVE_DATA when it stored it.
+    %% beamchain keeps such bodies at status VALID_TREE (no HAVE_DATA), so
+    %% that path still runs the work comparison below and only an outcome
+    %% that leaves the tip alone is reported as duplicate.
     case block_already_has_body(BlockHash) of
         true ->
             %% Body already stored + connected — genuinely a no-op.
-            {ok, side_branch, State};
+            {ok, duplicate, State};
         false ->
+            StoredBefore = beamchain_db:get_side_branch_index(BlockHash)
+                               =/= not_found,
             ParentHeight = maps:get(height, ParentEntry),
             Height = ParentHeight + 1,
             ParentCW = maps:get(chainwork, ParentEntry, <<0:256>>),
@@ -2456,8 +2467,14 @@ do_side_branch_accept_unfailed(#block{header = Header} = Block,
                             case persist_side_branch_block(
                                    Block, BlockHash, Height, NewCW) of
                                 ok ->
-                                    maybe_reorg_to_side_branch(
-                                      BlockHash, NewCWInt, State);
+                                    case maybe_reorg_to_side_branch(
+                                           BlockHash, NewCWInt, State) of
+                                        {ok, side_branch, State2}
+                                          when StoredBefore ->
+                                            {ok, duplicate, State2};
+                                        Other ->
+                                            Other
+                                    end;
                                 {error, _} = Err ->
                                     Err
                             end;
