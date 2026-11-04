@@ -1265,8 +1265,12 @@ do_add_transaction(Tx, PeerId, State, Opts) ->
         %% which queries the pending changeset; we compute it eagerly from parent
         %% clusters.  This is the ONLY size bound on a cluster and therefore MUST be
         %% present before the ancestor/descendant bounds are dropped below.
+        %% The staged RBF / TRUC evictions are still in the pool, so they
+        %% are subtracted from the cluster (Core evaluates the limits on the
+        %% ChangeSet's staged view).
+        StagedEvictTxids = RbfEvictedTxids ++ TrucEvictedTxids,
         (Bypass andalso not maps:get(enforce_cluster_limits, Opts, false))
-            orelse check_cluster_limits(Tx, AdjWeight),
+            orelse check_cluster_limits(Tx, AdjWeight, StagedEvictTxids),
 
         %% W96 GATE 17: ancestor/descendant STATISTICS (no longer a gate).
         %% Core v31 replaced -limitancestorcount / -limitdescendantcount with the
@@ -1339,6 +1343,10 @@ do_add_transaction(Tx, PeerId, State, Opts) ->
             adj_weight = AdjWeight
         },
 
+        %% 13b. every gate passed: apply the staged RBF / TRUC evictions.
+        %% Must run before insert_entry/1 (see apply_staged_evictions/1).
+        apply_staged_evictions(StagedEvictTxids),
+
         %% 14. insert into all tables
         insert_entry(Entry),
 
@@ -1347,7 +1355,7 @@ do_add_transaction(Tx, PeerId, State, Opts) ->
 
         %% 16. clean up clusters for evicted transactions (RBF + TRUC sibling).
         %% Thread State1 (post GetMinFee decay update) through cluster mutations.
-        AllEvictedTxids = RbfEvictedTxids ++ TrucEvictedTxids,
+        AllEvictedTxids = StagedEvictTxids,
         AllEvictedVBytes = RbfEvictedVBytes + TrucEvictedVBytes,
         State2 = lists:foldl(fun(EvictedTxid, St) ->
             cluster_remove_tx(EvictedTxid, St)
@@ -1493,8 +1501,8 @@ dry_run_atmp(Tx, State) ->
         TxSigopCost =< ?MAX_STANDARD_TX_SIGOPS_COST
             orelse throw({'bad-txns-too-many-sigops', TxSigopCost}),
 
-        %% GATE 10: double-spends / RBF (read-only — conflicts checked,
-        %% no actual eviction performed in dry-run)
+        %% GATE 10: double-spends / RBF.  do_rbf/3 only STAGES the eviction
+        %% (the real path applies it at commit), so a dry run removes nothing.
         {ok, RbfEvictedTxids, _RbfEvictedVBytes} =
             check_mempool_conflicts(Tx, InputCoins, TxSigopCost),
 
@@ -1554,8 +1562,9 @@ dry_run_atmp(Tx, State) ->
 
         %% GATE 16: cluster limits — count + sigop-adjusted WEIGHT (404000 wu).
         %% Mirrors do_add_transaction/3 GATE 16 so testmempoolaccept returns the
-        %% same decision as sendrawtransaction.
-        check_cluster_limits(Tx, AdjWeight),
+        %% same decision as sendrawtransaction, with the staged RBF
+        %% evictions subtracted from the cluster as the real path does.
+        check_cluster_limits(Tx, AdjWeight, RbfEvictedTxids),
 
         %% GATE 17: ancestor/descendant limits REMOVED — Core v31 deprecated
         %% -limitancestorcount/-limitdescendantcount in favour of cluster limits
@@ -2755,22 +2764,39 @@ do_rbf(NewTx, ConflictTxids, SigopCost) ->
     %% This ensures the replacement improves the mempool's fee-rate quality
     check_cluster_rbf_diagram(NewFee, NewVSize, AllEvictTxids),
 
-    %% evict all conflicting txs + descendants
-    %% Collect vbytes before removal for state update
-    EvictedVBytes = lists:foldl(fun(EvictTxid, Acc) ->
-        case remove_entry(EvictTxid) of
-            #mempool_entry{vsize = VS} ->
-                %% RBF replacement: tx left the mempool unmined — drop its
-                %% fee-estimator tracking row (Core removeTx, REPLACED).
-                beamchain_fee_estimator:remove_tx(EvictTxid),
-                Acc + VS;
-            not_found -> Acc
-        end
-    end, 0, AllEvictTxids),
+    %% STAGE the eviction; do not apply it.  The replacement still has to
+    %% pass every later ATMP gate (fee floor, TRUC, cluster limits, BIP68,
+    %% scripts).  Removing the conflicts here let a replacement that failed
+    %% one of those gates -- e.g. an invalid signature, which costs the
+    %% sender nothing -- evict them anyway, and made testmempoolaccept
+    %% (dry_run_atmp/2) evict them too.  Core stages the removals in its
+    %% ChangeSet and applies them only in Finalize (validation.cpp
+    %% StageRemoval / ChangeSet::Apply); do_add_transaction/4 applies them
+    %% via apply_staged_evictions/1 once every gate has passed.
+    EvictedVBytes = lists:foldl(fun(E, Acc) ->
+        Acc + E#mempool_entry.vsize
+    end, 0, AllEvictEntries),
 
-    logger:debug("mempool: rbf evicted ~B txs (fullrbf=~p)",
+    logger:debug("mempool: rbf staged ~B evictions (fullrbf=~p)",
                  [length(AllEvictTxids), FullRbfEnabled]),
     {ok, AllEvictTxids, EvictedVBytes}.
+
+%% @doc Apply evictions staged by do_rbf/3 or do_truc_sibling_eviction/3.
+%% Called only from the commit phase of do_add_transaction/4, after every
+%% gate has passed and BEFORE the replacement is inserted: remove_entry/1
+%% deletes the evicted tx's ?MEMPOOL_OUTPOINTS rows, which after the insert
+%% would be the replacement's own rows for the shared outpoints.
+apply_staged_evictions(Txids) ->
+    lists:foreach(fun(Txid) ->
+        case remove_entry(Txid) of
+            #mempool_entry{} ->
+                %% Replaced: the tx left the mempool unmined -- drop its
+                %% fee-estimator tracking row (Core removeTx, REPLACED).
+                beamchain_fee_estimator:remove_tx(Txid);
+            not_found ->
+                ok
+        end
+    end, Txids).
 
 %% Sum the input values for a transaction (UTXO set + mempool).
 compute_tx_input_value(#transaction{inputs = Inputs}) ->
@@ -3272,7 +3298,13 @@ check_desc_limits_walk([Txid | Rest], VSize, Visited) ->
 %% We read existing cluster data from the ETS table; the new tx is not yet
 %% inserted, so its AdjWeight must be added explicitly.
 check_cluster_limits(Tx, AdjWeight) ->
-    Members = cluster_members_for(Tx),
+    check_cluster_limits(Tx, AdjWeight, []).
+
+%% Excluded: txids staged for eviction by this admission (RBF conflicts and
+%% their descendants, a TRUC sibling).  They are still in ?MEMPOOL_TXS until
+%% the commit, but will be gone once Tx is in, so they do not count.
+check_cluster_limits(Tx, AdjWeight, Excluded) ->
+    Members = cluster_members_for(Tx) -- Excluded,
     %% the new tx itself counts as 1 tx, AdjWeight weight units
     CombinedCount = 1 + length(Members),
     CombinedWeight = AdjWeight + lists:sum([entry_adj_weight(T) || T <- Members]),
@@ -3305,11 +3337,14 @@ cluster_members_for(Tx) ->
     %% Membership is taken from ?MEMPOOL_TXS, NOT from the cached cluster
     %% totals.  Core evaluates the limits against the pending CHANGESET, so
     %% transactions staged for removal are already gone when the check runs.
-    %% beamchain's RBF path (do_rbf/3, reached at GATE 10) removes the replaced
-    %% entries from ?MEMPOOL_TXS immediately, but ?MEMPOOL_CLUSTERS is only
-    %% rebuilt later via cluster_remove_tx/2.  Trusting the cached txids list
-    %% here would therefore count already-evicted members and reject a
-    %% replacement that in fact FREES cluster room (corpus: cluster-rbf-frees-room).
+    %% The single-tx RBF / TRUC paths STAGE their evictions (do_rbf/3,
+    %% do_truc_sibling_eviction/3); check_cluster_limits/3 subtracts that
+    %% staged set from what this returns.  The package RBF path
+    %% (do_package_rbf/4) still removes entries from ?MEMPOOL_TXS in place,
+    %% while ?MEMPOOL_CLUSTERS is only rebuilt later via cluster_remove_tx/2,
+    %% so the cached txids list is filtered against ?MEMPOOL_TXS here.
+    %% Either way a replacement that FREES cluster room is not refused
+    %% (corpus: cluster-rbf-frees-room).
     %% Bounded work: a live cluster is capped at MAX_CLUSTER_COUNT members.
     Live = lists:append(lists:map(
         fun(ClusterId) ->
@@ -4912,21 +4947,19 @@ do_truc_sibling_eviction(SiblingTxid, NewTx, NewFee) ->
             MinFee = SiblingFee + NewVSize,  %% sibling fee + 1 sat/vB * new_vsize
             case NewFee >= MinFee of
                 true ->
-                    %% Evict sibling and its descendants
+                    %% Stage the sibling and its descendants for eviction.
+                    %% Like do_rbf/3 this removes nothing: the new child
+                    %% still has later gates to pass, and the commit phase
+                    %% of do_add_transaction/4 applies the eviction.
                     Descendants = get_all_descendants(SiblingTxid),
                     AllEvict = [SiblingTxid | Descendants],
                     EvictedVBytes = lists:foldl(fun(Txid, Acc) ->
-                        case remove_entry(Txid) of
-                            #mempool_entry{vsize = VS} ->
-                                %% TRUC sibling eviction left these txs
-                                %% unmined — drop their fee-estimator rows
-                                %% (Core removeTx, REPLACED).
-                                beamchain_fee_estimator:remove_tx(Txid),
-                                Acc + VS;
-                            not_found -> Acc
+                        case ets:lookup(?MEMPOOL_TXS, Txid) of
+                            [{_, #mempool_entry{vsize = VS}}] -> Acc + VS;
+                            [] -> Acc
                         end
                     end, 0, AllEvict),
-                    logger:debug("mempool: truc sibling eviction ~s + ~B descendants",
+                    logger:debug("mempool: truc sibling eviction staged ~s + ~B descendants",
                                  [short_hex(SiblingTxid), length(Descendants)]),
                     {ok, AllEvict, EvictedVBytes};
                 false ->
