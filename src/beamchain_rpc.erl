@@ -4053,11 +4053,14 @@ rpc_sendrawtransaction([HexStr, MaxFeeRateBtcKvB]) when is_binary(HexStr) ->
         {Tx, _} = beamchain_serialize:decode_transaction(Bin),
         Txid = beamchain_serialize:tx_hash(Tx),
 
-        %% Check if already in mempool
-        case beamchain_mempool:has_tx(Txid) of
-            true ->
+        %% Core node/transaction.cpp BroadcastTransaction: a tx whose wtxid is
+        %% already in the mempool skips the UTXO-set check and ATMP, is
+        %% re-relayed, and the call returns its txid (no error).
+        Wtxid = beamchain_serialize:wtx_hash(Tx),
+        case beamchain_mempool:get_wtxid(Txid) of
+            {ok, Wtxid} ->
                 throw({already_in_mempool, Txid});
-            false ->
+            _ ->
                 ok
         end,
 
@@ -4097,9 +4100,9 @@ rpc_sendrawtransaction([HexStr, MaxFeeRateBtcKvB]) when is_binary(HexStr) ->
                 end
         end
     catch
-        throw:{already_in_mempool, _} ->
-            {error, ?RPC_VERIFY_ALREADY_IN_CHAIN,
-             <<"Transaction already in mempool">>};
+        throw:{already_in_mempool, InPoolTxid} ->
+            relay_transaction(InPoolTxid),
+            {ok, hash_to_hex(InPoolTxid)};
         throw:{already_in_chain, _} ->
             {error, ?RPC_VERIFY_ALREADY_IN_CHAIN,
              <<"Transaction already in block chain">>};
