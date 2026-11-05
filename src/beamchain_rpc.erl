@@ -58,6 +58,8 @@
 
 %% Exported for testing — verifychain RPC handler.
 -export([rpc_verifychain/1]).
+%% Exported so eunit can drive the already-in-mempool path with a mocked mempool.
+-export([rpc_sendrawtransaction/1]).
 
 %% Exported for EUnit so tests can drive the BIP-157 RPC handler
 %% directly without spinning up the cowboy listener.
