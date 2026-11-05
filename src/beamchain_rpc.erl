@@ -58,6 +58,8 @@
 
 %% Exported for testing — verifychain RPC handler.
 -export([rpc_verifychain/1]).
+%% Exported so eunit can drive the already-in-mempool path with a mocked mempool.
+-export([rpc_sendrawtransaction/1]).
 
 %% Exported for EUnit so tests can drive the BIP-157 RPC handler
 %% directly without spinning up the cowboy listener.
@@ -4051,11 +4053,16 @@ rpc_sendrawtransaction([HexStr, MaxFeeRateBtcKvB]) when is_binary(HexStr) ->
         {Tx, _} = beamchain_serialize:decode_transaction(Bin),
         Txid = beamchain_serialize:tx_hash(Tx),
 
-        %% Check if already in mempool
-        case beamchain_mempool:has_tx(Txid) of
-            true ->
+        %% Core node/transaction.cpp BroadcastTransaction: any mempool entry
+        %% with this txid (same OR different witness) means the tx is already
+        %% present. Core does not call ATMP (it would reject a different
+        %% witness as txn-same-nonwitness-data-in-mempool); it reannounces the
+        %% MEMPOOL entry's wtxid and returns the txid. relay_transaction/1 ->
+        %% announce_tx/1 loads that mempool wtxid itself.
+        case beamchain_mempool:get_wtxid(Txid) of
+            {ok, _MempoolWtxid} ->
                 throw({already_in_mempool, Txid});
-            false ->
+            _ ->
                 ok
         end,
 
@@ -4095,9 +4102,9 @@ rpc_sendrawtransaction([HexStr, MaxFeeRateBtcKvB]) when is_binary(HexStr) ->
                 end
         end
     catch
-        throw:{already_in_mempool, _} ->
-            {error, ?RPC_VERIFY_ALREADY_IN_CHAIN,
-             <<"Transaction already in mempool">>};
+        throw:{already_in_mempool, InPoolTxid} ->
+            relay_transaction(InPoolTxid),
+            {ok, hash_to_hex(InPoolTxid)};
         throw:{already_in_chain, _} ->
             {error, ?RPC_VERIFY_ALREADY_IN_CHAIN,
              <<"Transaction already in block chain">>};
