@@ -2382,10 +2382,9 @@ do_side_branch_accept(#block{header = Header} = Block, State) ->
         {ok, ParentEntry} ->
             do_side_branch_accept_with_parent(Block, ParentEntry, State);
         not_found ->
-            %% Parent is unknown — true orphan.  Treat as bad_prevblk
-            %% so the BIP-22 mapping returns a generic "rejected"
-            %% reason (matches Core's behaviour: ProcessNewBlock skips
-            %% the block entirely until the parent header arrives).
+            %% Parent is unknown — true orphan.  bad_prevblk maps to
+            %% Core's AcceptBlockHeader token "prev-blk-not-found"
+            %% (validation.cpp:4217) in beamchain_rpc:bip22_result/1.
             {error, bad_prevblk}
     end.
 
