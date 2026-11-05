@@ -8294,6 +8294,24 @@ bip22_result(invalid_prevblk)           -> <<"bad-prevblk">>;
 %% but not the active tip; not heavier than active).  Per BIP-22 + Core
 %% rpc/mining.cpp::submitblock, this is success-with-no-tip-flip.
 bip22_result(inconclusive)              -> <<"inconclusive">>;
+%% Parent unknown (true orphan).  Core AcceptBlockHeader (validation.cpp:4217):
+%%   state.Invalid(BLOCK_MISSING_PREV, "prev-blk-not-found"); ProcessNewBlock
+%% (:4421-4423) fires BlockChecked with that state, so submitblock answers
+%% the token.  beamchain_chainstate:do_side_branch_accept/2 returns
+%% bad_prevblk for this case.
+bip22_result(bad_prevblk)               -> <<"prev-blk-not-found">>;
+%% The submitted block made a side branch heavier and failed its own
+%% ConnectBlock during the reorg.  Core ConnectTip (validation.cpp:3038-3039)
+%% fires BlockChecked for it, so submitblock answers ConnectBlock's reason
+%% (e.g. bad-cb-amount), exactly as for a block extending the tip.
+bip22_result({reorg_failed, {reorg_connect_failed, ConnErr}}) ->
+    bip22_result(ConnErr);
+%% An ANCESTOR of the submitted block failed ConnectBlock during the reorg:
+%% BlockChecked never fires for the submitted block, so Core's
+%% submitblock_StateCatcher is not found -> "inconclusive"
+%% (rpc/mining.cpp submitblock).
+bip22_result({reorg_failed, {ancestor_connect_failed, _, _}}) ->
+    <<"inconclusive">>;
 bip22_result(_)                         -> <<"rejected">>.
 
 %% Format a block nVersion as Core's "bad-version(0x%08x)" reason string.

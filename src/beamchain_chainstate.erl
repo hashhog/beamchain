@@ -2382,10 +2382,9 @@ do_side_branch_accept(#block{header = Header} = Block, State) ->
         {ok, ParentEntry} ->
             do_side_branch_accept_with_parent(Block, ParentEntry, State);
         not_found ->
-            %% Parent is unknown — true orphan.  Treat as bad_prevblk
-            %% so the BIP-22 mapping returns a generic "rejected"
-            %% reason (matches Core's behaviour: ProcessNewBlock skips
-            %% the block entirely until the parent header arrives).
+            %% Parent is unknown — true orphan.  bad_prevblk maps to
+            %% Core's AcceptBlockHeader token "prev-blk-not-found"
+            %% (validation.cpp:4217) in beamchain_rpc:bip22_result/1.
             {error, bad_prevblk}
     end.
 
@@ -2626,9 +2625,11 @@ do_promote_side_branch(NewTipHash, State) ->
                     %% candidate block, so a future call may retry.
                     logger:warning("chainstate: side-branch reorg "
                                    "failed: ~p (rolled back)", [Reason]),
+                    NewlyBad = known_invalid_hashes(NewBlocks) -- KnownBad,
                     activate_after_failed_reorg(
-                      {reorg_failed, Reason},
-                      known_invalid_hashes(NewBlocks) -- KnownBad,
+                      {reorg_failed,
+                       failed_connect_reason(Reason, NewlyBad, NewTipHash)},
+                      NewlyBad,
                       RolledBackState);
                 {error, Reason} ->
                     %% Defensive: legacy error path (e.g. from the
@@ -2678,6 +2679,22 @@ activate_after_failed_reorg(Err, _NewlyBad, State) ->
                     {error, Err, State}
             end
     end.
+
+%% Which block's ConnectBlock produced a failed reorg's verdict.  Core's
+%% submitblock (rpc/mining.cpp submitblock_StateCatcher) answers the reject
+%% reason only when BlockChecked fired for the SUBMITTED block; a verdict on
+%% one of its ancestors during ActivateBestChain (validation.cpp ConnectTip
+%% :3038-3039) never reaches the catcher, so the submitted block answers
+%% "inconclusive".  NewlyBad is fork->tip ordered and starts with the block
+%% whose connect failed (rollback_failed_reorg/4 marks it, then
+%% do_invalid_block_found marks its descendants), so a head other than the
+%% branch tip means an ancestor failed.  An empty NewlyBad (not a verdict:
+%% nothing was marked) keeps the reason unchanged.
+failed_connect_reason({reorg_connect_failed, ConnErr}, [Failed | _], TipHash)
+  when Failed =/= TipHash ->
+    {ancestor_connect_failed, Failed, ConnErr};
+failed_connect_reason(Reason, _NewlyBad, _TipHash) ->
+    Reason.
 
 known_invalid_hashes(Blocks) ->
     [H || #block{header = Hdr} <- Blocks,
