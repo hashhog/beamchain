@@ -141,7 +141,7 @@
 %% when the closure lands, and so eunit harnesses can drive the handlers
 %% directly (offline, no node). The dispatcher
 %% `handle_method(<<"converttopsbt"|"joinpsbts">>, ...)` calls these.
--export([rpc_converttopsbt/1, rpc_joinpsbts/1]).
+-export([rpc_converttopsbt/1, rpc_joinpsbts/1, rpc_decoderawtransaction/1]).
 
 %% utxoupdatepsbt / descriptorprocesspsbt / importmempool (T2 R5).
 %% Exported so the W137 gate30 audit-flip and T2 eunit can see the
@@ -3961,10 +3961,21 @@ format_vin_with_prevout(#tx_in{prev_out = #outpoint{hash = Hash, index = Idx},
     Head ++ WitField ++ PrevoutField ++ [{<<"sequence">>, Seq}].
 
 rpc_decoderawtransaction([HexStr]) when is_binary(HexStr) ->
+    rpc_decoderawtransaction([HexStr, null]);
+rpc_decoderawtransaction([HexStr, IsWitness])
+  when is_binary(HexStr),
+       (IsWitness =:= null orelse is_boolean(IsWitness)) ->
     %% Decode a raw transaction hex to a TxToUniv-shaped JSON object.
     %%
     %% Reference: bitcoin-core/src/rpc/rawtransaction.cpp decoderawtransaction()
-    %% → core_io.cpp TxToUniv(tx, block_hash=uint256(), entry, include_hex=false)
+    %% → core_io.cpp DecodeHexTx(try_no_witness, try_witness) then
+    %% TxToUniv(tx, block_hash=uint256(), entry, include_hex=false)
+    %%
+    %% iswitness (optional bool): true  = extended (witness) serialization only,
+    %%                            false = legacy serialization only,
+    %%                            absent = heuristic (try both).
+    %% A serialization only counts if it consumes the WHOLE hex string, so
+    %% trailing bytes are "TX decode failed" (-22) like Core.
     %%
     %% Shape: {txid, hash, version, size, vsize, weight, locktime, vin[], vout[]}.
     %% No top-level "hex" field (Core's include_hex=false).
@@ -3975,20 +3986,50 @@ rpc_decoderawtransaction([HexStr]) when is_binary(HexStr) ->
     %%   - vin has scriptSig.asm (sighash-decode), txinwitness, coinbase detection
     %%
     %% Returns {ok_raw_json, Bin} so the sentinel numerics bypass jsx re-encoding.
-    try
-        Bin = beamchain_serialize:hex_decode(HexStr),
-        {Tx, _Rest} = beamchain_serialize:decode_transaction(Bin),
-        TxJson = format_psbt_tx_json(Tx),
-        Encoded = jsx:encode(TxJson),
-        {ok_raw_json, replace_btc_sentinels(Encoded)}
-    catch
-        _:_ ->
-            {error, ?RPC_DESERIALIZATION_ERROR,
-             <<"TX decode failed">>}
+    Which = case IsWitness of
+                null  -> heuristic;
+                true  -> extended_only;
+                false -> no_witness_only
+            end,
+    Decoded =
+        try
+            Bin = beamchain_serialize:hex_decode(HexStr),
+            decode_raw_tx_core(Bin, Which)
+        catch
+            _:_ -> error
+        end,
+    case Decoded of
+        {ok, Tx} ->
+            try
+                TxJson = format_psbt_tx_json(Tx),
+                Encoded = jsx:encode(TxJson),
+                {ok_raw_json, replace_btc_sentinels(Encoded)}
+            catch
+                _:_ ->
+                    {error, ?RPC_DESERIALIZATION_ERROR, <<"TX decode failed">>}
+            end;
+        error ->
+            {error, ?RPC_DESERIALIZATION_ERROR, <<"TX decode failed">>}
     end;
 rpc_decoderawtransaction(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"Usage: decoderawtransaction \"hexstring\"">>}.
+
+%% Core DecodeHexTx for decoderawtransaction.  extended_only is Core's
+%% TX_WITH_WITNESS read: a tx without the 0x00 0x01 marker is read as a
+%% plain (witness-less) tx, so legacy hex is accepted with iswitness=true.
+%% Every serialization must consume the whole binary.
+decode_raw_tx_core(Bin, extended_only) ->
+    case try_witness_full(Bin) of
+        {ok, _} = Ok -> Ok;
+        error ->
+            case Bin of
+                <<_:32, 16#00:8, _/binary>> -> error;
+                _ -> try_legacy_full(Bin)
+            end
+    end;
+decode_raw_tx_core(Bin, Which) ->
+    decode_tx_with_consumption(Bin, Which).
 
 %% Default max fee rate: 0.10 BTC/kvB = 10,000,000 sat/kvB
 -define(DEFAULT_MAX_RAW_TX_FEE_RATE, 10000000).
