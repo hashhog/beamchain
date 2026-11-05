@@ -4053,12 +4053,14 @@ rpc_sendrawtransaction([HexStr, MaxFeeRateBtcKvB]) when is_binary(HexStr) ->
         {Tx, _} = beamchain_serialize:decode_transaction(Bin),
         Txid = beamchain_serialize:tx_hash(Tx),
 
-        %% Core node/transaction.cpp BroadcastTransaction: a tx whose wtxid is
-        %% already in the mempool skips the UTXO-set check and ATMP, is
-        %% re-relayed, and the call returns its txid (no error).
-        Wtxid = beamchain_serialize:wtx_hash(Tx),
+        %% Core node/transaction.cpp BroadcastTransaction: any mempool entry
+        %% with this txid (same OR different witness) means the tx is already
+        %% present. Core does not call ATMP (it would reject a different
+        %% witness as txn-same-nonwitness-data-in-mempool); it reannounces the
+        %% MEMPOOL entry's wtxid and returns the txid. relay_transaction/1 ->
+        %% announce_tx/1 loads that mempool wtxid itself.
         case beamchain_mempool:get_wtxid(Txid) of
-            {ok, Wtxid} ->
+            {ok, _MempoolWtxid} ->
                 throw({already_in_mempool, Txid});
             _ ->
                 ok
