@@ -4041,16 +4041,101 @@ decode_raw_tx_core(Bin, Which) ->
 -define(WALLET_MIN_TX_FEE, 1000).
 
 rpc_sendrawtransaction([HexStr]) when is_binary(HexStr) ->
-    rpc_sendrawtransaction([HexStr, ?DEFAULT_MAX_RAW_TX_FEE_RATE / 100000000.0]);
-rpc_sendrawtransaction([HexStr, MaxFeeRateBtcKvB]) when is_binary(HexStr) ->
-    %% MaxFeeRateBtcKvB is in BTC/kvB; convert to sat/vB for comparison
-    MaxFeeRateSatVB = case MaxFeeRateBtcKvB of
-        N when is_number(N) -> N * 100000000.0 / 1000.0;  %% BTC/kvB to sat/vB
-        _ -> ?DEFAULT_MAX_RAW_TX_FEE_RATE / 1000.0
-    end,
+    rpc_sendrawtransaction([HexStr, null]);
+rpc_sendrawtransaction([HexStr, MaxFeeRateArg]) when is_binary(HexStr) ->
+    %% Core rpc/mempool.cpp sendrawtransaction: DecodeHexTx first (-22), then
+    %% ParseFeeRate(maxfeerate) (-3 for a non-amount, -8 for >= 1 BTC/kvB).
+    case sendraw_decode_tx(HexStr) of
+        {error, _, _} = DecodeErr ->
+            DecodeErr;
+        {ok, Tx} ->
+            case sendraw_fee_rate(MaxFeeRateArg) of
+                {error, _, _} = FeeErr -> FeeErr;
+                {ok, SatPerKvB}        -> do_sendrawtransaction(Tx, SatPerKvB / 1000.0)
+            end
+    end;
+rpc_sendrawtransaction(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: sendrawtransaction \"hexstring\" ( maxfeerate )">>}.
+
+%% Core DecodeHexTx: the hex must decode to exactly one transaction with no
+%% trailing bytes ("TX decode failed" -22 otherwise).
+sendraw_decode_tx(HexStr) ->
     try
         Bin = beamchain_serialize:hex_decode(HexStr),
-        {Tx, _} = beamchain_serialize:decode_transaction(Bin),
+        {Tx, <<>>} = beamchain_serialize:decode_transaction(Bin),
+        {ok, Tx}
+    catch
+        _:_ ->
+            {error, ?RPC_DESERIALIZATION_ERROR,
+             <<"TX decode failed. Make sure the tx has at least one input.">>}
+    end.
+
+%% Core ParseFeeRate(AmountFromValue(json)) -> satoshis per kvB.
+%% null/absent -> DEFAULT_MAX_RAW_TX_FEE_RATE.
+sendraw_fee_rate(null) -> {ok, ?DEFAULT_MAX_RAW_TX_FEE_RATE};
+sendraw_fee_rate(undefined) -> {ok, ?DEFAULT_MAX_RAW_TX_FEE_RATE};
+sendraw_fee_rate(N) when is_integer(N) ->
+    sendraw_fee_rate_text(integer_to_binary(N));
+sendraw_fee_rate(F) when is_float(F) ->
+    %% The shortest round-trip text of the JSON number, as Core parses the
+    %% number's text (so 1.0e-9 is sub-satoshi -> Invalid amount, not 0).
+    sendraw_fee_rate_text(float_to_binary(F, [short]));
+sendraw_fee_rate(B) when is_binary(B) ->
+    sendraw_fee_rate_text(B);
+sendraw_fee_rate(_) ->
+    {error, ?RPC_TYPE_ERROR, <<"Amount is not a number or string">>}.
+
+%% Core ParseFixedPoint(text, 8): [-]digits[.digits][e[+-]digits], at least one
+%% digit before and after any ".", no leading zeros, no digits below 1
+%% satoshi.  Then MoneyRange -> "Amount out of range".
+sendraw_fee_rate_text(Text) ->
+    case re:run(Text, "^(-?)(0|[1-9][0-9]*)(?:\\.([0-9]+))?(?:[eE]([+-]?[0-9]+))?$",
+                [{capture, all_but_first, binary}]) of
+        {match, Groups} ->
+            %% re:run omits trailing unmatched groups.
+            [Sign, Int, Frac, Exp | _] = Groups ++ [<<>>, <<>>, <<>>, <<>>],
+            sendraw_fee_rate_parts(Sign, Int, Frac, Exp);
+        nomatch ->
+            {error, ?RPC_TYPE_ERROR, <<"Invalid amount">>}
+    end.
+
+sendraw_fee_rate_parts(Sign, Int, Frac, Exp) ->
+    %% Core ParseFixedPoint: a lone leading "0" is not a mantissa digit; the
+    %% mantissa's trailing zeros move into the exponent; the final exponent
+    %% (+ 8 decimals) must lie in [0, 18) whatever the mantissa is.
+    Digits0 = case Int of <<"0">> -> Frac; _ -> <<Int/binary, Frac/binary>> end,
+    Trimmed = string:trim(Digits0, trailing, "0"),
+    Tz = byte_size(Digits0) - byte_size(Trimmed),
+    Mantissa = case Trimmed of <<>> -> 0; _ -> binary_to_integer(Trimmed) end,
+    ExpI = case Exp of <<>> -> 0; _ -> binary_to_integer(Exp) end,
+    E = ExpI - byte_size(Frac) + Tz + 8,
+    if
+        E < 0; E >= 18 ->
+            {error, ?RPC_TYPE_ERROR, <<"Invalid amount">>};
+        true ->
+            V = Mantissa * lists:foldl(fun(_, A) -> A * 10 end, 1, lists:seq(1, E)),
+            if
+                V > 999999999999999999 ->
+                    {error, ?RPC_TYPE_ERROR, <<"Invalid amount">>};
+                Sign =:= <<"-">>, V > 0 ->
+                    {error, ?RPC_TYPE_ERROR, <<"Amount out of range">>};
+                true ->
+                    sendraw_fee_rate_sat(V)
+            end
+    end.
+
+sendraw_fee_rate_sat(Sat) when Sat < 0; Sat > 21000000 * 100000000 ->
+    {error, ?RPC_TYPE_ERROR, <<"Amount out of range">>};
+sendraw_fee_rate_sat(Sat) when Sat >= 100000000 ->
+    {error, ?RPC_INVALID_PARAMETER,
+     <<"Fee rates larger than or equal to 1BTC/kvB are not accepted">>};
+sendraw_fee_rate_sat(Sat) ->
+    {ok, Sat}.
+
+%% MaxFeeRateSatVB: sat/vB cap (0 disables the check).
+do_sendrawtransaction(Tx, MaxFeeRateSatVB) ->
+    try
         Txid = beamchain_serialize:tx_hash(Tx),
 
         %% Core node/transaction.cpp BroadcastTransaction: any mempool entry
@@ -4118,14 +4203,11 @@ rpc_sendrawtransaction([HexStr, MaxFeeRateBtcKvB]) when is_binary(HexStr) ->
                  [FeeRate, MaxFeeRateSatVB]))};
         throw:{missing_inputs, _} ->
             {error, ?RPC_VERIFY_ERROR,
-             <<"Missing inputs">>};
+             <<"bad-txns-inputs-missingorspent">>};
         _:_ ->
             {error, ?RPC_DESERIALIZATION_ERROR,
              <<"TX decode failed. Make sure the tx has at least one input.">>}
-    end;
-rpc_sendrawtransaction(_) ->
-    {error, ?RPC_INVALID_PARAMS,
-     <<"Usage: sendrawtransaction \"hexstring\" ( maxfeerate )">>}.
+    end.
 
 %% @doc createrawtransaction: Create a raw transaction from inputs and outputs.
 %% Returns hex-encoded unsigned transaction.
@@ -4714,10 +4796,12 @@ relay_transaction(Txid) ->
     end.
 
 %% Format mempool rejection errors with appropriate RPC error codes.
+%% Core node/transaction.cpp HandleATMPError: err_string = state.ToString(),
+%% which for TX_MISSING_INPUTS is the reject reason itself.
 format_mempool_error(orphan, _Txid) ->
-    {error, ?RPC_VERIFY_ERROR, <<"Missing inputs">>};
+    {error, ?RPC_VERIFY_ERROR, <<"bad-txns-inputs-missingorspent">>};
 format_mempool_error('bad-txns-inputs-missingorspent', _Txid) ->
-    {error, ?RPC_VERIFY_ERROR, <<"Missing inputs">>};
+    {error, ?RPC_VERIFY_ERROR, <<"bad-txns-inputs-missingorspent">>};
 format_mempool_error(already_in_mempool, _Txid) ->
     {error, ?RPC_VERIFY_ALREADY_IN_CHAIN, <<"Transaction already in mempool">>};
 format_mempool_error('txn-already-in-mempool', _Txid) ->
