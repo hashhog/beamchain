@@ -1101,7 +1101,9 @@ bip22_result_mandatory_script_test() ->
 
 bip22_result_catchall_test() ->
     ?assertEqual(<<"rejected">>, beamchain_rpc:bip22_result(unknown_error)),
-    ?assertEqual(<<"rejected">>, beamchain_rpc:bip22_result(bad_prevblk)),
+    %% bad_prevblk is no longer a catchall: an orphan answers Core's
+    %% AcceptBlockHeader token (validation.cpp:4217 "prev-blk-not-found").
+    ?assertEqual(<<"prev-blk-not-found">>, beamchain_rpc:bip22_result(bad_prevblk)),
     %% no_transactions is no longer a catchall: an empty block fails Core's
     %% size limits (validation.cpp CheckBlock -> "bad-blk-length"), and the
     %% R2 token map now returns the specific token.
