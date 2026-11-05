@@ -93,7 +93,7 @@
 %% confirms each in-scope handler routes a malformed arg to -8 while a
 %% well-formed 64-zero hash still passes the guard (decodes, no -8 throw).
 -export([parse_hash_v/2,
-         rpc_getblock/1, rpc_getblockheader/1, ntx_from_local_block/1, rpc_getrawtransaction/1,
+         rpc_getblock/1, getblock_verbosity/1, rpc_getblockheader/1, ntx_from_local_block/1, rpc_getrawtransaction/1,
          rpc_gettxout/1, rpc_getmempoolentry/1]).
 %% Test-only exports — submitpackage helpers (mempool wave 2026-05-06).
 -export([rpc_submitpackage/1, decode_package_tx/1]).
@@ -2054,13 +2054,26 @@ rpc_getblock([HashHex, Verbosity]) when is_binary(HashHex) ->
     %% No `of` clause: the catch must protect the lookup body too (a later
     %% ParseHashV guard may throw from inside the lookup, e.g. an optional
     %% blockhash argument on a sibling RPC).
-    try rpc_getblock_lookup(parse_hash_v(HashHex, <<"blockhash">>), Verbosity)
+    try rpc_getblock_lookup(parse_hash_v(HashHex, <<"blockhash">>),
+                            getblock_verbosity(Verbosity))
     catch
         throw:{rpc_error, Code, Msg} -> {error, Code, Msg}
     end
     end;
 rpc_getblock(_) ->
     {error, ?RPC_INVALID_PARAMS, <<"Usage: getblock \"hash\" ( verbosity )">>}.
+
+%% Core rpc/blockchain.cpp getblock: ParseVerbosity(params[1], 1, allow_bool=true)
+%% maps true->1, false->0, null->default 1; any integer is kept, then
+%% `verbosity <= 0` is raw hex, 1 is JSON with txids, 2 is JSON with decoded
+%% txs and anything >= 3 adds each input's prevout. There is no "Invalid verbosity value" error.
+getblock_verbosity(true) -> 1;
+getblock_verbosity(false) -> 0;
+getblock_verbosity(null) -> 1;
+getblock_verbosity(V) when is_integer(V), V =< 0 -> 0;
+getblock_verbosity(2) -> 2;
+getblock_verbosity(V) when is_integer(V), V >= 3 -> 3;
+getblock_verbosity(V) -> V.
 
 rpc_getblock_lookup(Hash, Verbosity) ->
     case beamchain_db:get_block(Hash) of
@@ -2083,9 +2096,14 @@ rpc_getblock_lookup(Hash, Verbosity) ->
                     %% difficulty (DIFF) and BTC amounts (BTC sentinels).
                     Map = format_block_json(Block, Hash, true),
                     {ok_raw_json, replace_all_sentinels(jsx:encode(Map))};
+                3 ->
+                    %% Core verbosity>=3: decoded txs plus per-input prevout
+                    %% (generated, height, value, scriptPubKey) from undo data.
+                    Map = format_block_json(Block, Hash, prevout),
+                    {ok_raw_json, replace_all_sentinels(jsx:encode(Map))};
                 _ ->
-                    {error, ?RPC_INVALID_PARAMETER,
-                     <<"Invalid verbosity value">>}
+                    {error, ?RPC_INVALID_PARAMS,
+                     <<"Usage: getblock \"blockhash\" ( verbosity )">>}
             end;
         not_found ->
             %% Index present but body gone: Core GetBlockChecked
@@ -9470,22 +9488,26 @@ format_block_json(#block{header = Header, transactions = Txs} = Block,
     Weight = block_weight(Block),
     %% Load undo data for fee computation (only needed when DecodeTxs=true).
     %% Undo data maps each spent outpoint to its {value, scriptPubKey}.
-    UndoMap = case DecodeTxs of
-        true ->
+    UndoCoins = case DecodeTxs of
+        false -> #{};
+        _ ->
             case beamchain_db:get_undo(Hash) of
                 {ok, UndoBin} ->
                     try
                         Entries = beamchain_validation:decode_undo_data(UndoBin),
-                        maps:from_list([{{Op#outpoint.hash, Op#outpoint.index}, Coin#utxo.value}
+                        maps:from_list([{{Op#outpoint.hash, Op#outpoint.index}, Coin}
                                         || {Op, Coin} <- Entries])
                     catch _:_ -> #{}
                     end;
                 not_found -> #{}
-            end;
-        false -> #{}
+            end
     end,
+    UndoMap = maps:map(fun(_K, Coin) -> Coin#utxo.value end, UndoCoins),
     %% Transaction list
     TxList = case DecodeTxs of
+        prevout ->
+            Net = beamchain_config:network(),
+            [format_getrawtx_v2_tx_json(Tx, UndoCoins, Net) || Tx <- Txs];
         true ->
             [format_tx_json_with_fee(Tx, UndoMap) || Tx <- Txs];
         false ->
