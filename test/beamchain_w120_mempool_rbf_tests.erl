@@ -113,11 +113,12 @@ g4_rule4_incremental_relay_floor_test_() ->
 %%% ===================================================================
 
 g5_rule5_should_count_clusters_not_txs_test_() ->
-    %% Structural: source uses length(AllEvictTxids), not cluster count.
+    %% Fixed: do_rbf counts distinct clusters of the direct conflicts
+    %% (count_conflict_clusters/1, Core GetUniqueClusterCount), no longer
+    %% length(AllEvictTxids).
     {ok, Src} = file:read_file(mempool_src_path()),
-    [?_assert(binary:match(Src, <<"length(AllEvictTxids) =< ?MAX_RBF_EVICTIONS">>) =/= nomatch),
-     %% No GetUniqueClusterCount equivalent reachable from do_rbf.
-     ?_assertEqual(nomatch, binary:match(Src, <<"GetUniqueClusterCount">>))].
+    [?_assertEqual(nomatch, binary:match(Src, <<"length(AllEvictTxids) =< ?MAX_RBF_EVICTIONS">>)),
+     ?_assert(binary:match(Src, <<"count_conflict_clusters(ConflictTxids) =< ?MAX_RBF_EVICTIONS">>) =/= nomatch)].
 
 %%% ===================================================================
 %%% G6 — Rule 5 cluster constant value

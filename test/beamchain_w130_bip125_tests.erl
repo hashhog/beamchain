@@ -480,11 +480,10 @@ g23_max_replacement_candidates_is_tx_count_test_() ->
                                  "include", "beamchain_protocol.hrl"]));
         _ -> PSrc
     end,
-    [?_assertEqual(nomatch, binary:match(MSrc, <<"GetUniqueClusterCount">>)),
-     ?_assertEqual(nomatch, binary:match(MSrc, <<"unique_cluster_count">>)),
-     %% Total-tx-count gate lives at the documented site.
-     ?_assert(binary:match(MSrc,
-        <<"length(AllEvictTxids) =< ?MAX_RBF_EVICTIONS">>) =/= nomatch),
+    [%% Fixed: the gate counts clusters (count_conflict_clusters/1), not txs.
+     ?_assert(binary:match(MSrc, <<"count_conflict_clusters">>) =/= nomatch),
+     ?_assertEqual(nomatch, binary:match(MSrc,
+        <<"length(AllEvictTxids) =< ?MAX_RBF_EVICTIONS">>)),
      %% Header comment falsely claims Core parity.
      ?_assert(JoinHrl =:= <<>> orelse
               binary:match(JoinHrl,
