@@ -1643,17 +1643,12 @@ rpc_getblockchaininfo() ->
                 true -> 1.0;
                 false -> 0.999
             end,
-            %% initialblockdownload: Core's IsInitialBlockDownload latches false
-            %% once the tip is "recent" (tip->Time() >= Now - max_tip_age) under
-            %% the *node clock* (which honours mocktime). On regtest, freshly
-            %% mined blocks are always tip-recent, so Core reports false. beamchain
-            %% has no mocktime, so its wall-clock IBD check stays true on a chain
-            %% mined far in the past; report the regtest-scoped Core value (false
-            %% whenever a tip exists) to match. Other networks keep `not Synced`.
-            IBD = case Network of
-                regtest -> false;
-                _       -> not Synced
-            end,
+            %% initialblockdownload: Core's IsInitialBlockDownload (validation.cpp)
+            %% is true until the tip is newer than now - max_tip_age (24h), then
+            %% latches false. is_synced/0 is that latch (maybe_check_ibd), so every
+            %% network, regtest included, reports `not Synced`: a regtest chain
+            %% with fixed 2023 timestamps stays in IBD exactly as Core's does.
+            IBD = not Synced,
             %% ORDERED proplist so jsx emits Core's pushKV order. Core v31.99
             %% rpc/blockchain.cpp:1417 getblockchaininfo: chain, blocks, headers,
             %% bestblockhash, bits, target, difficulty, time, mediantime,
