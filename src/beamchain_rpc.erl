@@ -4973,11 +4973,26 @@ reject_result(Tx, Txid, Wtxid, Reason) ->
     Row = #{<<"txid">>          => hash_to_hex(Txid),
             <<"wtxid">>         => hash_to_hex(Wtxid),
             <<"allowed">>       => false,
-            <<"reject-reason">> => mempool_reject_reason(Reason, Txid)},
-    case reject_details(Reason, Tx) of
-        undefined -> Row;
-        Details   -> Row#{<<"reject-details">> => Details}
+            <<"reject-reason">> => tmpa_reject_reason(Reason, Txid)},
+    %% Core: reject-details = state.ToString(), which is the reject reason
+    %% alone when no debug message was attached.  Emitted here for the
+    %% TX_CONFLICT tokens (txn-already-in-mempool / txn-already-known), whose
+    %% reason is the whole of Core's details string.
+    case {reject_details(Reason, Tx), maps:get(<<"reject-reason">>, Row)} of
+        {undefined, Token} when Token =:= <<"txn-already-in-mempool">>;
+                                Token =:= <<"txn-already-known">> ->
+            Row#{<<"reject-details">> => Token};
+        {undefined, _} -> Row;
+        {Details, _} -> Row#{<<"reject-details">> => Details}
     end.
+
+%% Core validation.cpp TX_CONFLICT tokens: testmempoolaccept reports
+%% state.GetRejectReason() verbatim, not sendrawtransaction's RPC prose.
+%% Scoped to testmempoolaccept; submitpackage keeps mempool_reject_reason/2.
+tmpa_reject_reason(already_in_mempool, _Txid)          -> <<"txn-already-in-mempool">>;
+tmpa_reject_reason('txn-already-in-mempool', _Txid)    -> <<"txn-already-in-mempool">>;
+tmpa_reject_reason('txn-already-known', _Txid)         -> <<"txn-already-known">>;
+tmpa_reject_reason(Reason, Txid)                       -> mempool_reject_reason(Reason, Txid).
 
 tx_by_txid(Txid, Txs) ->
     case [T || T <- Txs, beamchain_serialize:tx_hash(T) =:= Txid] of
@@ -5027,7 +5042,129 @@ reject_details(_Reason, _Tx) ->
 %% Reference: bitcoin-core/src/rpc/mempool.cpp::testmempoolaccept (≈ line
 %% 277). Core uses ProcessNewPackage(test_accept=true) for both single and
 %% multi-tx cases; we dispatch to the same dry-run helpers.
-rpc_testmempoolaccept([RawTxs]) when is_list(RawTxs) ->
+rpc_testmempoolaccept([RawTxs]) ->
+    rpc_testmempoolaccept([RawTxs, null]);
+rpc_testmempoolaccept([RawTxs, MaxFeeRateArg]) when is_list(RawTxs) ->
+    %% Core rpc/mempool.cpp testmempoolaccept: size check (-8), then
+    %% ParseFeeRate(maxfeerate), then DecodeHexTx per element (-22).
+    case length(RawTxs) of
+        N when N < 1; N > 25 ->
+            {error, ?RPC_INVALID_PARAMETER,
+             <<"Array must contain between 1 and 25 transactions.">>};
+        _ ->
+            case tmpa_fee_rate(MaxFeeRateArg) of
+                {error, _, _} = FeeErr -> FeeErr;
+                {ok, SatPerKvB}        -> do_testmempoolaccept(RawTxs, SatPerKvB)
+            end
+    end;
+rpc_testmempoolaccept([Other | _]) ->
+    %% Core RPCHelpMan type check: JSONRPCError(RPC_TYPE_ERROR, ...).
+    {error, ?RPC_TYPE_ERROR,
+     iolist_to_binary(
+       ["Wrong type passed:\n{\n    \"Position 1 (rawtxs)\": "
+        "\"JSON value of type ", tmpa_json_type(Other),
+        " is not of expected type array\"\n}"])};
+rpc_testmempoolaccept(_) ->
+    {error, ?RPC_INVALID_PARAMS,
+     <<"Usage: testmempoolaccept [\"rawtx\"]">>}.
+
+tmpa_json_type(B) when is_binary(B)  -> "string";
+tmpa_json_type(B) when is_boolean(B) -> "bool";
+tmpa_json_type(null)                 -> "null";
+tmpa_json_type(M) when is_map(M)     -> "object";
+tmpa_json_type(N) when is_number(N)  -> "number";
+tmpa_json_type(_)                    -> "unknown".
+
+%% Core ParseFeeRate(AmountFromValue(json)) -> satoshis per kvB.
+%% null/absent -> DEFAULT_MAX_RAW_TX_FEE_RATE (0.10 BTC/kvB).
+tmpa_fee_rate(null)      -> {ok, 10000000};
+tmpa_fee_rate(undefined) -> {ok, 10000000};
+tmpa_fee_rate(N) when is_integer(N) ->
+    tmpa_fee_rate_text(integer_to_binary(N));
+tmpa_fee_rate(F) when is_float(F) ->
+    tmpa_fee_rate_text(float_to_binary(F, [short]));
+tmpa_fee_rate(B) when is_binary(B) ->
+    tmpa_fee_rate_text(B);
+tmpa_fee_rate(_) ->
+    {error, ?RPC_TYPE_ERROR, <<"Amount is not a number or string">>}.
+
+%% Core ParseFixedPoint(text, 8): [-]digits[.digits][e[+-]digits], at least one
+%% digit before and after any ".", no leading zeros, no digits below 1
+%% satoshi.  Then MoneyRange -> "Amount out of range".
+tmpa_fee_rate_text(Text) ->
+    case re:run(Text, "^(-?)(0|[1-9][0-9]*)(?:\\.([0-9]+))?(?:[eE]([+-]?[0-9]+))?$",
+                [{capture, all_but_first, binary}]) of
+        {match, Groups} ->
+            %% re:run omits trailing unmatched groups.
+            [Sign, Int, Frac, Exp | _] = Groups ++ [<<>>, <<>>, <<>>, <<>>],
+            tmpa_fee_rate_parts(Sign, Int, Frac, Exp);
+        nomatch ->
+            {error, ?RPC_TYPE_ERROR, <<"Invalid amount">>}
+    end.
+
+tmpa_fee_rate_parts(Sign, Int, Frac, Exp) ->
+    %% Core ParseFixedPoint: a lone leading "0" is not a mantissa digit; the
+    %% mantissa's trailing zeros move into the exponent; the final exponent
+    %% (+ 8 decimals) must lie in [0, 18) whatever the mantissa is.
+    Digits0 = case Int of <<"0">> -> Frac; _ -> <<Int/binary, Frac/binary>> end,
+    Trimmed = string:trim(Digits0, trailing, "0"),
+    Tz = byte_size(Digits0) - byte_size(Trimmed),
+    Mantissa = case Trimmed of <<>> -> 0; _ -> binary_to_integer(Trimmed) end,
+    ExpI = case Exp of <<>> -> 0; _ -> binary_to_integer(Exp) end,
+    E = ExpI - byte_size(Frac) + Tz + 8,
+    if
+        E < 0; E >= 18 ->
+            {error, ?RPC_TYPE_ERROR, <<"Invalid amount">>};
+        true ->
+            V = Mantissa * lists:foldl(fun(_, A) -> A * 10 end, 1, lists:seq(1, E)),
+            if
+                V > 999999999999999999 ->
+                    {error, ?RPC_TYPE_ERROR, <<"Invalid amount">>};
+                Sign =:= <<"-">>, V > 0 ->
+                    {error, ?RPC_TYPE_ERROR, <<"Amount out of range">>};
+                true ->
+                    tmpa_fee_rate_sat(V)
+            end
+    end.
+
+tmpa_fee_rate_sat(Sat) when Sat < 0; Sat > 21000000 * 100000000 ->
+    {error, ?RPC_TYPE_ERROR, <<"Amount out of range">>};
+tmpa_fee_rate_sat(Sat) when Sat >= 100000000 ->
+    {error, ?RPC_INVALID_PARAMETER,
+     <<"Fee rates larger than or equal to 1BTC/kvB are not accepted">>};
+tmpa_fee_rate_sat(Sat) ->
+    {ok, Sat}.
+
+%% Core: a tx whose base fee exceeds maxfeerate.GetFee(vsize) is reported
+%% allowed=false / reject-reason "max-fee-exceeded", and every later tx gets
+%% only txid + wtxid (validation result withheld).  A rate of 0 disables it.
+tmpa_apply_max_fee(Rows, 0) ->
+    [Row || {_Fee, _VSize, Row} <- Rows];
+tmpa_apply_max_fee(Rows, SatPerKvB) ->
+    tmpa_apply_max_fee(Rows, SatPerKvB, false, []).
+
+tmpa_apply_max_fee([], _Rate, _Early, Acc) ->
+    lists:reverse(Acc);
+tmpa_apply_max_fee([{_F, _V, Row} | T], Rate, true, Acc) ->
+    Plain = maps:with([<<"txid">>, <<"wtxid">>], Row),
+    tmpa_apply_max_fee(T, Rate, true, [Plain | Acc]);
+tmpa_apply_max_fee([{Fee, VSize, Row} | T], Rate, false, Acc)
+  when is_integer(Fee) ->
+    %% CFeeRate::GetFee rounds up (EvaluateFeeUp).
+    case Fee > (Rate * VSize + 999) div 1000 of
+        true ->
+            Rej = maps:with([<<"txid">>, <<"wtxid">>], Row),
+            tmpa_apply_max_fee(
+              T, Rate, true,
+              [Rej#{<<"allowed">> => false,
+                    <<"reject-reason">> => <<"max-fee-exceeded">>} | Acc]);
+        false ->
+            tmpa_apply_max_fee(T, Rate, false, [Row | Acc])
+    end;
+tmpa_apply_max_fee([{_NoFee, _V, Row} | T], Rate, false, Acc) ->
+    tmpa_apply_max_fee(T, Rate, false, [Row | Acc]).
+
+do_testmempoolaccept(RawTxs, SatPerKvB) ->
     try
         %% Core rpc/mempool.cpp:332-335: DecodeHexTx failure is an RPC error
         %% (RPC_DESERIALIZATION_ERROR -22), not a result-row reject-reason.
@@ -5040,7 +5177,7 @@ rpc_testmempoolaccept([RawTxs]) when is_list(RawTxs) ->
                 Wtxid = beamchain_serialize:wtx_hash(Tx),
                 case beamchain_mempool:accept_to_memory_pool_dry_run(Tx) of
                     {ok, Txid, DryWtxid, Fee, VSize, _FeeRate} ->
-                        [#{<<"txid">>    => hash_to_hex(Txid),
+                        [{Fee, VSize, #{<<"txid">>    => hash_to_hex(Txid),
                            <<"wtxid">>   => hash_to_hex(DryWtxid),
                            <<"allowed">> => true,
                            <<"vsize">>   => VSize,
@@ -5050,9 +5187,9 @@ rpc_testmempoolaccept([RawTxs]) when is_list(RawTxs) ->
                                    feerate_btc_per_kvb(Fee, VSize),
                                <<"effective-includes">> =>
                                    [hash_to_hex(DryWtxid)]
-                           }}];
+                           }}}];
                     {error, Reason} ->
-                        [reject_result(Tx, Txid, Wtxid, Reason)]
+                        [{none, 0, reject_result(Tx, Txid, Wtxid, Reason)}]
                 end;
             _ ->
                 %% Multi-tx path — dry-run via accept_package_dry_run/1.
@@ -5061,7 +5198,7 @@ rpc_testmempoolaccept([RawTxs]) when is_list(RawTxs) ->
                     {ok, EntryList} ->
                         lists:map(fun
                             ({ok, Txid, Wtxid, Fee, VSize}) ->
-                                #{<<"txid">>    => hash_to_hex(Txid),
+                                {Fee, VSize, #{<<"txid">>    => hash_to_hex(Txid),
                                   <<"wtxid">>   => hash_to_hex(Wtxid),
                                   <<"allowed">> => true,
                                   <<"vsize">>   => VSize,
@@ -5071,35 +5208,33 @@ rpc_testmempoolaccept([RawTxs]) when is_list(RawTxs) ->
                                           feerate_btc_per_kvb(Fee, VSize),
                                       <<"effective-includes">> =>
                                           [hash_to_hex(Wtxid)]
-                                  }};
+                                  }}};
                             ({error, Txid, Wtxid, Reason}) ->
                                 Tx = tx_by_txid(Txid, Decoded),
-                                reject_result(Tx, Txid, Wtxid, Reason)
+                                {none, 0, reject_result(Tx, Txid, Wtxid, Reason)}
                         end, EntryList);
                     {error, Reason} ->
                         %% Structural package error — report for every tx
                         lists:map(fun(Tx) ->
                             Txid  = beamchain_serialize:tx_hash(Tx),
                             Wtxid = beamchain_serialize:wtx_hash(Tx),
-                            #{<<"txid">>    => hash_to_hex(Txid),
-                              <<"wtxid">>   => hash_to_hex(Wtxid),
-                              <<"allowed">> => false,
-                              <<"package-error">> =>
-                                  iolist_to_binary(io_lib:format("~p", [Reason]))}
+                            {none, 0,
+                             #{<<"txid">>    => hash_to_hex(Txid),
+                               <<"wtxid">>   => hash_to_hex(Wtxid),
+                               <<"allowed">> => false,
+                               <<"package-error">> =>
+                                   iolist_to_binary(io_lib:format("~p", [Reason]))}}
                         end, Decoded)
                 end
         end,
-        {ok, Results}
+        {ok, tmpa_apply_max_fee(Results, SatPerKvB)}
     catch
         throw:{decode_failed, BadHex} ->
             {error, ?RPC_DESERIALIZATION_ERROR,
              iolist_to_binary(io_lib:format(
                  "TX decode failed: ~s Make sure the tx has at "
                  "least one input.", [BadHex]))}
-    end;
-rpc_testmempoolaccept(_) ->
-    {error, ?RPC_INVALID_PARAMS,
-     <<"Usage: testmempoolaccept [\"rawtx\"]">>}.
+    end.
 
 %% @doc submitpackage: Submit a package of related transactions atomically.
 %% Mirrors Bitcoin Core's `rpc/mempool.cpp::submitpackage`. The package is
@@ -5253,7 +5388,8 @@ rpc_submitpackage(_) ->
 decode_package_tx(Hex) when is_binary(Hex) ->
     try
         Bin = beamchain_serialize:hex_decode(Hex),
-        {Tx, _} = beamchain_serialize:decode_transaction(Bin),
+        %% Core DecodeHexTx: the whole string must be consumed.
+        {Tx, <<>>} = beamchain_serialize:decode_transaction(Bin),
         Tx
     catch
         _:_ -> throw({decode_failed, Hex})
