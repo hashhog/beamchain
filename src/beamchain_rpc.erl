@@ -88,6 +88,7 @@
 -export([format_utxo_result/4]).
 %% Test-only exports — output-shape helpers (submitpackage / testmempoolaccept).
 -export([package_msg/1, package_tx_error/1, feerate_btc_per_kvb/2]).
+-export([sort_txids_core_order/1, hex_sorted/1, hash_to_hex/1]).
 %% Test-only exports — ParseHashV txid/blockhash parse-boundary guard
 %% (Core rpc/util.cpp ParseHashV: malformed hash -> -8 at the parse boundary,
 %% well-formed-but-absent -> the handler's -5/null). The eunit suite drives the
@@ -9982,7 +9983,8 @@ format_mempool_entry(_) ->
 
 %% depends / spentby / chunk of one mempool entry (Core entryToJSON,
 %% rpc/mempool.cpp).  depends = txids of in-mempool parents, spentby = txids
-%% of in-mempool children, both sorted; chunk = {weight, modified fee} of the
+%% of in-mempool children (depends: display-hex order, spentby: Core's Txid
+%% order); chunk = {weight, modified fee} of the
 %% cluster chunk holding the tx.  Read-only over the mempool tables.
 %% A tx evicted between the caller's lookup and this one falls back to its
 %% own weight and fee as a singleton chunk.
@@ -10000,14 +10002,24 @@ mempool_entry_links(Txid, OwnWeight, OwnFee) ->
         Children = [C || {C, {_, _, Ps}} <- maps:to_list(Nodes),
                          lists:member(Txid, Ps)],
         {[hash_to_hex(P) || P <- hex_sorted(Parents)],
-         [hash_to_hex(C) || C <- hex_sorted(Children)],
+         [hash_to_hex(C) || C <- sort_txids_core_order(Children)],
          beamchain_mempool_chunks:chunk_of(Txid, Nodes)}
     catch
         _:_ -> {[], [], {OwnWeight, OwnFee}}
     end.
 
+%% depends: Core collects display-hex strings in a std::set<std::string>
+%% (entryToJSON), so it is display-hex order.
 hex_sorted(Txids) ->
     [T || {_, T} <- lists:sort([{hash_to_hex(T), T} || T <- Txids])].
+
+%% spentby: Core orders mempool children by Txid `<` (uint256 memcmp over the
+%% internal
+%% little-endian bytes: CompareIteratorByHash in kernel/mempool_entry.h,
+%% GetChildren in txmempool.cpp), not by the byte-reversed display hex.
+%% Txids here are the internal 32-byte binaries, so plain term order is it.
+sort_txids_core_order(Txids) ->
+    lists:usort(Txids).
 
 %% Connected component of the in-mempool spend graph that holds the seeds.
 mempool_cluster_members([], Seen) -> Seen;
