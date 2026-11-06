@@ -2,10 +2,16 @@
 %%% verbose (`chunkweight`, `fees.chunk`, Bitcoin Core v31 entryToJSON).
 %%%
 %%% A cluster's chunks are the pieces of its feerate-diagram-optimal
-%%% linearization.  They are built here by repeatedly taking the
-%%% highest-feerate ancestor set among the remaining transactions, which gives
-%%% non-increasing chunk feerates.  This is output formatting only: nothing in
-%%% mempool admission, eviction, or block building reads it.
+%%% linearization (Core v31 cluster_linearize.h).  The first chunk of an
+%%% optimal linearization is the highest-feerate topologically closed set
+%%% (a set that contains every in-cluster parent of its members), and the
+%%% rest follow by repeating on what remains, which gives non-increasing
+%%% chunk feerates.  A closed set is not always an ancestor set of one tx (a
+%%% zero-fee parent plus all of its children is not), so the best ancestor
+%%% set is only the starting point: it is improved by Dinkelbach iteration,
+%%% each step a maximum-weight closure solved as a min cut.  Ties keep the
+%%% smaller set.  This is output formatting only: nothing in mempool
+%%% admission, eviction, or block building reads it.
 -module(beamchain_mempool_chunks).
 
 -export([chunk_of/2]).
@@ -30,6 +36,10 @@ chunk_loop(Target, Rem) ->
 %% Best (highest fee/weight) ancestor set among the remaining transactions;
 %% ties go to the smaller set, then to the smaller txid, so it is stable.
 best_ancestor_set(Rem) ->
+    {Set0, W0, F0} = best_single_ancestor_set(Rem),
+    improve(Set0, W0, F0, Rem).
+
+best_single_ancestor_set(Rem) ->
     Cands = [begin
                  Set = ancestor_set(T, Rem),
                  {W, F} = sum(Set, Rem),
@@ -62,3 +72,88 @@ sum(Set, Rem) ->
         {F, W, _} = maps:get(T, Rem),
         {WA + W, FA + F}
     end, {0, 0}, Set).
+
+%% Dinkelbach step.  With lambda = F/W, tx i has value v_i = f_i*W - F*w_i
+%% (scaled by W so it stays an integer); a closed set S has v(S) > 0 exactly
+%% when its feerate beats F/W.  Take the closed set of maximum v (the minimal
+%% one, so ties do not grow the chunk) and repeat until none beats F/W.
+improve(Set, W, F, Rem) ->
+    case max_closure(Rem, W, F) of
+        [] -> {Set, W, F};
+        New ->
+            {W1, F1} = sum(New, Rem),
+            improve(New, W1, F1, Rem)
+    end.
+
+%% Minimal closed subset of Rem with positive total value, or [].
+max_closure(Rem, W, F) ->
+    Vals = maps:map(fun(_, {Fee, Wt, _}) -> Fee * W - F * Wt end, Rem),
+    Pos = lists:sum([V || V <- maps:values(Vals), V > 0]),
+    case Pos of
+        0 -> [];
+        _ ->
+            Inf = Pos + 1,
+            Edges0 = lists:append(
+                [[{s, T, V} || V > 0] ++ [{T, t, -V} || V < 0]
+                 || {T, V} <- maps:to_list(Vals)]),
+            %% a member needs its in-Rem parents
+            Edges1 = [{T, P, Inf}
+                      || {T, {_, _, Ps}} <- maps:to_list(Rem),
+                         P <- lists:usort(Ps), maps:is_key(P, Rem)],
+            Cap0 = lists:foldl(fun({U, V, C}, M) ->
+                                   M1 = maps:update_with({U, V}, fun(X) -> X + C end, C, M),
+                                   maps:update_with({V, U}, fun(X) -> X end, 0, M1)
+                               end, #{}, Edges0 ++ Edges1),
+            Adj = lists:foldl(fun({U, V}, A) ->
+                                  maps:update_with(U, fun(L) -> [V | L] end, [V], A)
+                              end, #{}, maps:keys(Cap0)),
+            Res = max_flow(Cap0, Adj),
+            %% source side of the min cut: reachable from s in the residual graph
+            Reach = bfs_reach([s], Res, Adj, #{s => true}),
+            Set = [T || T <- maps:keys(Rem), maps:is_key(T, Reach)],
+            {_, FS} = sum(Set, Rem),
+            {WS, _} = sum(Set, Rem),
+            case Set =/= [] andalso FS * W > F * WS of
+                true -> lists:sort(Set);
+                false -> []
+            end
+    end.
+
+%% Edmonds-Karp on a residual-capacity map; returns the final residuals.
+max_flow(Res, Adj) ->
+    case bfs_path(Res, Adj) of
+        none -> Res;
+        Path ->
+            Bottleneck = lists:min([maps:get(E, Res) || E <- Path]),
+            Res1 = lists:foldl(
+                fun({U, V}, M) ->
+                    M#{{U, V} := maps:get({U, V}, M) - Bottleneck,
+                       {V, U} := maps:get({V, U}, M) + Bottleneck}
+                end, Res, Path),
+            max_flow(Res1, Adj)
+    end.
+
+bfs_path(Res, Adj) ->
+    bfs_path([s], Res, Adj, #{s => none}).
+
+bfs_path([], _Res, _Adj, _Prev) -> none;
+bfs_path([U | Queue], Res, Adj, Prev) ->
+    Next = [V || V <- maps:get(U, Adj, []),
+                 not maps:is_key(V, Prev), maps:get({U, V}, Res) > 0],
+    Prev1 = lists:foldl(fun(V, P) -> P#{V => U} end, Prev, Next),
+    case lists:member(t, Next) of
+        true -> build_path(t, Prev1, []);
+        false -> bfs_path(Queue ++ Next, Res, Adj, Prev1)
+    end.
+
+build_path(s, _Prev, Acc) -> Acc;
+build_path(V, Prev, Acc) ->
+    U = maps:get(V, Prev),
+    build_path(U, Prev, [{U, V} | Acc]).
+
+bfs_reach([], _Res, _Adj, Seen) -> Seen;
+bfs_reach([U | Queue], Res, Adj, Seen) ->
+    Next = [V || V <- maps:get(U, Adj, []),
+                 not maps:is_key(V, Seen), maps:get({U, V}, Res) > 0],
+    Seen1 = lists:foldl(fun(V, S) -> S#{V => true} end, Seen, Next),
+    bfs_reach(Queue ++ Next, Res, Adj, Seen1).
