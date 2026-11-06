@@ -166,9 +166,6 @@ hex_txid(Tx) ->
 in_pool(Tx) ->
     lists:member(beamchain_serialize:tx_hash(Tx), beamchain_mempool:get_all_txids()).
 
-pool_len() -> length(beamchain_mempool:get_all_txids()).
-info_size() -> maps:get(size, beamchain_mempool:get_info()).
-info_bytes() -> maps:get(bytes, beamchain_mempool:get_info()).
 vsize_of(Tx) -> beamchain_serialize:tx_vsize(Tx).
 
 %% Spend Txid:Vout (a P2SH(OP_TRUE) coin worth Amount) into one

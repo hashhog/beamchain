@@ -790,7 +790,14 @@ get_mempool_utxo(Txid, Vout) ->
 add_unbroadcast(Txid) ->
     case ets:info(?MEMPOOL_UNBROADCAST) =/= undefined andalso
          ets:member(?MEMPOOL_TXS, Txid) of
-        true -> ets:insert(?MEMPOOL_UNBROADCAST, {Txid, true}), ok;
+        true ->
+            ets:insert(?MEMPOOL_UNBROADCAST, {Txid, true}),
+            %% A concurrent removal between the check and the insert would
+            %% leave a stale flag (and a permanently high count); re-check.
+            case ets:member(?MEMPOOL_TXS, Txid) of
+                true -> ok;
+                false -> ets:delete(?MEMPOOL_UNBROADCAST, Txid), ok
+            end;
         false -> ok
     end.
 
