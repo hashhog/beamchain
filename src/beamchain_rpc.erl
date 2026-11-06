@@ -5329,6 +5329,12 @@ rpc_submitpackage([RawTxs, MaxFeeRate, MaxBurnAmount]) when is_list(RawTxs) ->
                         {ok, AcceptedTxids, Info} ->
                             {<<"success">>, sets:from_list(AcceptedTxids),
                              Info, none};
+                        {error, Reason, #{accepted := Acc} = PInfo} ->
+                            %% Some members were admitted before the package
+                            %% failed; they keep their vsize/fees, the others
+                            %% their own reason (Core ProcessNewPackage).
+                            {package_msg(Reason), sets:from_list(Acc), PInfo,
+                             Reason};
                         {error, Reason} ->
                             {package_msg(Reason), sets:new(), #{}, Reason}
                         end,
@@ -5471,7 +5477,9 @@ build_pkg_tx_result(Tx, Txid, Wtxid, Wtxids, Txids, AcceptedSet, PkgInfo,
         false ->
             %% Rejected.  The failing tx carries its own reason; the others
             %% were never validated.
+            Own = maps:get(Txid, maps:get(errors, PkgInfo, #{}), undefined),
             ErrorStr = case PkgFailure of
+                _ when Own =/= undefined -> package_tx_error(Own);
                 {tx_failed, Txid, _} -> package_tx_error(PkgFailure);
                 {tx_failed, _, _}    -> <<"package-not-validated">>;
                 none                 -> <<"package-not-validated">>;

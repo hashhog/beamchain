@@ -352,8 +352,10 @@ accept_package(Package) ->
 %% @doc accept_package/1 that also reports how the package was admitted.
 %% Info is #{cpfp := {Txids, Fee, VSize}} when some txs only entered as a
 %% package (they failed the mempool min fee on their own), else #{}.
+%% When some members were admitted before the package failed, the error is
+%% {error, Reason, #{accepted := Txids, errors := #{Txid => Reason}}}.
 -spec accept_package_info([#transaction{}]) ->
-    {ok, [binary()], map()} | {error, term()}.
+    {ok, [binary()], map()} | {error, term()} | {error, term(), map()}.
 accept_package_info(Package) ->
     gen_server:call(?SERVER, {accept_package_info, Package}, 60000).
 
@@ -1019,6 +1021,16 @@ handle_accept_package(Package, State, WithInfo) ->
             case WithInfo of
                 true  -> {reply, {ok, Txids, Info}, State3};
                 false -> {reply, {ok, Txids}, State3}
+            end;
+        {partial, Reason, Info, State2} ->
+            %% Some members were admitted before the package failed (Core's
+            %% ProcessNewPackage keeps every individually-valid member).  The
+            %% admitted ones live in ETS, so their accounting in State2 must
+            %% survive the error reply.
+            State3 = do_trim_to_size(State2#state.max_size, State2),
+            case WithInfo of
+                true  -> {reply, {error, Reason, Info}, State3};
+                false -> {reply, {error, Reason}, State3}
             end;
         {error, Reason} ->
             {reply, {error, Reason}, State}
@@ -1799,17 +1811,36 @@ do_accept_package(Package, State) ->
         %% 2. Compute txids for deduplication
         TxidTxPairs = [{beamchain_serialize:tx_hash(Tx), Tx} || Tx <- Package],
 
-        %% 3. Try each transaction individually, track results
-        {AcceptedTxids, DeferredTxs, State2} =
+        %% 3. Try each transaction individually, track results.  Like Core's
+        %%    ProcessNewPackage, a member that fails for a reason other than
+        %%    fee/missing inputs does not stop the others being tried: every
+        %%    valid member stays admitted and each failure keeps its own
+        %%    reason (validation.cpp ProcessNewPackage, quit_early path).
+        {AcceptedTxids, DeferredTxs, Errors, State2} =
             try_individual_accept(TxidTxPairs, State),
+        ErrMap = maps:from_list([{T, R} || {T, R, _Kind} <- Errors]),
+        HardFailed = [{T, R} || {T, R, hard} <- Errors],
 
-        %% 4. If no deferred transactions, we're done
-        case DeferredTxs of
+        %% 4. Hard failure: report it; deferred members keep their individual
+        %%    reason (a child of a rejected parent has missing inputs).
+        case HardFailed of
+            [{FTxid, FReason} | _] ->
+                {partial, {tx_failed, FTxid, FReason},
+                 #{accepted => AcceptedTxids, errors => ErrMap}, State2};
             [] ->
-                {ok, AcceptedTxids, #{}, State2};
-            _ ->
-                %% 5. Evaluate deferred transactions as a package (CPFP)
-                evaluate_package_cpfp(DeferredTxs, AcceptedTxids, State2)
+                case DeferredTxs of
+                    [] ->
+                        {ok, AcceptedTxids, #{}, State2};
+                    _ ->
+                        %% 5. Evaluate deferred transactions as a package (CPFP)
+                        try evaluate_package_cpfp(DeferredTxs, AcceptedTxids, State2)
+                        catch
+                            throw:PkgReason ->
+                                {partial, PkgReason,
+                                 #{accepted => AcceptedTxids, errors => #{}},
+                                 State2}
+                        end
+                end
         end
     catch
         throw:Reason ->
@@ -1908,36 +1939,40 @@ is_child_with_parents(Package) ->
 %% Returns {AcceptedTxids, DeferredTxs, UpdatedState}
 %% DeferredTxs contains {Txid, Tx} pairs that failed due to fee issues.
 try_individual_accept(TxidTxPairs, State) ->
-    try_individual_accept(TxidTxPairs, State, [], []).
+    try_individual_accept(TxidTxPairs, State, [], [], []).
 
-try_individual_accept([], State, AcceptedAcc, DeferredAcc) ->
-    {lists:reverse(AcceptedAcc), lists:reverse(DeferredAcc), State};
-try_individual_accept([{Txid, Tx} | Rest], State, AcceptedAcc, DeferredAcc) ->
+%% Returns {AcceptedTxids, DeferredTxs, Errors, State}.  Errors is a list of
+%% {Txid, Reason, hard | soft}: soft ones (fee, missing inputs) are deferred
+%% to package evaluation, hard ones are final.
+try_individual_accept([], State, AcceptedAcc, DeferredAcc, ErrAcc) ->
+    {lists:reverse(AcceptedAcc), lists:reverse(DeferredAcc),
+     lists:reverse(ErrAcc), State};
+try_individual_accept([{Txid, Tx} | Rest], State, AcceptedAcc, DeferredAcc, ErrAcc) ->
     %% Check if already in mempool
     case ets:member(?MEMPOOL_TXS, Txid) of
         true ->
             %% Already in mempool, treat as accepted
-            try_individual_accept(Rest, State, [Txid | AcceptedAcc], DeferredAcc);
+            try_individual_accept(Rest, State, [Txid | AcceptedAcc], DeferredAcc, ErrAcc);
         false ->
             case do_add_transaction(Tx, State) of
                 {ok, Txid, State2} ->
-                    try_individual_accept(Rest, State2, [Txid | AcceptedAcc], DeferredAcc);
-                {error, 'mempool min fee not met'} ->
-                    %% Defer for package evaluation (CPFP). Canonical Core string
-                    %% per validation.cpp:948 + policy/feerate.cpp.
+                    try_individual_accept(Rest, State2, [Txid | AcceptedAcc],
+                                          DeferredAcc, ErrAcc);
+                {error, Reason} when Reason =:= 'mempool min fee not met';
+                                     Reason =:= orphan;
+                                     Reason =:= ephemeral_anchor_needs_spending ->
+                    %% Defer for package evaluation (CPFP): fee shortfall,
+                    %% missing inputs (parent may be earlier in pkg) or an
+                    %% ephemeral anchor parent that its child must spend.
+                    %% Canonical Core string per validation.cpp:948 +
+                    %% policy/feerate.cpp.
                     try_individual_accept(Rest, State, AcceptedAcc,
-                                          [{Txid, Tx} | DeferredAcc]);
-                {error, orphan} ->
-                    %% Missing inputs - defer for package (parent may be earlier in pkg)
-                    try_individual_accept(Rest, State, AcceptedAcc,
-                                          [{Txid, Tx} | DeferredAcc]);
-                {error, ephemeral_anchor_needs_spending} ->
-                    %% Ephemeral anchor parent - must be spent by child in package
-                    try_individual_accept(Rest, State, AcceptedAcc,
-                                          [{Txid, Tx} | DeferredAcc]);
+                                          [{Txid, Tx} | DeferredAcc],
+                                          [{Txid, Reason, soft} | ErrAcc]);
                 {error, Reason} ->
-                    %% Non-recoverable failure - abort entire package
-                    throw({tx_failed, Txid, Reason})
+                    %% Non-recoverable failure: record it and keep going.
+                    try_individual_accept(Rest, State, AcceptedAcc, DeferredAcc,
+                                          [{Txid, Reason, hard} | ErrAcc])
             end
     end.
 
