@@ -94,17 +94,18 @@ min_relay_split_test_() ->
     ].
 
 %%% --- missing-inputs remap (rpc/mempool.cpp) ------------------------
-%%% testmempoolaccept surface -> "missing-inputs"; sendrawtransaction keeps
-%%% its own "Missing inputs" prose (only the reject-reason field is remapped).
+%%% testmempoolaccept surface -> "missing-inputs"; sendrawtransaction reports
+%%% Core HandleATMPError message (bad-txns-inputs-missingorspent); testmempoolaccept
+%%% remaps the reject-reason field to "missing-inputs".
 
 missing_inputs_remap_test_() ->
     [
      ?_assertEqual(<<"missing-inputs">>, mrr(orphan)),
      ?_assertEqual(<<"missing-inputs">>, mrr('bad-txns-inputs-missingorspent')),
      ?_assertEqual(<<"missing-inputs">>, mrr(missing_inputs)),
-     %% sendrawtransaction prose is intentionally left as-is.
-     ?_assertEqual(<<"Missing inputs">>, frm(orphan)),
-     ?_assertEqual(<<"Missing inputs">>, frm('bad-txns-inputs-missingorspent'))
+     %% sendrawtransaction: Core HandleATMPError message, state.ToString().
+     ?_assertEqual(<<"bad-txns-inputs-missingorspent">>, frm(orphan)),
+     ?_assertEqual(<<"bad-txns-inputs-missingorspent">>, frm('bad-txns-inputs-missingorspent'))
     ].
 
 %%% --- already-correct tokens preserved (regression guards) ----------
