@@ -144,7 +144,6 @@
 %%% Policy constants
 %%% -------------------------------------------------------------------
 
--define(DEFAULT_MAX_MEMPOOL_SIZE, 300 * 1024 * 1024).  % 300 MB
 -define(MIN_RELAY_TX_FEE, 1000).           % 1000 sat/kvB = 1 sat/vB
 -define(DUST_RELAY_TX_FEE, 3000).          % 3000 sat/kvB for dust calc
 -define(MAX_ORPHAN_TXS, 100).
@@ -880,7 +879,7 @@ init([]) ->
 
     logger:info("mempool: initialized"),
     {ok, #state{
-        max_size = ?DEFAULT_MAX_MEMPOOL_SIZE,
+        max_size = beamchain_config:maxmempool_bytes(),
         total_bytes = 0,
         total_count = 0,
         union_find = #{},

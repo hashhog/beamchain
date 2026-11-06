@@ -26,6 +26,7 @@
          prune_target/0,
          prune_manual_mode/0,
          dbcache_mb/0,
+         maxmempool_bytes/0,
          mempool_full_rbf/0,
          txreconciliation/0,
          zmq_enabled/0,
@@ -328,6 +329,29 @@ dbcache_mb() ->
             end;
         S ->
             Parse(S)
+    end.
+
+%% @doc Core `-maxmempool=<MB>` as bytes. Core node/mempool_args.cpp:
+%% max_size_bytes = MB * 1'000'000 (DEFAULT_MAX_MEMPOOL_SIZE_MB = 300).
+%% Env BEAMCHAIN_MAXMEMPOOL (set by --maxmempool) > config `maxmempool=` >
+%% default. A non-integer or negative value falls back to the default.
+-spec maxmempool_bytes() -> non_neg_integer().
+maxmempool_bytes() ->
+    Parse = fun(S) ->
+        case catch list_to_integer(string:trim(S)) of
+            N when is_integer(N), N >= 0 -> N * 1000000;
+            _ -> 300 * 1000000
+        end
+    end,
+    case os:getenv("BEAMCHAIN_MAXMEMPOOL") of
+        false ->
+            case get(maxmempool, undefined) of
+                S when is_list(S) -> Parse(S);
+                B when is_binary(B) -> Parse(binary_to_list(B));
+                N when is_integer(N), N >= 0 -> N * 1000000;
+                _ -> 300 * 1000000
+            end;
+        S -> Parse(S)
     end.
 
 %% @doc Check if full RBF is enabled.

@@ -448,7 +448,7 @@ rest_mempool_info(json) ->
         <<"bytes">> => Bytes,
         <<"usage">> => Bytes,
         <<"total_fee">> => maps:get(total_fee, Info, 0) / 100000000.0,
-        <<"maxmempool">> => 300000000,
+        <<"maxmempool">> => beamchain_config:maxmempool_bytes(),
         <<"mempoolminfee">> => maps:get(min_fee_rate, Info, 1) / 100000.0,
         <<"minrelaytxfee">> => 0.00001000,
         <<"incrementalrelayfee">> => 0.00001000,
