@@ -6587,7 +6587,7 @@ mempoolinfo_proplist(Size, Bytes, TotalFeeBtc, FullRbf) ->
         {<<"bytes">>, Bytes},
         {<<"usage">>, Bytes},
         {<<"total_fee">>, TotalFeeBtc},
-        {<<"maxmempool">>, ?DEFAULT_MEMPOOL_MAX_SIZE},
+        {<<"maxmempool">>, beamchain_config:maxmempool_bytes()},
         %% Core rpc/mempool.cpp reports these as
         %% ValueFromAmount(min_relay_feerate.GetFeePerK()) — i.e. the fee rate in
         %% sat/kvB divided by COIN (1e8) to yield BTC/kvB. DEFAULT_MIN_RELAY_TX_FEE

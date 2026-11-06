@@ -375,6 +375,16 @@ parse_args(["--coinstatsindex=0" | Rest], Cmd, Opts) ->
 parse_args(["--coinstatsindex=1" | Rest], Cmd, Opts) ->
     parse_args(Rest, Cmd, Opts#{coinstatsindex => 1});
 
+%% Core `-maxmempool=<MB>`; routed through BEAMCHAIN_MAXMEMPOOL by apply_opts/1.
+parse_args(["-maxmempool=" ++ V | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{maxmempool => V});
+parse_args(["--maxmempool=" ++ V | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{maxmempool => V});
+parse_args(["-maxmempool", V | Rest], Cmd, Opts) when V =/= [], hd(V) =/= $- ->
+    parse_args(Rest, Cmd, Opts#{maxmempool => V});
+parse_args(["--maxmempool", V | Rest], Cmd, Opts) when V =/= [], hd(V) =/= $- ->
+    parse_args(Rest, Cmd, Opts#{maxmempool => V});
+
 %% --dbcache=<MiB>: total UTXO cache budget (Core -dbcache). PERF-ONLY: sizes
 %% the in-memory ETS flush budget + the RocksDB coins block cache; does not
 %% change validation results. Routed through BEAMCHAIN_DBCACHE so the
@@ -478,6 +488,7 @@ print_usage() ->
         "  --cfilter=<n>     BIP-157/158 compact block filter index~n"
         "                    (0=off, 1=basic; mirrors Core -blockfilterindex)~n"
         "  -blockfilterindex[=basic]  alias for --cfilter=1 (Core spelling)~n"
+        "  -maxmempool=<MB>      mempool size limit in MB (default 300)~n"
         "  -fallbackfee=<btc/kvB> fee rate used when estimation has no data~n"
         "                    (default 0 = disabled, like Core)~n"
         "  --txindex[=n]     maintain a full transaction index, used by~n"
@@ -1014,6 +1025,10 @@ apply_opts(Opts) ->
         undefined -> ok;
         0 -> os:putenv("BEAMCHAIN_COINSTATSINDEX", "0");
         1 -> os:putenv("BEAMCHAIN_COINSTATSINDEX", "1")
+    end,
+    case maps:get(maxmempool, Opts, undefined) of
+        undefined -> ok;
+        MaxMp -> os:putenv("BEAMCHAIN_MAXMEMPOOL", MaxMp)
     end,
     case maps:get(fallbackfee, Opts, undefined) of
         undefined -> ok;
