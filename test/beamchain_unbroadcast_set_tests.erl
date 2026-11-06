@@ -166,7 +166,6 @@ hex_txid(Tx) ->
 in_pool(Tx) ->
     lists:member(beamchain_serialize:tx_hash(Tx), beamchain_mempool:get_all_txids()).
 
-vsize_of(Tx) -> beamchain_serialize:tx_vsize(Tx).
 
 %% Spend Txid:Vout (a P2SH(OP_TRUE) coin worth Amount) into one
 %% P2SH(OP_TRUE) output, paying ?FEE + Salt.
