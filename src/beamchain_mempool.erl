@@ -28,6 +28,9 @@
 -define(DRY_RUN_PKG_ENTRIES, beamchain_dry_run_pkg_entries).
 -define(DRY_RUN_PKG_CLUSTERS, beamchain_dry_run_pkg_clusters).
 -export([accept_to_memory_pool_dry_run/1, accept_package_dry_run/1]).
+%% Unbroadcast set (Core CTxMemPool::m_unbroadcast_txids).
+-export([add_unbroadcast/1, remove_unbroadcast/1, is_unbroadcast/1,
+         unbroadcast_count/0]).
 %% accept_package/1 plus which txs were admitted together as a CPFP package
 %% (submitpackage reports their shared effective feerate).
 -export([accept_package_info/1]).
@@ -228,6 +231,7 @@
 %% have a delta WITHOUT being in ?MEMPOOL_TXS (pre-prioritised, not yet
 %% admitted), so this is a separate table — never folded into the entry
 %% record (keeps #mempool_entry{} arity stable for the miner's positional copy).
+-define(MEMPOOL_UNBROADCAST, mempool_unbroadcast). %% txid -> true (Core m_unbroadcast_txids)
 -define(MEMPOOL_DELTAS, mempool_deltas).     %% txid -> integer() (signed sat)
 
 %%% -------------------------------------------------------------------
@@ -771,6 +775,42 @@ get_mempool_utxo(Txid, Vout) ->
     end.
 
 %%% ===================================================================
+%%% Unbroadcast set
+%%% ===================================================================
+%% Core: a tx submitted through sendrawtransaction / submitpackage is added
+%% to m_unbroadcast_txids (node/transaction.cpp BroadcastTransaction ->
+%% AddUnbroadcastTx) and stays there until a peer requests it with getdata
+%% (net_processing.cpp ProcessGetData -> RemoveUnbroadcastTx), it is mined,
+%% or it leaves the pool (txmempool.cpp removeUnchecked).  getmempoolentry
+%% reports `unbroadcast` and getmempoolinfo `unbroadcastcount` from it.
+
+%% @doc Mark Txid unbroadcast.  Ignored unless Txid is in the pool (Core
+%% AddUnbroadcastTx asserts the same via the callers).
+-spec add_unbroadcast(binary()) -> ok.
+add_unbroadcast(Txid) ->
+    case ets:info(?MEMPOOL_UNBROADCAST) =/= undefined andalso
+         ets:member(?MEMPOOL_TXS, Txid) of
+        true -> ets:insert(?MEMPOOL_UNBROADCAST, {Txid, true}), ok;
+        false -> ok
+    end.
+
+-spec remove_unbroadcast(binary()) -> ok.
+remove_unbroadcast(Txid) ->
+    catch ets:delete(?MEMPOOL_UNBROADCAST, Txid),
+    ok.
+
+-spec is_unbroadcast(binary()) -> boolean().
+is_unbroadcast(Txid) ->
+    try ets:member(?MEMPOOL_UNBROADCAST, Txid) catch _:_ -> false end.
+
+-spec unbroadcast_count() -> non_neg_integer().
+unbroadcast_count() ->
+    try ets:info(?MEMPOOL_UNBROADCAST, size) of
+        N when is_integer(N) -> N;
+        _ -> 0
+    catch _:_ -> 0 end.
+
+%%% ===================================================================
 %%% gen_server callbacks
 %%% ===================================================================
 
@@ -815,6 +855,8 @@ init([]) ->
     ensure_table(?MEMPOOL_CLUSTERS, [set, public, named_table,
                                      {read_concurrency, true}]),
     ensure_table(?MEMPOOL_EPHEMERAL, [set, public, named_table]),
+    ensure_table(?MEMPOOL_UNBROADCAST, [set, public, named_table,
+                                        {read_concurrency, true}]),
     ensure_table(?MEMPOOL_DELTAS, [set, public, named_table,
                                    {read_concurrency, true}]),
 
@@ -3894,6 +3936,8 @@ remove_entry(Txid) ->
                 ets:delete(?MEMPOOL_EPHEMERAL, {H, I})
             end, Tx#transaction.inputs),
             ets:delete(?MEMPOOL_TXS, Txid),
+            %% Core removeUnchecked: m_unbroadcast_txids.erase(hash).
+            catch ets:delete(?MEMPOOL_UNBROADCAST, Txid),
             wtxid_index_delete(Entry),
             Entry;
         [] ->
@@ -4192,6 +4236,9 @@ pull_descendants_of(Txs, State) ->
                             A#mempool_entry.fee_rate >= B#mempool_entry.fee_rate
                         end, Entries),
     Ordered = topo_order_entries(ByRate),
+    Unb = sets:from_list([T || #mempool_entry{txid = T} <- Ordered,
+                               is_unbroadcast(T)], [{version, 2}]),
+    WasUnbroadcast = fun(T) -> sets:is_element(T, Unb) end,
     State2 = lists:foldl(fun(#mempool_entry{txid = T, vsize = VS}, St) ->
         case remove_entry(T) of
             #mempool_entry{} ->
@@ -4202,8 +4249,11 @@ pull_descendants_of(Txs, State) ->
                 St
         end
     end, State, Ordered),
+    %% The unbroadcast flag survives like the admission time: Core never took
+    %% the descendant out of the pool, so m_unbroadcast_txids keeps it.
     {[{E#mempool_entry.tx, {E#mempool_entry.time_added,
-                           E#mempool_entry.height_added}} || E <- Ordered],
+                           E#mempool_entry.height_added,
+                           WasUnbroadcast(E#mempool_entry.txid)}} || E <- Ordered],
      State2}.
 
 %% Parents before children within a set of mempool entries.
@@ -4235,11 +4285,12 @@ topo_order_entries(Pending, InSet, Done, Acc) ->
 %% only rebuilds its ancestor state), so it keeps its admission time and height.
 restore_admission(_Txid, undefined) ->
     ok;
-restore_admission(Txid, {Time, Height}) ->
+restore_admission(Txid, {Time, Height, Unbroadcast}) ->
     case ets:lookup(?MEMPOOL_TXS, Txid) of
         [{Txid, E}] ->
             ets:insert(?MEMPOOL_TXS, {Txid, E#mempool_entry{time_added = Time,
                                                             height_added = Height}}),
+            Unbroadcast andalso add_unbroadcast(Txid),
             ok;
         [] ->
             ok

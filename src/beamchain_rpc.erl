@@ -4705,6 +4705,9 @@ compute_tx_input_value(#transaction{inputs = Inputs}) ->
 
 %% Relay a transaction to all connected peers.
 relay_transaction(Txid) ->
+    %% Core BroadcastTransaction: AddUnbroadcastTx before relaying; cleared
+    %% when a peer sends getdata for it, or when it is mined / evicted.
+    beamchain_mempool:add_unbroadcast(Txid),
     %% Per-peer BIP-339 inv type (MSG_WTX+wtxid to wtxidrelay peers); a
     %% MSG_TX+txid broadcast is silently dropped by every modern Core peer.
     try
@@ -6373,7 +6376,7 @@ mempoolinfo_proplist(Size, Bytes, TotalFeeBtc, FullRbf) ->
         %% ?DEFAULT_INCREMENTAL_RELAY_FEE (=100, policy.h:48) / 1e8 = 1e-06.
         %% Reads the real incremental constant — no hardcoded 0.00001.
         {<<"incrementalrelayfee">>, ?DEFAULT_INCREMENTAL_RELAY_FEE / 100000000.0},
-        {<<"unbroadcastcount">>, 0},
+        {<<"unbroadcastcount">>, beamchain_mempool:unbroadcast_count()},
         {<<"fullrbf">>, FullRbf},
         %% Core v31.99 additions (rpc/mempool.cpp:1057-1061). Regtest defaults:
         %% permit_bare_multisig (DEFAULT_PERMIT_BAREMULTISIG=true), max_datacarrier
@@ -9972,10 +9975,7 @@ format_mempool_entry(#mempool_entry{txid = Txid, wtxid = Wtxid,
         <<"depends">> => Depends,
         <<"spentby">> => SpentBy,
         <<"bip125-replaceable">> => Bip125,
-        %% TODO: track unbroadcast set (Core CTxMemPool::m_unbroadcast_txids)
-        %% and return pool.IsUnbroadcastTx(tx.GetHash()) here. Until then,
-        %% emit false (matches the common case for relayed txs).
-        <<"unbroadcast">> => false
+        <<"unbroadcast">> => beamchain_mempool:is_unbroadcast(Txid)
     };
 format_mempool_entry(_) ->
     #{<<"error">> => <<"failed to format entry">>}.

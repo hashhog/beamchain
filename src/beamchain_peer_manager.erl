@@ -91,7 +91,8 @@
 -export([chunk_inv_items/2, inv_items_from_pairs/2, getheaders_limit/2]).
 
 %% Exposed for testing (getdata per-inv-type serving decision)
--export([getdata_tx_msg/4, getdata_block_msg/2, getdata_cmpct_msg/3]).
+-export([getdata_tx_msg/4, getdata_block_msg/2, getdata_cmpct_msg/3,
+         handle_getdata_msg/2]).
 %% Data requests are served in the requesting peer's process (BC-S).
 -export([serve_peer_request/3]).
 
@@ -2684,6 +2685,9 @@ handle_getdata_msg(Pid, Payload) ->
                                             fun beamchain_mempool:get_tx_by_wtxid/1) of
                             {ok, Msg} ->
                                 beamchain_peer:send_message(Pid, Msg),
+                                %% Core ProcessGetData: serving a tx ->
+                                %% mempool.RemoveUnbroadcastTx (a peer has it).
+                                note_tx_served(Msg),
                                 false;
                             notfound ->
                                 {true, #{type => Type, hash => Hash}}
@@ -2698,6 +2702,12 @@ handle_getdata_msg(Pid, Payload) ->
         _ ->
             ok
     end.
+
+%% A peer fetched this tx: it is no longer in the unbroadcast set.
+note_tx_served({tx, {no_witness, Tx}}) -> note_tx_served({tx, Tx});
+note_tx_served({tx, Tx}) ->
+    catch beamchain_mempool:remove_unbroadcast(beamchain_serialize:tx_hash(Tx)),
+    ok.
 
 %% @doc Decide the reply to one getdata tx item.  Mirrors Core
 %% net_processing.cpp ProcessGetData + FindTxForGetData:

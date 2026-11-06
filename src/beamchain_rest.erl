@@ -452,7 +452,7 @@ rest_mempool_info(json) ->
         <<"mempoolminfee">> => maps:get(min_fee_rate, Info, 1) / 100000.0,
         <<"minrelaytxfee">> => 0.00001000,
         <<"incrementalrelayfee">> => 0.00001000,
-        <<"unbroadcastcount">> => 0,
+        <<"unbroadcastcount">> => beamchain_mempool:unbroadcast_count(),
         <<"fullrbf">> => beamchain_config:mempool_full_rbf()
     },
     {ok, json, jsx:encode(Json)};
