@@ -318,7 +318,7 @@ getrawtransaction_error_messages_test_() ->
           ?assert(is_binary(ExpectedMsg))
       end},
       {"Tx not in provided block", fun() ->
-          ExpectedMsg = <<"No such transaction found in the provided block">>,
+          ExpectedMsg = <<"No such transaction found in the provided block. Use gettransaction for wallet transactions.">>,
           ?assert(is_binary(ExpectedMsg))
       end}
      ]}.

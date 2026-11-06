@@ -3740,8 +3740,11 @@ find_tx_in_block_and_format(Txid, #block{transactions = Txs},
             format_getrawtransaction_result(Tx, BlockHash, Height, Verbosity,
                                              true, InActiveChain);
         not_found ->
+            %% Core rpc/rawtransaction.cpp getrawtransaction: errmsg + ". Use
+            %% gettransaction for wallet transactions." for every not-found case.
             {error, ?RPC_INVALID_ADDRESS_OR_KEY,
-             <<"No such transaction found in the provided block">>}
+             <<"No such transaction found in the provided block. "
+               "Use gettransaction for wallet transactions.">>}
     end.
 
 %% Find transaction in a list by txid
