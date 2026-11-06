@@ -36,7 +36,7 @@
 
 -include("beamchain.hrl").
 
--export([tips/0, tips/2]).
+-export([tips/0, tips/2, best_header/0, best_header/2]).
 
 -define(BLOCK_VALID_TREE, 2).
 -define(BLOCK_VALID_SCRIPTS, 5).
@@ -50,6 +50,7 @@
     top_hash     :: binary(),
     top_height   :: non_neg_integer(),
     top_status   :: non_neg_integer(),
+    top_chainwork :: binary(),
     %% lowest height in the run whose slot has no block data, or undefined
     first_missing :: non_neg_integer() | undefined
 }).
@@ -89,6 +90,74 @@ tips(TipHash, TipHeight) ->
     lists:sort(fun(A, B) -> height_of(A) >= height_of(B) end,
                [Active | [T || T <- Others, hash_of(T) =/= hex(TipHash)]]).
 
+%% @doc The best header: {Hash, Height} of the most-work block-index entry
+%% that is not known invalid, or not_found before genesis.
+%%
+%% Core getblockchaininfo / getchainstates report
+%%   headers = chainman.m_best_header ? m_best_header->nHeight : -1
+%% (rpc/blockchain.cpp).  m_best_header is raised by AddToBlockIndex whenever
+%% a new header (P2P headers, submitheader, submitblock) has more work than it
+%% (node/blockstorage.cpp AddToBlockIndex, `best_header->nChainWork <
+%% pindexNew->nChainWork`), and on load it is the active tip raised to every
+%% non-BLOCK_FAILED_VALID entry with more work (validation.cpp
+%% LoadBlockIndex / ChainstateManager::LoadBlockIndex).  So it is a
+%% headers-only entry above the tip as soon as one with more work is known,
+%% not the active tip.
+%%
+%% Chainwork only grows along a chain, so the maximum is the active tip or a
+%% leaf of the index: the top of a slot run above the tip, or a side-branch
+%% entry that is nobody's parent.  Leaves whose ancestry no longer reaches the
+%% active chain (left out of getchaintips, see describe/2) still count: their
+%% stored chainwork is the work Core has for them.  Ties keep the active tip
+%% (Core only replaces on strictly more work, starting from the tip on load),
+%% then the highest, then the lowest hash, so the answer is deterministic.
+%% Not covered: an invalid leaf whose non-invalid ancestor above the tip is
+%% itself not a leaf is not looked through (only the leaf is read).
+-spec best_header() -> {binary(), non_neg_integer()} | not_found.
+best_header() ->
+    case beamchain_chainstate:get_tip() of
+        {ok, {Hash, Height}} -> best_header(Hash, Height);
+        not_found -> not_found
+    end.
+
+-spec best_header(binary(), non_neg_integer()) -> {binary(), non_neg_integer()}.
+best_header(TipHash, TipHeight) ->
+    Runs = slot_runs_above(TipHeight),
+    Side = side_entries(),
+    Prevs = sets:from_list(
+              [R#run.start_prev || R <- Runs] ++
+              [prev(E) || E <- Side], [{version, 2}]),
+    TipCW = case beamchain_db:get_block_index(TipHeight) of
+        {ok, #{hash := TipHash, chainwork := C}} -> C;
+        _ ->
+            case beamchain_db:get_block_index_by_hash(TipHash) of
+                {ok, #{chainwork := C}} -> C;
+                _ -> <<0:256>>
+            end
+    end,
+    Leaves = [{cw_int(R#run.top_chainwork), R#run.top_height, R#run.top_hash}
+              || R <- Runs, not sets:is_element(R#run.top_hash, Prevs)] ++
+             [{cw_int(maps:get(chainwork, E, <<0:256>>)), Ht, H}
+              || E = #{hash := H, height := Ht} <- Side,
+                 not sets:is_element(H, Prevs)],
+    Ordered = lists:sort(fun({_, HA, A}, {_, HB, B}) -> {-HA, A} =< {-HB, B} end,
+                         Leaves),
+    {_, BestHeight, BestHash} =
+        lists:foldl(
+          fun({CW, Ht, H} = L, {BestCW, _, _} = Best) when CW > BestCW ->
+                  case H =/= TipHash andalso
+                       not beamchain_chainstate:is_known_invalid(H) of
+                      true -> L;
+                      false -> Best
+                  end;
+             (_, Best) -> Best
+          end,
+          {cw_int(TipCW), TipHeight, TipHash}, Ordered),
+    {BestHash, BestHeight}.
+
+cw_int(undefined) -> 0;
+cw_int(CW) when is_binary(CW) -> binary:decode_unsigned(CW, big).
+
 sort_key(T) -> {-height_of(T), hash_of(T)}.
 height_of(T) -> proplists:get_value(<<"height">>, T).
 hash_of(T) -> proplists:get_value(<<"hash">>, T).
@@ -104,7 +173,8 @@ slot_runs_above(TipHeight) ->
     lists:reverse(Runs).
 
 add_slot(#{hash := H, height := Ht, status := S,
-           header := #block_header{prev_hash = P}}, Runs) ->
+           header := #block_header{prev_hash = P}} = E, Runs) ->
+    CW = maps:get(chainwork, E, <<0:256>>),
     Missing = case (S band ?BLOCK_HAVE_DATA) =/= 0 of
         true -> undefined;
         false -> Ht
@@ -116,10 +186,10 @@ add_slot(#{hash := H, height := Ht, status := S,
                 Lower -> Lower
             end,
             [R#run{top_hash = H, top_height = Ht, top_status = S,
-                   first_missing = FM} | Rest];
+                   top_chainwork = CW, first_missing = FM} | Rest];
         _ ->
             [#run{start_height = Ht, start_prev = P, top_hash = H,
-                  top_height = Ht, top_status = S,
+                  top_height = Ht, top_status = S, top_chainwork = CW,
                   first_missing = Missing} | Runs]
     end.
 
