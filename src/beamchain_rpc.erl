@@ -2125,7 +2125,12 @@ rpc_getblockheader([HashHex, Verbose])
   when is_binary(HashHex), not is_boolean(Verbose) ->
     %% Core: params[1].get_bool() -> RPCTypeCheck-style -3 with the
     %% "Position 2 (verbose)" wrapper.
-    {error, ?RPC_TYPE_ERROR, getblockheader_verbose_type_error(Verbose)};
+    %% Core parses params[0] (ParseHashV, -8) before params[1].
+    try parse_hash_v(HashHex, <<"hash">>) of
+        _ -> {error, ?RPC_TYPE_ERROR, getblockheader_verbose_type_error(Verbose)}
+    catch
+        throw:{rpc_error, Code, Msg} -> {error, Code, Msg}
+    end;
 rpc_getblockheader([HashHex, Verbose]) when is_binary(HashHex) ->
     try rpc_getblockheader_lookup(parse_hash_v(HashHex, <<"hash">>),
                                   HashHex, Verbose)

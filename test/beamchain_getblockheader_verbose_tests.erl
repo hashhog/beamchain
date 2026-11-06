@@ -14,3 +14,7 @@ string_verbose_is_type_error_test() ->
 number_verbose_is_type_error_test() ->
     {error, -3, Msg} = beamchain_rpc:rpc_getblockheader([?H, 1]),
     ?assertNotEqual(nomatch, binary:match(Msg, <<"of type number is not of expected type bool">>)).
+bad_hash_is_reported_before_bad_verbose_test() ->
+    %% Core ParseHashV(params[0]) runs before params[1].get_bool().
+    {error, Code, _} = beamchain_rpc:rpc_getblockheader([<<"zz">>, <<"x">>]),
+    ?assertEqual(-8, Code).
