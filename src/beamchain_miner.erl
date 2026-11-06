@@ -25,6 +25,7 @@
 -export([decode_block_hex/1]).
 -export([build_gbt_rules_and_vbavailable/2]).
 -export([topological_sort/1]).
+-export([tx_sigop_cost/2]).
 %% Exported for testing: the GBT default_witness_commitment script and the
 %% coinbase builder it is checked against.
 -export([gbt_default_witness_commitment/2, build_coinbase/5]).
@@ -821,16 +822,46 @@ resolve_parents(#transaction{inputs = Inputs}, AlreadySelected) ->
         end
     end, {[], AlreadySelected}, ParentTxids).
 
-%% Estimate sigops for a tx (legacy count * witness scale factor).
-%% This is a conservative estimate used for block filling, not consensus.
-estimate_sigops(#transaction{inputs = Inputs, outputs = Outputs}) ->
-    InSigops = lists:foldl(fun(#tx_in{script_sig = S}, Acc) ->
-        Acc + beamchain_validation:count_legacy_sigops(S)
-    end, 0, Inputs),
-    OutSigops = lists:foldl(fun(#tx_out{script_pubkey = S}, Acc) ->
-        Acc + beamchain_validation:count_legacy_sigops(S)
-    end, 0, Outputs),
-    (InSigops + OutSigops) * ?WITNESS_SCALE_FACTOR.
+%% Sigop cost of a mempool tx, as Core's GetTransactionSigOpCost with
+%% P2SH+WITNESS flags (node/miner.cpp addChunks -> vTxSigOpsCost; getblocktemplate
+%% reports it unscaled once segwit is active).  Prevout scripts come from the
+%% UTXO set or an in-mempool parent.  If a prevout cannot be found, fall back to
+%% the legacy-only count so template building never crashes.
+estimate_sigops(#transaction{inputs = Inputs} = Tx) ->
+    case lookup_prevouts(Inputs, []) of
+        {ok, Coins} -> tx_sigop_cost(Tx, Coins);
+        error -> tx_sigop_cost(Tx, [])
+    end.
+
+%% @doc Sigop cost of Tx given its prevout coins (in input order).  With an
+%% empty coin list only the legacy count (scaled) is returned.
+-spec tx_sigop_cost(#transaction{}, [#utxo{}]) -> non_neg_integer().
+tx_sigop_cost(Tx, []) ->
+    beamchain_validation:get_tx_sigop_cost(Tx, [], 0);
+tx_sigop_cost(Tx, Coins) ->
+    beamchain_validation:get_tx_sigop_cost(
+        Tx, Coins, ?SCRIPT_VERIFY_P2SH bor ?SCRIPT_VERIFY_WITNESS).
+
+lookup_prevouts([], Acc) -> {ok, lists:reverse(Acc)};
+lookup_prevouts([#tx_in{prev_out = #outpoint{hash = H, index = I}} | Rest], Acc) ->
+    case beamchain_chainstate:get_utxo(H, I) of
+        {ok, Coin} -> lookup_prevouts(Rest, [Coin | Acc]);
+        _ ->
+            case beamchain_mempool:get_entry(H) of
+                {ok, PE} ->
+                    Outs = (PE#mempool_entry.tx)#transaction.outputs,
+                    case I < length(Outs) of
+                        true ->
+                            #tx_out{value = V, script_pubkey = SPK} =
+                                lists:nth(I + 1, Outs),
+                            lookup_prevouts(Rest,
+                                [#utxo{value = V, script_pubkey = SPK,
+                                       is_coinbase = false, height = 0} | Acc]);
+                        false -> error
+                    end;
+                _ -> error
+            end
+    end.
 
 %%% ===================================================================
 %%% Internal: topological sort (Kahn's algorithm)
