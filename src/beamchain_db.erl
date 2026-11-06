@@ -924,25 +924,28 @@ height_slot_ops({H, Idx, Cum}) ->
     end,
     IdxOps ++ CumOps.
 
-%% Core keys its block index by hash (BlockManager::m_block_index), so a block
-%% that leaves the active chain stays reachable: getblockheader/getblock answer
-%% for it and reconsiderblock finds it.  Here an active block's entry lives
-%% only in its height slot, and get_block_index_by_hash refuses it once another
-%% block owns the slot (KB-190).  Before a different block takes Height, copy
-%% the old entry, if its body is stored, into the hash-keyed side-branch index.
-%% Header-only entries are left as before.
+%% Core keys its block index by hash (BlockManager::m_block_index) and never
+%% drops an entry, so a block that leaves the active chain stays reachable:
+%% getblockheader/getblock answer for it, reconsiderblock finds it, and
+%% getchaintips walks through it.  Here an active block's entry lives only in
+%% its height slot, and get_block_index_by_hash refuses it once another block
+%% owns the slot (KB-190).  Before a different block takes Height, copy the
+%% old entry into the hash-keyed side-branch index.  That includes a
+%% header-only entry (submitheader / P2P headers above the tip): Core keeps
+%% it as a headers-only leaf, and its children above it still name it as
+%% their parent, so dropping it left their ancestry unreachable and
+%% getchaintips omitted the branch (Core regtest row
+%% warden_invalidated_submit/p2p-header/tips).  A header-only copy keeps its
+%% status, without BLOCK_HAVE_DATA, so it is never a body candidate.
 displaced_entry_ops(Db, IdxCF, MetaCF, Height, NewHash) ->
     case rocksdb:get(Db, IdxCF, encode_height(Height), []) of
         {ok, Bin} ->
             case decode_block_index_entry(Bin) of
                 #{hash := NewHash} ->
                     [];
-                #{hash := Old, status := S} = E
-                  when (S band ?BLOCK_HAVE_DATA) =/= 0 ->
+                #{hash := Old} = E ->
                     [{put, MetaCF, <<"sbidx:", Old/binary>>,
-                      encode_side_branch_index_entry(Old, E#{height => Height})}];
-                _ ->
-                    []
+                      encode_side_branch_index_entry(Old, E#{height => Height})}]
             end;
         _ ->
             []

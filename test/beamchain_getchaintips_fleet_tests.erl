@@ -33,9 +33,9 @@ getchaintips_fleet_test_() ->
                                fun displaced_block_is_valid_fork/0}} end,
       fun(_) -> {timeout, 60, {"header above the tip is headers-only",
                                fun header_above_tip_is_headers_only/0}} end,
-      fun(_) -> {timeout, 60, {"lost ancestry is left out, never a guessed "
-                               "branchlen",
-                               fun lost_ancestry_is_omitted/0}} end,
+      fun(_) -> {timeout, 60, {"displaced header keeps its child's branch "
+                               "(p2p-header)",
+                               fun displaced_header_keeps_branch/0}} end,
       fun(_) -> {timeout, 60, {"reconsider leaves the active tip alone",
                                fun reconsider_restores_single_tip/0}} end]}.
 
@@ -90,12 +90,12 @@ header_above_tip_is_headers_only() ->
        getchaintips()).
 
 %% Harness warden_invalidated_submit/p2p-header: headers 7 and 8 above the
-%% tip, then a competing header 7' takes height slot 7.  beamchain drops a
-%% displaced header-only entry (beamchain_db displaced_entry_ops/5), so 8's
-%% parent is gone and its fork point is unknowable; Core (which keeps 7)
-%% says branchlen 2.  The leaf is left out rather than reported with a
-%% wrong branchlen; 7' is reported as Core does.
-lost_ancestry_is_omitted() ->
+%% tip, then a competing header 7' takes height slot 7.  Core keeps 7 in its
+%% block index, so 8 is still a headers-only leaf with branchlen 2 next to
+%% 7' (branchlen 1).  beamchain used to drop the displaced header-only
+%% entry (beamchain_db displaced_entry_ops/5), lose 8's ancestry and leave
+%% 8 out; this test asserted that omission until the entry was kept.
+displaced_header_keeps_branch() ->
     {ok, _} = start_chainstate(),
     H7 = dummy_block(hash_at(?N), ?N + 1, 0),
     H8 = dummy_block(H7#block.hash, ?N + 2, 0),
@@ -105,6 +105,7 @@ lost_ancestry_is_omitted() ->
      || B <- [H7, H8, H7b]],
     ?assertEqual(
        lists:sort([tip(?N, hash_at(?N), 0, <<"active">>),
+                   tip(?N + 2, H8#block.hash, 2, <<"headers-only">>),
                    tip(?N + 1, H7b#block.hash, 1, <<"headers-only">>)]),
        getchaintips()).
 
