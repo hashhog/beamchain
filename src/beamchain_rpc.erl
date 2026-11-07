@@ -7371,6 +7371,12 @@ rpc_getpeerinfo() ->
             %% GetNetworkName(stats.m_network) in rpc/net.cpp:235.
             network       => classify_peer_network(IP),
             mapped_as     => beamchain_peer_manager:get_mapped_as(IP),
+            %% Core rpc/net.cpp:232: addrlocal is the address the peer saw us
+            %% at (VERSION addr_recv); omitted when the peer never told us.
+            addrlocal     => case maps:get(addr_local, Info, undefined) of
+                                 {LIP, LPort} -> format_addr(LIP, LPort);
+                                 _ -> undefined
+                             end,
             services      => beamchain_serialize:hex_encode(
                                  <<(maps:get(services, Info, 0)):64/big>>),
             servicesnames => services_to_names(maps:get(services, Info, 0)),
@@ -7410,11 +7416,15 @@ peerinfo_obj_proplist(F) ->
     [
         {<<"id">>, maps:get(id, F)},
         {<<"addr">>, maps:get(addr, F)},
-        {<<"addrbind">>, <<>>},
-        {<<"network">>, maps:get(network, F, <<"not_publicly_routable">>)},
-        %% ASMap: mapped_as (BUG-12 fix, W115 FIX-50)
-        %% Core: rpc/net.cpp obj.pushKV("mapped_as", ...) right after network.
-        {<<"mapped_as">>, maps:get(mapped_as, F)},
+        {<<"addrbind">>, <<>>}] ++
+    %% Core rpc/net.cpp:232: pushKV("addrlocal") only when non-empty.
+    [{<<"addrlocal">>, AL} || AL <- [maps:get(addrlocal, F, undefined)],
+                              AL =/= undefined, AL =/= <<>>] ++
+    [{<<"network">>, maps:get(network, F, <<"not_publicly_routable">>)}] ++
+    %% Core rpc/net.cpp:235: pushKV("mapped_as") only when m_mapped_as != 0
+    %% (no -asmap, or an unmapped address, omits the key), right after network.
+    [{<<"mapped_as">>, MA} || MA <- [maps:get(mapped_as, F, 0)], MA =/= 0] ++
+    [
         {<<"services">>, maps:get(services, F)},
         {<<"servicesnames">>, maps:get(servicesnames, F)},
         {<<"relaytxes">>, maps:get(relaytxes, F)},
