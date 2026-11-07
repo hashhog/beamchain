@@ -36,6 +36,8 @@
 -ifdef(TEST).
 -export([confirmations/1, confirmations/2, is_block_in_active_chain/1]).
 -export([rest_chaininfo/1]).
+%% Exported for EUnit: drives GET /rest/mempool/contents.json without cowboy.
+-export([rest_mempool_contents/2]).
 -endif.
 
 -define(SERVER, ?MODULE).
@@ -464,9 +466,10 @@ rest_mempool_info(_) ->
 rest_mempool_contents(json, Verbose) ->
     case Verbose of
         true ->
-            Entries = beamchain_mempool:get_all_entries(),
-            Json = format_mempool_contents(Entries),
-            {ok, json, jsx:encode(Json)};
+            %% Core rest_mempool: MempoolToJSON, the same serializer as
+            %% getrawmempool true (txid keys, full entryToJSON fields).
+            {ok_raw_json, Body} = beamchain_rpc:rpc_getrawmempool([true]),
+            {ok, json, Body};
         false ->
             Txids = beamchain_mempool:get_all_txids(),
             Json = #{<<"txids">> => [hash_to_hex(T) || T <- Txids]},
@@ -1035,41 +1038,6 @@ format_header_json(Header, Hash, Height) ->
         <<"difficulty">> => bits_to_difficulty(Bits),
         <<"previousblockhash">> => hash_to_hex(Header#block_header.prev_hash),
         <<"nextblockhash">> => next_block_hash(Height)
-    }.
-
-format_mempool_contents(Entries) ->
-    lists:foldl(fun(Entry, Acc) ->
-        Txid = element(1, Entry),  %% txid is 1st field
-        TxidHex = hash_to_hex(Txid),
-        Info = format_mempool_entry(Entry),
-        Acc#{TxidHex => Info}
-    end, #{}, Entries).
-
-format_mempool_entry(Entry) ->
-    %% mempool_entry record tuple layout (1-based including the tag atom):
-    %%   1=tag, 2=txid, 3=wtxid, 4=tx, 5=fee, 6=size, 7=vsize, 8=weight,
-    %%   9=fee_rate, 10=time_added, 11=height_added, 12=ancestor_count,
-    %%   13=ancestor_size, 14=ancestor_fee, 15=descendant_count,
-    %%   16=descendant_size, 17=descendant_fee, 18=spends_coinbase, 19=rbf_signaling
-    Fee = element(5, Entry),
-    VSize = element(7, Entry),
-    Weight = element(8, Entry),
-    TimeAdded = element(10, Entry),
-    AncestorSize = element(13, Entry),
-    AncestorFee = element(14, Entry),
-    DescendantSize = element(16, Entry),
-    DescendantFee = element(17, Entry),
-    #{
-        <<"vsize">> => VSize,
-        <<"weight">> => Weight,
-        <<"time">> => TimeAdded,
-        <<"fees">> => #{
-            <<"base">> => Fee / 100000000.0,
-            <<"ancestor">> => AncestorFee / 100000000.0,
-            <<"descendant">> => DescendantFee / 100000000.0
-        },
-        <<"ancestorsize">> => AncestorSize,
-        <<"descendantsize">> => DescendantSize
     }.
 
 format_utxo_bitmap(Results) ->
