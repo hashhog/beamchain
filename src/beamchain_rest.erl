@@ -35,6 +35,7 @@
 %% Test-only exports — confirmations helpers (Pattern C1 regression tests).
 -ifdef(TEST).
 -export([confirmations/1, confirmations/2, is_block_in_active_chain/1]).
+-export([rest_chaininfo/1]).
 -endif.
 
 -define(SERVER, ?MODULE).
@@ -1214,9 +1215,10 @@ get_mtp() ->
     beamchain_chainstate:get_mtp().
 
 get_header_count() ->
-    %% In a full node, headers count equals block count
-    case beamchain_chainstate:get_tip() of
-        {ok, {_Hash, Height}} -> Height;
+    %% Core rest_chaininfo is getblockchaininfo: headers = m_best_header's
+    %% height, which can be above the active tip (headers-only entries).
+    case beamchain_chaintips:best_header() of
+        {_Hash, Height} -> Height;
         not_found -> 0
     end.
 

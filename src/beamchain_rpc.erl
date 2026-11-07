@@ -1662,7 +1662,7 @@ rpc_getblockchaininfo() ->
             BaseInfo = [
                 {<<"chain">>, network_name(Network)},
                 {<<"blocks">>, TipHeight},
-                {<<"headers">>, TipHeight},
+                {<<"headers">>, best_header_height(TipHash, TipHeight)},
                 {<<"bestblockhash">>, hash_to_hex(TipHash)},
                 {<<"bits">>, beamchain_serialize:hex_encode(<<TipBits:32/big>>)},
                 {<<"target">>, bits_to_target_hex(TipBits)},
@@ -2239,6 +2239,15 @@ rpc_getdifficulty() ->
             {ok, 0}
     end.
 
+%% Core getblockchaininfo / getchainstates `headers`:
+%% chainman.m_best_header->nHeight (rpc/blockchain.cpp), the most-work header
+%% that is not BLOCK_FAILED_VALID, which is above the active tip as soon as a
+%% headers-only entry with more work is known (submitheader, P2P headers).
+%% See beamchain_chaintips:best_header/2.
+best_header_height(TipHash, TipHeight) ->
+    {_, Height} = beamchain_chaintips:best_header(TipHash, TipHeight),
+    Height.
+
 rpc_getchaintips() ->
     %% Every block-index leaf plus the active tip, with Core's status and
     %% branchlen (rpc/blockchain.cpp getchaintips) -- see beamchain_chaintips.
@@ -2278,13 +2287,9 @@ rpc_getchainstates() ->
     %% headers: Core's chainman.m_best_header->nHeight (-1 if no header seen).
     %% beamchain tracks the best-header tip in beamchain_db. Fall back to the
     %% active-chain tip height (best header is always >= chain tip), then -1.
-    Headers = case beamchain_db:get_header_tip() of
-        {ok, #{height := HHeight}} -> HHeight;
-        _ ->
-            case beamchain_chainstate:get_tip() of
-                {ok, {_, TH}} -> TH;
-                not_found -> -1
-            end
+    Headers = case beamchain_chainstate:get_tip() of
+        {ok, {TH, THt}} -> best_header_height(TH, THt);
+        not_found -> -1
     end,
     Chainstates = build_chainstates_array(),
     Result = [
