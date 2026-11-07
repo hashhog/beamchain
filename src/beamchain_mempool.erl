@@ -87,6 +87,7 @@
 -export([linearize_cluster/1]).  %% Exported for testing
 -export([uf_union/3, uf_get_cluster_members/2]).  %% Union-find utilities for debugging
 %% Policy constant accessors — for tests to verify Core parity without include leakage
+-export([count_conflict_clusters/1]).
 -export([cluster_count_limit/0, cluster_vbytes_limit/0, cluster_weight_limit/0]).
 %% W86 eviction constant accessors — for tests (Core parity guards)
 -export([incremental_relay_fee_constant/0,
@@ -2220,7 +2221,9 @@ do_package_rbf(_TxPairs, TotalFee, TotalVSize, ConflictTxids) ->
     end, DescendantsAndSelf)),
 
     AllEvictTxids = lists:usort(DescendantsAndSelf ++ EphemeralParents),
-    length(AllEvictTxids) =< ?MAX_RBF_EVICTIONS
+    %% Rule 5 (Core policy/rbf.cpp GetEntriesForConflicts): the limit is on
+    %% distinct CLUSTERS the direct conflicts belong to, not on evictions.
+    count_conflict_clusters(ConflictTxids) =< ?MAX_RBF_EVICTIONS
         orelse throw(rbf_too_many_evictions),
 
     AllEvictEntries = lists:filtermap(fun(Eid) ->
@@ -2803,7 +2806,9 @@ do_rbf(NewTx, ConflictTxids, SigopCost) ->
     end, DescendantsAndSelf)),
 
     AllEvictTxids = lists:usort(DescendantsAndSelf ++ EphemeralParents),
-    length(AllEvictTxids) =< ?MAX_RBF_EVICTIONS
+    %% Rule 5 (Core policy/rbf.cpp GetEntriesForConflicts): the limit is on
+    %% distinct CLUSTERS the direct conflicts belong to, not on evictions.
+    count_conflict_clusters(ConflictTxids) =< ?MAX_RBF_EVICTIONS
         orelse throw(rbf_too_many_evictions),
 
     AllEvictEntries = lists:filtermap(fun(Eid) ->
@@ -2968,6 +2973,29 @@ interpolate_diagram([{V1, F1}, {V2, F2} | Rest], VSize) when VSize > V1 ->
 interpolate_diagram([{_V, F} | _], _VSize) ->
     %% VSize is before this point - interpolate from origin
     F.
+
+%% Number of distinct mempool clusters (connected components of the
+%% spend graph) containing the given txids. Mirrors Core's
+%% CTxMemPool::GetUniqueClusterCount used by RBF rule 5.
+count_conflict_clusters(Txids) ->
+    {_, N} = lists:foldl(fun(T, {Seen, Cnt}) ->
+        case sets:is_element(T, Seen) of
+            true -> {Seen, Cnt};
+            false -> {cluster_component([T], sets:add_element(T, Seen)), Cnt + 1}
+        end
+    end, {sets:new(), 0}, Txids),
+    N.
+
+%% Add every tx connected to the frontier (via parents or children) to Seen.
+cluster_component([], Seen) -> Seen;
+cluster_component([T | Rest], Seen) ->
+    Neigh = case get_tx(T) of
+        {ok, Tx} -> get_parent_txids(Tx) ++ find_children(T);
+        not_found -> []
+    end,
+    New = lists:usort([N || N <- Neigh, not sets:is_element(N, Seen)]),
+    cluster_component(New ++ Rest,
+                      lists:foldl(fun sets:add_element/2, Seen, New)).
 
 %% Get all descendant txids for a given mempool tx.
 get_all_descendants(Txid) ->
