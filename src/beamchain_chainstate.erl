@@ -2257,16 +2257,17 @@ is_header_verdict(R) ->
 %%   4. ContextualCheckBlockHeader (difficulty match, MTP, BIP94, versions)
 %%   5. AddToBlockIndex   (header-only store via store_block_index/5)
 do_submit_header(#block_header{prev_hash = PrevHash} = Header,
-                 #state{params = Params}) ->
+                 #state{params = Params, tip_height = TipHeight}) ->
     BlockHash = beamchain_serialize:block_hash(Header),
     %% (0) Core AcceptBlockHeader: duplicate-invalid / bad-prevblk for a
     %% failed block or a child of one.
     case failed_block_or_parent(Header) of
-        ok -> do_submit_header_unfailed(Header, BlockHash, PrevHash, Params);
+        ok -> do_submit_header_unfailed(Header, BlockHash, PrevHash, Params,
+                                        TipHeight);
         {error, _} = Failed -> Failed
     end.
 
-do_submit_header_unfailed(Header, BlockHash, PrevHash, Params) ->
+do_submit_header_unfailed(Header, BlockHash, PrevHash, Params, TipHeight) ->
     %% (1) Idempotency.  Core's AcceptBlockHeader returns the existing index
     %% entry (success) when the header is already known.  Any index hit
     %% (active or side-branch, header-only or with body) counts as known.
@@ -2279,14 +2280,15 @@ do_submit_header_unfailed(Header, BlockHash, PrevHash, Params) ->
                 not_found ->
                     {error, unknown_prev};
                 {ok, ParentEntry} ->
-                    do_accept_new_header(Header, BlockHash, ParentEntry, Params)
+                    do_accept_new_header(Header, BlockHash, ParentEntry, Params,
+                                         TipHeight)
             end
     end.
 
 %% Validate a not-yet-known header whose parent IS in the index, then store
 %% it header-only.  Same validators + same store as the side-branch path
 %% (do_side_branch_accept_with_parent) and beamchain_header_sync.
-do_accept_new_header(Header, BlockHash, ParentEntry, Params) ->
+do_accept_new_header(Header, BlockHash, ParentEntry, Params, TipHeight) ->
     %% (3) Context-free header check: proof-of-work + bits within pow_limit.
     %% Core CheckBlockHeader (validation.cpp), fCheckPOW=true.
     case beamchain_validation:check_block_header(Header, Params) of
@@ -2314,11 +2316,26 @@ do_accept_new_header(Header, BlockHash, ParentEntry, Params) ->
                     %% (5) AddToBlockIndex — header-only entry.  Status 1 =
                     %% BLOCK_VALID_HEADER (no HAVE_DATA), identical to what
                     %% beamchain_header_sync writes for a synced header.
-                    ok = beamchain_db:store_block_index(
-                           Height, BlockHash, Header, NewCW, 1),
+                    ok = store_header_only(Height, BlockHash, Header, NewCW,
+                                           TipHeight),
                     {ok, accepted}
             end
     end.
+
+%% Core AcceptBlockHeader adds a hash-keyed index entry and never touches
+%% the active chain.  A height slot at or below the tip IS the active chain
+%% here (getblockhash, connect, undo read it), so a fork header for such a
+%% height goes to the hash-keyed side-branch index only; writing the slot
+%% would replace the active block there with a header-only fork block.
+%% Above the tip the slots are the header chain, so the header goes there
+%% (any header it displaces is kept, beamchain_db:displaced_entry_ops/5).
+store_header_only(Height, BlockHash, Header, CW, TipHeight)
+  when is_integer(TipHeight), Height =< TipHeight ->
+    beamchain_db:store_side_branch_index(
+      BlockHash, #{height => Height, header => Header, chainwork => CW,
+                   status => 1, n_tx => 0});
+store_header_only(Height, BlockHash, Header, CW, _TipHeight) ->
+    beamchain_db:store_block_index(Height, BlockHash, Header, CW, 1).
 
 %% G8 outer wrapper: look up the parent chainwork from the DB and delegate
 %% to the pure inner predicate.
@@ -2427,8 +2444,13 @@ do_side_branch_accept_unfailed(#block{header = Header} = Block,
             %% Body already stored + connected — genuinely a no-op.
             {ok, duplicate, State};
         false ->
+            %% A side-branch entry can be header-only (a header displaced
+            %% from its height slot, beamchain_db:displaced_entry_ops/5);
+            %% only a stored body makes this submit a duplicate (Core
+            %% AcceptBlock: fAlreadyHave = nStatus & BLOCK_HAVE_DATA).
             StoredBefore = beamchain_db:get_side_branch_index(BlockHash)
-                               =/= not_found,
+                               =/= not_found
+                           andalso beamchain_db:has_block(BlockHash) =:= true,
             ParentHeight = maps:get(height, ParentEntry),
             Height = ParentHeight + 1,
             ParentCW = maps:get(chainwork, ParentEntry, <<0:256>>),
@@ -4879,10 +4901,15 @@ mark_descendants_invalid(ParentHash, ParentHeight) ->
 %% All index entries descending from AncestorHash (height AncestorHeight):
 %%  - the height-keyed index holds one block per height, so its descendants
 %%    are the contiguous run above AncestorHeight whose prev links chain back;
-%%  - side-branch entries whose ancestor at AncestorHeight is AncestorHash.
+%%  - side-branch entries whose ancestor at AncestorHeight is AncestorHash;
+%%  - the height-slot run above each such side entry: a header displaced from
+%%    its slot is kept as a side entry (beamchain_db:displaced_entry_ops/5)
+%%    while its children above it still own their slots, so that run hangs
+%%    off the side entry, not off the contiguous run.
 %% The previous implementation rebuilt a list of the WHOLE index for every
 %% parent hop of every entry — quadratic in the chain length, i.e. a hung
-%% chainstate on a mainnet-sized index.
+%% chainstate on a mainnet-sized index.  Each run read here is a run of
+%% actual descendants, so the cost stays O(descendants + side entries).
 find_descendants(AncestorHash, AncestorHeight) ->
     Run = index_run_above(AncestorHash, AncestorHeight + 1, []),
     Side = case beamchain_db:get_all_side_branch_indexes() of
@@ -4892,7 +4919,21 @@ find_descendants(AncestorHash, AncestorHeight) ->
         _ ->
             []
     end,
-    Run ++ Side.
+    AboveSide = lists:flatmap(
+                  fun(#{hash := H, height := Ht}) ->
+                          index_run_above(H, Ht + 1, [])
+                  end, Side),
+    dedup_by_hash(Run ++ Side ++ AboveSide).
+
+dedup_by_hash(Entries) ->
+    {Out, _} = lists:foldl(
+                 fun(#{hash := H} = E, {Acc, Seen}) ->
+                         case sets:is_element(H, Seen) of
+                             true -> {Acc, Seen};
+                             false -> {[E | Acc], sets:add_element(H, Seen)}
+                         end
+                 end, {[], sets:new([{version, 2}])}, Entries),
+    lists:reverse(Out).
 
 index_run_above(PrevHash, Height, Acc) ->
     case beamchain_db:get_block_index(Height) of
