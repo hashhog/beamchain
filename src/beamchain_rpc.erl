@@ -96,7 +96,7 @@
 %% confirms each in-scope handler routes a malformed arg to -8 while a
 %% well-formed 64-zero hash still passes the guard (decodes, no -8 throw).
 -export([parse_hash_v/2,
-         rpc_getblock/1, getblock_verbosity/1, rpc_getblockheader/1, ntx_from_local_block/1, rpc_getrawtransaction/1,
+         rpc_getblock/1, getblock_verbosity/1, rpc_getblockheader/1, getblockheader_verbose_type_error/1, ntx_from_local_block/1, rpc_getrawtransaction/1,
          rpc_gettxout/1, rpc_getmempoolentry/1]).
 %% Test-only exports — submitpackage helpers (mempool wave 2026-05-06).
 -export([rpc_submitpackage/1, decode_package_tx/1]).
@@ -2119,6 +2119,18 @@ rpc_getblock_lookup(Hash, Verbosity) ->
 
 rpc_getblockheader([HashHex]) ->
     rpc_getblockheader([HashHex, true]);
+rpc_getblockheader([HashHex, null]) when is_binary(HashHex) ->
+    rpc_getblockheader([HashHex, true]);
+rpc_getblockheader([HashHex, Verbose])
+  when is_binary(HashHex), not is_boolean(Verbose) ->
+    %% Core: params[1].get_bool() -> RPCTypeCheck-style -3 with the
+    %% "Position 2 (verbose)" wrapper.
+    %% Core parses params[0] (ParseHashV, -8) before params[1].
+    try parse_hash_v(HashHex, <<"hash">>) of
+        _ -> {error, ?RPC_TYPE_ERROR, getblockheader_verbose_type_error(Verbose)}
+    catch
+        throw:{rpc_error, Code, Msg} -> {error, Code, Msg}
+    end;
 rpc_getblockheader([HashHex, Verbose]) when is_binary(HashHex) ->
     try rpc_getblockheader_lookup(parse_hash_v(HashHex, <<"hash">>),
                                   HashHex, Verbose)
@@ -2128,6 +2140,11 @@ rpc_getblockheader([HashHex, Verbose]) when is_binary(HashHex) ->
 rpc_getblockheader(_) ->
     {error, ?RPC_INVALID_PARAMS,
      <<"Usage: getblockheader \"hash\" ( verbose )">>}.
+
+getblockheader_verbose_type_error(V) ->
+    iolist_to_binary(
+      ["Wrong type passed:\n{\n    \"Position 2 (verbose)\": \"",
+       type_error_msg(V, <<"bool">>), "\"\n}"]).
 
 rpc_getblockheader_lookup(Hash, _HashHex, Verbose) ->
     case block_index_any(Hash) of
