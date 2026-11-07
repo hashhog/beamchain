@@ -60,6 +60,9 @@
 -export([rpc_verifychain/1]).
 %% Exported so eunit can drive the already-in-mempool path with a mocked mempool.
 -export([rpc_sendrawtransaction/1]).
+%% Exported so GET /rest/mempool/contents.json (Core rest.cpp rest_mempool ->
+%% MempoolToJSON) serializes verbose entries exactly like getrawmempool true.
+-export([rpc_getrawmempool/1]).
 
 %% Exported for EUnit so tests can drive the BIP-157 RPC handler
 %% directly without spinning up the cowboy listener.
