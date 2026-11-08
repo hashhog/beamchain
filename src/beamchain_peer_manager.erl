@@ -1124,8 +1124,17 @@ handle_info({peer_connected, Pid, Info}, State) ->
                 keyed_netgroup = calculate_keyed_netgroup(Addr, State)
             },
             ets:insert(?PEER_TABLE, Entry2),
-            %% Mark as tried in addrman
-            beamchain_addrman:mark_tried(Addr),
+            %% Mark as tried in addrman -- OUTBOUND ONLY. Bitcoin Core calls
+            %% m_addrman.Good(pfrom.addr) only `if (!pfrom.IsInboundConn())`
+            %% (net_processing.cpp, VERSION handling). An inbound peer's
+            %% address is its ephemeral SOURCE port, which nobody listens on;
+            %% promoting it filled the tried table with undialable entries
+            %% (mainnet 2026-11-08: 13,198 of 13,460 tried entries were
+            %% inbound crawler source ports) and starved the outbound slots.
+            case Dir of
+                outbound -> beamchain_addrman:mark_tried(Addr);
+                inbound  -> ok
+            end,
             %% Track outbound netgroup.
             %% Use asmap-aware netgroup for consistency with
             %% has_netgroup_diversity/2 (BUG-9 fix).

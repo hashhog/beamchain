@@ -768,26 +768,14 @@ do_mark_tried(Address, #state{addr_table = AddrTab, new_buckets = NewBuckets,
             State2#state{new_count = max(0, NewCount - 1),
                          tried_count = TriedCount + 1};
         [] ->
-            %% Unknown address, add directly to tried
-            Bucket = get_tried_bucket(Address, Secret),
-            Slot = get_bucket_position(Address, false, Bucket, Secret),
-            %% Handle collision
-            State2 = case ets:lookup(TriedBuckets, {Bucket, Slot}) of
-                [{_, OldAddr}] ->
-                    evict_tried_to_new(OldAddr, AddrTab, TriedBuckets, NewBuckets,
-                                        Secret, State);
-                [] ->
-                    State
-            end,
-            Entry = #addr_info{
-                address = Address,
-                timestamp = Now,
-                last_success = Now,
-                in_tried = true
-            },
-            ets:insert(AddrTab, Entry),
-            ets:insert(TriedBuckets, {{Bucket, Slot}, Address}),
-            State2#state{tried_count = State2#state.tried_count + 1}
+            %% Unknown address: do nothing. Bitcoin Core AddrManImpl::Good_
+            %% (addrman.cpp) returns false when the address is not already in
+            %% addrman (`if (!pinfo) return false;`) -- Good() only promotes a
+            %% NEW entry, it never invents a TRIED one. Inserting unknown
+            %% addresses straight into tried let every inbound peer's
+            %% ephemeral source address become a 70%-weighted dial candidate
+            %% and evicted real tried entries on bucket collision.
+            State
     end.
 
 clear_from_new_buckets(Address, SourceNG, Secret, NewBuckets) ->
@@ -1045,11 +1033,20 @@ persist_to_dets(#state{dets_table = DetsTab, addr_table = AddrTab}) ->
 
 load_from_dets(DetsTab, #state{addr_table = AddrTab, new_buckets = NewBuckets,
                                 tried_buckets = TriedBuckets, secret = Secret} = State) ->
-    {NewCount, TriedCount} = dets:foldl(
-        fun(RawEntry, {NC, TC}) ->
+    {NewCount, TriedCount, Dropped} = dets:foldl(
+        fun(RawEntry, {NC, TC, DR}) ->
             case upgrade_addr_info(RawEntry) of
                 skip ->
-                    {NC, TC};
+                    {NC, TC, DR};
+                #addr_info{source = undefined, source_netgroup = undefined} ->
+                    %% Written by the old do_mark_tried unknown-address path
+                    %% (an inbound peer's ephemeral source address promoted
+                    %% straight to tried, or later evicted from tried back to
+                    %% new). Every legitimate insert goes through add_to_new,
+                    %% which always records a source, so this shape is an
+                    %% entry Core's addrman could never hold. Drop it on load;
+                    %% the next persist rewrites peers.dets without it.
+                    {NC, TC, DR + 1};
                 #addr_info{address = Address, in_tried = InTried,
                            source_netgroup = SourceNG} = Entry ->
                     ets:insert(AddrTab, Entry),
@@ -1058,7 +1055,7 @@ load_from_dets(DetsTab, #state{addr_table = AddrTab, new_buckets = NewBuckets,
                             Bucket = get_tried_bucket(Address, Secret),
                             Slot = get_bucket_position(Address, false, Bucket, Secret),
                             ets:insert(TriedBuckets, {{Bucket, Slot}, Address}),
-                            {NC, TC + 1};
+                            {NC, TC + 1, DR};
                         false ->
                             SNG = case SourceNG of
                                 undefined -> other;
@@ -1067,12 +1064,13 @@ load_from_dets(DetsTab, #state{addr_table = AddrTab, new_buckets = NewBuckets,
                             Bucket = get_new_bucket(Address, SNG, Secret),
                             Slot = get_bucket_position(Address, true, Bucket, Secret),
                             ets:insert(NewBuckets, {{Bucket, Slot}, Address}),
-                            {NC + 1, TC}
+                            {NC + 1, TC, DR}
                     end
             end
-        end, {0, 0}, DetsTab),
-    logger:info("addrman: loaded ~B new, ~B tried addresses from disk",
-                [NewCount, TriedCount]),
+        end, {0, 0, 0}, DetsTab),
+    logger:info("addrman: loaded ~B new, ~B tried addresses from disk"
+                " (dropped ~B source-less entries)",
+                [NewCount, TriedCount, Dropped]),
     State#state{new_count = NewCount, tried_count = TriedCount}.
 
 %% @doc Upgrade old addr_info records to the current format.
