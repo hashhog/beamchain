@@ -50,7 +50,8 @@ encode_msg(Magic, Command, Payload) ->
 %% Returns {ok, Command, Payload, Rest} on success,
 %% `incomplete' if more data is needed, or {error, Reason}.
 -spec decode_msg(binary()) ->
-    {ok, atom(), binary(), binary()} | incomplete | {error, term()}.
+    {ok, atom() | {unknown, binary()}, binary(), binary()}
+    | incomplete | {error, term()}.
 decode_msg(Bin) when byte_size(Bin) < 24 ->
     incomplete;
 decode_msg(<<_Magic:4/binary, CmdBin:12/binary, Len:32/little,
@@ -116,7 +117,7 @@ command_name(cfheaders)     -> <<"cfheaders">>;
 command_name(getcfcheckpt)  -> <<"getcfcheckpt">>;
 command_name(cfcheckpt)     -> <<"cfcheckpt">>.
 
--spec command_atom(binary()) -> atom().
+-spec command_atom(binary()) -> atom() | {unknown, binary()}.
 command_atom(<<"version">>)     -> version;
 command_atom(<<"verack">>)      -> verack;
 command_atom(<<"ping">>)        -> ping;
@@ -155,7 +156,18 @@ command_atom(<<"getcfheaders">>)  -> getcfheaders;
 command_atom(<<"cfheaders">>)     -> cfheaders;
 command_atom(<<"getcfcheckpt">>)  -> getcfcheckpt;
 command_atom(<<"cfcheckpt">>)     -> cfcheckpt;
-command_atom(Other)             -> binary_to_atom(Other, utf8).
+%% Unknown (or malformed) names stay binaries. They used to fall through to
+%% binary_to_atom/2, which interned every distinct 12-byte command a peer
+%% sent -- before the handshake gate even ran -- into the finite,
+%% never-collected atom table (~1.05M of them abort the VM). Core keeps the
+%% message type as a std::string and ignores unknown ones
+%% (net_processing.cpp "Ignore unknown message types for extensibility");
+%% {unknown, _} is ignored the same way: the peer's pre-verack gate drops it
+%% (allowed_before_handshake/1 is false) and after the handshake the peer
+%% manager's handle_peer_message catch-all drops it. Known names match exactly, so a
+%% name with non-printable bytes or junk after the NUL padding (which Core's
+%% IsMessageTypeValid rejects) can never alias a real command.
+command_atom(Other) when is_binary(Other) -> {unknown, Other}.
 
 %%% ===================================================================
 %%% Payload encoding
