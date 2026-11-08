@@ -95,6 +95,8 @@
          mempool_expiry_hours_constant/0]).
 %% W86 eviction helpers exported for unit tests
 -export([compute_chunk_feerate/1]).
+%% Core CTxMemPool::DynamicMemoryUsage estimate (the quantity -maxmempool limits)
+-export([dynamic_memory_usage/0, entry_dynamic_usage/1]).
 %% Internal functions exported for unit-testing
 -export([compute_ancestors_for_test/3,
          check_descendant_limits_for_test/2,
@@ -233,6 +235,7 @@
 %% record (keeps #mempool_entry{} arity stable for the miner's positional copy).
 -define(MEMPOOL_UNBROADCAST, mempool_unbroadcast). %% txid -> true (Core m_unbroadcast_txids)
 -define(MEMPOOL_DELTAS, mempool_deltas).     %% txid -> integer() (signed sat)
+-define(MEMPOOL_USAGE, mempool_usage).       %% total -> integer() (Core DynamicMemoryUsage estimate, bytes)
 
 %%% -------------------------------------------------------------------
 %%% Mempool entry record
@@ -868,6 +871,9 @@ init([]) ->
                                         {read_concurrency, true}]),
     ensure_table(?MEMPOOL_DELTAS, [set, public, named_table,
                                    {read_concurrency, true}]),
+    ensure_table(?MEMPOOL_USAGE, [set, public, named_table,
+                                  {read_concurrency, true}]),
+    reset_dynamic_usage(),
 
     %% Schedule periodic orphan expiry
     erlang:send_after(60000, self(), expire_orphans),
@@ -888,7 +894,7 @@ init([]) ->
         zmq_seq = 0,
         rolling_min_fee = 0.0,
         block_since_bump = false,
-        last_fee_update = erlang:system_time(second)
+        last_fee_update = rolling_fee_now()
     }}.
 
 handle_call({add_tx, Tx, PeerId}, _From, State) ->
@@ -3987,7 +3993,11 @@ insert_entry(#mempool_entry{txid = Txid, fee_rate = FeeRate, tx = Tx} = Entry) -
     ets:insert(?MEMPOOL_BY_FEE, {{FeeRate, Txid}}),
     lists:foreach(fun(#tx_in{prev_out = #outpoint{hash = H, index = I}}) ->
         ets:insert(?MEMPOOL_OUTPOINTS, {{H, I}, Txid})
-    end, Tx#transaction.inputs).
+    end, Tx#transaction.inputs),
+    %% Core addNewTransaction: cachedInnerUsage += entry.DynamicMemoryUsage()
+    %% (txmempool.cpp:236), plus the mapTx / mapNextTx / txgraph overheads
+    %% DynamicMemoryUsage() adds per entry. See entry_dynamic_usage/1.
+    bump_dynamic_usage(entry_dynamic_usage(Tx)).
 
 remove_entry(Txid) ->
     case ets:lookup(?MEMPOOL_TXS, Txid) of
@@ -4005,6 +4015,9 @@ remove_entry(Txid) ->
                 ets:delete(?MEMPOOL_EPHEMERAL, {H, I})
             end, Tx#transaction.inputs),
             ets:delete(?MEMPOOL_TXS, Txid),
+            %% Core removeUnchecked: cachedInnerUsage -= it->DynamicMemoryUsage()
+            %% (txmempool.cpp:303).
+            bump_dynamic_usage(-entry_dynamic_usage(Tx)),
             %% Core removeUnchecked: m_unbroadcast_txids.erase(hash).
             catch ets:delete(?MEMPOOL_UNBROADCAST, Txid),
             wtxid_index_delete(Entry),
@@ -4079,7 +4092,7 @@ do_remove_for_block(Txids, State) ->
     %%   lastRollingFeeUpdate = GetTime();
     %%   blockSinceLastRollingFeeBump = true;
     %% This enables rolling fee decay on the next GetMinFee call.
-    Now = erlang:system_time(second),
+    Now = rolling_fee_now(),
     State0 = State#state{block_since_bump = true, last_fee_update = Now},
 
     %% 1. remove confirmed transactions and update clusters.
@@ -4145,7 +4158,7 @@ do_remove_for_block_with_txs(Txs, State) ->
 %% Core CTxMemPool::removeForBlock(vtx) proper: confirmed txs out, their
 %% conflicts out with descendants. No expiry / trim (the caller decides).
 remove_for_block_core(Txs, State) ->
-    Now = erlang:system_time(second),
+    Now = rolling_fee_now(),
     State0 = State#state{block_since_bump = true, last_fee_update = Now},
 
     %% Compute all txids and the set of outpoints they spend.  Skip
@@ -4585,7 +4598,11 @@ do_trim_to_size(MaxBytes, State) ->
     do_trim_to_size(MaxBytes, State, 0, 0.0).
 
 do_trim_to_size(MaxBytes, State, NRemoved, MaxFeeRateRemoved) ->
-    case State#state.total_bytes =< MaxBytes of
+    %% Core txmempool.cpp:868: while (!mapTx.empty() && DynamicMemoryUsage() > sizelimit).
+    %% The limit is on the pool's memory usage, not on the sum of vsizes:
+    %% -maxmempool=5 holds about 12 of the 66 kvB, 800-input txs that a
+    %% vsize test would let grow to 75.
+    case State#state.total_count =:= 0 orelse dynamic_memory_usage() =< MaxBytes of
         true ->
             %% Log if we removed anything (Core txmempool.cpp:908-910).
             case NRemoved > 0 of
@@ -4627,9 +4644,13 @@ do_trim_to_size(MaxBytes, State, NRemoved, MaxFeeRateRemoved) ->
                             %% Compute the evicted chunk's fee rate for rolling bump.
                             %% Core: feerate = removed_fee / removed_vsize, then
                             %%   removed += incremental_relay_feerate (line 877).
-                            ChunkFeeRate = compute_chunk_feerate(AllRemove),
+                            %% CFeeRate{fee, size}.GetFeePerK() is the fee per
+                            %% 1000 vB rounded DOWN to a whole satoshi (FeeFrac
+                            %% EvaluateFeeDown), so 25000 sat / 66244 vB is
+                            %% 377 sat/kvB, not 377.4.
+                            ChunkFeeRate = chunk_fee_per_k(AllRemove),
                             %% removed += incremental_relay (sat/kvB) — Core line 877
-                            RemovedRate = ChunkFeeRate + float(?DEFAULT_INCREMENTAL_RELAY_FEE),
+                            RemovedRate = float(ChunkFeeRate + ?DEFAULT_INCREMENTAL_RELAY_FEE),
                             %% trackPackageRemoved — Core line 878
                             State1 = track_package_removed(RemovedRate, State),
                             NewMaxRate = max(MaxFeeRateRemoved, RemovedRate),
@@ -4671,6 +4692,30 @@ compute_chunk_feerate(Txids) ->
     case TotalVSize of
         0 -> 0.0;
         _ -> TotalFee * 1000.0 / TotalVSize  %% fee * 1000 / vsize → sat/kvB
+    end.
+
+%% Whole-satoshi fee per 1000 vB of a set of txids, rounded toward minus
+%% infinity like Core's CFeeRate(fee, size).GetFeePerK() (FeeFrac::EvaluateFeeDown).
+chunk_fee_per_k(Txids) ->
+    {TotalFee, TotalVSize} = lists:foldl(
+        fun(Txid, {F, V}) ->
+            case ets:lookup(?MEMPOOL_TXS, Txid) of
+                [{_, E}] -> {F + E#mempool_entry.fee, V + E#mempool_entry.vsize};
+                []       -> {F, V}
+            end
+        end,
+        {0, 0},
+        Txids),
+    case TotalVSize of
+        0 -> 0;
+        _ -> floor_div(TotalFee * 1000, TotalVSize)
+    end.
+
+floor_div(N, D) when D > 0 ->
+    Q = N div D,
+    case N rem D < 0 of
+        true -> Q - 1;
+        false -> Q
     end.
 
 %% @doc Find the cluster with the lowest aggregate fee rate.
@@ -6298,10 +6343,13 @@ get_min_fee(#state{block_since_bump = false} = State) ->
     {Floor, State};
 get_min_fee(#state{rolling_min_fee = RollingRate,
                    last_fee_update = LastUpdate,
-                   total_bytes = TotalBytes,
                    max_size = MaxSize} = State) ->
     %% Gate 2: decay only if > 10 s have passed (Core line 835).
-    Now = erlang:system_time(second),
+    %% Core reads GetTime(), which setmocktime moves.
+    Now = rolling_fee_now(),
+    %% Core lines 837-840 compare DynamicMemoryUsage(), the same quantity
+    %% TrimToSize limits, against the size limit.
+    Usage = dynamic_memory_usage(),
     case Now > LastUpdate + 10 of
         false ->
             %% Not enough time passed — return current floor
@@ -6312,8 +6360,8 @@ get_min_fee(#state{rolling_min_fee = RollingRate,
             %% Core ROLLING_FEE_HALFLIFE = 60 * 60 * 12 = 43200 seconds.
             BaseHalflife = 43200.0,
             Halflife = if
-                TotalBytes < MaxSize div 4 -> BaseHalflife / 4.0;
-                TotalBytes < MaxSize div 2 -> BaseHalflife / 2.0;
+                Usage < MaxSize div 4 -> BaseHalflife / 4.0;
+                Usage < MaxSize div 2 -> BaseHalflife / 2.0;
                 true                       -> BaseHalflife
             end,
             Elapsed = Now - LastUpdate,
@@ -6328,8 +6376,10 @@ get_min_fee(#state{rolling_min_fee = RollingRate,
                     {Decayed, State#state{rolling_min_fee = Decayed,
                                          last_fee_update = Now}}
             end,
-            %% Gate 4: return max(decayed, incremental_relay) — Core line 850.
-            Floor = max(NewRate, float(IncrFee)) / 1000.0,  %% → sat/vB
+            %% Gate 4: return max(CFeeRate(llround(decayed)), incremental_relay)
+            %% — Core line 850. The rolling rate is kept unrounded; only the
+            %% returned fee rate is a whole sat/kvB.
+            Floor = max(float(round(NewRate)), float(IncrFee)) / 1000.0,  %% → sat/vB
             {Floor, NewState}
     end.
 
@@ -6347,6 +6397,93 @@ track_package_removed(RateSatKvB, #state{rolling_min_fee = Current} = State) ->
         false ->
             State
     end.
+
+%% Clock for the rolling minimum fee (Core GetTime() in GetMinFee and
+%% removeForBlock): the node clock, which setmocktime overrides on regtest
+%% (the same `beamchain_mocktime' key beamchain_validation reads).
+rolling_fee_now() ->
+    case persistent_term:get(beamchain_mocktime, undefined) of
+        T when is_integer(T) -> T;
+        _ -> erlang:system_time(second)
+    end.
+
+%%% ===================================================================
+%%% Dynamic memory usage (Core CTxMemPool::DynamicMemoryUsage)
+%%% ===================================================================
+
+%% @doc The pool's memory usage estimate in bytes: what -maxmempool limits
+%% (TrimToSize), what picks the rolling-fee halflife (GetMinFee) and what
+%% getmempoolinfo reports as `usage'.
+-spec dynamic_memory_usage() -> non_neg_integer().
+dynamic_memory_usage() ->
+    try ets:lookup(?MEMPOOL_USAGE, total) of
+        [{total, N}] -> max(0, N);
+        [] -> 0
+    catch error:badarg -> 0
+    end.
+
+bump_dynamic_usage(Delta) ->
+    try ets:update_counter(?MEMPOOL_USAGE, total, Delta, {total, 0}) of
+        _ -> ok
+    catch error:badarg -> ok
+    end.
+
+%% Recompute the counter from the entries (init: the tables may outlive a
+%% gen_server restart when another process owns them).
+reset_dynamic_usage() ->
+    Total = ets:foldl(fun({_Txid, #mempool_entry{tx = Tx}}, Acc) ->
+                              Acc + entry_dynamic_usage(Tx);
+                         (_, Acc) -> Acc
+                      end, 0, ?MEMPOOL_TXS),
+    ets:insert(?MEMPOOL_USAGE, {total, Total}),
+    ok.
+
+%% @doc Bytes one transaction adds to Core's CTxMemPool::DynamicMemoryUsage()
+%% (txmempool.cpp:778) on x86_64 / glibc, which is where -maxmempool is
+%% enforced:
+%%   MallocUsage(sizeof(CTxMemPoolEntry) + 9 pointers)   mapTx node     224
+%% + RecursiveDynamicUsage(CTransactionRef)              cachedInnerUsage
+%% + one indirectmap node per input                      mapNextTx      64 each
+%% + the txgraph's per-transaction cost                  m_txgraph      216
+%% Struct sizes are those of Core v31 (sizeof CTransaction 128, CTxIn 112,
+%% CTxOut 48, CTxMemPoolEntry 136, shared_ptr control block 24, CScript
+%% inline capacity 36). The txgraph term is a singleton cluster's cost
+%% (SingletonClusterImpl + its m_clusters slot + TxGraphImpl::Entry + chunk
+%% index node), measured against Core v31.1 getmempoolinfo.usage (single
+%% 1-in/1-out, 1-in P2WSH and 2-in/2-out pools match it exactly); a tx in a
+%% multi-tx cluster costs Core somewhat more. txns_randomized and mapDeltas
+%% are pool-level and not counted.
+-spec entry_dynamic_usage(#transaction{}) -> non_neg_integer().
+entry_dynamic_usage(#transaction{inputs = Ins, outputs = Outs}) ->
+    NIn = length(Ins),
+    NOut = length(Outs),
+    TxRef = malloc_usage(128) + malloc_usage(24),
+    Vecs = malloc_usage(NIn * 112) + malloc_usage(NOut * 48),
+    InUsage = lists:foldl(fun(#tx_in{script_sig = Sig, witness = W}, Acc) ->
+                                  Acc + script_usage(Sig) + witness_usage(W)
+                          end, 0, Ins),
+    OutUsage = lists:foldl(fun(#tx_out{script_pubkey = Spk}, Acc) ->
+                                   Acc + script_usage(Spk)
+                           end, 0, Outs),
+    malloc_usage(136 + 9 * 8) + TxRef + Vecs + InUsage + OutUsage
+        + NIn * malloc_usage(48) + 216.
+
+%% CScript is prevector<36>: no heap allocation up to 36 bytes.
+script_usage(Script) when is_binary(Script), byte_size(Script) > 36 ->
+    malloc_usage(byte_size(Script));
+script_usage(_) ->
+    0.
+
+%% CScriptWitness::stack is std::vector<std::vector<unsigned char>>.
+witness_usage(Items) when is_list(Items) ->
+    lists:foldl(fun(Item, Acc) -> Acc + malloc_usage(byte_size(Item)) end,
+                malloc_usage(length(Items) * 24), Items);
+witness_usage(_) ->
+    0.
+
+%% memusage::MallocUsage on a 64-bit glibc target (memusage.h).
+malloc_usage(0) -> 0;
+malloc_usage(N) -> ((N + 31) bsr 4) bsl 4.
 
 short_hex(<<H:4/binary, _/binary>>) ->
     beamchain_serialize:hex_encode(H);

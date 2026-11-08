@@ -224,7 +224,7 @@
 %% these let the suite assert the SERIALIZED key byte order — including the
 %% nested getblockchaininfo `softforks` value — without standing up live
 %% chainstate / mempool / peer gen_servers. No behavioural change.
--export([mempoolinfo_proplist/4,
+-export([mempoolinfo_proplist/4, mempoolinfo_proplist/6,
          networkinfo_proplist/4,
          mininginfo_proplist/7,
          peerinfo_obj_proplist/1,
@@ -6599,7 +6599,15 @@ rpc_getmempoolinfo() ->
         Entries
     ),
     TotalFeeBtc = TotalFeeSat / 100000000.0,
-    {ok, mempoolinfo_proplist(Size, Bytes, TotalFeeBtc,
+    %% Core rpc/mempool.cpp:1054: mempoolminfee is
+    %% max(pool.GetMinFee(), min_relay_feerate): the rolling floor that
+    %% TrimToSize raised, decayed, as a whole sat/kvB.
+    MinFeeSatKvB = case maps:get(min_fee, Info, undefined) of
+        F when is_number(F) -> round(F * 1000);
+        _ -> ?DEFAULT_MIN_RELAY_TX_FEE
+    end,
+    {ok, mempoolinfo_proplist(Size, Bytes, beamchain_mempool:dynamic_memory_usage(),
+                              TotalFeeBtc, MinFeeSatKvB,
                               beamchain_config:mempool_full_rbf())}.
 
 %% Pure result-shape builder for getmempoolinfo — exported so the wire-order
@@ -6611,11 +6619,17 @@ rpc_getmempoolinfo() ->
 %% unbroadcastcount, fullrbf, permitbaremultisig, maxdatacarriersize,
 %% limitclustercount, limitclustersize, optimal.
 mempoolinfo_proplist(Size, Bytes, TotalFeeBtc, FullRbf) ->
+    mempoolinfo_proplist(Size, Bytes, Bytes, TotalFeeBtc,
+                         ?DEFAULT_MIN_RELAY_TX_FEE, FullRbf).
+
+%% Usage is beamchain_mempool:dynamic_memory_usage/0 (Core
+%% DynamicMemoryUsage); MempoolMinFeeSatKvB is GetMinFee() in sat/kvB.
+mempoolinfo_proplist(Size, Bytes, Usage, TotalFeeBtc, MempoolMinFeeSatKvB, FullRbf) ->
     [
         {<<"loaded">>, true},
         {<<"size">>, Size},
         {<<"bytes">>, Bytes},
-        {<<"usage">>, Bytes},
+        {<<"usage">>, Usage},
         {<<"total_fee">>, TotalFeeBtc},
         {<<"maxmempool">>, beamchain_config:maxmempool_bytes()},
         %% Core rpc/mempool.cpp reports these as
@@ -6624,7 +6638,8 @@ mempoolinfo_proplist(Size, Bytes, TotalFeeBtc, FullRbf) ->
         %% (=100, Core policy.h:70) is already in sat/kvB, so the divisor is 1e8.
         %% Display floor is coupled to the ENFORCED floor (beamchain_mempool GATE
         %% 14, ?DEFAULT_MIN_RELAY_TX_FEE/1000.0 sat/vB) via the same macro.
-        {<<"mempoolminfee">>, ?DEFAULT_MIN_RELAY_TX_FEE / 100000000.0},
+        {<<"mempoolminfee">>,
+         max(MempoolMinFeeSatKvB, ?DEFAULT_MIN_RELAY_TX_FEE) / 100000000.0},
         {<<"minrelaytxfee">>, ?DEFAULT_MIN_RELAY_TX_FEE / 100000000.0},
         %% Core ValueFromAmount(incremental_relay_feerate.GetFeePerK()):
         %% ?DEFAULT_INCREMENTAL_RELAY_FEE (=100, policy.h:48) / 1e8 = 1e-06.
