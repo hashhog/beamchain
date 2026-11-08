@@ -371,26 +371,61 @@ encode_payload(cfcheckpt, #{filter_type := FT, stop_hash := Stop,
 %%% Payload decoding
 %%% ===================================================================
 
+%% Every command decode_payload_/2 has a clause for.
+-define(DECODABLE_COMMANDS,
+        [version, verack, ping, pong, addr, getaddr, inv, getdata, notfound,
+         getheaders, headers, getblocks, block, tx, sendheaders, mempool,
+         feefilter, sendcmpct, wtxidrelay, sendaddrv2, addrv2, cmpctblock,
+         getblocktxn, blocktxn, sendtxrcncl, reqrecon, sketch, reconcildiff,
+         reqsketchext, reqtx, getcfilters, cfilter, getcfheaders, cfheaders,
+         getcfcheckpt, cfcheckpt]).
+
 -spec decode_payload(atom(), binary()) -> {ok, term()} | {error, term()}.
 
-decode_payload(version, Bin) ->
+%% Total: a peer's payload can be truncated or otherwise malformed (a
+%% headers frame of just <<1>>, a blocktxn shorter than its 32-byte hash),
+%% and the per-command clauses below decode with pattern matches that raise
+%% function_clause / badmatch / case_clause on such input. The callers run
+%% inside shared gen_servers (beamchain_sync, beamchain_peer_manager), so a
+%% raise there crashed the process for every peer, and a handful of frames
+%% in a row exhausted beamchain_node_sup's restart intensity. Core instead
+%% catches the deserialize exception per message (net_processing.cpp
+%% ProcessMessages, "Exception '%s' (%s) caught") and moves on. Every caller
+%% already treats a non-{ok, _} result as a bad message from that peer, so
+%% turning the raise into {error, {malformed, Command}} is enough. Valid
+%% payloads take the same clauses as before and decode unchanged.
+%%
+%% The command atom never comes from the peer: every call site passes a
+%% literal for a command listed below. A command with no decoder is a
+%% programming error and still raises function_clause, as before.
+decode_payload(Command, Bin) ->
+    case lists:member(Command, ?DECODABLE_COMMANDS) of
+        true ->
+            try decode_payload_(Command, Bin)
+            catch error:_ -> {error, {malformed, Command}}
+            end;
+        false ->
+            erlang:error(function_clause, [Command, Bin])
+    end.
+
+decode_payload_(version, Bin) ->
     try decode_version(Bin) of
         Msg -> {ok, Msg}
     catch _:_ -> {error, bad_version}
     end;
 
-decode_payload(verack, <<>>) ->
+decode_payload_(verack, <<>>) ->
     {ok, #{}};
 
-decode_payload(ping, <<Nonce:64/little>>) ->
+decode_payload_(ping, <<Nonce:64/little>>) ->
     {ok, #{nonce => Nonce}};
 
-decode_payload(pong, <<Nonce:64/little>>) ->
+decode_payload_(pong, <<Nonce:64/little>>) ->
     {ok, #{nonce => Nonce}};
 
 %% -- Address discovery ------------------------------------------------
 
-decode_payload(addr, Bin) ->
+decode_payload_(addr, Bin) ->
     {Count, Rest} = beamchain_serialize:decode_varint(Bin),
     case Count > ?MAX_ADDR_TO_SEND of
         true ->
@@ -400,23 +435,23 @@ decode_payload(addr, Bin) ->
             {ok, #{addrs => Addrs}}
     end;
 
-decode_payload(getaddr, <<>>) ->
+decode_payload_(getaddr, <<>>) ->
     {ok, #{}};
 
 %% -- Inventory --------------------------------------------------------
 
-decode_payload(inv, Bin) ->
+decode_payload_(inv, Bin) ->
     decode_inv_payload(inv, Bin);
 
-decode_payload(getdata, Bin) ->
+decode_payload_(getdata, Bin) ->
     decode_inv_payload(getdata, Bin);
 
-decode_payload(notfound, Bin) ->
+decode_payload_(notfound, Bin) ->
     decode_inv_payload(notfound, Bin);
 
 %% -- Headers/blocks ---------------------------------------------------
 
-decode_payload(getheaders, <<V:32/little, Rest/binary>>) ->
+decode_payload_(getheaders, <<V:32/little, Rest/binary>>) ->
     {Count, Rest2} = beamchain_serialize:decode_varint(Rest),
     case Count > ?MAX_LOCATOR_SZ of
         true ->
@@ -427,7 +462,7 @@ decode_payload(getheaders, <<V:32/little, Rest/binary>>) ->
             {ok, #{version => V, locators => Locators, stop_hash => Stop}}
     end;
 
-decode_payload(headers, Bin) ->
+decode_payload_(headers, Bin) ->
     {Count, Rest} = beamchain_serialize:decode_varint(Bin),
     case Count > ?MAX_HEADERS_RESULTS of
         true ->
@@ -437,7 +472,7 @@ decode_payload(headers, Bin) ->
             {ok, #{headers => Headers}}
     end;
 
-decode_payload(getblocks, <<V:32/little, Rest/binary>>) ->
+decode_payload_(getblocks, <<V:32/little, Rest/binary>>) ->
     {Count, Rest2} = beamchain_serialize:decode_varint(Rest),
     case Count > ?MAX_LOCATOR_SZ of
         true ->
@@ -448,37 +483,37 @@ decode_payload(getblocks, <<V:32/little, Rest/binary>>) ->
             {ok, #{version => V, locators => Locators, stop_hash => Stop}}
     end;
 
-decode_payload(block, Bin) ->
+decode_payload_(block, Bin) ->
     {Block, _} = beamchain_serialize:decode_block(Bin),
     {ok, Block};
 
-decode_payload(tx, Bin) ->
+decode_payload_(tx, Bin) ->
     {Tx, _} = beamchain_serialize:decode_transaction(Bin),
     {ok, Tx};
 
-decode_payload(sendheaders, <<>>) ->
+decode_payload_(sendheaders, <<>>) ->
     {ok, #{}};
 
-decode_payload(mempool, <<>>) ->
+decode_payload_(mempool, <<>>) ->
     {ok, #{}};
 
 %% -- Policy ---------------------------------------------------------------
 
-decode_payload(feefilter, <<Fee:64/little>>) ->
+decode_payload_(feefilter, <<Fee:64/little>>) ->
     {ok, #{feerate => Fee}};
 
-decode_payload(sendcmpct, <<Ann:8, V:64/little>>) ->
+decode_payload_(sendcmpct, <<Ann:8, V:64/little>>) ->
     {ok, #{announce => Ann =/= 0, version => V}};
 
-decode_payload(wtxidrelay, <<>>) ->
+decode_payload_(wtxidrelay, <<>>) ->
     {ok, #{}};
 
-decode_payload(sendaddrv2, <<>>) ->
+decode_payload_(sendaddrv2, <<>>) ->
     {ok, #{}};
 
 %% -- ADDRv2 (BIP155) -----------------------------------------------------
 
-decode_payload(addrv2, Bin) ->
+decode_payload_(addrv2, Bin) ->
     {Count, Rest} = beamchain_serialize:decode_varint(Bin),
     case Count > ?MAX_ADDR_TO_SEND of
         true ->
@@ -490,7 +525,7 @@ decode_payload(addrv2, Bin) ->
 
 %% -- Compact blocks (BIP 152) --------------------------------------------
 
-decode_payload(cmpctblock, Bin) ->
+decode_payload_(cmpctblock, Bin) ->
     {Header, Rest} = beamchain_serialize:decode_block_header(Bin),
     <<Nonce:64/little, Rest2/binary>> = Rest,
     {SIDCount, Rest3} = beamchain_serialize:decode_varint(Rest2),
@@ -500,49 +535,49 @@ decode_payload(cmpctblock, Bin) ->
     {ok, #{header => Header, nonce => Nonce,
            short_ids => ShortIds, prefilled_txns => Prefilled}};
 
-decode_payload(getblocktxn, <<Hash:32/binary, Rest/binary>>) ->
+decode_payload_(getblocktxn, <<Hash:32/binary, Rest/binary>>) ->
     {Count, Rest2} = beamchain_serialize:decode_varint(Rest),
     {Indexes, _} = decode_diff_indexes(Count, Rest2),
     {ok, #{block_hash => Hash, indexes => Indexes}};
 
-decode_payload(blocktxn, <<Hash:32/binary, Rest/binary>>) ->
+decode_payload_(blocktxn, <<Hash:32/binary, Rest/binary>>) ->
     {Count, Rest2} = beamchain_serialize:decode_varint(Rest),
     {Txs, _} = decode_txs(Count, Rest2, []),
     {ok, #{block_hash => Hash, transactions => Txs}};
 
 %% -- BIP330 Erlay transaction reconciliation -------------------------------
 
-decode_payload(sendtxrcncl, <<V:32/little, Salt:64/little>>) ->
+decode_payload_(sendtxrcncl, <<V:32/little, Salt:64/little>>) ->
     {ok, #{version => V, salt => Salt}};
 
-decode_payload(reqrecon, <<SetSize:16/little, Q:16/little>>) ->
+decode_payload_(reqrecon, <<SetSize:16/little, Q:16/little>>) ->
     {ok, #{set_size => SetSize, q => Q}};
 
-decode_payload(sketch, SketchData) ->
+decode_payload_(sketch, SketchData) ->
     {ok, #{sketch => SketchData}};
 
-decode_payload(reconcildiff, <<1:8, Rest/binary>>) ->
+decode_payload_(reconcildiff, <<1:8, Rest/binary>>) ->
     {Count, Rest2} = beamchain_serialize:decode_varint(Rest),
     {ShortIds, _} = decode_erlay_short_ids(Count, Rest2, []),
     {ok, #{success => true, short_ids => ShortIds}};
-decode_payload(reconcildiff, <<0:8>>) ->
+decode_payload_(reconcildiff, <<0:8>>) ->
     {ok, #{success => false, short_ids => []}};
 
-decode_payload(reqsketchext, <<>>) ->
+decode_payload_(reqsketchext, <<>>) ->
     {ok, #{}};
 
-decode_payload(reqtx, Bin) ->
+decode_payload_(reqtx, Bin) ->
     {Count, Rest} = beamchain_serialize:decode_varint(Bin),
     {ShortIds, _} = decode_erlay_short_ids(Count, Rest, []),
     {ok, #{short_ids => ShortIds}};
 
 %% -- BIP157 compact block filters ----------------------------------------
 
-decode_payload(getcfilters,
+decode_payload_(getcfilters,
                <<FT:8, Start:32/little, Stop:32/binary>>) ->
     {ok, #{filter_type => FT, start_height => Start, stop_hash => Stop}};
 
-decode_payload(cfilter, <<FT:8, BH:32/binary, Rest/binary>>) ->
+decode_payload_(cfilter, <<FT:8, BH:32/binary, Rest/binary>>) ->
     {Len, Rest2} = beamchain_serialize:decode_varint(Rest),
     case Rest2 of
         <<FB:Len/binary, _/binary>> ->
@@ -551,21 +586,21 @@ decode_payload(cfilter, <<FT:8, BH:32/binary, Rest/binary>>) ->
             {error, truncated_cfilter}
     end;
 
-decode_payload(getcfheaders,
+decode_payload_(getcfheaders,
                <<FT:8, Start:32/little, Stop:32/binary>>) ->
     {ok, #{filter_type => FT, start_height => Start, stop_hash => Stop}};
 
-decode_payload(cfheaders,
+decode_payload_(cfheaders,
                <<FT:8, Stop:32/binary, Prev:32/binary, Rest/binary>>) ->
     {Count, Rest2} = beamchain_serialize:decode_varint(Rest),
     {Hashes, _} = decode_hashes(Count, Rest2, []),
     {ok, #{filter_type => FT, stop_hash => Stop, prev_header => Prev,
            filter_hashes => Hashes}};
 
-decode_payload(getcfcheckpt, <<FT:8, Stop:32/binary>>) ->
+decode_payload_(getcfcheckpt, <<FT:8, Stop:32/binary>>) ->
     {ok, #{filter_type => FT, stop_hash => Stop}};
 
-decode_payload(cfcheckpt, <<FT:8, Stop:32/binary, Rest/binary>>) ->
+decode_payload_(cfcheckpt, <<FT:8, Stop:32/binary, Rest/binary>>) ->
     {Count, Rest2} = beamchain_serialize:decode_varint(Rest),
     {Headers, _} = decode_hashes(Count, Rest2, []),
     {ok, #{filter_type => FT, stop_hash => Stop, headers => Headers}}.
