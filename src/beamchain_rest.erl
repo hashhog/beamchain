@@ -37,7 +37,7 @@
 -export([confirmations/1, confirmations/2, is_block_in_active_chain/1]).
 -export([rest_chaininfo/1]).
 %% Exported for EUnit: drives GET /rest/mempool/contents.json without cowboy.
--export([rest_mempool_contents/2]).
+-export([rest_mempool_contents/2, rest_mempool_info/1]).
 -endif.
 
 -define(SERVER, ?MODULE).
@@ -442,23 +442,10 @@ rest_chaininfo(_) ->
 
 %% GET /rest/mempool/info.json
 rest_mempool_info(json) ->
-    Info = beamchain_mempool:get_info(),
-    Size = maps:get(size, Info, 0),
-    Bytes = maps:get(bytes, Info, 0),
-    Json = #{
-        <<"loaded">> => true,
-        <<"size">> => Size,
-        <<"bytes">> => Bytes,
-        <<"usage">> => Bytes,
-        <<"total_fee">> => maps:get(total_fee, Info, 0) / 100000000.0,
-        <<"maxmempool">> => beamchain_config:maxmempool_bytes(),
-        <<"mempoolminfee">> => maps:get(min_fee_rate, Info, 1) / 100000.0,
-        <<"minrelaytxfee">> => 0.00001000,
-        <<"incrementalrelayfee">> => 0.00001000,
-        <<"unbroadcastcount">> => beamchain_mempool:unbroadcast_count(),
-        <<"fullrbf">> => beamchain_config:mempool_full_rbf()
-    },
-    {ok, json, jsx:encode(Json)};
+    %% Core rest.cpp rest_mempool_info: MempoolInfoToJSON, the same serializer
+    %% as getmempoolinfo.
+    {ok, Info} = beamchain_rpc:rpc_getmempoolinfo(),
+    {ok, json, jsx:encode(Info)};
 rest_mempool_info(_) ->
     {error, ?HTTP_BAD_REQUEST, <<"Only JSON format supported for mempool/info">>}.
 

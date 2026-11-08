@@ -63,6 +63,8 @@
 %% Exported so GET /rest/mempool/contents.json (Core rest.cpp rest_mempool ->
 %% MempoolToJSON) serializes verbose entries exactly like getrawmempool true.
 -export([rpc_getrawmempool/1]).
+%% Shared with REST /mempool/info (Core's MempoolInfoToJSON).
+-export([rpc_getmempoolinfo/0]).
 
 %% Exported for EUnit so tests can drive the BIP-157 RPC handler
 %% directly without spinning up the cowboy listener.
