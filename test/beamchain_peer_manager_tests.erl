@@ -1009,3 +1009,163 @@ getaddr_cap_floor_test_() ->
          ?assertEqual(999, beamchain_peer_manager:getaddr_cap(4347))
      end}
     ].
+
+%%% ===================================================================
+%%% Inbound acceptor: exactly one accept loop (Core net.cpp runs a single
+%%% accept thread, ThreadSocketHandler -> AcceptConnection).
+%%%
+%%% accept_loop/2 already loops on its own after every accept. The manager's
+%%% {accepted, ...} handler must therefore NOT spawn another acceptor; a new
+%%% one is only due when the current acceptor dies ('DOWN'). Before the fix
+%%% every inbound connection left one more accept_loop process behind.
+%%%
+%%% These tests drive the real gen_server callbacks: a proc_lib process
+%%% registered as beamchain_peer_manager enters gen_server:enter_loop/4 with a
+%%% #state{} record built from the module's own record definition (read from
+%%% its debug_info), listen_socket set to a real loopback listener. The real
+%%% accept_loop, check_inbound and handle_inbound run; only
+%%% beamchain_peer:accept/3 (spawning a peer) and beamchain_config:get/2 for
+%%% the whitelist are mocked.
+%%% ===================================================================
+
+-define(ACCEPT_TEST_CONNS, 200).
+
+inbound_accept_keeps_one_acceptor_test_() ->
+    {foreach, fun acceptor_setup/0, fun acceptor_cleanup/1,
+     [fun(Ctx) ->
+          {timeout, 60,
+           {"inbound_accept_keeps_one_acceptor: 200 inbound connections "
+            "leave exactly one accept_loop process",
+            fun() -> inbound_accept_keeps_one_acceptor(Ctx) end}}
+      end,
+      %% The 'DOWN' respawn path the fix relies on still works, and the
+      %% respawned acceptor also stays single after it accepts.
+      fun(Ctx) ->
+          {timeout, 60,
+           {"acceptor DOWN respawns exactly one acceptor that still accepts",
+            fun() -> acceptor_down_respawns_one(Ctx) end}}
+      end]}.
+
+inbound_accept_keeps_one_acceptor(#{port := Port}) ->
+    ?assertEqual(1, wait_acceptor_count(1)),
+    Before = meck:num_calls(beamchain_peer, accept, '_'),
+    Clients = [begin
+                   {ok, C} = gen_tcp:connect({127,0,0,1}, Port,
+                                             [binary, {active, false}]),
+                   C
+               end || _ <- lists:seq(1, ?ACCEPT_TEST_CONNS)],
+    %% Instrument check: every connection must actually reach the manager's
+    %% {accepted, ...} handler, otherwise a count of 1 proves nothing.
+    ?assertEqual(Before + ?ACCEPT_TEST_CONNS,
+                 wait_num_calls(Before + ?ACCEPT_TEST_CONNS)),
+    timer:sleep(200),
+    Count = acceptor_count(),
+    [gen_tcp:close(C) || C <- Clients],
+    ?assertEqual(1, Count).
+
+acceptor_down_respawns_one(#{port := Port}) ->
+    ?assertEqual(1, wait_acceptor_count(1)),
+    [Old] = acceptor_pids(),
+    exit(Old, kill),
+    ?assertEqual(1, wait_acceptor_count(1)),
+    [New] = acceptor_pids(),
+    ?assertNotEqual(Old, New),
+    Before = meck:num_calls(beamchain_peer, accept, '_'),
+    {ok, C} = gen_tcp:connect({127,0,0,1}, Port, [binary, {active, false}]),
+    ?assertEqual(Before + 1, wait_num_calls(Before + 1)),
+    gen_tcp:close(C),
+    timer:sleep(100),
+    ?assertEqual([New], acceptor_pids()).
+
+acceptor_setup() ->
+    setup(),
+    ok = meck:new(beamchain_peer, [no_link, passthrough]),
+    ok = meck:expect(beamchain_peer, accept,
+                     fun(_Sock, _Addr, _Mgr) -> {error, acceptor_test} end),
+    ok = meck:new(beamchain_config, [no_link, passthrough]),
+    ok = meck:expect(beamchain_config, get,
+                     fun(whitelist, _Default) -> [];
+                        (K, D) -> meck:passthrough([K, D]) end),
+    {ok, LSock} = gen_tcp:listen(0, [binary, {active, false}, {packet, raw},
+                                     {reuseaddr, true}, {backlog, 512},
+                                     {ip, {127,0,0,1}}]),
+    {ok, Port} = inet:port(LSock),
+    Dummy = spawn(fun() -> receive stop -> ok end end),
+    State = build_state(#{listen_socket => LSock, acceptor => Dummy,
+                          max_inbound => 100000, network_active => true}),
+    Parent = self(),
+    Mgr = proc_lib:spawn(fun() ->
+        true = register(beamchain_peer_manager, self()),
+        Parent ! {mgr_ready, self()},
+        gen_server:enter_loop(beamchain_peer_manager, [], State,
+                              {local, beamchain_peer_manager})
+    end),
+    receive {mgr_ready, Mgr} -> ok after 5000 -> error(mgr_not_ready) end,
+    %% The manager spawns its acceptor on the acceptor's 'DOWN' (the only
+    %% respawn path once the fix is in); feed it one for the dummy pid.
+    Mgr ! {'DOWN', make_ref(), process, Dummy, acceptor_test_boot},
+    Dummy ! stop,
+    #{lsock => LSock, port => Port, mgr => Mgr}.
+
+acceptor_cleanup(#{lsock := LSock, mgr := Mgr}) ->
+    MRef = erlang:monitor(process, Mgr),
+    exit(Mgr, kill),
+    receive {'DOWN', MRef, process, Mgr, _} -> ok after 5000 -> ok end,
+    %% Closing the listener ends every accept_loop ({error, closed}).
+    gen_tcp:close(LSock),
+    _ = wait_acceptor_count(0),
+    meck:unload(beamchain_config),
+    meck:unload(beamchain_peer),
+    ok.
+
+%% Build a #state{} tuple for beamchain_peer_manager from its record
+%% definition, evaluating each field's default where possible.
+build_state(Overrides) ->
+    Beam = code:which(beamchain_peer_manager),
+    {ok, {_, [{abstract_code, {raw_abstract_v1, Forms}}]}} =
+        beam_lib:chunks(Beam, [abstract_code]),
+    [Fields] = [Fs || {attribute, _, record, {state, Fs}} <- Forms],
+    Values = [field_value(F, Overrides) || F <- Fields],
+    list_to_tuple([state | Values]).
+
+field_value({typed_record_field, RF, _Type}, Ov) -> field_value(RF, Ov);
+field_value({record_field, _, {atom, _, Name}}, Ov) ->
+    maps:get(Name, Ov, undefined);
+field_value({record_field, _, {atom, _, Name}, Default}, Ov) ->
+    case maps:find(Name, Ov) of
+        {ok, V} -> V;
+        error ->
+            try erl_eval:expr(Default, erl_eval:new_bindings()) of
+                {value, V, _} -> V
+            catch _:_ -> undefined
+            end
+    end.
+
+%% A process "running accept_loop" has beamchain_peer_manager:accept_loop/2
+%% on its stack (it calls gen_tcp:accept/1 from inside a case, so the frame
+%% is there while it blocks waiting for the next connection).
+is_acceptor(P) ->
+    case erlang:process_info(P, current_stacktrace) of
+        {current_stacktrace, Frames} ->
+            lists:any(fun({beamchain_peer_manager, accept_loop, 2, _}) -> true;
+                         (_) -> false
+                      end, Frames);
+        undefined -> false
+    end.
+
+acceptor_pids() -> [P || P <- erlang:processes(), is_acceptor(P)].
+
+acceptor_count() -> length(acceptor_pids()).
+
+wait_acceptor_count(N) -> wait_until(fun acceptor_count/0, N, 50).
+
+wait_num_calls(N) ->
+    wait_until(fun() -> meck:num_calls(beamchain_peer, accept, '_') end,
+               N, 100).
+
+wait_until(F, Want, 0) -> _ = Want, F();
+wait_until(F, Want, Tries) ->
+    case F() of
+        Want -> Want;
+        _ -> timer:sleep(50), wait_until(F, Want, Tries - 1)
+    end.
