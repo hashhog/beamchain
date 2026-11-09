@@ -52,7 +52,7 @@ Erlang's progress reports.
 |---|---|
 | `rebar3 compile` | Compile only (also builds the NIF). |
 | `rebar3 eunit` | Build with the `test` profile (adds `meck`) and run the tests. |
-| `rebar3 as prod release` | An OTP release with ERTS included, in `_build/prod/rel/beamchain/`. It reads `config/sys.config` and `config/vm.args`; edit `sys.config` before using it, because the committed file names a network, data directory and ports for a particular machine. |
+| `rebar3 as prod release` | An OTP release with ERTS included, in `_build/prod/rel/beamchain/`. It reads `config/sys.config` and `config/vm.args`; edit `sys.config` before using it, because the committed file names a network, data directory and ports for a particular machine. `vm.args` sets no cookie: the runtime uses `~/.erlang.cookie` and the release's `bin/hooks/ensure_cookie.sh` start hook creates a random one there (mode 0400) on first start if it is missing, or you can set `RELX_COOKIE`. Distribution and EPMD listen on 127.0.0.1 only. |
 | `rebar3 xref` | Cross-reference check configured in `rebar.config` (undefined calls, unused locals). |
 
 ## Reproducible escript
