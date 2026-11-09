@@ -564,6 +564,18 @@ skip_data(Len, Bin) ->
 %%% Script execution loop
 %%% -------------------------------------------------------------------
 
+%% MAX_STACK_SIZE after EVERY opcode. Core's EvalScript ends each loop
+%% iteration with `if (stack.size() + altstack.size() > MAX_STACK_SIZE)
+%% return set_error(serror, SCRIPT_ERR_STACK_SIZE)` (interpreter.cpp), for
+%% every opcode, executed or not. Each opcode clause below bumps opcode_pos
+%% before it returns to execute/3, so opcode_pos > 0 on entry means "an
+%% opcode has just run": this one clause is that check. It covers OP_0,
+%% OP_DEPTH and an oversized initial stack, which the per-push checks missed.
+%% An empty script runs no opcode, so (as in Core) no check is made.
+execute(_Script, _Pos, #script_state{opcode_pos = P, stack = S, altstack = A})
+  when P > 0, length(S) + length(A) > ?MAX_STACK_SIZE ->
+    {error, stack_overflow};
+
 execute(<<>>, _Pos, #script_state{exec_stack = ExecStack} = State) ->
     case ExecStack of
         [] -> {ok, State#script_state.stack};
