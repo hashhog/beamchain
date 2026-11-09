@@ -9,7 +9,8 @@
 %%% every segment recopied everything received so far: O(size^2).  Measured
 %%% on OTP 27 (staged-patches/cffix-beamchain-recv-buffer-quadratic): one
 %%% 4 MB frame in 1460-byte segments cost ~3 s of copying in the peer
-%%% process (1 MB: ~145 ms), against ~5 ms when the buffer is not re-parsed.
+%%% process (536-byte segments: ~7 s), against ~5 ms when the buffer is not
+%%% re-parsed.
 %%% Any peer can send one such frame per 4 MB of bandwidth, before the
 %%% handshake.
 %%%
@@ -22,11 +23,13 @@
 
 -define(MAGIC, <<16#fa, 16#bf, 16#b5, 16#da>>).
 -define(V2_MAGIC, <<16#1c, 16#16, 16#3f, 16#28>>).
--define(SEG, 1460).
+%% The minimum IPv4 MSS: what a trickling peer can force.
+-define(SEG, 536).
 %% Just under MAX_PROTOCOL_MESSAGE_LENGTH (4 000 000).
 -define(BIG, 3999000).
-%% Generous: linear buffering of 4 MB takes a few ms; master takes ~3 s.
--define(LINEAR_BUDGET_US, 1000000).
+%% Linear buffering of 4 MB in 536-byte segments takes ~5-40 ms; master
+%% took 4-7 s (1.7-3 s at 1460 bytes).  >10x margin on each side.
+-define(LINEAR_BUDGET_US, 500000).
 
 %%% ===================================================================
 %%% v1, through a real inbound peer process (the production path)
@@ -38,7 +41,7 @@ v1_inbound_peer_test_() ->
      fun cleanup_peer/1,
      [fun(Ctx) ->
           {timeout, 60,
-           {"a 4 MB v1 frame trickled in 1460-byte segments is buffered in linear time",
+           {"a 4 MB v1 frame trickled in 536-byte segments is buffered in linear time",
             fun() -> trickled_v1_frame_is_linear(Ctx) end}}
       end,
       fun(Ctx) ->
