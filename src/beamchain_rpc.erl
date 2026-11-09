@@ -883,10 +883,31 @@ dispatch(Request, WalletName) ->
             %% the intended code (e.g. -8 for a malformed blockhash) instead of
             %% collapsing it to the -32603 internal-error default below.
             error_obj(Id, ECode, EMsg);
-        Class:Err:Stack ->
+        Class:Err0:Stack0 ->
+            %% Never log a secret (Core never logs passphrases or keys). The
+            %% raw exit of a failed wallet call is {Why, {gen_server, call,
+            %% [Pid, {walletpassphrase, Passphrase, T}]}} and stack frames
+            %% carry call arguments, so both are redacted, and for
+            %% secret-bearing methods every string parameter is scrubbed too.
+            {Err, Stack} = redact_dispatch_error(Request, Err0, Stack0),
             logger:warning("rpc dispatch error: ~p:~p~n~p", [Class, Err, Stack]),
             error_obj(Id, ?RPC_INTERNAL_ERROR, format_internal_error(Class, Err))
     end.
+
+redact_dispatch_error(Request, Err, Stack) ->
+    Secrets = try
+                  Method = maps:get(<<"method">>, Request, undefined),
+                  case beamchain_log_redact:secret_rpc_method(Method) of
+                      true ->
+                          beamchain_log_redact:secrets_in(
+                            maps:get(<<"params">>, Request, []));
+                      false ->
+                          []
+                  end
+              catch _:_ -> []
+              end,
+    {beamchain_log_redact:scrub(beamchain_log_redact:reason(Err), Secrets),
+     beamchain_log_redact:scrub(beamchain_log_redact:stack(Stack), Secrets)}.
 
 %% Format a caught exception for the -32603 response body.
 %% Includes class and a short reason description (truncated to 200 chars).
