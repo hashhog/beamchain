@@ -33,6 +33,9 @@ handler_test_() ->
                           fun getdata_50k_same_block_bounded_memory/0}}]
      end}.
 
+%% Covers the request side: decode, de-duplication and the hand-off out of
+%% the serve slot.  The peer-side incremental server is exercised over real
+%% sockets by getdata_50k_distinct_blocks_bounded_memory below.
 getdata_50k_same_block_bounded_memory() ->
     Hash = <<7:256>>,
     Big = getdata_payload([#{type => ?MSG_WITNESS_BLOCK, hash => Hash}
@@ -104,7 +107,7 @@ getdata_50k_distinct_blocks_bounded_memory() ->
     %% as a blocked gen_tcp:send would have dropped it.
     Down = receive {'DOWN', MRef, process, A, R} -> {down, R}
            after 3 * ?SEND_TIMEOUT_MS -> alive end,
-    ?assertMatch({down, _}, Down).
+    ?assertEqual({down, {shutdown, send_timeout}}, Down).
 
 getdata_reader_gets_every_block() ->
     L = listener(),
