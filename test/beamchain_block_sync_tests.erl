@@ -624,3 +624,316 @@ flush_getdata() ->
 
 flush_all() ->
     receive _ -> flush_all() after 0 -> ok end.
+
+%%% ===================================================================
+%%% A junk body under an honest header is MUTATED, not invalid
+%%% (secfix-beamchain-mutated-body-marks-failed)
+%%%
+%%% Core CheckBlock (validation.cpp:3935-3942) runs CheckMerkleRoot before
+%%% any body check: "All potential-corruption validation must be done
+%%% before we do any transaction validation, as otherwise we may mark the
+%%% header as invalid because we receive the wrong transactions for it."
+%%% A merkle mismatch is BLOCK_MUTATED, which AcceptBlock /
+%%% InvalidBlockFound never caches as BLOCK_FAILED_VALID. beamchain ran
+%%% no_transactions / first_tx_not_coinbase / extra_coinbase (consensus
+%%% verdicts) BEFORE the merkle check, so any peer could hand us a junk
+%%% body for an in-flight honest header and get the honest block marked
+%%% failed and its header refused for good: a chain split.
+%%%
+%%% These drive block_sync with the REAL beamchain_validation /
+%%% beamchain_serialize / beamchain_pow on a regtest header with real PoW;
+%%% only the stateful collaborators are mocked.
+%%% ===================================================================
+
+-define(MB_MOCKED, [beamchain_db, beamchain_peer, beamchain_peer_manager,
+                    beamchain_chainstate, beamchain_sync,
+                    beamchain_header_sync]).
+
+-define(MB_HEIGHT, 100).
+
+mb_params() -> beamchain_chain_params:params(regtest).
+
+mb_coinbase(Tag) ->
+    #transaction{
+        version = 1,
+        inputs = [#tx_in{prev_out = #outpoint{hash = <<0:256>>,
+                                              index = 16#ffffffff},
+                         %% BIP-34 height push for 100, then a tag byte
+                         script_sig = <<1, ?MB_HEIGHT, Tag>>,
+                         sequence = 16#ffffffff,
+                         witness = undefined}],
+        outputs = [#tx_out{value = 50 * 100000000,
+                           script_pubkey = <<16#51>>}],
+        locktime = 0}.
+
+mb_spend() ->
+    #transaction{
+        version = 1,
+        inputs = [#tx_in{prev_out = #outpoint{hash = <<16#ab:256>>,
+                                              index = 0},
+                         script_sig = <<>>,
+                         sequence = 16#ffffffff,
+                         witness = undefined}],
+        outputs = [#tx_out{value = 1000, script_pubkey = <<16#51>>}],
+        locktime = 0}.
+
+%% A header committing to Txs, with real regtest PoW.
+mb_header_for(Txs) ->
+    Root = beamchain_serialize:compute_merkle_root(
+             [beamchain_serialize:tx_hash(T) || T <- Txs]),
+    Hdr = #block_header{version = 4,
+                        prev_hash = <<(?MB_HEIGHT - 1):256>>,
+                        merkle_root = Root,
+                        timestamp = erlang:system_time(second),
+                        bits = 16#207fffff,
+                        nonce = 0},
+    mb_mine(Hdr, maps:get(pow_limit, mb_params())).
+
+mb_mine(#block_header{nonce = N} = Hdr, PowLimit) ->
+    case beamchain_pow:check_pow(beamchain_serialize:block_hash(Hdr),
+                                 Hdr#block_header.bits, PowLimit) of
+        true -> Hdr;
+        false -> mb_mine(Hdr#block_header{nonce = N + 1}, PowLimit)
+    end.
+
+mb_honest() ->
+    Txs = [mb_coinbase(0)],
+    #block{header = mb_header_for(Txs), transactions = Txs}.
+
+%% The three junk bodies the finding names, each under the honest header.
+mb_junk_bodies() ->
+    [{no_transactions, []},
+     {first_tx_not_coinbase, [mb_spend()]},
+     {extra_coinbase, [mb_coinbase(0), mb_coinbase(1)]}].
+
+%% --- pure: check_block ordering --------------------------------------
+
+check_block_merkle_before_body_checks_test_() ->
+    Params = mb_params(),
+    #block{header = Hdr} = Honest = mb_honest(),
+    [?_assertEqual(ok, beamchain_validation:check_block(Honest, Params))] ++
+    [{atom_to_list(Name),
+      ?_assertEqual({error, bad_merkle_root},
+                    beamchain_validation:check_block(
+                      #block{header = Hdr, transactions = Body}, Params))}
+     || {Name, Body} <- mb_junk_bodies()].
+
+%% Positive control: the merkle root COMMITS to the bad structure, so it
+%% is a consensus verdict about this header -- still rejected with the
+%% structural reason (the reorder must not let it through).
+check_block_committed_bad_structure_still_rejected_test_() ->
+    Params = mb_params(),
+    NoCb = [mb_spend()],
+    TwoCb = [mb_coinbase(0), mb_coinbase(1)],
+    [?_assertEqual({error, first_tx_not_coinbase},
+                   beamchain_validation:check_block(
+                     #block{header = mb_header_for(NoCb),
+                            transactions = NoCb}, Params)),
+     ?_assertEqual({error, extra_coinbase},
+                   beamchain_validation:check_block(
+                     #block{header = mb_header_for(TwoCb),
+                            transactions = TwoCb}, Params))].
+
+%% --- block_sync: the P2P path ------------------------------------------
+
+mb_setup() ->
+    Tab = ets:new(mb_tab, [set, public]),
+    Honest = mb_honest(),
+    HonestHdr = Honest#block.header,
+    HonestHash = beamchain_serialize:block_hash(HonestHdr),
+    ets:insert(Tab, {tip, {<<(?MB_HEIGHT - 1):256>>, ?MB_HEIGHT - 1}}),
+    ets:insert(Tab, {invalid, []}),
+    lists:foreach(fun(M) -> ok = meck:new(M, [no_link]) end, ?MB_MOCKED),
+    ok = meck:expect(beamchain_chainstate, is_chain_paused, fun() -> false end),
+    ok = meck:expect(beamchain_db, get_block_index,
+        fun(?MB_HEIGHT) ->
+                {ok, #{hash => HonestHash, header => HonestHdr,
+                       chainwork => ?MB_HEIGHT, n_tx => 1}};
+           (H) ->
+                {ok, #{hash => <<H:256>>, header => HonestHdr,
+                       chainwork => H, n_tx => 1}}
+        end),
+    ok = meck:expect(beamchain_db, store_block_index,
+        fun(_, _, _, _, _) -> ok end),
+    ok = meck:expect(beamchain_db, store_block_index,
+        fun(_, _, _, _, _, _) -> ok end),
+    ok = meck:expect(beamchain_peer, send_message, fun(_, _) -> ok end),
+    ok = meck:expect(beamchain_peer, disconnect, fun(_) -> ok end),
+    ok = meck:expect(beamchain_peer, add_misbehavior, fun(_, _) -> ok end),
+    ok = meck:expect(beamchain_peer_manager, get_peers, fun() -> [] end),
+    ok = meck:expect(beamchain_peer_manager, misbehaving,
+                     fun(_, _, _) -> ok end),
+    ok = meck:expect(beamchain_chainstate, get_tip,
+        fun() -> [{tip, T}] = ets:lookup(Tab, tip), {ok, T} end),
+    ok = meck:expect(beamchain_chainstate, connect_block,
+        fun(#block{header = H}) ->
+            ets:insert(Tab, {tip, {beamchain_serialize:block_hash(H),
+                                   ?MB_HEIGHT}}),
+            ok
+        end),
+    ok = meck:expect(beamchain_chainstate, invalid_block_found,
+        fun(Hash) ->
+            [{invalid, L}] = ets:lookup(Tab, invalid),
+            ets:insert(Tab, {invalid, [Hash | L]}),
+            ok
+        end),
+    ok = meck:expect(beamchain_chainstate, is_known_invalid,
+        fun(Hash) ->
+            [{invalid, L}] = ets:lookup(Tab, invalid),
+            lists:member(Hash, L)
+        end),
+    ok = meck:expect(beamchain_sync, notify_blocks_complete,
+                     fun(_) -> ok end),
+    ok = meck:expect(beamchain_header_sync, invalid_block_found,
+                     fun(_, _, _) -> ok end),
+    put(getdata_seen, 0),
+    {Tab, Honest, HonestHash}.
+
+mb_teardown({Tab, _, _}) ->
+    lists:foreach(fun(M) -> catch meck:unload(M) end, ?MB_MOCKED),
+    ets:delete(Tab),
+    flush_all().
+
+mb_state(Peer) ->
+    beamchain_block_sync:test_state(#{
+        status => syncing, next_to_validate => ?MB_HEIGHT,
+        target_height => ?MB_HEIGHT, download_queue => [?MB_HEIGHT],
+        in_flight => #{}, hash_to_height => #{}, downloaded => #{},
+        peers => #{Peer => #{}}, peer_stats => #{Peer => 0},
+        params => mb_params()}).
+
+mutated_body_does_not_mark_header_failed_test_() ->
+    [{foreach, fun mb_setup/0, fun mb_teardown/1,
+      [fun(Fx) ->
+           {"junk body (" ++ atom_to_list(Name) ++ ") under an honest "
+            "in-flight header: not FAILED, block later connects",
+            fun() -> mutated_body_does_not_mark_header_failed(Fx, Body) end}
+       end]}
+     || {Name, Body} <- mb_junk_bodies()].
+
+mutated_body_does_not_mark_header_failed({_Tab, Honest, HonestHash}, Body) ->
+    X = spawn(fun() -> receive stop -> ok end end),
+    S0 = mb_state(X),
+    {noreply, S1} = beamchain_block_sync:handle_info(continue_validation, S0),
+    ?assertEqual([HonestHash], collect_getdata()),
+    %% The peer answers our request with a junk body under the real header.
+    Junk = Honest#block{transactions = Body},
+    {noreply, S2} = beamchain_block_sync:handle_cast({block, X, Junk}, S1),
+    ?assertEqual(false, meck:called(beamchain_chainstate, invalid_block_found, '_')),
+    ?assertEqual(false, meck:called(beamchain_header_sync, invalid_block_found, '_')),
+    ?assertEqual(false, beamchain_chainstate:is_known_invalid(HonestHash)),
+    ?assertEqual(false, meck:called(beamchain_chainstate, connect_block, '_')),
+    ?assertEqual(syncing, beamchain_block_sync:test_get(status, S2)),
+    %% The honest block is asked for again ...
+    ?assertEqual([HonestHash], collect_getdata()),
+    %% ... and when the real body arrives it connects.
+    {noreply, S3} = beamchain_block_sync:handle_cast({block, X, Honest}, S2),
+    ?assertEqual(true, meck:called(beamchain_chainstate, connect_block, [Honest])),
+    ?assertEqual(?MB_HEIGHT + 1,
+                 beamchain_block_sync:test_get(next_to_validate, S3)),
+    ?assertEqual(false, beamchain_chainstate:is_known_invalid(HonestHash)),
+    X ! stop.
+
+%% Positive control on the P2P path: the header COMMITS to a body with no
+%% coinbase, so the verdict is about the block -- it is marked FAILED and
+%% the delivering peer is punished, exactly as before the reorder.
+committed_bad_structure_marks_failed_test_() ->
+    {setup, fun mb_setup/0, fun mb_teardown/1,
+     fun(Fx) -> ?_test(committed_bad_structure_marks_failed(Fx)) end}.
+
+committed_bad_structure_marks_failed(_Fx) ->
+    NoCb = [mb_spend()],
+    BadHdr = mb_header_for(NoCb),
+    BadHash = beamchain_serialize:block_hash(BadHdr),
+    ok = meck:expect(beamchain_db, get_block_index,
+        fun(H) -> {ok, #{hash => case H of ?MB_HEIGHT -> BadHash;
+                                           _ -> <<H:256>> end,
+                         header => BadHdr, chainwork => H, n_tx => 1}}
+        end),
+    X = spawn(fun() -> receive stop -> ok end end),
+    {noreply, S1} = beamchain_block_sync:handle_info(continue_validation,
+                                                     mb_state(X)),
+    ?assertEqual([BadHash], collect_getdata()),
+    {noreply, _S2} = beamchain_block_sync:handle_cast(
+                       {block, X, #block{header = BadHdr,
+                                         transactions = NoCb}}, S1),
+    ?assertEqual(true, meck:called(beamchain_chainstate, invalid_block_found, [BadHash])),
+    ?assertEqual(1, meck:num_calls(beamchain_peer_manager, misbehaving,
+                                   [X, '_', '_'])),
+    ?assertEqual(false, meck:called(beamchain_chainstate, connect_block, '_')),
+    X ! stop.
+
+%%% -------------------------------------------------------------------
+%%% Same split through the witness: witness bytes are not committed by the
+%%% txid merkle root, but check_block's bad_blk_weight (a verdict) counts
+%%% them. Core runs CheckWitnessMalleation (BLOCK_MUTATED) before
+%%% bad-blk-weight (validation.cpp:4169 then 4180), so junk witness data
+%%% that pushes an honest block over the weight limit must not mark it.
+%%% -------------------------------------------------------------------
+
+mb_big_witness() -> binary:copy(<<0>>, 4000000).
+
+junk_witness_overweight_does_not_mark_header_failed_test_() ->
+    {foreach, fun mb_setup/0, fun mb_teardown/1,
+     [fun(Fx) ->
+          {"honest txids + junk witness pushing weight over the limit: "
+           "not FAILED, block later connects",
+           fun() -> junk_witness_overweight(Fx) end}
+      end]}.
+
+junk_witness_overweight({_Tab, Honest, _HonestHash} = Fx) ->
+    [Cb] = Honest#block.transactions,
+    [In] = Cb#transaction.inputs,
+    CbJunk = Cb#transaction{inputs = [In#tx_in{witness = [mb_big_witness()]}]},
+    Junk = Honest#block{transactions = [CbJunk]},
+    %% Same txids, so the merkle root still matches; only the weight fails.
+    ?assertEqual({error, bad_blk_weight},
+                 beamchain_validation:check_block(Junk, mb_params())),
+    mutated_body_does_not_mark_header_failed(Fx, [CbJunk]).
+
+%% Positive control: the witness IS committed (valid BIP-141 commitment over
+%% the heavy witness) and the block is still too heavy -- a verdict about
+%% this block: marked FAILED, sender punished, not connected.
+committed_witness_overweight_marks_failed_test_() ->
+    {setup, fun mb_setup/0, fun mb_teardown/1,
+     fun(Fx) -> ?_test(committed_witness_overweight_marks_failed(Fx)) end}.
+
+committed_witness_overweight_marks_failed(_Fx) ->
+    Spend0 = mb_spend(),
+    [SIn] = Spend0#transaction.inputs,
+    Spend = Spend0#transaction{inputs = [SIn#tx_in{witness = [mb_big_witness()]}]},
+    Nonce = <<0:256>>,
+    Commitment = beamchain_serialize:compute_witness_commitment(
+                   [<<0:256>>, beamchain_serialize:wtx_hash(Spend)], Nonce),
+    Cb0 = mb_coinbase(0),
+    [CIn] = Cb0#transaction.inputs,
+    Cb = Cb0#transaction{
+           inputs = [CIn#tx_in{witness = [Nonce]}],
+           outputs = Cb0#transaction.outputs ++
+               [#tx_out{value = 0,
+                        script_pubkey = <<16#6a, 16#24, 16#aa, 16#21, 16#a9,
+                                          16#ed, Commitment/binary>>}]},
+    Txs = [Cb, Spend],
+    BadHdr = mb_header_for(Txs),
+    BadHash = beamchain_serialize:block_hash(BadHdr),
+    Bad = #block{header = BadHdr, transactions = Txs},
+    ?assertEqual(ok, beamchain_validation:check_witness_malleation(
+                       Bad, ?MB_HEIGHT, mb_params())),
+    ?assertEqual({error, bad_blk_weight},
+                 beamchain_validation:check_block(Bad, mb_params())),
+    ok = meck:expect(beamchain_db, get_block_index,
+        fun(H) -> {ok, #{hash => case H of ?MB_HEIGHT -> BadHash;
+                                           _ -> <<H:256>> end,
+                         header => BadHdr, chainwork => H, n_tx => 2}}
+        end),
+    X = spawn(fun() -> receive stop -> ok end end),
+    {noreply, S1} = beamchain_block_sync:handle_info(continue_validation,
+                                                     mb_state(X)),
+    ?assertEqual([BadHash], collect_getdata()),
+    {noreply, _S2} = beamchain_block_sync:handle_cast({block, X, Bad}, S1),
+    ?assertEqual(true, meck:called(beamchain_chainstate, invalid_block_found,
+                                   [BadHash])),
+    ?assertEqual(1, meck:num_calls(beamchain_peer_manager, misbehaving,
+                                   [X, '_', '_'])),
+    ?assertEqual(false, meck:called(beamchain_chainstate, connect_block, '_')),
+    X ! stop.
