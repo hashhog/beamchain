@@ -1705,6 +1705,25 @@ is_consensus_verdict(R) when is_atom(R) ->
 is_consensus_verdict(_) ->
     false.
 
+%% check_block's bad_blk_weight counts witness bytes, which the txid merkle
+%% root does not commit to. Core checks CheckWitnessMalleation
+%% (BLOCK_MUTATED, validation.cpp:4169) BEFORE bad-blk-weight (4180) in
+%% ContextualCheckBlock, so junk witness data that pushes an honest block
+%% over the weight limit is a mutation, never a verdict. Give the witness
+%% check the first word here: its failure (a non-verdict) replaces the
+%% weight verdict; a block whose witness IS committed and still too heavy
+%% keeps bad_blk_weight and is marked.
+-spec weight_failure_reason(#block{}, non_neg_integer(), map()) -> term().
+weight_failure_reason(Block, Height, Params) ->
+    case catch beamchain_validation:check_witness_malleation(Block, Height,
+                                                             Params) of
+        ok -> bad_blk_weight;
+        {error, WitnessReason} -> WitnessReason;
+        %% Could not establish that the witness is committed: not a
+        %% verdict (marking needs certainty), retried like a local fault.
+        Other -> {internal_error, {witness_check, Other}}
+    end.
+
 %% `failed` when Hash was failed (invalidateblock or a consensus verdict, or
 %% a descendant of one), else false.
 failed_block(Hash) ->
@@ -1753,6 +1772,8 @@ validate_and_connect(Height, Block,
         %% 1. Context-free block check
         case beamchain_validation:check_block(Block, Params) of
             ok -> ok;
+            {error, bad_blk_weight} ->
+                throw(weight_failure_reason(Block, Height, Params));
             {error, E1} -> throw(E1)
         end,
 
