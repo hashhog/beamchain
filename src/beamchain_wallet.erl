@@ -52,7 +52,7 @@
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
-         terminate/2]).
+         terminate/2, format_status/1]).
 
 %% BIP 32 HD key derivation (pure functions)
 -export([master_from_seed/1,
@@ -652,7 +652,72 @@ init_ets_tables() ->
     end,
     ok.
 
-handle_call({create, Seed, Passphrase}, _From, State) ->
+%% A crash inside a callback ends in a {gen_server, terminate} report and a
+%% proc_lib crash report, and both print the stacktrace that OTP appends
+%% itself, outside format_status/1. The top frame of a BIF or
+%% function_clause error carries the call's arguments: a passphrase
+%% (crypto:pbkdf2_hmac/5), a seed, or the whole #wallet_state{}. The same
+%% {Reason, Stack} is also the exit reason every caller receives. So each
+%% callback re-raises errors and exits with argument-free frames and a
+%% redacted reason. A throw is left alone: gen_server uses a thrown value
+%% as the callback's return.
+handle_call(Request, From, State) ->
+    try do_handle_call(Request, From, State)
+    catch error:Reason:Stack -> reraise_redacted(error, Reason, Stack, Request, State);
+          exit:Reason:Stack  -> reraise_redacted(exit, Reason, Stack, Request, State)
+    end.
+
+handle_cast(Msg, State) ->
+    try do_handle_cast(Msg, State)
+    catch error:Reason:Stack -> reraise_redacted(error, Reason, Stack, Msg, State);
+          exit:Reason:Stack  -> reraise_redacted(exit, Reason, Stack, Msg, State)
+    end.
+
+handle_info(Info, State) ->
+    try do_handle_info(Info, State)
+    catch error:Reason:Stack -> reraise_redacted(error, Reason, Stack, Info, State);
+          exit:Reason:Stack  -> reraise_redacted(exit, Reason, Stack, Info, State)
+    end.
+
+%% Structural redaction misses a secret held as a bare value in the reason
+%% ({badmatch, Seed}), so the secrets this server knows (its own state and
+%% the secret-bearing message being handled) are scrubbed as well.
+reraise_redacted(Class, Reason, Stack, Msg, State) ->
+    Secrets = wallet_secrets(Msg, State),
+    erlang:raise(Class,
+                 beamchain_log_redact:scrub(
+                   beamchain_log_redact:reason(Reason), Secrets),
+                 beamchain_log_redact:scrub(
+                   beamchain_log_redact:stack(Stack), Secrets)).
+
+wallet_secrets(Msg, State) ->
+    FromState = case State of
+                    #wallet_state{seed = Seed, passphrase = Pass,
+                                  master_key = MK, mnemonic = Words} ->
+                        Priv = case MK of
+                                   #hd_key{private_key = P} -> P;
+                                   _ -> undefined
+                               end,
+                        Phrase = case Words of
+                                     [_ | _] -> iolist_to_binary(
+                                                  lists:join(<<" ">>, Words));
+                                     _ -> undefined
+                                 end,
+                        [Seed, Pass, Priv, Phrase];
+                    _ ->
+                        []
+                end,
+    FromMsg = case redact_message(Msg) =:= Msg of
+                  true  -> [];
+                  false -> beamchain_log_redact:secrets_in(
+                             tuple_to_list_safe(Msg))
+              end,
+    [S || S <- FromState ++ FromMsg, is_binary(S), byte_size(S) > 0].
+
+tuple_to_list_safe(T) when is_tuple(T) -> tl(tuple_to_list(T));
+tuple_to_list_safe(_) -> [].
+
+do_handle_call({create, Seed, Passphrase}, _From, State) ->
     MasterKey = master_from_seed(Seed),
     WalletDir = wallet_dir(State#wallet_state.network),
     ok = filelib:ensure_dir(WalletDir ++ "/"),
@@ -671,7 +736,7 @@ handle_call({create, Seed, Passphrase}, _From, State) ->
     ok = save_wallet(NewState),
     {reply, {ok, Seed}, NewState};
 
-handle_call({create_bip39, Seed, Mnemonic, Passphrase}, _From, State) ->
+do_handle_call({create_bip39, Seed, Mnemonic, Passphrase}, _From, State) ->
     %% BIP-39 path: identical to {create,_,_} except we also remember
     %% the mnemonic in state for in-memory export. The seed is what
     %% drives BIP-32 master-key derivation.
@@ -703,7 +768,7 @@ handle_call({create_bip39, Seed, Mnemonic, Passphrase}, _From, State) ->
 %% Named wallets persist to <name>.json (matching wallet_sup's
 %% wallet_file_path/1 so loadwallet finds them); the default wallet keeps
 %% wallet.json.  The legacy {create, Seed, Passphrase} clause is unchanged.
-handle_call({create, Seed, Passphrase, Opts}, _From, State)
+do_handle_call({create, Seed, Passphrase, Opts}, _From, State)
   when is_map(Opts) ->
     Dpk = maps:get(disable_private_keys, Opts, false) =:= true,
     Blank = maps:get(blank, Opts, false) =:= true,
@@ -731,7 +796,7 @@ handle_call({create, Seed, Passphrase, Opts}, _From, State)
     ok = save_wallet(NewState),
     {reply, {ok, Seed}, NewState};
 
-handle_call(getwalletmnemonic, _From, State) ->
+do_handle_call(getwalletmnemonic, _From, State) ->
     case State#wallet_state.mnemonic of
         undefined ->
             {reply, {error, no_mnemonic}, State};
@@ -742,7 +807,7 @@ handle_call(getwalletmnemonic, _From, State) ->
             end
     end;
 
-handle_call({load, FilePath, Passphrase}, _From, State) ->
+do_handle_call({load, FilePath, Passphrase}, _From, State) ->
     case load_wallet_file(FilePath, Passphrase) of
         {ok, WalletData} ->
             NewState = apply_loaded_wallet(WalletData, FilePath, Passphrase,
@@ -759,32 +824,32 @@ handle_call({load, FilePath, Passphrase}, _From, State) ->
 
 %% A disable_private_keys wallet must never hand out key-derived addresses
 %% (Core: "Error: This wallet has no available keys").
-handle_call({get_new_address, _Type}, _From,
+do_handle_call({get_new_address, _Type}, _From,
             #wallet_state{private_keys_enabled = false} = State) ->
     {reply, {error, private_keys_disabled}, State};
-handle_call({get_new_address, _Type}, _From,
+do_handle_call({get_new_address, _Type}, _From,
             #wallet_state{master_key = undefined} = State) ->
     {reply, {error, no_wallet}, State};
-handle_call({get_new_address, Type}, _From, State) ->
+do_handle_call({get_new_address, Type}, _From, State) ->
     {Address, NewState} = generate_address(Type, receive_addr, State),
     ok = save_wallet(NewState),
     {reply, {ok, Address}, NewState};
 
-handle_call({get_change_address, _Type}, _From,
+do_handle_call({get_change_address, _Type}, _From,
             #wallet_state{private_keys_enabled = false} = State) ->
     {reply, {error, private_keys_disabled}, State};
-handle_call({get_change_address, _Type}, _From,
+do_handle_call({get_change_address, _Type}, _From,
             #wallet_state{master_key = undefined} = State) ->
     {reply, {error, no_wallet}, State};
-handle_call({get_change_address, Type}, _From, State) ->
+do_handle_call({get_change_address, Type}, _From, State) ->
     {Address, NewState} = generate_address(Type, change_addr, State),
     ok = save_wallet(NewState),
     {reply, {ok, Address}, NewState};
 
-handle_call(list_addresses, _From, State) ->
+do_handle_call(list_addresses, _From, State) ->
     {reply, {ok, State#wallet_state.addresses}, State};
 
-handle_call(get_balance, _From, State) ->
+do_handle_call(get_balance, _From, State) ->
     %% Core's getbalance counts only spendable coins: confirmed and (for
     %% coinbase) past the 100-confirmation maturity window.  Every entry in
     %% the wallet UTXO table is wallet-owned (only is_wallet_script outputs are
@@ -802,10 +867,10 @@ handle_call(get_balance, _From, State) ->
     end,
     {reply, {ok, Balance}, State};
 
-handle_call({get_private_key, _Address}, _From,
+do_handle_call({get_private_key, _Address}, _From,
             #wallet_state{locked = true} = State) ->
     {reply, {error, wallet_locked}, State};
-handle_call({get_private_key, Address}, _From, State) ->
+do_handle_call({get_private_key, Address}, _From, State) ->
     AddrBin = case is_list(Address) of
         true -> list_to_binary(Address);
         false -> Address
@@ -833,7 +898,7 @@ handle_call({get_private_key, Address}, _From, State) ->
             {reply, {error, not_found}, State}
     end;
 
-handle_call(get_wallet_info, _From, State) ->
+do_handle_call(get_wallet_info, _From, State) ->
     Info = #{
         wallet_name => State#wallet_state.wallet_name,
         network    => State#wallet_state.network,
@@ -848,7 +913,7 @@ handle_call(get_wallet_info, _From, State) ->
     },
     {reply, {ok, Info}, State};
 
-handle_call(private_keys_enabled, _From, State) ->
+do_handle_call(private_keys_enabled, _From, State) ->
     {reply, State#wallet_state.private_keys_enabled, State};
 
 %% Real watch-only registration (replaces the import_address/5 stub).
@@ -858,7 +923,7 @@ handle_call(private_keys_enabled, _From, State) ->
 %% present (authoritative — descriptor-derived) with address decoding as
 %% the fallback; reload re-registration is handled by
 %% reregister_address_scripts/2, which understands both.
-handle_call({import_watch_entries, Entries}, _From, State) ->
+do_handle_call({import_watch_entries, Entries}, _From, State) ->
     Network = State#wallet_state.network,
     Existing = State#wallet_state.addresses,
     NewEntries = lists:foldl(fun(Entry, Acc) when is_map(Entry) ->
@@ -899,7 +964,7 @@ handle_call({import_watch_entries, Entries}, _From, State) ->
 
 %% getaddressinfo support: fetch the address-book entry; HD entries gain a
 %% derived <<"pubkey_hex">> when the master key is available.
-handle_call({get_address_entry, AddrBin}, _From, State) ->
+do_handle_call({get_address_entry, AddrBin}, _From, State) ->
     case find_address(AddrBin, State) of
         {ok, AddrInfo} ->
             Enriched = case {maps:get(<<"path">>, AddrInfo, undefined),
@@ -923,18 +988,18 @@ handle_call({get_address_entry, AddrBin}, _From, State) ->
             {reply, not_found, State}
     end;
 
-handle_call(get_keypool_size, _From, State) ->
+do_handle_call(get_keypool_size, _From, State) ->
     %% Return the actual number of addresses in the keypool
     {reply, {ok, length(State#wallet_state.addresses)}, State};
 
 %% Encryption: encryptwallet
-handle_call({encryptwallet, _Passphrase}, _From,
+do_handle_call({encryptwallet, _Passphrase}, _From,
             #wallet_state{seed = undefined} = State) ->
     {reply, {error, no_wallet}, State};
-handle_call({encryptwallet, _Passphrase}, _From,
+do_handle_call({encryptwallet, _Passphrase}, _From,
             #wallet_state{encrypted = true} = State) ->
     {reply, {error, already_encrypted}, State};
-handle_call({encryptwallet, Passphrase}, _From, State) ->
+do_handle_call({encryptwallet, Passphrase}, _From, State) ->
     case do_encrypt_wallet(State, Passphrase) of
         {ok, NewState} ->
             ok = save_wallet(NewState),
@@ -944,13 +1009,13 @@ handle_call({encryptwallet, Passphrase}, _From, State) ->
     end;
 
 %% Encryption: walletpassphrase (unlock)
-handle_call({walletpassphrase, _Passphrase, _Timeout}, _From,
+do_handle_call({walletpassphrase, _Passphrase, _Timeout}, _From,
             #wallet_state{encrypted = false} = State) ->
     {reply, {error, not_encrypted}, State};
-handle_call({walletpassphrase, _Passphrase, _Timeout}, _From,
+do_handle_call({walletpassphrase, _Passphrase, _Timeout}, _From,
             #wallet_state{locked = false} = State) ->
     {reply, {error, already_unlocked}, State};
-handle_call({walletpassphrase, Passphrase, Timeout}, _From, State) ->
+do_handle_call({walletpassphrase, Passphrase, Timeout}, _From, State) ->
     case do_unlock_wallet(State, Passphrase, Timeout) of
         {ok, NewState} ->
             {reply, ok, NewState};
@@ -959,22 +1024,22 @@ handle_call({walletpassphrase, Passphrase, Timeout}, _From, State) ->
     end;
 
 %% Encryption: walletlock
-handle_call(walletlock, _From, #wallet_state{encrypted = false} = State) ->
+do_handle_call(walletlock, _From, #wallet_state{encrypted = false} = State) ->
     {reply, {error, not_encrypted}, State};
-handle_call(walletlock, _From, State) ->
+do_handle_call(walletlock, _From, State) ->
     NewState = do_lock_wallet(State),
     {reply, ok, NewState};
 
 %% Encryption: is_locked
-handle_call(is_locked, _From, State) ->
+do_handle_call(is_locked, _From, State) ->
     {reply, State#wallet_state.locked, State};
 
 %% Coin lock state (lockunspent / listlockunspent).
-handle_call({lock_coin, Txid, Vout}, _From,
+do_handle_call({lock_coin, Txid, Vout}, _From,
             #wallet_state{locked_coins = Set} = State) ->
     NewSet = sets:add_element({Txid, Vout}, Set),
     {reply, ok, State#wallet_state{locked_coins = NewSet}};
-handle_call({unlock_coin, Txid, Vout}, _From,
+do_handle_call({unlock_coin, Txid, Vout}, _From,
             #wallet_state{locked_coins = Set} = State) ->
     Key = {Txid, Vout},
     case sets:is_element(Key, Set) of
@@ -984,16 +1049,16 @@ handle_call({unlock_coin, Txid, Vout}, _From,
         false ->
             {reply, {error, not_locked}, State}
     end;
-handle_call(unlock_all_coins, _From, State) ->
+do_handle_call(unlock_all_coins, _From, State) ->
     {reply, ok, State#wallet_state{locked_coins = sets:new()}};
-handle_call({is_locked_coin, Txid, Vout}, _From,
+do_handle_call({is_locked_coin, Txid, Vout}, _From,
             #wallet_state{locked_coins = Set} = State) ->
     {reply, sets:is_element({Txid, Vout}, Set), State};
-handle_call(list_locked_coins, _From,
+do_handle_call(list_locked_coins, _From,
             #wallet_state{locked_coins = Set} = State) ->
     {reply, sets:to_list(Set), State};
 
-handle_call(_Request, _From, State) ->
+do_handle_call(_Request, _From, State) ->
     {reply, {error, unknown_request}, State}.
 
 %% A block was connected by the chainstate connect-loop (requirement 4).
@@ -1003,7 +1068,7 @@ handle_call(_Request, _From, State) ->
 %% rescans only the gap above this height.  Async (cast) by design — the
 %% chainstate must never block on the wallet during IBD, and we must never
 %% block on it (no gen_server round-trip back into chainstate here).
-handle_cast({block_connected, Height}, State)
+do_handle_cast({block_connected, Height}, State)
   when is_integer(Height) ->
     case Height > State#wallet_state.last_synced_height of
         true ->
@@ -1013,14 +1078,14 @@ handle_cast({block_connected, Height}, State)
         false ->
             {noreply, State}
     end;
-handle_cast(_Msg, State) ->
+do_handle_cast(_Msg, State) ->
     {noreply, State}.
 
 %% Coalesced durable flush fired by the debounce timer after block(s)
 %% connected.  Persists the advanced last_synced_height (and any other
 %% mutated state) to disk crash-safely.  Clearing the ref lets the next
 %% connect re-arm the timer.
-handle_info(flush_wallet, State) ->
+do_handle_info(flush_wallet, State) ->
     NewState = State#wallet_state{flush_timer_ref = undefined},
     _ = save_wallet(NewState),
     {noreply, NewState};
@@ -1031,23 +1096,67 @@ handle_info(flush_wallet, State) ->
 %% the in-memory UTXO/history ledger that does not survive a restart, then
 %% persists the new height.  Best-effort: a failure here logs and leaves
 %% the wallet usable (the user can always rescanblockchain manually).
-handle_info(reconcile_wallet, State) ->
+do_handle_info(reconcile_wallet, State) ->
     NewState = try reconcile_to_tip(State)
                catch Class:Reason:Stack ->
                    logger:warning(
                      "wallet: startup reconcile failed: ~p:~p~n  ~p",
-                     [Class, Reason, Stack]),
+                     [Class, beamchain_log_redact:reason(Reason),
+                      beamchain_log_redact:stack(Stack)]),
                    State
                end,
     {noreply, NewState};
 
-handle_info(wallet_lock, State) ->
+do_handle_info(wallet_lock, State) ->
     %% Auto-lock timer fired
     logger:info("wallet: auto-locking after timeout"),
     NewState = do_lock_wallet(State),
     {noreply, NewState};
-handle_info(_Info, State) ->
+do_handle_info(_Info, State) ->
     {noreply, State}.
+
+%% OTP calls format_status/1 for crash reports, sys:get_status/1 and the
+%% "last message" of a terminating server. Without it the report prints the
+%% whole #wallet_state{} (seed, master key, cached passphrase, mnemonic) and
+%% the request being handled ({walletpassphrase, Passphrase, T}). Core never
+%% logs key material or passphrases.
+format_status(Status) ->
+    maps:map(fun(state, S)   -> redact_state(S);
+                (message, M) -> redact_message(M);
+                (reason, R)  -> beamchain_log_redact:reason(
+                                  beamchain_log_redact:stack(R));
+                (log, L)     -> [redact_message(E) || E <- L];
+                (_, V)       -> V
+             end, Status).
+
+redact_state(#wallet_state{} = S) ->
+    R = fun(undefined) -> undefined; (_) -> redacted end,
+    S#wallet_state{master_key     = R(S#wallet_state.master_key),
+                   seed           = R(S#wallet_state.seed),
+                   passphrase     = R(S#wallet_state.passphrase),
+                   encrypted_seed = R(S#wallet_state.encrypted_seed),
+                   encryption_mac = R(S#wallet_state.encryption_mac),
+                   mnemonic       = R(S#wallet_state.mnemonic)};
+redact_state(Other) ->
+    beamchain_log_redact:reason(Other).
+
+%% Call/cast/info messages that carry a secret keep only their tag; every
+%% other message still goes through the generic redaction (wallet_state and
+%% hd_key records, nested call requests).
+redact_message({Tag, _}) when Tag =:= encryptwallet ->
+    {Tag, redacted};
+redact_message({Tag, _, _}) when Tag =:= walletpassphrase; Tag =:= create;
+                                 Tag =:= load ->
+    {Tag, redacted};
+redact_message({Tag, _, _, _}) when Tag =:= create; Tag =:= create_bip39 ->
+    {Tag, redacted};
+redact_message(T) when is_tuple(T) ->
+    %% sys debug-log entries and {'$gen_call', From, Req} wrappers nest the
+    %% request one level down.
+    beamchain_log_redact:reason(
+      list_to_tuple([redact_message(E) || E <- tuple_to_list(T)]));
+redact_message(Other) ->
+    beamchain_log_redact:reason(Other).
 
 terminate(_Reason, State) ->
     %% Final durable flush on graceful shutdown so the latest
@@ -2068,8 +2177,10 @@ atomic_write_wallet(File, Bytes) ->
     catch
         Class:Reason:Stack ->
             _ = file:delete(Tmp),
+            %% Stack frames can carry the serialized wallet (seed included).
             logger:warning("wallet: durable write of ~s failed: ~p:~p~n  ~p",
-                           [File, Class, Reason, Stack]),
+                           [File, Class, beamchain_log_redact:reason(Reason),
+                            beamchain_log_redact:stack(Stack)]),
             ok
     end.
 
