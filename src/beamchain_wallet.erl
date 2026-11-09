@@ -938,6 +938,7 @@ handle_call({encryptwallet, Passphrase}, _From, State) ->
     case do_encrypt_wallet(State, Passphrase) of
         {ok, NewState} ->
             ok = save_wallet(NewState),
+            ok = rewrite_backup_after_encrypt(NewState#wallet_state.wallet_file),
             {reply, ok, NewState};
         {error, Reason} ->
             {reply, {error, Reason}, State}
@@ -2070,6 +2071,42 @@ atomic_write_wallet(File, Bytes) ->
             _ = file:delete(Tmp),
             logger:warning("wallet: durable write of ~s failed: ~p:~p~n  ~p",
                            [File, Class, Reason, Stack]),
+            ok
+    end.
+
+%% @doc Replace <file>.bak with the just-written encrypted wallet.
+%%
+%% atomic_write_wallet/2 copies the previous file to <file>.bak before every
+%% save, so the save that encryptwallet triggers rotated the PLAINTEXT
+%% wallet (with its "seed" field) into <file>.bak, where it stayed readable
+%% next to the encrypted file. Core finishes CWallet::EncryptWallet with
+%% GetDatabase().Rewrite() for the same reason: no unencrypted key material
+%% may survive in the wallet's files. We make the backup a copy of the
+%% encrypted file (so it stays a valid recovery copy for load_wallet_file),
+%% written to a temp path, fsynced and renamed over the old backup. If that
+%% fails we delete the backup rather than leave the plaintext one behind.
+rewrite_backup_after_encrypt(undefined) ->
+    ok;
+rewrite_backup_after_encrypt(File) ->
+    Bak = File ++ ".bak",
+    BakTmp = Bak ++ ".tmp",
+    try
+        case file:read_file(File) of
+            {ok, Bytes} ->
+                ok = write_and_sync(BakTmp, Bytes),
+                ok = file:rename(BakTmp, Bak),
+                _ = fsync_dir(filename:dirname(File)),
+                ok;
+            {error, enoent} ->
+                _ = file:delete(Bak),
+                ok
+        end
+    catch
+        Class:Reason ->
+            _ = file:delete(BakTmp),
+            _ = file:delete(Bak),
+            logger:warning("wallet: rewriting ~s after encryptwallet failed "
+                           "(~p:~p); backup deleted", [Bak, Class, Reason]),
             ok
     end.
 
