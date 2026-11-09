@@ -841,7 +841,7 @@ committed_bad_structure_marks_failed_test_() ->
     {setup, fun mb_setup/0, fun mb_teardown/1,
      fun(Fx) -> ?_test(committed_bad_structure_marks_failed(Fx)) end}.
 
-committed_bad_structure_marks_failed({Tab, _Honest, _}) ->
+committed_bad_structure_marks_failed(_Fx) ->
     NoCb = [mb_spend()],
     BadHdr = mb_header_for(NoCb),
     BadHash = beamchain_serialize:block_hash(BadHdr),
@@ -861,5 +861,79 @@ committed_bad_structure_marks_failed({Tab, _Honest, _}) ->
     ?assertEqual(1, meck:num_calls(beamchain_peer_manager, misbehaving,
                                    [X, '_', '_'])),
     ?assertEqual(false, meck:called(beamchain_chainstate, connect_block, '_')),
-    _ = Tab,
+    X ! stop.
+
+%%% -------------------------------------------------------------------
+%%% Same split through the witness: witness bytes are not committed by the
+%%% txid merkle root, but check_block's bad_blk_weight (a verdict) counts
+%%% them. Core runs CheckWitnessMalleation (BLOCK_MUTATED) before
+%%% bad-blk-weight (validation.cpp:4169 then 4180), so junk witness data
+%%% that pushes an honest block over the weight limit must not mark it.
+%%% -------------------------------------------------------------------
+
+mb_big_witness() -> binary:copy(<<0>>, 4000000).
+
+junk_witness_overweight_does_not_mark_header_failed_test_() ->
+    {foreach, fun mb_setup/0, fun mb_teardown/1,
+     [fun(Fx) ->
+          {"honest txids + junk witness pushing weight over the limit: "
+           "not FAILED, block later connects",
+           fun() -> junk_witness_overweight(Fx) end}
+      end]}.
+
+junk_witness_overweight({_Tab, Honest, _HonestHash} = Fx) ->
+    [Cb] = Honest#block.transactions,
+    [In] = Cb#transaction.inputs,
+    CbJunk = Cb#transaction{inputs = [In#tx_in{witness = [mb_big_witness()]}]},
+    Junk = Honest#block{transactions = [CbJunk]},
+    %% Same txids, so the merkle root still matches; only the weight fails.
+    ?assertEqual({error, bad_blk_weight},
+                 beamchain_validation:check_block(Junk, mb_params())),
+    mutated_body_does_not_mark_header_failed(Fx, [CbJunk]).
+
+%% Positive control: the witness IS committed (valid BIP-141 commitment over
+%% the heavy witness) and the block is still too heavy -- a verdict about
+%% this block: marked FAILED, sender punished, not connected.
+committed_witness_overweight_marks_failed_test_() ->
+    {setup, fun mb_setup/0, fun mb_teardown/1,
+     fun(Fx) -> ?_test(committed_witness_overweight_marks_failed(Fx)) end}.
+
+committed_witness_overweight_marks_failed(_Fx) ->
+    Spend0 = mb_spend(),
+    [SIn] = Spend0#transaction.inputs,
+    Spend = Spend0#transaction{inputs = [SIn#tx_in{witness = [mb_big_witness()]}]},
+    Nonce = <<0:256>>,
+    Commitment = beamchain_serialize:compute_witness_commitment(
+                   [<<0:256>>, beamchain_serialize:wtx_hash(Spend)], Nonce),
+    Cb0 = mb_coinbase(0),
+    [CIn] = Cb0#transaction.inputs,
+    Cb = Cb0#transaction{
+           inputs = [CIn#tx_in{witness = [Nonce]}],
+           outputs = Cb0#transaction.outputs ++
+               [#tx_out{value = 0,
+                        script_pubkey = <<16#6a, 16#24, 16#aa, 16#21, 16#a9,
+                                          16#ed, Commitment/binary>>}]},
+    Txs = [Cb, Spend],
+    BadHdr = mb_header_for(Txs),
+    BadHash = beamchain_serialize:block_hash(BadHdr),
+    Bad = #block{header = BadHdr, transactions = Txs},
+    ?assertEqual(ok, beamchain_validation:check_witness_malleation(
+                       Bad, ?MB_HEIGHT, mb_params())),
+    ?assertEqual({error, bad_blk_weight},
+                 beamchain_validation:check_block(Bad, mb_params())),
+    ok = meck:expect(beamchain_db, get_block_index,
+        fun(H) -> {ok, #{hash => case H of ?MB_HEIGHT -> BadHash;
+                                           _ -> <<H:256>> end,
+                         header => BadHdr, chainwork => H, n_tx => 2}}
+        end),
+    X = spawn(fun() -> receive stop -> ok end end),
+    {noreply, S1} = beamchain_block_sync:handle_info(continue_validation,
+                                                     mb_state(X)),
+    ?assertEqual([BadHash], collect_getdata()),
+    {noreply, _S2} = beamchain_block_sync:handle_cast({block, X, Bad}, S1),
+    ?assertEqual(true, meck:called(beamchain_chainstate, invalid_block_found,
+                                   [BadHash])),
+    ?assertEqual(1, meck:num_calls(beamchain_peer_manager, misbehaving,
+                                   [X, '_', '_'])),
+    ?assertEqual(false, meck:called(beamchain_chainstate, connect_block, '_')),
     X ! stop.
