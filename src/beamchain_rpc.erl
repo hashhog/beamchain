@@ -132,6 +132,9 @@
 %% RPC dispatcher path directly.
 -export([rpc_bumpfee/2, rpc_psbtbumpfee/2,
          bumpfee_ceil_num/1, bumpfee_replace_change/3]).
+%% Test-only export — Basic-auth check, so eunit can authenticate a request
+%% map against the credentials setup_auth/0 installed, without a listener.
+-export([check_auth/1]).
 -endif.
 
 %% walletprocesspsbt (W118 BUG-5, FIX-63) — exported unconditionally so
@@ -730,10 +733,16 @@ setup_auth() ->
             New
     end,
     ets:insert(?RPC_AUTH_TABLE, {cookie, Cookie}),
-    %% Optional rpcuser/rpcpassword from config
+    %% Optional rpcuser/rpcpassword from config. An empty rpcpassword is
+    %% unset, as in Core's InitRPCAuthentication (httprpc.cpp:
+    %% `if (gArgs.GetArg("-rpcpassword", "") == "")` → cookie only): a
+    %% blank `rpcpassword=` line must not install `rpcuser:` with an empty
+    %% password as a working credential.
     case {beamchain_config:get(rpcuser), beamchain_config:get(rpcpassword)} of
         {undefined, _} -> ok;
         {_, undefined} -> ok;
+        {_, ""} -> ok;
+        {_, <<>>} -> ok;
         {U, P} ->
             ets:insert(?RPC_AUTH_TABLE,
                 {rpc_credentials, to_bin(U), to_bin(P)})
