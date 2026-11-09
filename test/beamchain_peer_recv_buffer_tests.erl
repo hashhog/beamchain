@@ -186,3 +186,36 @@ v2_trickled_packet() ->
     {ok, Peer2} = beamchain_peer:buffer_recv(binary:part(CT, byte_size(CT) - 1, 1),
                                              Peer1),
     ?assertEqual(3, beamchain_peer:recv_need(Peer2)).
+
+%% No frame is lost or held back by the size gate: two complete frames and
+%% the start of a third arrive in one segment, the rest of the third in a
+%% second.  `block` before the handshake is ignored (Core's pre-verack
+%% rule), so each dispatched frame simply leaves the buffer.
+v1_frames_split_across_segments_all_dispatch_test() ->
+    F = fun(Len) ->
+            Payload = binary:copy(<<7>>, Len),
+            <<Check:4/binary, _/binary>> = beamchain_crypto:hash256(Payload),
+            <<?MAGIC/binary, "block", 0:56, Len:32/little, Check/binary,
+              Payload/binary>>
+        end,
+    F1 = F(100), F2 = F(0), F3 = F(5000),
+    Cut = 30,
+    <<F3a:Cut/binary, F3b/binary>> = F3,
+    P0 = beamchain_peer:make_test_peer(v1, undefined, <<>>),
+    {ok, P1} = beamchain_peer:buffer_recv(<<F1/binary, F2/binary, F3a/binary>>, P0),
+    %% F1 and F2 consumed; the gate now waits for all of F3.
+    ?assertEqual(byte_size(F3), beamchain_peer:recv_need(P1)),
+    %% Deliver F3 in pieces below the gate, then the last byte.
+    Body = binary:part(F3b, 0, byte_size(F3b) - 1),
+    P2 = lists:foldl(fun(Seg, P) ->
+                         {ok, Q} = beamchain_peer:buffer_recv(Seg, P),
+                         ?assertEqual(byte_size(F3), beamchain_peer:recv_need(Q)),
+                         Q
+                     end, P1, segments(Body, 700)),
+    {ok, P3} = beamchain_peer:buffer_recv(binary:part(F3b, byte_size(F3b) - 1, 1), P2),
+    %% F3 consumed: buffer empty, the gate is back to a bare header.
+    ?assertEqual(24, beamchain_peer:recv_need(P3)),
+    %% A frame with a bad checksum is still reported once complete.
+    Bad = <<?MAGIC/binary, "block", 0:56, 4:32/little, 0:32, 1:32>>,
+    ?assertMatch({stop, {shutdown, {frame_error, bad_checksum}}},
+                 beamchain_peer:buffer_recv(Bad, P0)).
