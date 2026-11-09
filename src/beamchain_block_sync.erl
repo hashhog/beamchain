@@ -2226,6 +2226,27 @@ do_handle_cmpctblock(Peer, CmpctBlock, BlockHash, Height, State) ->
                                  "at height ~B from mempool", [Height]),
                     handle_block_received(Peer, Block, State);
 
+                {partial, _PartialState}
+                  when is_map_key(BlockHash, State#state.pending_compact)
+                       andalso element(3, map_get(BlockHash,
+                                                  State#state.pending_compact))
+                               =/= Peer ->
+                    %% We are already waiting on another peer's blocktxn
+                    %% for this block. Do not overwrite that entry: the
+                    %% requester binding in handle_blocktxn_received would
+                    %% otherwise move to whoever sent the latest cmpctblock,
+                    %% and a stranger could then tear down the asked peer's
+                    %% reconstruction with a bad blocktxn. Core keeps one
+                    %% partial block per peer and never replaces another
+                    %% peer's (mapBlocksInFlight). The block stays in flight,
+                    %% so stall handling still covers a silent requester.
+                    logger:debug("block_sync: cmpctblock ~s from ~p while a "
+                                 "reconstruction from ~p is pending; "
+                                 "keeping the pending one",
+                                 [hash_hex(BlockHash), Peer,
+                                  element(3, maps:get(BlockHash,
+                                      State#state.pending_compact))]),
+                    State;
                 {partial, PartialState} ->
                     %% Need to request missing transactions
                     MissingIdxs = beamchain_compact_block:get_missing_indices(
@@ -2272,10 +2293,25 @@ do_handle_cmpctblock(Peer, CmpctBlock, BlockHash, Height, State) ->
     end.
 
 %% Handle blocktxn response (missing transactions for a compact block)
+%%
+%% Only the peer we sent getblocktxn to may answer it. Core keys the partial
+%% block per peer and drops a BLOCKTXN unless mapBlocksInFlight holds this
+%% hash for THIS node with a partialBlock (requested_block_from_this_peer,
+%% net_processing.cpp ProcessMessage BLOCKTXN) -- no misbehavior score. A
+%% blocktxn from anyone else must not reach fill_block: a bad one would score
+%% the sender, drop the asked peer's pending reconstruction and re-request
+%% the block from the stranger, so the asked peer's real answer is then
+%% discarded as unexpected.
 handle_blocktxn_received(Peer, BlockTxn, State) ->
     #{block_hash := BlockHash, transactions := Txns} = BlockTxn,
 
     case maps:find(BlockHash, State#state.pending_compact) of
+        {ok, {_PartialState, _RequestedAt, RequestPeer}}
+          when RequestPeer =/= Peer ->
+            logger:debug("block_sync: blocktxn for ~s from ~p, which we did "
+                         "not ask (asked ~p); ignoring",
+                         [hash_hex(BlockHash), Peer, RequestPeer]),
+            State;
         {ok, {PartialState, _RequestedAt, _RequestPeer}} ->
             %% Try to fill in the block
             case beamchain_compact_block:fill_block(PartialState, Txns) of
