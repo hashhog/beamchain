@@ -841,16 +841,20 @@ buffer_recv(NewBytes, #peer_data{buffer = Buf, recv_need = Need} = Data) ->
 %% computed after dispatch_buffered/1 has consumed every complete frame.
 %% It never overstates: the decoders return `incomplete` for any smaller
 %% buffer, so skipping them below it changes no outcome.  0 means
-%% "always dispatch" (pre-classification and the v2 handshake phases,
-%% whose buffers are small and bounded).
+%% "always dispatch": pre-classification (acts at 16 bytes) and the v2
+%% recv_pubkey (64 bytes) and recv_garbterm (at most 4095 + 16 bytes,
+%% moved out of the buffer as it is scanned) phases.
 recv_need(#peer_data{v2_phase = v1, buffer = Buffer}) ->
     case Buffer of
         %% magic(4) command(12) length(4) checksum(4) payload(Len)
         <<_:16/binary, Len:32/little, _/binary>> -> 24 + Len;
         _ -> 24
     end;
-recv_need(#peer_data{v2_phase = ready, buffer = Buffer,
-                     v2_cipher = Cipher, v2_pending_len = Pending}) ->
+recv_need(#peer_data{v2_phase = Phase, buffer = Buffer,
+                     v2_cipher = Cipher, v2_pending_len = Pending})
+  when Phase =:= ready; Phase =:= drain_decoy ->
+    %% drain_decoy reads packets with the same extract_v2_packet/1 as
+    %% ready, and a decoy may be up to MAX_PROTOCOL_MESSAGE_LENGTH.
     LenLen = beamchain_transport_v2:length_field_len(),
     HdrLen = beamchain_transport_v2:header_len(),
     TagLen = beamchain_transport_v2:tag_len(),
@@ -1412,7 +1416,7 @@ make_test_v2_peer(Cipher, Buffer) ->
         handler         = self()
     }.
 
-%% Like make_test_v2_peer/2 but pinned to a receive phase (v1 | ready),
+%% Like make_test_v2_peer/2 but pinned to a phase (v1 | ready | drain_decoy),
 %% for driving buffer_recv/2 and recv_need/1 in unit tests.
 make_test_peer(Phase, Cipher, Buffer) ->
     (make_test_v2_peer(Cipher, Buffer))#peer_data{v2_phase = Phase}.

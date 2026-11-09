@@ -7,7 +7,7 @@
 %%% the frame decoder over the whole buffer.  The decoder matches the
 %%% buffer, and appending to a binary that has been matched copies it, so
 %%% every segment recopied everything received so far: O(size^2).  Measured
-%%% on OTP 27 (staged-patches/cffix-beamchain-recv-buffer-quadratic): one
+%%% on OTP 27 with scripts/recv_bench/recv_bench.erl (output beside it): one
 %%% 4 MB frame in 1460-byte segments cost ~3 s of copying in the peer
 %%% process (536-byte segments: ~7 s), against ~5 ms when the buffer is not
 %%% re-parsed.
@@ -222,3 +222,35 @@ v1_frames_split_across_segments_all_dispatch_test() ->
     Bad = <<?MAGIC/binary, "block", 0:56, 4:32/little, 0:32, 1:32>>,
     ?assertMatch({stop, {shutdown, {frame_error, bad_checksum}}},
                  beamchain_peer:buffer_recv(Bad, P0)).
+
+%% The BIP-324 decoy phase reads packets with the same decoder as `ready`,
+%% and a decoy may be up to 4 MB, so it is gated the same way: a peer that
+%% has sent its pubkey and garbage terminator cannot trickle a 4 MB decoy
+%% at quadratic cost either.
+v2_trickled_decoy_is_linear_and_consumed_test_() ->
+    {timeout, 60, fun v2_trickled_decoy/0}.
+
+v2_trickled_decoy() ->
+    {A1, B1} = v2_cipher_pair(),
+    %% Ignore bit set: a decoy.  AAD <<>> matches make_test_peer's
+    %% v2_next_aad (empty garbage).
+    {ok, CT, _} = beamchain_transport_v2:encrypt(
+                    A1, crypto:strong_rand_bytes(?BIG), <<>>, true),
+    Partial = binary:part(CT, 0, byte_size(CT) - 1),
+    Segs = [binary:copy(Seg) || Seg <- segments(Partial, ?SEG)],
+    Peer0 = beamchain_peer:make_test_peer(drain_decoy, B1, <<>>),
+    {Us, Peer1} = timer:tc(fun() ->
+        lists:foldl(fun(Seg, P) ->
+                        {ok, P2} = beamchain_peer:buffer_recv(Seg, P),
+                        P2
+                    end, Peer0, Segs)
+    end),
+    ?assert(Us < ?LINEAR_BUDGET_US,
+            lists:flatten(io_lib:format("v2 decoy buffering took ~B ms",
+                                        [Us div 1000]))),
+    ?assertEqual(byte_size(CT), beamchain_peer:recv_need(Peer1)),
+    %% The last byte completes the decoy: decrypted, discarded, consumed;
+    %% still waiting for the version packet.
+    {ok, Peer2} = beamchain_peer:buffer_recv(
+                    binary:part(CT, byte_size(CT) - 1, 1), Peer1),
+    ?assertEqual(3, beamchain_peer:recv_need(Peer2)).
