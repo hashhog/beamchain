@@ -468,10 +468,10 @@ g28_merkleblock_p2p_absent() ->
         _:_                   -> missing
     end,
     ?assertEqual(missing, Result),
-    %% command_atom decoded from <<"merkleblock">> falls through to
-    %% binary_to_atom(Other, utf8) — confirm by encoding to the catch-all
-    %% behaviour: the result atom *is* merkleblock but no handler exists.
-    ?assertEqual(merkleblock,
+    %% command_atom decoded from <<"merkleblock">> falls through to the
+    %% unknown-command catch-all: no handler exists, so it stays an
+    %% ignorable {unknown, Bin} (never interned as an atom).
+    ?assertEqual({unknown, <<"merkleblock">>},
                  beamchain_p2p_msg:command_atom(<<"merkleblock">>)),
     %% MSG_FILTERED_BLOCK inv type exists (= 3) but no getdata branch
     %% handles it — confirmed by source inspection: handle_getdata_msg in

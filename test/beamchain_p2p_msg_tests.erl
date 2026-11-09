@@ -59,8 +59,64 @@ command_roundtrip_test_() ->
                             beamchain_p2p_msg:command_name(Cmd)))
      || Cmd <- Commands].
 
+%% An unknown command name stays a binary: it must never be interned as an
+%% atom (the atom table is finite and not garbage-collected).
 unknown_command_test() ->
-    ?assertEqual(foobar, beamchain_p2p_msg:command_atom(<<"foobar">>)).
+    ?assertEqual({unknown, <<"foobar">>},
+                 beamchain_p2p_msg:command_atom(<<"foobar">>)).
+
+%% Core keeps the message type as a std::string and ignores unknown ones
+%% (net_processing.cpp "Ignore unknown message types for extensibility").
+%% Before this fix command_atom/1 fell through to binary_to_atom/2, so every
+%% distinct 12-byte command a peer sent - before the handshake gate even ran
+%% - added an atom; ~1.05M of them abort the VM (system_limit).
+unknown_command_does_not_intern_atom_test() ->
+    Magic = ?MAINNET_MAGIC,
+    Payload = <<"x">>,
+    <<Check:4/binary, _/binary>> = beamchain_serialize:hash256(Payload),
+    Frame = fun(Cmd) ->
+                <<Magic:4/binary, Cmd:12/binary, 1:32/little,
+                  Check:4/binary, Payload/binary>>
+            end,
+    %% 12 printable bytes, unique per run so no earlier run left them interned.
+    Tag = integer_to_binary(erlang:unique_integer([positive]) rem 100000),
+    Cmds = [iolist_to_binary(io_lib:format("~5..0s~7..0B", [Tag, N]))
+            || N <- lists:seq(1, 1000)],
+    %% Precondition: none of these names is an atom yet, so a zero delta
+    %% below cannot come from the atoms already existing.
+    lists:foreach(
+      fun(C) ->
+          ?assertError(badarg, binary_to_existing_atom(C, utf8))
+      end, Cmds),
+    %% Warm up: load every module decode_msg touches before sampling.
+    {ok, ping, _, <<>>} =
+        beamchain_p2p_msg:decode_msg(beamchain_p2p_msg:encode_msg(Magic, ping, Payload)),
+    Before = erlang:system_info(atom_count),
+    Results = [beamchain_p2p_msg:decode_msg(Frame(C)) || C <- Cmds],
+    After = erlang:system_info(atom_count),
+    ?assertEqual(0, After - Before),
+    lists:foreach(
+      fun({C, R}) -> ?assertEqual({ok, {unknown, C}, Payload, <<>>}, R) end,
+      lists:zip(Cmds, Results)).
+
+%% The BIP-324 long-form path (beamchain_peer:process_buffer_v2/1) maps its
+%% 12-byte name through the same command_atom/1.
+v2_long_form_unknown_command_test() ->
+    {ok, CmdBin, <<"p">>} =
+        beamchain_v2_msg:decode_contents(<<0, "zzzzzzzzzzzz", "p">>),
+    ?assertEqual({unknown, <<"zzzzzzzzzzzz">>},
+                 beamchain_p2p_msg:command_atom(CmdBin)).
+
+%% A known name followed by junk after the NUL padding is not that command
+%% (Core's IsMessageTypeValid rejects it); it decodes as an ignorable unknown.
+nul_embedded_command_is_unknown_test() ->
+    Magic = ?MAINNET_MAGIC,
+    Payload = <<>>,
+    <<Check:4/binary, _/binary>> = beamchain_serialize:hash256(Payload),
+    Cmd = <<"ping", 0, "junk", 0, 0, 0, 0>>,
+    Msg = <<Magic:4/binary, Cmd:12/binary, 0:32/little, Check:4/binary>>,
+    ?assertMatch({ok, {unknown, _}, <<>>, <<>>},
+                 beamchain_p2p_msg:decode_msg(Msg)).
 
 %%% ===================================================================
 %%% Version message tests
