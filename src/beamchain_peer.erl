@@ -27,7 +27,7 @@
 %% Advertised service bitset (single source of truth for both the wire
 %% version message and getnetworkinfo localservices).
 -export([advertised_services/0]).
--export([serve_request/3, send_timeout_opts/0]).
+-export([serve_request/3, send_timeout_opts/0, queue_getdata/2]).
 
 %% gen_statem callbacks
 -export([callback_mode/0, init/1, terminate/3]).
@@ -59,6 +59,10 @@
 %% A blocked send (peer not reading, kernel + port buffers full) gives up
 %% after this long; the socket is closed and the peer process stops.
 -define(PEER_SEND_TIMEOUT_MS, 30000).
+%% Retry interval while getdata serving is paused on a full send queue.
+-define(GETDATA_PAUSE_RETRY_MS, 10).
+%% Largest notfound batch held before it is sent.
+-define(GETDATA_NOTFOUND_BATCH, 1000).
 
 -define(BAN_SCORE, 100).
 
@@ -200,7 +204,17 @@
     %% v2 (initiator).  Set in init/1 from the address-cache + env-var
     %% gate; consumed in connecting → handshaking to drive the initiator
     %% state machine instead of the v1 send-version path.
-    v2_initiator = false        :: boolean()
+    v2_initiator = false        :: boolean(),
+    %% Pending getdata items, served one per event (Core
+    %% Peer::m_getdata_requests, drained by ProcessGetData).  A getdata is
+    %% decoded into this queue instead of being materialised as one reply
+    %% per item in the mailbox; getdata_paused_since is set while the
+    %% socket's send queue is non-empty (Core fPauseSend).
+    getdata_queue = queue:new() :: queue:queue(),
+    getdata_notfound = []       :: [map()],
+    getdata_notfound_n = 0      :: non_neg_integer(),
+    getdata_serving = false     :: boolean(),
+    getdata_paused_since = undefined :: undefined | integer()
 }).
 
 %%% -------------------------------------------------------------------
@@ -262,6 +276,16 @@ send_message(Pid, {Command, Payload}) ->
 -spec serve_request(pid(), atom(), binary()) -> ok.
 serve_request(Pid, Command, Payload) ->
     gen_statem:cast(Pid, {serve, Command, Payload}).
+
+%% @doc Queue decoded getdata items on this peer.  They are served one per
+%% event in the peer's own process (serve_getdata_next), never all at once:
+%% Core ProcessGetData serves one item per pass and stops while the send
+%% buffer is full (fPauseSend), keeping the rest in m_getdata_requests.
+-spec queue_getdata(pid(), [map()]) -> ok.
+queue_getdata(_Pid, []) ->
+    ok;
+queue_getdata(Pid, Items) when is_list(Items) ->
+    gen_statem:cast(Pid, {queue_getdata, Items}).
 
 %% @doc Socket send options: a send that cannot make progress for
 %% peer_send_timeout_ms (default 30 s) fails with {error, timeout} and the
@@ -738,6 +762,12 @@ ready(cast, {serve, Command, Payload}, Data) ->
                            [Data#peer_data.address, Command, Class, Why])
     end,
     keep_state_and_data;
+
+ready(cast, {queue_getdata, Items}, Data) ->
+    {keep_state, enqueue_getdata(Items, Data)};
+
+ready(info, serve_getdata_next, Data) ->
+    {keep_state, serve_getdata_next(Data#peer_data{getdata_serving = false})};
 
 ready(cast, disconnect, Data) ->
     Data#peer_data.handler ! {peer_disconnected, self(), requested},
@@ -2089,6 +2119,113 @@ maybe_stop_on_send_timeout(timeout, Data) ->
     exit({shutdown, send_timeout});
 maybe_stop_on_send_timeout(_Reason, Data) ->
     Data.
+
+%%% ===================================================================
+%%% Internal: incremental getdata serving
+%%% ===================================================================
+
+%% Append to the pending queue (capped at MAX_INV_SIZE items: a peer cannot
+%% park more than one getdata's worth of work here; Core instead stops
+%% reading that peer's socket while m_getdata_requests is non-empty) and
+%% kick the server if it is idle.
+enqueue_getdata(Items, #peer_data{getdata_queue = Q0} = Data) ->
+    Room = max(0, ?MAX_INV_SIZE - queue:len(Q0)),
+    Kept = lists:sublist(Items, Room),
+    case length(Items) - length(Kept) of
+        0 -> ok;
+        Dropped ->
+            logger:debug("peer ~p: getdata queue full, dropped ~p items",
+                         [Data#peer_data.address, Dropped])
+    end,
+    Q = lists:foldl(fun queue:in/2, Q0, Kept),
+    kick_getdata(Data#peer_data{getdata_queue = Q}).
+
+kick_getdata(#peer_data{getdata_serving = true} = Data) ->
+    Data;
+kick_getdata(Data) ->
+    self() ! serve_getdata_next,
+    Data#peer_data{getdata_serving = true}.
+
+%% Serve ONE queued item, then re-post serve_getdata_next to the back of
+%% the mailbox so the reply (a {send, ...} cast to self, already queued
+%% ahead of it) is written first and every other message interleaves.
+%% The serve slot is taken per item inside serve_getdata_item/2, so other
+%% peers are served between our items.
+serve_getdata_next(#peer_data{getdata_queue = Q} = Data) ->
+    case queue:out(Q) of
+        {empty, _} ->
+            flush_getdata_notfound(Data#peer_data{getdata_paused_since = undefined});
+        {{value, Item}, Q2} ->
+            case send_pending(Data) of
+                0 ->
+                    NF = serve_one_getdata(Item, Data),
+                    Data2 = Data#peer_data{
+                              getdata_queue = Q2,
+                              getdata_notfound = NF ++
+                                  Data#peer_data.getdata_notfound,
+                              getdata_notfound_n = length(NF) +
+                                  Data#peer_data.getdata_notfound_n,
+                              getdata_paused_since = undefined},
+                    kick_getdata(maybe_flush_getdata_notfound(Data2));
+                _ ->
+                    pause_getdata(Data)
+            end
+    end.
+
+serve_one_getdata(Item, Data) ->
+    Self = self(),
+    try beamchain_peer_manager:serve_getdata_item(Self, Item) of
+        ok -> [];
+        {notfound, NF} -> [NF]
+    catch
+        Class:Why ->
+            logger:warning("peer ~p: serving getdata item failed: ~p:~p",
+                           [Data#peer_data.address, Class, Why]),
+            []
+    end.
+
+%% Send queue non-empty (Core fPauseSend): retry shortly without reading
+%% the next block.  A peer that stays unread for the send timeout is
+%% dropped, as a blocked gen_tcp:send would have been.
+pause_getdata(#peer_data{getdata_paused_since = Since0} = Data) ->
+    Now = erlang:monotonic_time(millisecond),
+    Since = case Since0 of undefined -> Now; _ -> Since0 end,
+    Limit = proplists:get_value(send_timeout, send_timeout_opts()),
+    case Now - Since >= Limit of
+        true ->
+            maybe_stop_on_send_timeout(timeout, Data);
+        false ->
+            erlang:send_after(?GETDATA_PAUSE_RETRY_MS, self(),
+                              serve_getdata_next),
+            Data#peer_data{getdata_serving = true,
+                           getdata_paused_since = Since}
+    end.
+
+%% notfound items are batched and sent when the queue drains, or once a
+%% batch reaches GETDATA_NOTFOUND_BATCH so a peer that keeps the queue
+%% busy cannot grow the batch without bound.
+maybe_flush_getdata_notfound(#peer_data{getdata_notfound_n = N} = Data)
+  when N >= ?GETDATA_NOTFOUND_BATCH ->
+    flush_getdata_notfound(Data);
+maybe_flush_getdata_notfound(Data) ->
+    Data.
+
+flush_getdata_notfound(#peer_data{getdata_notfound = []} = Data) ->
+    Data;
+flush_getdata_notfound(#peer_data{getdata_notfound = NF} = Data) ->
+    do_send_msg(notfound, #{items => lists:reverse(NF)},
+                Data#peer_data{getdata_notfound = [],
+                               getdata_notfound_n = 0}).
+
+%% Bytes queued in the inet driver for this socket and not yet accepted
+%% by the kernel.  Non-zero means the kernel send buffer is full.
+send_pending(#peer_data{socket = undefined}) ->
+    0;
+send_pending(#peer_data{socket = Socket}) ->
+    case catch inet:getstat(Socket, [send_pend]) of
+        {ok, [{send_pend, N}]} -> N;
+        _ -> 0
+    end.
 
 %%% ===================================================================
 %%% Internal: Helpers

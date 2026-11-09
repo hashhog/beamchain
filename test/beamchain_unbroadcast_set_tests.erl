@@ -77,7 +77,12 @@ getdata_clears_unbroadcast() ->
     TxidA = beamchain_serialize:tx_hash(A),
     Payload = beamchain_p2p_msg:encode_payload(getdata,
         #{items => [#{type => ?MSG_WITNESS_TX, hash => TxidA}]}),
+    %% handle_getdata_msg hands the items to the peer's queue; the peer then
+    %% serves each one with serve_getdata_item/2 (here: this process).
     beamchain_peer_manager:handle_getdata_msg(self(), Payload),
+    Items = receive {'$gen_cast', {queue_getdata, Is}} -> Is
+            after 5000 -> error(no_queue_getdata) end,
+    [beamchain_peer_manager:serve_getdata_item(self(), I) || I <- Items],
     ?assertEqual(false, maps:get(<<"unbroadcast">>,
         rpc(<<"getmempoolentry">>, [hex_txid(A)]))),
     ?assertEqual(true, maps:get(<<"unbroadcast">>,

@@ -94,7 +94,7 @@
 -export([getdata_tx_msg/4, getdata_block_msg/2, getdata_cmpct_msg/3,
          handle_getdata_msg/2]).
 %% Data requests are served in the requesting peer's process (BC-S).
--export([serve_peer_request/3]).
+-export([serve_peer_request/3, serve_getdata_item/2, getdata_items/1]).
 
 %% Exposed for testing (BIP-130 announce branching)
 -export([pick_announce_msg/3]).
@@ -2631,88 +2631,119 @@ serve_peer_request(Pid, getcfcheckpt, Payload) ->
         false -> ok
     end.
 
+%% @doc Decode a getdata and hand its items to the peer's own queue
+%% (beamchain_peer:queue_getdata/2).  Nothing is read or sent here: the
+%% peer serves the queue one item per event (serve_getdata_item/2), taking
+%% the serve slot per item and pausing while its send queue is non-empty,
+%% as Core ProcessGetData does (one item per pass, stop on fPauseSend).
+%% Serving the whole list here used to read every block under one serve
+%% slot and cast every reply into the peer's mailbox at once: one getdata
+%% of 50,000 x MSG_WITNESS_BLOCK held 50,000 decoded blocks in memory and
+%% starved every other peer of the (single) slot.
+-spec handle_getdata_msg(pid(), binary()) -> ok.
 handle_getdata_msg(Pid, Payload) ->
+    case getdata_items(Payload) of
+        {ok, Items} -> beamchain_peer:queue_getdata(Pid, Items);
+        error -> ok
+    end.
+
+%% @doc Decode a getdata payload into its items, dropping repeats of the
+%% same (type, hash): serving one block twice in one request only
+%% amplifies the request.
+-spec getdata_items(binary()) -> {ok, [map()]} | error.
+getdata_items(Payload) ->
     case beamchain_p2p_msg:decode_payload(getdata, Payload) of
-        {ok, #{items := Items}} ->
+        {ok, #{items := Items}} -> {ok, dedupe_getdata_items(Items)};
+        _ -> error
+    end.
+
+dedupe_getdata_items(Items) ->
+    {Rev, _} = lists:foldl(
+        fun(#{type := T, hash := H} = I, {Acc, Seen}) ->
+                case maps:is_key({T, H}, Seen) of
+                    true -> {Acc, Seen};
+                    false -> {[I | Acc], Seen#{{T, H} => true}}
+                end;
+           (_, AccSeen) -> AccSeen
+        end, {[], #{}}, Items),
+    lists:reverse(Rev).
+
+%% @doc Serve ONE getdata item to peer Pid: read it holding a serve slot,
+%% then send the reply.  Returns {notfound, Item} for an item we cannot
+%% serve; the caller batches those into one notfound.
+-spec serve_getdata_item(pid(), map()) -> ok | {notfound, map()}.
+serve_getdata_item(Pid, #{type := Type, hash := Hash}) ->
+    NF = #{type => Type, hash => Hash},
+    case beamchain_serve_limiter:with_slot(
+           fun() -> getdata_item_reply(Type, Hash) end) of
+        {ok, Msg} ->
+            beamchain_peer:send_message(Pid, Msg),
+            ok;
+        {ok_tx, Msg} ->
+            beamchain_peer:send_message(Pid, Msg),
+            %% Core ProcessGetData: serving a tx ->
+            %% mempool.RemoveUnbroadcastTx (a peer has it).
+            note_tx_served(Msg),
+            ok;
+        notfound ->
+            {notfound, NF}
+    end.
+
+getdata_item_reply(Type, Hash) ->
+    case Type of
+        %% MSG_CMPCT_BLOCK: how a Core peer fetches a single
+        %% directly-announced tip from a peer that sent sendcmpct
+        %% (HeadersDirectFetchBlocks).  It used to fall to the
+        %% tx branch and get notfound, so the peer never got the
+        %% block (regtest relay test 2026-09-26).  Answered with
+        %% the full witness block -- getdata_block_msg/2.
+        T when T =:= ?MSG_BLOCK; T =:= ?MSG_WITNESS_BLOCK;
+               T =:= ?MSG_CMPCT_BLOCK ->
             %% BIP-159 peer-served-blocks gate.  When prune mode is on,
             %% refuse to serve blocks below tip - 288.  Mirrors Core's
             %% net_processing.cpp short-circuit; emits notfound rather
             %% than reading a possibly-deleted block file.
-            PruneActive = beamchain_config:prune_enabled(),
-            PruneHorizon =
-                case PruneActive of
-                    true ->
-                        case beamchain_chainstate:get_tip_height() of
-                            {ok, TipH} when TipH > 288 -> TipH - 288;
-                            _ -> -1
-                        end;
-                    false -> -1
-                end,
-            NotFound = lists:filtermap(fun(#{type := Type, hash := Hash}) ->
-                case Type of
-                    %% MSG_CMPCT_BLOCK: how a Core peer fetches a single
-                    %% directly-announced tip from a peer that sent sendcmpct
-                    %% (HeadersDirectFetchBlocks).  It used to fall to the
-                    %% tx branch and get notfound, so the peer never got the
-                    %% block (regtest relay test 2026-09-26).  Answered with
-                    %% the full witness block -- getdata_block_msg/2.
-                    T when T =:= ?MSG_BLOCK; T =:= ?MSG_WITNESS_BLOCK;
-                           T =:= ?MSG_CMPCT_BLOCK ->
-                        BelowHorizon =
-                            case PruneHorizon of
-                                -1 -> false;
-                                _  ->
-                                    case beamchain_db:get_block_index_by_hash(Hash) of
-                                        {ok, #{height := BH}} when BH < PruneHorizon ->
-                                            true;
-                                        _ -> false
-                                    end
-                            end,
-                        case BelowHorizon of
-                            true ->
-                                {true, #{type => Type, hash => Hash}};
-                            false ->
-                                case beamchain_db:get_block(Hash) of
-                                    {ok, Block} ->
-                                        beamchain_peer:send_message(Pid,
-                                            getdata_reply(Type, Hash, Block)),
-                                        false;
-                                    not_found ->
-                                        {true, #{type => Type, hash => Hash}};
-                                    %% beamchain_db:get_block can also return
-                                    %% {error, block_pruned} after a prune sweep
-                                    %% delivered the block file but left the index
-                                    %% entry. Translate to notfound so peers move
-                                    %% on instead of hanging the request.
-                                    {error, _} ->
-                                        {true, #{type => Type, hash => Hash}}
-                                end
-                        end;
-                    _ ->
-                        %% Every non-block item (MSG_TX / MSG_WITNESS_TX /
-                        %% MSG_WTX, and unknown types → notfound) is decided
-                        %% by getdata_tx_msg/4 alone.
-                        case getdata_tx_msg(Type, Hash,
-                                            fun beamchain_mempool:get_tx/1,
-                                            fun beamchain_mempool:get_tx_by_wtxid/1) of
-                            {ok, Msg} ->
-                                beamchain_peer:send_message(Pid, Msg),
-                                %% Core ProcessGetData: serving a tx ->
-                                %% mempool.RemoveUnbroadcastTx (a peer has it).
-                                note_tx_served(Msg),
-                                false;
-                            notfound ->
-                                {true, #{type => Type, hash => Hash}}
-                        end
-                end
-            end, Items),
-            case NotFound of
-                [] -> ok;
-                _  -> beamchain_peer:send_message(Pid,
-                        {notfound, #{items => NotFound}})
+            case below_prune_horizon(Hash) of
+                true ->
+                    notfound;
+                false ->
+                    case beamchain_db:get_block(Hash) of
+                        {ok, Block} ->
+                            {ok, getdata_reply(Type, Hash, Block)};
+                        %% not_found, or {error, block_pruned} after a prune
+                        %% sweep deleted the block file but left the index
+                        %% entry: notfound so peers move on instead of
+                        %% hanging the request.
+                        _ ->
+                            notfound
+                    end
             end;
         _ ->
-            ok
+            %% Every non-block item (MSG_TX / MSG_WITNESS_TX /
+            %% MSG_WTX, and unknown types → notfound) is decided
+            %% by getdata_tx_msg/4 alone.
+            case getdata_tx_msg(Type, Hash,
+                                fun beamchain_mempool:get_tx/1,
+                                fun beamchain_mempool:get_tx_by_wtxid/1) of
+                {ok, Msg} -> {ok_tx, Msg};
+                notfound -> notfound
+            end
+    end.
+
+below_prune_horizon(Hash) ->
+    case beamchain_config:prune_enabled() of
+        true ->
+            case beamchain_chainstate:get_tip_height() of
+                {ok, TipH} when TipH > 288 ->
+                    case beamchain_db:get_block_index_by_hash(Hash) of
+                        {ok, #{height := BH}} -> BH < TipH - 288;
+                        _ -> false
+                    end;
+                _ ->
+                    false
+            end;
+        false ->
+            false
     end.
 
 %% A peer fetched this tx: it is no longer in the unbroadcast set.
