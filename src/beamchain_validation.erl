@@ -238,19 +238,41 @@ check_block(#block{header = Header, transactions = Txs}, Params, CheckPow, Check
             {error, E} -> throw(E)
         end,
 
-        %% 2. at least one transaction
+        %% 2. Merkle root + CVE-2012-2459 malleation FIRST, before any body
+        %%    check (Core CheckBlock validation.cpp:3935-3942 ->
+        %%    CheckMerkleRoot:3837-3862). Both are BLOCK_MUTATED: the body
+        %%    does not belong to this header, so the failure says nothing
+        %%    about the header and must not be cached as invalid. Core:
+        %%    "All potential-corruption validation must be done before we do
+        %%    any transaction validation, as otherwise we may mark the header
+        %%    as invalid because we receive the wrong transactions for it."
+        %%    Running the coinbase / no-transactions checks first let any
+        %%    peer turn a junk body under an honest in-flight header into a
+        %%    consensus verdict (no_transactions / first_tx_not_coinbase /
+        %%    extra_coinbase), marking the honest block FAILED and refusing
+        %%    its header for good -- a chain split. Order inside follows
+        %%    Core: root mismatch (bad-txnmrklroot) before the mutation test
+        %%    (bad-txns-duplicate). An empty body hashes to the zero root,
+        %%    which no real header commits to.
+        TxHashes = [beamchain_serialize:tx_hash(Tx) || Tx <- Txs],
+        ComputedMerkle = beamchain_serialize:compute_merkle_root(TxHashes),
+        ComputedMerkle =:= Header#block_header.merkle_root
+            orelse throw(bad_merkle_root),
+        check_merkle_malleation(TxHashes),
+
+        %% 3. at least one transaction
         Txs =/= [] orelse throw(no_transactions),
 
-        %% 3. first transaction must be coinbase
+        %% 4. first transaction must be coinbase
         [CoinbaseTx | RestTxs] = Txs,
         is_coinbase_tx(CoinbaseTx) orelse throw(first_tx_not_coinbase),
 
-        %% 4. no other transaction may be coinbase
+        %% 5. no other transaction may be coinbase
         lists:foreach(fun(Tx) ->
             is_coinbase_tx(Tx) andalso throw(extra_coinbase)
         end, RestTxs),
 
-        %% 5. check each transaction
+        %% 6. check each transaction
         lists:foreach(fun(Tx) ->
             case check_transaction(Tx) of
                 ok -> ok;
@@ -258,36 +280,20 @@ check_block(#block{header = Header, transactions = Txs}, Params, CheckPow, Check
             end
         end, Txs),
 
-        %% 5b. Merkle tree malleation (CVE-2012-2459) — checked FIRST.
-        %% Core computes BlockMerkleRoot with the mutated out-param and
-        %% rejects mutated blocks with "bad-txns-duplicate" (validation.cpp
-        %% :3853) BEFORE the root comparison and before any per-tx or
-        %% connect-stage check, so an ALIGNED duplicate subtree must surface
-        %% as mutated_merkle, not dup_txid / bad_merkle_root.
-        %% (corpus: _cve-histbug-2026-07-07/cve-2012-2459-merkle-dup
-        %% reject-leaf-dup + reject-subtree-dup.)
-        TxHashes = [beamchain_serialize:tx_hash(Tx) || Tx <- Txs],
-        check_merkle_malleation(TxHashes),
-
-        %% 5c. Explicit duplicate-txid pre-check (Core BIP-22 parity).
+        %% 7. Explicit duplicate-txid pre-check (Core BIP-22 parity).
         %% Iterate non-coinbase transactions and accumulate txids into a set.
         %% If any non-coinbase txid appears more than once, reject with
-        %% dup_txid before the merkle root check fires.  After the 5b
-        %% malleation check this only catches MISALIGNED duplicates (e.g. the
-        %% 3-leaf [cb, S, S] shape, whose lone trailing leaf Core's mutation
-        %% scan deliberately skips); Core rejects those in ConnectBlock when
-        %% the second instance re-spends the same prevout, so the BIP-22
-        %% reason maps to "bad-txns-inputs-missingorspent" (corpus:
-        %% dup-txid-merkle-malleation, bwmc/B6, cve-2012-2459-merkle-dup
-        %% reject-misaligned-dup).  Note: coinbase uniqueness is enforced by
-        %% BIP-34 / height commitment, not here.
+        %% dup_txid.  After the step-2 malleation check this only catches
+        %% MISALIGNED duplicates (e.g. the 3-leaf [cb, S, S] shape, whose
+        %% lone trailing leaf Core's mutation scan deliberately skips); Core
+        %% rejects those in ConnectBlock when the second instance re-spends
+        %% the same prevout, so the BIP-22 reason maps to
+        %% "bad-txns-inputs-missingorspent" (corpus: dup-txid-merkle-
+        %% malleation, bwmc/B6, cve-2012-2459-merkle-dup reject-misaligned-
+        %% dup).  Note: coinbase uniqueness is enforced by BIP-34 / height
+        %% commitment, not here.
         NonCbTxids = [beamchain_serialize:tx_hash(Tx) || Tx <- RestTxs],
         check_no_dup_txids(NonCbTxids),
-
-        %% 6. verify merkle root
-        ComputedMerkle = beamchain_serialize:compute_merkle_root(TxHashes),
-        ComputedMerkle =:= Header#block_header.merkle_root
-            orelse throw(bad_merkle_root),
 
         %% 8. size limits (Core CheckBlock, validation.cpp:3947) — the
         %%    NON-WITNESS serialized block size scaled by WITNESS_SCALE_FACTOR
