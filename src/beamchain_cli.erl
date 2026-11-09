@@ -8,6 +8,10 @@
          remove_pidfile/0, pidfile_path/1,
          debug_categories/0, category_modules/1]).
 
+-ifdef(TEST).
+-export([main_app_start_type/0]).
+-endif.
+
 %% Dialyzer suppressions for false positives:
 %% import_utxo/1 calls halt/1 (diverges) on one path; dialyzer treats it as
 %%   no local return because start_app() is inferred to always return ok.
@@ -1165,10 +1169,20 @@ start_app() ->
     ensure_started(cowlib),
     ensure_started(cowboy),
     ensure_started(jsx),
-    case application:ensure_all_started(beamchain) of
+    case application:ensure_all_started(beamchain, main_app_start_type()) of
         {ok, _Apps} -> ok;
         {error, _} = Err -> Err
     end.
+
+%% beamchain runs `permanent`, not the default `temporary`. A temporary
+%% application that dies (beamchain_sup exceeding its restart intensity) is
+%% only logged: the VM keeps running with no node in it, the process stays up,
+%% and systemd has nothing to restart. A permanent application that dies takes
+%% the runtime system down with it, so the unit exits non-zero and Restart=
+%% brings the node back. An explicit application:stop(beamchain) (the SIGTERM
+%% and `stop` RPC paths) is unaffected: OTP only halts on an abnormal exit.
+main_app_start_type() ->
+    permanent.
 
 ensure_started(App) ->
     case application:ensure_all_started(App) of
