@@ -1387,10 +1387,13 @@ handle_info({peer_sendheaders, Pid}, State) ->
 
 %% Inbound connection accepted
 handle_info({accepted, Socket, Address}, State) ->
-    State2 = handle_inbound(Socket, Address, State),
-    %% Restart acceptor
-    Acceptor = spawn_acceptor(State2#state.listen_socket),
-    {noreply, State2#state{acceptor = Acceptor}};
+    %% accept_loop/2 keeps looping after it hands us a socket, so the
+    %% acceptor is still alive here and must not be replaced. Spawning a new
+    %% one per connection (as this handler used to) left one extra
+    %% accept_loop process behind for every inbound connection. A new
+    %% acceptor is spawned only on the acceptor's 'DOWN' below, matching
+    %% Core's single accept thread (net.cpp AcceptConnection).
+    {noreply, handle_inbound(Socket, Address, State)};
 
 %% Acceptor process died (maybe listen socket closed)
 handle_info({'DOWN', _MonRef, process, Pid, Reason},
