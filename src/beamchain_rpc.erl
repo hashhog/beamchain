@@ -10934,10 +10934,6 @@ rpc_getwalletinfo(WalletName) ->
         {ok, Pid} ->
             case beamchain_wallet:get_wallet_info(Pid) of
                 {ok, Info} ->
-                    Balance = case beamchain_wallet:get_balance(Pid) of
-                        {ok, B} -> B;
-                        _ -> 0
-                    end,
                     WalletNameDisplay = case maps:get(wallet_name, Info, <<>>) of
                         <<>> -> <<"default">>;
                         N -> N
@@ -10949,11 +10945,9 @@ rpc_getwalletinfo(WalletName) ->
                         <<"walletname">> => WalletNameDisplay,
                         <<"walletversion">> => 1,
                         <<"format">> => <<"json">>,
-                        %% Core uses ValueFromAmount for balance; use sentinel
-                        %% so replace_btc_sentinels emits exact 8-decimal form.
-                        <<"balance">> => format_amount_sentinel(Balance),
-                        <<"unconfirmed_balance">> => format_amount_sentinel(0),
-                        <<"immature_balance">> => format_amount_sentinel(0),
+                        %% Core v31 getwalletinfo has no balance,
+                        %% unconfirmed_balance or immature_balance (see
+                        %% getbalances / getbalance).
                         <<"txcount">> => TxCount,
                         <<"keypoolsize">> => maps:get(addresses, Info, 0),
                         <<"paytxfee">> => format_amount_sentinel(0),
