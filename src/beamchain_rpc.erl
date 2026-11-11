@@ -12447,27 +12447,74 @@ rpc_listunspent(Params, WalletName) ->
         {error, Code, Msg} ->
             {error, Code, Msg};
         {ok, MinConf, MaxConf, AddrFilter} ->
-            case resolve_wallet(WalletName) of
-                {ok, Pid} ->
-                    Utxos = beamchain_wallet:get_wallet_utxos(),
-                    case beamchain_chainstate:get_tip() of
-                        {ok, {_, CurrentHeight}} ->
-                            Network = cfg_network(),
-                            Filtered = lists:filtermap(
-                                fun({Txid, Vout, Utxo}) ->
-                                    listunspent_entry(
-                                        Pid, Txid, Vout, Utxo, CurrentHeight,
-                                        MinConf, MaxConf, AddrFilter, Network)
-                                end, Utxos),
-                            {ok_raw_json,
-                             replace_btc_sentinels(jsx:encode(Filtered))};
-                        not_found ->
-                            {ok, []}
-                    end;
-                {error, _} ->
-                    wallet_not_found_error(WalletName)
+            case listunspent_include_immature(Params) of
+                {error, _, _} = TypeErr ->
+                    TypeErr;
+                {ok, IncludeImmature} ->
+                    rpc_listunspent(WalletName, MinConf, MaxConf, AddrFilter,
+                                    IncludeImmature)
             end
     end.
+
+rpc_listunspent(WalletName, MinConf, MaxConf, AddrFilter, IncludeImmature) ->
+    case resolve_wallet(WalletName) of
+        {ok, Pid} ->
+            Utxos = beamchain_wallet:get_wallet_utxos(),
+            case beamchain_chainstate:get_tip() of
+                {ok, {_, CurrentHeight}} ->
+                    Network = cfg_network(),
+                    Filtered = lists:filtermap(
+                        fun({Txid, Vout, Utxo}) ->
+                            %% Core AvailableCoins (wallet/spend.cpp:357)
+                            %% skips an immature coinbase unless
+                            %% query_options.include_immature_coinbase.
+                            (IncludeImmature orelse
+                             listunspent_coin_mature(Utxo, CurrentHeight))
+                            andalso listunspent_entry(
+                                      Pid, Txid, Vout, Utxo, CurrentHeight,
+                                      MinConf, MaxConf, AddrFilter, Network)
+                        end, Utxos),
+                    {ok_raw_json,
+                     replace_btc_sentinels(jsx:encode(Filtered))};
+                not_found ->
+                    {ok, []}
+            end;
+        {error, _} ->
+            wallet_not_found_error(WalletName)
+    end.
+
+%% Core CWallet::IsTxImmatureCoinBase (wallet/wallet.cpp:3333-3351): a
+%% coinbase is immature while it has fewer than COINBASE_MATURITY+1
+%% confirmations, i.e. until CurrentHeight - Height >= COINBASE_MATURITY.
+listunspent_coin_mature(#utxo{is_coinbase = false}, _CurrentHeight) ->
+    true;
+listunspent_coin_mature(#utxo{is_coinbase = true, height = H}, CurrentHeight) ->
+    (CurrentHeight - H) >= ?COINBASE_MATURITY.
+
+%% query_options.include_immature_coinbase (5th positional param).  Core
+%% type-checks it with RPCTypeCheckObj(VBOOL) and defaults it to false
+%% (wallet/rpc/coins.cpp:558-585, wallet/spend.h CoinFilterParams).
+listunspent_include_immature([_, _, _, _, Opts | _]) when is_map(Opts) ->
+    case maps:find(<<"include_immature_coinbase">>, Opts) of
+        error -> {ok, false};
+        {ok, B} when is_boolean(B) -> {ok, B};
+        {ok, null} ->
+            %% Present-but-null passes RPCTypeCheckObj (fAllowNull) and then
+            %% fails get_bool() -> UniValue::type_error -> -3 without the
+            %% field name (checked against Core v31.1).
+            {error, ?RPC_TYPE_ERROR, type_error_msg(null, <<"bool">>)};
+        {ok, Other} ->
+            {error, ?RPC_TYPE_ERROR,
+             <<"JSON value of type ", (univalue_type_name(Other))/binary,
+               " for field include_immature_coinbase is not of expected"
+               " type bool">>}
+    end;
+listunspent_include_immature([_, _, _, _, null | _]) ->
+    {ok, false};
+listunspent_include_immature([_, _, _, _, Opts | _]) ->
+    {error, ?RPC_TYPE_ERROR, type_error_msg(Opts, <<"object">>)};
+listunspent_include_immature(_) ->
+    {ok, false}.
 
 parse_listunspent_params(Params) ->
     Min = case Params of
@@ -12525,9 +12572,6 @@ listunspent_entry(Pid, Txid, Vout, Utxo, CurrentHeight, MinConf, MaxConf,
                 false ->
                     false;
                 true ->
-                    Spendable = (not Utxo#utxo.is_coinbase)
-                        orelse (CurrentHeight - Utxo#utxo.height)
-                               >= ?COINBASE_MATURITY,
                     {Desc, ParentDescs, Label} =
                         listunspent_desc_fields(Pid, Address, Utxo),
                     {true, #{
@@ -12539,11 +12583,15 @@ listunspent_entry(Pid, Txid, Vout, Utxo, CurrentHeight, MinConf, MaxConf,
                             beamchain_serialize:hex_encode(Utxo#utxo.script_pubkey),
                         <<"amount">> => format_amount_sentinel(Utxo#utxo.value),
                         <<"confirmations">> => Confs,
-                        <<"spendable">> => Spendable,
+                        %% Core (wallet/rpc/coins.cpp:675) reports
+                        %% spendable:true for every coin it lists; an
+                        %% immature coinbase only appears when the caller
+                        %% asked for it with include_immature_coinbase.
+                        <<"spendable">> => true,
                         <<"solvable">> => true,
                         <<"desc">> => Desc,
                         <<"parent_descs">> => ParentDescs,
-                        <<"safe">> => Spendable
+                        <<"safe">> => true
                     }}
             end
     end.
