@@ -328,22 +328,20 @@ g19_sasl_disabled_test() ->
 %%% Section E — VM args / release config (Gates G20–G25)
 %%% ===================================================================
 
-%% G20 — vm.args sets -name and -setcookie (PASS, security PARTIAL).
-%% -name beamchain@127.0.0.1 binds the dist port to loopback — good.
-%% BUT -setcookie beamchain is a hardcoded, publicly-known value.
-%% Anyone on the same host (or with credentials that let them write a
-%% .erlang.cookie) can rpc:call/4 into the running node and execute
-%% arbitrary code (rpc:call(beamchain@127.0.0.1, os, cmd, ...)).
+%% G20 — vm.args sets -name but no static -setcookie, and binds the
+%% distribution listener to loopback.
+%% -name beamchain@127.0.0.1 only names the node; on its own the dist
+%% listener binds every interface. A fixed, publicly-known cookie
+%% (the old "-setcookie beamchain") let anyone who could reach that port
+%% rpc:call/4 into the node and run arbitrary code. The release now ships
+%% no cookie (the runtime generates a random ~/.erlang.cookie, mode 0400,
+%% per install; RELX_COOKIE overrides) and pins the listener to
+%% 127.0.0.1. Full pins: beamchain_release_dist_cookie_tests.
 g20_setcookie_default_test() ->
     Args = read_config("vm.args"),
-    ?assert(contains(Args, "-setcookie beamchain")),
+    ?assertNot(contains(Args, "-setcookie")),
     ?assert(contains(Args, "-name beamchain@127.0.0.1")),
-    %% MISSING: the cookie should be a random per-deployment value.
-    %% Stop-gap: rebar3 release respects RELEASE_COOKIE env var, but
-    %% smoke-beamchain.sh doesn't set it and the production launcher
-    %% doesn't generate a random cookie either.  Future fix: emit a
-    %% cookie file alongside .cookie (RPC auth cookie) and source it.
-    ?assert(true).
+    ?assert(contains(Args, "-kernel inet_dist_use_interface {127,0,0,1}")).
 
 %% G21 — vm.args has +P 1048576 process limit (PASS).
 g21_process_limit_test() ->

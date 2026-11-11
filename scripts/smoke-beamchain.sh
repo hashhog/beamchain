@@ -119,6 +119,37 @@ for _ in $(seq 1 "$SMOKE_PING_WAIT"); do
 done
 [ "$PING_OK" -eq 1 ] || fail "node did not respond to ping within ${SMOKE_PING_WAIT}s"
 
+# Distribution runs any code a peer holding the cookie sends, so the
+# built release must ship no fixed cookie and must listen on loopback.
+echo "[smoke] 4b/5 release ships no cookie; distribution listens on loopback"
+REL_VMARGS="$(ls "$BEAMCHAIN_DIR"/_build/prod/rel/beamchain/releases/*/vm.args 2>/dev/null | head -1)"
+[ -n "$REL_VMARGS" ] && [ -f "$REL_VMARGS" ] || fail "release vm.args not found"
+if grep -q -e '^[[:space:]]*-setcookie' "$REL_VMARGS"; then
+    fail "release vm.args sets a static cookie: $(grep -e '-setcookie' "$REL_VMARGS")"
+fi
+# Addresses of the sockets bound to this node's distribution port (from EPMD).
+DIST_ADDRS="$(run_release eval '{ok,Ns}=net_adm:names("127.0.0.1"), [N|_]=string:split(atom_to_list(node()),"@"), {_,P}=lists:keyfind(N,1,Ns), lists:usort([A || S <- erlang:ports(), {ok,{A,Pt}} <- [catch inet:sockname(S)], Pt =:= P]).' 2>&1 | tail -1 | tr -d '[:space:]' || true)"
+[ "$DIST_ADDRS" = "[{127,0,0,1}]" ] \
+    || fail "distribution listener is not loopback-only: $DIST_ADDRS"
+# The old committed cookie must not open the node.
+# eval prints the atom quoted ('beamchain@127.0.0.1'); strip quotes and spaces.
+SMOKE_TARGET="$(run_release eval 'node().' 2>&1 | tail -1 | tr -d "[:space:]'" || true)"
+PROBE_ERL="$(command -v erl || true)"
+if [ -n "$PROBE_ERL" ]; then
+    OLD_COOKIE_PING="$("$PROBE_ERL" -noshell -name "smoke_probe_$$@127.0.0.1" \
+        -setcookie beamchain \
+        -eval "io:format(\"~p~n\", [net_adm:ping('${SMOKE_TARGET}')]), halt()." 2>&1 | tail -1 || true)"
+    [ "$OLD_COOKIE_PING" = "pang" ] \
+        || fail "node $SMOKE_TARGET answered the old static cookie: $OLD_COOKIE_PING"
+    # Control: the same probe with this install's own cookie must get in,
+    # or the pang above could just mean a wrong node name.
+    OWN_COOKIE_PING="$("$PROBE_ERL" -noshell -name "smoke_probe_own_$$@127.0.0.1" \
+        -eval "io:format(\"~p~n\", [net_adm:ping('${SMOKE_TARGET}')]), halt()." 2>&1 | tail -1 || true)"
+    [ "$OWN_COOKIE_PING" = "pong" ] \
+        || fail "control ping with the install's own cookie failed: $OWN_COOKIE_PING (target $SMOKE_TARGET)"
+fi
+echo "[smoke]     dist=$DIST_ADDRS old-cookie-ping=${OLD_COOKIE_PING:-skipped(no erl)} own-cookie-ping=${OWN_COOKIE_PING:-skipped(no erl)}"
+
 # Now keep the node alive for SMOKE_LIFETIME seconds and confirm it's
 # still responding at the end. This catches bugs where boot succeeds
 # but the supervision tree dies under the first real workload (e.g.
