@@ -39,7 +39,13 @@ setup() ->
     beamchain_wallet:register_wallet_script(spk(1), <<"a1">>),
     beamchain_wallet:register_wallet_script(spk(2), <<"a2">>),
     beamchain_wallet:register_wallet_script(spk(3), <<"a3">>),
-    beamchain_wallet:register_change_script(spk(3)),
+    %% Guarded so the module also builds on a tree without the fix (the test
+    %% then fails on its assertion, not on an undef).
+    _ = code:ensure_loaded(beamchain_wallet),
+    case erlang:function_exported(beamchain_wallet, register_change_script, 1) of
+        true  -> beamchain_wallet:register_change_script(spk(3));
+        false -> ets:insert(beamchain_wallet_scripts, {{change, spk(3)}, true})
+    end,
     ok.
 
 cleanup(_) ->
