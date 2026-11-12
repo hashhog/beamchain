@@ -1325,7 +1325,7 @@ rpc_stop([]) ->
         timer:sleep(200),
         init:stop()
     end),
-    {ok, <<"Beamchain server stopping">>};
+    {ok, <<"Bitcoin Core stopping">>};
 rpc_stop([Wait]) when is_integer(Wait); is_float(Wait) ->
     %% Core rpc/server.cpp stop() optional `wait` NUM. Type is checked
     %% before anything happens — a string must not shut the node down.
