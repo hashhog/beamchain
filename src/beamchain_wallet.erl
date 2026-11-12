@@ -92,6 +92,8 @@
 -export([scan_utxos_for_script/1,
          register_wallet_script/2,
          is_wallet_script/1,
+         register_change_script/1,
+         is_change_script/1,
          add_wallet_utxo/5,
          add_wallet_utxo/6,
          spend_wallet_utxo/2,
@@ -1229,6 +1231,7 @@ generate_address_silent(Type, Direction, State) ->
     %% Register the script for UTXO tracking
     {ok, ScriptPubKey} = beamchain_address:address_to_script(Address, Network),
     register_wallet_script(ScriptPubKey, list_to_binary(Address)),
+    ChainIdx =:= 1 andalso register_change_script(ScriptPubKey),
     NewIndexMap = IndexMap#{Type => Index + 1},
     NewState = case Direction of
         receive_addr ->
@@ -1274,6 +1277,7 @@ generate_address(Type, Direction, State) ->
     %% Register the script for UTXO tracking
     {ok, ScriptPubKey} = beamchain_address:address_to_script(Address, Network),
     register_wallet_script(ScriptPubKey, list_to_binary(Address)),
+    ChainIdx =:= 1 andalso register_change_script(ScriptPubKey),
     NewIndexMap = IndexMap#{Type => Index + 1},
     NewState = case Direction of
         receive_addr ->
@@ -2315,6 +2319,12 @@ apply_loaded_wallet(WalletData, FilePath, Passphrase, State) ->
 %% script-lookup ETS table so is_wallet_script/1 recognises wallet outputs
 %% again after a restart.  Best-effort per address (a malformed entry is
 %% skipped, not fatal).
+mark_change_if_internal(AddrEntry, Script) ->
+    case maps:get(<<"change">>, AddrEntry, false) of
+        true -> register_change_script(Script);
+        _    -> ok
+    end.
+
 reregister_address_scripts(Addrs, Network) ->
     lists:foreach(
       fun(AddrEntry) ->
@@ -2327,13 +2337,15 @@ reregister_address_scripts(Addrs, Network) ->
                   case maps:get(<<"script_hex">>, AddrEntry, undefined) of
                       Hex when is_binary(Hex), Hex =/= <<>> ->
                           Script = beamchain_serialize:hex_decode(Hex),
-                          register_wallet_script(Script, AddrBin);
+                          register_wallet_script(Script, AddrBin),
+                          mark_change_if_internal(AddrEntry, Script);
                       _ ->
                           AddrStr = binary_to_list(AddrBin),
                           case beamchain_address:address_to_script(AddrStr,
                                                                    Network) of
                               {ok, Script} ->
-                                  register_wallet_script(Script, AddrBin);
+                                  register_wallet_script(Script, AddrBin),
+                                  mark_change_if_internal(AddrEntry, Script);
                               _ ->
                                   ok
                           end
@@ -2513,6 +2525,23 @@ normalize_utxo_entry({Value, Script, Height}) ->
 register_wallet_script(ScriptPubKey, Address) ->
     ets:insert(?WALLET_SCRIPT_TABLE, {ScriptPubKey, Address}),
     ok.
+
+%% @doc Mark a wallet script as belonging to the internal (change) chain.
+%% Stored in the script table under a {change, Script} key so that
+%% is_wallet_script/1 (keyed by the bare script) is unaffected.
+-spec register_change_script(binary()) -> ok.
+register_change_script(ScriptPubKey) ->
+    ets:insert(?WALLET_SCRIPT_TABLE, {{change, ScriptPubKey}, true}),
+    ok.
+
+%% @doc Whether a script is a change (internal-chain) script of this wallet
+%% (Core: CWallet::IsChange).
+-spec is_change_script(binary()) -> boolean().
+is_change_script(ScriptPubKey) ->
+    case ets:whereis(?WALLET_SCRIPT_TABLE) of
+        undefined -> false;
+        _ -> ets:member(?WALLET_SCRIPT_TABLE, {change, ScriptPubKey})
+    end.
 
 %% @doc Check if a script belongs to this wallet.
 -spec is_wallet_script(binary()) -> boolean().
