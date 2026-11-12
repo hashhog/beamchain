@@ -12743,17 +12743,22 @@ history_entry_to_list_items(Txid, Entry, TipHeight, Network, Long) ->
                                Height, BlockTime, DisplayTxid, Time);
         false -> #{}
     end,
-    %% Send entries: one per output of a tx that debited the wallet.  Core
-    %% emits a send line for every COutputEntry in listSent (each output that
-    %% is not change / paid out of the wallet).  We approximate with the
-    %% wallet-debiting txs' outputs paying foreign scripts (non-credit
-    %% outputs); change outputs (credits) appear as receive lines instead.
-    SendEntries = case Debits of
-        [] -> [];
-        _  -> build_send_entries(Entry, Fee, Network, LongFields,
-                                 DisplayTxid)
+    %% Core CachedTxGetAmounts (wallet/receive.cpp): when the wallet paid for
+    %% the tx (debit > 0), change outputs are skipped entirely, every other
+    %% output is a "send" entry, and every owned non-change output is ALSO a
+    %% "receive" entry (so a send-to-self lists both legs, never the change).
+    %% A tx the wallet did not fund lists every owned output as a receive.
+    FromMe = Debits =/= [],
+    OwnedNonChange = [C || {_, _, S} = C <- Credits,
+                           not (FromMe andalso
+                                beamchain_wallet:is_change_script(S))],
+    ChangeVouts = [V || {V, _, S} <- Credits,
+                        FromMe, beamchain_wallet:is_change_script(S)],
+    SendEntries = case FromMe of
+        false -> [];
+        true  -> build_send_entries(Entry, ChangeVouts, Fee, Network,
+                                    LongFields)
     end,
-    %% Receive / generate / immature entries: one per wallet-credited output.
     RecvEntries = lists:map(
         fun({Vout, Value, Script}) ->
             Category = credit_category(IsCoinbase, Confirmations),
@@ -12766,24 +12771,18 @@ history_entry_to_list_items(Txid, Entry, TipHeight, Network, Long) ->
                 <<"abandoned">> => false
             },
             maps:merge(Base, LongFields)
-        end, Credits),
+        end, OwnedNonChange),
     SendEntries ++ RecvEntries.
 
-%% Build the "send" detail entries for a wallet-debiting tx.  Core emits a send
-%% line per output paid out of the wallet (the foreign outputs); the change
-%% output (a wallet credit) is reported separately as a receive line, so the
-%% send lines are the tx outputs that do NOT credit the wallet.  We reconstruct
-%% the foreign outputs from the stored raw tx, skipping any output index that
-%% appears in `credits` (change).
-build_send_entries(Entry, Fee, Network, LongFields, _DisplayTxid) ->
-    Credits = maps:get(credits, Entry, []),
-    ChangeVouts = [V || {V, _, _} <- Credits],
+%% Build the "send" detail entries for a wallet-debiting tx: every output
+%% except change, reconstructed from the stored raw tx.
+build_send_entries(Entry, ChangeVouts, Fee, Network, LongFields) ->
     TxHex = maps:get(txhex, Entry, <<>>),
     Outputs = decode_tx_outputs(TxHex),
     lists:filtermap(
         fun({Vout, Value, Script}) ->
             case lists:member(Vout, ChangeVouts) of
-                true  -> false;  %% change -> reported as a receive line
+                true  -> false;  %% change: in neither list
                 false ->
                     Addr = script_addr(Script, Network),
                     Base = #{
@@ -12791,8 +12790,7 @@ build_send_entries(Entry, Fee, Network, LongFields, _DisplayTxid) ->
                         <<"category">> => <<"send">>,
                         <<"amount">>   => format_amount_sentinel(-Value),
                         %% Core emits ValueFromAmount(-nFee); our Fee already
-                        %% equals (outputs - inputs) = -nFee, so emit it as-is
-                        %% (a negative number for a real fee).
+                        %% equals (outputs - inputs) = -nFee.
                         <<"fee">>      => format_amount_sentinel(Fee),
                         <<"abandoned">> => false
                     },
