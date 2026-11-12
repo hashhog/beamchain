@@ -97,6 +97,7 @@
          spend_wallet_utxo/2,
          get_wallet_utxos/0,
          get_spendable_utxos/1,
+         get_selectable_utxos/0,
          get_wallet_balance/0,
          scan_block_for_wallet/1,
          scan_block_for_wallet/2,
@@ -2573,6 +2574,25 @@ get_wallet_utxos() ->
 get_spendable_utxos(TipHeight) ->
     [ U || {_, _, Utxo} = U <- get_wallet_utxos(),
            is_utxo_mature(Utxo, TipHeight) ].
+
+%% @doc The wallet coins that automatic coin selection may spend: every caller
+%% that picks inputs on its own (fundrawtransaction, sendtoaddress,
+%% walletcreatefundedpsbt, the payjoin sender and receiver) draws from this
+%% set.  Mirrors Core's AvailableCoins with the default CoinFilterParams
+%% (wallet/spend.cpp:357): an immature coinbase is skipped, because a
+%% transaction spending one is rejected as bad-txns-premature-spend-of-coinbase.
+%% When the tip height is unknown no coinbase is treated as mature (fail
+%% closed); a wallet with no chain tip has no mature coinbase to offer.
+%% The read goes through ?MODULE so tests can stand in a fixture coin set.
+-spec get_selectable_utxos() -> [{binary(), non_neg_integer(), #utxo{}}].
+get_selectable_utxos() ->
+    All = ?MODULE:get_wallet_utxos(),
+    case catch beamchain_chainstate:get_tip_height() of
+        {ok, TipHeight} when is_integer(TipHeight) ->
+            [U || {_, _, Utxo} = U <- All, is_utxo_mature(Utxo, TipHeight)];
+        _ ->
+            [U || {_, _, #utxo{is_coinbase = false}} = U <- All]
+    end.
 
 %% A coin is spendable when it is not coinbase, or when the coinbase has
 %% reached maturity at the current tip.  Mirrors

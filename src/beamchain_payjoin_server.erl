@@ -763,7 +763,9 @@ safe_get_wallet_utxos(_Pid) ->
     %% get_wallet_utxos/0 reads the ETS table directly so it is
     %% independent of the wallet gen_server pid. Pid is kept on the
     %% signature for symmetry with future per-wallet implementations.
-    try beamchain_wallet:get_wallet_utxos() of
+    %% Mature coins only: the receiver input it picks goes into the payjoin
+    %% tx, and an immature coinbase there is a premature spend.
+    try beamchain_wallet:get_selectable_utxos() of
         L when is_list(L) -> L
     catch
         _:_ -> []
