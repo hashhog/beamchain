@@ -55,7 +55,14 @@ setup() ->
           ets:insert(?UTXO_TABLE,
                      {{cb_txid(H), 0}, {5000000000, p2wpkh(H), H, true}})
       end, lists:seq(1, ?TIP)),
-    lists:foreach(fun(M) -> meck:new(M, [passthrough, no_link]) end, ?MOCKED),
+    try
+        lists:foreach(fun(M) -> meck:new(M, [passthrough, no_link]) end,
+                      ?MOCKED)
+    catch C:R:St ->
+        %% eunit skips cleanup when setup fails: undo the fixture here.
+        cleanup({Created, Saved}),
+        erlang:raise(C, R, St)
+    end,
     WalletPid = self(),
     meck:expect(beamchain_wallet_sup, list_wallets, fun() -> [<<"w">>] end),
     meck:expect(beamchain_wallet_sup, get_wallet,

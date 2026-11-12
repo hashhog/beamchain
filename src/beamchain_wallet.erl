@@ -2572,8 +2572,8 @@ spend_wallet_utxo(Txid, Vout) ->
     ets:delete(?WALLET_UTXO_TABLE, {Txid, Vout}),
     ok.
 
-%% @doc Get all unspent wallet UTXOs (mature and immature alike). Callers that
-%% must respect coinbase maturity should use get_spendable_utxos/1 instead.
+%% @doc Get all unspent wallet UTXOs (mature and immature alike). Automatic
+%% coin selection must use get_selectable_utxos/0 instead.
 -spec get_wallet_utxos() -> [{binary(), non_neg_integer(), #utxo{}}].
 get_wallet_utxos() ->
     case ets:whereis(?WALLET_UTXO_TABLE) of
