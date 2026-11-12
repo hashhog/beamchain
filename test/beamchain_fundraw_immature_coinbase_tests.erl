@@ -168,4 +168,7 @@ wcfp_over_mature_balance_is_refused() ->
     Result = beamchain_rpc:rpc_walletcreatefundedpsbt(
                [[], [#{dest_address() => 75}], 0, #{<<"fee_rate">> => 1}],
                undefined),
-    ?assertMatch({error, _, _}, Result).
+    %% Pin the reason so a decode or parameter error cannot pass as the
+    %% control. (beamchain answers -26 here where Core answers -4; that code
+    %% difference is outside this item.)
+    ?assertMatch({error, _, <<"Insufficient funds">>}, Result).

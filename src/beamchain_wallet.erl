@@ -2612,7 +2612,8 @@ get_spendable_utxos(TipHeight) ->
 %% transaction spending one is rejected as bad-txns-premature-spend-of-coinbase.
 %% When the tip height is unknown no coinbase is treated as mature (fail
 %% closed); a wallet with no chain tip has no mature coinbase to offer.
-%% The read goes through ?MODULE so tests can stand in a fixture coin set.
+%% The read goes through ?MODULE so suites that mock get_wallet_utxos/0
+%% keep feeding coin selection their fixture coins.
 -spec get_selectable_utxos() -> [{binary(), non_neg_integer(), #utxo{}}].
 get_selectable_utxos() ->
     All = ?MODULE:get_wallet_utxos(),
