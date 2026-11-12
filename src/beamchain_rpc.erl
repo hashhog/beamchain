@@ -11321,12 +11321,8 @@ rpc_sendtoaddress_spend(Address, AmountBtc, Pid) ->
             %% Get wallet UTXOs for coin selection.  Use the maturity-filtered
             %% spendable set so coin-selection never picks an immature coinbase
             %% (those would be rejected at broadcast with
-            %% premature_spend_of_coinbase).  Falls back to the full set only if
-            %% the chain tip is not yet known.
-            Utxos = case beamchain_chainstate:get_tip_height() of
-                {ok, TipHeight} -> beamchain_wallet:get_spendable_utxos(TipHeight);
-                not_found       -> beamchain_wallet:get_wallet_utxos()
-            end,
+            %% premature_spend_of_coinbase).
+            Utxos = beamchain_wallet:get_selectable_utxos(),
             %% Fee rate (sat/vB): estimator, else -fallbackfee, else -6
             %% (Core SendMoney maps the CreateTransaction failure to -6).
             FeeRate = wallet_default_fee_rate(?RPC_WALLET_INSUFFICIENT_FUNDS),
@@ -15154,13 +15150,10 @@ wcfp_select_coins(Pid, ManualInputs, OutputTotal, FeeRate) ->
     %% picks an immature coinbase (Core's wallet only offers mature coins to
     %% CreateTransaction; spending one is rejected at broadcast with
     %% premature_spend_of_coinbase).  Mirror the sendtoaddress path
-    %% (rpc_sendtoaddress_spend): fall back to the full set only when the chain
-    %% tip is not yet known.  Manual inputs are honoured verbatim regardless
-    %% (Core lets a caller name an immature input explicitly).
-    All = case beamchain_chainstate:get_tip_height() of
-        {ok, TipHeight} -> beamchain_wallet:get_spendable_utxos(TipHeight);
-        not_found       -> beamchain_wallet:get_wallet_utxos()
-    end,
+    %% (rpc_sendtoaddress_spend) through the shared selectable set.  Manual
+    %% inputs are honoured verbatim regardless (Core lets a caller name an
+    %% immature input explicitly).
+    All = beamchain_wallet:get_selectable_utxos(),
     ManualKeys = [{Txid, Vout} || {Txid, Vout, _} <- ManualInputs],
     Locked = sets:from_list(beamchain_wallet:list_locked_coins(Pid)),
     Available = lists:filter(fun({Txid, Vout, _U}) ->
@@ -15292,7 +15285,9 @@ do_fundrawtransaction(Pid, HexStr, Options) ->
     SffoIdx = frt_subtract_fee_outputs(Options, length(ExistingOuts)),
     %% 4. Available wallet UTXOs minus any caller-supplied (manual) inputs and
     %% locked coins — the same availability filter wcfp_select_coins uses.
-    AllUtxos = beamchain_wallet:get_wallet_utxos(),
+    %% Immature coinbases are never offered (Core AvailableCoins); this used
+    %% to read the raw wallet set and could fund a premature-spend tx.
+    AllUtxos = beamchain_wallet:get_selectable_utxos(),
     ManualKeys = [{O#outpoint.hash, O#outpoint.index}
                   || #tx_in{prev_out = O} <- ExistingIns],
     Locked = sets:from_list(beamchain_wallet:list_locked_coins(Pid)),
