@@ -223,7 +223,14 @@ payjoin_min_fee_rate_honoured_test_() ->
 %%% payjoin_original_must_be_broadcastable
 %%% ===================================================================
 
+exported(M, F, A) ->
+    {module, M} = code:ensure_loaded(M),
+    erlang:function_exported(M, F, A).
+
 payjoin_original_must_be_broadcastable_test() ->
+    ?assert(exported(beamchain_payjoin_server, validate_original_psbt, 1)),
+    ?assert(exported(beamchain_payjoin_server,
+                     check_original_broadcastable, 1)),
     Tx = #transaction{version = 2, inputs = [txin(2)],
                       outputs = [#tx_out{value = 1000,
                                          script_pubkey = sender_script(3)}],
@@ -286,6 +293,7 @@ payjoin_token_gate_from_conf_test_() ->
 %%% ===================================================================
 
 rest_listener_binds_loopback_by_default_test() ->
+    ?assert(exported(beamchain_rest, rest_socket_opts, 1)),
     %% rpcbind unset (get/1 -> undefined) is the default config.
     Opts = with_config([{rpcbind, undefined}], fun() ->
                beamchain_rest:rest_socket_opts(18555)
