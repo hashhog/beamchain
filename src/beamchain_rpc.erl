@@ -11321,12 +11321,8 @@ rpc_sendtoaddress_spend(Address, AmountBtc, Pid) ->
             %% Get wallet UTXOs for coin selection.  Use the maturity-filtered
             %% spendable set so coin-selection never picks an immature coinbase
             %% (those would be rejected at broadcast with
-            %% premature_spend_of_coinbase).  Falls back to the full set only if
-            %% the chain tip is not yet known.
-            Utxos = case beamchain_chainstate:get_tip_height() of
-                {ok, TipHeight} -> beamchain_wallet:get_spendable_utxos(TipHeight);
-                not_found       -> beamchain_wallet:get_wallet_utxos()
-            end,
+            %% premature_spend_of_coinbase).
+            Utxos = beamchain_wallet:get_selectable_utxos(),
             %% Fee rate (sat/vB): estimator, else -fallbackfee, else -6
             %% (Core SendMoney maps the CreateTransaction failure to -6).
             FeeRate = wallet_default_fee_rate(?RPC_WALLET_INSUFFICIENT_FUNDS),
@@ -12743,17 +12739,22 @@ history_entry_to_list_items(Txid, Entry, TipHeight, Network, Long) ->
                                Height, BlockTime, DisplayTxid, Time);
         false -> #{}
     end,
-    %% Send entries: one per output of a tx that debited the wallet.  Core
-    %% emits a send line for every COutputEntry in listSent (each output that
-    %% is not change / paid out of the wallet).  We approximate with the
-    %% wallet-debiting txs' outputs paying foreign scripts (non-credit
-    %% outputs); change outputs (credits) appear as receive lines instead.
-    SendEntries = case Debits of
-        [] -> [];
-        _  -> build_send_entries(Entry, Fee, Network, LongFields,
-                                 DisplayTxid)
+    %% Core CachedTxGetAmounts (wallet/receive.cpp): when the wallet paid for
+    %% the tx (debit > 0), change outputs are skipped entirely, every other
+    %% output is a "send" entry, and every owned non-change output is ALSO a
+    %% "receive" entry (so a send-to-self lists both legs, never the change).
+    %% A tx the wallet did not fund lists every owned output as a receive.
+    FromMe = Debits =/= [],
+    OwnedNonChange = [C || {_, _, S} = C <- Credits,
+                           not (FromMe andalso
+                                beamchain_wallet:is_change_script(S))],
+    ChangeVouts = [V || {V, _, S} <- Credits,
+                        FromMe, beamchain_wallet:is_change_script(S)],
+    SendEntries = case FromMe of
+        false -> [];
+        true  -> build_send_entries(Entry, ChangeVouts, Fee, Network,
+                                    LongFields)
     end,
-    %% Receive / generate / immature entries: one per wallet-credited output.
     RecvEntries = lists:map(
         fun({Vout, Value, Script}) ->
             Category = credit_category(IsCoinbase, Confirmations),
@@ -12766,24 +12767,18 @@ history_entry_to_list_items(Txid, Entry, TipHeight, Network, Long) ->
                 <<"abandoned">> => false
             },
             maps:merge(Base, LongFields)
-        end, Credits),
+        end, OwnedNonChange),
     SendEntries ++ RecvEntries.
 
-%% Build the "send" detail entries for a wallet-debiting tx.  Core emits a send
-%% line per output paid out of the wallet (the foreign outputs); the change
-%% output (a wallet credit) is reported separately as a receive line, so the
-%% send lines are the tx outputs that do NOT credit the wallet.  We reconstruct
-%% the foreign outputs from the stored raw tx, skipping any output index that
-%% appears in `credits` (change).
-build_send_entries(Entry, Fee, Network, LongFields, _DisplayTxid) ->
-    Credits = maps:get(credits, Entry, []),
-    ChangeVouts = [V || {V, _, _} <- Credits],
+%% Build the "send" detail entries for a wallet-debiting tx: every output
+%% except change, reconstructed from the stored raw tx.
+build_send_entries(Entry, ChangeVouts, Fee, Network, LongFields) ->
     TxHex = maps:get(txhex, Entry, <<>>),
     Outputs = decode_tx_outputs(TxHex),
     lists:filtermap(
         fun({Vout, Value, Script}) ->
             case lists:member(Vout, ChangeVouts) of
-                true  -> false;  %% change -> reported as a receive line
+                true  -> false;  %% change: in neither list
                 false ->
                     Addr = script_addr(Script, Network),
                     Base = #{
@@ -12791,8 +12786,7 @@ build_send_entries(Entry, Fee, Network, LongFields, _DisplayTxid) ->
                         <<"category">> => <<"send">>,
                         <<"amount">>   => format_amount_sentinel(-Value),
                         %% Core emits ValueFromAmount(-nFee); our Fee already
-                        %% equals (outputs - inputs) = -nFee, so emit it as-is
-                        %% (a negative number for a real fee).
+                        %% equals (outputs - inputs) = -nFee.
                         <<"fee">>      => format_amount_sentinel(Fee),
                         <<"abandoned">> => false
                     },
@@ -15156,13 +15150,10 @@ wcfp_select_coins(Pid, ManualInputs, OutputTotal, FeeRate) ->
     %% picks an immature coinbase (Core's wallet only offers mature coins to
     %% CreateTransaction; spending one is rejected at broadcast with
     %% premature_spend_of_coinbase).  Mirror the sendtoaddress path
-    %% (rpc_sendtoaddress_spend): fall back to the full set only when the chain
-    %% tip is not yet known.  Manual inputs are honoured verbatim regardless
-    %% (Core lets a caller name an immature input explicitly).
-    All = case beamchain_chainstate:get_tip_height() of
-        {ok, TipHeight} -> beamchain_wallet:get_spendable_utxos(TipHeight);
-        not_found       -> beamchain_wallet:get_wallet_utxos()
-    end,
+    %% (rpc_sendtoaddress_spend) through the shared selectable set.  Manual
+    %% inputs are honoured verbatim regardless (Core lets a caller name an
+    %% immature input explicitly).
+    All = beamchain_wallet:get_selectable_utxos(),
     ManualKeys = [{Txid, Vout} || {Txid, Vout, _} <- ManualInputs],
     Locked = sets:from_list(beamchain_wallet:list_locked_coins(Pid)),
     Available = lists:filter(fun({Txid, Vout, _U}) ->
@@ -15294,7 +15285,9 @@ do_fundrawtransaction(Pid, HexStr, Options) ->
     SffoIdx = frt_subtract_fee_outputs(Options, length(ExistingOuts)),
     %% 4. Available wallet UTXOs minus any caller-supplied (manual) inputs and
     %% locked coins — the same availability filter wcfp_select_coins uses.
-    AllUtxos = beamchain_wallet:get_wallet_utxos(),
+    %% Immature coinbases are never offered (Core AvailableCoins); this used
+    %% to read the raw wallet set and could fund a premature-spend tx.
+    AllUtxos = beamchain_wallet:get_selectable_utxos(),
     ManualKeys = [{O#outpoint.hash, O#outpoint.index}
                   || #tx_in{prev_out = O} <- ExistingIns],
     Locked = sets:from_list(beamchain_wallet:list_locked_coins(Pid)),

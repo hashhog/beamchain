@@ -388,7 +388,9 @@ build_original_psbt_for(#bip21_uri{address = Addr, amount = Amount},
                         WalletPid) when is_pid(WalletPid),
                                         is_integer(Amount),
                                         Amount > 0 ->
-    Utxos = beamchain_wallet:get_wallet_utxos(),
+    %% Mature coins only: an immature coinbase input would make the
+    %% Original PSBT (and its fallback broadcast) a premature spend.
+    Utxos = beamchain_wallet:get_selectable_utxos(),
     case beamchain_wallet:select_coins(Amount, 1, Utxos) of
         {ok, Selected, Change} ->
             Network = current_network(),
