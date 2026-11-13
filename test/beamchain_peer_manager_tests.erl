@@ -1264,12 +1264,19 @@ ban_flood_body(#{full := FullDir, ok := OkDir}) ->
     %% Persistence is debounced: flushing it against a full disk must not
     %% crash the manager (returns {noreply, _}, the gen_server lives on).
     {noreply, SFull} = beamchain_peer_manager:handle_info(dump_bans, SRe),
+    %% ... and the failed dump stays pending, retried a full interval later.
+    DirtyPos = record_field_pos(state, bans_dirty),
+    TimerPos = record_field_pos(state, ban_dump_timer),
+    ?assertEqual(true, element(DirtyPos, SFull)),
+    ?assert(timer_left_ms(element(TimerPos, SFull)) > 50000),
     %% Control: with a writable datadir the same flush really writes the
     %% bounded list (so the ENOSPC case above did reach file:write_file).
     DdPos = record_field_pos(state, datadir),
-    {noreply, _} = beamchain_peer_manager:handle_info(
-                     dump_bans, setelement(DdPos, SFull, OkDir)),
-    {ok, Bin} = file:read_file(filename:join(OkDir, "banned.json")),
+    {noreply, SOk} = beamchain_peer_manager:handle_info(
+                       dump_bans, setelement(DdPos, SFull, OkDir)),
+    ?assertEqual(false, element(DirtyPos, SOk)),
+    BanFile = filename:join(OkDir, "banned.json"),
+    {ok, Bin} = file:read_file(BanFile),
     Entries = jsx:decode(Bin, [return_maps]),
     ?assertEqual(Size, length(Entries)),
     Ips = [maps:get(<<"ip">>, E) || E <- Entries],
@@ -1285,7 +1292,40 @@ ban_flood_body(#{full := FullDir, ok := OkDir}) ->
     ?assertEqual(Size, ets:info(banned_peers, size)),
     ?assertEqual(Size - 1, ets:info(banned_peers_discouraged_idx, size)),
     [{Manual, ManualExp}] = ets:lookup(banned_peers, Manual),
-    ?assertNot(ets:member(banned_peers_discouraged_idx, {ManualExp, Manual})).
+    ?assertNot(ets:member(banned_peers_discouraged_idx, {ManualExp, Manual})),
+    %% Debounce: no discouragement writes banned.json synchronously.
+    %% Right after a dump, a new one is deferred a full interval (bursts
+    %% coalesce) ...
+    Discourage = fun(N, S) ->
+        true = ets:update_element(beamchain_peers, Pid,
+                                  {AddrPos, {Ip(N), 8333}}),
+        {noreply, S2} = beamchain_peer_manager:handle_cast(
+                          {misbehaving, Pid, 100, <<"debounce">>}, S),
+        S2
+    end,
+    flush_dump_bans(),
+    SDeferred = Discourage(?BAN_FLOOD + 1, SOk),
+    ?assertEqual({ok, Bin}, file:read_file(BanFile)),
+    ?assert(timer_left_ms(element(TimerPos, SDeferred)) > 50000),
+    %% ... while the first one after a quiet period is dumped on the very
+    %% next message (as promptly as the old per-event write).
+    _ = Discourage(?BAN_FLOOD + 2, build_state(#{datadir => OkDir})),
+    ?assertEqual({ok, Bin}, file:read_file(BanFile)),
+    receive dump_bans -> ok after 2000 -> ?assert(false) end.
+
+%% Milliseconds left on a pending timer; 0 if it already fired or is not a
+%% timer (erlang:read_timer/1 returns the atom false, and atoms compare
+%% greater than every integer).
+timer_left_ms(Ref) when is_reference(Ref) ->
+    case erlang:read_timer(Ref) of
+        Ms when is_integer(Ms) -> Ms;
+        false -> 0
+    end;
+timer_left_ms(_) ->
+    0.
+
+flush_dump_bans() ->
+    receive dump_bans -> flush_dump_bans() after 0 -> ok end.
 
 %% 1-based tuple position of Field in record Rec of beamchain_peer_manager.
 record_field_pos(Rec, Field) ->

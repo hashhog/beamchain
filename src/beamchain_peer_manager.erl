@@ -158,9 +158,12 @@
 %% operator's setban rows (Core's m_banned is a separate, unbounded map).
 -define(MAX_DISCOURAGED, 50000).
 -define(DISCOURAGED_INDEX, banned_peers_discouraged_idx).
-%% banned.json is dumped on a timer after a change, never per event (Core:
-%% DUMP_BANS_INTERVAL in net.h schedules BanMan::DumpBanlist).  A failed
-%% dump is logged and retried on the next tick instead of crashing the
+%% banned.json is dumped at most once per ?BAN_DUMP_DELAY_MS, never
+%% synchronously per event (Core: DUMP_BANS_INTERVAL in net.h schedules
+%% BanMan::DumpBanlist).  Leading edge: the first change after a quiet
+%% period dumps on the next message, so an isolated discouragement is on
+%% disk as promptly as before; a burst is coalesced into one dump per
+%% interval.  A failed dump is logged and retried instead of crashing the
 %% shared peer manager.
 -define(BAN_DUMP_DELAY_MS, 60000).
 
@@ -348,6 +351,8 @@
     %% message is scheduled (see ?BAN_DUMP_DELAY_MS).
     bans_dirty = false :: boolean(),
     ban_dump_timer :: reference() | undefined,
+    %% erlang:monotonic_time(millisecond) of the last dump attempt.
+    last_ban_dump :: integer() | undefined,
     %% Stale peer check timer
     stale_check_timer :: reference() | undefined,
     %% Stale tip detection: when our chain tip last advanced (erlang:system_time(second))
@@ -1471,7 +1476,8 @@ handle_info({'DOWN', _MonRef, process, Pid, Reason}, State) ->
 
 %% Debounced banned.json dump (scheduled by mark_bans_dirty/1).
 handle_info(dump_bans, State) ->
-    State1 = State#state{ban_dump_timer = undefined},
+    State1 = State#state{ban_dump_timer = undefined,
+                         last_ban_dump = erlang:monotonic_time(millisecond)},
     case save_bans(State1#state.datadir) of
         ok ->
             {noreply, State1#state{bans_dirty = false}};
@@ -1550,12 +1556,6 @@ handle_info(_Info, State) ->
 terminate(_Reason, State) ->
     %% Save anchor connections (block-relay-only outbound peers)
     save_anchors(State),
-    %% Flush a pending debounced ban dump so a clean shutdown loses nothing
-    %% the per-event write used to persist.
-    case State#state.bans_dirty of
-        true -> _ = (catch save_bans(State#state.datadir)), ok;
-        false -> ok
-    end,
     %% Close listen socket
     case State#state.listen_socket of
         undefined -> ok;
@@ -3131,9 +3131,17 @@ is_indexed_discouragement(IP, BanExpiry) ->
     ets:info(?DISCOURAGED_INDEX) =/= undefined andalso
         ets:member(?DISCOURAGED_INDEX, {BanExpiry, IP}).
 
-%% Schedule one banned.json dump if none is pending.
-mark_bans_dirty(#state{ban_dump_timer = undefined} = State) ->
-    T = erlang:send_after(?BAN_DUMP_DELAY_MS, self(), dump_bans),
+%% Schedule one banned.json dump if none is pending: immediately when the
+%% last dump attempt is at least ?BAN_DUMP_DELAY_MS old, otherwise when it
+%% will be.
+mark_bans_dirty(#state{ban_dump_timer = undefined,
+                       last_ban_dump = Last} = State) ->
+    Delay = case Last of
+        undefined -> 0;
+        _ -> max(0, Last + ?BAN_DUMP_DELAY_MS
+                    - erlang:monotonic_time(millisecond))
+    end,
+    T = erlang:send_after(Delay, self(), dump_bans),
     State#state{bans_dirty = true, ban_dump_timer = T};
 mark_bans_dirty(State) ->
     State#state{bans_dirty = true}.
