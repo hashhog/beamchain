@@ -74,7 +74,8 @@
          uih_score/4,
          compute_request_budget_ms/0,
          validate_original_psbt/1,
-         check_original_broadcastable/1]).
+         check_original_broadcastable/1,
+         check_original_broadcastable/2]).
 
 %% Supported BIP-78 version. Today the spec defines v=1 only; v=2 was
 %% proposed (https://github.com/payjoin/bips/pull/1) but is not yet in
@@ -207,8 +208,12 @@ handle_psbt_bin_after_dedup(Req0, State, Params, PsbtBin) ->
                     {ok, Req, State};
                 ok ->
                     case check_original_broadcastable(OriginalPsbt) of
-                        ok ->
-                            handle_validated(Req0, State, Params,
+                        {ok, Verified} ->
+                            %% The builder prices the Original from what
+                            %% the mempool measured, not from the input
+                            %% values the sender declared in the PSBT.
+                            handle_validated(Req0, State,
+                                             maps:merge(Params, Verified),
                                              OriginalPsbt);
                         {error, {original_rejected, BMsg}} ->
                             Req = bip78_error_reply(
@@ -454,27 +459,43 @@ validate_inputs([Map | Rest], Idx) ->
 
 %% BIP-78: "Verify that the transaction is broadcastable" (testmempoolaccept).
 %% Fails closed: with no mempool to ask, the Original is not accepted.
+%% On success returns the fee and vsize the mempool measured against the
+%% real coins, as #{original_fee, original_vsize}; the builder prices the
+%% receiver's contribution from these, because the witness_utxo values in
+%% the PSBT are only what the sender claims.
 check_original_broadcastable(OriginalPsbt) ->
+    check_original_broadcastable(OriginalPsbt, fun mempool_dry_run/1).
+
+check_original_broadcastable(OriginalPsbt, DryRun) ->
     case beamchain_psbt:extract(OriginalPsbt) of
         {error, R} ->
             {error, {original_rejected,
                      iolist_to_binary(io_lib:format(
                        "original not finalized: ~p", [R]))}};
         {ok, Tx} ->
-            case whereis(beamchain_mempool) of
-                undefined ->
-                    {error, mempool_unavailable};
+            case DryRun(Tx) of
+                {ok, _Txid, _Wtxid, Fee, VSize, _Rate}
+                  when is_integer(Fee), Fee >= 0,
+                       is_integer(VSize), VSize > 0 ->
+                    {ok, #{original_fee => Fee, original_vsize => VSize}};
+                {error, mempool_unavailable} = E ->
+                    E;
+                {error, Reason} ->
+                    {error, {original_rejected,
+                             iolist_to_binary(io_lib:format(
+                               "original not broadcastable: ~p",
+                               [Reason]))}};
                 _ ->
-                    try beamchain_mempool:accept_to_memory_pool_dry_run(Tx) of
-                        {ok, _Txid, _Wtxid, _Fee, _VSize, _Rate} -> ok;
-                        {error, Reason} ->
-                            {error, {original_rejected,
-                                     iolist_to_binary(io_lib:format(
-                                       "original not broadcastable: ~p",
-                                       [Reason]))}}
-                    catch
-                        _:_ -> {error, mempool_unavailable}
-                    end
+                    {error, mempool_unavailable}
+            end
+    end.
+
+mempool_dry_run(Tx) ->
+    case whereis(beamchain_mempool) of
+        undefined -> {error, mempool_unavailable};
+        _ ->
+            try beamchain_mempool:accept_to_memory_pool_dry_run(Tx)
+            catch _:_ -> {error, mempool_unavailable}
             end
     end.
 
@@ -515,7 +536,9 @@ build_payjoin_psbt_bounded(OriginalPsbt, Params, WalletPid, BudgetMs) ->
     Parent = self(),
     Ref = make_ref(),
     Worker = spawn(fun() ->
-        Result = build_payjoin_psbt(OriginalPsbt, Params, WalletPid),
+        Result = try build_payjoin_psbt(OriginalPsbt, Params, WalletPid)
+                 catch C:E -> {error, {internal, C, E}}
+                 end,
         Parent ! {Ref, Result}
     end),
     receive
@@ -545,7 +568,7 @@ compute_request_budget_ms() ->
 do_build_payjoin_psbt(OriginalPsbt, Params, WalletPid) ->
     Network = current_network(),
     OldTx = OriginalPsbt#psbt.unsigned_tx,
-    case inspect_original(OriginalPsbt, WalletPid, Network) of
+    case inspect_original(OriginalPsbt, Params, WalletPid, Network) of
         {error, _} = E0 -> E0;
         {ok, Orig} ->
             case pick_receiver_utxo_anti_fingerprint(
@@ -566,7 +589,7 @@ do_build_payjoin_psbt(OriginalPsbt, Params, WalletPid) ->
 %%   - every input value must be known, so the Original fee and fee rate
 %%     are real numbers and not the receiver's guess;
 %%   - there must be a receiver output to credit.
-inspect_original(#psbt{unsigned_tx = Tx, inputs = Maps} = Psbt,
+inspect_original(#psbt{unsigned_tx = Tx, inputs = Maps} = Psbt, Params,
                  WalletPid, Network) ->
     try
         TxIns = Tx#transaction.inputs,
@@ -591,11 +614,26 @@ inspect_original(#psbt{unsigned_tx = Tx, inputs = Maps} = Psbt,
                                         Network),
         RecvIdx =/= undefined orelse
             reject(<<"original pays no receiver output">>),
-        OrigVsize = case beamchain_psbt:extract(Psbt) of
-                        {ok, FinalTx} -> beamchain_serialize:tx_vsize(FinalTx);
-                        {error, _} -> reject(<<"original not finalized">>)
-                    end,
-        {ok, #{fee => OrigFee, vsize => OrigVsize, recv_idx => RecvIdx}}
+        OrigVsize0 = case beamchain_psbt:extract(Psbt) of
+                         {ok, FinalTx} -> beamchain_serialize:tx_vsize(FinalTx);
+                         {error, _} -> reject(<<"original not finalized">>)
+                     end,
+        %% The HTTP handler passes the fee and vsize the mempool measured
+        %% (check_original_broadcastable/1). A declared fee that differs
+        %% from the measured one means the sender misstated its input
+        %% values (to inflate the Original's fee rate and with it what
+        %% the receiver pays): refuse.
+        {Fee, Vsize} =
+            case Params of
+                #{original_fee := VFee, original_vsize := VVsize} ->
+                    VFee =:= OrigFee orelse
+                        reject(<<"original input values do not match "
+                                 "the coins they spend">>),
+                    {VFee, VVsize};
+                _ ->
+                    {OrigFee, OrigVsize0}
+            end,
+        {ok, #{fee => Fee, vsize => Vsize, recv_idx => RecvIdx}}
     catch
         throw:{original_rejected, Msg} -> {error, {original_rejected, Msg}}
     end.
@@ -694,37 +732,47 @@ input_signed(Map) ->
         maps:is_key(tap_key_sig, Map).
 
 %% Outputs of the payjoin proposal (BIP-78 receiver):
-%%   - the receiver output grows by the contributed value, less whatever
-%%     part of the contributed input's fee the sender does not pay;
-%%   - the sender pays at most the contributed input's fee at the
-%%     Original's fee rate, capped by maxadditionalfeecontribution, taken
-%%     from additionalfeeoutputindex (never the receiver output, never
-%%     below dust);
-%%   - minfeerate: the receiver tops up so the proposal's fee rate is at
-%%     least minfeerate sat/vB.
+%%   - the contributed input costs InVsize * (Original fee rate) in fee.
+%%     The sender pays as much of that as maxadditionalfeecontribution
+%%     allows, taken from
+%%     additionalfeeoutputindex: never the receiver output, never below
+%%     dust. The receiver pays the rest;
+%%   - minfeerate: the proposal must reach it. The receiver never pays
+%%     more than its own input's fee at the Original rate, so a sender
+%%     cannot name a huge minfeerate and have the receiver's coin burnt
+%%     as fee; when the cap is not enough the request is refused and the
+%%     sender broadcasts the Original;
+%%   - the receiver output grows by the contributed value less the
+%%     receiver's share of the fee.
 payjoin_outputs(Outs, Params, #{fee := OrigFee, vsize := OrigVsize,
                                 recv_idx := RecvIdx}, Utxo) ->
     InVsize = input_vsize_estimate(Utxo#utxo.script_pubkey),
     MinRate = maps:get(min_fee_rate, Params, 0),
-    AtOrigRate = ceil_div(OrigFee * InVsize, max(OrigVsize, 1)),
-    ForMinRate = MinRate * (OrigVsize + InVsize) - OrigFee,
-    Required = lists:max([AtOrigRate, ForMinRate, 0]),
-    SenderPays = sender_fee_share(Outs, Params, RecvIdx,
-                                  min(Required, AtOrigRate)),
-    ReceiverPays = Required - SenderPays,
+    OrigVsize1 = max(OrigVsize, 1),
+    InFee = ceil_div(OrigFee * InVsize, OrigVsize1),
+    SenderPays = sender_fee_share(Outs, Params, RecvIdx, InFee),
+    ReceiverCap = InFee - SenderPays,
+    ForMinRate = MinRate * (OrigVsize + InVsize) - OrigFee - SenderPays,
+    ReceiverPays = lists:max([ReceiverCap, ForMinRate, 0]),
     Contributed = Utxo#utxo.value,
-    case Contributed - ReceiverPays of
-        Credit when Credit > 0 ->
-            Outs1 = adjust_nth(RecvIdx + 1, Credit, Outs),
+    if
+        ReceiverPays > ReceiverCap ->
+            {error, {original_rejected,
+                     iolist_to_binary(io_lib:format(
+                       "minfeerate ~B sat/vB needs more fee than the "
+                       "receiver's input pays at the original fee rate",
+                       [MinRate]))}};
+        Contributed =< ReceiverPays ->
+            {error, no_eligible_utxo};
+        true ->
+            Outs1 = adjust_nth(RecvIdx + 1, Contributed - ReceiverPays, Outs),
             Outs2 = case SenderPays of
                         0 -> Outs1;
                         _ -> adjust_nth(maps:get(additional_fee_output_index,
                                                  Params) + 1,
                                         -SenderPays, Outs1)
                     end,
-            {ok, Outs2};
-        _ ->
-            {error, no_eligible_utxo}
+            {ok, Outs2}
     end.
 
 sender_fee_share(Outs, #{additional_fee_output_index := Idx,

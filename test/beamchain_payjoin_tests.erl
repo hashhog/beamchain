@@ -22,8 +22,12 @@
 %%       an Original whose inputs are not finalized is rejected, and the
 %%       broadcast check fails closed when no mempool is running.
 %%   payjoin_min_fee_rate_honoured
-%%       the receiver pays whatever minfeerate needs beyond what the
-%%       sender's additional fee covers, so the proposal meets minfeerate.
+%%       a reachable minfeerate is met; one that would need more than the
+%%       receiver's own input fee is refused instead of paid by the
+%%       receiver.
+%%   payjoin_declared_input_value_not_trusted
+%%       the Original is priced from the mempool's measurement; a PSBT
+%%       that overstates its input value is refused.
 %%   rest_listener_binds_loopback_by_default
 %%       the REST listener (which also serves /payjoin) binds 127.0.0.1
 %%       unless rpcbind says otherwise, as Core's HTTP server does.
@@ -190,32 +194,104 @@ receiver_output_credited_and_inputs_limited_test_() ->
 %%% ===================================================================
 
 payjoin_min_fee_rate_honoured_test_() ->
-    {setup,
+    {foreach,
      fun start_seeded_wallet/0,
      fun(_) -> stop_wallet() end,
-     fun(_) ->
-       ?_test(begin
+     [{"reachable minfeerate: the proposal's fee rate meets it",
+       fun() ->
            RecvScript = wallet_script(),
            Contrib = 200000,
            ok = beamchain_wallet:add_wallet_utxo(<<8:256>>, 0, Contrib,
                                                  wallet_script(), 1),
            Orig = honest_original(RecvScript),
-           MinRate = 50,
+           {ok, OrigTx} = beamchain_psbt:extract(Orig),
+           OrigVsize = beamchain_serialize:tx_vsize(OrigTx),
+           %% The Original's own rate (fee 1000), rounded down: reachable
+           %% with the receiver paying only its own input's fee.
+           MinRate = 1000 div OrigVsize,
+           ?assert(MinRate > 0),
            {ok, PJ} = beamchain_payjoin_server:build_payjoin_psbt(
-                        Orig, params(1, 300, MinRate),
+                        Orig, params(undefined, 0, MinRate),
                         whereis(beamchain_wallet)),
            [RecvOut, Change] = out_values(PJ),
+           ?assertEqual(49000, Change),
            Fee = 150000 + Contrib - (RecvOut + Change),
-           %% vsize upper bound: Original (finalized) + one P2WPKH input.
-           {ok, OrigTx} = beamchain_psbt:extract(Orig),
-           NewVsize = beamchain_serialize:tx_vsize(OrigTx) + 68,
-           ?assert(Fee >= MinRate * NewVsize),
-           %% Sender never pays more than it allowed.
-           ?assert(49000 - Change =< 300),
-           %% The receiver covers the rest out of its own contribution,
-           %% and still ends up strictly better off than the invoice.
+           ?assert(Fee >= MinRate * (OrigVsize + 68)),
+           %% The receiver paid its own input's fee and nothing more.
            ?assert(RecvOut > 100000),
-           ?assert(RecvOut =< 100000 + Contrib)
+           ?assert(100000 + Contrib - RecvOut =< 1000 * 68 div OrigVsize + 1)
+       end},
+      {"unreachable minfeerate: refused, receiver does not burn its coin",
+       fun() ->
+           RecvScript = wallet_script(),
+           ok = beamchain_wallet:add_wallet_utxo(<<8:256>>, 0, 200000,
+                                                 wallet_script(), 1),
+           Orig = honest_original(RecvScript),
+           R = beamchain_payjoin_server:build_payjoin_psbt(
+                 Orig, params(1, 300, 1000), whereis(beamchain_wallet)),
+           case R of
+               {ok, PJ} ->
+                   %% The receiver must not have paid 1000 sat/vB itself.
+                   [RecvOut, _] = out_values(PJ),
+                   ?assert(RecvOut >= 100000 + 200000 - 1000);
+               _ -> ok
+           end,
+           ?assertMatch({error, {original_rejected, _}}, R)
+       end}]}.
+
+%%% ===================================================================
+%%% payjoin_declared_input_value_not_trusted
+%%% ===================================================================
+
+%% The PSBT's witness_utxo values are only what the sender claims. A
+%% sender that overstates its input value inflates the Original's fee
+%% rate and, with it, the fee charged to the receiver's input. The
+%% handler prices the Original from the mempool dry-run instead
+%% (check_original_broadcastable -> #{original_fee, original_vsize}), and
+%% the builder refuses an Original whose declared fee disagrees.
+payjoin_declared_input_value_not_trusted_test_() ->
+    {setup,
+     fun start_seeded_wallet/0,
+     fun(_) -> stop_wallet() end,
+     fun(_) ->
+       ?_test(begin
+           ?assert(exported(beamchain_payjoin_server,
+                            check_original_broadcastable, 2)),
+           RecvScript = wallet_script(),
+           ok = beamchain_wallet:add_wallet_utxo(<<9:256>>, 0, 200000,
+                                                 wallet_script(), 1),
+           Tx = #transaction{version = 2, inputs = [txin(2)],
+                             outputs = [#tx_out{value = 100000,
+                                                script_pubkey = RecvScript},
+                                        #tx_out{value = 49000,
+                                                script_pubkey =
+                                                    sender_script(9)}],
+                             locktime = 0},
+           {ok, P0} = beamchain_psbt:create(Tx),
+           %% Real coin is 150000 (fee 1000); sender declares 250000.
+           Lying = finalized_input(P0, 0, utxo(250000, sender_script(1))),
+           {ok, LTx} = beamchain_psbt:extract(Lying),
+           VSize = beamchain_serialize:tx_vsize(LTx),
+           %% What the mempool would report for the real coin.
+           DryRun = fun(_) -> {ok, <<1:256>>, <<1:256>>, 1000, VSize,
+                               1000 / VSize} end,
+           {ok, Verified} =
+               beamchain_payjoin_server:check_original_broadcastable(
+                 Lying, DryRun),
+           ?assertEqual(#{original_fee => 1000, original_vsize => VSize},
+                        Verified),
+           Params = maps:merge(params(undefined, 0, 0), Verified),
+           R = beamchain_payjoin_server:build_payjoin_psbt(
+                 Lying, Params, whereis(beamchain_wallet)),
+           ?assertMatch({error, {original_rejected, _}}, R),
+           %% Control: the honest Original with the same verified numbers
+           %% goes through, and the receiver pays only its own input's
+           %% fee at the real rate.
+           Honest = honest_original(RecvScript),
+           {ok, PJ} = beamchain_payjoin_server:build_payjoin_psbt(
+                        Honest, Params, whereis(beamchain_wallet)),
+           [RecvOut, 49000] = out_values(PJ),
+           ?assert(100000 + 200000 - RecvOut =< 1000 * 68 div VSize + 1)
        end)
      end}.
 
