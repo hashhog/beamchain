@@ -166,6 +166,12 @@ stale_tip_detected(TryNew) ->
         false -> TryNew
     end.
 
+stale_peer_pass(TryNew, Now) ->
+    case hook(test_stale_peer_pass, 2) of
+        true -> beamchain_peer_manager:test_stale_peer_pass(TryNew, Now);
+        false -> pass(Now), TryNew
+    end.
+
 outbound_target(TryNew) ->
     case hook(test_outbound_target, 1) of
         true -> beamchain_peer_manager:test_outbound_target(TryNew);
@@ -320,7 +326,9 @@ extra_outbound_peer_trimmed() ->
     ok = beamchain_peer_manager:test_insert_peer(Old, outbound, full_relay,
                                                  normal),
     %% 9 full-relay, one over budget; 4 of the in-sync ones get m_protect.
-    pass(erlang:system_time(second)),
+    %% Core: after trimming, SetTryNewOutboundPeer(false) -- the stale tip
+    %% gets ONE extra peer per check, not one every 45 s pass.
+    ?assertEqual(false, stale_peer_pass(true, erlang:system_time(second))),
     Ev = evictions(),
     ?assertEqual([Old], [P || {P, "extra" ++ _} <- Ev]),
     stop_all([Old | Peers]).

@@ -120,6 +120,7 @@
          test_check_stale_peers/1,
          test_peer_message/3,
          test_stale_tip_detected/1,
+         test_stale_peer_pass/2,
          test_outbound_target/1,
          test_set_peer_info/2,
          test_get_token_bucket/1,
@@ -670,15 +671,12 @@ ensure_added_nodes_table() ->
 -spec update_peer_height(pid(), non_neg_integer()) -> ok.
 update_peer_height(Pid, Height) ->
     Now = erlang:system_time(second),
-    case ets:lookup(?PEER_TABLE, Pid) of
-        [Entry] ->
-            ets:insert(?PEER_TABLE, Entry#peer_entry{
-                best_height = Height,
-                last_block_time = Now
-            });
-        [] ->
-            ok
-    end.
+    %% update_element, not lookup+insert: this runs in header_sync's process
+    %% and must not overwrite the manager's concurrent chain-sync fields.
+    catch ets:update_element(?PEER_TABLE, Pid,
+                             [{#peer_entry.best_height, Height},
+                              {#peer_entry.last_block_time, Now}]),
+    ok.
 
 %% @doc Mark that we sent a getheaders request to this peer.
 %% Starts the headers response timeout tracking.
@@ -1465,9 +1463,9 @@ handle_info(cleanup_expired_bans, State) ->
 
 %% Periodic stale peer check
 handle_info(check_stale_peers, State) ->
-    check_stale_peers(),
+    State2 = after_stale_peer_pass(check_stale_peers(), State),
     Timer = erlang:send_after(?STALE_CHECK_INTERVAL, self(), check_stale_peers),
-    {noreply, State#state{stale_check_timer = Timer}};
+    {noreply, State2#state{stale_check_timer = Timer}};
 
 %% Evict a stale peer (called from check_stale_peers or peer process)
 handle_info({evict_peer, Pid, Reason}, State) ->
@@ -1793,7 +1791,7 @@ open_feeler(Address, State) ->
 %% @doc Outbound relay slot budget. Core ThreadOpenConnections: the full-relay
 %% + block-relay budget, plus ONE extra full-relay peer while
 %% m_try_another_outbound_peer is set (our tip may be stale). The extra peer
-%% is trimmed again by EvictExtraOutboundPeers (evict_extra_outbound_peers/1).
+%% is trimmed again by EvictExtraOutboundPeers (evict_extra_outbound_peers/2).
 outbound_target(#state{try_new_outbound = Extra}) ->
     Base = ?MAX_OUTBOUND_FULL_RELAY + ?MAX_BLOCK_RELAY_ONLY,
     case Extra of
@@ -3701,7 +3699,7 @@ shuffle(List) ->
 %% "worst" peer was usually an in-sync one (logged as "height 0, ours
 %% 975523"), and with eight outbound peers it took the node BELOW eight.
 %% Core never disconnects here; EvictExtraOutboundPeers trims the extra peer
-%% only once one is above the budget (evict_extra_outbound_peers/1).
+%% only once one is above the budget (evict_extra_outbound_peers/2).
 handle_stale_tip_detected(State) ->
     OurTipHeight = get_our_tip_height(),
     OutboundPeers = ets:foldl(fun
@@ -3825,6 +3823,14 @@ send_periodic_getheaders() ->
 check_stale_peers() ->
     check_stale_peers(erlang:system_time(second)).
 
+%% Core EvictExtraOutboundPeers: once the extra peer has been trimmed,
+%% SetTryNewOutboundPeer(false), so a stale tip opens ONE extra connection per
+%% stale-tip check rather than one every pass.
+after_stale_peer_pass(extra_evicted, State) ->
+    State#state{try_new_outbound = false};
+after_stale_peer_pass(_, State) ->
+    State.
+
 check_stale_peers(Now) ->
     OurTipHeight = get_our_tip_height(),
     NowMs = Now * 1000 + erlang:system_time(millisecond) rem 1000,
@@ -3850,18 +3856,23 @@ check_stale_peers(Now) ->
     %% Get network protection map (one per network type)
     ProtectedNetworks = get_protected_networks(OutboundPeers),
 
-    %% Check each peer for staleness
-    lists:foreach(fun(#peer_entry{pid = Pid}) ->
+    %% Check each peer for staleness; collect the peers asked to go.
+    Evicted = lists:filtermap(fun(#peer_entry{pid = Pid}) ->
         case ets:lookup(?PEER_TABLE, Pid) of
             [Entry] ->
-                check_peer_staleness(Entry, OurTipHeight, Now, NowMs,
-                                     ProtectedNetworks);
+                case check_peer_staleness(Entry, OurTipHeight, Now, NowMs,
+                                          ProtectedNetworks) of
+                    evict -> {true, Pid};
+                    _ -> false
+                end;
             [] ->
-                ok
+                false
         end
     end, OutboundPeers),
 
-    evict_extra_outbound_peers(Now).
+    %% Peers already being evicted this pass do not count (Core skips
+    %% fDisconnect nodes), so the two rules together never go below 8.
+    evict_extra_outbound_peers(Now, Evicted).
 
 %% @doc Core ProcessBlockAvailability: if the peer's last announced hash is
 %% now in our block index, raise its best known height to that block's.
@@ -3869,16 +3880,17 @@ check_stale_peers(Now) ->
 %% header has not been stored yet) and is retried on the next pass.
 process_block_availability(Pid, Now) ->
     case ets:lookup(?PEER_TABLE, Pid) of
-        [#peer_entry{announced_hash = Hash, best_height = Best} = E]
+        [#peer_entry{announced_hash = Hash, best_height = Best}]
           when is_binary(Hash) ->
             case lookup_block_height(Hash) of
                 {ok, H} when H > Best ->
-                    ets:insert(?PEER_TABLE, E#peer_entry{
-                        best_height = H, last_block_time = Now,
-                        announced_hash = undefined});
+                    ets:update_element(?PEER_TABLE, Pid,
+                                       [{#peer_entry.best_height, H},
+                                        {#peer_entry.last_block_time, Now},
+                                        {#peer_entry.announced_hash, undefined}]);
                 {ok, _} ->
-                    ets:insert(?PEER_TABLE,
-                               E#peer_entry{announced_hash = undefined});
+                    ets:update_element(?PEER_TABLE, Pid,
+                                       {#peer_entry.announced_hash, undefined});
                 unknown ->
                     ok
             end;
@@ -3913,13 +3925,13 @@ check_peer_staleness(#peer_entry{pid = Pid, connect_time = ConnTime,
                  (NowMs - HdrsSentAt) > ?HEADERS_RESPONSE_TIMEOUT of
                 true when not IsProtected ->
                     self() ! {evict_peer, Pid, "headers response timeout"},
-                    ok;
+                    evict;
                 _ ->
                     %% Check ping timeout (20 minutes)
                     case PingLatency > ?PING_TIMEOUT of
                         true when not IsProtected ->
                             self() ! {evict_peer, Pid, "ping timeout"},
-                            ok;
+                            evict;
                         _ ->
                             consider_eviction(Entry, OurTipHeight, Now,
                                               IsProtected)
@@ -3964,7 +3976,8 @@ consider_eviction(#peer_entry{direction = outbound, manual = false,
                                             "ours ~B; no catch-up ~B s after "
                                             "getheaders)",
                                             [Best, OurTipHeight,
-                                             ?HEADERS_RESPONSE_TIME])}
+                                             ?HEADERS_RESPONSE_TIME])},
+                    evict
             end;
         Now > Timeout ->
             %% m_work_header->pprev: a peer that is on our chain answers with
@@ -4017,12 +4030,17 @@ set_chain_sync(Pid, Timeout, WorkH, Sent) ->
 %% full-relay outbound peers than the budget (the stale-tip extra peer),
 %% disconnect the unprotected one whose last block announcement is oldest
 %% (ties: the most recently connected), once it has been up for at least
-%% MINIMUM_CONNECT_TIME. Never takes the count below the budget.
-evict_extra_outbound_peers(Now) ->
+%% MINIMUM_CONNECT_TIME. Never takes the count below the budget. Returns
+%% extra_evicted when it asked for a disconnect (the caller then clears
+%% try_new_outbound, as Core does).
+evict_extra_outbound_peers(Now, Evicting) ->
     Full = ets:foldl(fun
         (#peer_entry{direction = outbound, connected = true,
-                     conn_type = full_relay, manual = false} = E, Acc) ->
-            [E | Acc];
+                     conn_type = full_relay, manual = false, pid = P} = E, Acc) ->
+            case lists:member(P, Evicting) of
+                true -> Acc;
+                false -> [E | Acc]
+            end;
         (_, Acc) ->
             Acc
     end, [], ?PEER_TABLE),
@@ -4040,7 +4058,8 @@ evict_extra_outbound_peers(Now) ->
                 [#peer_entry{pid = Pid, connect_time = CT} | _]
                   when Now - CT >= ?MIN_CONNECT_TIME_FOR_EVICTION ->
                     self() ! {evict_peer, Pid,
-                              "extra outbound peer (oldest block announcement)"};
+                              "extra outbound peer (oldest block announcement)"},
+                    extra_evicted;
                 _ ->
                     ok
             end
@@ -4208,6 +4227,12 @@ test_ensure_peer_table() ->
 %% caller's mailbox as {evict_peer, Pid, Reason}.
 test_check_stale_peers(NowSec) ->
     check_stale_peers(NowSec).
+
+%% One stale-peer pass as the gen_server runs it; returns try_new_outbound.
+test_stale_peer_pass(TryNew, NowSec) ->
+    S = after_stale_peer_pass(check_stale_peers(NowSec),
+                              #state{try_new_outbound = TryNew}),
+    S#state.try_new_outbound.
 
 test_send_periodic_getheaders() ->
     send_periodic_getheaders().
