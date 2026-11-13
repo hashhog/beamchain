@@ -72,7 +72,9 @@
          pick_receiver_utxo_anti_fingerprint/3,
          bip78_error_body/2,
          uih_score/4,
-         compute_request_budget_ms/0]).
+         compute_request_budget_ms/0,
+         validate_original_psbt/1,
+         check_original_broadcastable/1]).
 
 %% Supported BIP-78 version. Today the spec defines v=1 only; v=2 was
 %% proposed (https://github.com/payjoin/bips/pull/1) but is not yet in
@@ -204,7 +206,22 @@ handle_psbt_bin_after_dedup(Req0, State, Params, PsbtBin) ->
                                             ValidateErr, Req0),
                     {ok, Req, State};
                 ok ->
-                    handle_validated(Req0, State, Params, OriginalPsbt)
+                    case check_original_broadcastable(OriginalPsbt) of
+                        ok ->
+                            handle_validated(Req0, State, Params,
+                                             OriginalPsbt);
+                        {error, {original_rejected, BMsg}} ->
+                            Req = bip78_error_reply(
+                                    400, <<"original-psbt-rejected">>,
+                                    BMsg, Req0),
+                            {ok, Req, State};
+                        {error, _} ->
+                            Req = bip78_error_reply(
+                                    503, <<"unavailable">>,
+                                    <<"receiver cannot check the Original "
+                                      "is broadcastable">>, Req0),
+                            {ok, Req, State}
+                    end
             end
     end.
 
@@ -241,6 +258,10 @@ handle_validated(Req0, State, Params, OriginalPsbt) ->
                                       "after backoff or fall back to "
                                       "broadcasting Original">>,
                                     Req0),
+            {ok, Req, State};
+        {error, {original_rejected, RejMsg}} ->
+            Req = bip78_error_reply(400, <<"original-psbt-rejected">>,
+                                    RejMsg, Req0),
             {ok, Req, State};
         {error, Other} ->
             Msg = iolist_to_binary(io_lib:format("~p", [Other])),
@@ -396,10 +417,11 @@ trim_trailing_ws(Bin) ->
 %% BIP-78 §"Receiver: validation of the original PSBT":
 %%   - All inputs MUST have witness_utxo or non_witness_utxo (so the
 %%     receiver can compute fees + scriptPubKey types).
-%%   - Inputs MUST be already signed (partial_sigs or final_*) — the
-%%     sender's role is "I committed to paying you, here's the proof".
-%%     We accept both partial_sigs (pre-finalize) and final_script_sig
-%%     / final_script_witness (already-finalized) per spec.
+%%   - The Original MUST be broadcastable: every input finalized
+%%     (final_script_sig / final_script_witness). A partial_sigs-only
+%%     input is not a signed transaction the receiver could broadcast
+%%     if the sender walks away, so it is refused. The mempool dry-run
+%%     itself is check_original_broadcastable/1, run by the handler.
 %%   - The unsigned tx itself must have at least one input and one output.
 validate_original_psbt(#psbt{unsigned_tx = Tx, inputs = InputMaps}) ->
     NumIn = length(Tx#transaction.inputs),
@@ -417,19 +439,43 @@ validate_inputs([], _) -> ok;
 validate_inputs([Map | Rest], Idx) ->
     HasUtxo = maps:is_key(witness_utxo, Map)
         orelse maps:is_key(non_witness_utxo, Map),
-    HasSig  = maps:is_key(partial_sigs, Map)
-        orelse maps:is_key(final_script_sig, Map)
-        orelse maps:is_key(final_script_witness, Map)
-        orelse maps:is_key(tap_key_sig, Map),
-    case {HasUtxo, HasSig} of
+    Final = maps:is_key(final_script_sig, Map)
+        orelse maps:is_key(final_script_witness, Map),
+    case {HasUtxo, Final} of
         {false, _} ->
             {error, iolist_to_binary(io_lib:format(
               "input ~B missing utxo info", [Idx]))};
         {_, false} ->
             {error, iolist_to_binary(io_lib:format(
-              "input ~B not signed", [Idx]))};
+              "input ~B not finalized", [Idx]))};
         {true, true} ->
             validate_inputs(Rest, Idx + 1)
+    end.
+
+%% BIP-78: "Verify that the transaction is broadcastable" (testmempoolaccept).
+%% Fails closed: with no mempool to ask, the Original is not accepted.
+check_original_broadcastable(OriginalPsbt) ->
+    case beamchain_psbt:extract(OriginalPsbt) of
+        {error, R} ->
+            {error, {original_rejected,
+                     iolist_to_binary(io_lib:format(
+                       "original not finalized: ~p", [R]))}};
+        {ok, Tx} ->
+            case whereis(beamchain_mempool) of
+                undefined ->
+                    {error, mempool_unavailable};
+                _ ->
+                    try beamchain_mempool:accept_to_memory_pool_dry_run(Tx) of
+                        {ok, _Txid, _Wtxid, _Fee, _VSize, _Rate} -> ok;
+                        {error, Reason} ->
+                            {error, {original_rejected,
+                                     iolist_to_binary(io_lib:format(
+                                       "original not broadcastable: ~p",
+                                       [Reason]))}}
+                    catch
+                        _:_ -> {error, mempool_unavailable}
+                    end
+            end
     end.
 
 %%% ===================================================================
@@ -499,101 +545,212 @@ compute_request_budget_ms() ->
 do_build_payjoin_psbt(OriginalPsbt, Params, WalletPid) ->
     Network = current_network(),
     OldTx = OriginalPsbt#psbt.unsigned_tx,
-    case pick_receiver_utxo_anti_fingerprint(
-           WalletPid, Network, OldTx) of
+    case inspect_original(OriginalPsbt, WalletPid, Network) of
+        {error, _} = E0 -> E0;
+        {ok, Orig} ->
+            case pick_receiver_utxo_anti_fingerprint(
+                   WalletPid, Network, OldTx) of
+                {error, _} = E -> E;
+                {ok, {Txid, Vout, Utxo}} ->
+                    build_and_sign(OriginalPsbt, Params, Orig,
+                                   {Txid, Vout, Utxo})
+            end
+    end.
+
+%% Everything the receiver must know about the Original before it adds a
+%% coin, and the BIP-78 checks that keep a sender from turning the
+%% receiver's signer against it:
+%%   - no Original input may be the receiver's: walletprocesspsbt would
+%%     otherwise sign it (BIP-78 "verify that none of the inputs in the
+%%     original PSBT belong to the receiver");
+%%   - every input value must be known, so the Original fee and fee rate
+%%     are real numbers and not the receiver's guess;
+%%   - there must be a receiver output to credit.
+inspect_original(#psbt{unsigned_tx = Tx, inputs = Maps} = Psbt,
+                 WalletPid, Network) ->
+    try
+        TxIns = Tx#transaction.inputs,
+        length(TxIns) =:= length(Maps) orelse
+            reject(<<"input count mismatch">>),
+        WalletOutpoints = sets:from_list(
+                            [{H, I} || {H, I, _} <- safe_get_wallet_utxos(
+                                                     WalletPid)]),
+        InValues = lists:zipwith(
+            fun(#tx_in{prev_out = #outpoint{hash = H, index = I}} = TxIn,
+                Map) ->
+                {Value, Script} = input_utxo(Map, TxIn),
+                (sets:is_element({H, I}, WalletOutpoints) orelse
+                 addr_is_wallet(WalletPid, Script, Network)) andalso
+                    reject(<<"original input belongs to the receiver">>),
+                Value
+            end, TxIns, Maps),
+        OutValues = [V || #tx_out{value = V} <- Tx#transaction.outputs],
+        OrigFee = lists:sum(InValues) - lists:sum(OutValues),
+        OrigFee >= 0 orelse reject(<<"original outputs exceed inputs">>),
+        RecvIdx = receiver_output_index(Tx#transaction.outputs, WalletPid,
+                                        Network),
+        RecvIdx =/= undefined orelse
+            reject(<<"original pays no receiver output">>),
+        OrigVsize = case beamchain_psbt:extract(Psbt) of
+                        {ok, FinalTx} -> beamchain_serialize:tx_vsize(FinalTx);
+                        {error, _} -> reject(<<"original not finalized">>)
+                    end,
+        {ok, #{fee => OrigFee, vsize => OrigVsize, recv_idx => RecvIdx}}
+    catch
+        throw:{original_rejected, Msg} -> {error, {original_rejected, Msg}}
+    end.
+
+reject(Msg) -> throw({original_rejected, Msg}).
+
+input_utxo(#{witness_utxo := {Value, Script}}, _TxIn)
+  when is_integer(Value), is_binary(Script) ->
+    {Value, Script};
+input_utxo(#{non_witness_utxo := #transaction{outputs = Outs}},
+           #tx_in{prev_out = #outpoint{index = I}}) when I < length(Outs) ->
+    #tx_out{value = V, script_pubkey = S} = lists:nth(I + 1, Outs),
+    {V, S};
+input_utxo(_, _) ->
+    reject(<<"original input missing utxo info">>).
+
+%% Index (0-based) of the first Original output the receiver's wallet owns.
+receiver_output_index(Outs, WalletPid, Network) ->
+    receiver_output_index(Outs, WalletPid, Network, 0).
+
+receiver_output_index([], _, _, _) -> undefined;
+receiver_output_index([#tx_out{script_pubkey = S} | Rest], W, N, I) ->
+    case addr_is_wallet(W, S, N) of
+        true -> I;
+        false -> receiver_output_index(Rest, W, N, I + 1)
+    end.
+
+build_and_sign(OriginalPsbt, Params, Orig, {Txid, Vout, Utxo}) ->
+    OldTx = OriginalPsbt#psbt.unsigned_tx,
+    %% G20 — record the picked script so the next request deprioritises
+    %% the same UTXO/script (best-effort).
+    catch beamchain_payjoin_state:remember_used_script(
+            Utxo#utxo.script_pubkey),
+    case payjoin_outputs(OldTx#transaction.outputs, Params, Orig, Utxo) of
         {error, _} = E -> E;
-        {ok, {Txid, Vout, Utxo}} ->
-            %% G20 — record the picked script so the next request
-            %% deprioritises the same UTXO/script. The write is best-
-            %% effort: if the ETS module is unavailable (e.g. tests
-            %% running with payjoin_state cleared) we silently skip.
-            catch beamchain_payjoin_state:remember_used_script(
-                    Utxo#utxo.script_pubkey),
-            %% Build the merged unsigned tx:
-            %%   - keep the sender's existing inputs and outputs intact
-            %%     (G7+G10 — we add inputs, we do not remove sender ones).
-            %%   - append our new tx_in with sequence 0xFFFFFFFD
-            %%     (BIP-125 RBF signal, consistent with sample_unsigned_tx).
-            %%   - optionally dock fees from
-            %%     additionalfeeoutputindex (G6+G9).
+        {ok, MergedOutputs} ->
+            %% Keep the sender's inputs; append ours with sequence
+            %% 0xFFFFFFFD (BIP-125 RBF signal).
             NewTxIn = #tx_in{
                 prev_out = #outpoint{hash = Txid, index = Vout},
                 script_sig = <<>>,
                 sequence = 16#fffffffd,
                 witness = []
             },
-            MergedInputs = OldTx#transaction.inputs ++ [NewTxIn],
-            MergedOutputs = maybe_dock_fee_output(
-                              OldTx#transaction.outputs, Params, Utxo),
             MergedTx = OldTx#transaction{
-                inputs = MergedInputs,
+                inputs = OldTx#transaction.inputs ++ [NewTxIn],
                 outputs = MergedOutputs
             },
-            %% Append a fresh input-map for the new input. Original
-            %% input-maps stay byte-equal (G10/G11 — sender's anti-snoop
-            %% receiver-side mirror: we touch nothing but our own input).
             NewInputMap = #{
                 witness_utxo => {Utxo#utxo.value, Utxo#utxo.script_pubkey},
                 utxo_record => Utxo
             },
-            MergedInputMaps = OriginalPsbt#psbt.inputs ++ [NewInputMap],
-            %% Output-maps: append an empty map for any new outputs we
-            %% would add (none in this MVP — fee adjustment shrinks an
-            %% existing output, doesn't append).
             MergedPsbt = OriginalPsbt#psbt{
                 unsigned_tx = MergedTx,
-                inputs = MergedInputMaps
+                inputs = OriginalPsbt#psbt.inputs ++ [NewInputMap]
             },
-            %% Sign the receiver input via the FIX-63 walletprocesspsbt
-            %% path (single-pipeline reuse — exercises
-            %% lookup_privkeys_for_inputs/3 indirectly via the wallet's
-            %% per-script-type signer).
-            MergedBin = beamchain_psbt:encode(MergedPsbt),
-            MergedB64 = base64:encode(MergedBin),
-            case beamchain_rpc:rpc_walletprocesspsbt(
-                   [MergedB64, true, <<"ALL">>, true, false], <<>>) of
-                {ok, #{<<"psbt">> := SignedB64}} ->
-                    case base64:decode(SignedB64) of
-                        SignedBin when is_binary(SignedBin) ->
-                            case beamchain_psbt:decode(SignedBin) of
-                                {ok, SignedPsbt} ->
-                                    {ok, SignedPsbt};
-                                {error, DErr} ->
-                                    {error, {round_trip_decode, DErr}}
-                            end;
-                        _ ->
-                            {error, {round_trip_b64, SignedB64}}
-                    end;
-                {error, -13, _} ->
-                    {error, {wallet_locked, locked}};
-                {error, Code, Msg} ->
-                    {error, {wpp_error, Code, Msg}};
-                Other ->
-                    {error, {wpp_unexpected, Other}}
-            end
+            sign_contributed_input(OriginalPsbt, MergedPsbt)
     end.
 
-maybe_dock_fee_output(Outs, #{additional_fee_output_index := undefined},
-                      _Utxo) ->
-    Outs;
-maybe_dock_fee_output(Outs, #{additional_fee_output_index := Idx,
-                              max_additional_fee_contribution := Max},
-                      _Utxo) when Max > 0, Idx >= 0, Idx < length(Outs) ->
-    OutAtIdx = lists:nth(Idx + 1, Outs),
-    %% Cap docking at Max sat AND keep the output above the dust
-    %% threshold. Sender asked us to dock from this output (G9), but
-    %% they did NOT ask us to dust them — anything that would push
-    %% below 546 sat we silently skip.
-    Dock = min(Max, OutAtIdx#tx_out.value - ?DUST_THRESHOLD_SAT),
-    case Dock > 0 of
-        true ->
-            NewOut = OutAtIdx#tx_out{value = OutAtIdx#tx_out.value - Dock},
-            replace_nth(Idx + 1, NewOut, Outs);
-        false ->
-            Outs
-    end;
-maybe_dock_fee_output(Outs, _Params, _Utxo) ->
-    Outs.
+%% Sign through the FIX-63 walletprocesspsbt path (single signing
+%% pipeline), then keep ONLY the contributed input's signed map. Every
+%% Original input map goes back exactly as the sender sent it: whatever
+%% walletprocesspsbt produced for those is discarded, so the receiver's
+%% keys never sign a coin it did not choose to contribute.
+sign_contributed_input(OriginalPsbt, MergedPsbt) ->
+    MergedB64 = base64:encode(beamchain_psbt:encode(MergedPsbt)),
+    case beamchain_rpc:rpc_walletprocesspsbt(
+           [MergedB64, true, <<"ALL">>, true, false], <<>>) of
+        {ok, #{<<"psbt">> := SignedB64}} ->
+            case beamchain_psbt:decode(base64:decode(SignedB64)) of
+                {ok, SignedPsbt} ->
+                    OurMap = lists:last(SignedPsbt#psbt.inputs),
+                    case input_signed(OurMap) of
+                        true ->
+                            {ok, SignedPsbt#psbt{
+                                   inputs = OriginalPsbt#psbt.inputs
+                                            ++ [OurMap]}};
+                        false ->
+                            {error, receiver_input_not_signed}
+                    end;
+                {error, DErr} ->
+                    {error, {round_trip_decode, DErr}}
+            end;
+        {error, -13, _} ->
+            {error, {wallet_locked, locked}};
+        {error, Code, Msg} ->
+            {error, {wpp_error, Code, Msg}};
+        Other ->
+            {error, {wpp_unexpected, Other}}
+    end.
+
+input_signed(Map) ->
+    maps:is_key(partial_sigs, Map) orelse
+        maps:is_key(final_script_sig, Map) orelse
+        maps:is_key(final_script_witness, Map) orelse
+        maps:is_key(tap_key_sig, Map).
+
+%% Outputs of the payjoin proposal (BIP-78 receiver):
+%%   - the receiver output grows by the contributed value, less whatever
+%%     part of the contributed input's fee the sender does not pay;
+%%   - the sender pays at most the contributed input's fee at the
+%%     Original's fee rate, capped by maxadditionalfeecontribution, taken
+%%     from additionalfeeoutputindex (never the receiver output, never
+%%     below dust);
+%%   - minfeerate: the receiver tops up so the proposal's fee rate is at
+%%     least minfeerate sat/vB.
+payjoin_outputs(Outs, Params, #{fee := OrigFee, vsize := OrigVsize,
+                                recv_idx := RecvIdx}, Utxo) ->
+    InVsize = input_vsize_estimate(Utxo#utxo.script_pubkey),
+    MinRate = maps:get(min_fee_rate, Params, 0),
+    AtOrigRate = ceil_div(OrigFee * InVsize, max(OrigVsize, 1)),
+    ForMinRate = MinRate * (OrigVsize + InVsize) - OrigFee,
+    Required = lists:max([AtOrigRate, ForMinRate, 0]),
+    SenderPays = sender_fee_share(Outs, Params, RecvIdx,
+                                  min(Required, AtOrigRate)),
+    ReceiverPays = Required - SenderPays,
+    Contributed = Utxo#utxo.value,
+    case Contributed - ReceiverPays of
+        Credit when Credit > 0 ->
+            Outs1 = adjust_nth(RecvIdx + 1, Credit, Outs),
+            Outs2 = case SenderPays of
+                        0 -> Outs1;
+                        _ -> adjust_nth(maps:get(additional_fee_output_index,
+                                                 Params) + 1,
+                                        -SenderPays, Outs1)
+                    end,
+            {ok, Outs2};
+        _ ->
+            {error, no_eligible_utxo}
+    end.
+
+sender_fee_share(Outs, #{additional_fee_output_index := Idx,
+                         max_additional_fee_contribution := Max},
+                 RecvIdx, Want)
+  when is_integer(Idx), Idx >= 0, Idx < length(Outs), Idx =/= RecvIdx,
+       Max > 0 ->
+    #tx_out{value = V} = lists:nth(Idx + 1, Outs),
+    max(0, lists:min([Want, Max, V - ?DUST_THRESHOLD_SAT]));
+sender_fee_share(_, _, _, _) ->
+    0.
+
+adjust_nth(N, Delta, Outs) ->
+    Out = lists:nth(N, Outs),
+    replace_nth(N, Out#tx_out{value = Out#tx_out.value + Delta}, Outs).
+
+ceil_div(A, B) -> (A + B - 1) div B.
+
+%% Spending vsize of one input of the receiver's script type (signed).
+input_vsize_estimate(Script) ->
+    case beamchain_address:classify_script(Script) of
+        p2wpkh -> 68;
+        p2tr   -> 58;
+        p2sh   -> 91;
+        _      -> 148
+    end.
 
 replace_nth(1, X, [_ | T]) -> [X | T];
 replace_nth(N, X, [H | T]) when N > 1 -> [H | replace_nth(N - 1, X, T)];

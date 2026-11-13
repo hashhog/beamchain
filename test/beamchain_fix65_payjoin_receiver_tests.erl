@@ -117,15 +117,16 @@ build_original_psbt(SenderInputScript, ReceiverPaymentScript,
     },
     {ok, P0} = beamchain_psbt:create(Tx),
     SenderUtxo = mk_utxo(150000, SenderInputScript),
-    %% Attach witness_utxo + a fake partial_sigs entry so validation
-    %% passes. The receiver does NOT cryptographically verify the
-    %% sender's signature today (Core has no PayJoin support to mirror;
-    %% the spec is implementation-defined here).
+    %% Attach witness_utxo + a fake final witness. BIP-78 requires the
+    %% Original to be broadcastable, i.e. every input finalized, so the
+    %% receiver refuses a partial_sigs-only Original (the HTTP handler
+    %% then runs the mempool dry-run, which this direct builder call
+    %% skips; the dummy signature itself is never verified here).
     P1 = beamchain_wallet:add_witness_utxo(P0, 0, SenderUtxo),
     [InputMap0] = P1#psbt.inputs,
     FakeSig = <<48, 6, 2, 1, 1, 2, 1, 1, 1>>,    % dummy DER, ignored
     FakePubKey = <<2, 0:8/unit:8, 0:8/unit:8, 0:8/unit:8, 0:8/unit:8>>,
-    InputMap1 = InputMap0#{partial_sigs => #{FakePubKey => FakeSig}},
+    InputMap1 = InputMap0#{final_script_witness => [FakeSig, FakePubKey]},
     NewInputs = [InputMap1],
     P1#psbt{inputs = NewInputs}.
 
