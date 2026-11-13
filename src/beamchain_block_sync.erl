@@ -38,6 +38,7 @@
          handle_cmpctblock/2,
          handle_blocktxn/2,
          get_status/0,
+         peer_has_blocks_in_flight/1,
          is_too_far_ahead/2,
          is_cmpctblock_too_deep/2,
          max_downloaded_ahead/0,
@@ -339,6 +340,13 @@ handle_blocktxn(Peer, BlockTxn) ->
 get_status() ->
     gen_server:call(?SERVER, get_status).
 
+%% @doc Whether Peer owns any block request in flight (Core
+%% CNodeState::vBlocksInFlight non-empty). Used by the peer manager's
+%% EvictExtraOutboundPeers so it never drops a peer we are downloading from.
+-spec peer_has_blocks_in_flight(pid()) -> boolean().
+peer_has_blocks_in_flight(Peer) ->
+    gen_server:call(?SERVER, {peer_has_blocks_in_flight, Peer}, 2000).
+
 %%% ===================================================================
 %%% gen_server callbacks
 %%% ===================================================================
@@ -357,6 +365,10 @@ init([]) ->
     {ok, #state{params = Params, assume_valid = AssumeValid,
                 assume_valid_height = AVHeight}}.
 
+handle_call({peer_has_blocks_in_flight, Peer}, _From,
+            #state{in_flight = InFlight} = State) ->
+    {reply, lists:any(fun({P, _, _}) -> P =:= Peer end,
+                      maps:values(InFlight)), State};
 handle_call(get_status, _From, State) ->
     Status = #{
         status => State#state.status,
