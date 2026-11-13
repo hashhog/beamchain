@@ -238,6 +238,14 @@ parse_args(["--rpcbind", Value | Rest], Cmd, Opts) ->
 parse_args(["--rpcbind=" ++ Value | Rest], Cmd, Opts) ->
     parse_args(Rest, Cmd, Opts#{rpc_bind => Value});
 
+%% --metricsbind=<addr>: address the Prometheus /metrics listener binds.
+%% Default 127.0.0.1; the endpoint is unauthenticated, so expose it only
+%% on purpose.
+parse_args(["--metricsbind", Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{metrics_bind => Value});
+parse_args(["--metricsbind=" ++ Value | Rest], Cmd, Opts) ->
+    parse_args(Rest, Cmd, Opts#{metrics_bind => Value});
+
 parse_args(["--p2p-port", Value | Rest], Cmd, Opts) ->
     parse_args(Rest, Cmd, Opts#{p2p_port => list_to_integer(Value)});
 parse_args(["--p2p-port=" ++ Value | Rest], Cmd, Opts) ->
@@ -466,6 +474,8 @@ print_usage() ->
         "  --conf=<file>     config file (default: <datadir>/beamchain.conf)~n"
         "  --rpc-port=<n>    rpc port override~n"
         "  --rpcbind=<addr>  rpc listen address (default: 127.0.0.1)~n"
+        "  --metricsbind=<addr>  prometheus /metrics listen address~n"
+        "                    (default: 127.0.0.1)~n"
         "  --p2p-port=<n>    p2p port override~n"
         "  --connect=<ip:port>  connect ONLY to this peer (repeatable);~n"
         "                    disables DNS seeds + addrman auto-outbound~n"
@@ -916,6 +926,10 @@ apply_opts(Opts) ->
         undefined -> ok;
         RpcBind -> application:set_env(beamchain, rpcbind, RpcBind, [{persistent, true}])
     end,
+    case maps:get(metrics_bind, Opts, undefined) of
+        undefined -> ok;
+        MetricsBind -> application:set_env(beamchain, metricsbind, MetricsBind, [{persistent, true}])
+    end,
     case maps:get(p2p_port, Opts, undefined) of
         undefined -> ok;
         P2pPort -> application:set_env(beamchain, p2pport, P2pPort, [{persistent, true}])
@@ -1346,6 +1360,7 @@ rebuild_argv_for_daemon(Opts) ->
     Datadir = maps:get(datadir, Opts, undefined),
     RpcPort = maps:get(rpc_port, Opts, undefined),
     RpcBind = maps:get(rpc_bind, Opts, undefined),
+    MetricsBind = maps:get(metrics_bind, Opts, undefined),
     P2PPort = maps:get(p2p_port, Opts, undefined),
     PidFile = maps:get(pidfile, Opts, undefined),
     Conf    = maps:get(conf, Opts, undefined),
@@ -1358,6 +1373,7 @@ rebuild_argv_for_daemon(Opts) ->
         opt("--datadir=", Datadir, fun id/1),
         opt("--rpc-port=", RpcPort, fun integer_to_list/1),
         opt("--rpcbind=", RpcBind, fun id/1),
+        opt("--metricsbind=", MetricsBind, fun id/1),
         opt("--p2p-port=", P2PPort, fun integer_to_list/1),
         opt("--pid=", PidFile, fun id/1),
         opt("--conf=", Conf, fun id/1),
