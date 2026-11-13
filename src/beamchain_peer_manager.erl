@@ -129,6 +129,7 @@
          test_handle_addrv2/3,
          test_handle_getaddr/2,
          test_peer_field/2,
+         load_bans/1,
          clamp_addr_timestamp/2]).
 -endif.
 
@@ -3110,8 +3111,14 @@ save_bans(DataDir) ->
         BanList = get_ban_list_internal(),
         Entries = lists:map(fun({IP, BanExpiry}) ->
             IPStr = inet:ntoa(IP),
-            #{<<"ip">> => list_to_binary(IPStr),
-              <<"until_timestamp">> => BanExpiry}
+            Base = #{<<"ip">> => list_to_binary(IPStr),
+                     <<"until_timestamp">> => BanExpiry},
+            %% Mark discouragements so load_bans/1 re-indexes them under the
+            %% cap; rows without the key load as operator bans.
+            case is_indexed_discouragement(IP, BanExpiry) of
+                true -> Base#{<<"discouraged">> => true};
+                false -> Base
+            end
         end, BanList),
         Json = jsx:encode(Entries),
         Path = filename:join(DataDir, "banned.json"),
@@ -3119,6 +3126,10 @@ save_bans(DataDir) ->
     catch
         Class:Err -> {error, {Class, Err}}
     end.
+
+is_indexed_discouragement(IP, BanExpiry) ->
+    ets:info(?DISCOURAGED_INDEX) =/= undefined andalso
+        ets:member(?DISCOURAGED_INDEX, {BanExpiry, IP}).
 
 %% Schedule one banned.json dump if none is pending.
 mark_bans_dirty(#state{ban_dump_timer = undefined} = State) ->
@@ -3195,7 +3206,11 @@ load_bans(DataDir) ->
                     BanExpiry = maps:get(<<"until_timestamp">>, Entry),
                     case inet:parse_address(IPStr) of
                         {ok, IP} when BanExpiry > Now ->
-                            ets:insert(?BANNED_PEERS_TABLE, {IP, BanExpiry});
+                            case maps:get(<<"discouraged">>, Entry, false) of
+                                true -> discourage_ip(IP, BanExpiry);
+                                _ -> ets:insert(?BANNED_PEERS_TABLE,
+                                                {IP, BanExpiry})
+                            end;
                         _ ->
                             ok
                     end

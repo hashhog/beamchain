@@ -1274,7 +1274,18 @@ ban_flood_body(#{full := FullDir, ok := OkDir}) ->
     ?assertEqual(Size, length(Entries)),
     Ips = [maps:get(<<"ip">>, E) || E <- Entries],
     ?assert(lists:member(list_to_binary(inet:ntoa(Ip(?BAN_FLOOD))), Ips)),
-    ?assert(lists:member(<<"203.0.113.7">>, Ips)).
+    ?assert(lists:member(<<"203.0.113.7">>, Ips)),
+    %% Discouragements are flagged on disk and reload under the cap; the
+    %% operator ban reloads as an operator ban (not evictable).
+    Flagged = [E || E <- Entries, maps:get(<<"discouraged">>, E, false)],
+    ?assertEqual(Size - 1, length(Flagged)),
+    ets:delete_all_objects(banned_peers),
+    ets:delete_all_objects(banned_peers_discouraged_idx),
+    beamchain_peer_manager:load_bans(OkDir),
+    ?assertEqual(Size, ets:info(banned_peers, size)),
+    ?assertEqual(Size - 1, ets:info(banned_peers_discouraged_idx, size)),
+    [{Manual, ManualExp}] = ets:lookup(banned_peers, Manual),
+    ?assertNot(ets:member(banned_peers_discouraged_idx, {ManualExp, Manual})).
 
 %% 1-based tuple position of Field in record Rec of beamchain_peer_manager.
 record_field_pos(Rec, Field) ->
