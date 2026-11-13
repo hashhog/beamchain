@@ -28,6 +28,7 @@
          handle_peer_connected/2,
          handle_peer_disconnected/1,
          probe_peer/1,
+         send_chain_sync_getheaders/2,
          invalid_block_found/3,
          best_header_invalidated/2,
          best_header_reconsidered/2,
@@ -171,6 +172,15 @@ handle_peer_disconnected(Peer) ->
 -spec probe_peer(pid()) -> ok.
 probe_peer(Peer) ->
     gen_server:cast(?SERVER, {probe_peer, Peer}).
+
+%% @doc Core ConsiderEviction's chain-sync challenge: send Peer ONE getheaders
+%% whose locator starts at our block at Height (m_work_header->pprev). A peer
+%% on our chain answers with at least m_work_header, which peer_manager
+%% records as the peer's best known block. Does not touch the sync state:
+%% the reply is processed like any other headers message.
+-spec send_chain_sync_getheaders(pid(), non_neg_integer()) -> ok.
+send_chain_sync_getheaders(Peer, Height) ->
+    gen_server:cast(?SERVER, {chain_sync_getheaders, Peer, Height}).
 
 %% @doc Block sync found the block at Height on our header chain consensus-
 %% invalid (already marked via beamchain_chainstate:invalid_block_found/1).
@@ -388,6 +398,20 @@ handle_cast({probe_peer, Peer}, State) ->
                 [Peer, State#state.status, State#state.sync_peer]),
     {noreply, State};
 
+handle_cast({chain_sync_getheaders, Peer, Height}, State) ->
+    case catch beamchain_db:get_block_index(Height) of
+        {ok, #{hash := Hash}} ->
+            Locator = build_block_locator(Height, Hash),
+            beamchain_peer:send_message(Peer,
+                {getheaders, #{version => ?PROTOCOL_VERSION,
+                               locators => Locator,
+                               stop_hash => <<0:256>>}}),
+            logger:info("header_sync: chain-sync getheaders to ~p from "
+                        "height ~B", [Peer, Height]);
+        _ ->
+            ok
+    end,
+    {noreply, State};
 handle_cast({invalid_block_found, Hash, Height, Culprit}, State) ->
     {noreply, do_invalid_block_found(Hash, Height, Culprit, State)};
 handle_cast({best_header_invalidated, ChainTipHash, ChainTipHeight}, State) ->
