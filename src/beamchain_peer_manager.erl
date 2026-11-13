@@ -683,31 +683,23 @@ update_peer_height(Pid, Height) ->
 -spec mark_getheaders_sent(pid()) -> ok.
 mark_getheaders_sent(Pid) ->
     Now = erlang:system_time(millisecond),
-    case ets:lookup(?PEER_TABLE, Pid) of
-        [Entry] ->
-            ets:insert(?PEER_TABLE, Entry#peer_entry{
-                pending_getheaders = true,
-                getheaders_sent_at = Now
-            });
-        [] ->
-            ok
-    end.
+    %% update_element: called from header_sync's process; must not overwrite
+    %% the manager's concurrent writes to other fields.
+    catch ets:update_element(?PEER_TABLE, Pid,
+                             [{#peer_entry.pending_getheaders, true},
+                              {#peer_entry.getheaders_sent_at, Now}]),
+    ok.
 
 %% @doc Mark that we received a headers response from this peer.
 %% Clears the pending headers flag.
 -spec mark_headers_received(pid()) -> ok.
 mark_headers_received(Pid) ->
     Now = erlang:system_time(second),
-    case ets:lookup(?PEER_TABLE, Pid) of
-        [Entry] ->
-            ets:insert(?PEER_TABLE, Entry#peer_entry{
-                pending_getheaders = false,
-                getheaders_sent_at = 0,
-                last_headers_time = Now
-            });
-        [] ->
-            ok
-    end.
+    catch ets:update_element(?PEER_TABLE, Pid,
+                             [{#peer_entry.pending_getheaders, false},
+                              {#peer_entry.getheaders_sent_at, 0},
+                              {#peer_entry.last_headers_time, Now}]),
+    ok.
 
 %% @doc Update a peer's ping latency.
 %% Called when we receive a pong response.
@@ -4030,7 +4022,9 @@ set_chain_sync(Pid, Timeout, WorkH, Sent) ->
 %% full-relay outbound peers than the budget (the stale-tip extra peer),
 %% disconnect the unprotected one whose last block announcement is oldest
 %% (ties: the most recently connected), once it has been up for at least
-%% MINIMUM_CONNECT_TIME. Never takes the count below the budget. Returns
+%% MINIMUM_CONNECT_TIME and owns no block in flight; the only full-relay /
+%% manual peer on a network is never chosen. Never takes the count below
+%% the budget. Returns
 %% extra_evicted when it asked for a disconnect (the caller then clears
 %% try_new_outbound, as Core does).
 evict_extra_outbound_peers(Now, Evicting) ->
@@ -4048,7 +4042,25 @@ evict_extra_outbound_peers(Now, Evicting) ->
         false ->
             ok;
         true ->
-            Candidates = [E || #peer_entry{chain_sync_protect = false} = E <- Full],
+            %% Core MultipleManualOrFullOutboundConns: the only full-relay or
+            %% manual outbound peer on a network is never the extra peer.
+            NetCounts = ets:foldl(fun
+                (#peer_entry{direction = outbound, connected = true,
+                             conn_type = full_relay, network_type = N,
+                             pid = P}, Acc) ->
+                    case lists:member(P, Evicting) of
+                        true -> Acc;
+                        false -> maps:update_with(N, fun(C) -> C + 1 end, 1, Acc)
+                    end;
+                (#peer_entry{direction = outbound, connected = true,
+                             manual = true, network_type = N}, Acc) ->
+                    maps:update_with(N, fun(C) -> C + 1 end, 1, Acc);
+                (_, Acc) ->
+                    Acc
+            end, #{}, ?PEER_TABLE),
+            Candidates = [E || #peer_entry{chain_sync_protect = false,
+                                           network_type = N} = E <- Full,
+                               maps:get(N, NetCounts, 0) > 1],
             Sorted = lists:sort(
                 fun(#peer_entry{last_block_time = A, connect_time = CA},
                     #peer_entry{last_block_time = B, connect_time = CB}) ->
@@ -4057,12 +4069,29 @@ evict_extra_outbound_peers(Now, Evicting) ->
             case Sorted of
                 [#peer_entry{pid = Pid, connect_time = CT} | _]
                   when Now - CT >= ?MIN_CONNECT_TIME_FOR_EVICTION ->
-                    self() ! {evict_peer, Pid,
-                              "extra outbound peer (oldest block announcement)"},
-                    extra_evicted;
+                    %% Core: never drop a peer we are downloading a block
+                    %% from; like Core, skip this round rather than pick the
+                    %% next peer. An unreachable block_sync counts as busy.
+                    case blocks_in_flight(Pid) of
+                        false ->
+                            self() ! {evict_peer, Pid,
+                                      "extra outbound peer (oldest block "
+                                      "announcement)"},
+                            extra_evicted;
+                        true ->
+                            ok
+                    end;
                 _ ->
                     ok
             end
+    end.
+
+blocks_in_flight(Pid) ->
+    try beamchain_block_sync:peer_has_blocks_in_flight(Pid) of
+        false -> false;
+        _ -> true
+    catch
+        _:_ -> true
     end.
 
 %% @doc Core UpdateBlockAvailability: remember the block a peer announced
@@ -4291,6 +4320,8 @@ test_set_token_bucket(Pid, Bucket, BackdateMs) ->
 test_peer_field(Pid, getaddr_recvd) ->
     [#peer_entry{getaddr_recvd = V}] = ets:lookup(?PEER_TABLE, Pid),
     V;
+test_peer_field(Pid, {set_network, N}) ->
+    ets:update_element(?PEER_TABLE, Pid, {#peer_entry.network_type, N});
 test_peer_field(Pid, best_height) ->
     [#peer_entry{best_height = V}] = ets:lookup(?PEER_TABLE, Pid),
     V.

@@ -64,6 +64,8 @@ setup() ->
     ok = meck:expect(beamchain_header_sync, handle_peer_connected,
                      fun(_, _) -> ok end),
     ok = meck:expect(beamchain_block_sync, start_sync, fun(_) -> ok end),
+    ok = meck:expect(beamchain_block_sync, peer_has_blocks_in_flight,
+                     fun(_) -> false end),
     ok = meck:expect(beamchain_peer, disconnect, fun(_) -> ok end),
     flush(),
     ok.
@@ -97,6 +99,12 @@ stale_eviction_test_() ->
       fun(_) -> {"4b: above the budget, exactly the extra peer with the "
                  "oldest block announcement is evicted",
                  fun extra_outbound_peer_trimmed/0} end,
+      fun(_) -> {"4c: the extra-peer trim never picks the only full-relay "
+                 "peer on its network",
+                 fun extra_trim_skips_sole_network_peer/0} end,
+      fun(_) -> {"4d: the extra-peer trim skips a round while the worst "
+                 "peer has blocks in flight",
+                 fun extra_trim_waits_for_blocks_in_flight/0} end,
       fun(_) -> {"negative control: a peer that stays on an old chain IS "
                  "evicted (anti-eclipse rule kept)",
                  fun peer_on_old_chain_evicted/0} end,
@@ -170,6 +178,11 @@ stale_peer_pass(TryNew, Now) ->
     case hook(test_stale_peer_pass, 2) of
         true -> beamchain_peer_manager:test_stale_peer_pass(TryNew, Now);
         false -> pass(Now), TryNew
+    end.
+
+set_network(P, Net) ->
+    try beamchain_peer_manager:test_peer_field(P, {set_network, Net})
+    catch error:function_clause -> ok   %% master: no such hook
     end.
 
 outbound_target(TryNew) ->
@@ -331,6 +344,38 @@ extra_outbound_peer_trimmed() ->
     ?assertEqual(false, stale_peer_pass(true, erlang:system_time(second))),
     Ev = evictions(),
     ?assertEqual([Old], [P || {P, "extra" ++ _} <- Ev]),
+    stop_all([Old | Peers]).
+
+extra_trim_skips_sole_network_peer() ->
+    Peers = outbound(8),
+    [beamchain_peer_manager:update_peer_height(P, ?TIP) || P <- Peers],
+    %% Two more full-relay peers with no block announcement at all (the
+    %% oldest): one is our only Tor peer, the other IPv4. Two over budget.
+    [Tor, V4] = outbound(2),
+    set_network(Tor, tor),
+    T0 = erlang:system_time(second),
+    pass(T0),
+    Ev1 = [P || {P, "extra" ++ _} <- evictions()],
+    ?assertEqual([V4], Ev1),
+    pass(T0 + 45),
+    ?assertNot(lists:member(Tor, [P || {P, "extra" ++ _} <- evictions()])),
+    stop_all([Tor, V4 | Peers]).
+
+extra_trim_waits_for_blocks_in_flight() ->
+    Peers = outbound(8),
+    [beamchain_peer_manager:update_peer_height(P, ?TIP) || P <- Peers],
+    [Old] = outbound(1),
+    ok = meck:expect(beamchain_block_sync, peer_has_blocks_in_flight,
+                     fun(P) -> P =:= Old end),
+    T0 = erlang:system_time(second),
+    %% Old is downloading a block for us: no trim this round, flag kept.
+    ?assertEqual(true, stale_peer_pass(true, T0)),
+    ?assertEqual([], [P || {P, "extra" ++ _} <- evictions()]),
+    %% Download done: the next pass trims it and clears the flag.
+    ok = meck:expect(beamchain_block_sync, peer_has_blocks_in_flight,
+                     fun(_) -> false end),
+    ?assertEqual(false, stale_peer_pass(true, T0 + 45)),
+    ?assertEqual([Old], [P || {P, "extra" ++ _} <- evictions()]),
     stop_all([Old | Peers]).
 
 %%% ===================================================================
