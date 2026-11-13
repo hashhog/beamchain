@@ -139,11 +139,12 @@ with_metrics(Bind, Fun) ->
     PrevPort = application:get_env(beamchain, metrics_port),
     application:set_env(beamchain, metrics_port, Port),
     with_cfg(metricsbind, Bind, fun() ->
-        process_flag(trap_exit, true),
+        PrevTrap = process_flag(trap_exit, true),
         {ok, Pid} = beamchain_metrics:start_link(),
         try
             Fun(Port)
         after
+            process_flag(trap_exit, PrevTrap),
             unlink(Pid),
             exit(Pid, shutdown),
             wait_dead(Pid),
@@ -174,8 +175,10 @@ ranch_ref_or_undefined() ->
     catch _:_ -> undefined
     end.
 
+%% Probe on every interface: the explicit 0.0.0.0 test binds the same port
+%% there, so a port free only on loopback would not do.
 free_port() ->
-    {ok, L} = gen_tcp:listen(0, [{ip, {127, 0, 0, 1}}]),
+    {ok, L} = gen_tcp:listen(0, [{ip, {0, 0, 0, 0}}]),
     {ok, P} = inet:port(L),
     gen_tcp:close(L),
     P.
