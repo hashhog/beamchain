@@ -610,10 +610,11 @@ inspect_original(#psbt{unsigned_tx = Tx, inputs = Maps} = Psbt, Params,
         OutValues = [V || #tx_out{value = V} <- Tx#transaction.outputs],
         OrigFee = lists:sum(InValues) - lists:sum(OutValues),
         OrigFee >= 0 orelse reject(<<"original outputs exceed inputs">>),
-        RecvIdx = receiver_output_index(Tx#transaction.outputs, WalletPid,
-                                        Network),
-        RecvIdx =/= undefined orelse
+        RecvIdxs = receiver_output_indices(Tx#transaction.outputs,
+                                           WalletPid, Network),
+        RecvIdxs =/= [] orelse
             reject(<<"original pays no receiver output">>),
+        RecvIdx = hd(RecvIdxs),
         OrigVsize0 = case beamchain_psbt:extract(Psbt) of
                          {ok, FinalTx} -> beamchain_serialize:tx_vsize(FinalTx);
                          {error, _} -> reject(<<"original not finalized">>)
@@ -633,7 +634,8 @@ inspect_original(#psbt{unsigned_tx = Tx, inputs = Maps} = Psbt, Params,
                 _ ->
                     {OrigFee, OrigVsize0}
             end,
-        {ok, #{fee => Fee, vsize => Vsize, recv_idx => RecvIdx}}
+        {ok, #{fee => Fee, vsize => Vsize, recv_idx => RecvIdx,
+               recv_idxs => RecvIdxs}}
     catch
         throw:{original_rejected, Msg} -> {error, {original_rejected, Msg}}
     end.
@@ -650,16 +652,12 @@ input_utxo(#{non_witness_utxo := #transaction{outputs = Outs}},
 input_utxo(_, _) ->
     reject(<<"original input missing utxo info">>).
 
-%% Index (0-based) of the first Original output the receiver's wallet owns.
-receiver_output_index(Outs, WalletPid, Network) ->
-    receiver_output_index(Outs, WalletPid, Network, 0).
-
-receiver_output_index([], _, _, _) -> undefined;
-receiver_output_index([#tx_out{script_pubkey = S} | Rest], W, N, I) ->
-    case addr_is_wallet(W, S, N) of
-        true -> I;
-        false -> receiver_output_index(Rest, W, N, I + 1)
-    end.
+%% Indices (0-based) of every Original output the receiver's wallet owns.
+%% The first is the one credited; none of them may pay the sender's fee.
+receiver_output_indices(Outs, WalletPid, Network) ->
+    [I || {I, #tx_out{script_pubkey = S}}
+              <- lists:zip(lists:seq(0, length(Outs) - 1), Outs),
+          addr_is_wallet(WalletPid, S, Network)].
 
 build_and_sign(OriginalPsbt, Params, Orig, {Txid, Vout, Utxo}) ->
     OldTx = OriginalPsbt#psbt.unsigned_tx,
@@ -735,8 +733,8 @@ input_signed(Map) ->
 %%   - the contributed input costs InVsize * (Original fee rate) in fee.
 %%     The sender pays as much of that as maxadditionalfeecontribution
 %%     allows, taken from
-%%     additionalfeeoutputindex: never the receiver output, never below
-%%     dust. The receiver pays the rest;
+%%     additionalfeeoutputindex: never an output the receiver owns,
+%%     never below dust. The receiver pays the rest;
 %%   - minfeerate: the proposal must reach it. The receiver never pays
 %%     more than its own input's fee at the Original rate, so a sender
 %%     cannot name a huge minfeerate and have the receiver's coin burnt
@@ -745,12 +743,13 @@ input_signed(Map) ->
 %%   - the receiver output grows by the contributed value less the
 %%     receiver's share of the fee.
 payjoin_outputs(Outs, Params, #{fee := OrigFee, vsize := OrigVsize,
-                                recv_idx := RecvIdx}, Utxo) ->
+                                recv_idx := RecvIdx, recv_idxs := RecvIdxs},
+                Utxo) ->
     InVsize = input_vsize_estimate(Utxo#utxo.script_pubkey),
     MinRate = maps:get(min_fee_rate, Params, 0),
     OrigVsize1 = max(OrigVsize, 1),
     InFee = ceil_div(OrigFee * InVsize, OrigVsize1),
-    SenderPays = sender_fee_share(Outs, Params, RecvIdx, InFee),
+    SenderPays = sender_fee_share(Outs, Params, RecvIdxs, InFee),
     ReceiverCap = InFee - SenderPays,
     ForMinRate = MinRate * (OrigVsize + InVsize) - OrigFee - SenderPays,
     ReceiverPays = lists:max([ReceiverCap, ForMinRate, 0]),
@@ -777,11 +776,14 @@ payjoin_outputs(Outs, Params, #{fee := OrigFee, vsize := OrigVsize,
 
 sender_fee_share(Outs, #{additional_fee_output_index := Idx,
                          max_additional_fee_contribution := Max},
-                 RecvIdx, Want)
-  when is_integer(Idx), Idx >= 0, Idx < length(Outs), Idx =/= RecvIdx,
-       Max > 0 ->
-    #tx_out{value = V} = lists:nth(Idx + 1, Outs),
-    max(0, lists:min([Want, Max, V - ?DUST_THRESHOLD_SAT]));
+                 RecvIdxs, Want)
+  when is_integer(Idx), Idx >= 0, Idx < length(Outs), Max > 0 ->
+    case lists:member(Idx, RecvIdxs) of
+        true -> 0;     % never dock the sender's fee from a receiver output
+        false ->
+            #tx_out{value = V} = lists:nth(Idx + 1, Outs),
+            max(0, lists:min([Want, Max, V - ?DUST_THRESHOLD_SAT]))
+    end;
 sender_fee_share(_, _, _, _) ->
     0.
 

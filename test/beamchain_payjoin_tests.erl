@@ -21,6 +21,9 @@
 %%   payjoin_original_must_be_broadcastable
 %%       an Original whose inputs are not finalized is rejected, and the
 %%       broadcast check fails closed when no mempool is running.
+%%   payjoin_fee_never_docked_from_a_receiver_output
+%%       additionalfeeoutputindex pointing at a second receiver output
+%%       takes nothing from it.
 %%   payjoin_min_fee_rate_honoured
 %%       a reachable minfeerate is met; one that would need more than the
 %%       receiver's own input fee is refused instead of paid by the
@@ -188,6 +191,44 @@ receiver_output_credited_and_inputs_limited_test_() ->
            end,
            ?assertMatch({error, {original_rejected, _}}, R)
        end}]}.
+
+%%% ===================================================================
+%%% payjoin_fee_never_docked_from_a_receiver_output
+%%% ===================================================================
+
+%% additionalfeeoutputindex is the SENDER's output. An Original that pays
+%% the receiver twice and points the fee index at the second receiver
+%% output must not get its fee share out of the receiver.
+payjoin_fee_never_docked_from_a_receiver_output_test_() ->
+    {setup,
+     fun start_seeded_wallet/0,
+     fun(_) -> stop_wallet() end,
+     fun(_) ->
+       ?_test(begin
+           Recv1 = wallet_script(),
+           Recv2 = wallet_script(),
+           Contrib = 200000,
+           ok = beamchain_wallet:add_wallet_utxo(<<10:256>>, 0, Contrib,
+                                                 wallet_script(), 1),
+           Tx = #transaction{version = 2, inputs = [txin(2)],
+                             outputs = [#tx_out{value = 100000,
+                                                script_pubkey = Recv1},
+                                        #tx_out{value = 49000,
+                                                script_pubkey = Recv2}],
+                             locktime = 0},
+           {ok, P0} = beamchain_psbt:create(Tx),
+           Orig = finalized_input(P0, 0, utxo(150000, sender_script(1))),
+           {ok, PJ} = beamchain_payjoin_server:build_payjoin_psbt(
+                        Orig, params(1, 1000, 0), whereis(beamchain_wallet)),
+           [Out0, Out1] = out_values(PJ),
+           %% The second receiver output is untouched ...
+           ?assertEqual(49000, Out1),
+           %% ... and the first is credited with the contribution less
+           %% only its own input's fee (the sender paid nothing).
+           ?assert(Out0 > 100000),
+           ?assert(Out0 =< 100000 + Contrib)
+       end)
+     end}.
 
 %%% ===================================================================
 %%% payjoin_min_fee_rate_honoured
