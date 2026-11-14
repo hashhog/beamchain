@@ -1,0 +1,70 @@
+$ erl -noshell -pa _build/recv_bench -pa _build/default/lib/*/ebin -s recv_bench main 1460 -s init stop
+OTP 27, chunk=1460 bytes
+
+ variant=master
+        size   chunks         ms      ns/byte frame_consumed
+      250000      172        1.9         7.65 true
+      500000      343       32.7        65.38 true
+     1000000      685      135.5       135.51 true
+     2000000     1370      720.8       360.41 true
+     3999000     2740     2772.8       693.36 true
+
+ variant=head
+        size   chunks         ms      ns/byte frame_consumed
+      250000      172        0.2         0.96 true
+      500000      343        0.4         0.85 true
+     1000000      685        0.8         0.82 true
+     2000000     1370        1.8         0.92 true
+     3999000     2740        4.0         1.00 true
+
+ variant=nomatch
+        size   chunks         ms      ns/byte frame_consumed
+      250000      172        0.3         1.24 true
+      500000      343        0.3         0.66 true
+     1000000      685        0.7         0.72 true
+     2000000     1370        1.8         0.91 true
+     3999000     2740        3.8         0.96 true
+
+ variant=copy
+        size   chunks         ms      ns/byte frame_consumed
+      250000      172        3.5        14.14 true
+      500000      343       38.8        77.57 true
+     1000000      685      161.3       161.30 true
+     2000000     1370      841.8       420.89 true
+     3999000     2740     3380.3       845.29 true
+
+$ erl -noshell -pa _build/recv_bench -pa _build/default/lib/*/ebin -s recv_bench main 536 -s init stop
+OTP 27, chunk=536 bytes
+
+ variant=master
+        size   chunks         ms      ns/byte frame_consumed
+      250000      467        4.1        16.56 true
+      500000      933       78.8       157.60 true
+     1000000     1866      409.1       409.10 true
+     2000000     3732     1983.8       991.92 true
+     3999000     7461     8170.7      2043.19 true
+
+ variant=head
+        size   chunks         ms      ns/byte frame_consumed
+      250000      467        0.3         1.14 true
+      500000      933        0.5         1.07 true
+     1000000     1866        0.7         0.75 true
+     2000000     3732        2.1         1.03 true
+     3999000     7461        4.8         1.20 true
+
+ variant=nomatch
+        size   chunks         ms      ns/byte frame_consumed
+      250000      467        0.3         1.14 true
+      500000      933        0.4         0.89 true
+     1000000     1866        0.7         0.75 true
+     2000000     3732        1.9         0.96 true
+     3999000     7461        4.3         1.07 true
+
+ variant=copy
+        size   chunks         ms      ns/byte frame_consumed
+      250000      467        5.2        20.95 true
+      500000      933       68.8       137.56 true
+     1000000     1866      391.7       391.74 true
+     2000000     3732     1752.4       876.19 true
+     3999000     7461     8371.0      2093.27 true
+

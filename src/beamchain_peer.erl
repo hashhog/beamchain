@@ -41,6 +41,9 @@
          scan_terminator/5,
          extract_v2_packet/1,
          make_test_v2_peer/2,
+         make_test_peer/3,
+         buffer_recv/2,
+         recv_need/1,
          advertised_services/0]).
 -endif.
 
@@ -102,6 +105,9 @@
     address                 :: {inet:ip_address(), inet:port_number()},
     direction               :: inbound | outbound,
     buffer = <<>>           :: binary(),
+    %% Smallest buffer size at which the next frame can be complete
+    %% (see recv_need/1).  Below it, appended bytes are not re-parsed.
+    recv_need = 0           :: non_neg_integer(),
     %% Handshake flags
     version_sent = false    :: boolean(),
     version_recv = false    :: boolean(),
@@ -816,7 +822,27 @@ terminate(_Reason, _State, #peer_data{socket = Socket}) ->
 %%% Internal: TCP receive and buffering
 %%% ===================================================================
 
-handle_tcp_data(NewBytes, #peer_data{socket = Socket, buffer = Buf} = Data) ->
+handle_tcp_data(NewBytes, #peer_data{socket = Socket} = Data) ->
+    case buffer_recv(NewBytes, Data) of
+        {ok, Data2} ->
+            inet:setopts(Socket, [{active, once}]),
+            {ok, Data2};
+        {stop, Reason} ->
+            {stop, Reason}
+    end.
+
+%% Append a TCP segment to the receive buffer and dispatch every frame
+%% that is now complete.
+%%
+%% While a frame is still partial we only append: the decoders match the
+%% buffer, and appending to a binary that has been matched copies it, so
+%% re-parsing on every segment made a frame trickled in small segments
+%% cost O(size^2) (a 4 MB frame in 1460-byte segments: ~3 s of copying
+%% in this process, against ~5 ms when unparsed).  Once nothing matches
+%% the buffer the runtime appends in place, so the whole frame costs
+%% O(size).  Core reads into a fixed per-message buffer sized from the
+%% header (net.cpp V1Transport::readHeader/readData), never re-scanning.
+buffer_recv(NewBytes, #peer_data{buffer = Buf, recv_need = Need} = Data) ->
     Buffer = <<Buf/binary, NewBytes/binary>>,
     BytesRecv = Data#peer_data.bytes_recv + byte_size(NewBytes),
     Data2 = Data#peer_data{
@@ -824,18 +850,62 @@ handle_tcp_data(NewBytes, #peer_data{socket = Socket, buffer = Buf} = Data) ->
         bytes_recv = BytesRecv,
         last_recv = erlang:system_time(millisecond)
     },
-    %% Inbound peers: peek-classify before we know whether the stream is
-    %% v1 (Bitcoin Core <26.0 / unencrypted) or v2 (BIP-324).  Outbound
-    %% peers stay on the v1 path for now (see "Outbound v2: NOT WIRED"
-    %% audit note in W90).
-    Data3 = maybe_classify_inbound(Data2),
-    case dispatch_buffered(Data3) of
-        {ok, Data4} ->
-            inet:setopts(Socket, [{active, once}]),
-            {ok, Data4};
-        {stop, Reason} ->
-            {stop, Reason}
+    case byte_size(Buffer) < Need of
+        true ->
+            {ok, Data2};
+        false ->
+            %% Inbound peers: peek-classify before we know whether the
+            %% stream is v1 (Bitcoin Core <26.0 / unencrypted) or v2
+            %% (BIP-324).  Outbound peers stay on the v1 path for now (see
+            %% "Outbound v2: NOT WIRED" audit note in W90).
+            Data3 = maybe_classify_inbound(Data2),
+            case dispatch_buffered(Data3) of
+                {ok, Data4} ->
+                    {ok, Data4#peer_data{recv_need = recv_need(Data4)}};
+                {stop, Reason} ->
+                    {stop, Reason}
+            end
     end.
+
+%% The buffer size the next frame needs before decoding can progress,
+%% computed after dispatch_buffered/1 has consumed every complete frame.
+%% It never overstates: the decoders return `incomplete` for any smaller
+%% buffer, so skipping them below it changes no outcome.  0 means
+%% "always dispatch": pre-classification (acts at 16 bytes) and the v2
+%% recv_pubkey (64 bytes) and recv_garbterm (at most 4095 + 16 bytes,
+%% moved out of the buffer as it is scanned) phases.
+recv_need(#peer_data{v2_phase = v1, buffer = Buffer}) ->
+    case Buffer of
+        %% magic(4) command(12) length(4) checksum(4) payload(Len)
+        <<_:16/binary, Len:32/little, _/binary>> -> 24 + Len;
+        _ -> 24
+    end;
+recv_need(#peer_data{v2_phase = Phase, buffer = Buffer,
+                     v2_cipher = Cipher, v2_pending_len = Pending})
+  when Phase =:= ready; Phase =:= drain_decoy ->
+    %% drain_decoy reads packets with the same extract_v2_packet/1 as
+    %% ready, and a decoy may be up to MAX_PROTOCOL_MESSAGE_LENGTH.
+    LenLen = beamchain_transport_v2:length_field_len(),
+    HdrLen = beamchain_transport_v2:header_len(),
+    TagLen = beamchain_transport_v2:tag_len(),
+    case Pending of
+        ContentsLen when is_integer(ContentsLen) ->
+            %% Length field already consumed from the buffer.
+            HdrLen + ContentsLen + TagLen;
+        undefined ->
+            case Buffer of
+                <<EncLen:LenLen/binary, _/binary>> ->
+                    %% Peek: the advanced cipher is discarded, so the
+                    %% length is decrypted again by extract_v2_packet/1.
+                    {ok, ContentsLen, _} =
+                        beamchain_transport_v2:decrypt_length(Cipher, EncLen),
+                    LenLen + HdrLen + ContentsLen + TagLen;
+                _ ->
+                    LenLen
+            end
+    end;
+recv_need(#peer_data{}) ->
+    0.
 
 %% Decide v1 vs v2 once we have at least 16 bytes buffered.
 %%
@@ -1375,6 +1445,11 @@ make_test_v2_peer(Cipher, Buffer) ->
         magic           = <<>>,
         handler         = self()
     }.
+
+%% Like make_test_v2_peer/2 but pinned to a phase (v1 | ready | drain_decoy),
+%% for driving buffer_recv/2 and recv_need/1 in unit tests.
+make_test_peer(Phase, Cipher, Buffer) ->
+    (make_test_v2_peer(Cipher, Buffer))#peer_data{v2_phase = Phase}.
 -endif.
 
 %% Open the BIP-324 outbound handshake.  Called from start_handshake/1
