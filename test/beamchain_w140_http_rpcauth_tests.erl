@@ -106,13 +106,19 @@ g05_rpcbind_missing_test() ->
     {start, Opts} = beamchain_cli:parse_args(["start", "--rpcbind=0.0.0.0"]),
     ?assertEqual("0.0.0.0", maps:get(rpc_bind, Opts)).
 
-%% G06 MISSING — auxiliary listeners replicate the bind bug.  BUG-4.
+%% G06 PARTIAL — auxiliary listeners replicate the bind bug.  BUG-4.
+%% Metrics half FLIPPED (secfix-beamchain-metrics-bind-all): socket_opts
+%% now carry {ip, _} from metrics_bind_ip/0, default 127.0.0.1; the
+%% real-socket check lives in beamchain_metrics_tests.  REST half open.
 g06_aux_listeners_also_unbound_test() ->
     Mh = metrics_module_src(),
-    ?assert(contains(Mh,
-                     <<"[{port, Port},\n                                              {reuseaddr, true}]">>)
-            orelse contains(Mh,
-                     <<"[{port, Port}, {reuseaddr, true}]">>)),
+    ?assertEqual(nomatch,
+                 binary:match(Mh, <<"[{port, Port},\n                                              {reuseaddr, true}]">>)),
+    ?assertEqual(nomatch,
+                 binary:match(Mh, <<"[{port, Port}, {reuseaddr, true}]">>)),
+    ?assert(contains(Mh, <<"metrics_socket_opts(Ip, Port)">>)),
+    ?assertEqual({ok, {127, 0, 0, 1}},
+                 beamchain_metrics:metrics_bind_ip(undefined)),
     %% No auth on /metrics.
     ?assertEqual(nomatch, binary:match(Mh, <<"check_auth">>)),
     %% REST listener: also no auth path, same bind shape.

@@ -864,6 +864,15 @@ init([]) ->
         _ -> ok
     end,
 
+    %% --metricsbind=<addr> (CLI, via application env) overrides
+    %% metricsbind= from the config file. Unset in both = loopback
+    %% (beamchain_metrics:metrics_bind_ip/1).
+    case application:get_env(beamchain, metricsbind) of
+        {ok, MetricsBind} when is_list(MetricsBind), MetricsBind =/= "" ->
+            ets:insert(?CONFIG_TABLE, {metricsbind, MetricsBind});
+        _ -> ok
+    end,
+
     %% W119 FIX-64: RPC HTTPS termination cert+key paths.
     %% CLI (apply_opts via application:set_env) overrides config file.
     case application:get_env(beamchain, rpc_tls_cert) of
