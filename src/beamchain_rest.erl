@@ -36,6 +36,7 @@
 -ifdef(TEST).
 -export([confirmations/1, confirmations/2, is_block_in_active_chain/1]).
 -export([rest_chaininfo/1]).
+-export([rest_socket_opts/1]).
 %% Exported for EUnit: drives GET /rest/mempool/contents.json without cowboy.
 -export([rest_mempool_contents/2, rest_mempool_info/1]).
 -endif.
@@ -91,7 +92,11 @@ init([]) ->
             {"/payjoin", beamchain_payjoin_server, []}
         ]}
     ]),
-    TransportOpts = #{socket_opts => [{port, Port}, {reuseaddr, true}]},
+    %% Bind the address RPC binds (rpcbind; loopback when unset). Core
+    %% serves REST from its RPC HTTP server, so it never listens wider
+    %% than RPC. Before this the socket_opts carried no {ip, _} and the
+    %% REST + unauthenticated /payjoin listener bound every interface.
+    TransportOpts = #{socket_opts => rest_socket_opts(Port)},
     ProtoOpts = #{env => #{dispatch => Dispatch}},
     case beamchain_listener:start_clear_with_retry(
             beamchain_rest_listener, TransportOpts, ProtoOpts, "rest") of
@@ -1284,6 +1289,18 @@ script_type(_) ->
 %%% ===================================================================
 %%% Configuration
 %%% ===================================================================
+
+%% Listen socket options for the REST listener: rpcbind's address (loopback
+%% unless the operator opted in to a wider bind), the REST port, reuseaddr.
+-spec rest_socket_opts(inet:port_number()) -> list().
+rest_socket_opts(Port) ->
+    Ip = case beamchain_rpc:rpc_bind_ip() of
+        {ok, BindIp} -> BindIp;
+        {error, BindErr} ->
+            logger:error("rest: invalid rpcbind: ~p", [BindErr]),
+            exit({rest_bind_invalid, BindErr})
+    end,
+    beamchain_rpc:rpc_socket_opts(Ip, Port) ++ [{reuseaddr, true}].
 
 rest_port(Params) ->
     %% Use RPC port + 10 for REST by default, or read from config.
