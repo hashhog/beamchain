@@ -3169,7 +3169,11 @@ unindex_discouraged(IP) ->
 
 %% Record a misbehaviour discouragement of IP until BanExpiry, keeping at
 %% most ?MAX_DISCOURAGED of them (oldest expiry rolls out first, like
-%% Core's rolling filter).  A longer operator ban on IP is left alone.
+%% Core's rolling filter).  An operator ban on IP (an unindexed row) is
+%% left exactly as it is, whatever its expiry: Core's Discourage() only
+%% inserts into m_discouraged and never writes m_banned, so a setban's
+%% bantime is neither shortened nor extended, and the row is never made
+%% evictable by being indexed.
 discourage_ip(IP, BanExpiry) ->
     ensure_discouraged_index(),
     Existing = ets:lookup(?BANNED_PEERS_TABLE, IP),
@@ -3178,7 +3182,7 @@ discourage_ip(IP, BanExpiry) ->
         [] -> false
     end,
     case Existing of
-        [{IP, OldExpiry}] when not IsDiscouraged, OldExpiry >= BanExpiry ->
+        [{IP, _OperatorExpiry}] when not IsDiscouraged ->
             ok;
         _ ->
             unindex_discouraged(IP),

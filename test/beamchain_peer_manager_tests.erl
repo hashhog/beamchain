@@ -1313,6 +1313,50 @@ ban_flood_body(#{full := FullDir, ok := OkDir}) ->
     ?assertEqual({ok, Bin}, file:read_file(BanFile)),
     receive dump_bans -> ok after 2000 -> ?assert(false) end.
 
+%% A short operator setban (under the 24 h discouragement) on an address
+%% that then misbehaves keeps its manual expiry and stays out of the
+%% evictable discouragement index.  Core's Discourage() only inserts into
+%% m_discouraged and never touches m_banned, so the setban row must not be
+%% lengthened into a discouragement that a later cap eviction could drop
+%% before the operator's bantime ends.
+short_setban_survives_discouragement_test_() ->
+    {setup,
+     fun() ->
+         setup(),
+         beamchain_peer_manager:test_ensure_peer_table(),
+         Dir = filename:join(["/tmp", "beamchain-shortban-" ++
+                              integer_to_list(erlang:unique_integer([positive]))]),
+         ok = filelib:ensure_dir(filename:join(Dir, "x")),
+         Dir
+     end,
+     fun(Dir) ->
+         _ = file:del_dir_r(Dir),
+         catch ets:delete_all_objects(beamchain_peers),
+         catch ets:delete_all_objects(banned_peers_discouraged_idx),
+         cleanup(ok)
+     end,
+     fun(Dir) -> [fun() -> short_setban_body(Dir) end] end}.
+
+short_setban_body(Dir) ->
+    Ip = {203, 0, 113, 8},
+    Pid = spawn(fun() -> ok end),
+    beamchain_peer_manager:test_insert_peer(Pid, inbound, full_relay, normal),
+    AddrPos = record_field_pos(peer_entry, address),
+    true = ets:update_element(beamchain_peers, Pid, {AddrPos, {Ip, 8333}}),
+    S0 = build_state(#{datadir => Dir}),
+    {reply, ok, S1} = beamchain_peer_manager:handle_call(
+                        {set_ban, Ip, 3600, <<"operator">>}, self(), S0),
+    [{Ip, ManualExp}] = ets:lookup(banned_peers, Ip),
+    {noreply, _} = beamchain_peer_manager:handle_cast(
+                     {misbehaving, Pid, 100, <<"misbehaved">>}, S1),
+    %% The manual expiry is unchanged ...
+    ?assertEqual([{Ip, ManualExp}], ets:lookup(banned_peers, Ip)),
+    %% ... and the address is not in the evictable discouragement index.
+    ?assertEqual([], [K || {{_, I} = K} <- ets:tab2list(
+                                               banned_peers_discouraged_idx),
+                           I =:= Ip]),
+    flush_dump_bans().
+
 %% Milliseconds left on a pending timer; 0 if it already fired or is not a
 %% timer (erlang:read_timer/1 returns the atom false, and atoms compare
 %% greater than every integer).
