@@ -2437,11 +2437,8 @@ handle_addr_msg(Pid, Payload, State) ->
             %% value is what reaches addrman and any relay recipients.
             Now = erlang:system_time(second),
             Clamped = [clamp_addr_timestamp(E, Now) || E <- Admitted],
-            %% Feed clamped addresses to addrman
-            lists:foreach(fun(#{ip := IP, port := Port} = Entry) ->
-                Svc = maps:get(services, Entry, 0),
-                beamchain_addrman:add_address({IP, Port}, Svc, Pid)
-            end, Clamped),
+            %% Feed clamped addresses to addrman, sourced from this peer.
+            store_relayed_addrs(Pid, Clamped),
             logger:debug("received ~B addresses from ~p (~B admitted, ~B "
                          "rate-limited)",
                          [length(Addrs), Pid, length(Clamped), Dropped]),
@@ -2469,16 +2466,9 @@ handle_addrv2_msg(Pid, Payload, State) ->
             %% as addr handler above — shared ProcessAddrs path in Core).
             Now = erlang:system_time(second),
             Clamped = [clamp_addr_timestamp(E, Now) || E <- Admitted],
-            %% Extract IPv4 addresses and add to addrman
-            lists:foreach(fun(Entry) ->
-                case Entry of
-                    #{ip := IP, port := Port} ->
-                        Svc = maps:get(services, Entry, 0),
-                        beamchain_addrman:add_address({IP, Port}, Svc, Pid);
-                    _ ->
-                        ok  %% Skip non-IPv4 for now
-                end
-            end, Clamped),
+            %% Add the IP entries to addrman, sourced from this peer
+            %% (non-IP networks are not stored yet, as before).
+            store_relayed_addrs(Pid, [E || #{ip := _} = E <- Clamped]),
             logger:debug("received ~B addrv2 entries from ~p (~B admitted, ~B "
                          "rate-limited)",
                          [length(Addrs), Pid, length(Clamped), Dropped]),
@@ -2488,6 +2478,21 @@ handle_addrv2_msg(Pid, Payload, State) ->
         _ ->
             {noreply, State}
     end.
+
+%% @doc Hand a peer's relayed addresses to addrman with that peer's address as
+%% the source, as Core does (ProcessAddrs: m_addrman.Add(vAddrOk, pfrom.addr,
+%% 2h)). The source picks the source group, which caps the new buckets one
+%% relaying network can fill at 64 of 1024. Passing the pid instead (as this
+%% used to) mapped every peer to one group, so all gossip shared <=64 buckets.
+%% Entries keep their clamped nTime; addrman applies the 2h penalty.
+store_relayed_addrs(_Pid, []) ->
+    ok;
+store_relayed_addrs(Pid, Entries) ->
+    Source = case ets:lookup(?PEER_TABLE, Pid) of
+        [#peer_entry{address = {_, _} = Addr}] -> Addr;
+        _ -> Pid
+    end,
+    beamchain_addrman:add_addresses(Entries, Source).
 
 %% @doc Apply the inbound-addr token bucket to a batch of addresses, returning
 %% {Admitted, NumDropped} and persisting the updated bucket back to the peer's

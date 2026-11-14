@@ -64,6 +64,10 @@
 -define(HORIZON_DAYS, 30).            %% Max age for addresses
 -define(REPLACEMENT_HOURS, 4).        %% Good() replaces if older
 -define(HORIZON_SECS, (?HORIZON_DAYS * 24 * 3600)).
+%% Core net_processing ProcessAddrs: m_addrman.Add(vAddrOk, pfrom.addr, 2h).
+%% A relayed address is filed as 2h older than the relayer claims, unless it
+%% is the relayer's own address (AddSingle: `if (addr == source)`).
+-define(ADDR_RELAY_TIME_PENALTY, 7200).
 
 %% Max addresses per table (total capacity)
 -define(MAX_NEW_ADDRS, (?NEW_BUCKET_COUNT * ?BUCKET_SIZE)).
@@ -123,6 +127,9 @@ add_address(Address, Services, Source, NetworkId) ->
 
 %% @doc Add a batch of addr entries (from an addr message).
 %% Each entry is #{ip => IP, port => Port, services => Svc, timestamp => T}.
+%% Source is the relaying peer's {IP, Port} (Core: pfrom.addr); it selects the
+%% source group the entries are bucketed under. Each entry's timestamp (nTime,
+%% already clamped by the caller) is kept, less the 2h relay penalty.
 -spec add_addresses([map()], term()) -> ok.
 add_addresses(Entries, Source) ->
     gen_server:cast(?SERVER, {add_addresses, Entries, Source}).
@@ -414,7 +421,7 @@ handle_cast({add_address, Address, Services, Source, NetworkId}, State) ->
 handle_cast({add_addresses, Entries, Source}, State) ->
     State2 = lists:foldl(fun(#{ip := IP, port := Port} = Entry, S) ->
         Svc = maps:get(services, Entry, 0),
-        do_add_address({IP, Port}, Svc, Source, 1, S)  %% 1 = IPv4
+        do_add_relayed(Entry, {IP, Port}, Svc, Source, 1, S)  %% 1 = IPv4
     end, State, Entries),
     {noreply, State2};
 
@@ -628,8 +635,30 @@ is_routable(_Address, _NetworkId) ->
 %%% Internal: address management
 %%% ===================================================================
 
-do_add_address(Address, Services, Source, NetworkId, #state{addr_table = AddrTab,
-                                                            secret = Secret} = State) ->
+%% Unsolicited / local adds (DNS seeds, addpeeraddress): nTime is now and
+%% there is no relay penalty.
+do_add_address(Address, Services, Source, NetworkId, State) ->
+    do_add_address(Address, Services, Source, NetworkId,
+                   erlang:system_time(second), 0, State).
+
+%% A gossiped address: keep its (clamped) nTime and apply Core's 2h relay
+%% penalty, waived when the address is the relaying peer's own.
+do_add_relayed(Entry, Address, Services, Source, NetworkId, State) ->
+    Now = erlang:system_time(second),
+    Time = maps:get(timestamp, Entry, Now),
+    Penalty = case {Address, Source} of
+        {{IP, _}, {IP, _}} -> 0;
+        _ -> ?ADDR_RELAY_TIME_PENALTY
+    end,
+    do_add_address(Address, Services, Source, NetworkId, Time, Penalty, State).
+
+%% Mirrors Bitcoin Core AddrManImpl::AddSingle (addrman.cpp) for the nTime
+%% handling: a new entry is stored with max(0, nTime - penalty); a known
+%% entry's nTime only moves forward, and only once the announced time is more
+%% than the update interval (1h if seen online in the last 24h, else 24h)
+%% beyond it.
+do_add_address(Address, Services, Source, NetworkId, Time, Penalty,
+               #state{addr_table = AddrTab, secret = Secret} = State) ->
     %% BUG-2 fix: reject non-routable addresses before touching the table.
     %% Mirrors Bitcoin Core addrman.cpp AddSingle() line 534:
     %%   if (!addr.IsRoutable()) return false;
@@ -640,17 +669,24 @@ do_add_address(Address, Services, Source, NetworkId, #state{addr_table = AddrTab
             Now = erlang:system_time(second),
             SourceNG = source_netgroup(Source),
             case ets:lookup(AddrTab, Address) of
-                [#addr_info{in_tried = true} = Existing] ->
-                    %% Already in tried, just update timestamp
-                    ets:insert(AddrTab, Existing#addr_info{timestamp = Now}),
-                    State;
-                [#addr_info{in_tried = false} = Existing] ->
-                    %% Already in new, update timestamp and maybe add to more buckets
-                    ets:insert(AddrTab, Existing#addr_info{timestamp = Now}),
+                [#addr_info{timestamp = OldTime} = Existing] ->
+                    %% Known (new or tried): refresh nTime per Core's rule.
+                    UpdateInterval = case Now - Time < 86400 of
+                        true -> 3600;
+                        false -> 86400
+                    end,
+                    case OldTime < Time - UpdateInterval - Penalty of
+                        true ->
+                            ets:insert(AddrTab, Existing#addr_info{
+                                timestamp = max(0, Time - Penalty)});
+                        false ->
+                            ok
+                    end,
                     State;
                 [] ->
                     %% New address - add to new table
-                    add_to_new(Address, Services, Now, Source, SourceNG, NetworkId, Secret, State)
+                    add_to_new(Address, Services, max(0, Time - Penalty), Now,
+                               Source, SourceNG, NetworkId, Secret, State)
             end
     end.
 
@@ -667,9 +703,9 @@ do_add_addrv2_entry(Entry, Source, State) ->
             AddrBytes = maps:get(address, Entry),
             {AddrBytes, maps:get(port, Entry, 0)}
     end,
-    do_add_address(Address, Svc, Source, NetworkId, State).
+    do_add_relayed(Entry, Address, Svc, Source, NetworkId, State).
 
-add_to_new(Address, Services, Now, Source, SourceNG, NetworkId, Secret,
+add_to_new(Address, Services, Time, Now, Source, SourceNG, NetworkId, Secret,
            #state{addr_table = AddrTab, new_buckets = NewBuckets,
                   new_count = NewCount} = State) ->
     %% Calculate bucket for this address+source
@@ -684,7 +720,7 @@ add_to_new(Address, Services, Now, Source, SourceNG, NetworkId, Secret,
                 [#addr_info{timestamp = OldTime}] when (Now - OldTime) > ?HORIZON_SECS ->
                     %% Old entry, evict
                     remove_from_new(ExistingAddr, AddrTab, NewBuckets),
-                    insert_new_entry(Address, Services, Now, Source, SourceNG,
+                    insert_new_entry(Address, Services, Time, Source, SourceNG,
                                       NetworkId, Bucket, Slot, AddrTab, NewBuckets),
                     State#state{new_count = NewCount};  %% count stays same
                 _ ->
@@ -693,17 +729,17 @@ add_to_new(Address, Services, Now, Source, SourceNG, NetworkId, Secret,
             end;
         [] ->
             %% Slot empty, insert
-            insert_new_entry(Address, Services, Now, Source, SourceNG,
+            insert_new_entry(Address, Services, Time, Source, SourceNG,
                               NetworkId, Bucket, Slot, AddrTab, NewBuckets),
             State#state{new_count = NewCount + 1}
     end.
 
-insert_new_entry(Address, Services, Now, Source, SourceNG, NetworkId,
+insert_new_entry(Address, Services, Time, Source, SourceNG, NetworkId,
                  Bucket, Slot, AddrTab, NewBuckets) ->
     Entry = #addr_info{
         address = Address,
         services = Services,
-        timestamp = Now,
+        timestamp = Time,
         source = Source,
         source_netgroup = SourceNG,
         in_tried = false,
@@ -1128,7 +1164,9 @@ load_or_generate_secret(DataDir) ->
 %%% ===================================================================
 
 source_netgroup(Source) when is_pid(Source) ->
-    %% Peer pid - we don't have the IP easily, use 'local'
+    %% A pid carries no address. Gossip callers pass the relaying peer's
+    %% {IP, Port} instead (see beamchain_peer_manager:store_relayed_addrs/3);
+    %% a pid source is only addrman's own addpeeraddress path.
     local;
 source_netgroup({IP, _Port}) ->
     netgroup({IP, 0});
