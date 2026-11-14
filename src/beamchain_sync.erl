@@ -262,16 +262,18 @@ route_message(Peer, inv, Payload, State) ->
             %% that gap. The resulting `tx` reply is handled by the tx clause
             %% below (accept_to_memory_pool).
             maybe_request_tx_invs(Peer, Items),
-            %% Collect block inv items we don't already have
-            BlockItems = lists:filter(fun(#{type := Type, hash := Hash}) ->
-                (Type =:= ?MSG_BLOCK orelse Type =:= ?MSG_WITNESS_BLOCK)
-                    andalso not beamchain_db:has_block(Hash);
-                (_) -> false
-            end, Items),
-            case BlockItems of
-                [] ->
+            %% The block announcement this inv carries, if any. Core keeps a
+            %% single best_block (the last block inv it does not already
+            %% have) and acts on that one alone. Its AlreadyHaveBlock is an
+            %% in-memory block-index lookup; ours, beamchain_db:has_block/1,
+            %% is a synchronous RocksDB read on the shared db gen_server, so
+            %% asking it once per item let one 50,000-item inv cost 50,000
+            %% db round trips on this process (secfix H9). See
+            %% last_unknown_block_inv/1 for the bound.
+            case last_unknown_block_inv(Items) of
+                none ->
                     State;
-                _ ->
+                {BestHash, NBlockItems} ->
                     %% Headers-first announcement handling — Bitcoin Core
                     %% net_processing.cpp ProcessMessage(INV) "best_block"
                     %% path (src/net_processing.cpp:4065-4123): a peer that
@@ -298,9 +300,12 @@ route_message(Peer, inv, Payload, State) ->
                     %% to pfrom) — required here because a reorg announcer's
                     %% advertised height equals ours, so the height-gated
                     %% start_sync peer-selection would never pick it.
-                    logger:info("sync: received block inv from ~p (~B new) — "
-                                "sending getheaders (headers-first)",
-                                [Peer, length(BlockItems)]),
+                    logger:info("sync: received block inv from ~p (~B block "
+                                "items, best ~s not had) — sending getheaders "
+                                "(headers-first)",
+                                [Peer, NBlockItems,
+                                 beamchain_serialize:hex_encode(
+                                   beamchain_serialize:reverse_bytes(BestHash))]),
                     beamchain_header_sync:probe_peer(Peer),
                     %% Arm the header-sync completion poll so we transition to
                     %% block download once the header chain connects. Only arm
@@ -524,6 +529,54 @@ tx_inv_to_getdata_item(#{type := Type, hash := Txid})
     end;
 tx_inv_to_getdata_item(_Other) ->
     false.
+
+%%% ===================================================================
+%%% Internal: block inv -> best_block
+%%% ===================================================================
+
+%% Bitcoin Core announces at most MAX_BLOCKS_TO_ANNOUNCE (8) blocks in one
+%% inv (net_processing.cpp:152, :2171). An honest announcer therefore puts
+%% the hash we lack within the last 8 block items.
+-define(MAX_BLOCK_INV_CHECKS, 8).
+
+%% @doc Pick the block announcement to act on from an inv's items.
+%% Core's ProcessMessage(INV) (net_processing.cpp:4051-4097) sets best_block
+%% to the LAST block item it does not already have, then sends one
+%% getheaders for it. Every block item before that one has no effect.
+%%
+%% Walk the block items from the end and ask beamchain_db:has_block/1 for at
+%% most ?MAX_BLOCK_INV_CHECKS of them, stopping at the first one not had.
+%% That finds Core's best_block whenever it lies in the last 8 block items.
+%% A larger inv whose last 8 block items are all known is treated as "no new
+%% block": an honest peer never sends one, and getheaders on a later inv or
+%% the periodic header sync still catches anything real.
+%%
+%% Returns {Hash, NumberOfBlockItems} or none.
+-spec last_unknown_block_inv([map()]) ->
+    {binary(), non_neg_integer()} | none.
+last_unknown_block_inv(Items) ->
+    %% One pass, no db: block hashes newest-first.
+    RevBlockHashes = lists:foldl(
+        fun(#{type := Type, hash := Hash}, Acc)
+              when Type =:= ?MSG_BLOCK; Type =:= ?MSG_WITNESS_BLOCK ->
+                [Hash | Acc];
+           (_, Acc) ->
+                Acc
+        end, [], Items),
+    case first_not_had(RevBlockHashes, ?MAX_BLOCK_INV_CHECKS) of
+        none -> none;
+        Hash -> {Hash, length(RevBlockHashes)}
+    end.
+
+first_not_had([], _Budget) ->
+    none;
+first_not_had(_Hashes, 0) ->
+    none;
+first_not_had([Hash | Rest], Budget) ->
+    case beamchain_db:has_block(Hash) of
+        false -> Hash;
+        true  -> first_not_had(Rest, Budget - 1)
+    end.
 
 -ifdef(TEST).
 %% A minimal post-IBD state for exercising route_message/4 in tests. `complete`
