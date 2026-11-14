@@ -610,7 +610,8 @@ wallet_files_are_private_test() ->
         Oct = fun(P) -> {P, integer_to_list(Mode(P), 8)} end,
         ?assertEqual([{WalletDir, "700"}, {File, "600"}, {Bak, "600"}],
                      [Oct(WalletDir), Oct(File), Oct(Bak)]),
-        ?assertNot(filelib:is_regular(File ++ ".tmp"))
+        ?assertNot(filelib:is_regular(File ++ ".tmp")),
+        ?assertNot(filelib:is_regular(Bak ++ ".tmp"))
     after
         gen_server:stop(Pid),
         beamchain_wallet_test_env:teardown(Env)

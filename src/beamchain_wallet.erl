@@ -2281,8 +2281,8 @@ write_and_sync(Path, Bytes) ->
 
 %% Create the wallet directory if needed and make it 0700 (Core's wallet
 %% directory under umask 077). Applied to an existing directory too, so a
-%% datadir created by an older build at 0775/0755 is tightened on the next
-%% create or save.
+%% wallet dir created by an older build at 0775/0755 is tightened on the
+%% next wallet create (the default-wallet boot auto-load also tightens it).
 ensure_private_dir(Dir) ->
     ok = filelib:ensure_dir(filename:join(Dir, "x")),
     ok = file:change_mode(Dir, ?WALLET_DIR_MODE).
