@@ -766,12 +766,19 @@ payjoin_budget_ms() ->
 %% parameter on every POST /payjoin and rejects requests without one.
 %% Defaults to false (lenient mode) for backwards compatibility with
 %% FIX-65 round-trip clients that pre-date the token scheme.
+%% The conf parser stores every value as a string, so
+%% `payjoin_require_token=1` arrives here as "1"; accept it (and "true")
+%% the way the other conf booleans in this module do.
 -spec payjoin_require_token() -> boolean().
 payjoin_require_token() ->
     case get(payjoin_require_token, false) of
-        true  -> true;
-        false -> false;
-        _     -> false
+        true   -> true;
+        1      -> true;
+        "1"    -> true;
+        "true" -> true;
+        <<"1">>    -> true;
+        <<"true">> -> true;
+        _      -> false
     end.
 
 %%% ===================================================================
