@@ -235,6 +235,12 @@
 %% Default gap limit (20 unused addresses before stopping lookahead)
 -define(DEFAULT_GAP_LIMIT, 20).
 
+%% Core sets umask 077 at startup (common/system.cpp SetupEnvironment): the wallet
+%% directory is 0700 and every wallet file 0600. The wallet file holds the
+%% seed (in plaintext for an unencrypted wallet), so these are not optional.
+-define(WALLET_DIR_MODE, 8#700).
+-define(WALLET_FILE_MODE, 8#600).
+
 %%% ===================================================================
 %%% gen_server API
 %%% ===================================================================
@@ -602,6 +608,8 @@ maybe_autoload_default(<<>>, BlankState) ->
         false ->
             BlankState;
         true ->
+            %% A wallet dir made by an older build may be 0775/0755.
+            _ = file:change_mode(WalletDir, ?WALLET_DIR_MODE),
             case load_wallet_file(WalletFile, undefined) of
                 {ok, WalletData} ->
                     case maps:get(<<"encrypted">>, WalletData, false) of
@@ -723,7 +731,7 @@ tuple_to_list_safe(_) -> [].
 do_handle_call({create, Seed, Passphrase}, _From, State) ->
     MasterKey = master_from_seed(Seed),
     WalletDir = wallet_dir(State#wallet_state.network),
-    ok = filelib:ensure_dir(WalletDir ++ "/"),
+    ok = ensure_private_dir(WalletDir),
     WalletFile = WalletDir ++ "/wallet.json",
     NewState0 = State#wallet_state{
         master_key  = MasterKey,
@@ -745,7 +753,7 @@ do_handle_call({create_bip39, Seed, Mnemonic, Passphrase}, _From, State) ->
     %% drives BIP-32 master-key derivation.
     MasterKey = master_from_seed(Seed),
     WalletDir = wallet_dir(State#wallet_state.network),
-    ok = filelib:ensure_dir(WalletDir ++ "/"),
+    ok = ensure_private_dir(WalletDir),
     WalletFile = WalletDir ++ "/wallet.json",
     NewState0 = State#wallet_state{
         master_key  = MasterKey,
@@ -777,7 +785,7 @@ do_handle_call({create, Seed, Passphrase, Opts}, _From, State)
     Blank = maps:get(blank, Opts, false) =:= true,
     MasterKey = master_from_seed(Seed),
     WalletDir = wallet_dir(State#wallet_state.network),
-    ok = filelib:ensure_dir(WalletDir ++ "/"),
+    ok = ensure_private_dir(WalletDir),
     WalletFile = case State#wallet_state.wallet_name of
         <<>> -> WalletDir ++ "/wallet.json";
         Name -> WalletDir ++ "/" ++ binary_to_list(Name) ++ ".json"
@@ -2169,13 +2177,19 @@ atomic_write_wallet(File, Bytes) ->
     Dir = filename:dirname(File),
     Tmp = File ++ ".tmp",
     Bak = File ++ ".bak",
+    %% Only the directory's existence here: File may be a caller-supplied
+    %% path (loadwallet / {load, Path, _}), and chmodding some arbitrary
+    %% parent directory 0700 is not ours to do. The node's own wallet
+    %% directory is made 0700 where it is created (ensure_private_dir/1).
     _ = filelib:ensure_dir(File),
     try
         ok = write_and_sync(Tmp, Bytes),
         %% Keep a backup of the last known-good file before clobbering it.
-        case filelib:is_regular(File) of
-            true  -> _ = file:copy(File, Bak);
-            false -> ok
+        %% Not file:copy/2: that creates the copy at the process umask, so
+        %% the seed in the backup would be readable by group/other.
+        case file:read_file(File) of
+            {ok, Prev} -> _ = catch write_and_sync(Bak, Prev);
+            {error, _} -> ok
         end,
         ok = file:rename(Tmp, File),
         _ = fsync_dir(Dir),
@@ -2229,10 +2243,19 @@ rewrite_backup_after_encrypt(File) ->
 %% Write Bytes to Path and fsync the file contents (not just the metadata)
 %% before returning, so a power loss after we return cannot leave the data
 %% only in the page cache.
+%%
+%% The file is created fresh (any old one is unlinked first, then opened
+%% `exclusive`, so a planted symlink or a file someone else already holds
+%% open is never written through) and chmodded 0600 BEFORE any byte of the
+%% wallet is written. Erlang's file:open/2 takes no mode and the VM has no
+%% umask call, so this is how we match Core, which runs with umask 077 and
+%% so creates every wallet file 0600. If the chmod fails nothing is written.
 write_and_sync(Path, Bytes) ->
-    case file:open(Path, [write, raw, binary]) of
+    _ = file:delete(Path),
+    case file:open(Path, [write, exclusive, raw, binary]) of
         {ok, Fd} ->
             try
+                ok = file:change_mode(Path, ?WALLET_FILE_MODE),
                 ok = file:write(Fd, Bytes),
                 _ = file:sync(Fd),   %% fsync file contents
                 ok
@@ -2242,6 +2265,30 @@ write_and_sync(Path, Bytes) ->
         {error, Reason} ->
             error({wallet_open_failed, Reason})
     end.
+
+%% Create the wallet directory if needed and make it 0700 (Core's wallet
+%% directory under umask 077). Applied to an existing directory too, so a
+%% datadir created by an older build at 0775/0755 is tightened on the next
+%% create or save.
+ensure_private_dir(Dir) ->
+    ok = filelib:ensure_dir(filename:join(Dir, "x")),
+    ok = file:change_mode(Dir, ?WALLET_DIR_MODE).
+
+%% Wallet files written by an older build sit at the umask mode (0664/0644)
+%% until the next save. Tighten them when they are loaded, so an unchanged
+%% wallet does not stay readable. Only the wallet's own files: the path may
+%% be caller-supplied, so its directory is left alone here (the default
+%% wallet directory is tightened by maybe_autoload_default/2). Best-effort:
+%% a failure here must not stop the wallet from loading.
+tighten_wallet_file_modes(FilePath) ->
+    lists:foreach(
+      fun(P) ->
+              case filelib:is_regular(P) of
+                  true  -> _ = file:change_mode(P, ?WALLET_FILE_MODE);
+                  false -> ok
+              end
+      end, [FilePath, FilePath ++ ".bak"]),
+    ok.
 
 %% fsync the directory so the rename is itself durable.  Best-effort:
 %% directory fsync is not portable to every filesystem/OS; a failure here
@@ -2408,6 +2455,7 @@ to_integer(_) -> -1.
 %% bad → {error, Reason} (callers decide whether that is fatal — for the
 %% boot auto-load it is NOT: the node starts with a fresh/empty wallet).
 load_wallet_file(FilePath, Passphrase) ->
+    ok = tighten_wallet_file_modes(FilePath),
     case try_load_one(FilePath, Passphrase) of
         {ok, _} = Ok ->
             Ok;
