@@ -1165,7 +1165,7 @@ load_or_generate_secret(DataDir) ->
 
 source_netgroup(Source) when is_pid(Source) ->
     %% A pid carries no address. Gossip callers pass the relaying peer's
-    %% {IP, Port} instead (see beamchain_peer_manager:store_relayed_addrs/3);
+    %% {IP, Port} instead (see beamchain_peer_manager:store_relayed_addrs/2);
     %% a pid source is only addrman's own addpeeraddress path.
     local;
 source_netgroup({IP, _Port}) ->
