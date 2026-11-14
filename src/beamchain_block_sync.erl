@@ -63,7 +63,8 @@
 -export([do_handle_cmpctblock/5, unsolicited_connect_penalty/1, test_new_state/0,
          test_state/1, test_get/2,
          admit_downloaded/3,
-         validate_and_connect/3]).
+         validate_and_connect/3,
+         find_start_height/0]).
 -endif.
 
 -define(SERVER, ?MODULE).
