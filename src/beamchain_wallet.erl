@@ -2187,9 +2187,19 @@ atomic_write_wallet(File, Bytes) ->
         %% Keep a backup of the last known-good file before clobbering it.
         %% Not file:copy/2: that creates the copy at the process umask, so
         %% the seed in the backup would be readable by group/other.
+        %% Written to a temp path and renamed, so a failed write leaves the
+        %% previous .bak in place.
         case file:read_file(File) of
-            {ok, Prev} -> _ = catch write_and_sync(Bak, Prev);
-            {error, _} -> ok
+            {ok, Prev} ->
+                BakTmp = Bak ++ ".tmp",
+                try
+                    ok = write_and_sync(BakTmp, Prev),
+                    ok = file:rename(BakTmp, Bak)
+                catch _:_ ->
+                    _ = file:delete(BakTmp)
+                end;
+            {error, _} ->
+                ok
         end,
         ok = file:rename(Tmp, File),
         _ = fsync_dir(Dir),
@@ -2245,11 +2255,14 @@ rewrite_backup_after_encrypt(File) ->
 %% only in the page cache.
 %%
 %% The file is created fresh (any old one is unlinked first, then opened
-%% `exclusive`, so a planted symlink or a file someone else already holds
-%% open is never written through) and chmodded 0600 BEFORE any byte of the
-%% wallet is written. Erlang's file:open/2 takes no mode and the VM has no
-%% umask call, so this is how we match Core, which runs with umask 077 and
-%% so creates every wallet file 0600. If the chmod fails nothing is written.
+%% `exclusive`, so a planted symlink or a pre-existing file is never written
+%% through) and chmodded 0600 BEFORE any byte of the wallet is written.
+%% Erlang's file:open/2 takes no mode and the VM has no umask call, so the
+%% empty file exists at the umask mode for the moment between open and
+%% chmod; in the node's own wallet directory, which is 0700, no other user
+%% can reach it then. This is how we match Core, which runs with umask 077
+%% and so creates every wallet file 0600. If the chmod fails nothing is
+%% written.
 write_and_sync(Path, Bytes) ->
     _ = file:delete(Path),
     case file:open(Path, [write, exclusive, raw, binary]) of
@@ -2275,7 +2288,7 @@ ensure_private_dir(Dir) ->
     ok = file:change_mode(Dir, ?WALLET_DIR_MODE).
 
 %% Wallet files written by an older build sit at the umask mode (0664/0644)
-%% until the next save. Tighten them when they are loaded, so an unchanged
+%% until the next save. Tighten them once they load, so an unchanged
 %% wallet does not stay readable. Only the wallet's own files: the path may
 %% be caller-supplied, so its directory is left alone here (the default
 %% wallet directory is tightened by maybe_autoload_default/2). Best-effort:
@@ -2455,7 +2468,15 @@ to_integer(_) -> -1.
 %% bad → {error, Reason} (callers decide whether that is fatal — for the
 %% boot auto-load it is NOT: the node starts with a fresh/empty wallet).
 load_wallet_file(FilePath, Passphrase) ->
-    ok = tighten_wallet_file_modes(FilePath),
+    case load_wallet_file_1(FilePath, Passphrase) of
+        {ok, _} = Ok ->
+            ok = tighten_wallet_file_modes(FilePath),
+            Ok;
+        Err ->
+            Err
+    end.
+
+load_wallet_file_1(FilePath, Passphrase) ->
     case try_load_one(FilePath, Passphrase) of
         {ok, _} = Ok ->
             Ok;
