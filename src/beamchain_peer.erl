@@ -59,13 +59,20 @@
 %% Retry interval while getdata serving is paused on a full send queue.
 -define(GETDATA_PAUSE_RETRY_MS, 10).
 %% Receive-side backpressure (Core net.cpp fPauseRecv). While the messages
-%% this node has taken off the wire but not yet processed -- the handler's
-%% (peer manager's) mailbox plus beamchain_sync's -- exceed this many, a
-%% peer stops dispatching frames and does not re-arm {active, once}; it
-%% re-checks every ?RECV_PAUSE_RETRY_MS. Override: app env
-%% recv_backlog_limit.
+%% this node has taken off the wire but not yet processed -- the mailboxes
+%% of the handler (peer manager) and of every process it relays peer
+%% messages into (?RECV_DOWNSTREAM) -- exceed this many, a peer stops
+%% dispatching frames and does not re-arm {active, once}; it re-checks
+%% every ?RECV_PAUSE_RETRY_MS. Override: app env recv_backlog_limit.
 -define(RECV_BACKLOG_LIMIT, 1000).
 -define(RECV_PAUSE_RETRY_MS, 10).
+%% The manager casts headers/inv/block/cmpctblock/blocktxn/notfound to
+%% beamchain_sync, which decodes them and casts headers on to
+%% beamchain_header_sync and block/cmpctblock/blocktxn on to
+%% beamchain_block_sync; a backlog can build in any of the three.
+%% (P2P tx goes to beamchain_tx_ingest, which sheds load itself.)
+-define(RECV_DOWNSTREAM, [beamchain_sync, beamchain_header_sync,
+                          beamchain_block_sync]).
 %% Largest notfound batch held before it is sent.
 -define(GETDATA_NOTFOUND_BATCH, 1000).
 
@@ -643,8 +650,10 @@ handshaking(info, {tcp, Socket, Bin}, #peer_data{socket = Socket} = Data) ->
     end;
 
 handshaking(info, resume_recv, _Data) ->
-    %% Pausing is only armed after the handshake completes, at which point
-    %% this state hands over to `ready`; keep the event for it regardless.
+    %% Pausing is only armed once the handshake is complete.  That can
+    %% happen while still in this state (frames after verack in the same
+    %% segment), but the {tcp, ...} clause then moves to `ready` before
+    %% the timer fires; postpone so `ready` handles it in any case.
     {keep_state_and_data, postpone};
 
 handshaking(info, {tcp_closed, _}, Data) ->
@@ -729,13 +738,7 @@ ready({timeout, pong}, pong_timeout, Data) ->
 ready(info, {tcp, Socket, Bin}, #peer_data{socket = Socket} = Data) ->
     case handle_tcp_data(Bin, Data) of
         {ok, Data2} ->
-            Actions = [{{timeout, inactivity}, ?INACTIVITY_TIMEOUT, inactive}],
-            %% Cancel pong timeout if pong was received (nonce cleared)
-            Actions2 = case Data2#peer_data.last_ping_nonce of
-                undefined -> [{{timeout, pong}, infinity, pong_timeout} | Actions];
-                _         -> Actions
-            end,
-            {keep_state, Data2, Actions2};
+            {keep_state, Data2, recv_actions(Data2)};
         {stop, Reason} ->
             {stop, Reason}
     end;
@@ -749,8 +752,10 @@ ready(info, resume_recv, Data) ->
             %% Dispatch the frames left in the buffer when we paused, then
             %% read again unless they filled the queues back up.
             case dispatch_buffered(Data#peer_data{recv_paused = false}) of
-                {ok, Data2}    -> {keep_state, rearm_recv(Data2)};
-                {stop, Reason} -> {stop, Reason}
+                {ok, Data2} ->
+                    {keep_state, rearm_recv(Data2), recv_actions(Data2)};
+                {stop, Reason} ->
+                    {stop, Reason}
             end
     end;
 
@@ -867,12 +872,21 @@ handle_tcp_data(NewBytes, #peer_data{buffer = Buf} = Data) ->
             {stop, Reason}
     end.
 
+%% Timer actions after frames from the peer were dispatched.
+recv_actions(Data) ->
+    Actions = [{{timeout, inactivity}, ?INACTIVITY_TIMEOUT, inactive}],
+    %% Cancel pong timeout if pong was received (nonce cleared)
+    case Data#peer_data.last_ping_nonce of
+        undefined -> [{{timeout, pong}, infinity, pong_timeout} | Actions];
+        _         -> Actions
+    end.
+
 %% Ask for the next TCP segment, unless the downstream queues are full.
 %%
 %% Every frame a peer decodes is forwarded to its handler (the peer
-%% manager), which casts it on to beamchain_sync; neither mailbox has a
-%% bound, so a peer that sends faster than sync drains them used to grow
-%% both without limit.  Core stops reading from a peer whose processing
+%% manager), which casts it on to beamchain_sync and from there to
+%% header_sync / block_sync; none of these mailboxes has a bound, so a
+%% peer that sends faster than they drain used to grow them without limit.  Core stops reading from a peer whose processing
 %% queue is over -maxreceivebuffer (net.cpp fPauseRecv, checked by
 %% CConnman::SocketHandler before every recv).  Here a paused peer leaves
 %% the socket passive -- the kernel receive window fills and TCP flow
@@ -894,7 +908,8 @@ should_pause_recv(Data) ->
 recv_backlogged(#peer_data{handler = Handler}) ->
     Limit = application:get_env(beamchain, recv_backlog_limit,
                                 ?RECV_BACKLOG_LIMIT),
-    mailbox_len(Handler) + mailbox_len(whereis(beamchain_sync)) > Limit.
+    lists:foldl(fun(Name, Acc) -> Acc + mailbox_len(whereis(Name)) end,
+                mailbox_len(Handler), ?RECV_DOWNSTREAM) > Limit.
 
 mailbox_len(Pid) when is_pid(Pid) ->
     case erlang:process_info(Pid, message_queue_len) of
