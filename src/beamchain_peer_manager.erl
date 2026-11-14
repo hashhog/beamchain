@@ -129,6 +129,7 @@
          test_handle_addrv2/3,
          test_handle_getaddr/2,
          test_peer_field/2,
+         load_bans/1,
          clamp_addr_timestamp/2]).
 -endif.
 
@@ -148,6 +149,23 @@
 %% Misbehavior scoring thresholds
 -define(BAN_THRESHOLD, 100).
 -define(DEFAULT_BAN_DURATION, 86400).  %% 24 hours in seconds
+%% Misbehaviour discouragements are bounded the way Core bounds them:
+%% BanMan::m_discouraged is a CRollingBloomFilter{50000, 0.000001}
+%% (banman.h), so once 50000 addresses are discouraged the oldest ones roll
+%% out.  ?DISCOURAGED_INDEX is an ordered_set of {BanExpiry, IP} holding
+%% only the misbehaviour-originated rows of ?BANNED_PEERS_TABLE, oldest
+%% expiry first, so eviction is ets:first/1 and never touches an
+%% operator's setban rows (Core's m_banned is a separate, unbounded map).
+-define(MAX_DISCOURAGED, 50000).
+-define(DISCOURAGED_INDEX, banned_peers_discouraged_idx).
+%% banned.json is dumped at most once per ?BAN_DUMP_DELAY_MS, never
+%% synchronously per event (Core: DUMP_BANS_INTERVAL in net.h schedules
+%% BanMan::DumpBanlist).  Leading edge: the first change after a quiet
+%% period dumps on the next message, so an isolated discouragement is on
+%% disk as promptly as before; a burst is coalesced into one dump per
+%% interval.  A failed dump is logged and retried instead of crashing the
+%% shared peer manager.
+-define(BAN_DUMP_DELAY_MS, 60000).
 
 %% Connection limits (matches Bitcoin Core)
 -define(MAX_INBOUND_DEFAULT, 125).
@@ -329,6 +347,12 @@
     netgroup_secret :: binary(),
     %% Data directory for anchor file
     datadir :: string(),
+    %% banned.json is behind the in-memory ban table and a dump_bans
+    %% message is scheduled (see ?BAN_DUMP_DELAY_MS).
+    bans_dirty = false :: boolean(),
+    ban_dump_timer :: reference() | undefined,
+    %% erlang:monotonic_time(millisecond) of the last dump attempt.
+    last_ban_dump :: integer() | undefined,
     %% Stale peer check timer
     stale_check_timer :: reference() | undefined,
     %% Stale tip detection: when our chain tip last advanced (erlang:system_time(second))
@@ -864,6 +888,7 @@ init([]) ->
         _ ->
             ok  %% table already exists (e.g., from tests)
     end,
+    ensure_discouraged_index(),
     %% Create the addnode added-node list table (Core m_added_nodes). Owned by
     %% the manager so the operator's keep-connected intent survives peer churn.
     ensure_added_nodes_table(),
@@ -1031,6 +1056,7 @@ handle_call(get_ban_list, _From, State) ->
 
 handle_call({set_ban, IP, Duration, Reason}, _From, State) ->
     BanExpiry = erlang:system_time(second) + Duration,
+    unindex_discouraged(IP),
     ets:insert(?BANNED_PEERS_TABLE, {IP, BanExpiry}),
     logger:info("peer manager: manually banned ~p for ~B seconds: ~s",
                 [IP, Duration, Reason]),
@@ -1041,6 +1067,7 @@ handle_call({set_ban, IP, Duration, Reason}, _From, State) ->
 handle_call({clear_ban, IP}, _From, State) ->
     case ets:lookup(?BANNED_PEERS_TABLE, IP) of
         [{IP, _}] ->
+            unindex_discouraged(IP),
             ets:delete(?BANNED_PEERS_TABLE, IP),
             logger:info("peer manager: unbanned ~p", [IP]),
             {reply, ok, State};
@@ -1445,6 +1472,20 @@ handle_info({'DOWN', _MonRef, process, Pid, Reason}, State) ->
             {noreply, State2};
         [] ->
             {noreply, State}
+    end;
+
+%% Debounced banned.json dump (scheduled by mark_bans_dirty/1).
+handle_info(dump_bans, State) ->
+    State1 = State#state{ban_dump_timer = undefined,
+                         last_ban_dump = erlang:monotonic_time(millisecond)},
+    case save_bans(State1#state.datadir) of
+        ok ->
+            {noreply, State1#state{bans_dirty = false}};
+        {error, Reason} ->
+            logger:warning("peer manager: failed to write banned.json: ~p; "
+                           "keeping bans in memory, retrying in ~B ms",
+                           [Reason, ?BAN_DUMP_DELAY_MS]),
+            {noreply, mark_bans_dirty(State1)}
     end;
 
 %% Periodic cleanup of expired bans
@@ -3030,6 +3071,7 @@ is_ip_banned(IP) ->
                 true -> true;
                 false ->
                     %% Ban has expired, remove it
+                    unindex_discouraged(IP),
                     ets:delete(?BANNED_PEERS_TABLE, IP),
                     false
             end;
@@ -3053,6 +3095,7 @@ cleanup_expired_bans() ->
     ets:foldl(fun({IP, BanExpiry}, _) ->
         case BanExpiry =< Now of
             true ->
+                unindex_discouraged(IP),
                 ets:delete(?BANNED_PEERS_TABLE, IP),
                 logger:debug("peer manager: ban expired for ~p", [IP]);
             false ->
@@ -3061,17 +3104,106 @@ cleanup_expired_bans() ->
     end, ok, ?BANNED_PEERS_TABLE).
 
 %% Persist ban list to banned.json in the data directory.
+%% Returns ok | {error, Reason}; never raises, so a full or failing disk
+%% cannot take the peer manager down.
 save_bans(DataDir) ->
-    BanList = get_ban_list_internal(),
-    Entries = lists:map(fun({IP, BanExpiry}) ->
-        IPStr = inet:ntoa(IP),
-        #{<<"ip">> => list_to_binary(IPStr),
-          <<"until_timestamp">> => BanExpiry}
-    end, BanList),
-    Json = jsx:encode(Entries),
-    Path = filename:join(DataDir, "banned.json"),
-    ok = file:write_file(Path, Json),
-    ok.
+    try
+        BanList = get_ban_list_internal(),
+        Entries = lists:map(fun({IP, BanExpiry}) ->
+            IPStr = inet:ntoa(IP),
+            Base = #{<<"ip">> => list_to_binary(IPStr),
+                     <<"until_timestamp">> => BanExpiry},
+            %% Mark discouragements so load_bans/1 re-indexes them under the
+            %% cap; rows without the key load as operator bans.
+            case is_indexed_discouragement(IP, BanExpiry) of
+                true -> Base#{<<"discouraged">> => true};
+                false -> Base
+            end
+        end, BanList),
+        Json = jsx:encode(Entries),
+        Path = filename:join(DataDir, "banned.json"),
+        file:write_file(Path, Json)
+    catch
+        Class:Err -> {error, {Class, Err}}
+    end.
+
+is_indexed_discouragement(IP, BanExpiry) ->
+    ets:info(?DISCOURAGED_INDEX) =/= undefined andalso
+        ets:member(?DISCOURAGED_INDEX, {BanExpiry, IP}).
+
+%% Schedule one banned.json dump if none is pending: immediately when the
+%% last dump attempt is at least ?BAN_DUMP_DELAY_MS old, otherwise when it
+%% will be.
+mark_bans_dirty(#state{ban_dump_timer = undefined,
+                       last_ban_dump = Last} = State) ->
+    Delay = case Last of
+        undefined -> 0;
+        _ -> max(0, Last + ?BAN_DUMP_DELAY_MS
+                    - erlang:monotonic_time(millisecond))
+    end,
+    T = erlang:send_after(Delay, self(), dump_bans),
+    State#state{bans_dirty = true, ban_dump_timer = T};
+mark_bans_dirty(State) ->
+    State#state{bans_dirty = true}.
+
+ensure_discouraged_index() ->
+    case ets:info(?DISCOURAGED_INDEX) of
+        undefined ->
+            ets:new(?DISCOURAGED_INDEX, [named_table, ordered_set, public]),
+            ok;
+        _ ->
+            ok
+    end.
+
+%% Drop IP's discouragement-index row, if its current ban row is one.
+unindex_discouraged(IP) ->
+    case ets:info(?DISCOURAGED_INDEX) of
+        undefined -> ok;
+        _ ->
+            case ets:lookup(?BANNED_PEERS_TABLE, IP) of
+                [{IP, Expiry}] -> ets:delete(?DISCOURAGED_INDEX, {Expiry, IP});
+                [] -> ok
+            end,
+            ok
+    end.
+
+%% Record a misbehaviour discouragement of IP until BanExpiry, keeping at
+%% most ?MAX_DISCOURAGED of them (oldest expiry rolls out first, like
+%% Core's rolling filter).  An operator ban on IP (an unindexed row) is
+%% left exactly as it is, whatever its expiry: Core's Discourage() only
+%% inserts into m_discouraged and never writes m_banned, so a setban's
+%% bantime is neither shortened nor extended, and the row is never made
+%% evictable by being indexed.
+discourage_ip(IP, BanExpiry) ->
+    ensure_discouraged_index(),
+    Existing = ets:lookup(?BANNED_PEERS_TABLE, IP),
+    IsDiscouraged = case Existing of
+        [{IP, E}] -> ets:member(?DISCOURAGED_INDEX, {E, IP});
+        [] -> false
+    end,
+    case Existing of
+        [{IP, _OperatorExpiry}] when not IsDiscouraged ->
+            ok;
+        _ ->
+            unindex_discouraged(IP),
+            ets:insert(?BANNED_PEERS_TABLE, {IP, BanExpiry}),
+            ets:insert(?DISCOURAGED_INDEX, {{BanExpiry, IP}}),
+            evict_discouraged(ets:info(?DISCOURAGED_INDEX, size)
+                              - ?MAX_DISCOURAGED)
+    end.
+
+evict_discouraged(N) when N =< 0 ->
+    ok;
+evict_discouraged(N) ->
+    case ets:first(?DISCOURAGED_INDEX) of
+        '$end_of_table' ->
+            ok;
+        {Expiry, IP} = Key ->
+            ets:delete(?DISCOURAGED_INDEX, Key),
+            %% Only drop the ban row if it is still this discouragement.
+            _ = ets:delete_object(?BANNED_PEERS_TABLE, {IP, Expiry}),
+            evict_discouraged(N - 1)
+    end.
 
 %% Load ban list from banned.json on startup.
 load_bans(DataDir) ->
@@ -3086,7 +3218,11 @@ load_bans(DataDir) ->
                     BanExpiry = maps:get(<<"until_timestamp">>, Entry),
                     case inet:parse_address(IPStr) of
                         {ok, IP} when BanExpiry > Now ->
-                            ets:insert(?BANNED_PEERS_TABLE, {IP, BanExpiry});
+                            case maps:get(<<"discouraged">>, Entry, false) of
+                                true -> discourage_ip(IP, BanExpiry);
+                                _ -> ets:insert(?BANNED_PEERS_TABLE,
+                                                {IP, BanExpiry})
+                            end;
                         _ ->
                             ok
                     end
@@ -3164,13 +3300,12 @@ handle_misbehaving(Pid, Score, Reason, State) ->
                         false ->
                             %% Regular peer: discourage (ban + disconnect) immediately.
                             BanExpiry = erlang:system_time(second) + ?DEFAULT_BAN_DURATION,
-                            ets:insert(?BANNED_PEERS_TABLE, {IP, BanExpiry}),
+                            discourage_ip(IP, BanExpiry),
                             logger:info("peer manager: discouraging ~p:~B for ~B seconds "
                                         "(score ~B, single-event)",
                                         [IP, Port, ?DEFAULT_BAN_DURATION, Score]),
-                            save_bans(State#state.datadir),
                             beamchain_peer:disconnect(Pid),
-                            {noreply, State}
+                            {noreply, mark_bans_dirty(State)}
                     end
             end;
         [] ->

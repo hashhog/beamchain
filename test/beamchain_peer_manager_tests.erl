@@ -1169,3 +1169,219 @@ wait_until(F, Want, Tries) ->
         Want -> Want;
         _ -> timer:sleep(50), wait_until(F, Want, Tries - 1)
     end.
+
+%%% ===================================================================
+%%% Ban table bound + persistence failure tolerance
+%%% (secfix-beamchain-banlist-uncapped)
+%%%
+%%% Every misbehaviour discouragement used to (a) insert into the
+%%% banned_peers ETS table with no bound and (b) rewrite banned.json
+%%% synchronously with `ok = file:write_file(...)` on the shared peer
+%%% manager.  A peer able to trigger misbehaviour from many addresses
+%%% (IPv6 gives an attacker effectively unlimited source IPs) grew the
+%%% table without limit and made each event cost an O(table) JSON rewrite;
+%%% one ENOSPC / EIO from the write then crashed the manager (badmatch),
+%%% dropping every peer.  Core keeps discouragement in a bounded rolling
+%%% bloom filter (banman.h m_discouraged{50000, 0.000001}) and dumps its
+%%% ban list on a timer (DUMP_BANS_INTERVAL), never per event.
+%%%
+%%% Drives the real handle_cast({misbehaving,...}) / handle_info callbacks
+%%% with a #state{} built from the module's record definition, so the
+%%% production code path is what runs.
+%%% ===================================================================
+
+-define(BAN_FLOOD, 100000).
+%% Core's discouragement filter capacity (banman.h m_discouraged).
+-define(BAN_CAP, 50000).
+
+ban_table_is_bounded_and_write_failure_tolerated_test_() ->
+    {timeout, 300,
+     {setup, fun ban_flood_setup/0, fun ban_flood_cleanup/1,
+      fun(Ctx) -> [fun() -> ban_flood_body(Ctx) end] end}}.
+
+ban_flood_setup() ->
+    setup(),
+    beamchain_peer_manager:test_ensure_peer_table(),
+    %% Scratch datadir whose banned.json is a symlink to /dev/full: open
+    %% succeeds and every write returns ENOSPC, i.e. a real disk-full error.
+    Dir = filename:join(["/tmp", "beamchain-bancap-" ++
+                         integer_to_list(erlang:unique_integer([positive]))]),
+    ok = filelib:ensure_dir(filename:join(Dir, "x")),
+    ok = file:make_symlink("/dev/full", filename:join(Dir, "banned.json")),
+    OkDir = Dir ++ "-ok",
+    ok = filelib:ensure_dir(filename:join(OkDir, "x")),
+    %% 100k discouragement log lines would swamp the eunit output.
+    #{level := Level} = logger:get_primary_config(),
+    ok = logger:set_primary_config(level, none),
+    #{full => Dir, ok => OkDir, level => Level}.
+
+ban_flood_cleanup(#{full := Dir, ok := OkDir, level := Level}) ->
+    logger:set_primary_config(level, Level),
+    _ = file:del_dir_r(Dir),
+    _ = file:del_dir_r(OkDir),
+    catch ets:delete_all_objects(beamchain_peers),
+    catch ets:delete_all_objects(banned_peers_discouraged_idx),
+    cleanup(ok).
+
+ban_flood_body(#{full := FullDir, ok := OkDir}) ->
+    %% A dead pid: beamchain_peer:disconnect/1 is a cast, harmless here.
+    Pid = spawn(fun() -> ok end),
+    beamchain_peer_manager:test_insert_peer(Pid, inbound, full_relay, normal),
+    AddrPos = record_field_pos(peer_entry, address),
+    %% An operator ban set before the flood must survive it.
+    Manual = {203, 0, 113, 7},
+    S0 = build_state(#{datadir => FullDir}),
+    {reply, ok, S1} = beamchain_peer_manager:handle_call(
+                        {set_ban, Manual, 86400, <<"operator">>}, self(), S0),
+    Ip = fun(N) -> {16#2001, 16#db8, 0, 0, 0, 0, N bsr 16, N band 16#FFFF} end,
+    SFlood = lists:foldl(
+        fun(N, S) ->
+            true = ets:update_element(beamchain_peers, Pid,
+                                      {AddrPos, {Ip(N), 8333}}),
+            {noreply, S2} = beamchain_peer_manager:handle_cast(
+                              {misbehaving, Pid, 100, <<"flood">>}, S),
+            S2
+        end, S1, lists:seq(1, ?BAN_FLOOD)),
+    %% Bounded: discouragements beyond the cap evict the oldest ones.
+    Size = ets:info(banned_peers, size),
+    ?assert(Size =< ?BAN_CAP + 1),
+    %% The newest discouragement is in force, the oldest was rolled out,
+    %% and the operator's manual ban was not evicted by the flood.
+    ?assertMatch([{_, _}], ets:lookup(banned_peers, Ip(?BAN_FLOOD))),
+    ?assertEqual([], ets:lookup(banned_peers, Ip(1))),
+    ?assertMatch([{Manual, _}], ets:lookup(banned_peers, Manual)),
+    %% Every discouraged row is indexed exactly once (the manual ban is not).
+    ?assertEqual(Size - 1, ets:info(banned_peers_discouraged_idx, size)),
+    %% Re-discouraging an already-discouraged address does not add rows.
+    SRe = lists:foldl(
+        fun(_, S) ->
+            {noreply, S2} = beamchain_peer_manager:handle_cast(
+                              {misbehaving, Pid, 100, <<"again">>}, S),
+            S2
+        end, SFlood, lists:seq(1, 3)),
+    ?assertEqual(Size, ets:info(banned_peers, size)),
+    ?assertEqual(Size - 1, ets:info(banned_peers_discouraged_idx, size)),
+    %% Persistence is debounced: flushing it against a full disk must not
+    %% crash the manager (returns {noreply, _}, the gen_server lives on).
+    {noreply, SFull} = beamchain_peer_manager:handle_info(dump_bans, SRe),
+    %% ... and the failed dump stays pending, retried a full interval later.
+    DirtyPos = record_field_pos(state, bans_dirty),
+    TimerPos = record_field_pos(state, ban_dump_timer),
+    ?assertEqual(true, element(DirtyPos, SFull)),
+    ?assert(timer_left_ms(element(TimerPos, SFull)) > 50000),
+    %% Control: with a writable datadir the same flush really writes the
+    %% bounded list (so the ENOSPC case above did reach file:write_file).
+    DdPos = record_field_pos(state, datadir),
+    {noreply, SOk} = beamchain_peer_manager:handle_info(
+                       dump_bans, setelement(DdPos, SFull, OkDir)),
+    ?assertEqual(false, element(DirtyPos, SOk)),
+    BanFile = filename:join(OkDir, "banned.json"),
+    {ok, Bin} = file:read_file(BanFile),
+    Entries = jsx:decode(Bin, [return_maps]),
+    ?assertEqual(Size, length(Entries)),
+    Ips = [maps:get(<<"ip">>, E) || E <- Entries],
+    ?assert(lists:member(list_to_binary(inet:ntoa(Ip(?BAN_FLOOD))), Ips)),
+    ?assert(lists:member(<<"203.0.113.7">>, Ips)),
+    %% Discouragements are flagged on disk and reload under the cap; the
+    %% operator ban reloads as an operator ban (not evictable).
+    Flagged = [E || E <- Entries, maps:get(<<"discouraged">>, E, false)],
+    ?assertEqual(Size - 1, length(Flagged)),
+    ets:delete_all_objects(banned_peers),
+    ets:delete_all_objects(banned_peers_discouraged_idx),
+    beamchain_peer_manager:load_bans(OkDir),
+    ?assertEqual(Size, ets:info(banned_peers, size)),
+    ?assertEqual(Size - 1, ets:info(banned_peers_discouraged_idx, size)),
+    [{Manual, ManualExp}] = ets:lookup(banned_peers, Manual),
+    ?assertNot(ets:member(banned_peers_discouraged_idx, {ManualExp, Manual})),
+    %% Debounce: no discouragement writes banned.json synchronously.
+    %% Right after a dump, a new one is deferred a full interval (bursts
+    %% coalesce) ...
+    Discourage = fun(N, S) ->
+        true = ets:update_element(beamchain_peers, Pid,
+                                  {AddrPos, {Ip(N), 8333}}),
+        {noreply, S2} = beamchain_peer_manager:handle_cast(
+                          {misbehaving, Pid, 100, <<"debounce">>}, S),
+        S2
+    end,
+    flush_dump_bans(),
+    SDeferred = Discourage(?BAN_FLOOD + 1, SOk),
+    ?assertEqual({ok, Bin}, file:read_file(BanFile)),
+    ?assert(timer_left_ms(element(TimerPos, SDeferred)) > 50000),
+    %% ... while the first one after a quiet period is dumped on the very
+    %% next message (as promptly as the old per-event write).
+    _ = Discourage(?BAN_FLOOD + 2, build_state(#{datadir => OkDir})),
+    ?assertEqual({ok, Bin}, file:read_file(BanFile)),
+    receive dump_bans -> ok after 2000 -> ?assert(false) end.
+
+%% A short operator setban (under the 24 h discouragement) on an address
+%% that then misbehaves keeps its manual expiry and stays out of the
+%% evictable discouragement index.  Core's Discourage() only inserts into
+%% m_discouraged and never touches m_banned, so the setban row must not be
+%% lengthened into a discouragement that a later cap eviction could drop
+%% before the operator's bantime ends.
+short_setban_survives_discouragement_test_() ->
+    {setup,
+     fun() ->
+         setup(),
+         beamchain_peer_manager:test_ensure_peer_table(),
+         Dir = filename:join(["/tmp", "beamchain-shortban-" ++
+                              integer_to_list(erlang:unique_integer([positive]))]),
+         ok = filelib:ensure_dir(filename:join(Dir, "x")),
+         Dir
+     end,
+     fun(Dir) ->
+         _ = file:del_dir_r(Dir),
+         catch ets:delete_all_objects(beamchain_peers),
+         catch ets:delete_all_objects(banned_peers_discouraged_idx),
+         cleanup(ok)
+     end,
+     fun(Dir) -> [fun() -> short_setban_body(Dir) end] end}.
+
+short_setban_body(Dir) ->
+    Ip = {203, 0, 113, 8},
+    Pid = spawn(fun() -> ok end),
+    beamchain_peer_manager:test_insert_peer(Pid, inbound, full_relay, normal),
+    AddrPos = record_field_pos(peer_entry, address),
+    true = ets:update_element(beamchain_peers, Pid, {AddrPos, {Ip, 8333}}),
+    S0 = build_state(#{datadir => Dir}),
+    {reply, ok, S1} = beamchain_peer_manager:handle_call(
+                        {set_ban, Ip, 3600, <<"operator">>}, self(), S0),
+    [{Ip, ManualExp}] = ets:lookup(banned_peers, Ip),
+    {noreply, _} = beamchain_peer_manager:handle_cast(
+                     {misbehaving, Pid, 100, <<"misbehaved">>}, S1),
+    %% The manual expiry is unchanged ...
+    ?assertEqual([{Ip, ManualExp}], ets:lookup(banned_peers, Ip)),
+    %% ... and the address is not in the evictable discouragement index.
+    ?assertEqual([], [K || {{_, I} = K} <- ets:tab2list(
+                                               banned_peers_discouraged_idx),
+                           I =:= Ip]),
+    flush_dump_bans().
+
+%% Milliseconds left on a pending timer; 0 if it already fired or is not a
+%% timer (erlang:read_timer/1 returns the atom false, and atoms compare
+%% greater than every integer).
+timer_left_ms(Ref) when is_reference(Ref) ->
+    case erlang:read_timer(Ref) of
+        Ms when is_integer(Ms) -> Ms;
+        false -> 0
+    end;
+timer_left_ms(_) ->
+    0.
+
+flush_dump_bans() ->
+    receive dump_bans -> flush_dump_bans() after 0 -> ok end.
+
+%% 1-based tuple position of Field in record Rec of beamchain_peer_manager.
+record_field_pos(Rec, Field) ->
+    Beam = code:which(beamchain_peer_manager),
+    {ok, {_, [{abstract_code, {raw_abstract_v1, Forms}}]}} =
+        beam_lib:chunks(Beam, [abstract_code]),
+    [Fields] = [Fs || {attribute, _, record, {R, Fs}} <- Forms, R =:= Rec],
+    Names = [field_name(F) || F <- Fields],
+    true = lists:member(Field, Names),
+    %% element 1 is the record tag, so field I sits at position I + 1.
+    2 + length(lists:takewhile(fun(N) -> N =/= Field end, Names)).
+
+field_name({typed_record_field, RF, _}) -> field_name(RF);
+field_name({record_field, _, {atom, _, N}}) -> N;
+field_name({record_field, _, {atom, _, N}, _}) -> N.
