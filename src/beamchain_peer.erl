@@ -58,6 +58,21 @@
 -define(PEER_SEND_TIMEOUT_MS, 30000).
 %% Retry interval while getdata serving is paused on a full send queue.
 -define(GETDATA_PAUSE_RETRY_MS, 10).
+%% Receive-side backpressure (Core net.cpp fPauseRecv). While the messages
+%% this node has taken off the wire but not yet processed -- the mailboxes
+%% of the handler (peer manager) and of every process it relays peer
+%% messages into (?RECV_DOWNSTREAM) -- exceed this many, a peer stops
+%% dispatching frames and does not re-arm {active, once}; it re-checks
+%% every ?RECV_PAUSE_RETRY_MS. Override: app env recv_backlog_limit.
+-define(RECV_BACKLOG_LIMIT, 1000).
+-define(RECV_PAUSE_RETRY_MS, 10).
+%% The manager casts headers/inv/block/cmpctblock/blocktxn/notfound to
+%% beamchain_sync, which decodes them and casts headers on to
+%% beamchain_header_sync and block/cmpctblock/blocktxn on to
+%% beamchain_block_sync; a backlog can build in any of the three.
+%% (P2P tx goes to beamchain_tx_ingest, which sheds load itself.)
+-define(RECV_DOWNSTREAM, [beamchain_sync, beamchain_header_sync,
+                          beamchain_block_sync]).
 %% Largest notfound batch held before it is sent.
 -define(GETDATA_NOTFOUND_BATCH, 1000).
 
@@ -208,7 +223,11 @@
     getdata_notfound = []       :: [map()],
     getdata_notfound_n = 0      :: non_neg_integer(),
     getdata_serving = false     :: boolean(),
-    getdata_paused_since = undefined :: undefined | integer()
+    getdata_paused_since = undefined :: undefined | integer(),
+    %% True while socket reads are paused because the downstream queues
+    %% are over ?RECV_BACKLOG_LIMIT (see should_pause_recv/1).  Complete
+    %% frames still in `buffer` are dispatched on resume.
+    recv_paused = false         :: boolean()
 }).
 
 %%% -------------------------------------------------------------------
@@ -630,6 +649,13 @@ handshaking(info, {tcp, Socket, Bin}, #peer_data{socket = Socket} = Data) ->
             {stop, Reason}
     end;
 
+handshaking(info, resume_recv, _Data) ->
+    %% Pausing is only armed once the handshake is complete.  That can
+    %% happen while still in this state (frames after verack in the same
+    %% segment), but the {tcp, ...} clause then moves to `ready` before
+    %% the timer fires; postpone so `ready` handles it in any case.
+    {keep_state_and_data, postpone};
+
 handshaking(info, {tcp_closed, _}, Data) ->
     logger:info("peer ~p closed during handshake", [Data#peer_data.address]),
     maybe_mark_v1_fallback(Data),
@@ -712,15 +738,25 @@ ready({timeout, pong}, pong_timeout, Data) ->
 ready(info, {tcp, Socket, Bin}, #peer_data{socket = Socket} = Data) ->
     case handle_tcp_data(Bin, Data) of
         {ok, Data2} ->
-            Actions = [{{timeout, inactivity}, ?INACTIVITY_TIMEOUT, inactive}],
-            %% Cancel pong timeout if pong was received (nonce cleared)
-            Actions2 = case Data2#peer_data.last_ping_nonce of
-                undefined -> [{{timeout, pong}, infinity, pong_timeout} | Actions];
-                _         -> Actions
-            end,
-            {keep_state, Data2, Actions2};
+            {keep_state, Data2, recv_actions(Data2)};
         {stop, Reason} ->
             {stop, Reason}
+    end;
+
+ready(info, resume_recv, Data) ->
+    case recv_backlogged(Data) of
+        true ->
+            erlang:send_after(?RECV_PAUSE_RETRY_MS, self(), resume_recv),
+            keep_state_and_data;
+        false ->
+            %% Dispatch the frames left in the buffer when we paused, then
+            %% read again unless they filled the queues back up.
+            case dispatch_buffered(Data#peer_data{recv_paused = false}) of
+                {ok, Data2} ->
+                    {keep_state, rearm_recv(Data2), recv_actions(Data2)};
+                {stop, Reason} ->
+                    {stop, Reason}
+            end
     end;
 
 ready(info, {tcp_closed, _}, Data) ->
@@ -816,7 +852,7 @@ terminate(_Reason, _State, #peer_data{socket = Socket}) ->
 %%% Internal: TCP receive and buffering
 %%% ===================================================================
 
-handle_tcp_data(NewBytes, #peer_data{socket = Socket, buffer = Buf} = Data) ->
+handle_tcp_data(NewBytes, #peer_data{buffer = Buf} = Data) ->
     Buffer = <<Buf/binary, NewBytes/binary>>,
     BytesRecv = Data#peer_data.bytes_recv + byte_size(NewBytes),
     Data2 = Data#peer_data{
@@ -831,11 +867,57 @@ handle_tcp_data(NewBytes, #peer_data{socket = Socket, buffer = Buf} = Data) ->
     Data3 = maybe_classify_inbound(Data2),
     case dispatch_buffered(Data3) of
         {ok, Data4} ->
-            inet:setopts(Socket, [{active, once}]),
-            {ok, Data4};
+            {ok, rearm_recv(Data4)};
         {stop, Reason} ->
             {stop, Reason}
     end.
+
+%% Timer actions after frames from the peer were dispatched.
+recv_actions(Data) ->
+    Actions = [{{timeout, inactivity}, ?INACTIVITY_TIMEOUT, inactive}],
+    %% Cancel pong timeout if pong was received (nonce cleared)
+    case Data#peer_data.last_ping_nonce of
+        undefined -> [{{timeout, pong}, infinity, pong_timeout} | Actions];
+        _         -> Actions
+    end.
+
+%% Ask for the next TCP segment, unless the downstream queues are full.
+%%
+%% Every frame a peer decodes is forwarded to its handler (the peer
+%% manager), which casts it on to beamchain_sync and from there to
+%% header_sync / block_sync; none of these mailboxes has a bound, so a
+%% peer that sends faster than they drain used to grow them without limit.  Core stops reading from a peer whose processing
+%% queue is over -maxreceivebuffer (net.cpp fPauseRecv, checked by
+%% CConnman::SocketHandler before every recv).  Here a paused peer leaves
+%% the socket passive -- the kernel receive window fills and TCP flow
+%% control stalls the sender -- and polls with resume_recv until the
+%% queues are back under the limit.
+rearm_recv(#peer_data{recv_paused = true} = Data) ->
+    erlang:send_after(?RECV_PAUSE_RETRY_MS, self(), resume_recv),
+    Data;
+rearm_recv(#peer_data{socket = Socket} = Data) ->
+    inet:setopts(Socket, [{active, once}]),
+    Data.
+
+%% Checked after each dispatched frame so one large TCP segment cannot
+%% push thousands of frames past the limit.  Before the handshake no
+%% frame is forwarded downstream, so only established peers pause.
+should_pause_recv(Data) ->
+    handshake_complete(Data) andalso recv_backlogged(Data).
+
+recv_backlogged(#peer_data{handler = Handler}) ->
+    Limit = application:get_env(beamchain, recv_backlog_limit,
+                                ?RECV_BACKLOG_LIMIT),
+    lists:foldl(fun(Name, Acc) -> Acc + mailbox_len(whereis(Name)) end,
+                mailbox_len(Handler), ?RECV_DOWNSTREAM) > Limit.
+
+mailbox_len(Pid) when is_pid(Pid) ->
+    case erlang:process_info(Pid, message_queue_len) of
+        {message_queue_len, N} -> N;
+        undefined -> 0
+    end;
+mailbox_len(_) ->
+    0.
 
 %% Decide v1 vs v2 once we have at least 16 bytes buffered.
 %%
@@ -923,7 +1005,11 @@ process_buffer_v1(#peer_data{buffer = Buffer} = Data) ->
         {ok, Command, Payload, Rest} ->
             Data2 = Data#peer_data{buffer = Rest},
             case dispatch_message(Command, Payload, Data2) of
-                {ok, Data3}    -> process_buffer_v1(Data3);
+                {ok, Data3} ->
+                    case should_pause_recv(Data3) of
+                        true  -> {ok, Data3#peer_data{recv_paused = true}};
+                        false -> process_buffer_v1(Data3)
+                    end;
                 {stop, Reason} -> {stop, Reason}
             end;
         incomplete ->
@@ -1176,7 +1262,13 @@ process_buffer_v2(Data) ->
                 {ok, CmdBin, Payload} ->
                     Cmd = beamchain_p2p_msg:command_atom(CmdBin),
                     case dispatch_message(Cmd, Payload, Data2) of
-                        {ok, Data3}    -> process_buffer_v2(Data3);
+                        {ok, Data3} ->
+                            case should_pause_recv(Data3) of
+                                true ->
+                                    {ok, Data3#peer_data{recv_paused = true}};
+                                false ->
+                                    process_buffer_v2(Data3)
+                            end;
                         {stop, Reason} -> {stop, Reason}
                     end;
                 {error, DecodeErr} ->

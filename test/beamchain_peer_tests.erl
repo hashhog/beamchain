@@ -1,6 +1,7 @@
 -module(beamchain_peer_tests).
 
 -include_lib("eunit/include/eunit.hrl").
+-include("beamchain.hrl").
 
 %% BIP 133 feefilter constants (matching beamchain_peer.erl)
 -define(FEEFILTER_BROADCAST_INTERVAL_MS, 600000).
@@ -652,3 +653,217 @@ v2_outbound_v1_only_cache_idempotent_test() ->
     [beamchain_peer:mark_v1_only(A) || _ <- lists:seq(1, 5)],
     ?assertEqual(true, beamchain_peer:is_v1_only(A)),
     beamchain_peer:clear_v1_only_cache().
+
+%%% ===================================================================
+%%% Receive-side backpressure (Core net.cpp fPauseRecv)
+%%% ===================================================================
+%%
+%% A peer that sends faster than the sync processes drain used to be read
+%% without limit: every frame re-armed {active, once} and was forwarded
+%% into the (unbounded) peer-manager mailbox, cast on to beamchain_sync and
+%% from there to beamchain_header_sync / beamchain_block_sync.  Here the
+%% stand-ins route exactly like production (manager -> sync; sync keeps
+%% inv, passes headers to header_sync and block to block_sync at once) and
+%% the process the flood lands in does not drain while a peer pushes
+%% 10,000 frames.  The peer must stop reading (socket left passive) with
+%% that mailbox held near the backlog limit, and must resume and deliver
+%% every frame once it drains.
+%%
+%%   rebar3 eunit --module=beamchain_peer_tests
+
+-define(FLOOD_FRAMES, 10000).
+-define(FLOOD_LIMIT, 1000).        %% beamchain_peer ?RECV_BACKLOG_LIMIT
+-define(FLOOD_SLACK, 50).
+
+flooded_peer_pauses_recv_test_() ->
+    {foreach, fun flood_setup/0, fun flood_teardown/1,
+     [fun(_) -> {timeout, 120, {"flooded_peer_pauses_recv",
+                                fun flooded_peer_pauses_recv/0}} end,
+      fun(_) -> {timeout, 120, {"flooded_peer_pauses_recv_block",
+                                fun flooded_peer_pauses_recv_block/0}} end,
+      fun(_) -> {timeout, 120, {"flooded_peer_pauses_recv_headers",
+                                fun flooded_peer_pauses_recv_headers/0}} end]}.
+
+%% inv: handled inside beamchain_sync itself, so the backlog builds there.
+flooded_peer_pauses_recv() ->
+    Magic = beamchain_config:magic(),
+    flood(inv, beamchain_sync, fun(I) ->
+        Items = [#{type => 1, hash => <<I:32, J:224>>} || J <- lists:seq(1, 10)],
+        beamchain_p2p_msg:encode_msg(Magic, inv,
+            beamchain_p2p_msg:encode_payload(inv, #{items => Items}))
+    end).
+
+%% block: beamchain_sync only decodes and casts it to beamchain_block_sync.
+flooded_peer_pauses_recv_block() ->
+    Magic = beamchain_config:magic(),
+    Block = beamchain_serialize:encode_block(
+              beamchain_chain_params:genesis_block(regtest)),
+    flood(block, beamchain_block_sync, fun(_) ->
+        beamchain_p2p_msg:encode_msg(Magic, block, Block)
+    end).
+
+%% headers: beamchain_sync casts them to beamchain_header_sync.
+flooded_peer_pauses_recv_headers() ->
+    Magic = beamchain_config:magic(),
+    Hdr = beamchain_serialize:encode_block_header(
+            (beamchain_chain_params:genesis_block(regtest))#block.header),
+    Payload = <<1, Hdr/binary, 0>>,
+    flood(headers, beamchain_header_sync, fun(_) ->
+        beamchain_p2p_msg:encode_msg(Magic, headers, Payload)
+    end).
+
+flood(Cmd, Sink, Frame) ->
+    Test = self(),
+    Sinks = [beamchain_header_sync, beamchain_block_sync],
+    Stalled = maps:from_list(
+                [{Name, spawn(fun() -> stalled_sink(Test, Name) end)}
+                 || Name <- Sinks]),
+    Sync = spawn(fun() -> routing_sync(Test) end),
+    [flood_register(Name, Pid) || {Name, Pid} <- maps:to_list(Stalled)],
+    flood_register(beamchain_sync, Sync),
+    SinkPid = maps:get(Sink, Stalled, Sync),
+    Manager = spawn(fun() -> forwarding_manager(Test) end),
+    {ok, L} = gen_tcp:listen(0, [binary, {active, false}, {ip, {127, 0, 0, 1}}]),
+    {Peer, PeerSock, Client} = flood_ready_peer(L, Manager),
+    Total = byte_size(Frame(1)) * ?FLOOD_FRAMES,
+    Sender = spawn(fun() ->
+        [ok = gen_tcp:send(Client, Frame(I)) || I <- lists:seq(1, ?FLOOD_FRAMES)],
+        Test ! sent
+    end),
+    %% The sink is stalled: sample its mailbox while the flood arrives.
+    MaxQ = flood_sample_max_qlen(SinkPid, 3000, 0),
+    {ok, [{active, Active}]} = inet:getopts(PeerSock, [active]),
+    {ok, #{bytes_recv := BytesRecv}} = beamchain_peer:info(Peer),
+    %% Release the sink; every frame must still arrive (the pause resumes).
+    SinkPid ! release,
+    Delivered = receive {sink_count, Sink, ?FLOOD_FRAMES} -> all
+                after 60000 ->
+                    receive {sink_count, Sink, N} -> N after 0 -> none end
+                end,
+    Alive = is_process_alive(Peer),
+    [exit(P, kill) || P <- [Sender, Manager, Peer, Sync | maps:values(Stalled)]],
+    gen_tcp:close(Client),
+    gen_tcp:close(L),
+    ?debugFmt("~p flood -> ~p: max qlen=~B active=~p bytes_recv=~B of ~B "
+              "delivered=~p", [Cmd, Sink, MaxQ, Active, BytesRecv, Total,
+                               Delivered]),
+    ?assert(MaxQ =< ?FLOOD_LIMIT + ?FLOOD_SLACK),
+    ?assertEqual(false, Active),
+    ?assert(BytesRecv < Total div 2),
+    ?assertEqual(all, Delivered),
+    ?assert(Alive).
+
+flood_register(Name, Pid) ->
+    catch unregister(Name),
+    true = register(Name, Pid).
+
+flood_setup() ->
+    TmpDir = filename:join(["/tmp", "beamchain_recv_bp_" ++
+                            integer_to_list(erlang:unique_integer([positive]))]),
+    ok = filelib:ensure_dir(filename:join(TmpDir, "dummy")),
+    application:set_env(beamchain, datadir, TmpDir),
+    application:set_env(beamchain, network, regtest),
+    os:unsetenv("BEAMCHAIN_DATADIR"),
+    os:unsetenv("BEAMCHAIN_NETWORK"),
+    catch gen_server:stop(beamchain_config),
+    {ok, Cfg} = beamchain_config:start_link(),
+    unlink(Cfg),
+    {module, beamchain_chainstate} = code:ensure_loaded(beamchain_chainstate),
+    ok = meck:new(beamchain_chainstate, [no_link, passthrough]),
+    ok = meck:expect(beamchain_chainstate, get_tip_height, fun() -> {ok, 0} end),
+    TmpDir.
+
+flood_teardown(TmpDir) ->
+    catch meck:unload(beamchain_chainstate),
+    catch gen_server:stop(beamchain_config),
+    [catch unregister(N) || N <- [beamchain_sync, beamchain_header_sync,
+                                  beamchain_block_sync]],
+    os:cmd("rm -rf " ++ TmpDir),
+    ok.
+
+%% Stand-in beamchain_peer_manager: forwards peer messages to sync exactly
+%% as handle_peer_message/4 does (beamchain_sync:handle_peer_message/3,
+%% a gen_server:cast), so its own mailbox stays short.
+forwarding_manager(Test) ->
+    receive
+        {peer_connected, P, Info} ->
+            Test ! {peer_connected, P, Info};
+        {peer_message, P, Cmd, Payload} ->
+            gen_server:cast(beamchain_sync, {peer_message, P, Cmd, Payload});
+        _ ->
+            ok
+    end,
+    forwarding_manager(Test).
+
+%% Stand-in beamchain_sync, routing as route_message/4 does: headers and
+%% block are cast on at once (beamchain_header_sync:handle_headers/2,
+%% beamchain_block_sync:handle_block/2); inv is handled here, so until
+%% released it is left in this mailbox.
+routing_sync(Test) ->
+    receive
+        {'$gen_cast', {peer_message, P, headers, Payload}} ->
+            gen_server:cast(beamchain_header_sync, {headers, P, Payload}),
+            routing_sync(Test);
+        {'$gen_cast', {peer_message, P, block, Payload}} ->
+            gen_server:cast(beamchain_block_sync, {block, P, Payload}),
+            routing_sync(Test);
+        release ->
+            sink_count(Test, beamchain_sync, 0)
+    end.
+
+%% Stand-in for a process that does real work per message: processes
+%% nothing until released, then counts and reports.
+stalled_sink(Test, Name) ->
+    receive release -> ok end,
+    sink_count(Test, Name, 0).
+
+sink_count(Test, Name, N) ->
+    receive
+        {'$gen_cast', _} ->
+            N2 = N + 1,
+            case N2 of
+                ?FLOOD_FRAMES -> Test ! {sink_count, Name, N2};
+                _ -> ok
+            end,
+            sink_count(Test, Name, N2);
+        _ ->
+            sink_count(Test, Name, N)
+    after 60000 ->
+        Test ! {sink_count, Name, N}
+    end.
+
+flood_sample_max_qlen(_Pid, Ms, Max) when Ms =< 0 ->
+    Max;
+flood_sample_max_qlen(Pid, Ms, Max) ->
+    timer:sleep(20),
+    Q = case erlang:process_info(Pid, message_queue_len) of
+            {message_queue_len, N} -> N;
+            undefined -> 0
+        end,
+    flood_sample_max_qlen(Pid, Ms - 20, max(Max, Q)).
+
+flood_ready_peer(L, Manager) ->
+    {ok, Port} = inet:port(L),
+    %% A small client send buffer: bytes the peer has not read stay in the
+    %% kernel instead of all being accepted into an autotuned buffer.
+    {ok, C} = gen_tcp:connect({127, 0, 0, 1}, Port,
+                              [binary, {active, false}, {sndbuf, 16384}]),
+    {ok, Acc} = gen_tcp:accept(L),
+    {ok, P} = beamchain_peer:accept(Acc, {{127, 0, 0, 4}, Port}, Manager),
+    ok = gen_tcp:controlling_process(Acc, P),
+    P ! socket_owner_transferred,
+    Magic = beamchain_config:magic(),
+    Ver = beamchain_p2p_msg:encode_payload(version, #{
+        version => 70016, services => 9,
+        timestamp => erlang:system_time(second),
+        addr_recv => #{services => 0, ip => {127, 0, 0, 1}, port => Port},
+        addr_from => #{services => 9, ip => {0, 0, 0, 0, 0, 0, 0, 0}, port => 0},
+        nonce => erlang:unique_integer([positive]),
+        user_agent => <<"/recv-backpressure-test/">>, start_height => 0,
+        relay => true}),
+    ok = gen_tcp:send(C, beamchain_p2p_msg:encode_msg(Magic, version, Ver)),
+    ok = gen_tcp:send(C, beamchain_p2p_msg:encode_msg(Magic, verack, <<>>)),
+    receive {peer_connected, P, _} -> ok
+    after 10000 -> error(handshake_timeout)
+    end,
+    {P, Acc, C}.
