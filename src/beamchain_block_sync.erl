@@ -830,16 +830,19 @@ walk_connected_to_fork(Hash, H) ->
             end
     end.
 
-%% True iff Hash is the active HEADER chain's hash at Height
-%% (beamchain_db:get_block_index/1 returns the active-chain header by
-%% height; after a header reorg it follows the heavier chain).
+%% True iff Hash is the best HEADER chain's hash at Height. Header sync
+%% keeps a fork's headers at or below the connected tip off the active
+%% height slots, so this follows the header chain by hash there
+%% (beamchain_header_chain:hash_at/1); above the connected tip it is the
+%% height slot, as before.
 is_on_active_header_chain(Hash, Height) when Height >= 0 ->
-    case beamchain_db:get_block_index(Height) of
-        {ok, #{hash := ActiveHash}} -> ActiveHash =:= Hash;
-        _ -> false
-    end;
+    header_chain_hash(Height) =:= {ok, Hash};
 is_on_active_header_chain(_Hash, _Height) ->
     false.
+
+%% The block to download at Height: the header chain's block there.
+header_chain_hash(Height) ->
+    beamchain_header_chain:hash_at(Height).
 
 %% Gather currently connected peers from peer_manager.
 gather_connected_peers() ->
@@ -1011,8 +1014,8 @@ blast_request_height(Height, #state{peers = Peers,
                                      in_flight = InFlight,
                                      hash_to_height = H2H,
                                      peer_stats = AllStats} = State) ->
-    case beamchain_db:get_block_index(Height) of
-        {ok, #{hash := Hash}} ->
+    case header_chain_hash(Height) of
+        {ok, Hash} ->
           case failed_block(Hash) of
             failed ->
                 State;
@@ -1131,8 +1134,8 @@ request_batch(Peer, BatchSize,
             %% Look up hashes and build getdata items
             {Items, InFlight2, H2H2, _Skipped, NotHere} = lists:foldl(
                 fun(Height, {ItemsAcc, IFAcc, H2HAcc, SkipAcc, NHAcc}) ->
-                    case beamchain_db:get_block_index(Height) of
-                        {ok, #{hash := Hash}} ->
+                    case header_chain_hash(Height) of
+                        {ok, Hash} ->
                             case said_notfound(Peer, Hash, State) orelse
                                  failed_block(Hash) of
                                 failed ->

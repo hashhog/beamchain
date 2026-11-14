@@ -42,7 +42,6 @@
 -ifdef(TEST).
 -export([build_block_locator/2, test_state/1, test_get/2]).
 -export([incoming_chain_wins/2,
-         mark_orphaned_blocks/2,
          classify_deep_fork/4,
          select_next_probe_peer/2]).
 -endif.
@@ -737,10 +736,12 @@ process_new_headers(Headers, Peer, State) ->
             case check_reorg(FirstHeader, Headers, State) of
                 {reorg, ForkHeight, _ForkHash, _ForkCW, State2} ->
                     %% Reorg detected: headers connect to a known block
-                    %% that is an ancestor of our tip. Roll back and
-                    %% process the new (more-work) chain.
-                    logger:info("header_sync: reorg detected at height ~B, "
-                                "rolling back from ~B",
+                    %% that is an ancestor of our tip. The header chain was
+                    %% rewound to the fork point (the active chain was
+                    %% not); store the new (more-work) headers on it.
+                    logger:info("header_sync: heavier fork at height ~B, "
+                                "header chain rewound from ~B (active "
+                                "chain unchanged until bodies connect)",
                                 [ForkHeight, State#state.tip_height]),
                     State3 = reset_unconnecting_count(Peer, State2),
                     process_connecting_headers(Headers, Peer, State3);
@@ -801,39 +802,64 @@ cached_invalid_headers(Peer, State) ->
 %% Rewind the header chain off a consensus-invalid block (see
 %% invalid_block_found/3).
 do_invalid_block_found(Hash, Height, Culprit,
-                       #state{tip_height = TipHeight, params = Params} = State)
+                       #state{tip_height = TipHeight} = State)
   when Height >= 1, TipHeight >= Height ->
     case {beamchain_db:get_block_index(Height),
           beamchain_db:get_block_index(Height - 1)} of
         {{ok, #{hash := Hash}}, {ok, #{hash := PHash, chainwork := PCW}}} ->
-            logger:warning("header_sync: header chain rewound from ~B to ~B "
-                           "off invalid block at ~B", [TipHeight, Height - 1,
-                                                       Height]),
-            ok = beamchain_db:set_header_tip(PHash, Height - 1),
-            State2 = cancel_timer(State#state{
-                tip_height = Height - 1,
-                tip_hash = PHash,
-                tip_chainwork = PCW,
-                mtp_window = load_mtp_window(Height - 1, Params),
-                hss_state = undefined,
-                sync_peer = undefined,
-                status = idle}),
-            State3 = case Culprit of
-                undefined -> State2;
-                _ -> remove_peer_state(Culprit, State2)
-            end,
-            case select_next_probe_peer(State3#state.peer_heights, []) of
-                {ok, Peer} ->
-                    start_probe(Peer, State3);
-                none ->
-                    State3#state{status = complete}
-            end;
+            rewind_off_invalid(PHash, Height - 1, PCW, Height, Culprit,
+                               State);
         _ ->
-            %% Our header chain is no longer on that block.
-            State
+            %% The failed block may be a fork block kept off the active
+            %% height slots. If it is on our header chain, every header
+            %% above it on that chain is invalid too; the best valid chain
+            %% we know is the connected (active) one, so the header chain
+            %% rewinds to the connected tip (Core RecalculateBestHeader;
+            %% other branches come back through getheaders).
+            case {beamchain_header_chain:hash_at(Height),
+                  beamchain_chainstate:get_tip()} of
+                {{ok, Hash}, {ok, {_, CHeight}}} when CHeight < Height ->
+                    State;
+                {{ok, Hash}, {ok, {CHash, CHeight}}} ->
+                    case beamchain_db:get_block_index(CHeight) of
+                        {ok, #{hash := CHash, chainwork := CCW}} ->
+                            rewind_off_invalid(CHash, CHeight, CCW, Height,
+                                               Culprit, State);
+                        _ ->
+                            State
+                    end;
+                _ ->
+                    %% Our header chain is no longer on that block.
+                    State
+            end
     end;
 do_invalid_block_found(_Hash, _Height, _Culprit, State) ->
     State.
+
+rewind_off_invalid(PHash, PHeight, PCW, Height, Culprit,
+                   #state{tip_height = TipHeight} = State) ->
+    logger:warning("header_sync: header chain rewound from ~B to ~B "
+                   "off invalid block at ~B", [TipHeight, PHeight, Height]),
+    ok = beamchain_db:set_header_tip(PHash, PHeight),
+    State2 = cancel_timer(State#state{
+        tip_height = PHeight,
+        tip_hash = PHash,
+        tip_chainwork = PCW,
+        mtp_window = load_mtp_window_for(PHash, PHeight),
+        hss_state = undefined,
+        sync_peer = undefined,
+        status = idle}),
+    State3 = case Culprit of
+        undefined -> State2;
+        _ -> remove_peer_state(Culprit, State2)
+    end,
+    case select_next_probe_peer(State3#state.peer_heights, []) of
+        {ok, Peer} ->
+            start_probe(Peer, State3);
+        none ->
+            State3#state{status = complete}
+    end.
+
 
 %% invalidateblock (see best_header_invalidated/2).  The header tip is on
 %% the failed branch iff it is itself failed: chainstate marks the
@@ -1035,17 +1061,24 @@ check_reorg_work(IncomingCWInt, TipCWInt, ForkHeight, PrevHash, ForkCW,
                  LessWork, #state{tip_height = TipHeight, params = Params} = State) ->
     case incoming_chain_wins(IncomingCWInt, TipCWInt) of
         true ->
-            %% Strictly more work. Accept reorg.
+            %% Strictly more work: the fork becomes the best HEADER chain.
             logger:info("header_sync: fork at height ~B "
                         "(depth ~B), incoming work ~B vs tip ~B",
                         [ForkHeight,
                          TipHeight - ForkHeight,
                          IncomingCWInt, TipCWInt]),
-            %% Mark orphaned blocks as invalid in the index
-            mark_orphaned_blocks(ForkHeight + 1, TipHeight),
-            %% Roll back state to the fork point
-            State2 = rollback_to(ForkHeight, PrevHash, ForkCW,
-                                  Params, State),
+            %% Headers only: rewind the header chain to the fork point so the
+            %% fork's headers are stored on top of it. The active chain, the
+            %% UTXO set and the validity of the blocks being out-worked are
+            %% NOT touched (Core AcceptBlockHeader only adds index entries;
+            %% ActivateBestChain switches once the fork's bodies connect).
+            %% block_sync sees the header chain diverge from the connected
+            %% tip, downloads the fork from ForkHeight + 1, and
+            %% beamchain_chainstate:submit_block/1 reorgs when the connected
+            %% fork has more work. If the bodies never arrive, or one is
+            %% invalid, the old chain stays active and intact.
+            State2 = rewind_header_chain_to(ForkHeight, PrevHash, ForkCW,
+                                            Params, State),
             {reorg, ForkHeight, PrevHash, ForkCW, State2};
         false ->
             %% Less work - don't reorg
@@ -1072,9 +1105,11 @@ check_reorg_work(IncomingCWInt, TipCWInt, ForkHeight, PrevHash, ForkCW,
 %% ALONE — no header drift, no other precondition — let a 6-header fork
 %% carrying 95.05% of the tip's work evict five validated blocks
 %% (receipts/beamchain-length-based-reorg-2026-08-23.md). The eviction is not
-%% recoverable: the caller runs mark_orphaned_blocks BEFORE the fork's headers
-%% are validated, writing FAILED_VALID with HAVE_DATA cleared, so
-%% find_best_valid_chain permanently excludes the heavier chain.
+%% recoverable: the caller then ran mark_orphaned_blocks BEFORE the fork's
+%% headers were validated, writing FAILED_VALID with HAVE_DATA cleared, so
+%% find_best_valid_chain permanently excluded the evicted chain. (The caller
+%% no longer marks or disconnects anything: a heavier fork only moves the
+%% header chain, see check_reorg_work/7.)
 %%
 %% The arm existed for a real reason: a peer may still have more headers to
 %% send, so a partial batch can understate a fork's true work. But that case
@@ -1086,93 +1121,39 @@ check_reorg_work(IncomingCWInt, TipCWInt, ForkHeight, PrevHash, ForkCW,
 incoming_chain_wins(IncomingCW, TipCW) ->
     IncomingCW > TipCW.
 
-%% Mark blocks from StartHeight to EndHeight as orphaned (failed valid).
-mark_orphaned_blocks(StartHeight, EndHeight) when StartHeight > EndHeight ->
-    ok;
-mark_orphaned_blocks(Height, EndHeight) ->
-    case beamchain_db:get_block_index(Height) of
-        {ok, #{hash := Hash}} ->
-            %% Mark as failed validation (orphaned). OR the FAILED_VALID bit
-            %% in (Core RaiseValidity / `nStatus |= BLOCK_FAILED_VALID`); the
-            %% old update_block_status(Hash, 32) ASSIGNED 32, wiping
-            %% HAVE_DATA, HAVE_UNDO and the validity level, so a later
-            %% reconsiderblock could never re-activate the block (it no
-            %% longer "had data") even though its body and undo are on disk.
-            _ = beamchain_db:raise_block_status(Hash, 0, 32),
-            mark_orphaned_blocks(Height + 1, EndHeight);
-        not_found ->
-            ok
-    end.
-
-%% Roll back the header sync state to a given fork point.
-rollback_to(ForkHeight, ForkHash, ForkCW, Params, State) ->
-    %% Update header tip in DB
+%% Rewind the header chain (header tip + header_sync state) to a fork point.
+%% Header state only: the chainstate is never disconnected from here.
+rewind_header_chain_to(ForkHeight, ForkHash, ForkCW, _Params, State) ->
     ok = beamchain_db:set_header_tip(ForkHash, ForkHeight),
-    %% Also disconnect blocks from the chainstate (UTXO set) back to
-    %% the fork point. Without this, the UTXO set still contains
-    %% outputs from the orphaned blocks, causing BIP30 failures.
-    disconnect_chainstate_to(ForkHeight),
-    %% Rebuild MTP window from the fork point
-    MTPWindow = load_mtp_window(ForkHeight, Params),
     State#state{
         tip_height = ForkHeight,
         tip_hash = ForkHash,
         tip_chainwork = ForkCW,
-        mtp_window = MTPWindow
+        mtp_window = load_mtp_window_for(ForkHash, ForkHeight)
     }.
 
-%% Disconnect blocks from the chainstate until the chainstate tip is
-%% at or below TargetHeight. Uses undo data to reverse UTXO changes.
-%% If rolling back to genesis (TargetHeight =< 0) and block-by-block
-%% disconnect fails (e.g. missing undo data), wipe the entire chainstate
-%% to avoid leaving stale UTXOs that cause BIP30 false positives.
-disconnect_chainstate_to(TargetHeight) ->
-    case beamchain_chainstate:get_tip() of
-        {ok, {_Hash, TipHeight}} when TipHeight > TargetHeight ->
-            logger:info("header_sync: disconnecting chainstate from ~B to ~B",
-                        [TipHeight, TargetHeight]),
-            disconnect_chainstate_loop(TargetHeight);
-        _ when TargetHeight =< 0 ->
-            %% Chainstate tip is already at or below genesis, but if we're
-            %% rolling back to genesis we must still wipe to clear any stale
-            %% UTXOs in RocksDB that survived a previous incomplete wipe
-            %% (e.g. tip metadata was reset but UTXO entries remained).
-            logger:info("header_sync: chainstate tip already at genesis, "
-                        "wiping to clear any stale RocksDB UTXOs"),
-            beamchain_chainstate:wipe_chainstate();
-        _ ->
-            %% Chainstate is already at or below fork point
-            ok
-    end.
+%% The MTP window ending at header Hash (at Height), oldest first like
+%% load_mtp_window/2. Walked back by prev_hash so it follows Hash's own
+%% branch: each step takes the height slot when the slot holds that exact
+%% block (on a linear chain that is every step, the same reads as
+%% load_mtp_window/2) and otherwise the entry by hash -- a fork header at
+%% or below the connected tip is kept off the slots, and the slot there
+%% holds the active block, whose timestamp is not this branch's.
+load_mtp_window_for(Hash, Height) ->
+    load_mtp_window_for(Hash, Height, ?MTP_WINDOW, []).
 
-disconnect_chainstate_loop(TargetHeight) ->
-    case beamchain_chainstate:get_tip() of
-        {ok, {_Hash, TipHeight}} when TipHeight > TargetHeight ->
-            %% header_reorg: the chainstate updates the mempool for each
-            %% disconnected block and re-offers the disconnected txs once
-            %% the heavier branch is connected (Core
-            %% MaybeUpdateMempoolForReorg).
-            case beamchain_chainstate:disconnect_block(header_reorg) of
-                ok ->
-                    disconnect_chainstate_loop(TargetHeight);
-                {error, Reason} ->
-                    logger:error("header_sync: chainstate disconnect failed at ~B: ~p",
-                                 [TipHeight, Reason]),
-                    %% If we're rolling back to genesis and disconnect fails,
-                    %% wipe the entire chainstate to prevent stale UTXOs.
-                    case TargetHeight =< 0 of
-                        true ->
-                            logger:warning("header_sync: wiping chainstate for "
-                                           "full resync (disconnect to genesis failed)"),
-                            beamchain_chainstate:wipe_chainstate();
-                        false ->
-                            %% Partial rollback failure — log and continue.
-                            %% Block sync will encounter mismatches but may recover.
-                            ok
-                    end
-            end;
-        _ ->
-            ok
+load_mtp_window_for(_Hash, Height, N, Acc) when Height < 0; N =:= 0 ->
+    Acc;
+load_mtp_window_for(Hash, Height, N, Acc) ->
+    Entry = case beamchain_db:get_block_index(Height) of
+        {ok, #{hash := Hash} = E} -> {ok, E};
+        _ -> beamchain_header_chain:lookup(Hash)
+    end,
+    case Entry of
+        {ok, #{header := #block_header{prev_hash = P, timestamp = Ts}}} ->
+            load_mtp_window_for(P, Height - 1, N - 1, [{Height, Ts} | Acc]);
+        not_found ->
+            Acc
     end.
 
 %% Process headers that connect to our chain
@@ -1497,10 +1478,9 @@ validate_one_header(Header, #state{tip_height = TipHeight,
         NewCWInt = PrevCWInt + BlockWork,
         NewCW = chainwork_to_binary(NewCWInt),
 
-        %% 9. Store in block index
-        %% Status 1 = headers only (not fully validated with block data)
-        ok = beamchain_db:store_block_index(NewHeight, BlockHash, Header,
-                                             NewCW, 1),
+        %% 9. Store in block index (Core AcceptBlockHeader: add an entry,
+        %% never touch the active chain). Status 1 = headers only.
+        ok = store_header_entry(NewHeight, BlockHash, Header, NewCW),
 
         %% 10. Update chain tip in DB
         ok = beamchain_db:set_header_tip(BlockHash, NewHeight),
@@ -1519,14 +1499,60 @@ validate_one_header(Header, #state{tip_height = TipHeight,
         throw:Reason -> {error, Reason}
     end.
 
+%% Record a validated header. Above the connected tip the height slots are
+%% the header chain: the header goes into its slot, as it always has, and so
+%% does a header for an empty slot (below a snapshot base the slots are
+%% empty until headers fill them). At or below the connected tip a slot
+%% that holds a block IS the active chain, which other code reads by height
+%% for consensus (MTP, BIP68 ancestor MTP) and getblockhash, so a different
+%% header never takes it (Core AcceptBlockHeader never changes the active
+%% chain): one we already index is left as it is (rewriting it would drop
+%% the have-bits of a block whose body we hold), a new one is kept
+%% hash-keyed in the side-branch index, the rule
+%% beamchain_chainstate:store_header_only/5 applies to submitheader.
+store_header_entry(Height, Hash, Header, CW) ->
+    case Height > beamchain_header_chain:connected_tip_height() of
+        true ->
+            beamchain_db:store_block_index(Height, Hash, Header, CW, 1);
+        false ->
+            case beamchain_db:get_block_index(Height) of
+                not_found ->
+                    beamchain_db:store_block_index(Height, Hash, Header, CW,
+                                                   1);
+                {ok, #{hash := Hash}} ->
+                    ok;
+                {ok, _ActiveBlock} ->
+                    case beamchain_header_chain:lookup(Hash) of
+                        {ok, _} ->
+                            ok;
+                        not_found ->
+                            beamchain_db:store_side_branch_index(
+                              Hash, #{height => Height, header => Header,
+                                      chainwork => CW, status => 1,
+                                      n_tx => 0})
+                    end
+            end
+    end.
+
 %% Get the header record for the current tip (needed for difficulty calc).
 prev_header(#state{tip_height = -1, params = Params}) ->
     Genesis = maps:get(genesis_block, Params),
     Genesis#block.header;
-prev_header(#state{tip_height = Height}) ->
+prev_header(#state{tip_height = Height, tip_hash = TipHash}) ->
     case beamchain_db:get_block_index(Height) of
-        {ok, #{header := Header}} -> Header;
-        not_found -> error({block_index_not_found, Height})
+        {ok, #{hash := TipHash, header := Header}} ->
+            Header;
+        Slot ->
+            %% The header tip is a fork header kept off the active height
+            %% slots (side-branch index): read it by hash.
+            case beamchain_header_chain:lookup(TipHash) of
+                {ok, #{header := Header}} -> Header;
+                not_found ->
+                    case Slot of
+                        {ok, #{header := Header}} -> Header;
+                        not_found -> error({block_index_not_found, Height})
+                    end
+            end
     end.
 
 %%% ===================================================================
@@ -1661,13 +1687,25 @@ check_bip94(Height, Header, #state{params = Params} = State) ->
 load_chain_tip(Params) ->
     case beamchain_db:get_header_tip() of
         {ok, #{hash := Hash, height := Height}} ->
-            %% Load the chainwork from block_index
-            Chainwork = case beamchain_db:get_block_index(Height) of
-                {ok, #{chainwork := CW}} -> CW;
-                not_found -> <<0:256>>
-            end,
-            MTPWindow = load_mtp_window(Height, Params),
-            {Height, Hash, Chainwork, MTPWindow};
+            %% Load the chainwork from block_index. The header tip may be a
+            %% fork header kept off the active height slots: then by hash.
+            case beamchain_db:get_block_index(Height) of
+                {ok, #{hash := Hash, chainwork := CW}} ->
+                    {Height, Hash, CW, load_mtp_window_for(Hash, Height)};
+                Slot ->
+                    case beamchain_header_chain:lookup(Hash) of
+                        {ok, #{chainwork := CW}} ->
+                            {Height, Hash, CW,
+                             load_mtp_window_for(Hash, Height)};
+                        not_found ->
+                            Chainwork = case Slot of
+                                {ok, #{chainwork := CW}} -> CW;
+                                not_found -> <<0:256>>
+                            end,
+                            {Height, Hash, Chainwork,
+                             load_mtp_window(Height, Params)}
+                    end
+            end;
         not_found ->
             %% Fresh database — store genesis block index
             init_genesis(Params)
