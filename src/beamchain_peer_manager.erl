@@ -2204,7 +2204,7 @@ entry_to_map(#peer_entry{pid = Pid, address = Addr, direction = Dir,
 %%% Internal: message handling
 %%% ===================================================================
 
-%% Data requests (getdata, getheaders, mempool, getcf*) are NOT served
+%% Data requests (getdata, getheaders, mempool, getcf*, getblocktxn) are NOT served
 %% here: they read blocks / headers / the mempool through other gen_servers
 %% (beamchain_db calls of up to 30 s under load) and used to block this
 %% process -- inbound accepts timed out (check_inbound) and every peer's
@@ -2215,7 +2215,7 @@ entry_to_map(#peer_entry{pid = Pid, address = Addr, direction = Dir,
 handle_peer_message(Pid, Command, Payload, State)
   when Command =:= getdata; Command =:= getheaders; Command =:= mempool;
        Command =:= getcfilters; Command =:= getcfheaders;
-       Command =:= getcfcheckpt ->
+       Command =:= getcfcheckpt; Command =:= getblocktxn ->
     beamchain_peer:serve_request(Pid, Command, Payload),
     {noreply, State};
 handle_peer_message(Pid, addr, Payload, State) ->
@@ -2258,9 +2258,6 @@ handle_peer_message(Pid, cmpctblock, Payload, State) ->
     {noreply, State};
 handle_peer_message(Pid, blocktxn, Payload, State) ->
     beamchain_sync:handle_peer_message(Pid, blocktxn, Payload),
-    {noreply, State};
-handle_peer_message(Pid, getblocktxn, Payload, State) ->
-    beamchain_sync:handle_peer_message(Pid, getblocktxn, Payload),
     {noreply, State};
 handle_peer_message(_Pid, _Command, _Payload, State) ->
     {noreply, State}.
@@ -2661,6 +2658,10 @@ serve_peer_request(Pid, getdata, Payload) ->
     handle_getdata_msg(Pid, Payload);
 serve_peer_request(Pid, getheaders, Payload) ->
     handle_getheaders_msg(Pid, Payload);
+%% BIP152 getblocktxn: a block read, so it is served here under the serve
+%% slot like getdata, not in beamchain_sync (beamchain_sync:serve_getblocktxn/2).
+serve_peer_request(Pid, getblocktxn, Payload) ->
+    beamchain_sync:serve_getblocktxn(Pid, Payload);
 %% BIP35: peer requested our complete mempool. Respond with one or more inv
 %% messages enumerating every txid (or wtxid, if peer signaled wtxidrelay)
 %% currently in the mempool, chunked at MAX_INV_SIZE. Decode + the message

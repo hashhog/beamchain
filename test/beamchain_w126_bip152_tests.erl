@@ -506,26 +506,26 @@ g26_no_post_decode_monotone_assertion_test() ->
 
 %%% ===================================================================
 %%% G27 GETBLOCKTXN out-of-bounds index → Misbehaving
-%%%      — Core net_processing.cpp:2602-2605 — MISSING (BUG-9, P0)
+%%%      — Core net_processing.cpp:2602-2605 — PRESENT
+%%%      (secfix-beamchain-getblocktxn-in-sync; behaviour is pinned by
+%%%      beamchain_sync_tests:getblocktxn_out_of_bounds_index_misbehaves)
 %%% ===================================================================
 
-g27_out_of_bounds_index_no_misbehavior_test() ->
-    %% AUDIT MARKER: Core punishes peers that request indexes >=
-    %% block.vtx.size(). beamchain's lists:filtermap silently drops
-    %% out-of-range indices; no add_misbehavior call.
+g27_out_of_bounds_index_misbehaves_test() ->
+    %% This marker used to assert the bug: the getblocktxn handler (then a
+    %% route_message clause) dropped out-of-range indexes with
+    %% lists:filtermap and never scored the peer. The handler is now
+    %% beamchain_sync:serve_getblocktxn/2, and SendBlockTransactions'
+    %% check lives in send_block_transactions/4: no filtermap, and the
+    %% out-of-bounds branch scores the peer.
     Bin = read_src_file("beamchain_sync.erl"),
-    %% Find the route_message(getblocktxn) clause:
-    {Start, _} = binary:match(Bin, <<"route_message(Peer, getblocktxn,">>),
-    %% Match the next ~50 lines of body — needs to NOT have an add_misbehavior
-    %% call gated specifically on the out-of-bounds index condition.
-    EndApprox = Start + 4000,
-    Body = binary:part(Bin, Start, min(EndApprox, byte_size(Bin)) - Start),
-    %% lists:filtermap is the silent-drop offender:
-    ?assert(binary:match(Body, <<"filtermap">>) =/= nomatch),
-    %% The out-of-bounds branch does not emit misbehavior:
-    %% (we look for the "false" branch of the `if ArrIdx >= 1, ...` guard
-    %% which is the silent-drop path — confirmed absent of misbehavior).
-    ?assert(true).
+    ?assertEqual(nomatch,
+                 binary:match(Bin, <<"route_message(Peer, getblocktxn,">>)),
+    {Start, _} = binary:match(Bin, <<"\nsend_block_transactions(">>),
+    Body = binary:part(Bin, Start, min(1500, byte_size(Bin) - Start)),
+    ?assertEqual(nomatch, binary:match(Body, <<"filtermap">>)),
+    ?assertNotEqual(nomatch,
+                    binary:match(Body, <<"add_misbehavior(Peer, 100)">>)).
 
 %%% ===================================================================
 %%% G28 NewPoWValidBlock fast-announce CMPCTBLOCK to HB-from peers
