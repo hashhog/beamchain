@@ -15,7 +15,9 @@
 %%% HAVE_DATA, so find_best_valid_chain — which requires HAVE_DATA — could
 %%% not see the chain, and reconsiderblock left the tip stuck below the
 %%% reconsidered block. header_sync:mark_orphaned_blocks had the same shape
-%%% (ASSIGNED 32).
+%%% (ASSIGNED 32); it has since been removed, as header sync no longer marks
+%%% out-worked blocks failed at all (beamchain_header_sync_tests,
+%%% header_only_reorg_test_).
 %%%
 %%% These tests REACH the real code: the block goes through
 %%% beamchain_block_sync:validate_and_connect/3 (the P2P connect path)
@@ -42,10 +44,6 @@ p2p_connect_keeps_have_bits_test_() ->
 p2p_connect_then_reconsider_test_() ->
     {setup, fun setup/0, fun teardown/1,
      fun(_) -> {timeout, 60, fun p2p_connect_then_reconsider/0} end}.
-
-mark_orphaned_keeps_have_bits_test_() ->
-    {setup, fun setup/0, fun teardown/1,
-     fun(_) -> {timeout, 60, fun mark_orphaned_keeps_have_bits/0} end}.
 
 raise_block_status_test_() ->
     {setup, fun setup/0, fun teardown/1,
@@ -197,19 +195,6 @@ p2p_connect_then_reconsider() ->
     {?N, TipHash} = lists:keyfind(?N, 1, Chain),
     ?assertMatch({ok, {TipHash, ?N}}, beamchain_chainstate:get_tip()),
     ok = gen_server:stop(beamchain_chainstate).
-
-%% header_sync:mark_orphaned_blocks OR-s FAILED_VALID in; the have-bits and
-%% the validity level survive (they used to be wiped by an assignment of 32).
-mark_orphaned_keeps_have_bits() ->
-    Chain = p2p_connect_chain(3),
-    ok = beamchain_header_sync:mark_orphaned_blocks(2, 3),
-    {1, H1} = lists:keyfind(1, 1, Chain),
-    ?assertEqual(?CONNECTED, status_of(H1)),
-    lists:foreach(
-      fun(H) ->
-          {H, Hash} = lists:keyfind(H, 1, Chain),
-          ?assertEqual(?CONNECTED bor ?FAILED_VALID, status_of(Hash))
-      end, [2, 3]).
 
 raise_block_status_never_lowers() ->
     [{1, H1}] = p2p_connect_chain(1),
