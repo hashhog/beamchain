@@ -157,17 +157,19 @@ notify_peer_disconnected_drops_peer_from_sync_modules_test_() ->
                 Peer, #{start_height => 1000000,
                         services => 0,
                         user_agent => <<"test">>}),
-            %% Let the casts settle.
-            _ = sys:get_state(beamchain_header_sync),
-            _ = sys:get_state(beamchain_block_sync),
+            %% Let the casts settle.  beamchain_sync forwards the event to
+            %% header_sync/block_sync with casts of its own, so sync with
+            %% beamchain_sync FIRST: once it has answered, its forwarded
+            %% casts are already queued ahead of our sys:get_state calls.
+            %% Syncing header_sync alone raced the forward under load.
+            settle_sync_stack(),
 
             ?assert(header_sync_knows_peer(Peer)),
 
             %% Now simulate what finalize_peer/2 does on ANY disconnect
             %% (graceful or non-graceful): notify the coordinator.
             beamchain_sync:notify_peer_disconnected(Peer),
-            _ = sys:get_state(beamchain_header_sync),
-            _ = sys:get_state(beamchain_block_sync),
+            settle_sync_stack(),
 
             %% Peer must be gone from header_sync's in-memory peer map —
             %% no zombie entry.
@@ -177,6 +179,13 @@ notify_peer_disconnected_drops_peer_from_sync_modules_test_() ->
             ok
         end}
      end}.
+
+%% Drain beamchain_sync, then the two modules it forwards to.
+settle_sync_stack() ->
+    _ = sys:get_state(beamchain_sync),
+    _ = sys:get_state(beamchain_header_sync),
+    _ = sys:get_state(beamchain_block_sync),
+    ok.
 
 %% Read header_sync's state record and check whether Peer is still in
 %% peer_heights. We pull the raw gen_server state via sys:get_state/1 and
