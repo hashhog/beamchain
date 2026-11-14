@@ -576,3 +576,71 @@ getwalletmnemonic_raw_seed_returns_error_test() ->
 
 hex_to_bin(Hex) ->
     binary:decode_hex(list_to_binary(Hex)).
+
+%%% -------------------------------------------------------------------
+%%% Wallet file permissions (security finding H5)
+%%% -------------------------------------------------------------------
+
+%% Core sets umask 077 at startup (common/system.cpp), so its wallet
+%% directory is 0700 and every wallet file is 0600. beamchain stores the
+%% seed in wallet.json (plaintext for an unencrypted wallet), so the wallet
+%% directory and the wallet file, its .bak and its .tmp must be private
+%% whatever umask the node was started with. The wallet dir is pre-created
+%% 0775 here so the test fails on a group-writable umask-less create even
+%% when eunit itself runs under umask 077.
+wallet_files_are_private_test() ->
+    Env = beamchain_wallet_test_env:setup(),
+    {DataDir, _} = Env,
+    WalletDir = filename:join([DataDir, "mainnet", "wallet"]),
+    ok = filelib:ensure_dir(filename:join(WalletDir, "x")),
+    ok = file:change_mode(WalletDir, 8#775),
+    {ok, Pid} = beamchain_wallet:start_link(<<"modes_test">>),
+    try
+        Seed = crypto:strong_rand_bytes(32),
+        {ok, _} = gen_server:call(Pid, {create, Seed, undefined}),
+        %% A second save rotates the first file into wallet.json.bak.
+        {ok, _} = beamchain_wallet:get_new_address(Pid, p2wpkh),
+        File = filename:join(WalletDir, "wallet.json"),
+        Bak = File ++ ".bak",
+        Mode = fun(P) ->
+                   {ok, I} = file:read_file_info(P),
+                   element(8, I) band 8#777    %% #file_info.mode
+               end,
+        %% Octal strings so a failure reads as modes, not decimal ints.
+        Oct = fun(P) -> {P, integer_to_list(Mode(P), 8)} end,
+        ?assertEqual([{WalletDir, "700"}, {File, "600"}, {Bak, "600"}],
+                     [Oct(WalletDir), Oct(File), Oct(Bak)]),
+        ?assertNot(filelib:is_regular(File ++ ".tmp"))
+    after
+        gen_server:stop(Pid),
+        beamchain_wallet_test_env:teardown(Env)
+    end.
+
+%% A wallet written by an older build is already on disk at the umask mode.
+%% Loading it must tighten the file and its .bak to 0600 even if nothing is
+%% saved afterwards.
+wallet_existing_files_tightened_on_load_test() ->
+    Env = beamchain_wallet_test_env:setup(),
+    {DataDir, _} = Env,
+    WalletDir = filename:join([DataDir, "mainnet", "wallet"]),
+    File = filename:join(WalletDir, "wallet.json"),
+    Bak = File ++ ".bak",
+    {ok, Pid1} = beamchain_wallet:start_link(<<"modes_old">>),
+    {ok, _} = gen_server:call(Pid1, {create, crypto:strong_rand_bytes(32),
+                                     undefined}),
+    {ok, _} = beamchain_wallet:get_new_address(Pid1, p2wpkh),
+    gen_server:stop(Pid1),
+    ok = file:change_mode(File, 8#664),
+    ok = file:change_mode(Bak, 8#664),
+    {ok, Pid2} = beamchain_wallet:start_link(<<"modes_old">>),
+    try
+        ok = gen_server:call(Pid2, {load, File, undefined}),
+        Oct = fun(P) ->
+                  {ok, I} = file:read_file_info(P),
+                  {P, integer_to_list(element(8, I) band 8#777, 8)}
+              end,
+        ?assertEqual([{File, "600"}, {Bak, "600"}], [Oct(File), Oct(Bak)])
+    after
+        gen_server:stop(Pid2),
+        beamchain_wallet_test_env:teardown(Env)
+    end.
