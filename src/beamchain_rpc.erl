@@ -5414,10 +5414,12 @@ rpc_submitpackage([RawTxs, MaxFeeRate, MaxBurnAmount]) when is_list(RawTxs) ->
                 {ok, #{
                     <<"package_msg">> => PackageMsg,
                     <<"tx-results">> => TxResultMap,
-                    %% beamchain's package validator does not yet emit
-                    %% a per-package replaced-tx list. Empty array keeps
-                    %% the field shape parity with Core.
-                    <<"replaced-transactions">> => []
+                    %% Core rpc/mempool.cpp collects them in a
+                    %% std::set<Txid>, so the list is sorted by the txid's
+                    %% internal byte order.
+                    <<"replaced-transactions">> =>
+                        [hash_to_hex(T)
+                         || T <- lists:usort(maps:get(replaced, PkgInfo, []))]
                 }}
             catch
                 throw:{max_fee_exceeded, FeeRate} ->
@@ -5471,6 +5473,10 @@ package_msg(package_not_sorted)            -> <<"package-not-sorted">>;
 package_msg(conflict_in_package)           -> <<"conflict-in-package">>;
 package_msg(package_not_child_with_parents) -> <<"package-not-child-with-parents">>;
 package_msg(package_fee_too_low)           -> <<"package-fee-too-low">>;
+%% Core PCKG_POLICY (e.g. PackageRBFChecks): package_msg is state.ToString(),
+%% the reason alone or "reason, details".
+package_msg({package_policy, Reason, <<>>})      -> Reason;
+package_msg({package_policy, Reason, Details})   -> <<Reason/binary, ", ", Details/binary>>;
 package_msg(_)                             -> <<"transaction failed">>.
 
 %% Per-transaction reject string for a tx-results "error" entry.
