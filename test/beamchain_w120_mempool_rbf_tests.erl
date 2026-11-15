@@ -290,43 +290,36 @@ g18_package_rbf_signaling_symmetric_test_() ->
     [?_assert(true)].
 
 %%% ===================================================================
-%%% G19 — Package RBF carries deprecated fee-rate check
-%%% Beamchain do_package_rbf line 1450-1455: PackageFeeRate > E.fee_rate per
-%%%   conflict.  do_rbf removed this check (line 1996-2000 comment).
-%%% **BUG-2 P0-CDIV**: policy asymmetric between single-tx and package paths.
+%%% G19 — Package RBF carried a deprecated fee-rate check
+%%% The old do_package_rbf required PackageFeeRate > E.fee_rate per
+%%%   conflict; do_rbf had already dropped that gate (BUG-2 P0-CDIV).
 %%%   Core has NO per-conflict feerate gate; both paths in Core use only
-%%%   PaysForRBF (Rules 3+4) + ImprovesFeerateDiagram.
+%%%   PaysForRBF (Rules 3+4) + ImprovesFeerateDiagram.  Fixed by
+%%%   package_rbf_checks/5 (refill-20261114-beamchain-policy): the gate is gone.
 %%% ===================================================================
 
 g19_package_rbf_dead_feerate_check_test_() ->
     {ok, Src} = file:read_file(mempool_src_path()),
-    %% Verify the per-conflict feerate gate still exists in package path.
-    [?_assert(binary:match(Src, <<"PackageFeeRate > E#mempool_entry.fee_rate">>) =/= nomatch)].
+    [?_assertEqual(nomatch,
+                   binary:match(Src, <<"PackageFeeRate > E#mempool_entry.fee_rate">>))].
 
 %%% ===================================================================
-%%% G20 — Package RBF has no diagram dominance check
-%%% Beamchain do_package_rbf: omits check_cluster_rbf_diagram entirely.
-%%% **BUG-11 P0-CDIV**: package replacement does NOT enforce diagram
-%%%   improvement.  A package can replace a higher-rate cluster as long as
-%%%   total fee >= evicted total + incremental.  Core PackageRBFChecks DOES
-%%%   call ImprovesFeerateDiagram (validation.cpp line 1120).
+%%% G20 — Package RBF diagram dominance check
+%%% The old do_package_rbf omitted check_cluster_rbf_diagram (BUG-11
+%%%   P0-CDIV).  Core PackageRBFChecks DOES call ImprovesFeerateDiagram.
+%%%   Fixed: package_rbf_checks/5 runs it (behaviour is pinned by
+%%%   beamchain_package_rbf_reconsider_tests; this keeps the source pin).
 %%% ===================================================================
 
 g20_package_rbf_no_diagram_check_test_() ->
     {ok, Src} = file:read_file(mempool_src_path()),
-    %% Find do_package_rbf body; confirm check_cluster_rbf_diagram not called.
-    [PkgBody | _] = binary:split(Src, <<"do_package_rbf(_TxPairs">>),
-    %% The body following the split start should not contain check_cluster_rbf_diagram
-    %% before the next function definition (heuristic).
-    Rest = binary:split(Src, <<"do_package_rbf(_TxPairs">>, [trim_all]),
-    [Tail | _] = case Rest of [_, X | _] -> [X]; [X] -> [X] end,
-    Cutoff = case binary:match(Tail, <<"\n%% Accept all package transactions">>) of
+    [_, Tail] = binary:split(Src, <<"\npackage_rbf_checks(">>),
+    Cutoff = case binary:match(Tail, <<"\n%% The per-tx gates accept_package_txs">>) of
         {Pos, _} -> Pos;
         nomatch  -> byte_size(Tail)
     end,
     Body = binary:part(Tail, 0, Cutoff),
-    _ = PkgBody,
-    [?_assertEqual(nomatch, binary:match(Body, <<"check_cluster_rbf_diagram">>))].
+    [?_assertNotEqual(nomatch, binary:match(Body, <<"check_cluster_rbf_diagram">>))].
 
 %%% ===================================================================
 %%% G21 — Sigop-adjusted vsize used for Rule 4
