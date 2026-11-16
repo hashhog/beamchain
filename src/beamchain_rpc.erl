@@ -4934,6 +4934,12 @@ format_mempool_error(rbf_spends_conflicting_tx, _Txid) ->
     {error, ?RPC_VERIFY_REJECTED, <<"bad-txns-spends-conflicting-tx">>};
 format_mempool_error(premature_spend_of_coinbase, _Txid) ->
     {error, ?RPC_VERIFY_REJECTED, <<"bad-txns-premature-spend-of-coinbase">>};
+%% Mempool script failure (beamchain_mempool:verify_scripts/2): Core
+%% validation.cpp CheckInputScripts reason under the policy flags,
+%% "mempool-script-verify-flag-failed (<ScriptErrorString>)".  The debug
+%% part ("input N of ...") is added by reject_details/2.
+format_mempool_error({script_verify_failed, _Idx, ScriptErr, _Debug}, _Txid) ->
+    {error, ?RPC_VERIFY_REJECTED, script_reject_reason(ScriptErr)};
 format_mempool_error({script_verify_failed, Idx}, _Txid) ->
     {error, ?RPC_VERIFY_ERROR,
      iolist_to_binary(io_lib:format("mandatory-script-verify-flag-failed (input ~B)", [Idx]))};
@@ -5078,8 +5084,16 @@ reject_details(premature_spend_of_coinbase, #transaction{inputs = Ins}) ->
             end;
         _ -> undefined
     end;
+%% Core state.ToString() for a script failure: "<reason>, <debug>", the
+%% debug being CScriptCheck's "input N of <txid> (wtxid W), spending P:n".
+reject_details({script_verify_failed, _Idx, ScriptErr, Debug}, _Tx) ->
+    Reason = script_reject_reason(ScriptErr),
+    <<Reason/binary, ", ", Debug/binary>>;
 reject_details(_Reason, _Tx) ->
     undefined.
+
+script_reject_reason(ScriptErr) ->
+    <<"mempool-script-verify-flag-failed (", ScriptErr/binary, ")">>.
 
 %% @doc testmempoolaccept — dry-run validation without mutating the mempool.
 %%
@@ -5481,6 +5495,9 @@ package_msg(_)                             -> <<"transaction failed">>.
 
 %% Per-transaction reject string for a tx-results "error" entry.
 package_tx_error({tx_failed, _Txid, Reason}) -> package_tx_error(Reason);
+%% Core submitpackage tx-results error is state.ToString(): reason + debug.
+package_tx_error({script_verify_failed, _, _, _} = Reason) ->
+    reject_details(Reason, undefined);
 package_tx_error(Reason) when Reason =:= orphan;
                               Reason =:= missing_inputs;
                               Reason =:= 'bad-txns-inputs-missingorspent' ->
