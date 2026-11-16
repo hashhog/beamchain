@@ -1067,6 +1067,10 @@ execute_if(ExpectTrue, Rest, Pos, State) ->
                             script_bool(Cond)
                     end,
                     case Bool of
+                        error when State1#script_state.sig_version =:=
+                                   tapscript ->
+                            %% Core SCRIPT_ERR_TAPSCRIPT_MINIMALIF
+                            {error, tapscript_minimalif_failed};
                         error ->
                             {error, minimalif_failed};
                         _ ->
@@ -2764,6 +2768,8 @@ script_error_string(nulldummy_failed) ->
     <<"Dummy CHECKMULTISIG argument must be zero">>;
 script_error_string(minimalif_failed) ->
     <<"OP_IF/NOTIF argument must be minimal">>;
+script_error_string(tapscript_minimalif_failed) ->
+    <<"OP_IF/NOTIF argument must be minimal in tapscript">>;
 script_error_string(nullfail) ->
     <<"Signature must be zero for failed CHECK(MULTI)SIG operation">>;
 script_error_string(discourage_upgradable_nops) ->
@@ -2790,6 +2796,8 @@ script_error_string(E) when E =:= witness_program_mismatch;
     <<"Witness program hash mismatch">>;
 script_error_string(witness_malleated) ->
     <<"Witness requires empty scriptSig">>;
+script_error_string(witness_malleated_p2sh) ->
+    <<"Witness requires only-redeemscript scriptSig">>;
 script_error_string(witness_unexpected) ->
     <<"Witness provided for non-witness script">>;
 script_error_string(witness_pubkeytype) ->

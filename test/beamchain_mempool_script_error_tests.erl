@@ -53,6 +53,23 @@ script_error_string_test_() ->
       ?_assertEqual(<<"Script evaluated without error but finished with a "
                       "false/empty top stack element">>,
                     beamchain_script:script_error_string(eval_false))},
+     {"FIX: P2SH-witness malleation is SCRIPT_ERR_WITNESS_MALLEATED_P2SH",
+      ?_assertEqual(<<"Witness requires only-redeemscript scriptSig">>,
+                    beamchain_script:script_error_string(witness_malleated_p2sh))},
+     {"FIX: tapscript MINIMALIF is SCRIPT_ERR_TAPSCRIPT_MINIMALIF",
+      fun() ->
+          %% <02> OP_IF OP_1 OP_ENDIF in tapscript (MINIMALIF always on).
+          {error, E} = beamchain_script:eval_script(
+                         <<1, 2, 16#63, 16#51, 16#68>>, [], 0, #{}, tapscript),
+          ?assertEqual(<<"OP_IF/NOTIF argument must be minimal in tapscript">>,
+                       beamchain_script:script_error_string(E)),
+          %% The witness v0 MINIMALIF failure keeps Core's other text.
+          {error, E0} = beamchain_script:eval_script(
+                          <<1, 2, 16#63, 16#51, 16#68>>, [],
+                          ?SCRIPT_VERIFY_MINIMALIF, #{}, witness_v0),
+          ?assertEqual(<<"OP_IF/NOTIF argument must be minimal">>,
+                       beamchain_script:script_error_string(E0))
+      end},
      {"FIX: an unmapped token gets Core's fallback",
       ?_assertEqual(<<"unknown error">>,
                     beamchain_script:script_error_string(no_such_error))}].
