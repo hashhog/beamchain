@@ -1822,8 +1822,12 @@ do_accept_package(Package, State) ->
         %%    fee/missing inputs does not stop the others being tried: every
         %%    valid member stays admitted and each failure keeps its own
         %%    reason (validation.cpp ProcessNewPackage, quit_early path).
-        {AcceptedTxids, DeferredTxs, Errors, State2} =
+        {AcceptedTxids, DeferredTxs0, Errors0, State2} =
             try_individual_accept(TxidTxPairs, State),
+        %% A lone reconsiderable RBF failure has nothing to be reconsidered
+        %% with: Core's AcceptSubPackage re-runs a 1-tx subpackage through
+        %% AcceptSingleTransaction, which fails it the same way.
+        {DeferredTxs, Errors} = finalize_lone_rbf_failure(DeferredTxs0, Errors0),
         ErrMap = maps:from_list([{T, R} || {T, R, _Kind} <- Errors]),
         HardFailed = [{T, R} || {T, R, hard} <- Errors],
 
@@ -1841,6 +1845,13 @@ do_accept_package(Package, State) ->
                         %% 5. Evaluate deferred transactions as a package (CPFP)
                         try evaluate_package_cpfp(DeferredTxs, AcceptedTxids, State2)
                         catch
+                            throw:{package_policy, _, _} = PkgReason ->
+                                %% Core PCKG_POLICY: the package as a whole
+                                %% failed; each member keeps the result of
+                                %% its own (individual) attempt.
+                                {partial, PkgReason,
+                                 #{accepted => AcceptedTxids, errors => ErrMap},
+                                 State2};
                             throw:PkgReason ->
                                 {partial, PkgReason,
                                  #{accepted => AcceptedTxids, errors => #{}},
@@ -1966,12 +1977,19 @@ try_individual_accept([{Txid, Tx} | Rest], State, AcceptedAcc, DeferredAcc, ErrA
                                           DeferredAcc, ErrAcc);
                 {error, Reason} when Reason =:= 'mempool min fee not met';
                                      Reason =:= orphan;
-                                     Reason =:= ephemeral_anchor_needs_spending ->
+                                     Reason =:= ephemeral_anchor_needs_spending;
+                                     Reason =:= rbf_insufficient_fee;
+                                     Reason =:= rbf_insufficient_additional_fee;
+                                     Reason =:= rbf_cluster_diagram_not_dominated ->
                     %% Defer for package evaluation (CPFP): fee shortfall,
                     %% missing inputs (parent may be earlier in pkg) or an
                     %% ephemeral anchor parent that its child must spend.
                     %% Canonical Core string per validation.cpp:948 +
-                    %% policy/feerate.cpp.
+                    %% policy/feerate.cpp.  An RBF fee shortfall (PaysForRBF,
+                    %% ImprovesFeerateDiagram) is TX_RECONSIDERABLE in Core
+                    %% (validation.cpp ReplacementChecks: "Result may change
+                    %% in a package context"), so the package can still
+                    %% replace the conflicts as a package RBF.
                     try_individual_accept(Rest, State, AcceptedAcc,
                                           [{Txid, Tx} | DeferredAcc],
                                           [{Txid, Reason, soft} | ErrAcc]);
@@ -1981,6 +1999,27 @@ try_individual_accept([{Txid, Tx} | Rest], State, AcceptedAcc, DeferredAcc, ErrA
                                           [{Txid, Reason, hard} | ErrAcc])
             end
     end.
+
+%% Only RBF fee failures are deferred so that a package can reconsider them;
+%% a deferred set of one such tx is final.
+finalize_lone_rbf_failure([{Txid, _}] = Deferred, Errors) ->
+    case lists:keyfind(Txid, 1, Errors) of
+        {Txid, Reason, soft} ->
+            case is_rbf_reconsiderable(Reason) of
+                true  -> {[], lists:keyreplace(Txid, 1, Errors,
+                                               {Txid, Reason, hard})};
+                false -> {Deferred, Errors}
+            end;
+        _ ->
+            {Deferred, Errors}
+    end;
+finalize_lone_rbf_failure(Deferred, Errors) ->
+    {Deferred, Errors}.
+
+is_rbf_reconsiderable(rbf_insufficient_fee)              -> true;
+is_rbf_reconsiderable(rbf_insufficient_additional_fee)   -> true;
+is_rbf_reconsiderable(rbf_cluster_diagram_not_dominated) -> true;
+is_rbf_reconsiderable(_)                                 -> false.
 
 %% Evaluate deferred transactions as a package with CPFP.
 %% Calculates aggregate package fee rate and accepts if sufficient.
@@ -2001,22 +2040,31 @@ evaluate_package_cpfp(DeferredTxs, AlreadyAccepted, State) ->
     %% Check ephemeral anchor spends - all dust must be spent by children
     EphemeralDeps = check_ephemeral_spends(TxEntries, PackageTxMap),
 
-    %% Check for package RBF
+    %% Package RBF (Core validation.cpp PackageRBFChecks).  Every check runs
+    %% against the unchanged mempool and the conflicts are removed only once
+    %% the package has passed them all and its scripts verify, the way Core
+    %% stages removals in its ChangeSet and applies them in SubmitPackage.
+    %% The old code evicted first, so a package that then failed (too large a
+    %% cluster, a bad signature) still cost the mempool its conflicts.
     AllConflicts = find_all_package_conflicts(DeferredTxs),
-    case AllConflicts of
+    {Replaced, State1} = case AllConflicts of
         [] ->
-            ok;
+            {[], State};
         _ ->
-            do_package_rbf(DeferredTxs, TotalFee, TotalVSize, AllConflicts)
+            EvictTxids = package_rbf_checks(DeferredTxs, TxEntries, TotalFee,
+                                            TotalVSize, AllConflicts),
+            package_rbf_prevalidate(TxEntries),
+            {EvictTxids, apply_package_rbf_evictions(EvictTxids, State)}
     end,
 
     %% Accept all deferred transactions
-    State2 = accept_package_txs(TxEntries, EphemeralDeps, State),
+    State2 = accept_package_txs(TxEntries, EphemeralDeps, State1),
 
     AcceptedTxids = AlreadyAccepted ++ [Txid || {Txid, _} <- DeferredTxs],
     logger:debug("mempool: accepted package of ~B txs (pkg_fee_rate=~.1f sat/vB)",
                  [length(DeferredTxs), PackageFeeRate]),
-    Info = #{cpfp => {[Txid || {Txid, _} <- DeferredTxs], TotalFee, TotalVSize}},
+    Info = #{cpfp => {[Txid || {Txid, _} <- DeferredTxs], TotalFee, TotalVSize},
+             replaced => Replaced},
     {ok, AcceptedTxids, Info, State2}.
 
 %% Compute package metrics: total fee, total vsize, and entry data.
@@ -2196,9 +2244,26 @@ find_all_package_conflicts(TxPairs) ->
         find_mempool_conflicts(Tx)
     end, TxPairs)).
 
-%% Handle package RBF.
-do_package_rbf(_TxPairs, TotalFee, TotalVSize, ConflictTxids) ->
-    %% Gather all conflicting entries
+%% Core validation.cpp PackageRBFChecks, run against the unchanged mempool.
+%% Returns the txids to evict (conflicts, their descendants and orphaned
+%% ephemeral parents); evicts nothing.  Package-level failures are thrown as
+%% {package_policy, Reason, Details} (Core PCKG_POLICY: submitpackage
+%% reports Reason, or "Reason, Details", as package_msg).
+package_rbf_checks(DeferredTxs, TxEntries, TotalFee, TotalVSize, ConflictTxids) ->
+    NotOnePOneC = pkg_policy(<<"package RBF failed: package must be "
+                               "1-parent-1-child">>, <<>>),
+    {ParentTxid, ChildTxid, ChildTx} = case DeferredTxs of
+        [{PT, _}, {CTid, CT}] -> {PT, CTid, CT};
+        _ -> throw(NotOnePOneC)
+    end,
+    lists:any(fun(#tx_in{prev_out = #outpoint{hash = H}}) -> H =:= ParentTxid end,
+              ChildTx#transaction.inputs)
+        orelse throw(NotOnePOneC),
+    %% No in-mempool parents: the new cluster is the two package txs alone.
+    lists:all(fun({_, T}) -> get_parent_txids(T) =:= [] end, DeferredTxs)
+        orelse throw(pkg_policy(<<"package RBF failed: new transaction cannot "
+                                  "have mempool ancestors">>, <<>>)),
+
     ConflictEntries = lists:filtermap(fun(Cid) ->
         case ets:lookup(?MEMPOOL_TXS, Cid) of
             [{_, E}] -> {true, E};
@@ -2207,8 +2272,7 @@ do_package_rbf(_TxPairs, TotalFee, TotalVSize, ConflictTxids) ->
     end, ConflictTxids),
 
     %% Check RBF signaling (unless full RBF is enabled)
-    FullRbfEnabled = beamchain_config:mempool_full_rbf(),
-    case FullRbfEnabled of
+    case beamchain_config:mempool_full_rbf() of
         true -> ok;
         false ->
             lists:foreach(fun(E) ->
@@ -2216,67 +2280,156 @@ do_package_rbf(_TxPairs, TotalFee, TotalVSize, ConflictTxids) ->
             end, ConflictEntries)
     end,
 
-    %% Collect all descendants of conflicting txs
+    %% Rule 5 (Core policy/rbf.cpp GetEntriesForConflicts): the limit is on
+    %% distinct CLUSTERS the direct conflicts belong to, not on evictions.
+    NClusters = count_conflict_clusters(ConflictTxids),
+    NClusters =< ?MAX_RBF_EVICTIONS
+        orelse throw(pkg_policy(
+                       <<"package RBF failed: too many potential replacements">>,
+                       fmt("rejecting replacement ~s; too many conflicting "
+                           "clusters (~B > ~B)",
+                           [txid_hex(ChildTxid), NClusters, ?MAX_RBF_EVICTIONS]))),
+
     DescendantsAndSelf = lists:usort(lists:flatmap(fun(Cid) ->
         [Cid | get_all_descendants(Cid)]
     end, ConflictTxids)),
-
-    %% Also include ephemeral anchor parents whose dust is no longer spent
     EphemeralParents = lists:usort(lists:flatmap(fun(EvictTxid) ->
         find_orphaned_ephemeral_parents(EvictTxid)
     end, DescendantsAndSelf)),
-
     AllEvictTxids = lists:usort(DescendantsAndSelf ++ EphemeralParents),
-    %% Rule 5 (Core policy/rbf.cpp GetEntriesForConflicts): the limit is on
-    %% distinct CLUSTERS the direct conflicts belong to, not on evictions.
-    count_conflict_clusters(ConflictTxids) =< ?MAX_RBF_EVICTIONS
-        orelse throw(rbf_too_many_evictions),
 
-    AllEvictEntries = lists:filtermap(fun(Eid) ->
+    EvictedFeeTotal = lists:foldl(fun(Eid, Acc) ->
         case ets:lookup(?MEMPOOL_TXS, Eid) of
-            [{_, E}] -> {true, E};
-            [] -> false
+            [{_, E}] -> Acc + E#mempool_entry.fee;
+            [] -> Acc
         end
-    end, AllEvictTxids),
+    end, 0, AllEvictTxids),
 
-    %% Package fee must be >= sum of all evicted fees
-    EvictedFeeTotal = lists:foldl(fun(E, Acc) ->
-        Acc + E#mempool_entry.fee
-    end, 0, AllEvictEntries),
-    TotalFee >= EvictedFeeTotal orelse throw(rbf_insufficient_fee),
-
-    %% Additional fee must cover incremental relay fee.
+    %% Core PaysForRBF over the package totals, errors attributed to the child.
+    AntiDoS = <<"package RBF failed: insufficient anti-DoS fees">>,
+    TotalFee >= EvictedFeeTotal
+        orelse throw(pkg_policy(AntiDoS,
+                       fmt("rejecting replacement ~s, less fees than "
+                           "conflicting txs; ~s < ~s",
+                           [txid_hex(ChildTxid), format_money(TotalFee),
+                            format_money(EvictedFeeTotal)]))),
     %% Core DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB; GetFee(vsize) = ceil(vsize/10).
     MinAdditionalFee = (TotalVSize * ?DEFAULT_INCREMENTAL_RELAY_FEE + 999) div 1000,
     (TotalFee - EvictedFeeTotal) >= MinAdditionalFee
-        orelse throw(rbf_insufficient_additional_fee),
+        orelse throw(pkg_policy(AntiDoS,
+                       fmt("rejecting replacement ~s, not enough additional "
+                           "fees to relay; ~s < ~s",
+                           [txid_hex(ChildTxid),
+                            format_money(TotalFee - EvictedFeeTotal),
+                            format_money(MinAdditionalFee)]))),
 
-    %% Package fee rate must exceed all conflict fee rates
-    PackageFeeRate = TotalFee / max(1, TotalVSize),
-    lists:foreach(fun(E) ->
-        PackageFeeRate > E#mempool_entry.fee_rate
-            orelse throw(rbf_insufficient_fee_rate)
-    end, ConflictEntries),
+    %% The package must be a chunk of its own: package feerate strictly above
+    %% the parent's (CFeeRate compares exact fractions in Core v31).
+    {ParentFee, ParentVSize} = hd([{E#mempool_entry.fee, E#mempool_entry.vsize}
+                                   || {T, _, E, _} <- TxEntries, T =:= ParentTxid]),
+    TotalFee * ParentVSize > ParentFee * TotalVSize
+        orelse throw(pkg_policy(
+                       <<"package RBF failed: package feerate is less than or "
+                         "equal to parent feerate">>,
+                       fmt("package feerate ~s <= parent feerate is ~s",
+                           [feerate_string(TotalFee, TotalVSize),
+                            feerate_string(ParentFee, ParentVSize)]))),
 
-    %% Evict all conflicting txs + descendants
-    lists:foreach(fun(EvictTxid) ->
-        case remove_entry(EvictTxid) of
-            #mempool_entry{} ->
-                %% Package RBF replacement left these txs unmined — drop
-                %% their fee-estimator rows (Core removeTx, REPLACED).
-                beamchain_fee_estimator:remove_tx(EvictTxid);
-            not_found ->
-                ok
+    %% Cluster limits on the post-replacement cluster, which is the package
+    %% itself (no mempool ancestors; the package txs have no descendants).
+    PkgAdjWeight = lists:sum([E#mempool_entry.adj_weight
+                              || {_, _, E, _} <- TxEntries]),
+    (length(TxEntries) =< ?MAX_CLUSTER_COUNT
+     andalso PkgAdjWeight =< ?MAX_CLUSTER_WEIGHT)
+        orelse throw(pkg_policy(<<"too-large-cluster">>, <<>>)),
+
+    %% Core ImprovesFeerateDiagram: the package (one chunk, since its feerate
+    %% beats the parent's) against what it evicts.
+    try check_cluster_rbf_diagram(TotalFee, TotalVSize, AllEvictTxids)
+    catch
+        throw:rbf_cluster_diagram_not_dominated ->
+            throw(pkg_policy(<<"package RBF failed: insufficient feerate: "
+                               "does not improve feerate diagram">>, <<>>))
+    end,
+    AllEvictTxids.
+
+%% The per-tx gates accept_package_txs/3 runs after the evictions, run here
+%% first so a package that fails one of them evicts nothing: scripts, dust
+%% (a parent deferred at the RBF gate never reached GATE 13/13b) and TRUC.
+package_rbf_prevalidate(TxEntries) ->
+    PackageTxMap = [{Txid, Tx} || {Txid, Tx, _Entry, _Coins} <- TxEntries],
+    lists:foreach(fun({_Txid, Tx, Entry, InputCoins}) ->
+        Fee = Entry#mempool_entry.fee,
+        case pre_check_ephemeral_tx(Tx, Fee) of
+            ok -> ok;
+            {error, EphReason} -> throw(EphReason)
+        end,
+        _ = check_dust(Tx, Fee),
+        case check_truc_package_rules(Tx, Entry#mempool_entry.vsize,
+                                      PackageTxMap, get_parent_txids(Tx)) of
+            ok -> ok;
+            {error, TrucErr} -> throw(TrucErr)
+        end,
+        verify_scripts(Tx, InputCoins)
+    end, lists:reverse(TxEntries)).
+
+%% Remove the replaced txs with the same bookkeeping as the single-tx commit
+%% phase (do_add_transaction/4 steps 13b, 16 and 18).
+apply_package_rbf_evictions(EvictTxids, State) ->
+    EvictedVBytes = lists:foldl(fun(Eid, Acc) ->
+        case ets:lookup(?MEMPOOL_TXS, Eid) of
+            [{_, E}] -> Acc + E#mempool_entry.vsize;
+            [] -> Acc
         end
-    end, AllEvictTxids),
+    end, 0, EvictTxids),
+    Present = [T || T <- EvictTxids, ets:member(?MEMPOOL_TXS, T)],
+    apply_staged_evictions(Present),
+    State2 = lists:foldl(fun(T, St) -> cluster_remove_tx(T, St) end,
+                         State, Present),
+    logger:debug("mempool: package rbf evicted ~B txs", [length(Present)]),
+    State2#state{
+        total_bytes = max(0, State2#state.total_bytes - EvictedVBytes),
+        total_count = max(0, State2#state.total_count - length(Present))
+    }.
 
-    logger:debug("mempool: package rbf evicted ~B txs", [length(AllEvictTxids)]),
-    ok.
+pkg_policy(Reason, Details) ->
+    {package_policy, Reason, Details}.
+
+fmt(Format, Args) ->
+    iolist_to_binary(io_lib:format(Format, Args)).
+
+txid_hex(Txid) ->
+    beamchain_serialize:hex_encode(beamchain_serialize:reverse_bytes(Txid)).
+
+%% Core FormatMoney: 8 decimals, trailing zeros trimmed down to 2.
+format_money(Sats) when Sats < 0 ->
+    <<"-", (format_money(-Sats))/binary>>;
+format_money(Sats) ->
+    Frac0 = lists:flatten(io_lib:format("~8..0B", [Sats rem 100000000])),
+    Frac = trim_money_zeros(lists:reverse(Frac0)),
+    fmt("~B.~s", [Sats div 100000000, Frac]).
+
+trim_money_zeros([$0 | Rest]) when length(Rest) >= 2 -> trim_money_zeros(Rest);
+trim_money_zeros(Rev) -> lists:reverse(Rev).
+
+%% Core CFeeRate::ToString: GetFeePerK() as "<sat/vB>.<3 decimals> sat/vB".
+feerate_string(Fee, VSize) ->
+    PerK = Fee * 1000 div max(1, VSize),
+    fmt("~B.~3..0B sat/vB", [PerK div 1000, PerK rem 1000]).
 
 %% Accept all package transactions (after CPFP validation passed).
 accept_package_txs(TxEntries, EphemeralDeps, State) ->
     %% Build package map for TRUC checks
     PackageTxMap = [{Txid, Tx} || {Txid, Tx, _Entry, _Coins} <- TxEntries],
+
+    %% A child that failed its individual attempt with missing inputs was put
+    %% in the orphan pool.  Take the package txs out of it first: otherwise
+    %% inserting the parent below promotes the child through
+    %% reprocess_orphans/2, and the loop then inserts the child a second
+    %% time, counting it twice and seeing it in its own cluster (which
+    %% refused a package at the cluster limit, core-regtest
+    %% package_rbf/at-limit).
+    drop_package_orphans(TxEntries),
 
     %% Register ephemeral anchor dependencies
     %% EphemeralDeps = [{ParentTxid, AnchorIndex, ChildTxid}, ...]
@@ -2334,6 +2487,17 @@ accept_package_txs(TxEntries, EphemeralDeps, State) ->
             total_count = St3#state.total_count + 1
         }
     end, State, lists:reverse(TxEntries)).
+
+drop_package_orphans(TxEntries) ->
+    lists:foreach(fun({Txid, Tx, _Entry, _Coins}) ->
+        Wtxid = beamchain_serialize:wtx_hash(Tx),
+        case ets:lookup(?MEMPOOL_ORPHANS, Wtxid) of
+            [{Wtxid, _OTx, _Expiry, Announcers, Weight}] ->
+                erase_orphan_entry(Wtxid, Txid, Announcers, Weight);
+            _ ->
+                ok
+        end
+    end, TxEntries).
 
 %%% ===================================================================
 %%% Internal: input lookup
@@ -2924,21 +3088,37 @@ check_cluster_rbf_diagram(NewFee, NewVSize, OldTxids) ->
     end.
 
 %% @doc Build a fee-rate diagram from a list of txids.
-%% Returns a list of {cumulative_vsize, cumulative_fee} points, sorted by fee rate.
+%% Returns a list of {cumulative_vsize, cumulative_fee} points, one per chunk,
+%% chunks in descending feerate.
+%%
+%% The txs are chunked the way a linearization chunks them (Core
+%% CalculateChunksForRBF): a tx never comes before its in-set parents, so a
+%% high-feerate child is chunked together with its cheap parent.  Sorting
+%% the txs by their own feerate (the old code) put a child ahead of its
+%% parent and overstated the old diagram, which refused a replacement of a
+%% wide cheap parent and its child that Core accepts (core-regtest
+%% package_rbf/at-limit).  Each connected component is linearized on its
+%% own by repeatedly taking the best-feerate ancestor set, adjacent chunks
+%% are merged until feerates strictly decrease, and the chunks of all
+%% components are then merged by feerate.
 build_feerate_diagram(Txids) ->
-    %% Get fee and vsize for each txid, compute fee rate, sort by descending fee rate
-    Entries = lists:filtermap(fun(Txid) ->
+    Info = maps:from_list(lists:filtermap(fun(Txid) ->
         case ets:lookup(?MEMPOOL_TXS, Txid) of
-            [{_, E}] -> {true, {E#mempool_entry.fee, E#mempool_entry.vsize,
-                                E#mempool_entry.fee_rate}};
+            [{_, E}] -> {true, {Txid, {E#mempool_entry.fee,
+                                       E#mempool_entry.vsize,
+                                       E#mempool_entry.tx}}};
             [] -> false
         end
-    end, Txids),
-    %% Sort by descending fee rate (best first)
-    Sorted = lists:sort(fun({_, _, R1}, {_, _, R2}) -> R1 >= R2 end, Entries),
-    %% Build cumulative diagram
+    end, lists:usort(Txids))),
+    Parents = maps:map(fun(_Txid, {_, _, Tx}) ->
+        [P || P <- get_parent_txids(Tx), maps:is_key(P, Info)]
+    end, Info),
+    Anc = maps:map(fun(Txid, _) -> diagram_ancestors(Txid, Parents) end, Parents),
+    Chunks = lists:append([linearize_component(C, Info, Anc)
+                           || C <- diagram_components(Parents)]),
+    Sorted = lists:sort(fun({F1, V1}, {F2, V2}) -> F1 * V2 >= F2 * V1 end, Chunks),
     {Diagram, _, _} = lists:foldl(
-        fun({Fee, VSize, _Rate}, {Acc, CumFee, CumVSize}) ->
+        fun({Fee, VSize}, {Acc, CumFee, CumVSize}) ->
             NewCumFee = CumFee + Fee,
             NewCumVSize = CumVSize + VSize,
             {[{NewCumVSize, NewCumFee} | Acc], NewCumFee, NewCumVSize}
@@ -2946,6 +3126,75 @@ build_feerate_diagram(Txids) ->
         {[], 0, 0},
         Sorted),
     lists:reverse(Diagram).
+
+%% Txid plus its ancestors inside the diagram set, as a set.
+diagram_ancestors(Txid, Parents) ->
+    diagram_ancestors_loop([Txid], Parents, sets:new()).
+
+diagram_ancestors_loop([], _Parents, Acc) ->
+    Acc;
+diagram_ancestors_loop([T | Rest], Parents, Acc) ->
+    case sets:is_element(T, Acc) of
+        true -> diagram_ancestors_loop(Rest, Parents, Acc);
+        false -> diagram_ancestors_loop(maps:get(T, Parents, []) ++ Rest,
+                                        Parents, sets:add_element(T, Acc))
+    end.
+
+%% Connected components of the parent graph (undirected).
+diagram_components(Parents) ->
+    Adj = maps:fold(fun(T, Ps, A0) ->
+        lists:foldl(fun(P, A) ->
+            A1 = maps:update_with(T, fun(L) -> [P | L] end, [P], A),
+            maps:update_with(P, fun(L) -> [T | L] end, [T], A1)
+        end, A0, Ps)
+    end, maps:from_list([{T, []} || T <- maps:keys(Parents)]), Parents),
+    diagram_components(lists:sort(maps:keys(Parents)), Adj, sets:new(), []).
+
+diagram_components([], _Adj, _Seen, Acc) ->
+    Acc;
+diagram_components([T | Rest], Adj, Seen, Acc) ->
+    case sets:is_element(T, Seen) of
+        true -> diagram_components(Rest, Adj, Seen, Acc);
+        false ->
+            Comp = diagram_ancestors_loop([T], Adj, sets:new()),
+            diagram_components(Rest, Adj, sets:union(Seen, Comp),
+                               [sets:to_list(Comp) | Acc])
+    end.
+
+%% Chunks {Fee, VSize} of one component, in strictly decreasing feerate.
+linearize_component(Txids, Info, Anc) ->
+    linearize_loop(sets:from_list(Txids), Info, Anc, []).
+
+linearize_loop(Remaining, Info, Anc, Acc) ->
+    case sets:size(Remaining) of
+        0 -> merge_chunks(lists:reverse(Acc), []);
+        _ ->
+            Candidates = [begin
+                              Set = sets:intersection(maps:get(T, Anc), Remaining),
+                              {F, V} = sets:fold(fun(X, {FA, VA}) ->
+                                  {XF, XV, _} = maps:get(X, Info),
+                                  {FA + XF, VA + XV}
+                              end, {0, 0}, Set),
+                              {F, V, Set}
+                          end || T <- lists:sort(sets:to_list(Remaining))],
+            {BF, BV, BSet} = lists:foldl(fun({F, V, _} = C, {BF0, BV0, _} = B) ->
+                case F * BV0 > BF0 * V of
+                    true -> C;
+                    false -> B
+                end
+            end, hd(Candidates), tl(Candidates)),
+            linearize_loop(sets:subtract(Remaining, BSet), Info, Anc,
+                           [{BF, BV} | Acc])
+    end.
+
+%% Merge each chunk into its predecessor while it has a higher or equal
+%% feerate, so the result is a valid chunking (feerates strictly decrease).
+merge_chunks([], Stack) ->
+    lists:reverse(Stack);
+merge_chunks([{F, V} | Rest], [{PF, PV} | Stack]) when F * PV >= PF * V ->
+    merge_chunks([{F + PF, V + PV} | Rest], Stack);
+merge_chunks([C | Rest], Stack) ->
+    merge_chunks(Rest, [C | Stack]).
 
 %% @doc Check if diagram A dominates diagram B (A >= B at all points).
 %% Both diagrams are lists of {cumulative_vsize, cumulative_fee}.
@@ -3457,9 +3706,9 @@ cluster_members_for(Tx) ->
     %% The single-tx RBF / TRUC paths STAGE their evictions (do_rbf/3,
     %% do_truc_sibling_eviction/3); check_cluster_limits/3 subtracts that
     %% staged set from what this returns.  The package RBF path
-    %% (do_package_rbf/4) still removes entries from ?MEMPOOL_TXS in place,
-    %% while ?MEMPOOL_CLUSTERS is only rebuilt later via cluster_remove_tx/2,
-    %% so the cached txids list is filtered against ?MEMPOOL_TXS here.
+    %% (apply_package_rbf_evictions/2) removes its conflicts before the
+    %% package txs are inserted; the cached txids list is still filtered
+    %% against ?MEMPOOL_TXS here in case a cluster record lags.
     %% Either way a replacement that FREES cluster room is not refused
     %% (corpus: cluster-rbf-frees-room).
     %% Bounded work: a live cluster is capped at MAX_CLUSTER_COUNT members.
