@@ -30,6 +30,8 @@
 %% Linear buffering of 4 MB in 536-byte segments takes ~5-40 ms; master
 %% took 4-7 s (1.7-3 s at 1460 bytes).  >10x margin on each side.
 -define(LINEAR_BUDGET_US, 500000).
+%% MAX_PROTOCOL_MESSAGE_LENGTH + 1.
+-define(OVERSIZE, 4000001).
 
 %%% ===================================================================
 %%% v1, through a real inbound peer process (the production path)
@@ -48,6 +50,11 @@ v1_inbound_peer_test_() ->
           {timeout, 60,
            {"a v1 frame fed one byte at a time dispatches on its last byte, not before",
             fun() -> v1_frame_dispatches_exactly_when_complete(Ctx) end}}
+      end,
+      fun(Ctx) ->
+          {timeout, 60,
+           {"a v1 header claiming more than 4 MB stops the peer on its 24th byte",
+            fun() -> v1_oversize_header_stops_peer(Ctx) end}}
       end]}.
 
 setup_peer() ->
@@ -126,6 +133,24 @@ v1_frame_dispatches_exactly_when_complete(#{server := S, pid := Pid}) ->
             ?assertEqual(bad_version, Reason)
     after 10000 ->
         ?assert(false, "complete frame was never dispatched")
+    end.
+
+%% Warden, hashhog/beamchain#65 (2026-11-10): decode_msg rejects a header
+%% whose length exceeds MAX_PROTOCOL_MESSAGE_LENGTH as soon as the 24
+%% header bytes are present.  The size gate must not defer that: a first
+%% segment of 20-23 bytes that already holds such a length must not set
+%% recv_need to 24 + Len (up to ~4 GB buffered before the reject).
+v1_oversize_header_stops_peer(#{server := S, pid := Pid}) ->
+    Mon = erlang:monitor(process, Pid),
+    Hdr = <<?MAGIC/binary, "version", 0:40, (?OVERSIZE):32/little, 0:32>>,
+    inject(Pid, S, binary:part(Hdr, 0, 20)),
+    ?assertEqual(20, byte_size(peer_buffer(Pid))),
+    inject(Pid, S, binary:part(Hdr, 20, 4)),
+    receive
+        {'DOWN', Mon, process, Pid, Reason} ->
+            ?assertEqual({shutdown, {frame_error, message_too_large}}, Reason)
+    after 10000 ->
+        ?assert(false, "oversize header was buffered instead of rejected")
     end.
 
 %%% ===================================================================
@@ -254,3 +279,31 @@ v2_trickled_decoy() ->
     {ok, Peer2} = beamchain_peer:buffer_recv(
                     binary:part(CT, byte_size(CT) - 1, 1), Peer1),
     ?assertEqual(3, beamchain_peer:recv_need(Peer2)).
+
+%% Unit-level twin of v1_oversize_header_stops_peer: 20 bytes of a v1
+%% header with Len = 4000001, then the 4 checksum bytes.  recv_need never
+%% exceeds 24, so the checksum bytes reach the decoder and the frame is
+%% rejected at the header.  Also fed one byte at a time.
+v1_oversize_header_recv_need_capped_test() ->
+    Hdr = <<?MAGIC/binary, "block", 0:56, (?OVERSIZE):32/little, 0:32>>,
+    P0 = beamchain_peer:make_test_peer(v1, undefined, <<>>),
+    {ok, P1} = beamchain_peer:buffer_recv(binary:part(Hdr, 0, 20), P0),
+    ?assertEqual(24, beamchain_peer:recv_need(P1)),
+    ?assertMatch({stop, {shutdown, {frame_error, message_too_large}}},
+                 beamchain_peer:buffer_recv(binary:part(Hdr, 20, 4), P1)),
+    %% The whole header in one segment: rejected, never buffered.
+    ?assertMatch({stop, {shutdown, {frame_error, message_too_large}}},
+                 beamchain_peer:buffer_recv(Hdr, P0)),
+    %% Byte at a time: the gate stays at 24 through the length field.
+    Last = lists:foldl(
+             fun(I, P) ->
+                 {ok, Q} = beamchain_peer:buffer_recv(binary:part(Hdr, I, 1), P),
+                 ?assert(beamchain_peer:recv_need(Q) =< 24),
+                 Q
+             end, P0, lists:seq(0, 22)),
+    ?assertMatch({stop, {shutdown, {frame_error, message_too_large}}},
+                 beamchain_peer:buffer_recv(binary:part(Hdr, 23, 1), Last)),
+    %% The exact maximum is still a legal size and waits for its payload.
+    Max = <<?MAGIC/binary, "block", 0:56, (?OVERSIZE - 1):32/little, 0:32>>,
+    {ok, PM} = beamchain_peer:buffer_recv(Max, P0),
+    ?assertEqual(24 + ?OVERSIZE - 1, beamchain_peer:recv_need(PM)).
