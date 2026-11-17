@@ -145,7 +145,7 @@ MANIFEST.sha256: OK
   (`<datadir>/regtest/regtest/wallet`).
 - The Prometheus port (9332) can only be changed through `ERL_FLAGS`
   (see [running.md](running.md#networks-and-ports)).
-- The RPC, REST and metrics listeners bind every interface.
+- The REST listener binds every interface.
 - 30 methods in Core v31.1's `help` are not implemented, mostly label, rescan and
   send-many wallet calls; see [rpc.md](rpc.md#in-core-v311-but-not-in-beamchain).
 - PayJoin (BIP-78) lacks output substitution and the anti-fingerprinting rules.

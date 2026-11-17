@@ -281,3 +281,112 @@ secret_key_test_() ->
             ]
         end
     }}.
+
+%%% ===================================================================
+%%% Gossiped addr: source group and nTime (Core AddrManImpl::AddSingle)
+%%%
+%%% Core files a gossiped address in a new bucket chosen from
+%%% (address group, SOURCE group), where the source is the address of the
+%%% peer that relayed it (net_processing ProcessAddrs ->
+%%% m_addrman.Add(vAddrOk, pfrom.addr, 2h)). The source group bounds how
+%%% much of the new table one peer's network can fill: 64 of 1024 buckets.
+%%% It also keeps the relayed nTime, penalised by 2h unless the address is
+%%% the source's own (self-announcement).
+%%%
+%%% Before this fix the peer manager handed addrman the peer PID as the
+%%% source, which source_netgroup/1 mapped to the single group `local`, so
+%%% every gossiped address from every peer competed for the same <=64 new
+%%% buckets; and addrman stamped every entry with "now", discarding nTime.
+%%%
+%%% The test drives the real peer-manager addr/addrv2 handlers into a live
+%%% addrman, then counts the distinct new buckets from inside the addrman
+%%% process (its ETS tables are private).
+%%% ===================================================================
+
+gossip_spreads_across_buckets_by_source_group_test_() ->
+    {"gossiped addrs are bucketed by the relaying peer's group and keep nTime",
+     {setup, fun setup/0, fun cleanup/1,
+      fun(_Setup) ->
+          {timeout, 60, fun gossip_spreads_across_buckets_by_source_group/0}
+      end}}.
+
+gossip_spreads_across_buckets_by_source_group() ->
+    beamchain_peer_manager:test_ensure_peer_table(),
+    PeerAddrs = [{{11, 1, 0, 1}, 8333},
+                 {{22, 2, 0, 1}, 8333},
+                 {{33, 3, 0, 1}, 8333}],
+    Peers = [{gossip_test_peer(A), A} || A <- PeerAddrs],
+    Now = erlang:system_time(second),
+    T0 = Now - 3 * 86400,
+    %% 5000 routable addresses, each in its own /16 (A in 40..89, B in 0..99).
+    All = [#{timestamp => T0, services => 1,
+             ip => {40 + I rem 50, I div 50, 7, 9}, port => 8333}
+           || I <- lists:seq(0, 4999)],
+    [Chunk1, Chunk2, Chunk3] = split3(All),
+    [{P1, A1}, {P2, A2}, {P3, A3}] = Peers,
+    %% Peer 1 also announces itself: no time penalty for a self-announcement.
+    {SelfIP, SelfPort} = A1,
+    Self = #{timestamp => T0, services => 1, ip => SelfIP, port => SelfPort},
+    send_addr(P1, addr, [Self | Chunk1]),
+    send_addr(P2, addr, Chunk2),
+    send_addr(P3, addrv2, Chunk3),
+    {NewCount, _} = beamchain_addrman:count(),   %% sync with the casts
+    ?assert(NewCount > 0),
+    Buckets = new_bucket_ids(),
+    ?debugFmt("~B entries in ~B distinct new buckets", [NewCount, length(Buckets)]),
+    %% One source group can reach at most 64 new buckets; three distinct
+    %% relaying peers (three /16s) must reach more than that.
+    ?assert(length(Buckets) > 64),
+    %% nTime is kept (minus Core's 2h relay penalty), not replaced by now.
+    Dump = beamchain_addrman:get_node_addresses(0, all),
+    Times = maps:from_list([{{maps:get(address, E), maps:get(port, E)},
+                             maps:get(time, E)} || E <- Dump]),
+    ?assertEqual(T0, maps:get({<<"11.1.0.1">>, 8333}, Times)),
+    Others = [T || {K, T} <- maps:to_list(Times), K =/= {<<"11.1.0.1">>, 8333}],
+    ?assert(length(Others) > 0),
+    ?assertEqual([T0 - 7200], lists:usort(Others)),
+    [begin ets:delete(beamchain_peers, P), P ! stop end || {P, _} <- Peers],
+    _ = {A2, A3},
+    ok.
+
+%% A registered, rate-limit-exempt (noban) peer whose address is Addr.
+gossip_test_peer(Addr) ->
+    P = spawn(fun Loop() -> receive stop -> ok; _ -> Loop() end end),
+    ok = beamchain_peer_manager:test_insert_peer(P, inbound, full_relay, noban),
+    %% test_insert_peer pins 127.0.0.1:18333; rewrite that field to Addr.
+    [Row] = ets:lookup(beamchain_peers, P),
+    Fields = tuple_to_list(Row),
+    Idx = length(lists:takewhile(fun(F) -> F =/= {{127, 0, 0, 1}, 18333} end,
+                                 Fields)) + 1,
+    ets:insert(beamchain_peers, setelement(Idx, Row, Addr)),
+    P.
+
+send_addr(_Pid, _Cmd, []) ->
+    ok;
+send_addr(Pid, Cmd, Entries) ->
+    {Batch, Rest} = lists:split(min(1000, length(Entries)), Entries),
+    Wire = case Cmd of
+        addr -> Batch;
+        addrv2 -> [#{timestamp => T, services => S, network_id => 1,
+                     address => list_to_binary(tuple_to_list(IP)), port => Po}
+                   || #{timestamp := T, services := S, ip := IP, port := Po} <- Batch]
+    end,
+    Payload = beamchain_p2p_msg:encode_payload(Cmd, #{addrs => Wire}),
+    ok = beamchain_peer_manager:test_peer_message(Pid, Cmd, Payload),
+    send_addr(Pid, Cmd, Rest).
+
+split3(L) ->
+    N = length(L) div 3,
+    {A, R1} = lists:split(N, L),
+    {B, C} = lists:split(N, R1),
+    [A, B, C].
+
+%% Distinct new-table bucket ids, read inside the addrman process.
+new_bucket_ids() ->
+    Self = self(),
+    sys:replace_state(beamchain_addrman, fun(S) ->
+        NewTab = element(3, S),   %% #state.new_buckets
+        Self ! {new_buckets, lists:usort([B || {{B, _}, _} <- ets:tab2list(NewTab)])},
+        S
+    end),
+    receive {new_buckets, Bs} -> Bs after 5000 -> error(no_bucket_reply) end.

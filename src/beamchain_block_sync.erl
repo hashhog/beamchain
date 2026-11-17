@@ -38,6 +38,7 @@
          handle_cmpctblock/2,
          handle_blocktxn/2,
          get_status/0,
+         peer_has_blocks_in_flight/1,
          is_too_far_ahead/2,
          is_cmpctblock_too_deep/2,
          max_downloaded_ahead/0,
@@ -62,7 +63,8 @@
 -export([do_handle_cmpctblock/5, unsolicited_connect_penalty/1, test_new_state/0,
          test_state/1, test_get/2,
          admit_downloaded/3,
-         validate_and_connect/3]).
+         validate_and_connect/3,
+         find_start_height/0]).
 -endif.
 
 -define(SERVER, ?MODULE).
@@ -339,6 +341,13 @@ handle_blocktxn(Peer, BlockTxn) ->
 get_status() ->
     gen_server:call(?SERVER, get_status).
 
+%% @doc Whether Peer owns any block request in flight (Core
+%% CNodeState::vBlocksInFlight non-empty). Used by the peer manager's
+%% EvictExtraOutboundPeers so it never drops a peer we are downloading from.
+-spec peer_has_blocks_in_flight(pid()) -> boolean().
+peer_has_blocks_in_flight(Peer) ->
+    gen_server:call(?SERVER, {peer_has_blocks_in_flight, Peer}, 2000).
+
 %%% ===================================================================
 %%% gen_server callbacks
 %%% ===================================================================
@@ -357,6 +366,10 @@ init([]) ->
     {ok, #state{params = Params, assume_valid = AssumeValid,
                 assume_valid_height = AVHeight}}.
 
+handle_call({peer_has_blocks_in_flight, Peer}, _From,
+            #state{in_flight = InFlight} = State) ->
+    {reply, lists:any(fun({P, _, _}) -> P =:= Peer end,
+                      maps:values(InFlight)), State};
 handle_call(get_status, _From, State) ->
     Status = #{
         status => State#state.status,
@@ -817,16 +830,19 @@ walk_connected_to_fork(Hash, H) ->
             end
     end.
 
-%% True iff Hash is the active HEADER chain's hash at Height
-%% (beamchain_db:get_block_index/1 returns the active-chain header by
-%% height; after a header reorg it follows the heavier chain).
+%% True iff Hash is the best HEADER chain's hash at Height. Header sync
+%% keeps a fork's headers at or below the connected tip off the active
+%% height slots, so this follows the header chain by hash there
+%% (beamchain_header_chain:hash_at/1); above the connected tip it is the
+%% height slot, as before.
 is_on_active_header_chain(Hash, Height) when Height >= 0 ->
-    case beamchain_db:get_block_index(Height) of
-        {ok, #{hash := ActiveHash}} -> ActiveHash =:= Hash;
-        _ -> false
-    end;
+    header_chain_hash(Height) =:= {ok, Hash};
 is_on_active_header_chain(_Hash, _Height) ->
     false.
+
+%% The block to download at Height: the header chain's block there.
+header_chain_hash(Height) ->
+    beamchain_header_chain:hash_at(Height).
 
 %% Gather currently connected peers from peer_manager.
 gather_connected_peers() ->
@@ -998,8 +1014,8 @@ blast_request_height(Height, #state{peers = Peers,
                                      in_flight = InFlight,
                                      hash_to_height = H2H,
                                      peer_stats = AllStats} = State) ->
-    case beamchain_db:get_block_index(Height) of
-        {ok, #{hash := Hash}} ->
+    case header_chain_hash(Height) of
+        {ok, Hash} ->
           case failed_block(Hash) of
             failed ->
                 State;
@@ -1118,8 +1134,8 @@ request_batch(Peer, BatchSize,
             %% Look up hashes and build getdata items
             {Items, InFlight2, H2H2, _Skipped, NotHere} = lists:foldl(
                 fun(Height, {ItemsAcc, IFAcc, H2HAcc, SkipAcc, NHAcc}) ->
-                    case beamchain_db:get_block_index(Height) of
-                        {ok, #{hash := Hash}} ->
+                    case header_chain_hash(Height) of
+                        {ok, Hash} ->
                             case said_notfound(Peer, Hash, State) orelse
                                  failed_block(Hash) of
                                 failed ->
@@ -2226,6 +2242,27 @@ do_handle_cmpctblock(Peer, CmpctBlock, BlockHash, Height, State) ->
                                  "at height ~B from mempool", [Height]),
                     handle_block_received(Peer, Block, State);
 
+                {partial, _PartialState}
+                  when is_map_key(BlockHash, State#state.pending_compact)
+                       andalso element(3, map_get(BlockHash,
+                                                  State#state.pending_compact))
+                               =/= Peer ->
+                    %% We are already waiting on another peer's blocktxn
+                    %% for this block. Do not overwrite that entry: the
+                    %% requester binding in handle_blocktxn_received would
+                    %% otherwise move to whoever sent the latest cmpctblock,
+                    %% and a stranger could then tear down the asked peer's
+                    %% reconstruction with a bad blocktxn. Core keeps one
+                    %% partial block per peer and never replaces another
+                    %% peer's (mapBlocksInFlight). The block stays in flight,
+                    %% so stall handling still covers a silent requester.
+                    logger:debug("block_sync: cmpctblock ~s from ~p while a "
+                                 "reconstruction from ~p is pending; "
+                                 "keeping the pending one",
+                                 [hash_hex(BlockHash), Peer,
+                                  element(3, maps:get(BlockHash,
+                                      State#state.pending_compact))]),
+                    State;
                 {partial, PartialState} ->
                     %% Need to request missing transactions
                     MissingIdxs = beamchain_compact_block:get_missing_indices(
@@ -2272,10 +2309,25 @@ do_handle_cmpctblock(Peer, CmpctBlock, BlockHash, Height, State) ->
     end.
 
 %% Handle blocktxn response (missing transactions for a compact block)
+%%
+%% Only the peer we sent getblocktxn to may answer it. Core keys the partial
+%% block per peer and drops a BLOCKTXN unless mapBlocksInFlight holds this
+%% hash for THIS node with a partialBlock (requested_block_from_this_peer,
+%% net_processing.cpp ProcessMessage BLOCKTXN) -- no misbehavior score. A
+%% blocktxn from anyone else must not reach fill_block: a bad one would score
+%% the sender, drop the asked peer's pending reconstruction and re-request
+%% the block from the stranger, so the asked peer's real answer is then
+%% discarded as unexpected.
 handle_blocktxn_received(Peer, BlockTxn, State) ->
     #{block_hash := BlockHash, transactions := Txns} = BlockTxn,
 
     case maps:find(BlockHash, State#state.pending_compact) of
+        {ok, {_PartialState, _RequestedAt, RequestPeer}}
+          when RequestPeer =/= Peer ->
+            logger:debug("block_sync: blocktxn for ~s from ~p, which we did "
+                         "not ask (asked ~p); ignoring",
+                         [hash_hex(BlockHash), Peer, RequestPeer]),
+            State;
         {ok, {PartialState, _RequestedAt, _RequestPeer}} ->
             %% Try to fill in the block
             case beamchain_compact_block:fill_block(PartialState, Txns) of

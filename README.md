@@ -65,8 +65,9 @@ Mainnet uses the data directory itself; every other network gets a subdirectory
 
 RPC binds `127.0.0.1` unless you pass `--rpcbind=<addr>` (or set `rpcbind=` in the
 config file). The P2P listener binds all interfaces (`0.0.0.0`). RPC requires the cookie
-or `rpcuser`/`rpcpassword`; if you set `--rpcbind=0.0.0.0`, firewall the RPC port. A Prometheus endpoint listens on port 9332; if that port is busy the node
-retries for about 30 seconds, then carries on without metrics.
+or `rpcuser`/`rpcpassword`; if you set `--rpcbind=0.0.0.0`, firewall the RPC port. An unauthenticated Prometheus endpoint listens on `127.0.0.1:9332`;
+pass `--metricsbind=<addr>` (or set `metricsbind=`) to expose it elsewhere. If that port is
+busy the node retries for about 30 seconds, then carries on without metrics.
 
 A mainnet node keeps every block unless you set `prune=<MiB>` (550 or more) in the
 config file: plan for at least 1 TB of fast disk without pruning. The UTXO cache

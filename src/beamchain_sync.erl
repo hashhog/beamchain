@@ -17,6 +17,7 @@
 -export([start_link/0]).
 -export([handle_peer_message/3]).
 -export([process_tx/2]).
+-export([serve_getblocktxn/2]).
 -export([notify_peer_connected/2, notify_peer_disconnected/1]).
 -export([notify_headers_complete/1]).
 -export([notify_blocks_complete/1]).
@@ -39,7 +40,7 @@
 
 %% BIP152 getblocktxn depth limit (Core net_processing.cpp:140/4276).
 %% When a peer sends getblocktxn for a block deeper than this below the tip
-%% we respond with a full block (cheaper to send than unbounded disk reads).
+%% we queue a block getdata for it instead (serve_getblocktxn/3).
 -define(MAX_BLOCKTXN_DEPTH, 10).
 
 -record(state, {
@@ -262,16 +263,18 @@ route_message(Peer, inv, Payload, State) ->
             %% that gap. The resulting `tx` reply is handled by the tx clause
             %% below (accept_to_memory_pool).
             maybe_request_tx_invs(Peer, Items),
-            %% Collect block inv items we don't already have
-            BlockItems = lists:filter(fun(#{type := Type, hash := Hash}) ->
-                (Type =:= ?MSG_BLOCK orelse Type =:= ?MSG_WITNESS_BLOCK)
-                    andalso not beamchain_db:has_block(Hash);
-                (_) -> false
-            end, Items),
-            case BlockItems of
-                [] ->
+            %% The block announcement this inv carries, if any. Core keeps a
+            %% single best_block (the last block inv it does not already
+            %% have) and acts on that one alone. Its AlreadyHaveBlock is an
+            %% in-memory block-index lookup; ours, beamchain_db:has_block/1,
+            %% is a synchronous RocksDB read on the shared db gen_server, so
+            %% asking it once per item let one 50,000-item inv cost 50,000
+            %% db round trips on this process (secfix H9). See
+            %% last_unknown_block_inv/1 for the bound.
+            case last_unknown_block_inv(Items) of
+                none ->
                     State;
-                _ ->
+                {BestHash, NBlockItems} ->
                     %% Headers-first announcement handling — Bitcoin Core
                     %% net_processing.cpp ProcessMessage(INV) "best_block"
                     %% path (src/net_processing.cpp:4065-4123): a peer that
@@ -298,9 +301,12 @@ route_message(Peer, inv, Payload, State) ->
                     %% to pfrom) — required here because a reorg announcer's
                     %% advertised height equals ours, so the height-gated
                     %% start_sync peer-selection would never pick it.
-                    logger:info("sync: received block inv from ~p (~B new) — "
-                                "sending getheaders (headers-first)",
-                                [Peer, length(BlockItems)]),
+                    logger:info("sync: received block inv from ~p (~B block "
+                                "items, best ~s not had) — sending getheaders "
+                                "(headers-first)",
+                                [Peer, NBlockItems,
+                                 beamchain_serialize:hex_encode(
+                                   beamchain_serialize:reverse_bytes(BestHash))]),
                     beamchain_header_sync:probe_peer(Peer),
                     %% Arm the header-sync completion poll so we transition to
                     %% block download once the header chain connects. Only arm
@@ -354,60 +360,6 @@ route_message(Peer, blocktxn, Payload, State) ->
     end,
     State;
 
-%% BIP152: Handle getblocktxn - peer requests missing transactions for a compact block
-route_message(Peer, getblocktxn, Payload, State) ->
-    case beamchain_p2p_msg:decode_payload(getblocktxn, Payload) of
-        {ok, #{block_hash := BlockHash, indexes := Indexes}} ->
-            logger:debug("sync: getblocktxn from ~p for ~s (~B indexes)",
-                         [Peer, beamchain_serialize:hex_encode(BlockHash),
-                          length(Indexes)]),
-            %% MAX_BLOCKTXN_DEPTH guard (Core net_processing.cpp:4276).
-            %% If the requested block is more than MAX_BLOCKTXN_DEPTH below the
-            %% tip, respond with the full block instead of a blocktxn message.
-            %% This bounds expensive disk reads from malicious getblocktxn floods.
-            TipH = case beamchain_chainstate:get_tip_height() of
-                {ok, H} -> H;
-                not_found -> 0
-            end,
-            BlockHeight = case beamchain_db:get_block_index_by_hash(BlockHash) of
-                {ok, #{height := BH}} -> BH;
-                _ -> TipH  %% unknown block: treat as shallow (will fail get_block)
-            end,
-            TooDeep = BlockHeight < TipH - ?MAX_BLOCKTXN_DEPTH,
-            %% Look up the full block and respond accordingly
-            case beamchain_db:get_block(BlockHash) of
-                {ok, Block} when TooDeep ->
-                    %% Block is too old: send full block per Core fallback path.
-                    logger:debug("sync: getblocktxn for ~s is ~B deep (max ~B), "
-                                 "sending full block",
-                                 [beamchain_serialize:hex_encode(BlockHash),
-                                  TipH - BlockHeight, ?MAX_BLOCKTXN_DEPTH]),
-                    beamchain_peer:send_message(Peer, {block, Block});
-                {ok, Block} ->
-                    Txs = Block#block.transactions,
-                    TxArray = list_to_tuple(Txs),
-                    RequestedTxs = lists:filtermap(
-                        fun(Idx) ->
-                            %% Indexes are 0-based
-                            ArrIdx = Idx + 1,
-                            if ArrIdx >= 1, ArrIdx =< tuple_size(TxArray) ->
-                                {true, element(ArrIdx, TxArray)};
-                               true ->
-                                false
-                            end
-                        end, Indexes),
-                    beamchain_peer:send_message(Peer,
-                        {blocktxn, #{block_hash => BlockHash,
-                                     transactions => RequestedTxs}});
-                not_found ->
-                    logger:debug("sync: getblocktxn block not found: ~s",
-                                 [beamchain_serialize:hex_encode(BlockHash)])
-            end;
-        _Error ->
-            beamchain_peer:add_misbehavior(Peer, 20)
-    end,
-    State;
-
 %% Handle incoming tx message: validate via AcceptToMemoryPool and relay.
 %% W125: pass Peer to accept_to_memory_pool/2 so any resulting orphan is
 %% attributed for per-peer DoS-score eviction (mirrors Core's
@@ -452,6 +404,96 @@ process_tx(Peer, Payload) ->
             beamchain_peer:add_misbehavior(Peer, 20)
     end,
     ok.
+
+%% @doc Serve a BIP152 getblocktxn for peer Peer.
+%%
+%% Runs in the REQUESTING PEER's process, holding a beamchain_serve_limiter
+%% slot (beamchain_peer_manager routes getblocktxn through
+%% beamchain_peer:serve_request/3 like getdata), never in this gen_server.
+%% It used to be a route_message/4 clause here: every peer's getblocktxn
+%% then read a block through beamchain_db inside the shared sync process
+%% with no serve slot, and a get_block reply the case did not match
+%% ({error, block_pruned}, {error, _} from a failed read) raised
+%% case_clause and crashed beamchain_sync for every peer.
+%%
+%% Mirrors Core net_processing.cpp NetMsgType::GETBLOCKTXN:
+%%   - indexes are uint16 (DifferenceFormatter "differential value
+%%     overflow"): beamchain_p2p_msg rejects a larger one as malformed;
+%%   - a block we have no index entry / data for: log and return;
+%%   - a block at most MAX_BLOCKTXN_DEPTH below the tip: SendBlockTransactions,
+%%     where an index >= vtx.size() is Misbehaving and nothing is sent;
+%%   - a deeper block: queue a MSG_WITNESS_BLOCK getdata on this peer
+%%     (m_getdata_requests.push_back) so it is served by the normal getdata
+%%     path (one item per pass, send-pause, prune horizon) instead of
+%%     pushing the whole block from here.
+-spec serve_getblocktxn(pid(), binary()) -> ok.
+serve_getblocktxn(Peer, Payload) ->
+    case beamchain_p2p_msg:decode_payload(getblocktxn, Payload) of
+        {ok, #{block_hash := BlockHash, indexes := Indexes}} ->
+            logger:debug("sync: getblocktxn from ~p for ~s (~B indexes)",
+                         [Peer, beamchain_serialize:hex_encode(BlockHash),
+                          length(Indexes)]),
+            serve_getblocktxn(Peer, BlockHash, Indexes);
+        _Error ->
+            beamchain_peer:add_misbehavior(Peer, 20),
+            ok
+    end.
+
+serve_getblocktxn(Peer, BlockHash, Indexes) ->
+    case beamchain_db:get_block_index_by_hash(BlockHash) of
+        {ok, #{height := BlockHeight}} ->
+            TipH = case beamchain_chainstate:get_tip_height() of
+                {ok, H} -> H;
+                _ -> 0
+            end,
+            case BlockHeight >= TipH - ?MAX_BLOCKTXN_DEPTH of
+                true ->
+                    case beamchain_db:get_block(BlockHash) of
+                        {ok, #block{transactions = Txs}} ->
+                            send_block_transactions(Peer, BlockHash, Txs,
+                                                    Indexes);
+                        Other ->
+                            %% not_found, {error, block_pruned}, a failed
+                            %% read: we do not have the data to answer.
+                            logger:debug("sync: getblocktxn for ~s: block "
+                                         "unreadable (~p)",
+                                         [beamchain_serialize:hex_encode(
+                                            BlockHash), Other]),
+                            ok
+                    end;
+                false ->
+                    logger:debug("sync: getblocktxn for ~s is ~B deep "
+                                 "(max ~B), queueing a block getdata",
+                                 [beamchain_serialize:hex_encode(BlockHash),
+                                  TipH - BlockHeight, ?MAX_BLOCKTXN_DEPTH]),
+                    beamchain_peer:queue_getdata(
+                      Peer, [#{type => ?MSG_WITNESS_BLOCK, hash => BlockHash}])
+            end;
+        _ ->
+            logger:debug("sync: getblocktxn for a block we don't have: ~s",
+                         [beamchain_serialize:hex_encode(BlockHash)]),
+            ok
+    end.
+
+%% Core SendBlockTransactions: every index must be < vtx.size(); one that
+%% is not is Misbehaving ("getblocktxn with out-of-bounds tx indices") and
+%% no blocktxn is sent (it used to drop the bad index silently and answer
+%% with the rest).
+send_block_transactions(Peer, BlockHash, Txs, Indexes) ->
+    TxArray = list_to_tuple(Txs),
+    N = tuple_size(TxArray),
+    case lists:all(fun(I) -> I >= 0 andalso I < N end, Indexes) of
+        true ->
+            Requested = [element(I + 1, TxArray) || I <- Indexes],
+            beamchain_peer:send_message(Peer,
+                {blocktxn, #{block_hash => BlockHash,
+                             transactions => Requested}});
+        false ->
+            logger:debug("sync: getblocktxn from ~p with out-of-bounds tx "
+                         "indices for ~s", [Peer,
+                          beamchain_serialize:hex_encode(BlockHash)]),
+            beamchain_peer:add_misbehavior(Peer, 100)
+    end.
 
 %%% ===================================================================
 %%% Internal: mempool tx-relay ingest (inv -> getdata REQUEST leg)
@@ -524,6 +566,54 @@ tx_inv_to_getdata_item(#{type := Type, hash := Txid})
     end;
 tx_inv_to_getdata_item(_Other) ->
     false.
+
+%%% ===================================================================
+%%% Internal: block inv -> best_block
+%%% ===================================================================
+
+%% Bitcoin Core announces at most MAX_BLOCKS_TO_ANNOUNCE (8) blocks in one
+%% inv (net_processing.cpp:152, :2171). An honest announcer therefore puts
+%% the hash we lack within the last 8 block items.
+-define(MAX_BLOCK_INV_CHECKS, 8).
+
+%% @doc Pick the block announcement to act on from an inv's items.
+%% Core's ProcessMessage(INV) (net_processing.cpp:4051-4097) sets best_block
+%% to the LAST block item it does not already have, then sends one
+%% getheaders for it. Every block item before that one has no effect.
+%%
+%% Walk the block items from the end and ask beamchain_db:has_block/1 for at
+%% most ?MAX_BLOCK_INV_CHECKS of them, stopping at the first one not had.
+%% That finds Core's best_block whenever it lies in the last 8 block items.
+%% A larger inv whose last 8 block items are all known is treated as "no new
+%% block": an honest peer never sends one, and getheaders on a later inv or
+%% the periodic header sync still catches anything real.
+%%
+%% Returns {Hash, NumberOfBlockItems} or none.
+-spec last_unknown_block_inv([map()]) ->
+    {binary(), non_neg_integer()} | none.
+last_unknown_block_inv(Items) ->
+    %% One pass, no db: block hashes newest-first.
+    RevBlockHashes = lists:foldl(
+        fun(#{type := Type, hash := Hash}, Acc)
+              when Type =:= ?MSG_BLOCK; Type =:= ?MSG_WITNESS_BLOCK ->
+                [Hash | Acc];
+           (_, Acc) ->
+                Acc
+        end, [], Items),
+    case first_not_had(RevBlockHashes, ?MAX_BLOCK_INV_CHECKS) of
+        none -> none;
+        Hash -> {Hash, length(RevBlockHashes)}
+    end.
+
+first_not_had([], _Budget) ->
+    none;
+first_not_had(_Hashes, 0) ->
+    none;
+first_not_had([Hash | Rest], Budget) ->
+    case beamchain_db:has_block(Hash) of
+        false -> Hash;
+        true  -> first_not_had(Rest, Budget - 1)
+    end.
 
 -ifdef(TEST).
 %% A minimal post-IBD state for exercising route_message/4 in tests. `complete`

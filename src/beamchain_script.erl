@@ -12,7 +12,8 @@
                               subscript_from_codesep/2]}).
 
 %% Public API
--export([verify_script/5, eval_script/5]).
+-export([verify_script/5, verify_script_error/5, script_error_string/1,
+         eval_script/5]).
 -export([decode_script_num/2, decode_script_num/3, encode_script_num/1, script_bool/1]).
 -export([check_minimal_encoding/1]).
 -export([flags_for_height/2, flags_for_block/3]).
@@ -564,6 +565,18 @@ skip_data(Len, Bin) ->
 %%% Script execution loop
 %%% -------------------------------------------------------------------
 
+%% MAX_STACK_SIZE after EVERY opcode. Core's EvalScript ends each loop
+%% iteration with `if (stack.size() + altstack.size() > MAX_STACK_SIZE)
+%% return set_error(serror, SCRIPT_ERR_STACK_SIZE)` (interpreter.cpp), for
+%% every opcode, executed or not. Each opcode clause below bumps opcode_pos
+%% before it returns to execute/3, so opcode_pos > 0 on entry means "an
+%% opcode has just run": this one clause is that check. It covers OP_0,
+%% OP_DEPTH and an oversized initial stack, which the per-push checks missed.
+%% An empty script runs no opcode, so (as in Core) no check is made.
+execute(_Script, _Pos, #script_state{opcode_pos = P, stack = S, altstack = A})
+  when P > 0, length(S) + length(A) > ?MAX_STACK_SIZE ->
+    {error, stack_overflow};
+
 execute(<<>>, _Pos, #script_state{exec_stack = ExecStack} = State) ->
     case ExecStack of
         [] -> {ok, State#script_state.stack};
@@ -1054,6 +1067,10 @@ execute_if(ExpectTrue, Rest, Pos, State) ->
                             script_bool(Cond)
                     end,
                     case Bool of
+                        error when State1#script_state.sig_version =:=
+                                   tapscript ->
+                            %% Core SCRIPT_ERR_TAPSCRIPT_MINIMALIF
+                            {error, tapscript_minimalif_failed};
                         error ->
                             {error, minimalif_failed};
                         _ ->
@@ -2534,11 +2551,27 @@ check_sig_encoding(SigBody, HashTypeByte, PubKey, Flags) ->
 -spec verify_script(binary(), binary(), [binary()],
                     non_neg_integer(), term()) -> boolean().
 verify_script(ScriptSig, ScriptPubKey, Witness, Flags, SigChecker) ->
+    case verify_script_error(ScriptSig, ScriptPubKey, Witness, Flags,
+                             SigChecker) of
+        ok -> true;
+        {error, _ScriptError} -> false
+    end.
+
+%% verify_script/5 with the script error kept: `ok` where verify_script/5
+%% answers true, `{error, ScriptError}` where it answers false, and the same
+%% error({script_internal, _}) raise for an INTERNAL fault. ScriptError is
+%% the interpreter's token (an atom, or a tuple such as {unknown_opcode, Op});
+%% script_error_string/1 renders it as Core's ScriptErrorString. The mempool
+%% needs it for Core's "mempool-script-verify-flag-failed (<error>)" reject
+%% reason (validation.cpp CheckInputScripts); the verdict is unchanged.
+-spec verify_script_error(binary(), binary(), [binary()],
+                          non_neg_integer(), term()) -> ok | {error, term()}.
+verify_script_error(ScriptSig, ScriptPubKey, Witness, Flags, SigChecker) ->
     try
         do_verify_script(ScriptSig, ScriptPubKey, Witness, Flags, SigChecker)
     catch
-        throw:_ScriptError ->
-            false;
+        throw:ScriptError ->
+            {error, ScriptError};
         error:{script_internal, _} = Internal ->
             error(Internal);
         Class:Reason ->
@@ -2565,11 +2598,11 @@ do_verify_script(ScriptSig, ScriptPubKey, Witness, Flags, SigChecker) ->
             case eval_script(ScriptPubKey, Stack1, Flags, SigChecker, base) of
                 {ok, []} ->
                     logger:debug("verify: scriptPubKey left empty stack"),
-                    false;
+                    {error, eval_false};
                 {ok, Stack2} ->
                     [Top | _] = Stack2,
                     case script_bool(Top) of
-                        false -> false;
+                        false -> {error, eval_false};
                         true ->
                             %% Step 3: P2SH evaluation
                             IsP2SH = (Flags band ?SCRIPT_VERIFY_P2SH) =/= 0 andalso
@@ -2643,22 +2676,156 @@ do_verify_script(ScriptSig, ScriptPubKey, Witness, Flags, SigChecker) ->
                                     %% CLEANSTACK check
                                     case (Flags band ?SCRIPT_VERIFY_CLEANSTACK) =/= 0 of
                                         true ->
-                                            length(FinalStack) =:= 1;
+                                            case length(FinalStack) =:= 1 of
+                                                true -> ok;
+                                                false -> {error, cleanstack}
+                                            end;
                                         false ->
-                                            true
+                                            ok
                                     end;
-                                {error, _WE} ->
-                                    false
+                                {error, WE} ->
+                                    {error, WE}
                             end
                     end;
                 {error, SPKErr} ->
                     logger:error("verify: scriptPubKey eval error=~p",
                                  [SPKErr]),
-                    false
+                    {error, SPKErr}
             end;
-        {error, _} ->
-            false
+        {error, SigErr} ->
+            {error, SigErr}
     end.
+
+%% Core script/script_error.cpp ScriptErrorString for the interpreter's
+%% error tokens. Several tokens fold onto one Core ScriptError where Core
+%% reports the same error (e.g. every false/empty final stack is
+%% SCRIPT_ERR_EVAL_FALSE). A token with no exact Core counterpart -- or one
+%% that stands for two Core errors, like sig_encoding (SIG_HASHTYPE or
+%% PUBKEYTYPE) -- gets Core's own fallback, "unknown error".
+-spec script_error_string(term()) -> binary().
+script_error_string(E) when E =:= eval_false; E =:= p2sh_no_script;
+                            E =:= p2sh_empty_stack; E =:= p2sh_failed;
+                            E =:= witness_program_failed;
+                            E =:= tapscript_failed ->
+    <<"Script evaluated without error but finished with a false/empty top stack element">>;
+script_error_string(verify_failed) ->
+    <<"Script failed an OP_VERIFY operation">>;
+script_error_string(equalverify_failed) ->
+    <<"Script failed an OP_EQUALVERIFY operation">>;
+script_error_string(checkmultisigverify_failed) ->
+    <<"Script failed an OP_CHECKMULTISIGVERIFY operation">>;
+script_error_string(checksigverify_failed) ->
+    <<"Script failed an OP_CHECKSIGVERIFY operation">>;
+script_error_string(numequalverify_failed) ->
+    <<"Script failed an OP_NUMEQUALVERIFY operation">>;
+script_error_string(E) when E =:= script_too_large;
+                            E =:= witness_script_too_large ->
+    <<"Script is too big">>;
+script_error_string(push_size_exceeded) ->
+    <<"Push value size limit exceeded">>;
+script_error_string(op_count_exceeded) ->
+    <<"Operation limit exceeded">>;
+script_error_string(E) when E =:= stack_overflow; E =:= stack_size ->
+    <<"Stack size limit exceeded">>;
+script_error_string(invalid_multisig) ->
+    <<"Signature count negative or greater than pubkey count">>;
+script_error_string(invalid_multisig_key_count) ->
+    <<"Pubkey count negative or limit exceeded">>;
+script_error_string(E) when E =:= bad_opcode; E =:= op_verif;
+                            E =:= op_vernotif; E =:= op_reserved;
+                            E =:= op_ver; E =:= script_truncated;
+                            E =:= invalid_script ->
+    <<"Opcode missing or not understood">>;
+script_error_string({unknown_opcode, _}) ->
+    <<"Opcode missing or not understood">>;
+script_error_string(disabled_opcode) ->
+    <<"Attempted to use a disabled opcode">>;
+script_error_string(E) when E =:= stack_underflow;
+                            E =:= invalid_stack_index ->
+    <<"Operation not valid with the current stack size">>;
+script_error_string(altstack_underflow) ->
+    <<"Operation not valid with the current altstack size">>;
+script_error_string(op_return) ->
+    <<"OP_RETURN was encountered">>;
+script_error_string(E) when E =:= unbalanced_conditional;
+                            E =:= unexpected_else;
+                            E =:= unexpected_endif ->
+    <<"Invalid OP_IF construction">>;
+script_error_string(E) when E =:= negative_locktime;
+                            E =:= negative_sequence ->
+    <<"Negative locktime">>;
+script_error_string(E) when E =:= locktime_failed; E =:= sequence_failed ->
+    <<"Locktime requirement not satisfied">>;
+script_error_string(sig_der) ->
+    <<"Non-canonical DER signature">>;
+script_error_string(minimaldata) ->
+    <<"Data push larger than necessary">>;
+script_error_string(sig_pushonly) ->
+    <<"Only push operators allowed in signatures">>;
+script_error_string(sig_high_s) ->
+    <<"Non-canonical signature: S value is unnecessarily high">>;
+script_error_string(nulldummy_failed) ->
+    <<"Dummy CHECKMULTISIG argument must be zero">>;
+script_error_string(minimalif_failed) ->
+    <<"OP_IF/NOTIF argument must be minimal">>;
+script_error_string(tapscript_minimalif_failed) ->
+    <<"OP_IF/NOTIF argument must be minimal in tapscript">>;
+script_error_string(nullfail) ->
+    <<"Signature must be zero for failed CHECK(MULTI)SIG operation">>;
+script_error_string(discourage_upgradable_nops) ->
+    <<"NOPx reserved for soft-fork upgrades">>;
+script_error_string(discourage_upgradable_witness_program) ->
+    <<"Witness version reserved for soft-fork upgrades">>;
+script_error_string(discourage_upgradable_taproot_version) ->
+    <<"Taproot version reserved for soft-fork upgrades">>;
+script_error_string(discourage_op_success) ->
+    <<"OP_SUCCESSx reserved for soft-fork upgrades">>;
+script_error_string(discourage_upgradable_pubkeytype) ->
+    <<"Public key version reserved for soft-fork upgrades">>;
+script_error_string(E) when E =:= cleanstack; E =:= witness_cleanstack;
+                            E =:= tapscript_cleanstack;
+                            E =:= tapscript_empty_stack ->
+    <<"Stack size must be exactly one after execution">>;
+script_error_string(witness_program_wrong_length) ->
+    <<"Witness program has incorrect length">>;
+script_error_string(witness_program_empty) ->
+    <<"Witness program was passed an empty witness">>;
+script_error_string(E) when E =:= witness_program_mismatch;
+                            E =:= taproot_commitment_mismatch;
+                            E =:= taproot_tweak_failed ->
+    <<"Witness program hash mismatch">>;
+script_error_string(witness_malleated) ->
+    <<"Witness requires empty scriptSig">>;
+script_error_string(witness_malleated_p2sh) ->
+    <<"Witness requires only-redeemscript scriptSig">>;
+script_error_string(witness_unexpected) ->
+    <<"Witness provided for non-witness script">>;
+script_error_string(witness_pubkeytype) ->
+    <<"Using non-compressed keys in segwit">>;
+script_error_string(invalid_schnorr_sig_size) ->
+    <<"Invalid Schnorr signature size">>;
+script_error_string(schnorr_sig_hashtype) ->
+    <<"Invalid Schnorr signature hash type">>;
+script_error_string(E) when E =:= schnorr_sig_failed;
+                            E =:= taproot_sig_failed ->
+    <<"Invalid Schnorr signature">>;
+script_error_string(invalid_control_block) ->
+    <<"Invalid Taproot control block size">>;
+script_error_string(tapscript_sigops_exceeded) ->
+    <<"Too much signature validation relative to witness weight">>;
+script_error_string(checkmultisig_in_tapscript) ->
+    <<"OP_CHECKMULTISIG(VERIFY) is not available in tapscript">>;
+script_error_string(tapscript_empty_pubkey) ->
+    <<"Empty public key in tapscript">>;
+script_error_string(op_codeseparator_in_legacy) ->
+    <<"Using OP_CODESEPARATOR in non-witness script">>;
+script_error_string(sig_findanddelete) ->
+    <<"Signature is found in scriptCode">>;
+script_error_string(E) when E =:= script_num_overflow;
+                            E =:= non_minimal_encoding ->
+    <<"Script number overflowed or is non-minimally encoded">>;
+script_error_string(_) ->
+    <<"unknown error">>.
 
 %%% -------------------------------------------------------------------
 %%% Witness program verification

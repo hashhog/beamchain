@@ -121,7 +121,8 @@ set these variables, so an option wins over an inherited variable.
 | regtest | 18444 | 18443 | 18453 |
 
 The Prometheus endpoint is on port 9332 for every network. RPC binds `127.0.0.1`
-(see `--rpcbind`); every other listener binds all interfaces. Run beside another node on the same machine with `--rpc-port` and
+(see `--rpcbind`) and so does the unauthenticated Prometheus endpoint (see
+`--metricsbind=<addr>` or `metricsbind=`); every other listener binds all interfaces. Run beside another node on the same machine with `--rpc-port` and
 `--p2p-port`. If port 9332 is busy, startup retries for about 30 seconds and then
 continues without metrics. RPC and P2P are already up by then, but services started
 after metrics, such as REST, wait for those 30 seconds. To move or turn off the

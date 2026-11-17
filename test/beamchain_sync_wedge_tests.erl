@@ -422,7 +422,12 @@ behind_peer_evicted_after_timeout() ->
     Now = erlang:system_time(second),
     beamchain_peer_manager:test_check_stale_peers(Now),
     _ = evictions(),
+    %% Core ConsiderEviction: past CHAIN_SYNC_TIMEOUT the peer is first
+    %% sent ONE getheaders and kept; only if it is still behind
+    %% HEADERS_RESPONSE_TIME later is it dropped.
     beamchain_peer_manager:test_check_stale_peers(Now + 23 * 60),
+    ?assertEqual([], evictions()),
+    beamchain_peer_manager:test_check_stale_peers(Now + 26 * 60),
     ?assertMatch([{B, _}], evictions()),
     A ! stop, B ! stop.
 

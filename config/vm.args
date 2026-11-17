@@ -1,5 +1,17 @@
 -name beamchain@127.0.0.1
--setcookie beamchain
+
+## No cookie is set here: one committed in this file would be the same on every
+## install, and anyone holding it who can reach the distribution port can
+## run arbitrary code in the node. Without one, the runtime reads
+## $HOME/.erlang.cookie and, if it is absent, generates a random cookie
+## there on first boot (mode 0400), so each install has its own. Set
+## RELX_COOKIE to supply one explicitly.
+
+## Distribution listens on loopback only (-name alone binds every interface)
+-kernel inet_dist_use_interface {127,0,0,1}
+
+## An EPMD started by this VM listens on loopback only
+-env ERL_EPMD_ADDRESS 127.0.0.1
 
 ## Process limit — 1M processes for concurrent peer/block handling
 +P 1048576

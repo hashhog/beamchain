@@ -790,9 +790,13 @@ decode_diff_indexes(Count, Bin) ->
     decode_diff_indexes(Count, Bin, -1, []).
 
 decode_diff_indexes(0, Rest, _Prev, Acc) -> {lists:reverse(Acc), Rest};
+%% Indexes are uint16 on the wire (Core BlockTransactionsRequest,
+%% DifferenceFormatter throws "differential value overflow" past
+%% 0xffff): a larger one makes the whole message malformed.
 decode_diff_indexes(N, Bin, Prev, Acc) ->
     {Diff, Rest} = beamchain_serialize:decode_varint(Bin),
     Idx = Prev + Diff + 1,
+    Idx =< 16#ffff orelse erlang:error(differential_value_overflow),
     decode_diff_indexes(N - 1, Rest, Idx, [Idx | Acc]).
 
 decode_txs(0, Rest, Acc) -> {lists:reverse(Acc), Rest};

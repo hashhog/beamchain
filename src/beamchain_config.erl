@@ -766,12 +766,19 @@ payjoin_budget_ms() ->
 %% parameter on every POST /payjoin and rejects requests without one.
 %% Defaults to false (lenient mode) for backwards compatibility with
 %% FIX-65 round-trip clients that pre-date the token scheme.
+%% The conf parser stores every value as a string, so
+%% `payjoin_require_token=1` arrives here as "1"; accept it (and "true")
+%% the way the other conf booleans in this module do.
 -spec payjoin_require_token() -> boolean().
 payjoin_require_token() ->
     case get(payjoin_require_token, false) of
-        true  -> true;
-        false -> false;
-        _     -> false
+        true   -> true;
+        1      -> true;
+        "1"    -> true;
+        "true" -> true;
+        <<"1">>    -> true;
+        <<"true">> -> true;
+        _      -> false
     end.
 
 %%% ===================================================================
@@ -854,6 +861,15 @@ init([]) ->
     case application:get_env(beamchain, rpcbind) of
         {ok, RPCBind} when is_list(RPCBind), RPCBind =/= "" ->
             ets:insert(?CONFIG_TABLE, {rpcbind, RPCBind});
+        _ -> ok
+    end,
+
+    %% --metricsbind=<addr> (CLI, via application env) overrides
+    %% metricsbind= from the config file. Unset in both = loopback
+    %% (beamchain_metrics:metrics_bind_ip/1).
+    case application:get_env(beamchain, metricsbind) of
+        {ok, MetricsBind} when is_list(MetricsBind), MetricsBind =/= "" ->
+            ets:insert(?CONFIG_TABLE, {metricsbind, MetricsBind});
         _ -> ok
     end,
 

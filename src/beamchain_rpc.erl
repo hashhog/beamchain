@@ -132,6 +132,9 @@
 %% RPC dispatcher path directly.
 -export([rpc_bumpfee/2, rpc_psbtbumpfee/2,
          bumpfee_ceil_num/1, bumpfee_replace_change/3]).
+%% Test-only export — Basic-auth check, so eunit can authenticate a request
+%% map against the credentials setup_auth/0 installed, without a listener.
+-export([check_auth/1]).
 -endif.
 
 %% walletprocesspsbt (W118 BUG-5, FIX-63) — exported unconditionally so
@@ -224,7 +227,7 @@
 %% these let the suite assert the SERIALIZED key byte order — including the
 %% nested getblockchaininfo `softforks` value — without standing up live
 %% chainstate / mempool / peer gen_servers. No behavioural change.
--export([mempoolinfo_proplist/4,
+-export([mempoolinfo_proplist/4, mempoolinfo_proplist/6,
          networkinfo_proplist/4,
          mininginfo_proplist/7,
          peerinfo_obj_proplist/1,
@@ -730,10 +733,16 @@ setup_auth() ->
             New
     end,
     ets:insert(?RPC_AUTH_TABLE, {cookie, Cookie}),
-    %% Optional rpcuser/rpcpassword from config
+    %% Optional rpcuser/rpcpassword from config. An empty rpcpassword is
+    %% unset, as in Core's InitRPCAuthentication (httprpc.cpp:
+    %% `if (gArgs.GetArg("-rpcpassword", "") == "")` → cookie only): a
+    %% blank `rpcpassword=` line must not install `rpcuser:` with an empty
+    %% password as a working credential.
     case {beamchain_config:get(rpcuser), beamchain_config:get(rpcpassword)} of
         {undefined, _} -> ok;
         {_, undefined} -> ok;
+        {_, ""} -> ok;
+        {_, <<>>} -> ok;
         {U, P} ->
             ets:insert(?RPC_AUTH_TABLE,
                 {rpc_credentials, to_bin(U), to_bin(P)})
@@ -883,10 +892,31 @@ dispatch(Request, WalletName) ->
             %% the intended code (e.g. -8 for a malformed blockhash) instead of
             %% collapsing it to the -32603 internal-error default below.
             error_obj(Id, ECode, EMsg);
-        Class:Err:Stack ->
+        Class:Err0:Stack0 ->
+            %% Never log a secret (Core never logs passphrases or keys). The
+            %% raw exit of a failed wallet call is {Why, {gen_server, call,
+            %% [Pid, {walletpassphrase, Passphrase, T}]}} and stack frames
+            %% carry call arguments, so both are redacted, and for
+            %% secret-bearing methods every string parameter is scrubbed too.
+            {Err, Stack} = redact_dispatch_error(Request, Err0, Stack0),
             logger:warning("rpc dispatch error: ~p:~p~n~p", [Class, Err, Stack]),
             error_obj(Id, ?RPC_INTERNAL_ERROR, format_internal_error(Class, Err))
     end.
+
+redact_dispatch_error(Request, Err, Stack) ->
+    Secrets = try
+                  Method = maps:get(<<"method">>, Request, undefined),
+                  case beamchain_log_redact:secret_rpc_method(Method) of
+                      true ->
+                          beamchain_log_redact:secrets_in(
+                            maps:get(<<"params">>, Request, []));
+                      false ->
+                          []
+                  end
+              catch _:_ -> []
+              end,
+    {beamchain_log_redact:scrub(beamchain_log_redact:reason(Err), Secrets),
+     beamchain_log_redact:scrub(beamchain_log_redact:stack(Stack), Secrets)}.
 
 %% Format a caught exception for the -32603 response body.
 %% Includes class and a short reason description (truncated to 200 chars).
@@ -1295,7 +1325,7 @@ rpc_stop([]) ->
         timer:sleep(200),
         init:stop()
     end),
-    {ok, <<"Beamchain server stopping">>};
+    {ok, <<"Bitcoin Core stopping">>};
 rpc_stop([Wait]) when is_integer(Wait); is_float(Wait) ->
     %% Core rpc/server.cpp stop() optional `wait` NUM. Type is checked
     %% before anything happens — a string must not shut the node down.
@@ -4904,6 +4934,12 @@ format_mempool_error(rbf_spends_conflicting_tx, _Txid) ->
     {error, ?RPC_VERIFY_REJECTED, <<"bad-txns-spends-conflicting-tx">>};
 format_mempool_error(premature_spend_of_coinbase, _Txid) ->
     {error, ?RPC_VERIFY_REJECTED, <<"bad-txns-premature-spend-of-coinbase">>};
+%% Mempool script failure (beamchain_mempool:verify_scripts/2): Core
+%% validation.cpp CheckInputScripts reason under the policy flags,
+%% "mempool-script-verify-flag-failed (<ScriptErrorString>)".  The debug
+%% part ("input N of ...") is added by reject_details/2.
+format_mempool_error({script_verify_failed, _Idx, ScriptErr, _Debug}, _Txid) ->
+    {error, ?RPC_VERIFY_REJECTED, script_reject_reason(ScriptErr)};
 format_mempool_error({script_verify_failed, Idx}, _Txid) ->
     {error, ?RPC_VERIFY_ERROR,
      iolist_to_binary(io_lib:format("mandatory-script-verify-flag-failed (input ~B)", [Idx]))};
@@ -5048,8 +5084,16 @@ reject_details(premature_spend_of_coinbase, #transaction{inputs = Ins}) ->
             end;
         _ -> undefined
     end;
+%% Core state.ToString() for a script failure: "<reason>, <debug>", the
+%% debug being CScriptCheck's "input N of <txid> (wtxid W), spending P:n".
+reject_details({script_verify_failed, _Idx, ScriptErr, Debug}, _Tx) ->
+    Reason = script_reject_reason(ScriptErr),
+    <<Reason/binary, ", ", Debug/binary>>;
 reject_details(_Reason, _Tx) ->
     undefined.
+
+script_reject_reason(ScriptErr) ->
+    <<"mempool-script-verify-flag-failed (", ScriptErr/binary, ")">>.
 
 %% @doc testmempoolaccept — dry-run validation without mutating the mempool.
 %%
@@ -5384,10 +5428,12 @@ rpc_submitpackage([RawTxs, MaxFeeRate, MaxBurnAmount]) when is_list(RawTxs) ->
                 {ok, #{
                     <<"package_msg">> => PackageMsg,
                     <<"tx-results">> => TxResultMap,
-                    %% beamchain's package validator does not yet emit
-                    %% a per-package replaced-tx list. Empty array keeps
-                    %% the field shape parity with Core.
-                    <<"replaced-transactions">> => []
+                    %% Core rpc/mempool.cpp collects them in a
+                    %% std::set<Txid>, so the list is sorted by the txid's
+                    %% internal byte order.
+                    <<"replaced-transactions">> =>
+                        [hash_to_hex(T)
+                         || T <- lists:usort(maps:get(replaced, PkgInfo, []))]
                 }}
             catch
                 throw:{max_fee_exceeded, FeeRate} ->
@@ -5441,10 +5487,17 @@ package_msg(package_not_sorted)            -> <<"package-not-sorted">>;
 package_msg(conflict_in_package)           -> <<"conflict-in-package">>;
 package_msg(package_not_child_with_parents) -> <<"package-not-child-with-parents">>;
 package_msg(package_fee_too_low)           -> <<"package-fee-too-low">>;
+%% Core PCKG_POLICY (e.g. PackageRBFChecks): package_msg is state.ToString(),
+%% the reason alone or "reason, details".
+package_msg({package_policy, Reason, <<>>})      -> Reason;
+package_msg({package_policy, Reason, Details})   -> <<Reason/binary, ", ", Details/binary>>;
 package_msg(_)                             -> <<"transaction failed">>.
 
 %% Per-transaction reject string for a tx-results "error" entry.
 package_tx_error({tx_failed, _Txid, Reason}) -> package_tx_error(Reason);
+%% Core submitpackage tx-results error is state.ToString(): reason + debug.
+package_tx_error({script_verify_failed, _, _, _} = Reason) ->
+    reject_details(Reason, undefined);
 package_tx_error(Reason) when Reason =:= orphan;
                               Reason =:= missing_inputs;
                               Reason =:= 'bad-txns-inputs-missingorspent' ->
@@ -6599,7 +6652,15 @@ rpc_getmempoolinfo() ->
         Entries
     ),
     TotalFeeBtc = TotalFeeSat / 100000000.0,
-    {ok, mempoolinfo_proplist(Size, Bytes, TotalFeeBtc,
+    %% Core rpc/mempool.cpp:1054: mempoolminfee is
+    %% max(pool.GetMinFee(), min_relay_feerate): the rolling floor that
+    %% TrimToSize raised, decayed, as a whole sat/kvB.
+    MinFeeSatKvB = case maps:get(min_fee, Info, undefined) of
+        F when is_number(F) -> round(F * 1000);
+        _ -> ?DEFAULT_MIN_RELAY_TX_FEE
+    end,
+    {ok, mempoolinfo_proplist(Size, Bytes, beamchain_mempool:dynamic_memory_usage(),
+                              TotalFeeBtc, MinFeeSatKvB,
                               beamchain_config:mempool_full_rbf())}.
 
 %% Pure result-shape builder for getmempoolinfo — exported so the wire-order
@@ -6611,11 +6672,17 @@ rpc_getmempoolinfo() ->
 %% unbroadcastcount, fullrbf, permitbaremultisig, maxdatacarriersize,
 %% limitclustercount, limitclustersize, optimal.
 mempoolinfo_proplist(Size, Bytes, TotalFeeBtc, FullRbf) ->
+    mempoolinfo_proplist(Size, Bytes, Bytes, TotalFeeBtc,
+                         ?DEFAULT_MIN_RELAY_TX_FEE, FullRbf).
+
+%% Usage is beamchain_mempool:dynamic_memory_usage/0 (Core
+%% DynamicMemoryUsage); MempoolMinFeeSatKvB is GetMinFee() in sat/kvB.
+mempoolinfo_proplist(Size, Bytes, Usage, TotalFeeBtc, MempoolMinFeeSatKvB, FullRbf) ->
     [
         {<<"loaded">>, true},
         {<<"size">>, Size},
         {<<"bytes">>, Bytes},
-        {<<"usage">>, Bytes},
+        {<<"usage">>, Usage},
         {<<"total_fee">>, TotalFeeBtc},
         {<<"maxmempool">>, beamchain_config:maxmempool_bytes()},
         %% Core rpc/mempool.cpp reports these as
@@ -6624,7 +6691,8 @@ mempoolinfo_proplist(Size, Bytes, TotalFeeBtc, FullRbf) ->
         %% (=100, Core policy.h:70) is already in sat/kvB, so the divisor is 1e8.
         %% Display floor is coupled to the ENFORCED floor (beamchain_mempool GATE
         %% 14, ?DEFAULT_MIN_RELAY_TX_FEE/1000.0 sat/vB) via the same macro.
-        {<<"mempoolminfee">>, ?DEFAULT_MIN_RELAY_TX_FEE / 100000000.0},
+        {<<"mempoolminfee">>,
+         max(MempoolMinFeeSatKvB, ?DEFAULT_MIN_RELAY_TX_FEE) / 100000000.0},
         {<<"minrelaytxfee">>, ?DEFAULT_MIN_RELAY_TX_FEE / 100000000.0},
         %% Core ValueFromAmount(incremental_relay_feerate.GetFeePerK()):
         %% ?DEFAULT_INCREMENTAL_RELAY_FEE (=100, policy.h:48) / 1e8 = 1e-06.
@@ -10889,10 +10957,6 @@ rpc_getwalletinfo(WalletName) ->
         {ok, Pid} ->
             case beamchain_wallet:get_wallet_info(Pid) of
                 {ok, Info} ->
-                    Balance = case beamchain_wallet:get_balance(Pid) of
-                        {ok, B} -> B;
-                        _ -> 0
-                    end,
                     WalletNameDisplay = case maps:get(wallet_name, Info, <<>>) of
                         <<>> -> <<"default">>;
                         N -> N
@@ -10904,11 +10968,9 @@ rpc_getwalletinfo(WalletName) ->
                         <<"walletname">> => WalletNameDisplay,
                         <<"walletversion">> => 1,
                         <<"format">> => <<"json">>,
-                        %% Core uses ValueFromAmount for balance; use sentinel
-                        %% so replace_btc_sentinels emits exact 8-decimal form.
-                        <<"balance">> => format_amount_sentinel(Balance),
-                        <<"unconfirmed_balance">> => format_amount_sentinel(0),
-                        <<"immature_balance">> => format_amount_sentinel(0),
+                        %% Core v31 getwalletinfo has no balance,
+                        %% unconfirmed_balance or immature_balance (see
+                        %% getbalances / getbalance).
                         <<"txcount">> => TxCount,
                         <<"keypoolsize">> => maps:get(addresses, Info, 0),
                         <<"paytxfee">> => format_amount_sentinel(0),
@@ -11282,12 +11344,8 @@ rpc_sendtoaddress_spend(Address, AmountBtc, Pid) ->
             %% Get wallet UTXOs for coin selection.  Use the maturity-filtered
             %% spendable set so coin-selection never picks an immature coinbase
             %% (those would be rejected at broadcast with
-            %% premature_spend_of_coinbase).  Falls back to the full set only if
-            %% the chain tip is not yet known.
-            Utxos = case beamchain_chainstate:get_tip_height() of
-                {ok, TipHeight} -> beamchain_wallet:get_spendable_utxos(TipHeight);
-                not_found       -> beamchain_wallet:get_wallet_utxos()
-            end,
+            %% premature_spend_of_coinbase).
+            Utxos = beamchain_wallet:get_selectable_utxos(),
             %% Fee rate (sat/vB): estimator, else -fallbackfee, else -6
             %% (Core SendMoney maps the CreateTransaction failure to -6).
             FeeRate = wallet_default_fee_rate(?RPC_WALLET_INSUFFICIENT_FUNDS),
@@ -12402,27 +12460,74 @@ rpc_listunspent(Params, WalletName) ->
         {error, Code, Msg} ->
             {error, Code, Msg};
         {ok, MinConf, MaxConf, AddrFilter} ->
-            case resolve_wallet(WalletName) of
-                {ok, Pid} ->
-                    Utxos = beamchain_wallet:get_wallet_utxos(),
-                    case beamchain_chainstate:get_tip() of
-                        {ok, {_, CurrentHeight}} ->
-                            Network = cfg_network(),
-                            Filtered = lists:filtermap(
-                                fun({Txid, Vout, Utxo}) ->
-                                    listunspent_entry(
-                                        Pid, Txid, Vout, Utxo, CurrentHeight,
-                                        MinConf, MaxConf, AddrFilter, Network)
-                                end, Utxos),
-                            {ok_raw_json,
-                             replace_btc_sentinels(jsx:encode(Filtered))};
-                        not_found ->
-                            {ok, []}
-                    end;
-                {error, _} ->
-                    wallet_not_found_error(WalletName)
+            case listunspent_include_immature(Params) of
+                {error, _, _} = TypeErr ->
+                    TypeErr;
+                {ok, IncludeImmature} ->
+                    rpc_listunspent(WalletName, MinConf, MaxConf, AddrFilter,
+                                    IncludeImmature)
             end
     end.
+
+rpc_listunspent(WalletName, MinConf, MaxConf, AddrFilter, IncludeImmature) ->
+    case resolve_wallet(WalletName) of
+        {ok, Pid} ->
+            Utxos = beamchain_wallet:get_wallet_utxos(),
+            case beamchain_chainstate:get_tip() of
+                {ok, {_, CurrentHeight}} ->
+                    Network = cfg_network(),
+                    Filtered = lists:filtermap(
+                        fun({Txid, Vout, Utxo}) ->
+                            %% Core AvailableCoins (wallet/spend.cpp:357)
+                            %% skips an immature coinbase unless
+                            %% query_options.include_immature_coinbase.
+                            (IncludeImmature orelse
+                             listunspent_coin_mature(Utxo, CurrentHeight))
+                            andalso listunspent_entry(
+                                      Pid, Txid, Vout, Utxo, CurrentHeight,
+                                      MinConf, MaxConf, AddrFilter, Network)
+                        end, Utxos),
+                    {ok_raw_json,
+                     replace_btc_sentinels(jsx:encode(Filtered))};
+                not_found ->
+                    {ok, []}
+            end;
+        {error, _} ->
+            wallet_not_found_error(WalletName)
+    end.
+
+%% Core CWallet::IsTxImmatureCoinBase (wallet/wallet.cpp:3333-3351): a
+%% coinbase is immature while it has fewer than COINBASE_MATURITY+1
+%% confirmations, i.e. until CurrentHeight - Height >= COINBASE_MATURITY.
+listunspent_coin_mature(#utxo{is_coinbase = false}, _CurrentHeight) ->
+    true;
+listunspent_coin_mature(#utxo{is_coinbase = true, height = H}, CurrentHeight) ->
+    (CurrentHeight - H) >= ?COINBASE_MATURITY.
+
+%% query_options.include_immature_coinbase (5th positional param).  Core
+%% type-checks it with RPCTypeCheckObj(VBOOL) and defaults it to false
+%% (wallet/rpc/coins.cpp:558-585, wallet/spend.h CoinFilterParams).
+listunspent_include_immature([_, _, _, _, Opts | _]) when is_map(Opts) ->
+    case maps:find(<<"include_immature_coinbase">>, Opts) of
+        error -> {ok, false};
+        {ok, B} when is_boolean(B) -> {ok, B};
+        {ok, null} ->
+            %% Present-but-null passes RPCTypeCheckObj (fAllowNull) and then
+            %% fails get_bool() -> UniValue::type_error -> -3 without the
+            %% field name (checked against Core v31.1).
+            {error, ?RPC_TYPE_ERROR, type_error_msg(null, <<"bool">>)};
+        {ok, Other} ->
+            {error, ?RPC_TYPE_ERROR,
+             <<"JSON value of type ", (univalue_type_name(Other))/binary,
+               " for field include_immature_coinbase is not of expected"
+               " type bool">>}
+    end;
+listunspent_include_immature([_, _, _, _, null | _]) ->
+    {ok, false};
+listunspent_include_immature([_, _, _, _, Opts | _]) ->
+    {error, ?RPC_TYPE_ERROR, type_error_msg(Opts, <<"object">>)};
+listunspent_include_immature(_) ->
+    {ok, false}.
 
 parse_listunspent_params(Params) ->
     Min = case Params of
@@ -12480,9 +12585,6 @@ listunspent_entry(Pid, Txid, Vout, Utxo, CurrentHeight, MinConf, MaxConf,
                 false ->
                     false;
                 true ->
-                    Spendable = (not Utxo#utxo.is_coinbase)
-                        orelse (CurrentHeight - Utxo#utxo.height)
-                               >= ?COINBASE_MATURITY,
                     {Desc, ParentDescs, Label} =
                         listunspent_desc_fields(Pid, Address, Utxo),
                     {true, #{
@@ -12494,11 +12596,15 @@ listunspent_entry(Pid, Txid, Vout, Utxo, CurrentHeight, MinConf, MaxConf,
                             beamchain_serialize:hex_encode(Utxo#utxo.script_pubkey),
                         <<"amount">> => format_amount_sentinel(Utxo#utxo.value),
                         <<"confirmations">> => Confs,
-                        <<"spendable">> => Spendable,
+                        %% Core (wallet/rpc/coins.cpp:675) reports
+                        %% spendable:true for every coin it lists; an
+                        %% immature coinbase only appears when the caller
+                        %% asked for it with include_immature_coinbase.
+                        <<"spendable">> => true,
                         <<"solvable">> => true,
                         <<"desc">> => Desc,
                         <<"parent_descs">> => ParentDescs,
-                        <<"safe">> => Spendable
+                        <<"safe">> => true
                     }}
             end
     end.
@@ -12656,17 +12762,22 @@ history_entry_to_list_items(Txid, Entry, TipHeight, Network, Long) ->
                                Height, BlockTime, DisplayTxid, Time);
         false -> #{}
     end,
-    %% Send entries: one per output of a tx that debited the wallet.  Core
-    %% emits a send line for every COutputEntry in listSent (each output that
-    %% is not change / paid out of the wallet).  We approximate with the
-    %% wallet-debiting txs' outputs paying foreign scripts (non-credit
-    %% outputs); change outputs (credits) appear as receive lines instead.
-    SendEntries = case Debits of
-        [] -> [];
-        _  -> build_send_entries(Entry, Fee, Network, LongFields,
-                                 DisplayTxid)
+    %% Core CachedTxGetAmounts (wallet/receive.cpp): when the wallet paid for
+    %% the tx (debit > 0), change outputs are skipped entirely, every other
+    %% output is a "send" entry, and every owned non-change output is ALSO a
+    %% "receive" entry (so a send-to-self lists both legs, never the change).
+    %% A tx the wallet did not fund lists every owned output as a receive.
+    FromMe = Debits =/= [],
+    OwnedNonChange = [C || {_, _, S} = C <- Credits,
+                           not (FromMe andalso
+                                beamchain_wallet:is_change_script(S))],
+    ChangeVouts = [V || {V, _, S} <- Credits,
+                        FromMe, beamchain_wallet:is_change_script(S)],
+    SendEntries = case FromMe of
+        false -> [];
+        true  -> build_send_entries(Entry, ChangeVouts, Fee, Network,
+                                    LongFields)
     end,
-    %% Receive / generate / immature entries: one per wallet-credited output.
     RecvEntries = lists:map(
         fun({Vout, Value, Script}) ->
             Category = credit_category(IsCoinbase, Confirmations),
@@ -12679,24 +12790,18 @@ history_entry_to_list_items(Txid, Entry, TipHeight, Network, Long) ->
                 <<"abandoned">> => false
             },
             maps:merge(Base, LongFields)
-        end, Credits),
+        end, OwnedNonChange),
     SendEntries ++ RecvEntries.
 
-%% Build the "send" detail entries for a wallet-debiting tx.  Core emits a send
-%% line per output paid out of the wallet (the foreign outputs); the change
-%% output (a wallet credit) is reported separately as a receive line, so the
-%% send lines are the tx outputs that do NOT credit the wallet.  We reconstruct
-%% the foreign outputs from the stored raw tx, skipping any output index that
-%% appears in `credits` (change).
-build_send_entries(Entry, Fee, Network, LongFields, _DisplayTxid) ->
-    Credits = maps:get(credits, Entry, []),
-    ChangeVouts = [V || {V, _, _} <- Credits],
+%% Build the "send" detail entries for a wallet-debiting tx: every output
+%% except change, reconstructed from the stored raw tx.
+build_send_entries(Entry, ChangeVouts, Fee, Network, LongFields) ->
     TxHex = maps:get(txhex, Entry, <<>>),
     Outputs = decode_tx_outputs(TxHex),
     lists:filtermap(
         fun({Vout, Value, Script}) ->
             case lists:member(Vout, ChangeVouts) of
-                true  -> false;  %% change -> reported as a receive line
+                true  -> false;  %% change: in neither list
                 false ->
                     Addr = script_addr(Script, Network),
                     Base = #{
@@ -12704,8 +12809,7 @@ build_send_entries(Entry, Fee, Network, LongFields, _DisplayTxid) ->
                         <<"category">> => <<"send">>,
                         <<"amount">>   => format_amount_sentinel(-Value),
                         %% Core emits ValueFromAmount(-nFee); our Fee already
-                        %% equals (outputs - inputs) = -nFee, so emit it as-is
-                        %% (a negative number for a real fee).
+                        %% equals (outputs - inputs) = -nFee.
                         <<"fee">>      => format_amount_sentinel(Fee),
                         <<"abandoned">> => false
                     },
@@ -15069,13 +15173,10 @@ wcfp_select_coins(Pid, ManualInputs, OutputTotal, FeeRate) ->
     %% picks an immature coinbase (Core's wallet only offers mature coins to
     %% CreateTransaction; spending one is rejected at broadcast with
     %% premature_spend_of_coinbase).  Mirror the sendtoaddress path
-    %% (rpc_sendtoaddress_spend): fall back to the full set only when the chain
-    %% tip is not yet known.  Manual inputs are honoured verbatim regardless
-    %% (Core lets a caller name an immature input explicitly).
-    All = case beamchain_chainstate:get_tip_height() of
-        {ok, TipHeight} -> beamchain_wallet:get_spendable_utxos(TipHeight);
-        not_found       -> beamchain_wallet:get_wallet_utxos()
-    end,
+    %% (rpc_sendtoaddress_spend) through the shared selectable set.  Manual
+    %% inputs are honoured verbatim regardless (Core lets a caller name an
+    %% immature input explicitly).
+    All = beamchain_wallet:get_selectable_utxos(),
     ManualKeys = [{Txid, Vout} || {Txid, Vout, _} <- ManualInputs],
     Locked = sets:from_list(beamchain_wallet:list_locked_coins(Pid)),
     Available = lists:filter(fun({Txid, Vout, _U}) ->
@@ -15207,7 +15308,9 @@ do_fundrawtransaction(Pid, HexStr, Options) ->
     SffoIdx = frt_subtract_fee_outputs(Options, length(ExistingOuts)),
     %% 4. Available wallet UTXOs minus any caller-supplied (manual) inputs and
     %% locked coins — the same availability filter wcfp_select_coins uses.
-    AllUtxos = beamchain_wallet:get_wallet_utxos(),
+    %% Immature coinbases are never offered (Core AvailableCoins); this used
+    %% to read the raw wallet set and could fund a premature-spend tx.
+    AllUtxos = beamchain_wallet:get_selectable_utxos(),
     ManualKeys = [{O#outpoint.hash, O#outpoint.index}
                   || #tx_in{prev_out = O} <- ExistingIns],
     Locked = sets:from_list(beamchain_wallet:list_locked_coins(Pid)),
