@@ -919,8 +919,13 @@ dispatch_and_rearm_need(Data) ->
 %% moved out of the buffer as it is scanned) phases.
 recv_need(#peer_data{v2_phase = v1, buffer = Buffer}) ->
     case Buffer of
-        %% magic(4) command(12) length(4) checksum(4) payload(Len)
-        <<_:16/binary, Len:32/little, _/binary>> -> 24 + Len;
+        %% magic(4) command(12) length(4) checksum(4) payload(Len).
+        %% decode_msg/1 rejects an oversize length as soon as the 24
+        %% header bytes are in, so only gate on lengths it accepts;
+        %% otherwise the claimed payload (up to ~4 GB) would be buffered
+        %% before the reject.
+        <<_:16/binary, Len:32/little, _/binary>>
+          when Len =< ?MAX_PROTOCOL_MESSAGE_LENGTH -> 24 + Len;
         _ -> 24
     end;
 recv_need(#peer_data{v2_phase = Phase, buffer = Buffer,
