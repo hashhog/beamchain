@@ -3415,14 +3415,36 @@ verify_scripts(Tx, InputCoins) ->
         Witness = Input#tx_in.witness,
         Amount = Coin#utxo.value,
         SigChecker = {Tx, Idx, Amount, AllPrevOuts},
-        case verify_script_policy(ScriptSig, ScriptPubKey, Witness, Flags,
-                                  SigChecker) of
-            true -> ok;
-            false -> throw({script_verify_failed, Idx})
+        case verify_script_policy_error(ScriptSig, ScriptPubKey, Witness,
+                                        Flags, SigChecker) of
+            ok -> ok;
+            {error, ScriptError} ->
+                %% Core validation.cpp CheckInputScripts under the policy
+                %% (STANDARD) flags: TX_NOT_STANDARD with reason
+                %% "mempool-script-verify-flag-failed (<ScriptErrorString>)"
+                %% and debug "input N of <txid> (wtxid W), spending P:n"
+                %% (CScriptCheck::operator()). Rendered by beamchain_rpc.
+                throw({script_verify_failed, Idx,
+                       beamchain_script:script_error_string(ScriptError),
+                       script_failure_debug(Tx, Idx, Input)})
         end,
         Idx + 1
     end, 0, lists:zip(Inputs, InputCoins)),
     ok.
+
+%% Core CScriptCheck::operator() debug string for a failing input:
+%%   strprintf("input %i of %s (wtxid %s), spending %s:%i", nIn,
+%%             GetHash(), GetWitnessHash(), prevout.hash, prevout.n)
+script_failure_debug(Tx, Idx, #tx_in{prev_out = #outpoint{hash = PH,
+                                                          index = PI}}) ->
+    iolist_to_binary(io_lib:format(
+        "input ~B of ~s (wtxid ~s), spending ~s:~B",
+        [Idx, display_hex(beamchain_serialize:tx_hash(Tx)),
+         display_hex(beamchain_serialize:wtx_hash(Tx)),
+         display_hex(PH), PI])).
+
+display_hex(Hash) ->
+    beamchain_serialize:hex_encode(beamchain_serialize:reverse_bytes(Hash)).
 
 %% Tip MTP for ATMP. beamchain_chainstate:get_mtp/0 answers from ETS (keyed
 %% by the tip hash); only a stale/missing entry falls back to a 5 s
@@ -3446,6 +3468,20 @@ verify_script_policy(ScriptSig, ScriptPubKey, Witness, Flags, SigChecker) ->
     try
         beamchain_script:verify_script(ScriptSig, ScriptPubKey, Witness,
                                        Flags, SigChecker)
+    catch
+        error:{script_internal, D} ->
+            logger:error("mempool: script verification INTERNAL fault ~p -- "
+                         "tx refused as a system fault, not a verdict", [D]),
+            throw({system_fault, {script_internal, D}})
+    end.
+
+%% verify_script_policy/5 with the interpreter's script error kept
+%% (beamchain_script:verify_script_error/5); same system-fault handling.
+verify_script_policy_error(ScriptSig, ScriptPubKey, Witness, Flags,
+                           SigChecker) ->
+    try
+        beamchain_script:verify_script_error(ScriptSig, ScriptPubKey, Witness,
+                                             Flags, SigChecker)
     catch
         error:{script_internal, D} ->
             logger:error("mempool: script verification INTERNAL fault ~p -- "

@@ -581,7 +581,11 @@ mempool_control_accept() ->
 
 mempool_control_bad_sig() ->
     Tx = mempool_spend(2, bad),
-    ?assertEqual({error, {script_verify_failed, 0}},
+    %% Still a script-failure verdict on input 0; the mempool now also carries
+    %% Core's ScriptErrorString and CScriptCheck debug string.
+    ?assertMatch({error, {script_verify_failed, 0,
+                          <<"Signature must be zero for failed CHECK(MULTI)SIG"
+                            " operation">>, <<"input 0 of ", _/binary>>}},
                  beamchain_mempool:add_transaction(Tx)).
 
 %%% ===================================================================

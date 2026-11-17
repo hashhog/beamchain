@@ -1365,7 +1365,9 @@ minimalif_tapscript_always_enforced_test() ->
     Script = <<1, 2, 16#63, 16#51, 16#68>>,
     %% In tapscript, MINIMALIF is consensus (always enforced)
     %% Even with Flags=0, should fail
-    {error, minimalif_failed} = beamchain_script:eval_script(Script, [], 0, #{}, tapscript).
+    %% Core reports SCRIPT_ERR_TAPSCRIPT_MINIMALIF here, a distinct error.
+    {error, tapscript_minimalif_failed} =
+        beamchain_script:eval_script(Script, [], 0, #{}, tapscript).
 
 %% MINIMALIF with OP_NOTIF in witness
 minimalif_notif_witness_test() ->
