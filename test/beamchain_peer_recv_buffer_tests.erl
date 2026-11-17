@@ -55,6 +55,11 @@ v1_inbound_peer_test_() ->
           {timeout, 60,
            {"a v1 header claiming more than 4 MB stops the peer on its 24th byte",
             fun() -> v1_oversize_header_stops_peer(Ctx) end}}
+      end,
+      fun(_Ctx) ->
+          {timeout, 60,
+           {"after a backpressure pause, resume recomputes the size gate",
+            fun resume_after_pause_recomputes_need/0}}
       end]}.
 
 setup_peer() ->
@@ -151,6 +156,94 @@ v1_oversize_header_stops_peer(#{server := S, pid := Pid}) ->
             ?assertEqual({shutdown, {frame_error, message_too_large}}, Reason)
     after 10000 ->
         ?assert(false, "oversize header was buffered instead of rejected")
+    end.
+
+%% Master's receive backpressure (recv_paused / resume_recv) dispatches
+%% the frames left in the buffer from resume_recv, outside buffer_recv/2.
+%% If that left recv_need at the size of a frame it has since consumed, a
+%% smaller frame behind it would wait for bytes that never come.  Here a
+%% 100 kB frame is consumed on resume and a 50-byte frame behind it must
+%% still dispatch on its last byte.
+resume_after_pause_recomputes_need() ->
+    %% Pause as soon as one forwarded frame is in our mailbox.
+    application:set_env(beamchain, recv_backlog_limit, 0),
+    %% The version reply reads the tip height; no chainstate runs here.
+    {module, _} = code:ensure_loaded(beamchain_chainstate),
+    ok = meck:new(beamchain_chainstate, [no_link, passthrough]),
+    ok = meck:expect(beamchain_chainstate, get_tip_height, fun() -> {ok, 0} end),
+    ok = meck:expect(beamchain_config, prune_enabled, fun() -> false end),
+    try resume_after_pause_recomputes_need_()
+    after
+        meck:unload(beamchain_chainstate),
+        application:unset_env(beamchain, recv_backlog_limit)
+    end.
+
+resume_after_pause_recomputes_need_() ->
+    {ok, L} = gen_tcp:listen(0, [binary, {active, false}, {ip, loopback}]),
+    {ok, Port} = inet:port(L),
+    {ok, C} = gen_tcp:connect({127, 0, 0, 1}, Port, [binary, {active, false}]),
+    {ok, S} = gen_tcp:accept(L),
+    %% Handler = this process, so its mailbox is the backlog.
+    {ok, Pid} = beamchain_peer:accept(S, {{127, 0, 0, 1}, Port}, self()),
+    ok = gen_tcp:controlling_process(S, Pid),
+    Pid ! socket_owner_transferred,
+    Ver = beamchain_p2p_msg:encode_payload(version, #{
+        version => 70016, services => 9,
+        timestamp => erlang:system_time(second),
+        addr_recv => #{services => 0, ip => {127, 0, 0, 1}, port => Port},
+        addr_from => #{services => 9, ip => {0, 0, 0, 0, 0, 0, 0, 0}, port => 0},
+        nonce => erlang:unique_integer([positive]),
+        user_agent => <<"/recv-buffer-test/">>, start_height => 0,
+        relay => true}),
+    ok = gen_tcp:send(C, beamchain_p2p_msg:encode_msg(?MAGIC, version, Ver)),
+    ok = gen_tcp:send(C, beamchain_p2p_msg:encode_msg(?MAGIC, verack, <<>>)),
+    receive {peer_connected, Pid, _} -> ok
+    after 10000 -> error(handshake_timeout)
+    end,
+    %% peer_connected sat in our mailbox, so the peer paused after verack.
+    %% Wait for that pause to clear, so no resume_recv timer is in flight
+    %% (a stray one dispatches the buffer whatever recv_need says, and
+    %% would hide the stall this test is for).
+    wait_unpaused(Pid, 200),
+    Block = fun(Len) ->
+                beamchain_p2p_msg:encode_msg(?MAGIC, block,
+                                             binary:copy(<<Len:8>>, Len))
+            end,
+    F1 = Block(10), F2 = Block(100000), F3 = Block(50),
+    <<F3a:30/binary, F3b/binary>> = F3,
+    %% F1 is forwarded and the peer pauses with F2 + the start of F3
+    %% buffered: recv_need is F2's size.
+    inject(Pid, S, <<F1/binary, F2/binary, F3a/binary>>),
+    %% F1's forward is still in our mailbox, so the peer stays paused.
+    ?assertEqual(byte_size(F2) + 30, byte_size(peer_buffer(Pid))),
+    ?assertEqual(10, forwarded_block(Pid)),
+    %% Our mailbox is empty again: resume_recv dispatches F2, pauses again.
+    ?assertEqual(100000, forwarded_block(Pid)),
+    %% Resumed (the resume found only F3's first 30 bytes, incomplete) and
+    %% re-armed: from here only a new segment can dispatch F3.
+    wait_unpaused(Pid, 200),
+    ?assertEqual(30, byte_size(peer_buffer(Pid))),
+    inject(Pid, S, F3b),
+    ?assertEqual(50, forwarded_block(Pid)),
+    exit(Pid, kill),
+    gen_tcp:close(C),
+    gen_tcp:close(L).
+
+%% recv_paused is the last #peer_data field.
+wait_unpaused(_Pid, 0) ->
+    error(still_paused);
+wait_unpaused(Pid, N) ->
+    {_State, Data} = sys:get_state(Pid),
+    case element(tuple_size(Data), Data) of
+        false -> ok;
+        true -> timer:sleep(10), wait_unpaused(Pid, N - 1)
+    end.
+
+forwarded_block(Pid) ->
+    receive {peer_message, Pid, block, Payload} -> byte_size(Payload)
+    after 5000 ->
+        {_State, Data} = sys:get_state(Pid),
+        {not_dispatched, {buffered, byte_size(element(5, Data))}}
     end.
 
 %%% ===================================================================
