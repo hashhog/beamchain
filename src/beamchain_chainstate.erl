@@ -2257,17 +2257,18 @@ is_header_verdict(R) ->
 %%   4. ContextualCheckBlockHeader (difficulty match, MTP, BIP94, versions)
 %%   5. AddToBlockIndex   (header-only store via store_block_index/5)
 do_submit_header(#block_header{prev_hash = PrevHash} = Header,
-                 #state{params = Params, tip_height = TipHeight}) ->
+                 #state{params = Params, tip_height = TipHeight,
+                         tip_hash = TipHash}) ->
     BlockHash = beamchain_serialize:block_hash(Header),
     %% (0) Core AcceptBlockHeader: duplicate-invalid / bad-prevblk for a
     %% failed block or a child of one.
     case failed_block_or_parent(Header) of
         ok -> do_submit_header_unfailed(Header, BlockHash, PrevHash, Params,
-                                        TipHeight);
+                                        {TipHeight, TipHash});
         {error, _} = Failed -> Failed
     end.
 
-do_submit_header_unfailed(Header, BlockHash, PrevHash, Params, TipHeight) ->
+do_submit_header_unfailed(Header, BlockHash, PrevHash, Params, Tip) ->
     %% (1) Idempotency.  Core's AcceptBlockHeader returns the existing index
     %% entry (success) when the header is already known.  Any index hit
     %% (active or side-branch, header-only or with body) counts as known.
@@ -2281,14 +2282,14 @@ do_submit_header_unfailed(Header, BlockHash, PrevHash, Params, TipHeight) ->
                     {error, unknown_prev};
                 {ok, ParentEntry} ->
                     do_accept_new_header(Header, BlockHash, ParentEntry, Params,
-                                         TipHeight)
+                                         Tip)
             end
     end.
 
 %% Validate a not-yet-known header whose parent IS in the index, then store
 %% it header-only.  Same validators + same store as the side-branch path
 %% (do_side_branch_accept_with_parent) and beamchain_header_sync.
-do_accept_new_header(Header, BlockHash, ParentEntry, Params, TipHeight) ->
+do_accept_new_header(Header, BlockHash, ParentEntry, Params, Tip) ->
     %% (3) Context-free header check: proof-of-work + bits within pow_limit.
     %% Core CheckBlockHeader (validation.cpp), fCheckPOW=true.
     case beamchain_validation:check_block_header(Header, Params) of
@@ -2317,7 +2318,7 @@ do_accept_new_header(Header, BlockHash, ParentEntry, Params, TipHeight) ->
                     %% BLOCK_VALID_HEADER (no HAVE_DATA), identical to what
                     %% beamchain_header_sync writes for a synced header.
                     ok = store_header_only(Height, BlockHash, Header, NewCW,
-                                           TipHeight),
+                                           Tip),
                     {ok, accepted}
             end
     end.
@@ -2329,12 +2330,22 @@ do_accept_new_header(Header, BlockHash, ParentEntry, Params, TipHeight) ->
 %% would replace the active block there with a header-only fork block.
 %% Above the tip the slots are the header chain, so the header goes there
 %% (any header it displaces is kept, beamchain_db:displaced_entry_ops/5).
-store_header_only(Height, BlockHash, Header, CW, TipHeight)
+%%
+%% The one exception is the active tip's own header.  A node whose tip came
+%% from a snapshot import without ancestry (beamchain import-utxo on an
+%% assumeutxo entry with no base_header) has NO index row for the tip, and
+%% Core always has one for the active tip: the header is the tip itself, not
+%% a fork, so it fills the empty slot (getblockhash(tip) answers).  A
+%% different header at the tip's height still goes hash-keyed only.
+store_header_only(Height, BlockHash, Header, CW, {TipHeight, BlockHash})
+  when Height =:= TipHeight ->
+    beamchain_db:store_block_index(Height, BlockHash, Header, CW, 1);
+store_header_only(Height, BlockHash, Header, CW, {TipHeight, _TipHash})
   when is_integer(TipHeight), Height =< TipHeight ->
     beamchain_db:store_side_branch_index(
       BlockHash, #{height => Height, header => Header, chainwork => CW,
                    status => 1, n_tx => 0});
-store_header_only(Height, BlockHash, Header, CW, _TipHeight) ->
+store_header_only(Height, BlockHash, Header, CW, _Tip) ->
     beamchain_db:store_block_index(Height, BlockHash, Header, CW, 1).
 
 %% G8 outer wrapper: look up the parent chainwork from the DB and delegate
