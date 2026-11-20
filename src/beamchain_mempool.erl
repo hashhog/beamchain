@@ -4282,7 +4282,9 @@ insert_entry(#mempool_entry{txid = Txid, fee_rate = FeeRate, tx = Tx} = Entry) -
     %% Core addNewTransaction: cachedInnerUsage += entry.DynamicMemoryUsage()
     %% (txmempool.cpp:236), plus the mapTx / mapNextTx / txgraph overheads
     %% DynamicMemoryUsage() adds per entry. See entry_dynamic_usage/1.
-    bump_dynamic_usage(entry_dynamic_usage(Tx)).
+    bump_dynamic_usage(entry_dynamic_usage(Tx)),
+    %% Core addNewTransaction: txns_randomized.emplace_back (txmempool.cpp:253).
+    txns_randomized_push().
 
 remove_entry(Txid) ->
     case ets:lookup(?MEMPOOL_TXS, Txid) of
@@ -4303,6 +4305,9 @@ remove_entry(Txid) ->
             %% Core removeUnchecked: cachedInnerUsage -= it->DynamicMemoryUsage()
             %% (txmempool.cpp:303).
             bump_dynamic_usage(-entry_dynamic_usage(Tx)),
+            %% Core removeUnchecked: the txns_randomized swap-remove
+            %% (txmempool.cpp:289-299).
+            txns_randomized_pop(),
             %% Core removeUnchecked: m_unbroadcast_txids.erase(hash).
             catch ets:delete(?MEMPOOL_UNBROADCAST, Txid),
             wtxid_index_delete(Entry),
@@ -6701,11 +6706,62 @@ rolling_fee_now() ->
 %% getmempoolinfo reports as `usage'.
 -spec dynamic_memory_usage() -> non_neg_integer().
 dynamic_memory_usage() ->
-    try ets:lookup(?MEMPOOL_USAGE, total) of
-        [{total, N}] -> max(0, N);
+    Entries = try ets:lookup(?MEMPOOL_USAGE, total) of
+                  [{total, N}] -> max(0, N);
+                  [] -> 0
+              catch error:badarg -> 0
+              end,
+    Entries + txns_randomized_usage(usage_counter(trcap)).
+
+%% Core's txns_randomized is a std::vector<std::pair<Wtxid, txiter>>
+%% (40-byte elements) whose heap block DynamicMemoryUsage() counts as
+%% memusage::DynamicUsage(txns_randomized) = MallocUsage(40 * capacity)
+%% (txmempool.cpp:781, memusage.h). It is a pool-level allocation, so it is
+%% tracked here by size and libstdc++ capacity rather than per entry.
+-define(TXNS_RANDOMIZED_ELEM, 40).
+
+-spec txns_randomized_usage(non_neg_integer()) -> non_neg_integer().
+txns_randomized_usage(Capacity) ->
+    malloc_usage(?TXNS_RANDOMIZED_ELEM * Capacity).
+
+usage_counter(Key) ->
+    try ets:lookup(?MEMPOOL_USAGE, Key) of
+        [{Key, N}] -> N;
         [] -> 0
     catch error:badarg -> 0
     end.
+
+%% emplace_back: a full libstdc++ vector doubles its capacity (1 when empty).
+txns_randomized_push() ->
+    Size = usage_counter(trsize),
+    Cap = usage_counter(trcap),
+    NewCap = case Size >= Cap of
+                 true -> max(1, Cap * 2);
+                 false -> Cap
+             end,
+    catch ets:insert(?MEMPOOL_USAGE, [{trsize, Size + 1}, {trcap, NewCap}]),
+    ok.
+
+%% removeUnchecked: with more than one element, pop_back and shrink_to_fit
+%% once under half full; the last element goes by clear(), which keeps the
+%% capacity. A drained pool still reports the vector's allocation, as Core
+%% does (64 bytes after one transaction came and went).
+txns_randomized_pop() ->
+    Size = usage_counter(trsize),
+    Cap = usage_counter(trcap),
+    {NewSize, NewCap} =
+        case Size > 1 of
+            true ->
+                S = Size - 1,
+                case S * 2 < Cap of
+                    true -> {S, S};
+                    false -> {S, Cap}
+                end;
+            false ->
+                {0, Cap}
+        end,
+    catch ets:insert(?MEMPOOL_USAGE, [{trsize, NewSize}, {trcap, NewCap}]),
+    ok.
 
 bump_dynamic_usage(Delta) ->
     try ets:update_counter(?MEMPOOL_USAGE, total, Delta, {total, 0}) of
@@ -6721,7 +6777,16 @@ reset_dynamic_usage() ->
                          (_, Acc) -> Acc
                       end, 0, ?MEMPOOL_TXS),
     ets:insert(?MEMPOOL_USAGE, {total, Total}),
+    %% txns_randomized as Core rebuilds it by pushing every entry back
+    %% (LoadMempool): capacity is the smallest power of two that holds them.
+    Count = ets:info(?MEMPOOL_TXS, size),
+    ets:insert(?MEMPOOL_USAGE, [{trsize, Count}, {trcap, pow2_ceil(Count)}]),
     ok.
+
+pow2_ceil(0) -> 0;
+pow2_ceil(N) -> pow2_ceil(N, 1).
+pow2_ceil(N, P) when P >= N -> P;
+pow2_ceil(N, P) -> pow2_ceil(N, P * 2).
 
 %% @doc Bytes one transaction adds to Core's CTxMemPool::DynamicMemoryUsage()
 %% (txmempool.cpp:778) on x86_64 / glibc, which is where -maxmempool is
@@ -6736,8 +6801,8 @@ reset_dynamic_usage() ->
 %% (SingletonClusterImpl + its m_clusters slot + TxGraphImpl::Entry + chunk
 %% index node), measured against Core v31.1 getmempoolinfo.usage (single
 %% 1-in/1-out, 1-in P2WSH and 2-in/2-out pools match it exactly); a tx in a
-%% multi-tx cluster costs Core somewhat more. txns_randomized and mapDeltas
-%% are pool-level and not counted.
+%% multi-tx cluster costs Core somewhat more. txns_randomized is pool-level
+%% and added by dynamic_memory_usage/0; mapDeltas is not counted.
 -spec entry_dynamic_usage(#transaction{}) -> non_neg_integer().
 entry_dynamic_usage(#transaction{inputs = Ins, outputs = Outs}) ->
     NIn = length(Ins),

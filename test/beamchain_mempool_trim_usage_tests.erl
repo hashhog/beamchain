@@ -122,8 +122,10 @@ trims_on_usage_not_vsize() ->
     Decayed = round(Rolling / math:pow(2.0, 43211 / 43200)),
     I5 = info(),
     ?assertEqual(Decayed / 1.0e8, maps:get(<<"mempoolminfee">>, I5)),
-    %% getmempoolinfo.usage is the number the limit was enforced on.
-    ?assertEqual(lists:sum([beamchain_mempool:entry_dynamic_usage(T) || T <- Kept]),
+    %% getmempoolinfo.usage is the number the limit was enforced on: the
+    %% entries plus Core's txns_randomized vector, which grew to capacity 4
+    %% on the fourth push and stays there at size 3 (MallocUsage(160) = 176).
+    ?assertEqual(lists:sum([beamchain_mempool:entry_dynamic_usage(T) || T <- Kept]) + 176,
                  maps:get(<<"usage">>, I5)),
     ?assert(maps:get(<<"usage">>, I5) =< 1000000).
 
