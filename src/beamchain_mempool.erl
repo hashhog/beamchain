@@ -97,6 +97,8 @@
 -export([compute_chunk_feerate/1]).
 %% Core CTxMemPool::DynamicMemoryUsage estimate (the quantity -maxmempool limits)
 -export([dynamic_memory_usage/0, entry_dynamic_usage/1]).
+-export([txgraph_cluster_usage/2, txgraph_chunk_count/1]).
+-export([txns_randomized_replay/3]).
 %% Internal functions exported for unit-testing
 -export([compute_ancestors_for_test/3,
          check_descendant_limits_for_test/2,
@@ -4536,6 +4538,9 @@ do_update_for_reorg(ConnectedBlocks, Disconnected, State0) ->
             end
         end, {[], sets:new([{version, 2}])}, Disconnected),
     ReAddTxs = lists:reverse(ReAdd),
+    %% txns_randomized before steps 2-3: they pull descendants out and put
+    %% them back, which Core never does (see after step 3).
+    TrBefore = txns_randomized_get(),
     %% 2. UpdateTransactionsFromBlock: in-pool descendants of a tx being
     %%    re-added were admitted against the old chain, where the parent was
     %%    confirmed. Take them out (keeping their admission time) and put them
@@ -4568,6 +4573,13 @@ do_update_for_reorg(ConnectedBlocks, Disconnected, State0) ->
         end, {0, 0, State2},
         [{T, true, undefined} || T <- ReAddTxs] ++
         [{T, false, Orig} || {T, Orig} <- Pulled]),
+    %% Core's txns_randomized saw only an emplace_back per re-accepted
+    %% disconnected tx (ATMP), then a removal per descendant Trim() dropped
+    %% (UpdateTransactionsFromBlock, txmempool.cpp:115) -- the descendants
+    %% stayed in its pool throughout. Replay that order on the vector, so
+    %% its capacity is Core's: 64 children, +1 parent, -1 trimmed child is
+    %% capacity 128 there, where taking the children out and back gave 64.
+    reorg_txns_randomized(TrBefore, ReAddTxs),
     %% 4. removeForReorg over the whole pool at the new tip.
     {Dropped, State4} = remove_for_reorg(State3),
     case ConnectedBlocks =/= [] orelse Disconnected =/= [] of
@@ -4583,6 +4595,13 @@ do_update_for_reorg(ConnectedBlocks, Disconnected, State0) ->
     %% 5. LimitMempoolSize.
     {_ExpiredN, State5} = do_expire_old(State4),
     do_trim_to_size(State5#state.max_size, State5).
+
+reorg_txns_randomized({SizeBefore, _} = TrBefore, ReAddTxs) ->
+    Accepted = length([T || T <- ReAddTxs,
+                            ets:member(?MEMPOOL_TXS, beamchain_serialize:tx_hash(T))]),
+    {SizeNow, _} = txns_randomized_get(),
+    Removed = max(0, SizeBefore + Accepted - SizeNow),
+    txns_randomized_put(txns_randomized_replay(TrBefore, Accepted, Removed)).
 
 %% Remove every in-pool descendant of Txs (the txs about to be re-added) and
 %% return them parents-first as [{Tx, {TimeAdded, HeightAdded}}].
@@ -4914,7 +4933,7 @@ do_trim_to_size(MaxBytes, State, NRemoved, MaxFeeRateRemoved) ->
                     case Linearization of
                         [] ->
                             %% Empty cluster - remove it and try again
-                            ets:delete(?MEMPOOL_CLUSTERS, ClusterId),
+                            cluster_drop(ClusterId),
                             State2 = State#state{
                                 cluster_count = max(0, State#state.cluster_count - 1)
                             },
@@ -6006,7 +6025,7 @@ create_singleton_cluster(Txid, Fee, VSize, #state{union_find = UF, cluster_count
         linearization = [Txid],
         fee_rate = Fee / max(1, VSize)
     },
-    ets:insert(?MEMPOOL_CLUSTERS, {Txid, ClusterData}),
+    cluster_store(Txid, ClusterData),
 
     State#state{union_find = UF2, cluster_count = CC + 1}.
 
@@ -6079,7 +6098,7 @@ merge_clusters_and_add(Txid, _Fee, _VSize, ClusterIds, #state{union_find = UF, c
 
     %% Delete merged cluster records
     lists:foreach(fun(CId) ->
-        ets:delete(?MEMPOOL_CLUSTERS, CId)
+        cluster_drop(CId)
     end, RestClusters),
 
     %% Recompute the merged cluster
@@ -6116,7 +6135,7 @@ recompute_cluster(ClusterId, UnionFind) ->
                 linearization = Linearization,
                 fee_rate = TotalFee / max(1, TotalVSize)
             },
-            ets:insert(?MEMPOOL_CLUSTERS, {ClusterId, ClusterData})
+            cluster_store(ClusterId, ClusterData)
     end.
 
 %% @doc Remove a transaction from the cluster system.
@@ -6145,7 +6164,7 @@ cluster_remove_tx(Txid, #state{union_find = UF} = State) ->
 %% @doc Handle cluster state after a transaction is removed.
 handle_cluster_after_removal(ClusterId, [], #state{cluster_count = CC} = State) ->
     %% Cluster is now empty - delete it
-    ets:delete(?MEMPOOL_CLUSTERS, ClusterId),
+    cluster_drop(ClusterId),
     State#state{cluster_count = CC - 1};
 handle_cluster_after_removal(ClusterId, RemainingTxids, State) ->
     %% Check if cluster needs to be split
@@ -6233,7 +6252,7 @@ find_children_in_set(ParentTxid, TxidSet) ->
 %% @doc Split a cluster into multiple components.
 split_cluster(OldClusterId, Components, #state{union_find = UF, cluster_count = CC} = State) ->
     %% Delete old cluster
-    ets:delete(?MEMPOOL_CLUSTERS, OldClusterId),
+    cluster_drop(OldClusterId),
 
     %% Create new clusters for each component
     {UF2, NewClusterCount} = lists:foldl(
@@ -6731,37 +6750,39 @@ usage_counter(Key) ->
     catch error:badarg -> 0
     end.
 
-%% emplace_back: a full libstdc++ vector doubles its capacity (1 when empty).
 txns_randomized_push() ->
-    Size = usage_counter(trsize),
-    Cap = usage_counter(trcap),
-    NewCap = case Size >= Cap of
-                 true -> max(1, Cap * 2);
-                 false -> Cap
-             end,
-    catch ets:insert(?MEMPOOL_USAGE, [{trsize, Size + 1}, {trcap, NewCap}]),
+    txns_randomized_put(tr_push(txns_randomized_get())).
+
+txns_randomized_pop() ->
+    txns_randomized_put(tr_pop(txns_randomized_get())).
+
+txns_randomized_get() ->
+    {usage_counter(trsize), usage_counter(trcap)}.
+
+txns_randomized_put({Size, Cap}) ->
+    catch ets:insert(?MEMPOOL_USAGE, [{trsize, Size}, {trcap, Cap}]),
     ok.
+
+%% emplace_back: a full libstdc++ vector doubles its capacity (1 when empty).
+tr_push({Size, Cap}) when Size >= Cap -> {Size + 1, max(1, Cap * 2)};
+tr_push({Size, Cap}) -> {Size + 1, Cap}.
 
 %% removeUnchecked: with more than one element, pop_back and shrink_to_fit
 %% once under half full; the last element goes by clear(), which keeps the
 %% capacity. A drained pool still reports the vector's allocation, as Core
 %% does (64 bytes after one transaction came and went).
-txns_randomized_pop() ->
-    Size = usage_counter(trsize),
-    Cap = usage_counter(trcap),
-    {NewSize, NewCap} =
-        case Size > 1 of
-            true ->
-                S = Size - 1,
-                case S * 2 < Cap of
-                    true -> {S, S};
-                    false -> {S, Cap}
-                end;
-            false ->
-                {0, Cap}
-        end,
-    catch ets:insert(?MEMPOOL_USAGE, [{trsize, NewSize}, {trcap, NewCap}]),
-    ok.
+tr_pop({Size, Cap}) when Size > 1, (Size - 1) * 2 < Cap -> {Size - 1, Size - 1};
+tr_pop({Size, Cap}) when Size > 1 -> {Size - 1, Cap};
+tr_pop({_Size, Cap}) -> {0, Cap}.
+
+%% @doc {Size, Capacity} of txns_randomized after Pushes emplace_backs and
+%% then Pops removals, starting from {Size0, Cap0}.
+-spec txns_randomized_replay({non_neg_integer(), non_neg_integer()},
+                             non_neg_integer(), non_neg_integer()) ->
+    {non_neg_integer(), non_neg_integer()}.
+txns_randomized_replay(SizeCap, Pushes, Pops) ->
+    Pushed = lists:foldl(fun(_, SC) -> tr_push(SC) end, SizeCap, lists:seq(1, Pushes)),
+    lists:foldl(fun(_, SC) -> tr_pop(SC) end, Pushed, lists:seq(1, Pops)).
 
 bump_dynamic_usage(Delta) ->
     try ets:update_counter(?MEMPOOL_USAGE, total, Delta, {total, 0}) of
@@ -6776,7 +6797,17 @@ reset_dynamic_usage() ->
                               Acc + entry_dynamic_usage(Tx);
                          (_, Acc) -> Acc
                       end, 0, ?MEMPOOL_TXS),
-    ets:insert(?MEMPOOL_USAGE, {total, Total}),
+    %% Plus each multi-tx cluster's TxGraph term (cluster_store/2).
+    ets:match_delete(?MEMPOOL_USAGE, {{txgraph_excess, '_'}, '_'}),
+    Excess = ets:foldl(fun({Id, #cluster_data{txids = Txids}}, Acc) ->
+                               case txgraph_excess(Txids) of
+                                   0 -> Acc;
+                                   E -> ets:insert(?MEMPOOL_USAGE, {{txgraph_excess, Id}, E}),
+                                        Acc + E
+                               end;
+                          (_, Acc) -> Acc
+                       end, 0, ?MEMPOOL_CLUSTERS),
+    ets:insert(?MEMPOOL_USAGE, {total, Total + Excess}),
     %% txns_randomized as Core rebuilds it by pushing every entry back
     %% (LoadMempool): capacity is the smallest power of two that holds them.
     Count = ets:info(?MEMPOOL_TXS, size),
@@ -6794,15 +6825,17 @@ pow2_ceil(N, P) -> pow2_ceil(N, P * 2).
 %%   MallocUsage(sizeof(CTxMemPoolEntry) + 9 pointers)   mapTx node     224
 %% + RecursiveDynamicUsage(CTransactionRef)              cachedInnerUsage
 %% + one indirectmap node per input                      mapNextTx      64 each
-%% + the txgraph's per-transaction cost                  m_txgraph      216
+%% + the txgraph's cost of a singleton cluster            m_txgraph      216
 %% Struct sizes are those of Core v31 (sizeof CTransaction 128, CTxIn 112,
 %% CTxOut 48, CTxMemPoolEntry 136, shared_ptr control block 24, CScript
 %% inline capacity 36). The txgraph term is a singleton cluster's cost
 %% (SingletonClusterImpl + its m_clusters slot + TxGraphImpl::Entry + chunk
-%% index node), measured against Core v31.1 getmempoolinfo.usage (single
-%% 1-in/1-out, 1-in P2WSH and 2-in/2-out pools match it exactly); a tx in a
-%% multi-tx cluster costs Core somewhat more. txns_randomized is pool-level
-%% and added by dynamic_memory_usage/0; mapDeltas is not counted.
+%% index node, txgraph_cluster_usage(1, 1)), measured against Core v31.1
+%% getmempoolinfo.usage (single 1-in/1-out, 1-in P2WSH and 2-in/2-out pools
+%% match it exactly). A tx in a multi-tx cluster costs Core a different
+%% amount; that difference is tracked per cluster (cluster_store/2).
+%% txns_randomized is pool-level and added by dynamic_memory_usage/0;
+%% mapDeltas is not counted.
 -spec entry_dynamic_usage(#transaction{}) -> non_neg_integer().
 entry_dynamic_usage(#transaction{inputs = Ins, outputs = Outs}) ->
     NIn = length(Ins),
@@ -6816,7 +6849,314 @@ entry_dynamic_usage(#transaction{inputs = Ins, outputs = Outs}) ->
                                    Acc + script_usage(Spk)
                            end, 0, Outs),
     malloc_usage(136 + 9 * 8) + TxRef + Vecs + InUsage + OutUsage
-        + NIn * malloc_usage(48) + 216.
+        + NIn * malloc_usage(48) + txgraph_cluster_usage(1, 1).
+
+%%% -------------------------------------------------------------------
+%%% TxGraph cluster memory (Core TxGraphImpl::GetMainMemoryUsage)
+%%% -------------------------------------------------------------------
+%%% entry_dynamic_usage/1 charges every tx the TxGraph cost of a singleton
+%%% cluster. Core's m_txgraph->GetMainMemoryUsage() (txgraph.cpp:3535) is
+%%%   sum of Cluster::TotalMemoryUsage() over the main clusters
+%%% + sizeof(TxGraphImpl::Entry) per transaction
+%%% + memusage::DynamicUsage(m_main_chunkindex), one std::set node per chunk,
+%%% so a tx in a multi-tx cluster costs a different amount. The difference,
+%%% txgraph_cluster_usage(N, Chunks) - N * txgraph_cluster_usage(1, 1), is
+%%% kept per cluster in ?MEMPOOL_USAGE under {txgraph_excess, ClusterId} and
+%%% folded into the `total' counter whenever a cluster is stored or dropped.
+
+%% sizeof(TxGraphImpl::Entry) (txgraph.cpp:602): Ref* 8, ChunkIndex::iterator
+%% 8, Locator[2] 2 * 16, FeePerWeight 16, int32 + 2 * uint32 12 -> 76, 80
+%% aligned. Counted as sizeof (not MallocUsage): m_entries is one vector.
+-define(TXGRAPH_ENTRY, 80).
+%% m_main_chunkindex is std::set<ChunkData>; ChunkData (txgraph.cpp:468) is
+%% GraphIndex + LinearizationIndex = 8, a stl_tree_node adds 32 (memusage.h).
+-define(TXGRAPH_CHUNK_NODE, 32 + 8).
+%% The ClusterSet::m_clusters slot, sizeof(std::unique_ptr<Cluster>).
+-define(TXGRAPH_CLUSTER_SLOT, 8).
+%% sizeof(SingletonClusterImpl) (txgraph.cpp:311): Cluster base (vptr 8,
+%% QualityLevel 4, ClusterSetIndex 4, m_sequence 8 = 24) + FeePerWeight 16 +
+%% GraphIndex 4 -> 44.
+-define(TXGRAPH_SINGLETON_IMPL, 44).
+%% sizeof(GenericClusterImpl) (txgraph.cpp:252): Cluster base 24 +
+%% DepGraph<BitSet<64>> (entries vector 24 + m_used 8) + m_mapping 24 +
+%% m_linearization 24 -> 104.
+-define(TXGRAPH_GENERIC_IMPL, 104).
+%% Element sizes: GraphIndex / DepGraphIndex are uint32; DepGraph::Entry is
+%% FeeFrac 16 + ancestors 8 + descendants 8 (cluster_linearize.h:33).
+-define(TXGRAPH_INDEX_ELEM, 4).
+-define(TXGRAPH_DEPGRAPH_ELEM, 32).
+
+%% @doc Bytes Core's TxGraph holds for one main cluster of N transactions
+%% whose linearization has Chunks chunks: the Cluster object, its m_clusters
+%% slot, its N Entry objects and its chunk index nodes.
+%%
+%% A cluster of two or more is a GenericClusterImpl (GenericClusterImpl::
+%% TotalMemoryUsage, txgraph.cpp:915). Its three vectors have capacity N:
+%% every path that builds or shrinks one ends in Compact(), which is
+%% shrink_to_fit on all three (Merge txgraph.cpp:2110, Split :1503,
+%% ApplyRemovals :1295), CopyToStaging copy-assigns them (capacity = size)
+%% and Relinearize moves in a vector Linearize() reserved to exactly N
+%% (cluster_linearize.h:1469). Measured against Core v31.1
+%% getmempoolinfo.usage: 2-tx clusters of 1 and 2 chunks, five 21-tx single-
+%% chunk clusters (rbf/clusters) and 64-tx clusters of 19 and 30 chunks
+%% (seed_warden_e, warden_e).
+-spec txgraph_cluster_usage(pos_integer(), non_neg_integer()) -> non_neg_integer().
+txgraph_cluster_usage(1, _Chunks) ->
+    %% SingletonClusterImpl::TotalMemoryUsage (txgraph.cpp:927): one chunk.
+    malloc_usage(?TXGRAPH_SINGLETON_IMPL) + ?TXGRAPH_CLUSTER_SLOT
+        + ?TXGRAPH_ENTRY + malloc_usage(?TXGRAPH_CHUNK_NODE);
+txgraph_cluster_usage(N, Chunks) when N > 1 ->
+    malloc_usage(?TXGRAPH_GENERIC_IMPL) + ?TXGRAPH_CLUSTER_SLOT
+        + 2 * malloc_usage(?TXGRAPH_INDEX_ELEM * N)   %% m_mapping, m_linearization
+        + malloc_usage(?TXGRAPH_DEPGRAPH_ELEM * N)    %% m_depgraph.entries
+        + N * ?TXGRAPH_ENTRY
+        + Chunks * malloc_usage(?TXGRAPH_CHUNK_NODE).
+
+%% Store / drop a cluster record, keeping the TxGraph usage term in step.
+%% Every write to ?MEMPOOL_CLUSTERS goes through these two.
+cluster_store(ClusterId, #cluster_data{txids = Txids} = ClusterData) ->
+    ets:insert(?MEMPOOL_CLUSTERS, {ClusterId, ClusterData}),
+    set_txgraph_excess(ClusterId, txgraph_excess(Txids)).
+
+cluster_drop(ClusterId) ->
+    ets:delete(?MEMPOOL_CLUSTERS, ClusterId),
+    set_txgraph_excess(ClusterId, 0).
+
+set_txgraph_excess(ClusterId, New) ->
+    Key = {txgraph_excess, ClusterId},
+    Old = usage_counter(Key),
+    case New of
+        0 -> catch ets:delete(?MEMPOOL_USAGE, Key);
+        _ -> catch ets:insert(?MEMPOOL_USAGE, {Key, New})
+    end,
+    bump_dynamic_usage(New - Old).
+
+%% Core's cost of the cluster minus what entry_dynamic_usage/1 already
+%% charged its members (a singleton cluster's cost each).
+txgraph_excess(Txids) when length(Txids) < 2 ->
+    0;
+txgraph_excess(Txids) ->
+    case txgraph_nodes(Txids) of
+        Nodes when length(Nodes) < 2 ->
+            0;
+        Nodes ->
+            N = length(Nodes),
+            txgraph_cluster_usage(N, txgraph_chunk_count(Nodes))
+                - N * txgraph_cluster_usage(1, 1)
+    end.
+
+%% The cluster as Core's TxGraph sees it: per tx the modified fee (signed,
+%% Core SetTransactionFee(GetModifiedFee)) and the sigop-adjusted weight
+%% (txmempool.cpp:1017), and its parents inside the cluster.
+txgraph_nodes(Txids) ->
+    InCluster = sets:from_list(Txids, [{version, 2}]),
+    lists:filtermap(
+      fun(Txid) ->
+          case ets:lookup(?MEMPOOL_TXS, Txid) of
+              [{Txid, #mempool_entry{tx = Tx} = E}] ->
+                  Parents = lists:usort(
+                              [H || #tx_in{prev_out = #outpoint{hash = H}}
+                                        <- Tx#transaction.inputs,
+                                    sets:is_element(H, InCluster)]),
+                  {true, {Txid, modified_fee_signed_of_entry(E),
+                          txgraph_weight(E), Parents}};
+              [] ->
+                  false
+          end
+      end, Txids).
+
+txgraph_weight(#mempool_entry{adj_weight = W}) when is_integer(W), W > 0 -> W;
+txgraph_weight(#mempool_entry{weight = W}) when is_integer(W), W > 0 -> W;
+txgraph_weight(#mempool_entry{vsize = V}) when is_integer(V), V > 0 -> 4 * V;
+txgraph_weight(_) -> 1.
+
+%% @doc The number of chunks in Core's linearization of a cluster, given as
+%% [{Id, Fee, Size, ParentIds}] (ParentIds outside the list are ignored).
+%%
+%% Core keeps clusters optimally linearized with minimal chunks: Linearize
+%% runs the spanning-forest search to optimality and then MinimizeStep until
+%% no chunk splits into an equal-feerate topological prefix and rest
+%% (cluster_linearize.h:1829), and ChunkLinearization only merges a chunk
+%% into its predecessor when its feerate is strictly higher. So the first
+%% chunks are the minimal pieces of the highest-feerate closed set (a set
+%% holding every in-cluster parent of its members), then the same for what is
+%% left, and so on. Each peel finds that feerate exactly (Dinkelbach steps,
+%% each a max-weight closure solved as a min cut) and counts the minimal
+%% pieces as the strongly connected components of the final residual graph
+%% restricted to the maximal optimal closure (Picard-Queyranne: the min cuts
+%% are the residual closures, and a maximal chain of them adds one SCC at a
+%% time).
+-spec txgraph_chunk_count([{term(), integer(), pos_integer(), [term()]}]) -> non_neg_integer().
+txgraph_chunk_count(Nodes) ->
+    Ids = [Id || {Id, _, _, _} <- Nodes],
+    Index = maps:from_list(lists:zip(Ids, lists:seq(1, length(Ids)))),
+    Info = maps:from_list(
+             [{maps:get(Id, Index),
+               {Fee, max(1, Size),
+                lists:usort([maps:get(P, Index) || P <- Ps, maps:is_key(P, Index)])}}
+              || {Id, Fee, Size, Ps} <- Nodes]),
+    chunk_peel(lists:seq(1, length(Ids)), Info, 0).
+
+chunk_peel([], _Info, Count) ->
+    Count;
+chunk_peel(Rem, Info, Count) ->
+    RemSet = sets:from_list(Rem, [{version, 2}]),
+    {F0, S0} = best_ancestor_feerate(Rem, RemSet, Info),
+    {Best, Pieces} = chunk_dinkelbach(Rem, RemSet, Info, F0, S0),
+    chunk_peel([I || I <- Rem, not sets:is_element(I, Best)], Info, Count + Pieces).
+
+%% A first lower bound for the best feerate: the best ancestor set.
+best_ancestor_feerate(Rem, RemSet, Info) ->
+    lists:foldl(
+      fun(I, {BF, BS} = Best) ->
+          {F, S} = set_feerate(closure([I], RemSet, Info, sets:new([{version, 2}])), Info),
+          case BS =:= 0 orelse F * BS > BF * S of
+              true -> {F, S};
+              false -> Best
+          end
+      end, {0, 0}, Rem).
+
+closure([], _RemSet, _Info, Acc) ->
+    sets:to_list(Acc);
+closure([I | Rest], RemSet, Info, Acc) ->
+    case sets:is_element(I, Acc) of
+        true ->
+            closure(Rest, RemSet, Info, Acc);
+        false ->
+            {_, _, Ps} = maps:get(I, Info),
+            closure([P || P <- Ps, sets:is_element(P, RemSet)] ++ Rest,
+                    RemSet, Info, sets:add_element(I, Acc))
+    end.
+
+set_feerate(Members, Info) ->
+    lists:foldl(fun(I, {F, S}) ->
+                        {Fee, Size, _} = maps:get(I, Info),
+                        {F + Fee, S + Size}
+                end, {0, 0}, Members).
+
+%% Max-weight closure at feerate F/S: weight(i) = fee(i) * S - size(i) * F.
+%% Source 0, sink N+1; a source edge for positive weight, a sink edge for
+%% negative, and an unbounded edge from each tx to each remaining parent.
+chunk_dinkelbach(Rem, RemSet, Info, F, S) ->
+    Sink = maps:size(Info) + 1,
+    W = maps:from_list([begin
+                            {Fee, Size, _} = maps:get(I, Info),
+                            {I, Fee * S - Size * F}
+                        end || I <- Rem]),
+    Inf = 1 + lists:sum([abs(X) || X <- maps:values(W)]),
+    Edges = lists:flatmap(
+              fun(I) ->
+                  {_, _, Ps} = maps:get(I, Info),
+                  Wi = maps:get(I, W),
+                  Term = if Wi > 0 -> [{0, I, Wi}];
+                            Wi < 0 -> [{I, Sink, -Wi}];
+                            true -> []
+                         end,
+                  Term ++ [{I, P, Inf} || P <- Ps, sets:is_element(P, RemSet)]
+              end, Rem),
+    {Res, Adj} = flow_graph(Edges),
+    Res2 = max_flow(Res, Adj, 0, Sink),
+    SourceSide = [I || I <- reach_from(0, Res2, Adj), I =/= 0],
+    case lists:sum([maps:get(I, W) || I <- SourceSide]) > 0 of
+        true ->
+            %% A closed set beats F/S: its feerate is the next bound.
+            {F2, S2} = set_feerate(SourceSide, Info),
+            chunk_dinkelbach(Rem, RemSet, Info, F2, S2);
+        false ->
+            ToSink = sets:from_list(reach_to(Sink, Res2, Adj), [{version, 2}]),
+            Best = [I || I <- Rem, not sets:is_element(I, ToSink)],
+            BestSet = sets:from_list(Best, [{version, 2}]),
+            {BestSet, scc_count(Best, BestSet, Res2, Adj)}
+    end.
+
+flow_graph(Edges) ->
+    lists:foldl(
+      fun({U, V, C}, {Res, Adj}) ->
+              Res1 = maps:update_with({U, V}, fun(X) -> X + C end, C, Res),
+              Res2 = maps:update_with({V, U}, fun(X) -> X end, 0, Res1),
+              Adj1 = maps:update_with(U, fun(L) -> [V | L] end, [V], Adj),
+              {Res2, maps:update_with(V, fun(L) -> [U | L] end, [U], Adj1)}
+      end, {#{}, #{}}, Edges).
+
+%% Edmonds-Karp.
+max_flow(Res, Adj, Src, Sink) ->
+    case bfs_path(Res, Adj, Src, Sink) of
+        none ->
+            Res;
+        Path ->
+            Bottleneck = lists:min([maps:get(E, Res) || E <- Path]),
+            Res2 = lists:foldl(
+                     fun({U, V} = E, R) ->
+                             R1 = maps:update(E, maps:get(E, R) - Bottleneck, R),
+                             maps:update({V, U}, maps:get({V, U}, R1) + Bottleneck, R1)
+                     end, Res, Path),
+            max_flow(Res2, Adj, Src, Sink)
+    end.
+
+bfs_path(Res, Adj, Src, Sink) ->
+    bfs_path(queue:from_list([Src]), #{Src => root}, Res, Adj, Sink).
+
+bfs_path(Q, Prev, Res, Adj, Sink) ->
+    case queue:out(Q) of
+        {empty, _} ->
+            none;
+        {{value, U}, Q2} ->
+            {Q3, Prev2} = lists:foldl(
+                            fun(V, {QA, PA}) ->
+                                    case not maps:is_key(V, PA)
+                                         andalso maps:get({U, V}, Res) > 0 of
+                                        true -> {queue:in(V, QA), PA#{V => U}};
+                                        false -> {QA, PA}
+                                    end
+                            end, {Q2, Prev}, maps:get(U, Adj, [])),
+            case maps:is_key(Sink, Prev2) of
+                true -> path_edges(Sink, Prev2, []);
+                false -> bfs_path(Q3, Prev2, Res, Adj, Sink)
+            end
+    end.
+
+path_edges(V, Prev, Acc) ->
+    case maps:get(V, Prev) of
+        root -> Acc;
+        U -> path_edges(U, Prev, [{U, V} | Acc])
+    end.
+
+%% Nodes reachable from Src along residual edges.
+reach_from(Src, Res, Adj) ->
+    walk([Src], fun(U, V) -> maps:get({U, V}, Res) > 0 end, Adj,
+         sets:from_list([Src], [{version, 2}])).
+
+%% Nodes that reach Dst along residual edges.
+reach_to(Dst, Res, Adj) ->
+    walk([Dst], fun(V, U) -> maps:get({U, V}, Res) > 0 end, Adj,
+         sets:from_list([Dst], [{version, 2}])).
+
+walk([], _Edge, _Adj, Seen) ->
+    sets:to_list(Seen);
+walk([U | Rest], Edge, Adj, Seen) ->
+    Next = [V || V <- maps:get(U, Adj, []), not sets:is_element(V, Seen), Edge(U, V)],
+    walk(lists:usort(Next) ++ Rest, Edge, Adj,
+         lists:foldl(fun sets:add_element/2, Seen, Next)).
+
+%% Strongly connected components of the residual graph restricted to Nodes.
+scc_count(Nodes, NodeSet, Res, Adj) ->
+    Within = fun(U, V) -> sets:is_element(V, NodeSet) andalso maps:get({U, V}, Res) > 0 end,
+    Back = fun(V, U) -> sets:is_element(U, NodeSet) andalso maps:get({U, V}, Res) > 0 end,
+    {Count, _} = lists:foldl(
+                   fun(U, {C, Done}) ->
+                           case sets:is_element(U, Done) of
+                               true ->
+                                   {C, Done};
+                               false ->
+                                   One = fun(E) -> sets:from_list(
+                                                     walk([U], E, Adj,
+                                                          sets:from_list([U], [{version, 2}])),
+                                                     [{version, 2}]) end,
+                                   Comp = sets:intersection(One(Within), One(Back)),
+                                   {C + 1, sets:union(Done, Comp)}
+                           end
+                   end, {0, sets:new([{version, 2}])}, Nodes),
+    Count.
 
 %% CScript is prevector<36>: no heap allocation up to 36 bytes.
 script_usage(Script) when is_binary(Script), byte_size(Script) > 36 ->
