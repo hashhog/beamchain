@@ -543,6 +543,14 @@ scan_for_op_success(<<?OP_PUSHDATA2, Len:16/little, Rest/binary>>) ->
     skip_data(Len, Rest);
 scan_for_op_success(<<?OP_PUSHDATA4, Len:32/little, Rest/binary>>) ->
     skip_data(Len, Rest);
+scan_for_op_success(<<Op, _Rest/binary>>)
+  when Op =:= ?OP_PUSHDATA1; Op =:= ?OP_PUSHDATA2; Op =:= ?OP_PUSHDATA4 ->
+    %% The length field is cut off by the end of the script (the clauses
+    %% above match whenever it is complete). Core's GetScriptOp
+    %% (script.cpp:336/342/349) fails here, so the prescan stops with
+    %% BAD_OPCODE (interpreter.cpp:1841-1843) and the leftover length bytes
+    %% are never classified as opcodes.
+    {error, bad_opcode};
 scan_for_op_success(<<Op, _Rest/binary>>) ->
     case is_op_success(Op) of
         true -> true;
