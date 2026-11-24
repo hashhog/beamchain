@@ -155,7 +155,12 @@ Mainnet without pruning needs about as much disk as Bitcoin Core's blocks direct
 plus the UTXO set: plan for at least 1 TB of SSD. The default `--dbcache=4096` plus
 RocksDB and the Erlang VM need well over 4 GB; 16 GB of RAM is a comfortable minimum
 for initial sync. `--dbcache` and `--par` trade memory and cores for speed and do not
-change validation results.
+change validation results. Block download keeps up to 256 MiB of downloaded blocks
+(wire size) ahead of validation; on a small machine lower it through `ERL_FLAGS`,
+for example `ERL_FLAGS="-beamchain block_download_buffer_mb 64"` (minimum 8).
+Blocks connect in a separate process so requests keep going out meanwhile;
+`ERL_FLAGS="-beamchain block_sync_async_validate false"` connects them inside the
+download process instead, as earlier releases did.
 
 ## Logging and monitoring
 

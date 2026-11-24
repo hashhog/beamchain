@@ -255,7 +255,11 @@ download_buffer_byte_cap() ->
     Cap = beamchain_block_sync:max_downloaded_bytes(),
     Ahead = beamchain_block_sync:max_downloaded_ahead(),
     Pad = <<0:(2 * 1024 * 1024)/unit:8>>,
-    N = 40,
+    %% Enough 2 MiB blocks to overfill the byte cap whatever it is (it was
+    %% 64 MiB of decoded terms; it is now 256 MiB of raw payload), and
+    %% still fewer than the count cap so bytes are what refuses the tail.
+    N = Cap div byte_size(Pad) + 8,
+    ?assert(N < Ahead),
     {_Kept, Bytes, Count} =
         lists:foldl(
           fun(H, {State, _B, _C}) ->

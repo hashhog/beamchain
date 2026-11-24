@@ -224,13 +224,13 @@ route_message(Peer, headers, Payload, State) ->
     end,
     State;
 
+%% A block goes to block_sync as the raw payload. It is decoded once,
+%% where it is connected (block_sync's validation worker), instead of
+%% here, in this one process shared by every peer, and then copied as a
+%% large decoded term into block_sync's mailbox and buffer. block_sync
+%% gives an undecodable payload the same 20 points this clause did.
 route_message(Peer, block, Payload, State) ->
-    case beamchain_p2p_msg:decode_payload(block, Payload) of
-        {ok, Block} ->
-            beamchain_block_sync:handle_block(Peer, Block);
-        _Error ->
-            beamchain_peer:add_misbehavior(Peer, 20)
-    end,
+    beamchain_block_sync:handle_block(Peer, Payload),
     State;
 
 route_message(Peer, notfound, Payload, State) ->
