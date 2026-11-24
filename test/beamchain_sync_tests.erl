@@ -80,12 +80,21 @@ truncated_headers_payload_does_not_crash_sync_test_() ->
                ?assertEqual(alive, deliver(Peer, Cmd, P)),
                %% Same process: it did not crash and get restarted.
                ?assertEqual(Sync, whereis(beamchain_sync)),
-               %% The sender is scored, as the existing fallback clauses
-               %% already do for a non-{ok, _} decode.
-               ?assertEqual(1, meck:num_calls(beamchain_peer, add_misbehavior,
-                                              [Peer, 20]))
+               expect_scored_or_forwarded(Cmd, Peer, P)
            end}
       end || {Cmd, P} <- truncated_frames()]}.
+
+%% The sender is scored, as the existing fallback clauses already do for a
+%% non-{ok, _} decode. A `block` payload is no longer decoded here: it is
+%% forwarded raw to block_sync, which decodes it where it is connected and
+%% gives an undecodable one the same 20 points
+%% (beamchain_download_pipeline_tests, undecodable_*_payload).
+expect_scored_or_forwarded(block, Peer, Payload) ->
+    ?assert(meck:called(beamchain_block_sync, handle_block, [Peer, Payload])),
+    ?assertEqual(0, meck:num_calls(beamchain_peer, add_misbehavior, '_'));
+expect_scored_or_forwarded(_Cmd, Peer, _Payload) ->
+    ?assertEqual(1, meck:num_calls(beamchain_peer, add_misbehavior,
+                                   [Peer, 20])).
 
 %% Six malformed frames inside ten seconds: the burst that used to exhaust
 %% beamchain_node_sup's restart intensity. The one server sees all of them.
