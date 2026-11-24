@@ -158,6 +158,9 @@ for initial sync. `--dbcache` and `--par` trade memory and cores for speed and d
 change validation results. Block download keeps up to 256 MiB of downloaded blocks
 (wire size) ahead of validation; on a small machine lower it through `ERL_FLAGS`,
 for example `ERL_FLAGS="-beamchain block_download_buffer_mb 64"` (minimum 8).
+Blocks connect in a separate process so requests keep going out meanwhile;
+`ERL_FLAGS="-beamchain block_sync_async_validate false"` connects them inside the
+download process instead, as earlier releases did.
 
 ## Logging and monitoring
 
