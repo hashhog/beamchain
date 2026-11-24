@@ -1763,7 +1763,16 @@ do_send_version(#peer_data{address = {IP, Port}, our_nonce = Nonce} = Data) ->
 %% same way (only when -v2transport is active).
 -spec advertised_services() -> non_neg_integer().
 advertised_services() ->
-    BaseServices = ?NODE_NETWORK bor ?NODE_WITNESS,
+    %% NODE_NETWORK promises every historical block. Core sets it only
+    %% when not in prune mode and with no snapshot chainstate still
+    %% waiting for its history (init.cpp:1947-1953); otherwise the node is
+    %% NODE_NETWORK_LIMITED | NODE_WITNESS. beamchain's equivalent of the
+    %% second condition is a store without the body of block 1 below its
+    %% flushed tip (snapshot boot that never fetched the old bodies).
+    BaseServices = case holds_full_history() of
+        true  -> ?NODE_NETWORK bor ?NODE_WITNESS;
+        false -> ?NODE_WITNESS
+    end,
     Services0 = case beamchain_config:node_bloom_enabled() of
         true  -> BaseServices bor ?NODE_BLOOM;
         false -> BaseServices
@@ -1786,9 +1795,9 @@ advertised_services() ->
     %% then adds NODE_NETWORK in non-prune mode (init.cpp:1949-1950). A full
     %% node always serves at least the recent ~288-block window, so the
     %% NODE_NETWORK_LIMITED guarantee holds regardless of prune mode. The
-    %% earlier prune-only gate was a Core-parity error. We keep NODE_NETWORK
-    %% set (non-pruned full node), giving NODE_NETWORK | NODE_WITNESS |
-    %% NODE_NETWORK_LIMITED = 0x409.
+    %% earlier prune-only gate was a Core-parity error. A node holding the
+    %% full history also has NODE_NETWORK (BaseServices), giving
+    %% NODE_NETWORK | NODE_WITNESS | NODE_NETWORK_LIMITED = 0x409.
     Services2 = Services1 bor ?NODE_NETWORK_LIMITED,
     %% BIP-324: advertise NODE_P2P_V2 only when the v2 transport is
     %% genuinely enabled. Gated on the SAME predicate that enables the
@@ -1798,6 +1807,11 @@ advertised_services() ->
         true  -> Services2 bor ?NODE_P2P_V2;
         false -> Services2
     end.
+
+%% Not pruning and holding every body from block 1 (see advertised_services/0).
+holds_full_history() ->
+    (not beamchain_config:prune_enabled())
+        andalso beamchain_db:holds_full_history().
 
 handle_version_msg(_Payload, #peer_data{version_recv = true} = Data) ->
     logger:warning("peer ~p duplicate version", [Data#peer_data.address]),

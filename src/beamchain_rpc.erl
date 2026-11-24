@@ -2730,36 +2730,60 @@ rpc_pruneblockchain(_) ->
      <<"Usage: pruneblockchain height_or_unix_timestamp">>}.
 
 do_pruneblockchain(N) ->
-    %% Reject if pruning is not enabled at all.
+    %% Core rpc/blockchain.cpp pruneblockchain, in its order: prune mode,
+    %% negative height, timestamp -> height, "too short" (PruneAfterHeight),
+    %% "shorter than", clamp to tip - MIN_BLOCKS_TO_KEEP (288), prune,
+    %% return GetPruneHeight (the last pruned height) or -1.
     case beamchain_config:prune_enabled() of
         false ->
             {error, ?RPC_MISC_ERROR,
              <<"Cannot prune blocks because node is not in prune mode.">>};
+        true when N < 0 ->
+            {error, ?RPC_INVALID_PARAMETER, <<"Negative block height.">>};
         true ->
-            %% Resolve the parameter: heights are typically <= 5e8 for
-            %% the foreseeable future, while unix timestamps are >=1e9.
-            %% Core uses the same threshold (rpc/blockchain.cpp).
-            Height = case N >= 1000000000 of
-                false ->
-                    N;
-                true ->
-                    case beamchain_chainstate:get_tip() of
-                        not_found -> 0;
-                        {ok, {_TipHash, TipH}} ->
-                            timestamp_to_height(N, TipH)
-                    end
+            {ok, {_TipHash, TipH}} = case beamchain_chainstate:get_tip() of
+                not_found -> {ok, {undefined, 0}};
+                Found -> Found
             end,
-            case beamchain_db:prune_block_files_manual(Height) of
-                {ok, #{effective_height := Eff}} ->
-                    {ok, Eff};
-                {error, prune_disabled} ->
+            %% Heights are typically <= 5e8, unix timestamps >= 1e9.
+            Height = case N > 1000000000 of
+                false -> N;
+                true -> timestamp_to_height(N, TipH)
+            end,
+            PruneAfter = case beamchain_config:network() of
+                mainnet -> 100000;
+                _ -> 1000
+            end,
+            if
+                TipH < PruneAfter ->
                     {error, ?RPC_MISC_ERROR,
-                     <<"Cannot prune blocks because node is not in prune mode.">>};
-                {error, Reason} ->
-                    {error, ?RPC_DATABASE_ERROR,
-                     iolist_to_binary(io_lib:format("Manual prune failed: ~p",
-                                                    [Reason]))}
+                     <<"Blockchain is too short for pruning.">>};
+                Height > TipH ->
+                    {error, ?RPC_INVALID_PARAMETER,
+                     <<"Blockchain is shorter than the attempted prune height.">>};
+                true ->
+                    Clamped = erlang:min(Height, TipH - 288),
+                    %% beamchain_db prunes no higher than the FLUSHED tip
+                    %% - 288 (boot roll-forward replays the bodies above
+                    %% the flushed tip). Core flushes before it prunes too.
+                    ok = beamchain_chainstate:flush(),
+                    run_manual_prune(Clamped)
             end
+    end.
+
+run_manual_prune(Height) ->
+    case beamchain_db:prune_block_files_manual(Height) of
+        {ok, #{last_pruned := 0}} ->
+            {ok, -1};
+        {ok, #{last_pruned := Last}} ->
+            {ok, Last};
+        {error, prune_disabled} ->
+            {error, ?RPC_MISC_ERROR,
+             <<"Cannot prune blocks because node is not in prune mode.">>};
+        {error, Reason} ->
+            {error, ?RPC_DATABASE_ERROR,
+             iolist_to_binary(io_lib:format("Manual prune failed: ~p",
+                                            [Reason]))}
     end.
 
 %% Map a unix timestamp to the height of the last block whose
