@@ -37,3 +37,19 @@ f7_control_non_push_opcode_test() ->
 f7_control_cut_off_push_test() ->
     ?assertNot(beamchain_script:is_push_only(<<16#4d, 16#01>>)),
     ?assertNot(beamchain_script:is_push_only(<<16#02, 16#aa>>)).
+
+%% Consensus control: a P2SH scriptSig holding OP_RESERVED now passes the
+%% push-only test, but executing it still fails (BAD_OPCODE), as in Core,
+%% under block flags. No spend that failed before passes.
+f7_control_p2sh_script_sig_with_op_reserved_still_fails_test() ->
+    Redeem = <<16#51>>,
+    SPK = <<16#a9, 20, (beamchain_crypto:hash160(Redeem))/binary, 16#87>>,
+    Flags = beamchain_script:flags_for_height(900000, mainnet),
+    {error, E} = beamchain_script:verify_script_error(
+                   <<1, 16#51, 16#50>>, SPK, [], Flags, #{}),
+    ?assertEqual(<<"Opcode missing or not understood">>,
+                 beamchain_script:script_error_string(E)),
+    {error, E2} = beamchain_script:verify_script_error(
+                    <<16#50, 1, 16#51>>, SPK, [], Flags, #{}),
+    ?assertEqual(<<"Opcode missing or not understood">>,
+                 beamchain_script:script_error_string(E2)).
