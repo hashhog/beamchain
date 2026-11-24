@@ -61,7 +61,8 @@ setup() ->
                 [] -> not_found
             end
         end),
-    ok = meck:expect(beamchain_chainstate, is_chain_paused, fun() -> false end),
+    ok = meck:expect(beamchain_chainstate, is_chain_paused,
+                     fun() -> ets:lookup(?T, paused) =/= [] end),
     ok = meck:expect(beamchain_chainstate, is_known_invalid, fun(_) -> false end),
     ok = meck:expect(beamchain_chainstate, get_tip,
         fun() -> [{tip, T}] = ets:lookup(?T, tip), {ok, T} end),
@@ -176,6 +177,7 @@ mock_connect(#block{header = #block_header{prev_hash = Prev} = Hdr}) ->
     Hash = beamchain_serialize:block_hash(Hdr),
     H = height_of(Hash),
     gate(H),
+    note_off_header_chain(H, Hash),
     [{tip, {TipHash, _}}] = ets:lookup(?T, tip),
     case ets:lookup(?T, {verdict, H}) of
         [{_, V}] ->
@@ -195,12 +197,24 @@ mock_submit(#block{header = Hdr}) ->
     Hash = beamchain_serialize:block_hash(Hdr),
     H = height_of(Hash),
     gate(H),
+    note_off_header_chain(H, Hash),
     [{tip, {_, TipH}}] = ets:lookup(?T, tip),
     ets:insert(?T, {{connected, next_seq()}, submit, H, Hash}),
     case H > TipH of
         true -> ets:insert(?T, {tip, {Hash, H}}), {ok, reorg};
         false -> {ok, side_branch}
     end.
+
+%% Record a block handed to the chainstate that is not, at that moment, the
+%% header chain's block at its height: block download must never do that.
+note_off_header_chain(H, Hash) ->
+    case ets:lookup(?T, {hdr, H}) of
+        [{_, Hash}] -> ok;
+        _ -> ets:insert(?T, {{off_header_chain, next_seq()}, H, Hash})
+    end.
+
+off_header_chain() ->
+    [{H, Hash} || {{off_header_chain, _}, H, Hash} <- ets:tab2list(?T)].
 
 %% A gated height blocks the connecting process until released, as a
 %% slow chainstate connect holds its caller.
@@ -365,6 +379,9 @@ pipeline_test_() ->
       {"a mutated body on the block after a connecting one is "
        "re-requested, not marked (reference behaviour)",
        fun prepared_check_mutation/0},
+      {"a re-plan while connecting is paused never connects the block "
+       "that was prepared for the old plan (reference behaviour)",
+       fun replan_during_pause/0},
       {"an undecodable payload under a requested header is scored and "
        "re-requested, not marked invalid",
        fun undecodable_solicited_payload/0},
@@ -649,6 +666,36 @@ prepared_check_mutation() ->
                          H =:= hash_at_height(2)]) >= 2),
     ?assertNot(meck:called(beamchain_chainstate, invalid_block_found, '_')),
     ?assertEqual(lists:seq(1, 20), connected_heights()).
+
+%% Block 1 connects while block 2 (branch A) is buffered, so with
+%% validation workers A2 is decoded and checked ahead in a prepared worker.
+%% Right then a chain pause starts (dumptxoutset rollback), and while paused
+%% the plan changes: the header chain now has branch B from height 2 and
+%% download is re-planned (chain_invalidated + start_sync). After the pause
+%% B2 arrives. Every block handed to the chainstate must be the header
+%% chain's block at its height at that moment -- A2 must not be connected
+%% by a worker left over from the old plan.
+replan_during_pause() ->
+    make_chain(30, 0),
+    close_gate(1),
+    [P] = start(1, 30),
+    [beamchain_block_sync:handle_block(P, decoded(H)) || H <- [1, 2, 3]],
+    ?assert(wait_until(fun() -> in_connect(1) end, 2000)),
+    ets:insert(?T, {paused}),
+    release_gate(1),
+    ?assert(wait_until(fun() -> lists:member(1, connected_heights()) end,
+                       5000)),
+    settle(),
+    A1 = hash_at_height(1),
+    build(2, 30, A1, 0, chain_b),
+    gen_server:cast(beamchain_block_sync, chain_invalidated),
+    ok = beamchain_block_sync:start_sync(#{target_height => 30}),
+    _ = status(5000),
+    ets:delete(?T, paused),
+    serve_all(fun decoded/1, fun in_order/1),
+    ?assertEqual([], off_header_chain()),
+    ?assertEqual([{tip, {hash_at_height(30), 30}}], ets:lookup(?T, tip)),
+    ?assertMatch(#{status := complete, next_to_validate := 31}, status(5000)).
 
 %% The requested header followed by garbage: it does not decode. Not a
 %% verdict about the header -- the sender is scored 20 (as beamchain_sync
