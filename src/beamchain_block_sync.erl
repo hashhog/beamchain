@@ -69,12 +69,14 @@
 
 -define(SERVER, ?MODULE).
 
-%% Download limits. Count+byte caps are global (decoded #block{} terms,
-%% not wire bytes). 256 decoded mainnet blocks at ~10× term overhead
-%% was several GB on top of the 4096MB UTXO cache and blew the 8G
-%% MemoryMax (live 2026-09-17). Core keeps
-%% MAX_BLOCKS_IN_TRANSIT_PER_PEER=16 (net_processing.cpp).
--define(MAX_IN_FLIGHT, 32).
+%% Download limits. Core keeps MAX_BLOCKS_IN_TRANSIT_PER_PEER=16
+%% (net_processing.cpp), which over its 8 outbound peers is ~128 blocks
+%% in transit. The old global cap of 32 (with 32 blocks / 64 MB of
+%% DECODED terms ahead of validation) was set after 256 decoded mainnet
+%% blocks at ~10x term overhead blew the 8G MemoryMax (live 2026-09-17).
+%% The buffer now holds the raw wire bytes, so the byte cap below bounds
+%% what is really held, and the in-flight total can be Core-sized.
+-define(MAX_IN_FLIGHT, 128).
 -define(MAX_PER_PEER, 16).
 
 %% Stall detection
@@ -85,13 +87,19 @@
 %% UTXO batch flush every N blocks during IBD
 -define(UTXO_FLUSH_INTERVAL, 1000).
 
-%% Memory cap: max blocks downloaded ahead of validation.
-%% Count is a safety net; MAX_DOWNLOADED_BYTES is the real RSS bound
-%% (erlang:external_size of decoded #block{} terms). Previous count of
-%% 256 with no byte cap held multi-GB of mainnet blocks.
--define(MAX_DOWNLOADED_AHEAD, 32).
--define(MAX_DOWNLOADED_BYTES, (64 * 1024 * 1024)).
+%% Memory cap: blocks downloaded ahead of validation (plus in flight).
+%% The count is a safety net, Core's BLOCK_DOWNLOAD_WINDOW (1024). The
+%% byte cap is the real bound: buffered blocks are kept as the raw wire
+%% payload (byte_size), and requests stop once buffered bytes plus the
+%% estimated size of the blocks in flight reach it. Default 256 MiB;
+%% app env `block_download_buffer_mb` overrides (e.g. lower on a small
+%% laptop: ERL_FLAGS="-beamchain block_download_buffer_mb 64").
+-define(MAX_DOWNLOADED_AHEAD, 1024).
+-define(DEFAULT_DOWNLOAD_BUFFER_MB, 256).
 -define(DEADLOCK_HEADROOM, 8).
+%% Starting estimate of a block's wire size, before any has arrived; the
+%% running average (1/8 weight per block) replaces it quickly.
+-define(INITIAL_BLOCK_SIZE_ESTIMATE, (1024 * 1024)).
 
 %% Max blocks to validate per gen_server iteration (yield to process messages)
 -define(MAX_VALIDATE_BATCH, 50).
@@ -135,10 +143,36 @@
     %% Reverse index: Hash -> Height (for fast block arrival lookup)
     hash_to_height = #{}   :: #{binary() => non_neg_integer()},
 
-    %% Height -> #block{} — downloaded but not yet validated
-    downloaded = #{}       :: #{non_neg_integer() => #block{}},
-    %% Running erlang:external_size of downloaded values (RSS bound).
+    %% Height -> raw block payload (wire bytes, as received) or, for a
+    %% block that only exists decoded (a reconstructed compact block), a
+    %% #block{} -- downloaded but not yet validated. Raw payloads are
+    %% decoded just before connect, in the validation worker.
+    downloaded = #{}       :: #{non_neg_integer() => binary() | #block{}},
+    %% Running size of downloaded values: byte_size of a raw payload,
+    %% erlang:external_size of a decoded #block{} (RSS bound).
     downloaded_bytes = 0   :: non_neg_integer(),
+    %% Running average wire size of received blocks; estimates the bytes
+    %% still in flight so requests stop before the byte cap is reached.
+    avg_block_bytes = ?INITIAL_BLOCK_SIZE_ESTIMATE :: pos_integer(),
+
+    %% Validation off the download process. When async_validate is true
+    %% (init/1 sets it from app env block_sync_async_validate, default
+    %% true) each block is connected by a short-lived worker process, so
+    %% this process keeps receiving blocks and sending getdata while a
+    %% block connects. Blocks still connect strictly in height order: at
+    %% most one worker is `connecting` (always the block at
+    %% next_to_validate), and at most one more is `prepared` (decodes and
+    %% runs the context-free check of the next block, then waits for a go
+    %% before it may touch the chain). With async_validate false (the
+    %% record default, used by the callback-driven unit tests) the block
+    %% is validated inline, as before.
+    async_validate = false :: boolean(),
+    connecting = undefined :: undefined | map(),
+    prepared = undefined   :: undefined | map(),
+    %% Control casts that arrived while a block was connecting; replayed,
+    %% in order, after that connect's result is applied, so they see the
+    %% same state they would have seen with inline validation.
+    deferred = []          :: [term()],
 
     %% Next height that needs sequential validation
     next_to_validate = 0   :: non_neg_integer(),
@@ -242,6 +276,7 @@ test_state(Overrides) ->
         (stuck_ticks, V, S)      -> S#state{stuck_ticks = V};
         (block_source, V, S)     -> S#state{block_source = V};
         (params, V, S)           -> S#state{params = V};
+        (async_validate, V, S)   -> S#state{async_validate = V};
         (peer_stats, V, S) ->
             S#state{peer_stats = maps:map(
                 fun(_Pid, Count) ->
@@ -260,7 +295,10 @@ test_get(target_height, S)    -> S#state.target_height;
 test_get(peers, S)            -> S#state.peers;
 test_get(stuck_ticks, S)      -> S#state.stuck_ticks;
 test_get(validation_failures, S) -> S#state.validation_failures;
-test_get(notfound_from, S)    -> S#state.notfound_from.
+test_get(notfound_from, S)    -> S#state.notfound_from;
+test_get(connecting, S)       -> S#state.connecting;
+test_get(prepared, S)         -> S#state.prepared;
+test_get(deferred, S)         -> S#state.deferred.
 -endif.
 
 %%% ===================================================================
@@ -306,7 +344,8 @@ chain_invalidated() ->
     gen_server:cast(?SERVER, chain_invalidated).
 
 %% @doc Handle a received block from a peer.
--spec handle_block(pid(), #block{}) -> ok.
+%% Block is the raw `block` payload (wire bytes) or a decoded #block{}.
+-spec handle_block(pid(), binary() | #block{}) -> ok.
 handle_block(Peer, Block) ->
     gen_server:cast(?SERVER, {block, Peer, Block}).
 
@@ -363,8 +402,11 @@ init([]) ->
     end,
     %% Cache the height of the assumevalid block
     AVHeight = lookup_assume_valid_height(AssumeValid),
+    Async = application:get_env(beamchain, block_sync_async_validate, true)
+            =/= false,
     {ok, #state{params = Params, assume_valid = AssumeValid,
-                assume_valid_height = AVHeight}}.
+                assume_valid_height = AVHeight,
+                async_validate = Async}}.
 
 handle_call({peer_has_blocks_in_flight, Peer}, _From,
             #state{in_flight = InFlight} = State) ->
@@ -386,7 +428,34 @@ handle_call(get_status, _From, State) ->
 handle_call(_Request, _From, State) ->
     {reply, {error, not_implemented}, State}.
 
-handle_cast({start_sync, Opts}, #state{status = idle,
+%% A block is connecting in a worker: hold every cast that would reset or
+%% re-plan the download (or connect a block itself) until that connect's
+%% result is applied. With inline validation these could only be handled
+%% between two connects; deferring them keeps exactly that order.
+handle_cast(Msg, #state{connecting = C, deferred = D} = State)
+  when C =/= undefined ->
+    case is_deferrable(Msg) of
+        true -> {noreply, State#state{deferred = D ++ [Msg]}};
+        false -> handle_cast_now(Msg, State)
+    end;
+handle_cast(Msg, State) ->
+    handle_cast_now(Msg, State).
+
+is_deferrable({start_sync, _}) -> true;
+is_deferrable(stale_tip_rearm) -> true;
+is_deferrable(chain_invalidated) -> true;
+is_deferrable(stop_sync) -> true;
+is_deferrable({cmpctblock, _, _}) -> true;
+is_deferrable({blocktxn, _, _}) -> true;
+is_deferrable(_) -> false.
+
+%% Raw block payload from beamchain_sync (the wire bytes, not decoded).
+handle_cast_now({block, Peer, Bin}, State) when is_binary(Bin) ->
+    {noreply, handle_raw_block(Peer, Bin, State)};
+handle_cast_now(Msg, State) ->
+    handle_cast_1(Msg, State).
+
+handle_cast_1({start_sync, Opts}, #state{status = idle,
                                          assume_valid = AV} = State) ->
     TargetHeight = clamp_to_header_tip(maps:get(target_height, Opts, 0)),
     ProgressCb = maps:get(progress_cb, Opts, undefined),
@@ -462,7 +531,7 @@ handle_cast({start_sync, Opts}, #state{status = idle,
 %% peer-announced heights never re-opened the download cursor).
 %% Reference: bitcoin-core/src/net_processing.cpp — FindNextBlocksToDownload
 %% is invoked unconditionally per peer-message tick; IBD is a dynamic predicate.
-handle_cast({start_sync, Opts}, #state{status = complete} = State) ->
+handle_cast_1({start_sync, Opts}, #state{status = complete} = State) ->
     StartHeight = find_start_height(),
     TargetHeight = clamp_to_header_tip(
                      maps:get(target_height, Opts, State#state.target_height)),
@@ -480,7 +549,7 @@ handle_cast({start_sync, Opts}, #state{status = complete} = State) ->
             %% all the bookkeeping (queue rebuild, timers, peer gather).
             %% cancel_timers is safe even if timers are already undefined.
             State2 = cancel_timers(State),
-            handle_cast({start_sync, Opts},
+            handle_cast_1({start_sync, Opts},
                         State2#state{status = idle,
                                      download_queue = [],
                                      in_flight = #{},
@@ -496,7 +565,7 @@ handle_cast({start_sync, Opts}, #state{status = complete} = State) ->
 %% start_sync arriving mid-syncing: extend the download queue to a higher
 %% target if the new target exceeds the current one. Common path: header_sync
 %% ticks while block_sync is still draining the previous range.
-handle_cast({start_sync, Opts}, #state{status = syncing,
+handle_cast_1({start_sync, Opts}, #state{status = syncing,
                                        target_height = OldTarget,
                                        download_queue = Queue} = State) ->
     NewTarget = clamp_to_header_tip(maps:get(target_height, Opts, OldTarget)),
@@ -514,7 +583,7 @@ handle_cast({start_sync, Opts}, #state{status = syncing,
             {noreply, State}
     end;
 
-handle_cast(stale_tip_rearm, State) ->
+handle_cast_1(stale_tip_rearm, State) ->
     ChainTip = case beamchain_chainstate:get_tip() of
         {ok, {_, H}} -> H;
         _ -> undefined
@@ -530,7 +599,7 @@ handle_cast(stale_tip_rearm, State) ->
                             maps:size(State#state.in_flight),
                             maps:size(State#state.downloaded)]),
             State2 = cancel_timers(State),
-            handle_cast({start_sync, #{target_height => HT}},
+            handle_cast_1({start_sync, #{target_height => HT}},
                         State2#state{status = idle,
                                      download_queue = [],
                                      in_flight = #{},
@@ -543,7 +612,7 @@ handle_cast(stale_tip_rearm, State) ->
             {noreply, State}
     end;
 
-handle_cast(chain_invalidated, State) ->
+handle_cast_1(chain_invalidated, State) ->
     State2 = cancel_timers(State),
     {noreply, State2#state{status = idle,
                            download_queue = [],
@@ -553,31 +622,31 @@ handle_cast(chain_invalidated, State) ->
                            downloaded_bytes = 0,
                            block_source = #{}}};
 
-handle_cast(stop_sync, State) ->
+handle_cast_1(stop_sync, State) ->
     State2 = cancel_timers(State),
     {noreply, State2#state{status = idle, in_flight = #{},
                             hash_to_height = #{},
                             downloaded = #{}, downloaded_bytes = 0,
                             download_queue = []}};
 
-handle_cast({block, Peer, Block}, #state{status = syncing} = State) ->
+handle_cast_1({block, Peer, Block}, #state{status = syncing} = State) ->
     State2 = handle_block_received(Peer, Block, State),
     {noreply, State2};
-handle_cast({block, Peer, Block}, State) ->
+handle_cast_1({block, Peer, Block}, State) ->
     %% Unsolicited block (not in syncing state) — validate and connect
     %% directly. This handles blocks fetched via getdata from inv
     %% announcements when we're idle or complete.
     State2 = handle_unsolicited_block(Peer, Block, State),
     {noreply, State2};
 
-handle_cast({notfound, Peer, Items}, #state{status = syncing} = State) ->
+handle_cast_1({notfound, Peer, Items}, #state{status = syncing} = State) ->
     State2 = handle_notfound_items(Peer, Items, State),
     State3 = fill_pipeline(State2),
     {noreply, State3};
-handle_cast({notfound, _Peer, _Items}, State) ->
+handle_cast_1({notfound, _Peer, _Items}, State) ->
     {noreply, State};
 
-handle_cast({peer_connected, Peer, Info}, State) ->
+handle_cast_1({peer_connected, Peer, Info}, State) ->
     Peers = maps:put(Peer, Info, State#state.peers),
     PeerStats = case maps:is_key(Peer, State#state.peer_stats) of
         true -> State#state.peer_stats;
@@ -591,7 +660,7 @@ handle_cast({peer_connected, Peer, Info}, State) ->
     end,
     {noreply, State3};
 
-handle_cast({peer_disconnected, Peer}, State) ->
+handle_cast_1({peer_disconnected, Peer}, State) ->
     State2 = handle_peer_disconnect(Peer, State),
     {noreply, State2};
 
@@ -601,18 +670,18 @@ handle_cast({peer_disconnected, Peer}, State) ->
 %% that honored our sendcmpct announce=true. Both must be processed —
 %% dropping the post-IBD case re-introduces the 1-2 block tip lag the
 %% sendcmpct-announce fix was meant to close.
-handle_cast({cmpctblock, Peer, CmpctBlock}, State) ->
+handle_cast_1({cmpctblock, Peer, CmpctBlock}, State) ->
     State2 = handle_cmpctblock_received(Peer, CmpctBlock, State),
     {noreply, State2};
 
 %% BIP152 blocktxn response
-handle_cast({blocktxn, Peer, BlockTxn}, #state{status = syncing} = State) ->
+handle_cast_1({blocktxn, Peer, BlockTxn}, #state{status = syncing} = State) ->
     State2 = handle_blocktxn_received(Peer, BlockTxn, State),
     {noreply, State2};
-handle_cast({blocktxn, _Peer, _BlockTxn}, State) ->
+handle_cast_1({blocktxn, _Peer, _BlockTxn}, State) ->
     {noreply, State};
 
-handle_cast(_Msg, State) ->
+handle_cast_1(_Msg, State) ->
     {noreply, State}.
 
 handle_info(stall_check, #state{status = syncing,
@@ -626,7 +695,11 @@ handle_info(stall_check, #state{status = syncing,
     Timer = erlang:send_after(?STALL_CHECK_INTERVAL, self(), stall_check),
     State4 = fill_pipeline(State3#state{stall_timer = Timer}),
     %% Log stall detection and escalate if wedged at same height.
+    %% A block connecting in a worker is validation in progress, not a
+    %% download stall (inline validation held this process for the whole
+    %% connect, so a tick could never observe one).
     Stuck = State4#state.next_to_validate =:= NextH
+            andalso State4#state.connecting =:= undefined
             andalso (maps:size(State4#state.downloaded) > 0
                      orelse maps:size(State4#state.in_flight) > 0),
     State5 = case Stuck of
@@ -684,6 +757,23 @@ handle_info(continue_validation, #state{status = syncing} = State) ->
     State2 = validate_sequential(State),
     State3 = fill_pipeline(State2),
     {noreply, State3};
+
+%% The connecting worker's result. Applied exactly as an inline connect's
+%% result would be, then the deferred casts are replayed and the next
+%% block (if any) starts connecting.
+handle_info({bs_validated, Ref, Height, Result},
+            #state{connecting = #{ref := Ref, mref := MRef}} = State) ->
+    erlang:demonitor(MRef, [flush]),
+    {noreply, finish_connect(Height, Result, State)};
+%% The connecting worker died without a result (it was killed, or crashed
+%% outside the connect's own try): a local fault, never a verdict.
+handle_info({'DOWN', MRef, process, _Pid, Reason},
+            #state{connecting = #{mref := MRef, height := Height}} = State) ->
+    {noreply, finish_connect(Height,
+                             {error, {exit_during_connect, Reason}}, State)};
+handle_info({'DOWN', MRef, process, _Pid, _Reason},
+            #state{prepared = #{mref := MRef}} = State) ->
+    {noreply, State#state{prepared = undefined}};
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -863,19 +953,48 @@ gather_connected_peers() ->
 %%% ===================================================================
 
 max_downloaded_ahead() -> ?MAX_DOWNLOADED_AHEAD.
-max_downloaded_bytes() -> ?MAX_DOWNLOADED_BYTES.
 
+%% Byte cap of the ahead-of-validation buffer. Never below 8 MiB, so the
+%% largest possible block (4 MB serialized) always fits.
+max_downloaded_bytes() ->
+    MB = case application:get_env(beamchain, block_download_buffer_mb,
+                                  ?DEFAULT_DOWNLOAD_BUFFER_MB) of
+        N when is_integer(N) -> N;
+        _ -> ?DEFAULT_DOWNLOAD_BUFFER_MB
+    end,
+    max(8, MB) * 1024 * 1024.
+
+%% A raw payload is held as its own bytes; a decoded block costs about its
+%% external term size.
+block_mem_bytes(Bin) when is_binary(Bin) ->
+    byte_size(Bin);
 block_mem_bytes(Block) ->
     erlang:external_size(Block).
 
-pipeline_full(#state{downloaded = D, in_flight = IF,
-                     downloaded_bytes = B}) ->
-    maps:size(D) + maps:size(IF) >= ?MAX_DOWNLOADED_AHEAD
-        orelse B >= ?MAX_DOWNLOADED_BYTES.
+%% Bytes the blocks now in flight are expected to add when they arrive.
+in_flight_bytes(#state{in_flight = IF, avg_block_bytes = Avg}) ->
+    maps:size(IF) * Avg.
 
-%% Insert a decoded block into the ahead-of-validation buffer, or
-%% re-queue it when the count/byte budget is full. Always keep
-%% next_to_validate so sequential connect can make progress.
+pipeline_full(#state{downloaded = D, in_flight = IF,
+                     downloaded_bytes = B} = State) ->
+    maps:size(D) + maps:size(IF) >= ?MAX_DOWNLOADED_AHEAD
+        orelse B + in_flight_bytes(State) >= max_downloaded_bytes().
+
+%% How many more blocks may be requested before the count or byte budget
+%% is used up (bytes estimated from the running average block size).
+request_capacity(#state{downloaded = D, in_flight = IF,
+                        downloaded_bytes = B,
+                        avg_block_bytes = Avg} = State) ->
+    ByCount = ?MAX_DOWNLOADED_AHEAD - maps:size(D) - maps:size(IF),
+    ByBytes = (max_downloaded_bytes() - B - in_flight_bytes(State))
+              div max(1, Avg),
+    max(0, min(ByCount, ByBytes)).
+
+%% Insert a downloaded block (raw payload or decoded) into the
+%% ahead-of-validation buffer, or re-queue it when the count/byte budget
+%% is full. next_to_validate is always kept so sequential connect can make
+%% progress; to keep the buffer within its byte cap the highest buffered
+%% blocks are given back to the queue to make room for it.
 admit_downloaded(#state{downloaded = D, downloaded_bytes = Bytes,
                         next_to_validate = Next,
                         download_queue = Queue} = State,
@@ -885,17 +1004,43 @@ admit_downloaded(#state{downloaded = D, downloaded_bytes = Bytes,
             State;
         false ->
             BlockBytes = block_mem_bytes(Block),
-            MustKeep = Height =:= Next,
-            Over = maps:size(D) >= ?MAX_DOWNLOADED_AHEAD
-                   orelse Bytes + BlockBytes > ?MAX_DOWNLOADED_BYTES,
-            case MustKeep orelse not Over of
+            Cap = max_downloaded_bytes(),
+            case Height =:= Next of
                 true ->
-                    State#state{downloaded = maps:put(Height, Block, D),
-                                downloaded_bytes = Bytes + BlockBytes};
+                    State1 = make_room(BlockBytes, Cap, State),
+                    put_downloaded(Height, Block, BlockBytes, State1);
                 false ->
-                    Queue1 = [Height | lists:delete(Height, Queue)],
-                    State#state{download_queue = Queue1}
+                    Over = maps:size(D) >= ?MAX_DOWNLOADED_AHEAD
+                           orelse Bytes + BlockBytes > Cap,
+                    case Over of
+                        false ->
+                            put_downloaded(Height, Block, BlockBytes, State);
+                        true ->
+                            Queue1 = [Height | lists:delete(Height, Queue)],
+                            State#state{download_queue = Queue1}
+                    end
             end
+    end.
+
+put_downloaded(Height, Block, BlockBytes,
+               #state{downloaded = D, downloaded_bytes = Bytes} = State) ->
+    State#state{downloaded = maps:put(Height, Block, D),
+                downloaded_bytes = Bytes + BlockBytes}.
+
+%% Give the highest buffered blocks back to the queue until BlockBytes
+%% more fit under Cap. Only called for next_to_validate, which is not
+%% buffered, so no validation worker holds any of these heights.
+make_room(BlockBytes, Cap, #state{downloaded = D,
+                                  downloaded_bytes = Bytes} = State) ->
+    case Bytes + BlockBytes > Cap andalso maps:size(D) > 0 of
+        true ->
+            Top = lists:max(maps:keys(D)),
+            State1 = remove_downloaded(Top, State),
+            Queue1 = [Top | lists:delete(Top, State1#state.download_queue)],
+            make_room(BlockBytes, Cap,
+                      State1#state{download_queue = Queue1});
+        false ->
+            State
     end.
 
 remove_downloaded(Height, #state{downloaded = D,
@@ -1094,7 +1239,6 @@ assign_blocks_round_robin(_Peers, _AllPeers,
     State;
 assign_blocks_round_robin([Peer | RestPeers], AllPeers, State) ->
     TotalInFlight = maps:size(State#state.in_flight),
-    DownloadedAhead = maps:size(State#state.downloaded),
     case pipeline_full(State) of
         true ->
             State;
@@ -1105,8 +1249,7 @@ assign_blocks_round_robin([Peer | RestPeers], AllPeers, State) ->
             PeerCapacity = ?MAX_PER_PEER -
                            PeerStats#peer_stats.in_flight_count,
             GlobalCapacity = ?MAX_IN_FLIGHT - TotalInFlight,
-            MemCapacity = max(0, ?MAX_DOWNLOADED_AHEAD
-                                 - DownloadedAhead - TotalInFlight),
+            MemCapacity = request_capacity(State),
             BatchSize = min(PeerCapacity,
                             min(GlobalCapacity, MemCapacity)),
             case BatchSize > 0 of
@@ -1221,9 +1364,53 @@ take_from_queue(N, [H | T], Acc) ->
 %%% Internal: block arrival and validation
 %%% ===================================================================
 
+%% A raw block payload (the wire bytes of a `block` message). beamchain_sync
+%% forwards it undecoded so the decode happens once, in the validation
+%% worker, and the buffer holds the compact wire form. Its hash is the
+%% hash of the 80-byte header that starts it. A payload we did not ask for
+%% (or that arrives outside block download) is decoded here and goes the
+%% old decoded-block way; a payload that does not decode costs its sender
+%% the same 20 points beamchain_sync used to give.
+handle_raw_block(Peer, <<HeaderBin:80/binary, _/binary>> = Bin,
+                 #state{status = syncing, hash_to_height = H2H} = State) ->
+    Hash = beamchain_crypto:hash256(HeaderBin),
+    case maps:is_key(Hash, H2H) of
+        true -> handle_block_received(Peer, own_binary(Bin), Hash, State);
+        false -> decode_and_handle(Peer, Bin, State)
+    end;
+handle_raw_block(Peer, Bin, State) ->
+    decode_and_handle(Peer, Bin, State).
+
+decode_and_handle(Peer, Bin, State) ->
+    case beamchain_p2p_msg:decode_payload(block, Bin) of
+        {ok, #block{} = Block} ->
+            {noreply, State2} = handle_cast_1({block, Peer, Block}, State),
+            State2;
+        _Error ->
+            beamchain_peer:add_misbehavior(Peer, 20),
+            State
+    end.
+
+%% A payload can be a sub-binary of a larger receive buffer; holding it
+%% would keep the whole buffer alive and the byte count would understate
+%% it. Copy in that case so byte_size is what is really held.
+own_binary(Bin) ->
+    case binary:referenced_byte_size(Bin) > byte_size(Bin) of
+        true -> binary:copy(Bin);
+        false -> Bin
+    end.
+
+%% Hash of a buffered block: raw payload or decoded #block{}.
+buffered_hash(<<HeaderBin:80/binary, _/binary>>) ->
+    beamchain_crypto:hash256(HeaderBin);
+buffered_hash(#block{header = Header}) ->
+    beamchain_serialize:block_hash(Header).
+
 handle_block_received(Peer, Block, State) ->
     BlockHash = beamchain_serialize:block_hash(Block#block.header),
+    handle_block_received(Peer, Block, BlockHash, State).
 
+handle_block_received(Peer, Block, BlockHash, State) ->
     %% Use hash_to_height reverse index for O(1) lookup
     case maps:find(BlockHash, State#state.hash_to_height) of
         {ok, Height} ->
@@ -1249,7 +1436,10 @@ handle_block_received(Peer, Block, State) ->
                         block_source = maps:put(Height, Peer,
                                                 State#state.block_source),
                         notfound_from = maps:remove(BlockHash,
-                                                    State#state.notfound_from)
+                                                    State#state.notfound_from),
+                        avg_block_bytes = update_avg_block_bytes(
+                                            Block,
+                                            State#state.avg_block_bytes)
                     },
                     %% Store in downloaded map, or re-queue if over budget
                     State2 = admit_downloaded(State1, Height, Block),
@@ -1389,6 +1579,13 @@ handle_unsolicited_block(Peer, Block, State) ->
             end
     end.
 
+%% Running average wire size (weight 1/8 per block). Only raw payloads
+%% carry their wire size; a decoded block leaves the estimate alone.
+update_avg_block_bytes(Bin, Avg) when is_binary(Bin) ->
+    max(1, (Avg * 7 + byte_size(Bin)) div 8);
+update_avg_block_bytes(_Block, Avg) ->
+    Avg.
+
 %% Update peer stats after receiving a block.
 update_peer_block_received(Peer, ResponseMs, AllStats) ->
     Stats = maps:get(Peer, AllStats, #peer_stats{}),
@@ -1404,8 +1601,14 @@ update_peer_block_received(Peer, ResponseMs, AllStats) ->
     maps:put(Peer, Stats2, AllStats).
 
 %% Validate blocks sequentially starting from next_to_validate.
-%% Limits to MAX_VALIDATE_BATCH blocks per call to avoid blocking
-%% the gen_server loop (which would prevent stall checks and new blocks).
+%%
+%% Async (production): hand the block at next_to_validate to a validation
+%% worker and return at once; the worker's result comes back as
+%% {bs_validated, ...} (finish_connect/3), which applies it and starts the
+%% next block. Inline (async_validate = false): connect every consecutive
+%% buffered block here, as before.
+validate_sequential(#state{async_validate = true} = State) ->
+    validate_async(State);
 validate_sequential(State) ->
     validate_sequential(State, ?MAX_VALIDATE_BATCH).
 
@@ -1414,8 +1617,7 @@ validate_sequential(State, 0) ->
     %% Refresh in-flight timestamps so validation time isn't counted as stall.
     self() ! continue_validation,
     refresh_in_flight_timestamps(State);
-validate_sequential(#state{next_to_validate = NextH,
-                            downloaded = Downloaded} = State, Remaining) ->
+validate_sequential(State, Remaining) ->
     case beamchain_chainstate:is_chain_paused() of
         true ->
             %% dumptxoutset rollback in progress (Core NetworkDisable): the
@@ -1424,7 +1626,7 @@ validate_sequential(#state{next_to_validate = NextH,
             %% counted as a validation failure.
             park_for_chain_pause(State);
         false ->
-            validate_sequential_unpaused(State, NextH, Downloaded, Remaining)
+            validate_sequential_inner(fast_forward(State), Remaining)
     end.
 
 park_for_chain_pause(State) ->
@@ -1443,14 +1645,15 @@ park_for_chain_pause(State) ->
     end,
     refresh_in_flight_timestamps(State).
 
-validate_sequential_unpaused(State, NextH, Downloaded, Remaining) ->
-    %% Fast-forward: if next_to_validate is behind the chainstate tip,
-    %% skip directly to tip+1 (avoids re-downloading already-connected
-    %% blocks). But only over heights where the connected chainstate
-    %% AGREES with the active header chain — when the header chain has
-    %% reorganised to a heavier fork below the connected tip, the blocks
-    %% from fork_point+1 must be re-downloaded and reconnected via the
-    %% reorg path, so we must not fast-forward past the fork point.
+%% Fast-forward: if next_to_validate is behind the chainstate tip,
+%% skip directly to tip+1 (avoids re-downloading already-connected
+%% blocks). But only over heights where the connected chainstate
+%% AGREES with the active header chain — when the header chain has
+%% reorganised to a heavier fork below the connected tip, the blocks
+%% from fork_point+1 must be re-downloaded and reconnected via the
+%% reorg path, so we must not fast-forward past the fork point.
+fast_forward(#state{next_to_validate = NextH,
+                    downloaded = Downloaded} = State) ->
     case beamchain_chainstate:get_tip() of
         {ok, {TipHash, TipH}} when TipH >= NextH ->
             %% Highest height the connected chain still agrees with the
@@ -1469,108 +1672,290 @@ validate_sequential_unpaused(State, NextH, Downloaded, Remaining) ->
                                           State, StaleKeys),
                     Queue2 = [H || H <- StateFF#state.download_queue,
                                    H > FFTarget],
-                    State2 = StateFF#state{
+                    StateFF#state{
                         next_to_validate = FFTarget + 1,
                         download_queue = Queue2
-                    },
-                    validate_sequential_inner(State2, Remaining);
+                    };
                 false ->
                     %% next_to_validate is already at or past the fork
                     %% point (fork-aware re-download in progress) — do
                     %% not fast-forward over the divergent region.
-                    validate_sequential_inner(State, Remaining)
+                    State
             end;
         _ ->
-            validate_sequential_inner(State, Remaining)
+            State
     end.
 
 validate_sequential_inner(#state{next_to_validate = NextH,
                             downloaded = Downloaded} = State, Remaining) ->
     case maps:find(NextH, Downloaded) of
-        {ok, Block} ->
-            case validate_and_connect(NextH, Block, State) of
-                {ok, Outcome, State2} ->
-                    %% All three success outcomes advance the sequential
-                    %% cursor (the block was durably accepted at NextH);
-                    %% Outcome only controls logging + whether the active-
-                    %% chain post-steps ran inside validate_and_connect:
-                    %%   active      — extended the active tip (linear IBD or
-                    %%                 a direct extension accepted by submit).
-                    %%   reorg       — this block's branch overtook the active
-                    %%                 chain; the tip flipped to the heavier
-                    %%                 fork (Core ActivateBestChain). Advance
-                    %%                 and continue connecting its descendants.
-                    %%   side_branch — the fork is still building up BELOW the
-                    %%                 active tip (not yet heavier). The block
-                    %%                 is stored on the side-branch index; we
-                    %%                 advance WITHOUT requiring it to connect
-                    %%                 to the active tip, so the next fork block
-                    %%                 can be fetched and submitted until one
-                    %%                 tips the work balance and triggers the
-                    %%                 reorg above.
-                    case Outcome of
-                        active ->
-                            ok;
-                        reorg ->
-                            logger:info("block_sync: reorg at height ~B — "
-                                        "active tip flipped to the heavier "
-                                        "branch", [NextH]);
-                        side_branch ->
-                            logger:info("block_sync: height ~B accepted on a "
-                                        "side branch below the active tip "
-                                        "(fork still building)", [NextH])
-                    end,
-                    %% Remove from downloaded, advance counter
-                    State3a = remove_downloaded(NextH, State2),
-                    State3 = State3a#state{
-                        next_to_validate = NextH + 1,
-                        blocks_validated = State2#state.blocks_validated + 1
-                    },
+        {ok, Entry} ->
+            Result = validate_inline(NextH, Entry, State),
+            case apply_validation_result(NextH, buffered_hash(Entry),
+                                         Result, State) of
+                {continue, State3} ->
                     %% Continue validating the next one
                     validate_sequential_inner(State3, Remaining - 1);
-                {skip_to, SkipH, State2} ->
-                    %% Block was already connected — jump next_to_validate
-                    %% to TipH+1 and discard any stale buffered blocks below
-                    %% that height to avoid re-downloading them.
-                    logger:info("block_sync: skipping next_to_validate "
-                                "from ~B to ~B (tip already ahead)",
-                                [NextH, SkipH]),
-                    StaleKeys = [K || K <- maps:keys(Downloaded)
-                                    , K < SkipH],
-                    State2a = lists:foldl(fun remove_downloaded/2,
-                                          State2, StaleKeys),
-                    %% Also clear any stale entries from download_queue
-                    Queue2 = [H || H <- State2a#state.download_queue,
-                                   H >= SkipH],
-                    State3 = State2a#state{
-                        next_to_validate = SkipH,
-                        download_queue = Queue2
-                    },
-                    validate_sequential_inner(State3, Remaining - 1);
-                {error, chain_paused} ->
-                    %% The pause began between the check above and the
-                    %% connect: keep the block buffered, retry after it.
-                    park_for_chain_pause(State);
-                {error, Reason} ->
-                    case {beamchain_fatal:is_aborted(),
-                          is_consensus_verdict(Reason)} of
-                        {true, _} ->
-                            %% Gate 6: the node is latched (AbortNode).
-                            %% Whatever this connect returned, it is not a
-                            %% verdict; stop, mark nothing, punish nobody.
-                            halt_sync_aborted(NextH, Reason, State);
-                        {false, true} ->
-                            invalid_block_found(NextH, Block, Reason, State);
-                        {false, false} when Reason =:= duplicate_invalid ->
-                            cached_invalid_block(NextH, Block, State);
-                        {false, false} ->
-                            validation_retry_or_halt(NextH, Reason, State)
-                    end
+                {stop, State3} ->
+                    State3
             end;
         error ->
             %% Not yet downloaded, nothing to do
             State
     end.
+
+validate_inline(Height, Entry, State) ->
+    case decode_buffered(Entry) of
+        {ok, Block} -> connect_result(validate_and_connect(Height, Block, State));
+        {error, Reason} -> {decode_error, Reason}
+    end.
+
+connect_result({ok, Outcome, _State}) -> {ok, Outcome};
+connect_result({skip_to, SkipH, _State}) -> {skip_to, SkipH};
+connect_result({error, _} = Error) -> Error.
+
+%% A buffered raw payload is decoded with the very function beamchain_sync
+%% used before it forwarded payloads raw, so what decodes (and what does
+%% not) is unchanged.
+decode_buffered(#block{} = Block) ->
+    {ok, Block};
+decode_buffered(Bin) when is_binary(Bin) ->
+    case beamchain_p2p_msg:decode_payload(block, Bin) of
+        {ok, #block{} = Block} -> {ok, Block};
+        {error, Reason} -> {error, Reason};
+        Other -> {error, Other}
+    end.
+
+%% Apply the result of connecting the block at NextH (hash Hash) to the
+%% download state. Shared by inline and async validation, so both make the
+%% same decisions. {continue, _} when the cursor advanced (the caller may
+%% connect the next block), {stop, _} otherwise.
+apply_validation_result(NextH, _Hash, {ok, Outcome}, State) ->
+    %% All three success outcomes advance the sequential cursor (the
+    %% block was durably accepted at NextH); Outcome only controls
+    %% logging + whether the active-chain post-steps ran inside
+    %% validate_and_connect:
+    %%   active      — extended the active tip (linear IBD or a direct
+    %%                 extension accepted by submit).
+    %%   reorg       — this block's branch overtook the active chain; the
+    %%                 tip flipped to the heavier fork (Core
+    %%                 ActivateBestChain). Advance and continue connecting
+    %%                 its descendants.
+    %%   side_branch — the fork is still building up BELOW the active tip
+    %%                 (not yet heavier). The block is stored on the
+    %%                 side-branch index; we advance WITHOUT requiring it
+    %%                 to connect to the active tip, so the next fork block
+    %%                 can be fetched and submitted until one tips the work
+    %%                 balance and triggers the reorg above.
+    case Outcome of
+        active ->
+            ok;
+        reorg ->
+            logger:info("block_sync: reorg at height ~B — "
+                        "active tip flipped to the heavier "
+                        "branch", [NextH]);
+        side_branch ->
+            logger:info("block_sync: height ~B accepted on a "
+                        "side branch below the active tip "
+                        "(fork still building)", [NextH])
+    end,
+    %% Remove from downloaded, advance counter
+    State3a = remove_downloaded(NextH, State),
+    {continue, State3a#state{
+                 next_to_validate = NextH + 1,
+                 blocks_validated = State#state.blocks_validated + 1
+               }};
+apply_validation_result(NextH, _Hash, {skip_to, SkipH}, State) ->
+    %% Block was already connected — jump next_to_validate to TipH+1 and
+    %% discard any stale buffered blocks below that height to avoid
+    %% re-downloading them.
+    logger:info("block_sync: skipping next_to_validate "
+                "from ~B to ~B (tip already ahead)",
+                [NextH, SkipH]),
+    StaleKeys = [K || K <- maps:keys(State#state.downloaded), K < SkipH],
+    State2a = lists:foldl(fun remove_downloaded/2, State, StaleKeys),
+    %% Also clear any stale entries from download_queue
+    Queue2 = [H || H <- State2a#state.download_queue, H >= SkipH],
+    {continue, State2a#state{
+                 next_to_validate = SkipH,
+                 download_queue = Queue2
+               }};
+apply_validation_result(_NextH, _Hash, {error, chain_paused}, State) ->
+    %% The pause began between the check above and the connect: keep the
+    %% block buffered, retry after it.
+    {stop, park_for_chain_pause(State)};
+apply_validation_result(NextH, Hash, {decode_error, Reason}, State) ->
+    %% The payload under a requested header does not decode as a block.
+    %% Not a verdict about the header (another copy may be fine): score the
+    %% peer that delivered it as beamchain_sync did for an undecodable
+    %% block, drop it and request the height again.
+    Source = maps:get(NextH, State#state.block_source, undefined),
+    logger:warning("block_sync: block ~s at height ~B from ~p does not "
+                   "decode (~p) -- re-requesting",
+                   [hash_hex(Hash), NextH, Source, Reason]),
+    case is_pid(Source) of
+        true -> beamchain_peer:add_misbehavior(Source, 20);
+        false -> ok
+    end,
+    StateR = remove_downloaded(NextH, State),
+    Queue = [NextH | lists:delete(NextH, StateR#state.download_queue)],
+    {stop, StateR#state{download_queue = Queue}};
+apply_validation_result(NextH, Hash, {error, Reason}, State) ->
+    State2 = case {beamchain_fatal:is_aborted(),
+                   is_consensus_verdict(Reason)} of
+        {true, _} ->
+            %% Gate 6: the node is latched (AbortNode). Whatever this
+            %% connect returned, it is not a verdict; stop, mark nothing,
+            %% punish nobody.
+            halt_sync_aborted(NextH, Reason, State);
+        {false, true} ->
+            invalid_block_found(NextH, Hash, Reason, State);
+        {false, false} when Reason =:= duplicate_invalid ->
+            cached_invalid_block(NextH, Hash, State);
+        {false, false} ->
+            validation_retry_or_halt(NextH, Reason, State)
+    end,
+    {stop, State2}.
+
+%%% -------------------------------------------------------------------
+%%% Async validation: one worker connects the block at next_to_validate
+%%% while this process keeps downloading; one more may decode and
+%%% pre-check the next block meanwhile.
+%%% -------------------------------------------------------------------
+
+validate_async(#state{connecting = undefined} = State) ->
+    case beamchain_chainstate:is_chain_paused() of
+        true -> park_for_chain_pause(State);
+        false -> start_connect(fast_forward(State))
+    end;
+validate_async(State) ->
+    maybe_prepare_next(State).
+
+%% Start connecting the block at next_to_validate, if it is buffered:
+%% promote the prepared worker when it holds that block, else spawn one.
+start_connect(#state{next_to_validate = NextH, downloaded = D,
+                     prepared = Prepared} = State) ->
+    case maps:find(NextH, D) of
+        {ok, Entry} ->
+            {Worker, State1} =
+                case Prepared of
+                    #{height := NextH} ->
+                        {Prepared, State#state{prepared = undefined}};
+                    _ ->
+                        S1 = cancel_prepared(State),
+                        {spawn_validation(NextH, Entry, S1), S1}
+                end,
+            #{pid := Pid, ref := Ref} = Worker,
+            Pid ! {bs_go, Ref},
+            maybe_prepare_next(State1#state{connecting = Worker});
+        error ->
+            cancel_prepared(State)
+    end.
+
+%% While a block connects, let one more worker decode and pre-check the
+%% next buffered block (context-free work only; it waits for a go before
+%% it reads or changes the chain).
+maybe_prepare_next(#state{connecting = #{height := H}, prepared = undefined,
+                          downloaded = D} = State) ->
+    case maps:find(H + 1, D) of
+        {ok, Entry} ->
+            State#state{prepared = spawn_validation(H + 1, Entry, State)};
+        error ->
+            State
+    end;
+maybe_prepare_next(State) ->
+    State.
+
+cancel_prepared(#state{prepared = #{pid := Pid, mref := MRef}} = State) ->
+    erlang:demonitor(MRef, [flush]),
+    exit(Pid, kill),
+    State#state{prepared = undefined};
+cancel_prepared(State) ->
+    State.
+
+spawn_validation(Height, Entry, #state{params = Params, assume_valid = AV,
+                                       assume_valid_height = AVH}) ->
+    Parent = self(),
+    Ref = make_ref(),
+    %% Only what validate_and_connect reads; the buffers stay here.
+    Ctx = #state{params = Params, assume_valid = AV,
+                 assume_valid_height = AVH},
+    Hash = buffered_hash(Entry),
+    {Pid, MRef} = spawn_monitor(
+                    fun() ->
+                        validation_worker(Parent, Ref, Height, Entry, Ctx)
+                    end),
+    #{ref => Ref, pid => Pid, mref => MRef, height => Height, hash => Hash}.
+
+%% Decode and run the context-free check first; then wait for the go, and
+%% only then do what validate_and_connect does after its own check (tip
+%% guard, connect or submit). The check's outcome -- a value, a throw, an
+%% error -- is replayed at the same point the inline path runs it, so the
+%% result is the same as validate_and_connect's on the same block.
+validation_worker(Parent, Ref, Height, Entry, Ctx) ->
+    PMon = erlang:monitor(process, Parent),
+    Prepared = case decode_buffered(Entry) of
+        {ok, Block} -> {ok, Block, precheck(Block, Height, Ctx)};
+        {error, Reason} -> {decode_error, Reason}
+    end,
+    receive
+        {bs_go, Ref} ->
+            Result = case Prepared of
+                {decode_error, R} ->
+                    {decode_error, R};
+                {ok, Block2, Pre} ->
+                    connect_result(
+                      connect_phase(Height, Block2,
+                                    fun() -> replay_precheck(Pre) end, Ctx))
+            end,
+            Parent ! {bs_validated, Ref, Height, Result};
+        {'DOWN', PMon, process, Parent, _} ->
+            ok
+    end.
+
+precheck(Block, Height, #state{params = Params}) ->
+    try {value, check_block_step(Block, Height, Params)}
+    catch Class:Reason:Stack -> {raised, Class, Reason, Stack}
+    end.
+
+replay_precheck({value, V}) -> V;
+replay_precheck({raised, Class, Reason, Stack}) ->
+    erlang:raise(Class, Reason, Stack).
+
+%% The connecting worker finished (Result) or died. Apply the result,
+%% keep the prepared worker only if it holds the new next_to_validate and
+%% nothing was deferred, replay deferred casts, then start the next
+%% connect and refill the pipeline.
+finish_connect(Height, Result,
+               #state{connecting = #{hash := Hash}} = State0) ->
+    State = State0#state{connecting = undefined},
+    {Cont, State1} = apply_validation_result(Height, Hash, Result, State),
+    NextH = State1#state.next_to_validate,
+    State2 = case State1#state.prepared of
+        #{height := NextH} when Cont =:= continue,
+                                State1#state.deferred =:= [] ->
+            case maps:is_key(NextH, State1#state.downloaded) of
+                true -> State1;
+                false -> cancel_prepared(State1)
+            end;
+        _ ->
+            cancel_prepared(State1)
+    end,
+    State3 = replay_deferred(State2),
+    State4 = case Cont =:= continue
+                  andalso State3#state.status =:= syncing of
+        true -> validate_sequential(State3);
+        false -> State3
+    end,
+    fill_pipeline(State4).
+
+%% Replay deferred casts in arrival order while no block is connecting; if
+%% one of them starts a connect, the rest wait for that one too.
+replay_deferred(#state{deferred = [Msg | Rest], connecting = undefined} = S) ->
+    {noreply, S2} = handle_cast_now(Msg, S#state{deferred = Rest}),
+    replay_deferred(S2);
+replay_deferred(State) ->
+    State.
 
 %% The node latched (beamchain_fatal) during or before this connect: stop
 %% block download for good -- the VM is shutting down with status 1.
@@ -1629,8 +2014,7 @@ validation_retry_or_halt(NextH, Reason, State) ->
 %% Core's IsLocal exemption), and the header chain is rewound so the valid
 %% competitor at this height is fetched. The old path re-requested the block
 %% MAX_VALIDATION_RETRIES times and then halted block download for good.
-invalid_block_found(NextH, Block, Reason, State) ->
-    Hash = beamchain_serialize:block_hash(Block#block.header),
+invalid_block_found(NextH, Hash, Reason, State) ->
     Source = maps:get(NextH, State#state.block_source, undefined),
     logger:warning("block_sync: block ~s at height ~B is invalid (~p), "
                    "delivered by ~p -- marking failed, not re-requesting",
@@ -1666,8 +2050,7 @@ invalid_block_found(NextH, Block, Reason, State) ->
 %% invalid chain, and our request is the cause here).  Never retried: the
 %% header chain is rewound off it and download goes idle until it re-arms
 %% from the recomputed best header.
-cached_invalid_block(NextH, Block, State) ->
-    Hash = beamchain_serialize:block_hash(Block#block.header),
+cached_invalid_block(NextH, Hash, State) ->
     logger:warning("block_sync: block ~s at height ~B is marked invalid "
                    "(duplicate-invalid) -- not connected, not re-requested",
                    [hash_hex(Hash), NextH]),
@@ -1754,10 +2137,27 @@ said_notfound(Peer, Hash, #state{notfound_from = NF}) ->
 %% Validate and connect a single block.
 %% Delegates to beamchain_chainstate which manages the UTXO cache,
 %% then stores block data and updates the block index.
-validate_and_connect(Height, Block,
-                     #state{params = Params,
-                            assume_valid = AssumeValid,
-                            assume_valid_height = AVHeight} = State) ->
+validate_and_connect(Height, Block, #state{params = Params} = State) ->
+    connect_phase(Height, Block,
+                  fun() -> check_block_step(Block, Height, Params) end,
+                  State).
+
+%% Step 1 of validate_and_connect: the context-free block check. Returns
+%% ok or throws the reason, exactly as the inline step did.
+check_block_step(Block, Height, Params) ->
+    case beamchain_validation:check_block(Block, Params) of
+        ok -> ok;
+        {error, bad_blk_weight} ->
+            throw(weight_failure_reason(Block, Height, Params));
+        {error, E1} -> throw(E1)
+    end.
+
+%% validate_and_connect with its context-free check supplied as CheckFun
+%% (run at the same point, inside the same try): the async worker computes
+%% the check before it is allowed to connect and replays its outcome here.
+connect_phase(Height, Block, CheckFun,
+              #state{assume_valid = AssumeValid,
+                     assume_valid_height = AVHeight} = State) ->
     PrevHash = (Block#block.header)#block_header.prev_hash,
     try
         %% 0. Guard against replaying a block that was already connected
@@ -1786,12 +2186,7 @@ validate_and_connect(Height, Block,
         end,
 
         %% 1. Context-free block check
-        case beamchain_validation:check_block(Block, Params) of
-            ok -> ok;
-            {error, bad_blk_weight} ->
-                throw(weight_failure_reason(Block, Height, Params));
-            {error, E1} -> throw(E1)
-        end,
+        ok = CheckFun(),
 
         %% 2. Connect block. If it extends the connected tip (linear IBD,
         %%    the common case) use connect_block/1 — the fast path, exactly
