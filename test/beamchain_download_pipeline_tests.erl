@@ -264,32 +264,30 @@ requests() ->
 
 requested_hashes() -> [H || {_, H} <- requests()].
 
-%% Serve every request not yet served, using Deliver(Height) for the
-%% payload and Order to arrange each round, until nothing new is asked for
-%% and validation is idle. Returns the number of rounds.
+%% Serve every getdata item sent so far exactly once (a re-request of
+%% the same block is a new item and is served again), using
+%% Deliver(Height) for the payload and Order to arrange each round, until
+%% nothing new is asked for and validation is idle. Returns the number of
+%% rounds.
 serve_all(Deliver, Order) ->
-    serve_all(Deliver, Order, sets:new(), 0).
+    serve_all(Deliver, Order, 0, 0).
 
 serve_all(Deliver, Order, Served, Rounds) when Rounds < 5000 ->
-    Pending = [{P, Hash} || {P, Hash} <- requests(),
-                            not sets:is_element({P, Hash}, Served)],
-    case Pending of
+    All = requests(),
+    case lists:nthtail(Served, All) of
         [] ->
             settle(),
-            case [X || {P, Hash} = X <- requests(),
-                       not sets:is_element({P, Hash}, Served)] of
-                [] -> Rounds;
-                _ -> serve_all(Deliver, Order, Served, Rounds + 1)
+            case length(requests()) > Served of
+                true -> serve_all(Deliver, Order, Served, Rounds + 1);
+                false -> Rounds
             end;
-        _ ->
-            Batch = Order(Pending),
+        Pending ->
             lists:foreach(
               fun({P, Hash}) ->
                       beamchain_block_sync:handle_block(P, Deliver(height_of(Hash)))
-              end, Batch),
-            Served2 = lists:foldl(fun sets:add_element/2, Served, Pending),
+              end, Order(Pending)),
             settle(),
-            serve_all(Deliver, Order, Served2, Rounds + 1)
+            serve_all(Deliver, Order, length(All), Rounds + 1)
     end.
 
 %% Wait until block_sync has handled everything sent so far and no block
@@ -361,6 +359,12 @@ pipeline_test_() ->
       {"a verdict for a block connecting when chain_invalidated arrives "
        "is still applied (reference behaviour)",
        fun verdict_survives_concurrent_invalidate/0},
+      {"a check_block verdict on the block after a connecting one marks "
+       "it invalid (reference behaviour)",
+       fun prepared_check_verdict/0},
+      {"a mutated body on the block after a connecting one is "
+       "re-requested, not marked (reference behaviour)",
+       fun prepared_check_mutation/0},
       {"an undecodable payload under a requested header is scored and "
        "re-requested, not marked invalid",
        fun undecodable_solicited_payload/0},
@@ -589,6 +593,62 @@ verdict_survives_concurrent_invalidate() ->
     ?assert(meck:called(beamchain_header_sync, invalid_block_found,
                         [hash_at_height(1), 1, P])),
     ?assertMatch(#{status := idle}, status(5000)).
+
+%% check_block fails for height Bad with Reason (only on the first Times
+%% calls for that height), ok otherwise.
+fail_check(Bad, Reason, Times) ->
+    ets:insert(?T, {{check_fail, Bad}, Times}),
+    ok = meck:expect(beamchain_validation, check_block,
+        fun(#block{header = Hdr}, _) ->
+            H = height_of(beamchain_serialize:block_hash(Hdr)),
+            case ets:lookup(?T, {check_fail, H}) of
+                [{_, N}] when N > 0 ->
+                    ets:insert(?T, {{check_fail, H}, N - 1}),
+                    {error, Reason};
+                _ ->
+                    ok
+            end
+        end).
+
+%% Block 2 is buffered while block 1 connects, so with validation workers
+%% its context-free check runs ahead, in the prepared worker. A consensus
+%% verdict from that check must still be applied when block 2's turn comes:
+%% block 2 marked invalid, its sender punished, download stopped.
+prepared_check_verdict() ->
+    make_chain(20, 0),
+    fail_check(2, first_tx_not_coinbase, 1000),
+    close_gate(1),
+    [P] = start(1, 20),
+    [beamchain_block_sync:handle_block(P, decoded(H)) || H <- [1, 2, 3]],
+    ?assert(wait_until(fun() -> in_connect(1) end, 2000)),
+    release_gate(1),
+    ?assert(wait_until(
+              fun() ->
+                  meck:called(beamchain_chainstate, invalid_block_found,
+                              [hash_at_height(2)])
+              end, 5000)),
+    ?assert(meck:called(beamchain_peer_manager, misbehaving, [P, 100, '_'])),
+    ?assertEqual([1], connected_heights()),
+    ?assertMatch(#{status := idle}, status(5000)).
+
+%% Same, but the check says BLOCK_MUTATED (bad_merkle_root): not a verdict.
+%% Block 2 is dropped and asked for again, nothing is marked, and the good
+%% copy then connects.
+prepared_check_mutation() ->
+    make_chain(20, 0),
+    fail_check(2, bad_merkle_root, 1),
+    close_gate(1),
+    [P] = start(1, 20),
+    [beamchain_block_sync:handle_block(P, decoded(H)) || H <- [1, 2, 3]],
+    ?assert(wait_until(fun() -> in_connect(1) end, 2000)),
+    release_gate(1),
+    %% Keep serving: block 2 is asked for again (once a request slot is
+    %% free) and its good copy connects.
+    serve_all(fun decoded/1, fun in_order/1),
+    ?assert(length([1 || H <- requested_hashes(),
+                         H =:= hash_at_height(2)]) >= 2),
+    ?assertNot(meck:called(beamchain_chainstate, invalid_block_found, '_')),
+    ?assertEqual(lists:seq(1, 20), connected_heights()).
 
 %% The requested header followed by garbage: it does not decode. Not a
 %% verdict about the header -- the sender is scored 20 (as beamchain_sync
