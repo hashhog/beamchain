@@ -2167,15 +2167,17 @@ disconnect_block(#block{header = Header, transactions = Txs},
 %% @doc Decide whether to skip script verification for the block at Height
 %% with BlockHash, given chain consensus Params.
 %%
-%% Returns true (skip scripts) iff ALL six conditions hold:
+%% Returns true (skip scripts) iff ALL six of Core's conditions hold
+%% (ConnectBlock, validation.cpp:2349-2385):
 %%   1. assume_valid hash is configured (non-zero).
 %%   2. The assumed-valid block is present in the local block index.
-%%   3. The block being connected is at or below the assumed-valid height
-%%      (linear-chain equivalent of the ancestor check).
-%%   4. The best known header extends at or above this block's height.
-%%   5. The best-known-header's chainwork >= minimum chainwork.
-%%   6. The best-known-header is at least 2 weeks of equivalent-work
-%%      (POW_TARGET_TIMESPAN) past the block being connected.
+%%   3. The block is AV's ancestor at its height
+%%      (it->second.GetAncestor(pindex->nHeight) == pindex).
+%%   4. The block is the best header's ancestor at its height
+%%      (m_best_header->GetAncestor(pindex->nHeight) == pindex).
+%%   5. The best header's chainwork >= minimum chainwork.
+%%   6. GetBlockProofEquivalentTime(*best, *pindex, *best) > two weeks:
+%%      the chainwork between them, in block-spacing seconds.
 %%
 %% If any condition fails, scripts are verified normally.
 %% Regtest: assume_valid is always <<0:256>>, so condition 1 fails → scripts run.
@@ -2195,104 +2197,111 @@ skip_scripts(Height, BlockHash, Params) ->
             AVLookup = beamchain_db:get_block_index_by_hash(AssumeValid),
             %% Conditions 4-6: look up best known header tip.
             HdrTip = beamchain_db:get_header_tip(),
-            %% For condition 6: look up block's own index entry for its timestamp.
-            BlockEntry = beamchain_db:get_block_index(Height),
-            skip_scripts_eval(Height, BlockHash, Params, AVLookup, HdrTip, BlockEntry)
+            %% The block's own entry is looked up by hash for condition 6,
+            %% so its height slot is not read here.
+            skip_scripts_eval(Height, BlockHash, Params, AVLookup, HdrTip, not_found)
     end.
 
-%% @doc Pure evaluator for the 6-condition skip_scripts check.
-%% All DB lookups are passed in as arguments so this function is unit-testable
-%% without a running database.
+%% @doc Evaluator for the 6-condition skip_scripts check. The AV and
+%% header-tip lookups are passed in; the ancestry and chainwork reads go
+%% through beamchain_header_chain (mockable in tests).
 %%
 %% Arguments:
-%%   Height     — height of the block being connected
-%%   _BlockHash — hash of the block being connected (reserved for future use)
-%%   Params     — chain consensus params map
-%%   AVLookup   — result of beamchain_db:get_block_index_by_hash(AVHash)
-%%   HdrTip     — result of beamchain_db:get_header_tip()
-%%   BlockEntry — result of beamchain_db:get_block_index(Height)
+%%   Height      — height of the block being connected
+%%   BlockHash   — hash of the block being connected (internal byte order)
+%%   Params      — chain consensus params map
+%%   AVLookup    — result of beamchain_db:get_block_index_by_hash(AVHash)
+%%   HdrTip      — result of beamchain_db:get_header_tip()
+%%   _BlockEntry — unused; kept so existing callers keep their arity (the
+%%                 block's entry is found by hash, not by its height slot,
+%%                 which may hold another block)
 -spec skip_scripts_eval(
     non_neg_integer(), binary(), map(),
     {ok, map()} | not_found,
     {ok, map()} | not_found,
     {ok, map()} | not_found
 ) -> boolean().
-skip_scripts_eval(Height, _BlockHash, Params, AVLookup, HdrTip, BlockEntry) ->
+skip_scripts_eval(Height, BlockHash, Params, AVLookup, HdrTip, _BlockEntry) ->
     case AVLookup of
         not_found ->
             %% Condition 2 fails: assumed-valid block header not yet received.
             false;
+        {ok, #{height := AVHeight}} when Height > AVHeight ->
+            %% Condition 3 ("block height above assumevalid height").
+            false;
         {ok, #{height := AVHeight}} ->
-            %% Condition 3: block must be at or below assumed-valid height.
-            %% In beamchain's linear canonical chain, any block being connected
-            %% via connect_block IS on the canonical chain (prev_hash enforced
-            %% in do_connect_block). Therefore height =< AVHeight is a correct
-            %% linear-chain equivalent of Bitcoin Core's GetAncestor check.
-            case Height > AVHeight of
-                true ->
-                    %% Block is above the assumed-valid block → verify scripts.
+            AVHash = beamchain_serialize:reverse_bytes(
+                       maps:get(assume_valid, Params, <<0:256>>)),
+            case HdrTip of
+                not_found ->
                     false;
-                false ->
-                    %% Conditions 4-6 require the best-known-header tip.
-                    case HdrTip of
-                        not_found ->
-                            false;
-                        {ok, #{hash := HdrHash, height := HdrHeight}} ->
-                            %% Condition 4: best known header must be at or
-                            %% above this block's height (block is in the
-                            %% best header chain).
-                            case HdrHeight < Height of
-                                true ->
-                                    false;
-                                false ->
-                                    %% Conditions 5 and 6 need the header tip's
-                                    %% block index entry (chainwork + timestamp).
-                                    HdrEntry = case beamchain_db:get_block_index_by_hash(HdrHash) of
-                                        not_found -> not_found;
-                                        {ok, E} -> E
-                                    end,
-                                    check_chainwork_and_time(
-                                        Height, HdrEntry, BlockEntry, Params)
-                            end
-                    end
+                {ok, #{height := HdrHeight}} when HdrHeight < Height ->
+                    false;
+                {ok, #{hash := HdrHash}} ->
+                    %% Conditions 3 and 4. The best header chain's block at
+                    %% Height must be this block (4). If that chain also
+                    %% holds AV at AVHeight, AV's ancestor at Height is the
+                    %% same block (3). When the best header chain does not
+                    %% hold AV, Core would still skip a block that is a
+                    %% common ancestor of both; beamchain verifies it (more
+                    %% checking, never less: no invalid block is accepted).
+                    in_best_header_chain(Height, BlockHash) andalso
+                        in_best_header_chain(AVHeight, AVHash) andalso
+                        check_chainwork_and_time(
+                          BlockHash, header_entry(HdrHash), Params)
             end
     end.
 
-%% Check conditions 5 and 6 given the header tip's index entry.
-%% HdrEntry is a map (from block_index) or 'not_found'.
-%% BlockEntry is {ok, map()} | not_found for the block being connected.
-check_chainwork_and_time(_BlockHeight, not_found, _BlockEntry, _Params) ->
+in_best_header_chain(Height, Hash) ->
+    beamchain_header_chain:hash_at(Height) =:= {ok, Hash}.
+
+%% The header tip's entry, active-chain slot or side-branch index.
+header_entry(Hash) ->
+    case beamchain_header_chain:lookup(Hash) of
+        {ok, E} -> E;
+        not_found -> not_found
+    end.
+
+%% Conditions 5 and 6 for the block BlockHash, given the header tip's entry.
+check_chainwork_and_time(_BlockHash, not_found, _Params) ->
     false;
-check_chainwork_and_time(_BlockHeight, HdrEntry, BlockEntry, Params) ->
+check_chainwork_and_time(BlockHash, HdrEntry, Params) ->
     %% Condition 5: best-header chainwork >= minimum chainwork.
     MinChainwork = maps:get(min_chainwork, Params, <<0:256>>),
-    HdrChainwork = maps:get(chainwork, HdrEntry, <<0:256>>),
-    MinCWInt = binary:decode_unsigned(MinChainwork, big),
-    HdrCWInt = binary:decode_unsigned(HdrChainwork, big),
-    case HdrCWInt < MinCWInt of
+    HdrCWInt = binary:decode_unsigned(maps:get(chainwork, HdrEntry, <<0:256>>), big),
+    case HdrCWInt < binary:decode_unsigned(MinChainwork, big) of
         true ->
             false;
         false ->
-            %% Condition 6: best header must be at least POW_TARGET_TIMESPAN
-            %% (1 209 600 seconds = 2 weeks) past the block being connected.
-            %% We use header timestamps as a proxy for block-proof-equivalent
-            %% time, matching Bitcoin Core's GetBlockProofEquivalentTime intent.
-            HdrTimestamp = case maps:get(header, HdrEntry, undefined) of
-                undefined -> 0;
-                H -> H#block_header.timestamp
-            end,
-            %% Get the block being connected's timestamp from its index entry.
-            BlockTimestamp = case BlockEntry of
-                {ok, #{header := BH}} -> BH#block_header.timestamp;
-                not_found ->
-                    %% Block not yet in index (fresh IBD connecting a new block).
-                    %% Use 0 so the time-delta check passes when the header tip
-                    %% is well ahead — the only case that matters for IBD speed.
-                    0
-            end,
-            TimeDelta = HdrTimestamp - BlockTimestamp,
-            TimeDelta > ?POW_TARGET_TIMESPAN
+            %% Condition 6 (chain.cpp GetBlockProofEquivalentTime(to = best,
+            %% from = pindex, tip = best)). Without the block's own index
+            %% entry there is no chainwork to measure: verify.
+            case beamchain_header_chain:lookup(BlockHash) of
+                {ok, #{chainwork := BlockCW}} ->
+                    Spacing = maps:get(pow_target_spacing, Params, ?POW_TARGET_SPACING),
+                    TipBits = (maps:get(header, HdrEntry))#block_header.bits,
+                    proof_equivalent_time(HdrCWInt,
+                                          binary:decode_unsigned(BlockCW, big),
+                                          beamchain_pow:compute_work(TipBits),
+                                          Spacing) > ?POW_TARGET_TIMESPAN;
+                _ ->
+                    false
+            end
     end.
+
+%% GetBlockProofEquivalentTime (chain.cpp): the chainwork difference,
+%% times nPowTargetSpacing, over the tip's block proof, signed. The
+%% product wraps at 2^256 as arith_uint256 does; a result over 63 bits
+%% saturates.
+proof_equivalent_time(_ToCW, _FromCW, 0, _Spacing) ->
+    0;
+proof_equivalent_time(ToCW, FromCW, TipProof, Spacing) ->
+    {Diff, Sign} = case ToCW > FromCW of
+        true -> {ToCW - FromCW, 1};
+        false -> {FromCW - ToCW, -1}
+    end,
+    R = ((Diff * Spacing) band ((1 bsl 256) - 1)) div TipProof,
+    Sign * min(R, (1 bsl 63) - 1).
 
 %% Split a list into {First, Last} where Last has N elements.
 %% Returns {First (Len-N elements), Last (N elements)}.
