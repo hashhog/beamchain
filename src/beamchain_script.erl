@@ -1623,14 +1623,52 @@ checkmultisig_prepare_scriptcode(#script_state{sig_version = base,
 checkmultisig_prepare_scriptcode(State, _Sigs, _Flags) ->
     {ok, State}.
 
+%% Core v31.1 interpreter.cpp CheckPubKeyEncoding (:216-227): STRICTENC
+%% wants a compressed or uncompressed key (PUBKEYTYPE), then witness v0
+%% under WITNESS_PUBKEYTYPE wants a compressed one.
+check_pubkey_encoding(PubKey, Flags, SigVersion) ->
+    case (Flags band ?SCRIPT_VERIFY_STRICTENC) =/= 0 andalso
+         not beamchain_crypto:validate_pubkey(PubKey) of
+        true ->
+            {error, pubkeytype};
+        false ->
+            case SigVersion =:= witness_v0 andalso
+                 (Flags band ?SCRIPT_VERIFY_WITNESS_PUBKEYTYPE) =/= 0 andalso
+                 not is_compressed_pubkey(PubKey) of
+                true -> {error, witness_pubkeytype};
+                false -> ok
+            end
+    end.
+
+%% Core v31.1 EvalChecksigPreTapscript (interpreter.cpp:321-345) for an
+%% EMPTY signature. It is not short-cut: FindAndDelete(scriptCode,
+%% CScript() << vchSig) still runs in BASE scripts (the push of an empty sig
+%% is OP_0, so every opcode-aligned OP_0 of the scriptCode is a hit, and
+%% CONST_SCRIPTCODE makes a hit SIG_FINDANDDELETE), then
+%% CheckSignatureEncoding (true for an empty sig, :203-205) and
+%% CheckPubKeyEncoding. Only then does the empty sig fail, without NULLFAIL.
+%% All three flags are policy-only, so block verdicts do not change.
+check_empty_sig_pre_tapscript(#script_state{flags = Flags,
+                                            sig_version = SigVersion} = State,
+                              PubKey) ->
+    case checksig_prepare_scriptcode(State, <<>>, Flags) of
+        {error, _} = E -> E;
+        {ok, _} -> check_pubkey_encoding(PubKey, Flags, SigVersion)
+    end.
+
 do_checksig_ecdsa(Rest, Pos, State) ->
     %% pop2 returns {ok, deeper, top, State} — deeper=Sig, top=PubKey
     case pop2(State) of
         {ok, Sig, PubKey, State1} ->
             case Sig of
                 <<>> ->
-                    %% empty sig = push false (no NULLFAIL issue with empty)
-                    execute(Rest, Pos, push(script_false(), State1));
+                    %% An empty sig is false (and exempt from NULLFAIL), but
+                    %% only after Core's FindAndDelete and pubkey encoding
+                    %% checks, which run for it too.
+                    case check_empty_sig_pre_tapscript(State1, PubKey) of
+                        ok -> execute(Rest, Pos, push(script_false(), State1));
+                        {error, _} = EmptyErr -> EmptyErr
+                    end;
                 _ ->
                     %% extract hash type (last byte)
                     SigLen = byte_size(Sig),
@@ -1873,6 +1911,13 @@ do_checksig_result(#script_state{sig_version = tapscript} = State, Pos) ->
 do_checksig_result(State, Pos) ->
     %% pop2 returns {ok, deeper, top, State} — deeper=Sig, top=PubKey
     case pop2(State) of
+        {ok, <<>>, PubKey, State1} ->
+            %% Empty sig: false, after Core's FindAndDelete and pubkey
+            %% encoding checks (see check_empty_sig_pre_tapscript/2).
+            case check_empty_sig_pre_tapscript(State1, PubKey) of
+                ok -> {ok, false, State1};
+                {error, _} = EmptyErr -> EmptyErr
+            end;
         {ok, Sig, PubKey, State1} ->
             Flags = State1#script_state.flags,
             %% BIP 141: WITNESS_PUBKEYTYPE requires compressed pubkeys in witness v0
@@ -1886,34 +1931,30 @@ do_checksig_result(State, Pos) ->
                 false ->
                     {error, witness_pubkeytype};
                 true ->
-                    case Sig of
-                        <<>> -> {ok, false, State1};
-                        _ ->
-                            SigLen = byte_size(Sig),
-                            HashTypeByte = binary:at(Sig, SigLen - 1),
-                            SigBody = binary:part(Sig, 0, SigLen - 1),
-                            %% Check signature encoding
-                            case check_sig_encoding(SigBody, HashTypeByte, PubKey, Flags) of
-                                {error, _} = E -> E;
-                                ok ->
-                                    %% Slice scriptCode at the last codesep
-                                    %% BYTE offset FIRST, then FindAndDelete on
-                                    %% the slice (Core interpreter.cpp:325-332).
-                                    %% CONST_SCRIPTCODE: reject if deletion occurred.
-                                    State2Result = checksig_prepare_scriptcode(
-                                        State1, Sig, Flags),
-                                    case State2Result of
-                                        {error, _} = FadErr2 -> FadErr2;
-                                        {ok, State2} ->
-                                            SigHash = compute_sig_hash(State2, HashTypeByte, Pos),
-                                            Valid = check_ecdsa_sig(
-                                                State2#script_state.sig_checker, SigBody, PubKey, SigHash),
-                                            case Valid of
-                                                false when (Flags band ?SCRIPT_VERIFY_NULLFAIL) =/= 0 ->
-                                                    {error, nullfail};
-                                                _ ->
-                                                    {ok, Valid, State1}
-                                            end
+                    SigLen = byte_size(Sig),
+                    HashTypeByte = binary:at(Sig, SigLen - 1),
+                    SigBody = binary:part(Sig, 0, SigLen - 1),
+                    %% Check signature encoding
+                    case check_sig_encoding(SigBody, HashTypeByte, PubKey, Flags) of
+                        {error, _} = E -> E;
+                        ok ->
+                            %% Slice scriptCode at the last codesep
+                            %% BYTE offset FIRST, then FindAndDelete on
+                            %% the slice (Core interpreter.cpp:325-332).
+                            %% CONST_SCRIPTCODE: reject if deletion occurred.
+                            State2Result = checksig_prepare_scriptcode(
+                                State1, Sig, Flags),
+                            case State2Result of
+                                {error, _} = FadErr2 -> FadErr2;
+                                {ok, State2} ->
+                                    SigHash = compute_sig_hash(State2, HashTypeByte, Pos),
+                                    Valid = check_ecdsa_sig(
+                                        State2#script_state.sig_checker, SigBody, PubKey, SigHash),
+                                    case Valid of
+                                        false when (Flags band ?SCRIPT_VERIFY_NULLFAIL) =/= 0 ->
+                                            {error, nullfail};
+                                        _ ->
+                                            {ok, Valid, State1}
                                     end
                             end
                     end
@@ -1973,8 +2014,21 @@ verify_multisig_sigs([], [_ | _], _State, _Pos) ->
 verify_multisig_sigs([PK | PKRest], [Sig | SigRest] = Sigs, State, Pos) ->
     case Sig of
         <<>> ->
-            %% empty sig always fails, try next pubkey
-            verify_multisig_sigs(PKRest, Sigs, State, Pos);
+            %% Core (interpreter.cpp:1161) checks both encodings in every
+            %% loop iteration: CheckSignatureEncoding accepts the empty sig,
+            %% CheckPubKeyEncoding still runs on this key. The empty sig
+            %% then fails like any failed sig, including the early exit
+            %% once more sigs than keys remain.
+            #script_state{flags = EFlags, sig_version = ESigVersion} = State,
+            case check_pubkey_encoding(PK, EFlags, ESigVersion) of
+                {error, _} = EmptyErr ->
+                    EmptyErr;
+                ok ->
+                    case length(PKRest) >= length(Sigs) of
+                        true -> verify_multisig_sigs(PKRest, Sigs, State, Pos);
+                        false -> false
+                    end
+            end;
         _ ->
             SigLen = byte_size(Sig),
             HashTypeByte = binary:at(Sig, SigLen - 1),
@@ -2808,6 +2862,8 @@ script_error_string(witness_malleated_p2sh) ->
     <<"Witness requires only-redeemscript scriptSig">>;
 script_error_string(witness_unexpected) ->
     <<"Witness provided for non-witness script">>;
+script_error_string(pubkeytype) ->
+    <<"Public key is neither compressed or uncompressed">>;
 script_error_string(witness_pubkeytype) ->
     <<"Using non-compressed keys in segwit">>;
 script_error_string(invalid_schnorr_sig_size) ->
