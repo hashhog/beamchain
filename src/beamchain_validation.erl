@@ -1350,7 +1350,8 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
         %% them here so the leaves are LIVE (not dead code); the Phase-B
         %% differential drives the same two leaves directly over a seeded
         %% chainstate so a divergence is a real beamchain consensus bug.
-        case enforce_bip30(Height, BlockHash, Params) of
+        EnforceBip30 = enforce_bip30(Height, BlockHash, Params),
+        case EnforceBip30 of
             true  -> bip30_scan(Txs);
             false -> ok
         end,
@@ -1536,8 +1537,17 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
                               0, CoinbaseTx#transaction.outputs),
         CbValue =< Subsidy + TotalFees orelse throw(bad_cb_amount),
 
-        %% 6. add coinbase outputs to UTXO set (use add_utxo_fresh —
-        %%    BIP30 uniqueness was already checked in step 3 above)
+        %% 6. add coinbase outputs to UTXO set. FRESH (add_utxo_fresh) is
+        %%    a claim that the outpoint is not on disk; the BIP30 scan in
+        %%    step 3 proved that. Without the scan (a BIP30 repeat block,
+        %%    mainnet 91842 / 91880, or BIP34 standing in for it) the coin
+        %%    may overwrite a flushed one, and Core never adds a coinbase as
+        %%    FRESH (AddCoins possible_overwrite, coins.cpp): add_utxo/3
+        %%    asks the disk first, so a later spend deletes the old copy.
+        AddCoinbaseUtxo = case EnforceBip30 of
+            true -> fun beamchain_chainstate:add_utxo_fresh/3;
+            false -> fun beamchain_chainstate:add_utxo/3
+        end,
         CbTxid = beamchain_serialize:tx_hash(CoinbaseTx),
         lists:foldl(fun(#tx_out{value = V, script_pubkey = SPK}, Idx) ->
             Utxo = #utxo{
@@ -1546,7 +1556,7 @@ connect_block(#block{header = Header, transactions = Txs} = Block,
                 is_coinbase = true,
                 height = Height
             },
-            beamchain_chainstate:add_utxo_fresh(CbTxid, Idx, Utxo),
+            AddCoinbaseUtxo(CbTxid, Idx, Utxo),
             Idx + 1
         end, 0, CoinbaseTx#transaction.outputs),
 
