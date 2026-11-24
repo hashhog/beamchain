@@ -3959,19 +3959,28 @@ flags_for_height(Height, mainnet) ->
         false -> F3
     end;
 
+flags_for_height(Height, testnet) ->
+    %% testnet3 (CTestNetParams, kernel/chainparams.cpp): the same four
+    %% DeploymentActiveAt tests as mainnet, at testnet3's buried heights
+    %% BIP66Height = 330776, BIP65Height = 581885, CSVHeight = 770112,
+    %% SegwitHeight = 834624 (NULLDUMMY). The base trio is unconditional.
+    gate(Height >= 834624, ?SCRIPT_VERIFY_NULLDUMMY)
+    bor gate(Height >= 770112, ?SCRIPT_VERIFY_CHECKSEQUENCEVERIFY)
+    bor gate(Height >= 581885, ?SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY)
+    bor gate(Height >= 330776, ?SCRIPT_VERIFY_DERSIG)
+    bor ?SCRIPT_VERIFY_P2SH
+    bor ?SCRIPT_VERIFY_WITNESS
+    bor ?SCRIPT_VERIFY_TAPROOT;
+
 flags_for_height(_Height, _Network) ->
-    %% testnet/regtest: all consensus flags active from genesis.
+    %% testnet4/regtest/signet: every deployment height is 1 (SegwitHeight
+    %% 0 on regtest), so all consensus flags are active for every block
+    %% that is script-checked (genesis never is).
     %% Only Bitcoin Core MANDATORY_SCRIPT_VERIFY_FLAGS here.
     %% Policy flags (CLEANSTACK, SIGPUSHONLY, LOW_S, STRICTENC, MINIMALDATA,
     %% NULLFAIL, WITNESS_PUBKEYTYPE, etc.) belong in the mempool path only.
-    %%
-    %% WAVE B: the base trio (P2SH|WITNESS|TAPROOT) was ALREADY unconditional
-    %% on this branch, so Wave B requires no change here.  The testnet3
-    %% catch-all separately over-enforces DERSIG/CLTV/CSV/NULLDUMMY from
-    %% genesis (Core height-gates them on testnet3: BIP66Height=330776,
-    %% BIP65Height=581885, CSVHeight=770112, SegwitHeight=834624) — that is a
-    %% REJECT-VALID divergence in the opposite direction from Wave B and is
-    %% tracked as its own fix.  Deliberately NOT bundled here.
+    %% (testnet3 has its own clause above: Core height-gates these four
+    %% flags there.)
     ?SCRIPT_VERIFY_P2SH
     bor ?SCRIPT_VERIFY_DERSIG
     bor ?SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY
@@ -3979,6 +3988,9 @@ flags_for_height(_Height, _Network) ->
     bor ?SCRIPT_VERIFY_WITNESS
     bor ?SCRIPT_VERIFY_NULLDUMMY
     bor ?SCRIPT_VERIFY_TAPROOT.
+
+gate(true, Flag) -> Flag;
+gate(false, _Flag) -> 0.
 
 %%% -------------------------------------------------------------------
 %%% Script-flag exceptions (Core consensus.script_flag_exceptions)
