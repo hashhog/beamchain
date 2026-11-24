@@ -4579,7 +4579,7 @@ do_update_for_reorg(ConnectedBlocks, Disconnected, State0) ->
     %% stayed in its pool throughout. Replay that order on the vector, so
     %% its capacity is Core's: 64 children, +1 parent, -1 trimmed child is
     %% capacity 128 there, where taking the children out and back gave 64.
-    reorg_txns_randomized(TrBefore, ReAddTxs),
+    reorg_txns_randomized(TrBefore, Pulled),
     %% 4. removeForReorg over the whole pool at the new tip.
     {Dropped, State4} = remove_for_reorg(State3),
     case ConnectedBlocks =/= [] orelse Disconnected =/= [] of
@@ -4596,12 +4596,16 @@ do_update_for_reorg(ConnectedBlocks, Disconnected, State0) ->
     {_ExpiredN, State5} = do_expire_old(State4),
     do_trim_to_size(State5#state.max_size, State5).
 
-reorg_txns_randomized({SizeBefore, _} = TrBefore, ReAddTxs) ->
-    Accepted = length([T || T <- ReAddTxs,
-                            ets:member(?MEMPOOL_TXS, beamchain_serialize:tx_hash(T))]),
+%% Pushes first (each re-accepted tx, plus any orphan step 3 promoted),
+%% then a removal per pulled descendant that did not come back. The size
+%% always ends where the push/pop counter of steps 2-3 left it.
+reorg_txns_randomized({SizeBefore, _} = TrBefore, Pulled) ->
     {SizeNow, _} = txns_randomized_get(),
-    Removed = max(0, SizeBefore + Accepted - SizeNow),
-    txns_randomized_put(txns_randomized_replay(TrBefore, Accepted, Removed)).
+    Trimmed = length([T || {T, _Orig} <- Pulled,
+                           not ets:member(?MEMPOOL_TXS, beamchain_serialize:tx_hash(T))]),
+    Pops = max(Trimmed, SizeBefore - SizeNow),
+    Pushes = SizeNow - SizeBefore + Pops,
+    txns_randomized_put(txns_randomized_replay(TrBefore, Pushes, Pops)).
 
 %% Remove every in-pool descendant of Txs (the txs about to be re-added) and
 %% return them parents-first as [{Tx, {TimeAdded, HeightAdded}}].
@@ -6875,8 +6879,8 @@ entry_dynamic_usage(#transaction{inputs = Ins, outputs = Outs}) ->
 -define(TXGRAPH_CLUSTER_SLOT, 8).
 %% sizeof(SingletonClusterImpl) (txgraph.cpp:311): Cluster base (vptr 8,
 %% QualityLevel 4, ClusterSetIndex 4, m_sequence 8 = 24) + FeePerWeight 16 +
-%% GraphIndex 4 -> 44.
--define(TXGRAPH_SINGLETON_IMPL, 44).
+%% GraphIndex 4 = 44, padded to 48 (8-byte alignment: vptr, uint64, int64).
+-define(TXGRAPH_SINGLETON_IMPL, 48).
 %% sizeof(GenericClusterImpl) (txgraph.cpp:252): Cluster base 24 +
 %% DepGraph<BitSet<64>> (entries vector 24 + m_used 8) + m_mapping 24 +
 %% m_linearization 24 -> 104.
@@ -6986,6 +6990,11 @@ txgraph_weight(_) -> 1.
 %% restricted to the maximal optimal closure (Picard-Queyranne: the min cuts
 %% are the residual closures, and a maximal chain of them adds one SCC at a
 %% time).
+%%
+%% This is the OPTIMAL result. Core's linearization work is cost-bounded, so
+%% a cluster too large to finish in budget can sit at QualityLevel
+%% ACCEPTABLE (txgraph.cpp:52) with a different chunking until it is
+%% relinearized. Every calibrated shape (up to 64 txs) is optimal in Core.
 -spec txgraph_chunk_count([{term(), integer(), pos_integer(), [term()]}]) -> non_neg_integer().
 txgraph_chunk_count(Nodes) ->
     Ids = [Id || {Id, _, _, _} <- Nodes],

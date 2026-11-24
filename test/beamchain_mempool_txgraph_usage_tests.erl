@@ -114,7 +114,10 @@ txgraph_usage_test_() ->
                   fun pairs_match_core/0}} end,
       fun(_) -> {timeout, 600,
                  {"seed_warden_e: invalidate a parent of 64 children, usage is Core's 60296",
-                  fun seed_warden_e_matches_core/0}} end]}.
+                  fun seed_warden_e_matches_core/0}} end,
+      fun(_) -> {timeout, 300,
+                 {"mined txs leave the pool: usage is Core's 4944 / 4096 / 2056 / 64",
+                  fun mined_paths_match_core/0}} end]}.
 
 %% Core v31.1 after the same four steps on the same transactions.
 pairs_match_core() ->
@@ -136,6 +139,31 @@ pairs_match_core() ->
     %% Plus an equal-feerate chain of three: three chunks.
     ?assertEqual(9088, usage()),
     ?assertEqual(9, maps:get(<<"size">>, info())).
+
+%% Clusters shrink, split and vanish as their txs are mined. Core v31.1 on
+%% the same transactions (generateblock with the listed txids):
+%% chain A-B-C (fee 1000 each) and CPFP pair P-Q (200, 5000) -> 4944; mine A
+%% (B-C is left, a 2-tx cluster of 2 chunks) -> 4096; mine P, Q -> 2056; mine
+%% B, C -> 64 (only txns_randomized's allocation is left). No per-cluster
+%% TxGraph term may outlive its cluster.
+mined_paths_match_core() ->
+    A = acs_spend(cb_txid(1), subsidy(), 1000),
+    B = acs_spend(beamchain_serialize:tx_hash(A), subsidy() - 1000, 1000),
+    C = acs_spend(beamchain_serialize:tx_hash(B), subsidy() - 2000, 1000),
+    P = acs_spend(cb_txid(2), subsidy(), 200),
+    Q = acs_spend(beamchain_serialize:tx_hash(P), subsidy() - 200, 5000),
+    lists:foreach(fun send/1, [A, B, C, P, Q]),
+    ?assertEqual(4944, usage()),
+    ok = beamchain_chainstate:connect_block(next_block([A])),
+    ?assertEqual(4, maps:get(<<"size">>, info())),
+    ?assertEqual(4096, usage()),
+    ok = beamchain_chainstate:connect_block(next_block([P, Q])),
+    ?assertEqual(2, maps:get(<<"size">>, info())),
+    ?assertEqual(2056, usage()),
+    ok = beamchain_chainstate:connect_block(next_block([B, C])),
+    ?assertEqual(0, maps:get(<<"size">>, info())),
+    ?assertEqual(64, usage()),
+    ?assertEqual([], ets:match(mempool_usage, {{txgraph_excess, '$1'}, '_'})).
 
 %% The core-regtest seed_warden_e group, transaction for transaction: the
 %% parent spends the height-1 coinbase into 64 outputs of 200000 sat plus
