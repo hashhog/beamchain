@@ -456,7 +456,10 @@ handle_cast_now(Msg, State) ->
     handle_cast_1(Msg, State).
 
 handle_cast_1({start_sync, Opts}, #state{status = idle,
-                                         assume_valid = AV} = State) ->
+                                         assume_valid = AV} = State0) ->
+    %% Every re-plan (re-arm from complete, stale-tip rebuild) comes through
+    %% here: no prepared worker may survive into the new plan.
+    State = cancel_prepared(State0),
     TargetHeight = clamp_to_header_tip(maps:get(target_height, Opts, 0)),
     ProgressCb = maps:get(progress_cb, Opts, undefined),
 
@@ -613,7 +616,7 @@ handle_cast_1(stale_tip_rearm, State) ->
     end;
 
 handle_cast_1(chain_invalidated, State) ->
-    State2 = cancel_timers(State),
+    State2 = cancel_timers(cancel_prepared(State)),
     {noreply, State2#state{status = idle,
                            download_queue = [],
                            in_flight = #{},
@@ -623,7 +626,7 @@ handle_cast_1(chain_invalidated, State) ->
                            block_source = #{}}};
 
 handle_cast_1(stop_sync, State) ->
-    State2 = cancel_timers(State),
+    State2 = cancel_timers(cancel_prepared(State)),
     {noreply, State2#state{status = idle, in_flight = #{},
                             hash_to_height = #{},
                             downloaded = #{}, downloaded_bytes = 0,
@@ -1629,7 +1632,11 @@ validate_sequential(State, Remaining) ->
             validate_sequential_inner(fast_forward(State), Remaining)
     end.
 
-park_for_chain_pause(State) ->
+park_for_chain_pause(State0) ->
+    %% A prepared worker exists only beside a connecting one; parking leaves
+    %% nothing connecting, so drop it (the block stays buffered and is
+    %% prepared again when connecting resumes).
+    State = cancel_prepared(State0),
     %% One pending re-check at a time (block arrivals during the pause would
     %% otherwise each start their own 250 ms chain of timers).
     case get(chain_pause_timer) of
@@ -1833,13 +1840,17 @@ validate_async(State) ->
 
 %% Start connecting the block at next_to_validate, if it is buffered:
 %% promote the prepared worker when it holds that block, else spawn one.
+%% A prepared worker is promoted only if it holds the very block now
+%% buffered at next_to_validate (same height AND same hash): the block at a
+%% height can change under it (a re-plan onto another branch).
 start_connect(#state{next_to_validate = NextH, downloaded = D,
                      prepared = Prepared} = State) ->
     case maps:find(NextH, D) of
         {ok, Entry} ->
+            Hash = buffered_hash(Entry),
             {Worker, State1} =
                 case Prepared of
-                    #{height := NextH} ->
+                    #{height := NextH, hash := Hash} ->
                         {Prepared, State#state{prepared = undefined}};
                     _ ->
                         S1 = cancel_prepared(State),
