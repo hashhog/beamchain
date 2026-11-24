@@ -8,8 +8,8 @@
 %% init/1: dialyzer cannot prove all called functions return (rocksdb APIs
 %%   returning error tuples trigger defensive patterns, making init look like
 %%   it has no local return due to cascaded analysis).
-%% handle_call/3, handle_cast/2: do_prune_files always returns {ok,...} in
-%%   practice; the {error,_} branches are defensive code for future error cases.
+%% handle_call/3, handle_cast/2: do_prune_step's {error,_} branches are
+%%   defensive (a failed RocksDB write).
 -dialyzer({nowarn_function, [init/1, handle_call/3, handle_cast/2]}).
 
 %% API
@@ -100,7 +100,14 @@
 %% Pruning
 -export([prune_block_files/0, prune_block_files_manual/1,
          is_block_pruned/1, trigger_pruning/1]).
--export([get_prune_state/0, history_floor/1]).
+-export([get_prune_state/0, history_floor/1, holds_full_history/0]).
+%% Pure prune planner, exported for tests.
+-export([plan_prune/6]).
+-ifdef(TEST).
+%% -prune=N has a 550 MiB floor; tests shrink the target of the running
+%% server instead of writing 550 MiB.
+-export([test_set_prune_target/1]).
+-endif.
 %% Exported for cross-module testing of the prune file-eligibility
 %% calculation (CORE-PARITY-AUDIT/_pruning-cross-impl-audit-2026-05-05.md
 %% Bug 1).
@@ -146,6 +153,29 @@
 %% Pruning constants
 -define(MIN_PRUNE_TARGET_MB, 550).  %% Minimum disk usage in MB
 -define(REORG_SAFETY_BLOCKS, 288).  %% Keep at least 2 days of blocks
+%% Core MIN_BLOCKS_TO_KEEP (validation.h) is the same 288.
+%% Core FindFilesToPrune leaves BLOCKFILE_CHUNK_SIZE + UNDOFILE_CHUNK_SIZE
+%% (16 MiB + 1 MiB) of headroom under the target.
+-define(PRUNE_BUFFER_BYTES, (16 * 1024 * 1024 + 1024 * 1024)).
+%% Heights examined per prune step. A step runs inside this gen_server, so
+%% it is bounded; the rest is re-queued behind other requests.
+-define(PRUNE_STEP_HEIGHTS, 2000).
+%% ...and at most this many bytes of bodies + undo, which the step reads
+%% to size them (a mainnet block is ~1-4 MB, so 2000 heights alone could
+%% mean gigabytes of reads in one call).
+-define(PRUNE_STEP_BYTES, (64 * 1024 * 1024)).
+-define(PRUNE_LAST_KEY, <<"prune_last_height">>).
+%% Bytes deleted but not yet compacted away, persisted with every prune
+%% batch so a restart resumes the compaction instead of counting dead
+%% bytes as usage (which would prune further than the target asks).
+-define(PRUNE_RECLAIM_KEY, <<"prune_reclaim_pending">>).
+%% A compaction works in 2^12 key-range slices (see compact_slices/3).
+-define(PRUNE_COMPACT_CHUNK_BITS, 12).
+-define(PRUNE_COMPACT_CHUNKS, 4096).
+%% Bytes of deletes that justify a compaction in automatic mode. A manual
+%% prune compacts at the end of every walk.
+-define(PRUNE_COMPACT_MIN_BYTES, (64 * 1024 * 1024)).
+
 
 -record(state, {
     db_handle   :: rocksdb:db_handle() | undefined,
@@ -168,7 +198,20 @@
     %% Pruning state
     prune_target :: non_neg_integer(),  %% Target disk usage in bytes (0 = disabled)
     prune_manual_mode :: boolean(),     %% true = -prune=1 (RPC-only)
-    pruned_files :: sets:set(non_neg_integer()),  %% Set of pruned file numbers
+    pruned_files :: sets:set(non_neg_integer()),  %% Legacy flat-file set (read_block_flat only)
+    %% Body pruning. Block bodies live in CF_BLOCKS and undo data in
+    %% CF_UNDO, both keyed by block hash; nothing writes blk/rev files.
+    %% prune_last_height is the highest active-chain height whose body and
+    %% undo have been deleted (0 = nothing pruned; genesis is never
+    %% pruned). Persisted in meta ?PRUNE_LAST_KEY in the same WriteBatch
+    %% as the deletes. Core: GetPruneHeight (rpc/blockchain.cpp).
+    prune_last_height = 0 :: non_neg_integer(),
+    %% Bytes deleted that a compaction has not yet reclaimed from disk.
+    %% Subtracted from the measured SST size so deletes count at once,
+    %% the way Core's nCurrentUsage drops when a blk/rev pair is unlinked.
+    reclaim_pending = 0 :: non_neg_integer(),
+    %% In-flight whole-CF compaction of CF_BLOCKS + CF_UNDO, if any.
+    compactor = undefined :: undefined | {pid(), reference(), non_neg_integer()},
     file_info :: #{non_neg_integer() => #{size => non_neg_integer(),
                                            height_first => non_neg_integer(),
                                            height_last => non_neg_integer()}}
@@ -691,26 +734,76 @@ read_block(Hash) when byte_size(Hash) =:= 32 ->
 get_block_file_info() ->
     gen_server:call(?SERVER, get_block_file_info).
 
-%% @doc Prune old block files to reduce disk usage.
-%% Deletes the oldest blk*.dat and rev*.dat files until disk usage
-%% is below the prune target, while keeping at least 288 blocks.
-%% Returns the number of files pruned.
+%% @doc Run automatic pruning to completion: delete the oldest block
+%% bodies (CF_BLOCKS) and undo data (CF_UNDO) until the block store is
+%% below the -prune target, never touching the last 288 blocks below the
+%% flushed tip. Core FindFilesToPrune, per block instead of per blk/rev
+%% pair. Returns the number of heights pruned.
 -spec prune_block_files() -> {ok, non_neg_integer()} | {error, term()}.
 prune_block_files() ->
-    gen_server:call(?SERVER, prune_block_files, 60000).
+    prune_steps(auto, 0).
 
-%% @doc Manual pruneblockchain RPC entry point.
-%% Prune block files containing only blocks below the given target
-%% height, capped at chain_tip - 288 to preserve the reorg-safety
-%% window. Mirrors `bitcoin-core/src/rpc/blockchain.cpp::pruneblockchain`
-%% which calls `PruneBlockFilesManual(target_height)` from
-%% `validation.cpp`.
-%% Returns {ok, EffectiveHeight} where EffectiveHeight is the (clamped)
-%% height up to which pruning was attempted; or {error, Reason}.
+%% @doc Manual pruneblockchain RPC entry point. Deletes bodies and undo
+%% data of every height up to min(TargetHeight, flushed_tip - 288).
+%% Core PruneBlockFilesManual / FindFilesToPruneManual. Runs in bounded
+%% steps so other beamchain_db requests interleave.
+%% Returns {ok, #{pruned_count, effective_height, last_pruned}} where
+%% last_pruned is the highest pruned height (0 = none), or {error, _}.
 -spec prune_block_files_manual(non_neg_integer()) ->
-    {ok, non_neg_integer()} | {error, term()}.
+    {ok, map()} | {error, term()}.
 prune_block_files_manual(TargetHeight) ->
-    gen_server:call(?SERVER, {prune_block_files_manual, TargetHeight}, 60000).
+    prune_steps({manual, TargetHeight}, 0).
+
+prune_steps(Mode, Count0) ->
+    case gen_server:call(?SERVER, {prune_step, Mode}, 60000) of
+        {ok, #{pruned_count := N, more := true}} ->
+            prune_steps(Mode, Count0 + N);
+        {ok, #{pruned_count := N} = R} ->
+            case Mode of
+                auto -> {ok, Count0 + N};
+                {manual, _} ->
+                    {ok, maps:remove(more, R#{pruned_count => Count0 + N})}
+            end;
+        {error, _} = E ->
+            E
+    end.
+
+%% @doc True unless the node is known NOT to hold every block body from
+%% height 1 up to its flushed tip (a pruned store, or a snapshot-boot
+%% datadir that never downloaded the old bodies). Direct RocksDB reads, no
+%% gen_server hop: advertised_services/0 calls it on every version
+%% message. Unknown (DB not open, nothing flushed yet) answers true, the
+%% state of a node that is still syncing from genesis.
+-spec holds_full_history() -> boolean().
+holds_full_history() ->
+    try
+        Db = persistent_term:get(beamchain_db_handle),
+        MetaCF = persistent_term:get(beamchain_cf_meta),
+        case rocksdb:get(Db, MetaCF, <<"chain_tip">>, []) of
+            {ok, <<_:32/binary, Tip:64/big>>} when Tip >= 1 ->
+                case rocksdb:get(Db, MetaCF, ?PRUNE_LAST_KEY, []) of
+                    {ok, <<Last:64/big>>} when Last > 0 ->
+                        false;
+                    _ ->
+                        IdxCF = persistent_term:get(beamchain_cf_block_idx),
+                        BlocksCF = persistent_term:get(beamchain_cf_blocks),
+                        case rocksdb:get(Db, IdxCF, encode_height(1), []) of
+                            {ok, <<Hash:32/binary, _/binary>>} ->
+                                case rocksdb:get(Db, BlocksCF, Hash, []) of
+                                    {ok, _} -> true;
+                                    not_found -> false;
+                                    _ -> true
+                                end;
+                            not_found -> false;
+                            _ -> true
+                        end
+                end;
+            _ ->
+                true
+        end
+    catch
+        _:_ -> true
+    end.
 
 %% @doc Check if a block has been pruned.
 %% Returns true if the block data has been deleted.
@@ -755,6 +848,12 @@ get_prune_state() ->
 -spec history_floor(non_neg_integer()) -> undefined | pos_integer().
 history_floor(Tip) when is_integer(Tip), Tip >= 0 ->
     gen_server:call(?SERVER, {history_floor, Tip}, 30000).
+
+-ifdef(TEST).
+test_set_prune_target(Bytes) when is_integer(Bytes), Bytes > 0 ->
+    _ = sys:replace_state(?SERVER, fun(S) -> S#state{prune_target = Bytes} end),
+    ok.
+-endif.
 
 %%% ===================================================================
 %%% Direct-write API (bypasses gen_server for hot paths)
@@ -1291,6 +1390,8 @@ init([]) ->
                 prune_target = PruneTargetBytes,
                 prune_manual_mode = PruneManualMode,
                 pruned_files = PrunedFiles,
+                prune_last_height = load_prune_last_height(DbHandle, MetaCF),
+                reclaim_pending = load_reclaim_pending(DbHandle, MetaCF),
                 file_info = FileInfo
             },
             %% Store handles in persistent_term for direct access
@@ -1306,7 +1407,8 @@ init([]) ->
             ok = txindex_boot_marker(DbHandle, MetaCF),
             logger:info("beamchain_db: opened rocksdb at ~s, blocks at ~s (file ~p, pos ~p)",
                         [DbPath, BlocksDir, CurrentFile, CurrentPos]),
-            {ok, State};
+            %% Resume a prune compaction a restart interrupted (own process).
+            {ok, maybe_start_prune_compaction(0, State)};
         {error, Reason} ->
             logger:error("beamchain_db: failed to open rocksdb: ~p", [Reason]),
             {stop, {db_open_failed, Reason}}
@@ -1633,30 +1735,17 @@ handle_call(get_block_file_info, _From,
     },
     {reply, Info, State};
 
-%% Pruning operations
-handle_call(prune_block_files, _From, State) ->
-    case do_prune_files(State) of
-        {ok, Count, NewState} ->
-            {reply, {ok, Count}, NewState};
-        {error, Reason} ->
-            {reply, {error, Reason}, State}
-    end;
-
-handle_call({prune_block_files_manual, TargetHeight}, _From, State) ->
-    %% Manual prune: prune files whose blocks are entirely below
-    %% min(TargetHeight, ChainTip - REORG_SAFETY_BLOCKS). Mirrors Core's
-    %% PruneBlockFilesManual + FindFilesToPruneManual.
-    case do_prune_files_manual(TargetHeight, State) of
-        {ok, Count, EffectiveHeight, NewState} ->
-            {reply, {ok, #{pruned_count => Count,
-                           effective_height => EffectiveHeight}},
-             NewState};
+%% Pruning operations: one bounded step per call (see prune_steps/2).
+handle_call({prune_step, Mode}, _From, State) ->
+    case do_prune_step(Mode, State) of
+        {ok, Reply, NewState} ->
+            {reply, {ok, Reply}, NewState};
         {error, Reason} ->
             {reply, {error, Reason}, State}
     end;
 
 handle_call({is_block_pruned, Hash}, _From, State) ->
-    Result = check_block_pruned(Hash, State),
+    Result = check_body_pruned(Hash, State),
     {reply, Result, State};
 
 handle_call({history_floor, Tip}, _From, State) ->
@@ -1665,16 +1754,20 @@ handle_call({history_floor, Tip}, _From, State) ->
 handle_call(get_prune_state, _From,
             #state{prune_target = TargetBytes,
                    prune_manual_mode = ManualMode,
-                   pruned_files = PrunedFiles,
-                   file_info = FileInfo} = State) ->
+                   prune_last_height = Last,
+                   reclaim_pending = Pending,
+                   compactor = Compactor} = State) ->
     Enabled = TargetBytes > 0,
     %% AutomaticPruning is true iff prune mode is on AND it's not the
     %% manual-only sentinel.  Mirrors Core's getblockchaininfo `automatic_pruning`.
     Automatic = Enabled andalso (not ManualMode),
-    %% prune_height: lowest height whose file is NOT in the pruned set.
-    %% Core reports this as the smallest height that hasn't been pruned;
-    %% we approximate by scanning the file_info map.
-    PruneHeight = compute_prune_height(FileInfo, PrunedFiles),
+    %% prune_height: first height whose body is still held, all lower
+    %% ones pruned. Core getblockchaininfo: GetPruneHeight() + 1, or 0
+    %% when nothing is pruned.
+    PruneHeight = case Last of
+        0 -> 0;
+        _ -> Last + 1
+    end,
     %% target_bytes is reported as 0 for manual-only mode (matches
     %% Core's `prune_target_size` which is the *automatic* MiB target).
     ReportedTargetBytes = case ManualMode of
@@ -1686,7 +1779,10 @@ handle_call(get_prune_state, _From,
         manual_mode       => ManualMode,
         automatic_pruning => Automatic,
         target_bytes      => ReportedTargetBytes,
-        prune_height      => PruneHeight
+        prune_height      => PruneHeight,
+        last_pruned       => Last,
+        reclaim_pending   => Pending,
+        compacting        => Compactor =/= undefined
     }, State};
 
 %% Update block index status (for invalidateblock/reconsiderblock)
@@ -1818,22 +1914,27 @@ handle_cast({trigger_pruning, _Height},
     %% vs `FindFilesToPruneManual`).
     {noreply, State};
 
-handle_cast({trigger_pruning, Height}, #state{prune_target = PruneTarget} = State)
+handle_cast({trigger_pruning, _Height}, #state{prune_target = PruneTarget} = State)
   when PruneTarget > 0 ->
-    %% Only prune if we're past the reorg safety window
-    case Height > ?REORG_SAFETY_BLOCKS of
-        true ->
-            case do_prune_files(State) of
-                {ok, Count, NewState} when Count > 0 ->
-                    logger:info("beamchain_db: pruned ~p block files after height ~p",
-                                [Count, Height]),
-                    {noreply, NewState};
-                {ok, 0, _} ->
-                    {noreply, State};
-                {error, _Reason} ->
-                    {noreply, State}
-            end;
-        false ->
+    %% One bounded step; if more is due, queue the next one behind
+    %% whatever else is waiting on this server. The step itself reads the
+    %% flushed tip and the keep window, so _Height is only the wake-up.
+    case do_prune_step(auto, State) of
+        {ok, #{pruned_count := N, more := More} = R, NewState} ->
+            case N > 0 of
+                true ->
+                    logger:info("beamchain_db: pruned ~p block(s), last "
+                                "pruned height now ~p",
+                                [N, maps:get(last_pruned, R)]);
+                false -> ok
+            end,
+            case More of
+                true -> gen_server:cast(self(), {trigger_pruning, 0});
+                false -> ok
+            end,
+            {noreply, NewState};
+        {error, Reason} ->
+            logger:warning("beamchain_db: prune step failed: ~p", [Reason]),
             {noreply, State}
     end;
 
@@ -1844,14 +1945,36 @@ handle_cast({trigger_pruning, _Height}, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
+handle_info({'DOWN', Ref, process, Pid, Why},
+            #state{compactor = {Pid, Ref, Covered}} = State) ->
+    %% The compaction covered the deletes that were pending when it
+    %% started; later deletes stay pending for the next one.
+    case Why of
+        normal -> ok;
+        _ -> logger:warning("beamchain_db: prune compaction exited: ~p", [Why])
+    end,
+    Pending = case Why of
+        normal -> erlang:max(0, State#state.reclaim_pending - Covered);
+        _ -> State#state.reclaim_pending
+    end,
+    _ = (catch rocksdb:put(State#state.db_handle, State#state.cf_meta,
+                           ?PRUNE_RECLAIM_KEY, <<Pending:64/big>>, [])),
+    State1 = State#state{compactor = undefined, reclaim_pending = Pending},
+    {noreply, case Why of
+                  normal -> maybe_start_prune_compaction(?PRUNE_COMPACT_MIN_BYTES, State1);
+                  _ -> State1
+              end};
 handle_info(_Info, State) ->
     {noreply, State}.
 
 terminate(_Reason, #state{db_handle = undefined}) ->
     ok;
 terminate(_Reason, #state{db_handle = DbHandle, write_fd = WriteFd,
-                          blocks_dir = BlocksDir}) ->
+                          blocks_dir = BlocksDir} = State) ->
     logger:info("beamchain_db: closing rocksdb"),
+    %% A running compaction holds the DB open past rocksdb:close/1, and a
+    %% restarted beamchain_db could then not take the LOCK. End it first.
+    stop_prune_compaction(State),
     %% Close write file descriptor
     case WriteFd of
         undefined -> ok;
@@ -2192,12 +2315,6 @@ persist_block_index(BlocksDir) ->
 %%% Pruning helpers
 %%% ===================================================================
 
-%% @doc Generate path to an undo (rev) file.
--spec revfile_path(string(), non_neg_integer()) -> string().
-revfile_path(BlocksDir, FileNum) ->
-    Filename = io_lib:format("rev~5..0B.dat", [FileNum]),
-    filename:join(BlocksDir, lists:flatten(Filename)).
-
 %% @doc Load the set of pruned file numbers from metadata.
 -spec load_pruned_files(rocksdb:db_handle(), rocksdb:cf_handle()) ->
     sets:set(non_neg_integer()).
@@ -2210,13 +2327,6 @@ load_pruned_files(Db, MetaCF) ->
         not_found ->
             sets:new()
     end.
-
-%% @doc Save the set of pruned file numbers to metadata.
--spec save_pruned_files(rocksdb:db_handle(), rocksdb:cf_handle(),
-                        sets:set(non_neg_integer())) -> ok.
-save_pruned_files(Db, MetaCF, PrunedFiles) ->
-    Bin = term_to_binary(PrunedFiles),
-    rocksdb:put(Db, MetaCF, <<"pruned_files">>, Bin, []).
 
 %% @doc Scan block files to build file info map.
 -spec scan_block_files(string(), non_neg_integer()) ->
@@ -2236,26 +2346,6 @@ scan_block_files(BlocksDir, N, MaxFile, Acc) ->
             %% File doesn't exist, skip it
             scan_block_files(BlocksDir, N + 1, MaxFile, Acc)
     end.
-
-%% @doc Calculate total disk usage of block and undo files.
--spec calculate_disk_usage(string(), #{non_neg_integer() => map()},
-                           sets:set(non_neg_integer())) -> non_neg_integer().
-calculate_disk_usage(BlocksDir, FileInfo, PrunedFiles) ->
-    maps:fold(fun(FileNum, #{size := BlkSize}, Total) ->
-        case sets:is_element(FileNum, PrunedFiles) of
-            true ->
-                %% Already pruned, don't count
-                Total;
-            false ->
-                %% Add block file size
-                RevPath = revfile_path(BlocksDir, FileNum),
-                RevSize = case file:read_file_info(RevPath) of
-                    {ok, #file_info{size = S}} -> S;
-                    _ -> 0
-                end,
-                Total + BlkSize + RevSize
-        end
-    end, 0, FileInfo).
 
 %% @doc Check if a block has been pruned by looking up its file number.
 -spec check_block_pruned(binary(), #state{}) -> boolean().
@@ -2280,162 +2370,307 @@ get_current_height(Db, MetaCF) ->
         not_found -> undefined
     end.
 
-%% @doc Perform the actual pruning operation.
-%% Deletes oldest block files until disk usage is below target.
--spec do_prune_files(#state{}) ->
-    {ok, non_neg_integer(), #state{}} | {error, term()}.
-do_prune_files(#state{prune_target = 0} = State) ->
-    %% Pruning disabled
-    {ok, 0, State};
-do_prune_files(#state{prune_target = Target, blocks_dir = BlocksDir,
-                      file_info = FileInfo, pruned_files = PrunedFiles,
-                      db_handle = Db, cf_meta = MetaCF,
-                      current_file = CurrentFile} = State) ->
-    %% Get current chain height
-    case get_current_height(Db, MetaCF) of
-        undefined ->
-            %% No chain tip yet, nothing to prune
-            {ok, 0, State};
-        ChainHeight when ChainHeight =< ?REORG_SAFETY_BLOCKS ->
-            %% Not enough blocks yet
-            {ok, 0, State};
-        ChainHeight ->
-            %% Calculate current disk usage
-            CurrentUsage = calculate_disk_usage(BlocksDir, FileInfo, PrunedFiles),
-            case CurrentUsage =< Target of
-                true ->
-                    %% Already below target
-                    {ok, 0, State};
-                false ->
-                    %% Need to prune - find files we can delete
-                    %% Get min height we must keep (for reorg safety)
-                    MinKeepHeight = ChainHeight - ?REORG_SAFETY_BLOCKS,
+%%% -------------------------------------------------------------------
+%%% Body pruning (CF_BLOCKS + CF_UNDO)
+%%%
+%%% Core prunes whole blk/rev file pairs (BlockManager::FindFilesToPrune /
+%%% FindFilesToPruneManual, node/blockstorage.cpp). beamchain never writes
+%%% blk/rev files: a body is one CF_BLOCKS value and its undo one CF_UNDO
+%%% value, both keyed by block hash. So the unit here is one height, walked
+%%% upward from prune_last_height + 1, with Core's limits:
+%%%   * never above flushed_tip - MIN_BLOCKS_TO_KEEP (288). The flushed tip
+%%%     (meta chain_tip) is <= the live tip, and boot roll-forward replays
+%%%     the bodies above it, so this keeps both the reorg window and the
+%%%     crash-recovery range;
+%%%   * auto mode only once the flushed tip is above PruneAfterHeight, and
+%%%     only while usage + 17 MiB >= target;
+%%%   * genesis is never deleted.
+%%% Keys are hashes, so a pruned prefix is not a key range and
+%%% DeleteFilesInRange cannot drop it; the deletes are point tombstones and
+%%% a whole-CF compaction (in a separate process) gives the space back.
+%%% -------------------------------------------------------------------
 
-                    %% Find prunable files (not already pruned, not in safety window)
-                    PrunableFiles = find_prunable_files(BlocksDir, FileInfo,
-                                                         PrunedFiles, MinKeepHeight,
-                                                         CurrentFile),
-
-                    %% Prune files until below target
-                    {Pruned, NewUsage, NewPrunedFiles} =
-                        prune_until_target(BlocksDir, PrunableFiles, CurrentUsage,
-                                           Target, PrunedFiles),
-
-                    case Pruned of
-                        [] ->
-                            {ok, 0, State};
-                        _ ->
-                            %% Update ETS index to mark blocks as pruned
-                            mark_blocks_pruned(Pruned),
-
-                            %% Save pruned files set
-                            save_pruned_files(Db, MetaCF, NewPrunedFiles),
-
-                            logger:info("beamchain_db: pruned ~p files, usage: ~pMB -> ~pMB",
-                                        [length(Pruned), CurrentUsage div (1024*1024),
-                                         NewUsage div (1024*1024)]),
-
-                            {ok, length(Pruned),
-                             State#state{pruned_files = NewPrunedFiles}}
-                    end
-            end
+load_prune_last_height(Db, MetaCF) ->
+    case rocksdb:get(Db, MetaCF, ?PRUNE_LAST_KEY, []) of
+        {ok, <<H:64/big>>} -> H;
+        _ -> 0
     end.
 
-%% @doc Manual prune entry point — prunes files entirely below the
-%% supplied target height (clamped to chain_tip - REORG_SAFETY_BLOCKS so
-%% the keep window is preserved). Counterpart to Core's
-%% `PruneBlockFilesManual`.
--spec do_prune_files_manual(non_neg_integer(), #state{}) ->
-    {ok, non_neg_integer(), non_neg_integer(), #state{}} | {error, term()}.
-do_prune_files_manual(_TargetHeight,
-                      #state{prune_target = 0,
-                             prune_manual_mode = false} = _State) ->
-    %% Pruning mode is off entirely.
+%% Core CChainParams::PruneAfterHeight (kernel/chainparams.cpp): 100000 on
+%% mainnet, 1000 on testnet3/testnet4/signet/regtest.
+-spec prune_after_height() -> non_neg_integer().
+prune_after_height() ->
+    case catch beamchain_config:network() of
+        mainnet -> 100000;
+        _ -> 1000
+    end.
+
+step_reply(Count, Eff, Last, More) ->
+    #{pruned_count => Count, effective_height => Eff,
+      last_pruned => Last, more => More}.
+
+-spec do_prune_step(auto | {manual, non_neg_integer()}, #state{}) ->
+    {ok, map(), #state{}} | {error, term()}.
+do_prune_step(auto, #state{prune_target = 0, prune_manual_mode = false,
+                           prune_last_height = Last} = State) ->
+    {ok, step_reply(0, 0, Last, false), State};
+do_prune_step({manual, _}, #state{prune_target = 0, prune_manual_mode = false}) ->
     {error, prune_disabled};
-do_prune_files_manual(TargetHeight,
-                      #state{blocks_dir = BlocksDir,
-                             file_info = FileInfo,
-                             pruned_files = PrunedFiles,
-                             db_handle = Db, cf_meta = MetaCF,
-                             current_file = CurrentFile} = State) ->
+do_prune_step(auto, #state{prune_manual_mode = true,
+                           prune_last_height = Last} = State) ->
+    %% -prune=1: only pruneblockchain prunes (Core: fAutoPrune off).
+    {ok, step_reply(0, 0, Last, false), State};
+do_prune_step(Mode, #state{db_handle = Db, cf_meta = MetaCF,
+                           prune_last_height = Last} = State) ->
     case get_current_height(Db, MetaCF) of
-        undefined ->
-            {ok, 0, 0, State};
-        ChainHeight when ChainHeight =< ?REORG_SAFETY_BLOCKS ->
-            %% Not enough blocks yet to safely prune anything.
-            {ok, 0, 0, State};
-        ChainHeight ->
-            %% Clamp the operator-supplied height to the safety window.
-            SafeUpper = ChainHeight - ?REORG_SAFETY_BLOCKS,
-            EffectiveHeight = min(TargetHeight, SafeUpper),
-            case EffectiveHeight =< 0 of
-                true ->
-                    {ok, 0, EffectiveHeight, State};
-                false ->
-                    PrunableFiles = find_prunable_files(BlocksDir, FileInfo,
-                                                         PrunedFiles,
-                                                         EffectiveHeight,
-                                                         CurrentFile),
-                    %% Manual mode: prune ALL eligible files (don't stop
-                    %% at a disk-usage threshold). Equivalent to setting
-                    %% Target=0 inside prune_until_target.
-                    {Pruned, _NewUsage, NewPrunedFiles} =
-                        prune_until_target(BlocksDir, PrunableFiles,
-                                            16#FFFFFFFFFFFFFFFF, 0,
-                                            PrunedFiles),
-                    case Pruned of
-                        [] ->
-                            {ok, 0, EffectiveHeight, State};
-                        _ ->
-                            mark_blocks_pruned(Pruned),
-                            save_pruned_files(Db, MetaCF, NewPrunedFiles),
-                            logger:info("beamchain_db: manual prune up to "
-                                        "height ~p deleted ~p files",
-                                        [EffectiveHeight, length(Pruned)]),
-                            {ok, length(Pruned), EffectiveHeight,
-                             State#state{pruned_files = NewPrunedFiles}}
-                    end
+        Flushed when is_integer(Flushed), Flushed > ?REORG_SAFETY_BLOCKS ->
+            KeepFloor = Flushed - ?REORG_SAFETY_BLOCKS,
+            case Mode of
+                auto ->
+                    case Flushed =< prune_after_height() of
+                        true ->
+                            {ok, step_reply(0, 0, Last, false), State};
+                        false ->
+                            Usage = prune_usage(State),
+                            prune_walk(KeepFloor, KeepFloor, Usage,
+                                       State#state.prune_target,
+                                       ?PRUNE_COMPACT_MIN_BYTES, State)
+                    end;
+                {manual, Target} ->
+                    Upto = erlang:min(Target, KeepFloor),
+                    prune_walk(Upto, Upto, 0, manual, 0, State)
+            end;
+        _ ->
+            {ok, step_reply(0, 0, Last, false), State}
+    end.
+
+prune_walk(Upto, Eff, Usage, Target, CompactMin,
+           #state{db_handle = Db, cf_blocks = BlocksCF, cf_undo = UndoCF,
+                  cf_block_idx = IdxCF, cf_meta = MetaCF,
+                  prune_last_height = Last} = State) ->
+    SizeFun = fun(H) -> held_bytes_at(Db, IdxCF, BlocksCF, UndoCF, H) end,
+    {NewLast, Items, Freed0, Status} =
+        plan_prune(Last + 1, Upto, Usage, Target, ?PRUNE_STEP_HEIGHTS, SizeFun),
+    More = Status =:= more,
+    case NewLast > Last of
+        false ->
+            {ok, step_reply(0, Eff, Last, false),
+             maybe_start_prune_compaction(CompactMin, State)};
+        true ->
+            {SideItems, SideFreed} =
+                side_branch_prune_items(Db, BlocksCF, UndoCF, MetaCF, NewLast),
+            Pending = State#state.reclaim_pending + Freed0 + SideFreed,
+            Ops = lists:append([[{delete, BlocksCF, Hash}, {delete, UndoCF, Hash}]
+                                || {_H, Hash} <- Items ++ SideItems])
+                  ++ [{put, MetaCF, ?PRUNE_LAST_KEY, <<NewLast:64/big>>},
+                      {put, MetaCF, ?PRUNE_RECLAIM_KEY, <<Pending:64/big>>}],
+            case rocksdb:write(Db, Ops, []) of
+                ok ->
+                    State1 = State#state{prune_last_height = NewLast,
+                                         reclaim_pending = Pending},
+                    State2 = case More of
+                        true -> State1;
+                        false -> maybe_start_prune_compaction(CompactMin, State1)
+                    end,
+                    {ok, step_reply(length(Items), Eff, NewLast, More), State2};
+                {error, _} = Err ->
+                    Err
             end
     end.
 
-%% @doc Find files that can be pruned (sorted by file number, oldest first).
--spec find_prunable_files(string(), #{non_neg_integer() => map()},
-                          sets:set(non_neg_integer()), non_neg_integer(),
-                          non_neg_integer()) -> [{non_neg_integer(), non_neg_integer()}].
-find_prunable_files(BlocksDir, FileInfo, PrunedFiles, MinKeepHeight, CurrentFile) ->
-    %% Build list of {FileNum, MaxHeight, Size} for each file
-    FileList = maps:fold(fun(FileNum, #{size := Size}, Acc) ->
-        case sets:is_element(FileNum, PrunedFiles) of
-            true ->
-                %% Already pruned
-                Acc;
-            false when FileNum >= CurrentFile ->
-                %% Don't prune the current write file
-                Acc;
-            false ->
-                %% Check if file contains blocks we need to keep
-                %% We need to scan the ETS index to find max height in this file
-                MaxHeight = find_max_height_in_file(FileNum),
-                case MaxHeight of
-                    undefined ->
-                        %% No blocks found for this file
-                        [{FileNum, Size} | Acc];
-                    H when H < MinKeepHeight ->
-                        %% All blocks in file are old enough to prune
-                        RevPath = revfile_path(BlocksDir, FileNum),
-                        RevSize = case file:read_file_info(RevPath) of
-                            {ok, #file_info{size = S}} -> S;
-                            _ -> 0
-                        end,
-                        [{FileNum, Size + RevSize} | Acc];
-                    _ ->
-                        %% File contains blocks we need to keep
-                        Acc
-                end
-        end
-    end, [], FileInfo),
-    %% Sort by file number (oldest first)
-    lists:sort(fun({A, _}, {B, _}) -> A =< B end, FileList).
+%% @doc Pure prune planner. Walks heights From..Upto, at most Steps of
+%% them and about ?PRUNE_STEP_BYTES of data, and stops early once Target
+%% is met (Core: stop when
+%% usage + buffer < target). Target `manual` never stops early.
+%% SizeFun(H) -> {ok, Hash, Bytes} for a height whose body or undo is held,
+%% `none` for one that holds neither (a snapshot hole: nothing to delete,
+%% but it still counts as pruned).
+%% Returns {LastHeightCovered, [{H, Hash}], BytesFreed, done | more}.
+-spec plan_prune(non_neg_integer(), integer(), non_neg_integer(),
+                 non_neg_integer() | manual, non_neg_integer(),
+                 fun((non_neg_integer()) ->
+                         {ok, binary(), non_neg_integer()} | none)) ->
+    {non_neg_integer(), [{non_neg_integer(), binary()}], non_neg_integer(),
+     done | more}.
+plan_prune(From0, Upto, Usage, Target, Steps, SizeFun) ->
+    From = erlang:max(From0, 1),                 %% genesis is never pruned
+    plan_prune(From, Upto, Usage, Target, Steps, SizeFun, From - 1, [], 0).
+
+plan_prune(H, Upto, _U, _T, _S, _F, LastH, Acc, Freed) when H > Upto ->
+    {LastH, lists:reverse(Acc), Freed, done};
+plan_prune(_H, _Upto, U, T, _S, _F, LastH, Acc, Freed)
+  when is_integer(T), U + ?PRUNE_BUFFER_BYTES < T ->
+    {LastH, lists:reverse(Acc), Freed, done};
+plan_prune(_H, _Upto, _U, _T, 0, _F, LastH, Acc, Freed) ->
+    {LastH, lists:reverse(Acc), Freed, more};
+plan_prune(_H, _Upto, _U, _T, _S, _F, LastH, Acc, Freed)
+  when Freed >= ?PRUNE_STEP_BYTES ->
+    {LastH, lists:reverse(Acc), Freed, more};
+plan_prune(H, Upto, U, T, S, F, _LastH, Acc, Freed) ->
+    case F(H) of
+        {ok, Hash, Bytes} ->
+            plan_prune(H + 1, Upto, erlang:max(0, U - Bytes), T, S - 1, F,
+                       H, [{H, Hash} | Acc], Freed + Bytes);
+        none ->
+            plan_prune(H + 1, Upto, U, T, S - 1, F, H, Acc, Freed)
+    end.
+
+held_bytes_at(Db, IdxCF, BlocksCF, UndoCF, H) ->
+    case rocksdb:get(Db, IdxCF, encode_height(H), []) of
+        {ok, <<Hash:32/binary, _/binary>>} ->
+            held_bytes_of(Db, BlocksCF, UndoCF, Hash);
+        _ ->
+            none
+    end.
+
+held_bytes_of(Db, BlocksCF, UndoCF, Hash) ->
+    B = value_size(rocksdb:get(Db, BlocksCF, Hash, [])),
+    U = value_size(rocksdb:get(Db, UndoCF, Hash, [])),
+    case {B, U} of
+        {none, none} -> none;
+        _ -> {ok, Hash, size_or_zero(B) + size_or_zero(U)}
+    end.
+
+value_size({ok, Bin}) -> byte_size(Bin);
+value_size(_) -> none.
+
+size_or_zero(none) -> 0;
+size_or_zero(N) -> N.
+
+%% Side-branch bodies at or below the new prune height go too: Core's
+%% file-level prune drops every block in a pruned file, active or not.
+side_branch_prune_items(Db, BlocksCF, UndoCF, MetaCF, NewLast) ->
+    {ok, Iter} = rocksdb:iterator(Db, MetaCF, []),
+    Entries = try
+        collect_side_branch_indexes(
+          rocksdb:iterator_move(Iter, {seek, <<"sbidx:">>}), Iter, [])
+    after
+        rocksdb:iterator_close(Iter)
+    end,
+    lists:foldl(
+      fun(#{hash := Hash, height := H}, {Acc, Freed}) when H =< NewLast ->
+              case held_bytes_of(Db, BlocksCF, UndoCF, Hash) of
+                  {ok, _, Bytes} -> {[{H, Hash} | Acc], Freed + Bytes};
+                  none -> {Acc, Freed}
+              end;
+         (_, AccFreed) ->
+              AccFreed
+      end, {[], 0}, Entries).
+
+%% On-disk size of the block store: live SST files plus memtables of
+%% CF_BLOCKS and CF_UNDO, less deletes not yet compacted away.
+%% Core CalculateCurrentUsage sums blk+rev file sizes. The memtable term
+%% moves in arena blocks (write_buffer_size / 8, 8 MiB by default), so
+%% pruning has that granularity; Core's is a whole 128 MiB blk file.
+prune_usage(#state{db_handle = Db, cf_blocks = BlocksCF, cf_undo = UndoCF,
+                   reclaim_pending = Pending}) ->
+    Raw = lists:sum([cf_int_property(Db, CF, P)
+                     || CF <- [BlocksCF, UndoCF],
+                        P <- [<<"rocksdb.live-sst-files-size">>,
+                              <<"rocksdb.cur-size-all-mem-tables">>]]),
+    erlang:max(0, Raw - Pending).
+
+cf_int_property(Db, CF, Prop) ->
+    case catch rocksdb:get_property(Db, CF, Prop) of
+        {ok, Bin} when is_binary(Bin) ->
+            case catch binary_to_integer(Bin) of
+                N when is_integer(N) -> N;
+                _ -> 0
+            end;
+        _ ->
+            0
+    end.
+
+%% Start a compaction of CF_BLOCKS and CF_UNDO in its own process when at
+%% least MinBytes of deletes are waiting and none is running. It works in
+%% ?PRUNE_COMPACT_CHUNKS key ranges (keys are uniform hashes, so each range
+%% is an equal slice) and checks for `stop` between them: a RocksDB manual
+%% compaction cannot be cancelled, and while one runs the NIF holds the DB
+%% open, so terminate/2 must be able to end it within one slice.
+maybe_start_prune_compaction(MinBytes,
+                             #state{compactor = undefined,
+                                    reclaim_pending = Pending,
+                                    db_handle = Db, cf_blocks = BlocksCF,
+                                    cf_undo = UndoCF} = State)
+  when Pending > 0, Pending >= MinBytes ->
+    {Pid, Ref} = spawn_monitor(
+                   fun() ->
+                           %% The tombstones are still in the memtable; a
+                           %% manual compaction only rewrites SST files,
+                           %% so without the flush it drops nothing.
+                           ok = rocksdb:flush(Db, BlocksCF, [{wait, true}]),
+                           ok = rocksdb:flush(Db, UndoCF, [{wait, true}]),
+                           compact_slices(Db, [BlocksCF, UndoCF], 0)
+                   end),
+    State#state{compactor = {Pid, Ref, Pending}};
+maybe_start_prune_compaction(_MinBytes, State) ->
+    State.
+
+compact_slices(_Db, _CFs, N) when N >= ?PRUNE_COMPACT_CHUNKS ->
+    ok;
+compact_slices(Db, CFs, N) ->
+    receive
+        stop -> exit(stopped)
+    after 0 ->
+        ok
+    end,
+    Bits = ?PRUNE_COMPACT_CHUNK_BITS,
+    Begin = case N of
+        0 -> undefined;
+        _ -> <<N:Bits, 0:(16 - Bits)>>
+    end,
+    End = case N + 1 of
+        ?PRUNE_COMPACT_CHUNKS -> undefined;
+        M -> <<M:Bits, 0:(16 - Bits)>>
+    end,
+    [ok = rocksdb:compact_range(Db, CF, Begin, End,
+                                [{exclusive_manual_compaction, false}])
+     || CF <- CFs],
+    compact_slices(Db, CFs, N + 1).
+
+%% Stop an in-flight compaction and wait for it (at most one slice).
+stop_prune_compaction(#state{compactor = undefined}) ->
+    ok;
+stop_prune_compaction(#state{compactor = {Pid, Ref, _}}) ->
+    Pid ! stop,
+    receive
+        {'DOWN', Ref, process, Pid, _} -> ok
+    after 120000 ->
+        logger:warning("beamchain_db: prune compaction did not stop in 120 s"),
+        ok
+    end.
+
+load_reclaim_pending(Db, MetaCF) ->
+    case rocksdb:get(Db, MetaCF, ?PRUNE_RECLAIM_KEY, []) of
+        {ok, <<P:64/big>>} -> P;
+        _ -> 0
+    end.
+
+%% @doc A block whose body was deleted by pruning: it is known (active
+%% height index or side-branch index), its height is at or below the last
+%% pruned height, and CF_BLOCKS no longer holds it.
+check_body_pruned(_Hash, #state{prune_last_height = 0}) ->
+    false;
+check_body_pruned(Hash, #state{db_handle = Db, cf_blocks = BlocksCF,
+                               cf_meta = MetaCF,
+                               prune_last_height = Last}) ->
+    case rocksdb:get(Db, BlocksCF, Hash, []) of
+        {ok, _} ->
+            false;
+        _ ->
+            Height = case rocksdb:get(Db, MetaCF, <<"blkidx:", Hash/binary>>, []) of
+                {ok, <<H:64/big>>} ->
+                    H;
+                _ ->
+                    case rocksdb:get(Db, MetaCF, <<"sbidx:", Hash/binary>>, []) of
+                        {ok, SB} ->
+                            maps:get(height, decode_side_branch_index_entry(SB));
+                        _ ->
+                            undefined
+                    end
+            end,
+            is_integer(Height) andalso Height =< Last
+    end.
 
 %% @doc Find the maximum block height stored in a given file.
 %%
@@ -2527,111 +2762,6 @@ has_body_at(Height, #state{db_handle = Db, cf_blocks = BlocksCF,
         _ ->
             false
     end.
-
-%% @doc Compute the lowest block height whose data is still on disk
-%% (i.e., NOT in the pruned-files set). This is the analogue of Bitcoin
-%% Core's `BlockManager::m_blockfiles_indexed` first-non-pruned height,
-%% surfaced via `getblockchaininfo.pruneheight`.
-%%
-%% Iterates the height index and finds the smallest height whose owning
-%% file number is not pruned. Returns 0 when nothing has been pruned
-%% (matches Core's behavior for the never-pruned case).
--spec compute_prune_height(#{non_neg_integer() => map()},
-                            sets:set(non_neg_integer())) ->
-    non_neg_integer().
-compute_prune_height(_FileInfo, PrunedFiles) ->
-    case sets:size(PrunedFiles) of
-        0 ->
-            0;  %% Never pruned — pruneheight is 0
-        _ ->
-            %% Walk HEIGHT_TO_HASH_ETS in ascending height order looking
-            %% for the first height whose file number is NOT pruned.
-            %% This is O(n) on first call but the result is rarely
-            %% queried (only via RPC).
-            case ets:info(?HEIGHT_TO_HASH_ETS) of
-                undefined ->
-                    0;
-                _ ->
-                    Heights = lists:sort(
-                                ets:select(?HEIGHT_TO_HASH_ETS,
-                                            [{{'$1', '_'}, [], ['$1']}])),
-                    find_first_unpruned_height(Heights, PrunedFiles)
-            end
-    end.
-
-%% @doc Walk a sorted list of heights and return the first one whose
-%% data is on disk. Returns the highest height + 1 (or 0) if everything
-%% is pruned, matching Core's "all pruned" semantics.
-find_first_unpruned_height([], _PrunedFiles) ->
-    0;
-find_first_unpruned_height([H | Rest], PrunedFiles) ->
-    case ets:lookup(?HEIGHT_TO_HASH_ETS, H) of
-        [{H, Hash}] ->
-            case ets:lookup(?BLOCK_INDEX_ETS, Hash) of
-                [{Hash, {FN, _Off, _Sz}}] ->
-                    case sets:is_element(FN, PrunedFiles) of
-                        false -> H;
-                        true  -> find_first_unpruned_height(Rest, PrunedFiles)
-                    end;
-                [{Hash, {FN, _Off, _Sz, pruned}}] ->
-                    %% Tombstoned entry — file is pruned regardless of set.
-                    _ = FN,
-                    find_first_unpruned_height(Rest, PrunedFiles);
-                _ ->
-                    %% Hash not in block-location index — treat as pruned.
-                    find_first_unpruned_height(Rest, PrunedFiles)
-            end;
-        _ ->
-            find_first_unpruned_height(Rest, PrunedFiles)
-    end.
-
-%% @doc Prune files until disk usage is below target.
--spec prune_until_target(string(), [{non_neg_integer(), non_neg_integer()}],
-                         non_neg_integer(), non_neg_integer(),
-                         sets:set(non_neg_integer())) ->
-    {[non_neg_integer()], non_neg_integer(), sets:set(non_neg_integer())}.
-prune_until_target(_BlocksDir, [], CurrentUsage, _Target, PrunedFiles) ->
-    {[], CurrentUsage, PrunedFiles};
-prune_until_target(_BlocksDir, _Files, CurrentUsage, Target, PrunedFiles)
-  when CurrentUsage =< Target ->
-    {[], CurrentUsage, PrunedFiles};
-prune_until_target(BlocksDir, [{FileNum, Size} | Rest], CurrentUsage, Target, PrunedFiles) ->
-    %% Delete block and undo files
-    BlkPath = blockfile_path(BlocksDir, FileNum),
-    RevPath = revfile_path(BlocksDir, FileNum),
-
-    %% Delete files
-    _ = file:delete(BlkPath),
-    _ = file:delete(RevPath),
-
-    NewUsage = CurrentUsage - Size,
-    NewPrunedFiles = sets:add_element(FileNum, PrunedFiles),
-
-    case NewUsage =< Target of
-        true ->
-            {[FileNum], NewUsage, NewPrunedFiles};
-        false ->
-            {Pruned, FinalUsage, FinalPrunedFiles} =
-                prune_until_target(BlocksDir, Rest, NewUsage, Target, NewPrunedFiles),
-            {[FileNum | Pruned], FinalUsage, FinalPrunedFiles}
-    end.
-
-%% @doc Update ETS index entries to mark blocks as pruned.
--spec mark_blocks_pruned([non_neg_integer()]) -> ok.
-mark_blocks_pruned(FileNums) ->
-    FileNumSet = sets:from_list(FileNums),
-    ets:foldl(fun({Hash, {FileNum, Offset, Size}}, _Acc) ->
-        case sets:is_element(FileNum, FileNumSet) of
-            true ->
-                %% Mark as pruned
-                ets:insert(?BLOCK_INDEX_ETS, {Hash, {FileNum, Offset, Size, pruned}});
-            false ->
-                ok
-        end;
-    (_, Acc) ->
-        Acc
-    end, ok, ?BLOCK_INDEX_ETS),
-    ok.
 
 %%% ===================================================================
 %%% Block height/time index functions
