@@ -754,6 +754,13 @@ check_transaction(#transaction{inputs = Inputs, outputs = Outputs} = Tx) ->
         Inputs =/= [] orelse throw(no_inputs),
         Outputs =/= [] orelse throw(no_outputs),
 
+        %% 1b. Core tx_check.cpp: the stripped (no-witness) size times
+        %% WITNESS_SCALE_FACTOR may not exceed MAX_BLOCK_WEIGHT
+        %% (bad-txns-oversize), checked before the outputs.
+        byte_size(beamchain_serialize:encode_transaction(Tx, no_witness))
+            * ?WITNESS_SCALE_FACTOR =< ?MAX_BLOCK_WEIGHT
+            orelse throw(oversize),
+
         %% 2. check serialized size is non-empty
         %% (implicit: we have inputs and outputs)
 
@@ -1119,21 +1126,24 @@ get_p2sh_redeem_script(<<16#4e:8, Len:32/little, Rest/binary>>, _Last) ->
             get_p2sh_redeem_script(Rest2, {ok, Data});
         _ -> error
     end;
-%% OP_1NEGATE (0x4f): push -1 (sign-magnitude: <<0x81>>)
-get_p2sh_redeem_script(<<16#4f:8, Rest/binary>>, _Last) ->
-    get_p2sh_redeem_script(Rest, {ok, <<16#81>>});
-%% OP_RESERVED (0x50): not a data push; Core's GetOp doesn't fill vData but
-%% 0x50 ≤ OP_16 (0x60) so Core does NOT return 0 here.  vData retains its
-%% previous value.  Mirror: keep Last unchanged.
-get_p2sh_redeem_script(<<16#50:8, Rest/binary>>, Last) ->
-    get_p2sh_redeem_script(Rest, Last);
-%% OP_1..OP_16 (0x51..0x60): push small integers 1..16
-get_p2sh_redeem_script(<<OpN:8, Rest/binary>>, _Last)
-        when OpN >= 16#51, OpN =< 16#60 ->
-    get_p2sh_redeem_script(Rest, {ok, <<(OpN - 16#50):8>>});
+%% OP_1NEGATE (0x4f), OP_RESERVED (0x50), OP_1..OP_16 (0x51..0x60): not
+%% data pushes. Core's GetScriptOp clears vData before it reads any opcode
+%% (script.cpp), so after one of these the "last push" is EMPTY, and an
+%% empty subscript has 0 sigops. They are <= OP_16, so Core does not
+%% return 0 early either.
+get_p2sh_redeem_script(<<Op:8, Rest/binary>>, _Last)
+        when Op >= 16#4f, Op =< 16#60 ->
+    get_p2sh_redeem_script(Rest, {ok, <<>>});
 %% Any opcode > 0x60: Core returns 0 immediately.  Map to not_pushonly.
 get_p2sh_redeem_script(<<Op:8, _Rest/binary>>, _Last) when Op > 16#60 ->
-    not_pushonly.
+    not_pushonly;
+%% OP_PUSHDATA1/2/4 whose length field is cut off by the end of the
+%% script (the clauses above match whenever it is complete): Core's GetOp
+%% fails and GetSigOpCount returns 0. Without this clause the function
+%% crashed with function_clause.
+get_p2sh_redeem_script(<<Op:8, _Rest/binary>>, _Last)
+        when Op =:= 16#4c; Op =:= 16#4d; Op =:= 16#4e ->
+    error.
 
 %% @doc Count witness sigops for a transaction.
 %% P2WPKH: 1 sigop
@@ -1151,7 +1161,15 @@ count_witness_sigops(#transaction{inputs = Inputs}, InputCoins) ->
                 %% check for P2SH-wrapped witness
                 case is_p2sh_script(ScriptPubKey) of
                     true ->
-                        case get_last_push(Input#tx_in.script_sig) of
+                        %% Core CountWitnessSigOps: only a push-only
+                        %% scriptSig (CScript::IsPushOnly) is looked into,
+                        %% and the subscript is the LAST GetOp's data.
+                        ScriptSig = Input#tx_in.script_sig,
+                        LastPush = case beamchain_script:is_push_only(ScriptSig) of
+                            true -> get_p2sh_redeem_script(ScriptSig);
+                            false -> error
+                        end,
+                        case LastPush of
                             {ok, RedeemScript} ->
                                 case classify_witness_program(RedeemScript) of
                                     {ok, V, P} ->
@@ -1159,7 +1177,7 @@ count_witness_sigops(#transaction{inputs = Inputs}, InputCoins) ->
                                     not_witness ->
                                         Acc
                                 end;
-                            error ->
+                            _ ->
                                 Acc
                         end;
                     false ->
@@ -1216,51 +1234,6 @@ classify_witness_program(<<OpN:8, Len:8, Program:Len/binary>>)
     {ok, OpN - 16#50, Program};
 classify_witness_program(_) ->
     not_witness.
-
-%% Get the last data push from a script (used to extract P2SH redeem script)
-get_last_push(Script) ->
-    get_last_push(Script, error).
-
-get_last_push(<<>>, Last) -> Last;
-%% direct push: 1-75 bytes
-get_last_push(<<N:8, Rest/binary>>, _Last) when N >= 1, N =< 75 ->
-    case Rest of
-        <<Data:N/binary, Rest2/binary>> ->
-            get_last_push(Rest2, {ok, Data});
-        _ -> error
-    end;
-%% OP_PUSHDATA1
-get_last_push(<<16#4c:8, Len:8, Rest/binary>>, _Last) ->
-    case Rest of
-        <<Data:Len/binary, Rest2/binary>> ->
-            get_last_push(Rest2, {ok, Data});
-        _ -> error
-    end;
-%% OP_PUSHDATA2
-get_last_push(<<16#4d:8, Len:16/little, Rest/binary>>, _Last) ->
-    case Rest of
-        <<Data:Len/binary, Rest2/binary>> ->
-            get_last_push(Rest2, {ok, Data});
-        _ -> error
-    end;
-%% OP_PUSHDATA4
-get_last_push(<<16#4e:8, Len:32/little, Rest/binary>>, _Last) ->
-    case Rest of
-        <<Data:Len/binary, Rest2/binary>> ->
-            get_last_push(Rest2, {ok, Data});
-        _ -> error
-    end;
-%% OP_0: pushes empty
-get_last_push(<<16#00:8, Rest/binary>>, _Last) ->
-    get_last_push(Rest, {ok, <<>>});
-%% OP_1NEGATE .. OP_16: small number pushes
-get_last_push(<<16#4f:8, Rest/binary>>, _Last) ->
-    get_last_push(Rest, {ok, <<16#81>>});
-get_last_push(<<OpN:8, Rest/binary>>, _Last) when OpN >= 16#51, OpN =< 16#60 ->
-    get_last_push(Rest, {ok, <<(OpN - 16#50):8>>});
-%% any other opcode: not a push, reset
-get_last_push(<<_:8, Rest/binary>>, Last) ->
-    get_last_push(Rest, Last).
 
 %%% -------------------------------------------------------------------
 %%% Connect block (full consensus validation + UTXO update)
@@ -1684,8 +1657,10 @@ bip34_canonical_chain_active(_Height, _Bip34Height, <<0:256>>) ->
     %% No canonical BIP34Hash configured — keep BIP30 enabled.
     false;
 bip34_canonical_chain_active(Height, Bip34Height, _Bip34Hash)
-  when Height < Bip34Height ->
-    %% Below BIP34 activation — BIP34 is not yet active.
+  when Height =< Bip34Height ->
+    %% Core asks pindex->pprev->GetAncestor(BIP34Height). For the block AT
+    %% BIP34Height pprev is one below it, so the ancestor is null and BIP30
+    %% stays enforced; it can only be skipped from BIP34Height + 1 on.
     false;
 bip34_canonical_chain_active(_Height, Bip34Height, Bip34Hash) ->
     %% At or past BIP34Height: walk the active chain to BIP34Height and

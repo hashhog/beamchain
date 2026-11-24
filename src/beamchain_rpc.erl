@@ -5017,6 +5017,7 @@ format_mempool_error(Reason, _Txid) ->
 -spec check_transaction_token(atom()) -> binary() | undefined.
 check_transaction_token(no_inputs)             -> <<"bad-txns-vin-empty">>;
 check_transaction_token(no_outputs)            -> <<"bad-txns-vout-empty">>;
+check_transaction_token(oversize)              -> <<"bad-txns-oversize">>;
 check_transaction_token(negative_output)       -> <<"bad-txns-vout-negative">>;
 check_transaction_token(output_too_large)      -> <<"bad-txns-vout-toolarge">>;
 check_transaction_token(total_output_overflow) -> <<"bad-txns-txouttotal-toolarge">>;
