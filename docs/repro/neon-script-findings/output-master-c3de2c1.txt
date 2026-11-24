@@ -1,0 +1,11 @@
+bitcoind: Bitcoin Core daemon version v31.1.0 bitcoind
+beamchain: master c3de2c1
+bare 5100634d68 (PUSHDATA2 + 1 length byte): core submitblock='block-script-verify-flag-failed (Opcode missing or not understood)' height=101 | beamchain submitblock=None height=102 | SPLIT
+P2WSH 5100634d68 (PUSHDATA2 + 1 length byte): core submitblock='block-script-verify-flag-failed (Opcode missing or not understood)' height=101 | beamchain submitblock=None height=102 | SPLIT
+bare 5100634e68 (PUSHDATA4 + 1 length byte): core submitblock='block-script-verify-flag-failed (Opcode missing or not understood)' height=101 | beamchain submitblock=None height=102 | SPLIT
+P2WSH 5100634e68 (PUSHDATA4 + 1 length byte): core submitblock='block-script-verify-flag-failed (Opcode missing or not understood)' height=101 | beamchain submitblock=None height=102 | SPLIT
+bare 5100634c (PUSHDATA1, no length byte): core submitblock='block-script-verify-flag-failed (Opcode missing or not understood)' height=101 | beamchain submitblock='block-script-verify-flag-failed' height=101 | AGREE
+P2WSH 5100634c (PUSHDATA1, no length byte): core submitblock='block-script-verify-flag-failed (Opcode missing or not understood)' height=101 | beamchain submitblock='block-script-verify-flag-failed' height=101 | AGREE
+control bare 5100634d0100aa68 (complete PUSHDATA2): core submitblock=None height=102 | beamchain submitblock=None height=102 | AGREE
+control P2WSH 5100634d0100aa68 (complete PUSHDATA2): core submitblock=None height=102 | beamchain submitblock=None height=102 | AGREE
+RESULT blocks: SPLIT
