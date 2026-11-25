@@ -130,6 +130,37 @@ f12_missing_block_entry_is_not_time_zero_test() ->
                           hdr_ts => 1700000000 + 10 * ?SPACING},
     with_layout(L, fun(C) -> ?assertNot(skip(C#{block_entry => not_found})) end).
 
+%% Condition 3 after a header rewind: a heavier fork whose header tip is
+%% BELOW the AV height. The height slot at the AV height still names AV
+%% (the old chain's header, left above the new header tip), but the best
+%% header chain does not reach it. Core: AV's ancestor at H is not F ->
+%% verify.
+f12_header_tip_below_av_stale_av_slot_verifies_scripts_test() ->
+    F = <<16#f1:256>>,
+    L = (base_layout(F))#{height => ?AV_HEIGHT - 3000, cw => ?AV_HEIGHT - 3000,
+                          ts => 1600000000,
+                          hdr_height => ?AV_HEIGHT - 10, hdr_cw => ?AV_HEIGHT + 100,
+                          hdr_ts => 1600000000 + 3000 * ?SPACING,
+                          best_at_av => av_hash()},
+    with_layout(L, fun(C) -> ?assertNot(skip(C)) end).
+
+%% Condition 6 needs the block's own index entry (its chainwork). When it
+%% cannot be found by hash, there is nothing to measure: verify. master
+%% read the height slot instead and, finding none, used timestamp 0.
+f12_block_own_entry_not_found_verifies_scripts_test() ->
+    B = <<16#c2:256>>,
+    L = base_layout(B),
+    with_layout(L, fun(C) ->
+        %% Only the header tip's entry is found; the block's own is not.
+        meck:expect(beamchain_header_chain, lookup,
+                    fun(H) when H =:= <<16#dd:256>> ->
+                            {ok, entry(H, ?AV_HEIGHT + 3000, ?AV_HEIGHT + 3000,
+                                       1500000000 + (?AV_HEIGHT + 3000 - 500000) * ?SPACING)};
+                       (_) -> not_found
+                    end),
+        ?assertNot(skip(C#{block_entry => not_found}))
+    end).
+
 %%% --- controls -----------------------------------------------------------
 
 %% On both chains, 403,000 blocks of work behind the header tip: skip.
