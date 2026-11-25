@@ -1,5 +1,5 @@
 bitcoind: Bitcoin Core daemon version v31.1.0 bitcoind
-beamchain: head fb7c359
+beamchain: head 1ad8878 (escript built from src tree bae7204, the src tree of 1ad8878)
 OP_RETURN OP_RESERVED (6a50): testmempoolaccept core allowed=True reason=None | beamchain allowed=True reason=None
 OP_RETURN OP_RESERVED (6a50): sendrawtransaction core=accept | beamchain=accept | AGREE
 control OP_RETURN OP_NOP (6a61): testmempoolaccept core allowed=False reason='scriptpubkey' | beamchain allowed=False reason='scriptpubkey'
