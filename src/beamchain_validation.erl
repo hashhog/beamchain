@@ -2237,6 +2237,13 @@ skip_scripts_eval(Height, BlockHash, Params, AVLookup, HdrTip, _BlockEntry) ->
                     false;
                 {ok, #{height := HdrHeight}} when HdrHeight < Height ->
                     false;
+                {ok, #{height := HdrHeight}} when HdrHeight < AVHeight ->
+                    %% The best header chain ends below AV, so it does not
+                    %% hold AV. (A height slot above the header tip can
+                    %% still name AV after a header rewind; never read it
+                    %% as the best chain's.) Core would skip only a common
+                    %% ancestor of both chains; beamchain verifies.
+                    false;
                 {ok, #{hash := HdrHash}} ->
                     %% Conditions 3 and 4. The best header chain's block at
                     %% Height must be this block (4). If that chain also
