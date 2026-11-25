@@ -44,6 +44,7 @@
 -export([incoming_chain_wins/2,
          classify_deep_fork/4,
          select_next_probe_peer/2]).
+-export([validate_one_header/2]).
 -endif.
 
 -define(SERVER, ?MODULE).
