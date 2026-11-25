@@ -35,6 +35,7 @@
 
 %% Contextual checks (need chain state)
 -export([contextual_check_block_header/3]).
+-export([block_version_check/3]).
 -export([median_time_past/1]).
 
 %% Contextual block checks
@@ -373,34 +374,11 @@ contextual_check_block_header(Header, PrevIndex, Params) ->
                 ok
         end,
 
-        %% 5. verify block version (BIP 34: version >= 2 after activation)
+        %% 5. verify block version (BIP 34/66/65 version floors).
         %% Reference: validation.cpp:4112-4118.
-        %% Uses buried deployment heights, same as Core's DeploymentActiveAfter
-        %% for DEPLOYMENT_HEIGHTINCB/DERSIG/CLTV.
-        Bip34Height = maps:get(bip34_height, Params, 0),
-        case Height >= Bip34Height of
-            true ->
-                Header#block_header.version >= 2
-                    orelse throw({bad_version, Header#block_header.version});
-            false -> ok
-        end,
-
-        %% BIP 66: version >= 3 after activation (DEPLOYMENT_DERSIG)
-        Bip66Height = maps:get(bip66_height, Params, 0),
-        case Height >= Bip66Height of
-            true ->
-                Header#block_header.version >= 3
-                    orelse throw({bad_version, Header#block_header.version});
-            false -> ok
-        end,
-
-        %% BIP 65: version >= 4 after activation (DEPLOYMENT_CLTV)
-        Bip65Height = maps:get(bip65_height, Params, 0),
-        case Height >= Bip65Height of
-            true ->
-                Header#block_header.version >= 4
-                    orelse throw({bad_version, Header#block_header.version});
-            false -> ok
+        case block_version_check(Height, Header#block_header.version, Params) of
+            ok -> ok;
+            BadVersion -> throw(BadVersion)
         end,
 
         ok
@@ -739,6 +717,23 @@ check_against_checkpoint(Height, BlockHash, Network) ->
                 true -> ok;
                 false -> {error, checkpoint_mismatch}
             end
+    end.
+
+%% @doc ContextualCheckBlockHeader's version floors (validation.cpp:
+%% 4112-4118): nVersion >= 2 from BIP34Height, >= 3 from BIP66Height, >= 4
+%% from BIP65Height (buried deployment heights, DeploymentActiveAfter).
+%% Height is the header's own height; nVersion is signed. Shared by block
+%% connection and P2P header sync. Returns ok or {bad_version, Version}.
+-spec block_version_check(non_neg_integer(), integer(), map()) ->
+    ok | {bad_version, integer()}.
+block_version_check(Height, Version, Params) ->
+    Floors = [{maps:get(bip34_height, Params, 0), 2},
+              {maps:get(bip66_height, Params, 0), 3},
+              {maps:get(bip65_height, Params, 0), 4}],
+    case lists:any(fun({ActiveAt, Min}) -> Height >= ActiveAt andalso Version < Min end,
+                   Floors) of
+        true -> {bad_version, Version};
+        false -> ok
     end.
 
 %%% -------------------------------------------------------------------
