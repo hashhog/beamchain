@@ -764,9 +764,11 @@ wtxid_index_correct() ->
 
 height_hash(H) -> <<H:256>>.
 
+%% Version 4: regtest's BIP34/66/65 heights are all 1, and header sync now
+%% refuses a lower version at receipt (bad-version), as Core does.
 mk_header(H) ->
     #block_header{
-        version     = 1,
+        version     = 4,
         prev_hash   = height_hash(H - 1),
         merkle_root = height_hash(H),
         timestamp   = 1296688602 + H,
