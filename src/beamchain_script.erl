@@ -3415,6 +3415,10 @@ is_push_only(<<?OP_PUSHDATA4, Len:32/little, Rest/binary>>) ->
     end;
 is_push_only(<<?OP_1NEGATE, Rest/binary>>) ->
     is_push_only(Rest);
+%% OP_RESERVED (0x50): Core's IsPushOnly only asks `opcode > OP_16`
+%% (script.cpp), so 0x50 counts. Executing it still fails (BAD_OPCODE).
+is_push_only(<<?OP_RESERVED, Rest/binary>>) ->
+    is_push_only(Rest);
 is_push_only(<<Op, Rest/binary>>) when Op >= ?OP_1, Op =< ?OP_16 ->
     is_push_only(Rest);
 is_push_only(_) ->
