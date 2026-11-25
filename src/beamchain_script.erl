@@ -642,6 +642,17 @@ execute(<<?OP_PUSHDATA2, Len:16/little, Rest/binary>>, Pos, State) ->
 execute(<<?OP_PUSHDATA4, Len:32/little, Rest/binary>>, Pos, State) ->
     execute_pushdata(Len, Rest, Pos + 5, inc_opcode_pos(State), pushdata4);
 
+%% --- OP_PUSHDATA1/2/4 whose length field is cut off ---
+%% The three clauses above match whenever the 1/2/4-byte length field is
+%% complete. Core's GetScriptOp (script.cpp) returns false when it is not,
+%% and EvalScript answers SCRIPT_ERR_BAD_OPCODE at once, before it looks at
+%% fExec (interpreter.cpp). So this fails inside an unexecuted IF branch
+%% too; the generic clause below would skip the 0x4c/0x4d/0x4e as a
+%% one-byte opcode and run the leftover length bytes as opcodes.
+execute(<<Op, _/binary>>, _Pos, _State)
+  when Op =:= ?OP_PUSHDATA1; Op =:= ?OP_PUSHDATA2; Op =:= ?OP_PUSHDATA4 ->
+    {error, bad_opcode};
+
 %% --- OP_1NEGATE ---
 execute(<<?OP_1NEGATE, Rest/binary>>, Pos, State) ->
     State0 = inc_opcode_pos(State),
@@ -2494,6 +2505,19 @@ valid_taproot_hash_type(HT) when is_integer(HT), HT >= 0, HT =< 16#ff ->
 valid_taproot_hash_type(_) ->
     false.
 
+%% Core CPubKey::CheckLowS (pubkey.cpp): parse with
+%% ecdsa_signature_parse_der_lax, then "low" iff
+%% secp256k1_ecdsa_signature_normalize reports nothing to normalise. The lax
+%% parser turns an R or S at or above the curve order N into the all-zero
+%% signature, whose S (0) is not high; S = 0 itself is not high either. So
+%% only N/2 < S < N with R < N is high. R and S are the DER integers'
+%% magnitudes (a sign byte, if any, is a leading zero).
+core_check_low_s(R, S) ->
+    N = 16#FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141,
+    RInt = binary:decode_unsigned(R, big),
+    SInt = binary:decode_unsigned(S, big),
+    RInt >= N orelse SInt >= N orelse SInt =< N bsr 1.
+
 %% @doc Check signature encoding (DER, LOW_S, STRICTENC) - returns ok or {error, Reason}.
 %% This consolidates all encoding checks done before signature verification.
 %%
@@ -2516,7 +2540,7 @@ check_sig_encoding(SigBody, HashTypeByte, PubKey, Flags) ->
                 0 -> true;
                 _ ->
                     case beamchain_crypto:decode_der_signature(SigBody) of
-                        {ok, {_R, S}} -> beamchain_crypto:is_low_s(S);
+                        {ok, {R, S}} -> core_check_low_s(R, S);
                         _ -> false
                     end
             end,
@@ -2864,6 +2888,13 @@ verify_witness_program(0, Program, Witness, Flags, SigChecker, _IsP2SH)
   when byte_size(Program) =:= 20 ->
     %% P2WPKH
     case Witness of
+        [Sig, PubKey] when byte_size(Sig) > ?MAX_SCRIPT_ELEMENT_SIZE;
+                           byte_size(PubKey) > ?MAX_SCRIPT_ELEMENT_SIZE ->
+            %% Core runs P2WPKH through ExecuteWitnessScript, which refuses
+            %% any initial witness stack element over MAX_SCRIPT_ELEMENT_SIZE
+            %% with SCRIPT_ERR_PUSH_SIZE before evaluating
+            %% (interpreter.cpp:1858-1861), as the P2WSH branch below does.
+            {error, push_size_exceeded};
         [Sig, PubKey] ->
             %% BIP 141: WITNESS_PUBKEYTYPE requires compressed pubkeys in witness v0
             case (Flags band ?SCRIPT_VERIFY_WITNESS_PUBKEYTYPE) =/= 0 andalso
