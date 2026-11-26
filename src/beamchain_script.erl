@@ -42,7 +42,13 @@
 -record(script_state, {
     stack = []        :: [binary()],
     altstack = []     :: [binary()],
-    exec_stack = []   :: [boolean()],   %% IF/ELSE nesting
+    %% IF/ELSE nesting as Core's ConditionStack (interpreter.cpp): the
+    %% depth plus the 0-based position of the first false entry (`none` if
+    %% every entry is true). Only those two facts are observable, and keeping
+    %% them instead of the list makes executing/1 O(1) per opcode. A list
+    %% walk there is O(depth), and tapscript has no opcode cap to bound the
+    %% depth (BIP-342), so deep OP_IF nesting cost O(N^2).
+    exec_stack = {0, none} :: {non_neg_integer(), none | non_neg_integer()},
     op_count = 0      :: non_neg_integer(),
     codesep_pos = 16#ffffffff :: non_neg_integer(),
     %% BYTE offset into `script` of the first byte AFTER the most-recently
@@ -386,9 +392,27 @@ is_compressed_pubkey(_) -> false.
 %%% Execution state helpers
 %%% -------------------------------------------------------------------
 
-executing(#script_state{exec_stack = []}) -> true;
-executing(#script_state{exec_stack = Stack}) ->
-    lists:all(fun(V) -> V end, Stack).
+executing(#script_state{exec_stack = {_, none}}) -> true;
+executing(#script_state{}) -> false.
+
+%% ConditionStack operations, as Core's push_back / pop_back / toggle_top.
+cond_push(true, {Size, FirstFalse}) -> {Size + 1, FirstFalse};
+cond_push(false, {Size, none}) -> {Size + 1, Size};
+cond_push(false, {Size, FirstFalse}) -> {Size + 1, FirstFalse}.
+
+cond_pop({Size, FirstFalse}) when Size > 0 ->
+    NewSize = Size - 1,
+    case FirstFalse of
+        NewSize -> {NewSize, none};      %% popped the first false: all true
+        _ -> {NewSize, FirstFalse}
+    end.
+
+%% Toggling an entry above the first false is unobservable, so only the
+%% all-true case and the case where the top is the first false change state.
+cond_toggle_top({Size, none}) when Size > 0 -> {Size, Size - 1};
+cond_toggle_top({Size, FirstFalse}) when Size > 0, FirstFalse =:= Size - 1 ->
+    {Size, none};
+cond_toggle_top({Size, FirstFalse}) when Size > 0 -> {Size, FirstFalse}.
 
 push(Value, #script_state{stack = Stack} = State) ->
     State#script_state{stack = [Value | Stack]}.
@@ -587,7 +611,7 @@ execute(_Script, _Pos, #script_state{opcode_pos = P, stack = S, altstack = A})
 
 execute(<<>>, _Pos, #script_state{exec_stack = ExecStack} = State) ->
     case ExecStack of
-        [] -> {ok, State#script_state.stack};
+        {0, _} -> {ok, State#script_state.stack};
         _ -> {error, unbalanced_conditional}
     end;
 
@@ -720,14 +744,14 @@ execute(<<?OP_NOTIF, Rest/binary>>, Pos, State) ->
 
 %% --- OP_ELSE ---
 execute(<<?OP_ELSE, _Rest/binary>>, _Pos,
-        #script_state{exec_stack = []} = _State) ->
+        #script_state{exec_stack = {0, _}} = _State) ->
     {error, unexpected_else};
 execute(<<?OP_ELSE, Rest/binary>>, Pos,
-        #script_state{exec_stack = [Top | ExRest]} = State) ->
+        #script_state{exec_stack = ExecStack} = State) ->
     case count_and_inc_op(State) of
         {ok, State1} ->
             State2 = State1#script_state{
-                exec_stack = [not Top | ExRest]
+                exec_stack = cond_toggle_top(ExecStack)
             },
             execute(Rest, Pos + 1, State2);
         Error -> Error
@@ -735,13 +759,13 @@ execute(<<?OP_ELSE, Rest/binary>>, Pos,
 
 %% --- OP_ENDIF ---
 execute(<<?OP_ENDIF, _Rest/binary>>, _Pos,
-        #script_state{exec_stack = []} = _State) ->
+        #script_state{exec_stack = {0, _}} = _State) ->
     {error, unexpected_endif};
 execute(<<?OP_ENDIF, Rest/binary>>, Pos,
-        #script_state{exec_stack = [_ | ExRest]} = State) ->
+        #script_state{exec_stack = ExecStack} = State) ->
     case count_and_inc_op(State) of
         {ok, State1} ->
-            State2 = State1#script_state{exec_stack = ExRest},
+            State2 = State1#script_state{exec_stack = cond_pop(ExecStack)},
             execute(Rest, Pos + 1, State2);
         Error -> Error
     end;
@@ -1086,7 +1110,8 @@ execute_if(ExpectTrue, Rest, Pos, State) ->
                                 true -> Bool;
                                 false -> not Bool
                             end,
-                            ExecStack = [Exec | State1#script_state.exec_stack],
+                            ExecStack = cond_push(Exec,
+                                State1#script_state.exec_stack),
                             execute(Rest, Pos,
                                     State1#script_state{exec_stack = ExecStack})
                     end;
@@ -1094,7 +1119,7 @@ execute_if(ExpectTrue, Rest, Pos, State) ->
             end;
         false ->
             %% not executing, just push false onto exec stack
-            ExecStack = [false | State#script_state.exec_stack],
+            ExecStack = cond_push(false, State#script_state.exec_stack),
             execute(Rest, Pos, State#script_state{exec_stack = ExecStack})
     end.
 
