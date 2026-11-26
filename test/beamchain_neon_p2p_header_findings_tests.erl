@@ -23,7 +23,12 @@ validate(Header, State) ->
 %% A regtest header-sync state whose tip is genesis, and a header for
 %% height 1 (BIP34/66/65 heights are all 1 on regtest) mined on top.
 with_regtest_tip(Fun) ->
-    Params = beamchain_chain_params:params(regtest),
+    with_tip(#{}, Fun).
+
+%% Same, with some regtest params overridden (activation heights). The
+%% header under test is at height 1.
+with_tip(Overrides, Fun) ->
+    Params = maps:merge(beamchain_chain_params:params(regtest), Overrides),
     #block{header = GH} = maps:get(genesis_block, Params),
     GHash = beamchain_serialize:block_hash(GH),
     ok = meck:new(beamchain_db, [passthrough, non_strict]),
@@ -83,3 +88,47 @@ f14_control_version_4_and_bip9_accepted_test() ->
         ?assertMatch({ok, _}, validate(mined(G, 4), S)),
         ?assertMatch({ok, _}, validate(mined(G, 16#20000000), S))
     end).
+
+%%% Controls for the other direction: a header BELOW an activation height
+%%% keeps an old version. Every mainnet header below 227,931 is version 1,
+%%% so a floor applied too early would stall IBD from genesis. The header
+%%% under test is at height 1; the overrides put the activation heights
+%%% above it.
+
+%% Below all three floors: versions 1, 2 and 3 are accepted.
+f14_control_old_versions_below_activation_accepted_test() ->
+    with_tip(#{bip34_height => 100, bip66_height => 200, bip65_height => 300},
+             fun(G, S) ->
+                 [?assertMatch({ok, _}, validate(mined(G, V), S)) || V <- [1, 2, 3]]
+             end).
+
+%% Each floor starts at its own height: with BIP34 active and BIP66/BIP65
+%% not yet, version 2 is accepted (and version 1 is not); with BIP34 and
+%% BIP66 active and BIP65 not yet, version 3 is accepted (and 2 is not).
+f14_control_only_active_floors_accept_test() ->
+    with_tip(#{bip34_height => 1, bip66_height => 100, bip65_height => 200},
+             fun(G, S) -> ?assertMatch({ok, _}, validate(mined(G, 2), S)) end),
+    with_tip(#{bip34_height => 1, bip66_height => 1, bip65_height => 100},
+             fun(G, S) -> ?assertMatch({ok, _}, validate(mined(G, 3), S)) end).
+
+f14_each_floor_refuses_at_its_own_height_test() ->
+    with_tip(#{bip34_height => 1, bip66_height => 100, bip65_height => 200},
+             fun(G, S) ->
+                 ?assertEqual({error, {bad_version, 1}}, validate(mined(G, 1), S))
+             end),
+    with_tip(#{bip34_height => 1, bip66_height => 1, bip65_height => 100},
+             fun(G, S) ->
+                 ?assertEqual({error, {bad_version, 2}}, validate(mined(G, 2), S))
+             end).
+
+%% The floors read these keys; a missing key would default to height 0 and
+%% enforce version 4 everywhere. Core v31.1 kernel/chainparams.cpp heights.
+f14_control_network_activation_heights_test() ->
+    H = fun(N) ->
+            P = beamchain_chain_params:params(N),
+            {maps:get(bip34_height, P), maps:get(bip66_height, P),
+             maps:get(bip65_height, P)}
+        end,
+    ?assertEqual({227931, 363725, 388381}, H(mainnet)),
+    ?assertEqual({21111, 330776, 581885}, H(testnet)),
+    [?assertEqual({1, 1, 1}, H(N)) || N <- [testnet4, signet, regtest]].
