@@ -172,3 +172,56 @@ f18_oversize_maps_to_core_token_test() ->
 %% Control: exactly 1,000,000 stripped bytes is allowed (> not >=).
 f18_control_max_size_tx_ok_test() ->
     ?assertEqual(ok, beamchain_validation:check_transaction(oversize_tx(1000000))).
+
+%%% F18 at block level. Core's CheckBlock (validation.cpp) checks the size
+%%% limits ("bad-blk-length": stripped block size * 4 > MAX_BLOCK_WEIGHT)
+%%% right after the merkle root and BEFORE CheckTransaction runs on each tx.
+%%% So a block holding an oversize tx is bad-blk-length, never a per-tx
+%%% bad-txns-oversize: the new CheckTransaction rule must not change the
+%%% block's reason (P2P treats bad_blk_length as a consensus verdict).
+
+f18_block(Txs) ->
+    Root = beamchain_serialize:compute_merkle_root(
+             [beamchain_serialize:tx_hash(T) || T <- Txs]),
+    Hdr = #block_header{version = 4, prev_hash = <<1:256>>,
+                        merkle_root = Root, timestamp = 1700000000,
+                        bits = 16#207fffff, nonce = 0},
+    #block{header = Hdr, transactions = Txs}.
+
+f18_coinbase() ->
+    #transaction{version = 1,
+                 inputs = [#tx_in{prev_out = #outpoint{hash = <<0:256>>,
+                                                       index = 16#ffffffff},
+                                  script_sig = <<1, 100, 0>>,
+                                  sequence = 16#ffffffff, witness = []}],
+                 outputs = [#tx_out{value = 50 * 100000000,
+                                    script_pubkey = <<16#51>>}],
+                 locktime = 0}.
+
+check_block_nopow(Block) ->
+    beamchain_validation:check_block(
+      Block, beamchain_chain_params:params(regtest), false, false).
+
+f18_block_with_oversize_tx_is_bad_blk_length_test() ->
+    ?assertEqual({error, bad_blk_length},
+                 check_block_nopow(f18_block([f18_coinbase(),
+                                              oversize_tx(1000001)]))).
+
+%% Core runs the size limits before the coinbase checks too: an oversize
+%% block whose first tx is not a coinbase is still bad-blk-length.
+f18_oversize_block_without_coinbase_is_bad_blk_length_test() ->
+    ?assertEqual({error, bad_blk_length},
+                 check_block_nopow(f18_block([oversize_tx(1000001)]))).
+
+%% Control: under the size limit, a bad tx is still reported per tx.
+f18_control_small_block_bad_tx_still_per_tx_test() ->
+    Bad = tx_with_script_sig(<<>>, []),
+    [Out] = Bad#transaction.outputs,
+    ?assertEqual({error, {bad_tx, negative_output}},
+                 check_block_nopow(f18_block([f18_coinbase(),
+                     Bad#transaction{outputs = [Out#tx_out{value = -1}]}]))).
+
+%% Control: a small valid-shaped block passes check_block.
+f18_control_small_block_ok_test() ->
+    ?assertEqual(ok, check_block_nopow(
+                       f18_block([f18_coinbase(), tx_with_script_sig(<<>>, [])]))).
