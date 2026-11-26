@@ -747,7 +747,12 @@ decode_hashes(N, <<H:32/binary, Rest/binary>>, Acc) ->
 decode_headers_list(0, Rest, Acc) -> {lists:reverse(Acc), Rest};
 decode_headers_list(N, Bin, Acc) ->
     {Header, Rest} = beamchain_serialize:decode_block_header(Bin),
-    {_TxCount, Rest2} = beamchain_serialize:decode_varint(Rest),
+    %% Core reads the tx count with ReadCompactSize and ignores its value;
+    %% a non-canonical or oversized CompactSize throws and the message is
+    %% dropped. decode_varint/1 returns {error, _} for those, which used to
+    %% bind Rest2 to the atom and, on the last header, pass as success.
+    {TxCount, Rest2} = beamchain_serialize:decode_varint(Rest),
+    true = is_integer(TxCount),
     decode_headers_list(N - 1, Rest2, [Header | Acc]).
 
 %%% ===================================================================
