@@ -3491,6 +3491,11 @@ verify_script_policy_error(ScriptSig, ScriptPubKey, Witness, Flags,
             throw({system_fault, {script_internal, D}})
     end.
 
+%% Core v31.1 policy/policy.h STANDARD_SCRIPT_VERIFY_FLAGS: the mandatory
+%% (block) flags plus every policy-only flag, including the three taproot
+%% upgrade-discouragement flags (unknown leaf version, OP_SUCCESSx, unknown
+%% tapscript pubkey type). PolicyScriptChecks (validation.cpp) checks every
+%% input under exactly this set.
 all_standard_flags() ->
     ?SCRIPT_VERIFY_P2SH bor
     ?SCRIPT_VERIFY_STRICTENC bor
@@ -3508,7 +3513,10 @@ all_standard_flags() ->
     ?SCRIPT_VERIFY_NULLFAIL bor
     ?SCRIPT_VERIFY_WITNESS_PUBKEYTYPE bor
     ?SCRIPT_VERIFY_CONST_SCRIPTCODE bor
-    ?SCRIPT_VERIFY_TAPROOT.
+    ?SCRIPT_VERIFY_TAPROOT bor
+    ?SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION bor
+    ?SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS bor
+    ?SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE.
 
 %%% ===================================================================
 %%% Internal: coinbase maturity check
