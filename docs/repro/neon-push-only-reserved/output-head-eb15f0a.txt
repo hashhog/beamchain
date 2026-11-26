@@ -1,0 +1,11 @@
+bitcoind: Bitcoin Core daemon version v31.1.0 bitcoind
+beamchain: head eb15f0a (merged branch)
+OP_RETURN OP_RESERVED (6a50): testmempoolaccept core allowed=True reason=None | beamchain allowed=True reason=None
+OP_RETURN OP_RESERVED (6a50): sendrawtransaction core=accept | beamchain=accept | AGREE
+control OP_RETURN OP_NOP (6a61): testmempoolaccept core allowed=False reason='scriptpubkey' | beamchain allowed=False reason='scriptpubkey'
+control OP_RETURN OP_NOP (6a61): sendrawtransaction core=reject: scriptpubkey | beamchain=reject: scriptpubkey | AGREE
+control OP_RETURN OP_1 (6a51): testmempoolaccept core allowed=True reason=None | beamchain allowed=True reason=None
+control OP_RETURN OP_1 (6a51): sendrawtransaction core=accept | beamchain=accept | AGREE
+decodescript 6a50: core type=nulldata | beamchain type=nulldata | AGREE
+decodescript 6a61: core type=nonstandard | beamchain type=nonstandard | AGREE
+RESULT mempool/decodescript: AGREE
