@@ -853,18 +853,19 @@ decode_der_lax(Sig) ->
 decode_der_lax_impl(Sig) when byte_size(Sig) < 1 ->
     {error, too_short};
 decode_der_lax_impl(<<16#30, Rest/binary>>) ->
-    %% Read compound length (skip it, don't validate)
-    {_CompoundLen, Rest2} = read_der_length(Rest),
+    %% Core ecdsa_signature_parse_der_lax (pubkey.cpp): the compound length
+    %% is skipped, never read; each integer length may be any long form.
+    {ok, Rest2} = skip_der_compound_length(Rest),
     %% Read R integer
     case Rest2 of
         <<16#02, Rest3/binary>> ->
-            {RLen, Rest4} = read_der_length(Rest3),
+            {ok, RLen, Rest4} = read_der_int_length(Rest3),
             case Rest4 of
                 <<RBytes:RLen/binary, Rest5/binary>> ->
                     %% Read S integer
                     case Rest5 of
                         <<16#02, Rest6/binary>> ->
-                            {SLen, Rest7} = read_der_length(Rest6),
+                            {ok, SLen, Rest7} = read_der_int_length(Rest6),
                             case Rest7 of
                                 <<SBytes:SLen/binary, _/binary>> ->
                                     R = lax_int_to_unsigned(RBytes),
@@ -888,17 +889,33 @@ decode_der_lax_impl(<<16#30, Rest/binary>>) ->
 decode_der_lax_impl(_) ->
     {error, missing_sequence_tag}.
 
-%% Read a DER length field (handles 1-byte and multi-byte forms)
-read_der_length(<<>>) -> {0, <<>>};
-read_der_length(<<Len, Rest/binary>>) when Len < 16#80 ->
-    {Len, Rest};
-read_der_length(<<16#81, Len, Rest/binary>>) ->
-    {Len, Rest};
-read_der_length(<<16#82, Len:16/big, Rest/binary>>) ->
-    {Len, Rest};
-read_der_length(<<_, Rest/binary>>) ->
-    %% Fallback: treat as zero length
-    {0, Rest}.
+%% Compound (sequence) length. Core: a byte with the 0x80 bit set means
+%% "skip the next (byte - 0x80) bytes", which must be present; the value is
+%% never used. Any badmatch here is caught by decode_der_lax/1.
+skip_der_compound_length(<<Len, Rest/binary>>) when Len < 16#80 ->
+    {ok, Rest};
+skip_der_compound_length(<<Len, Rest/binary>>) ->
+    K = Len - 16#80,
+    <<_:K/binary, Rest2/binary>> = Rest,
+    {ok, Rest2}.
+
+%% Integer (R or S) length. Core: short form is the length itself; long
+%% form 0x80+K takes the next K bytes (which must be present), drops their
+%% leading zero bytes, and fails if 4 or more bytes are left, otherwise
+%% reads them big-endian. So 0x83 00 00 20 is a 32-byte length, and 0x80
+%% is a zero length.
+read_der_int_length(<<Len, Rest/binary>>) when Len < 16#80 ->
+    {ok, Len, Rest};
+read_der_int_length(<<Len, Rest/binary>>) ->
+    K = Len - 16#80,
+    <<LenBytes:K/binary, Rest2/binary>> = Rest,
+    case strip_all_leading_zeros(LenBytes) of
+        <<>> -> {ok, 0, Rest2};
+        Sig when byte_size(Sig) < 4 -> {ok, binary:decode_unsigned(Sig, big), Rest2}
+    end.
+
+strip_all_leading_zeros(<<0, Rest/binary>>) -> strip_all_leading_zeros(Rest);
+strip_all_leading_zeros(Bin) -> Bin.
 
 %% Convert a lax DER integer (possibly with padding/negative) to unsigned binary.
 %% Strips leading zero bytes but preserves at least 1 byte if non-zero.
