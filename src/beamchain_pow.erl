@@ -61,8 +61,10 @@ target_to_bits(Target) ->
             M = (B1 bsl 16) bor (B2 bsl 8) bor B3,
             {M, Size};
         false ->
-            %% pad to 3 bytes
-            Padded = <<0:((3 - Size) * 8), Bytes/binary>>,
+            %% Core GetCompact: nCompact = GetLow64() << 8 * (3 - nSize),
+            %% i.e. the 1- or 2-byte target goes in the HIGH mantissa bytes
+            %% (zero bytes appended, not prepended).
+            Padded = <<Bytes/binary, 0:((3 - Size) * 8)>>,
             <<B1:8, B2:8, B3:8>> = Padded,
             M = (B1 bsl 16) bor (B2 bsl 8) bor B3,
             {M, Size}
