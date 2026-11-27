@@ -1,0 +1,5 @@
+{
+  "decision": "reject",
+  "error_code": "",
+  "notes": "T2 spends a bare scriptPubKey 5100634d68 (verify-neon-beamchain-findings F1). Core v31.1 verdict: see ../README.md."
+}

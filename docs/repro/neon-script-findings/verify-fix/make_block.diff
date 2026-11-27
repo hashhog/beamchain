@@ -1,0 +1,4 @@
+1191c1191
+<                 script_pubkey=b"\x7e",  # raw OP_CAT (disabled opcode)
+---
+>                 script_pubkey=bytes.fromhex(os.environ["BARE_SPK_HEX"]),  # verify-neon-beamchain-findings F1: local copy, bytes from $BARE_SPK_HEX
