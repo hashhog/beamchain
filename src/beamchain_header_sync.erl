@@ -44,6 +44,7 @@
 -export([incoming_chain_wins/2,
          classify_deep_fork/4,
          select_next_probe_peer/2]).
+-export([validate_one_header/2]).
 -endif.
 
 -define(SERVER, ?MODULE).
@@ -1471,6 +1472,15 @@ validate_one_header(Header, #state{tip_height = TipHeight,
 
         %% 7. BIP94 (testnet4): first block of retarget period
         check_bip94(NewHeight, Header, State),
+
+        %% 7b. BIP34/66/65 version floors. Core's AcceptBlockHeader runs
+        %% ContextualCheckBlockHeader on every received header, so a header
+        %% below a floor is bad-version before it is indexed.
+        case beamchain_validation:block_version_check(
+               NewHeight, Header#block_header.version, Params) of
+            ok -> ok;
+            BadVersion -> throw(BadVersion)
+        end,
 
         %% 8. Calculate chainwork
         BlockWork = beamchain_pow:compute_work(Header#block_header.bits),
