@@ -170,23 +170,23 @@ g4_max_standard_scriptsig_size_test_() ->
 %%% ===================================================================
 
 g5_bug5_is_push_only_rejects_op_reserved_test_() ->
-    {"G5: BUG-5 (MEDIUM) — Core's CScript::IsPushOnly accepts OP_RESERVED "
-     "(0x50) as push-only because `if (opcode > OP_16) return false;` and "
-     "0x50 < OP_16 (0x60). beamchain's is_push_only/1 has no clause for "
-     "0x50 and returns false. A scriptSig containing OP_RESERVED is "
-     "incorrectly rejected as scriptsig_not_pushonly in beamchain.",
+    {"G5: FIXED (Neon finding 7, 2026-11-24) — Core's CScript::IsPushOnly "
+     "accepts OP_RESERVED (0x50) as push-only because `if (opcode > OP_16) "
+     "return false;` and 0x50 < OP_16 (0x60). beamchain's is_push_only/1 now "
+     "has that clause, so a scriptSig holding OP_RESERVED passes the "
+     "scriptsig-not-pushonly check (it still fails when executed).",
      [
       ?_test(begin
-         %% Today: beamchain says OP_RESERVED is NOT push-only.
-         ?assertEqual(false, beamchain_script:is_push_only(<<16#50>>)),
-         %% A scriptSig of just OP_RESERVED — beamchain rejects.
+         ?assertEqual(true, beamchain_script:is_push_only(<<16#50>>)),
+         %% A scriptSig of just OP_RESERVED is push-only: IsStandardTx passes.
          Tx = make_tx_with_scriptsig(<<16#50>>),
-         ?assertThrow(scriptsig_not_pushonly,
-                      beamchain_mempool:check_standard(Tx)),
+         ?assertEqual(ok, beamchain_mempool:check_standard(Tx)),
          %% Sanity: legitimately push-only data still works.
          ?assertEqual(true, beamchain_script:is_push_only(<<>>)),
          ?assertEqual(true, beamchain_script:is_push_only(<<16#51>>)), %% OP_1
-         ?assertEqual(true, beamchain_script:is_push_only(<<16#60>>))  %% OP_16
+         ?assertEqual(true, beamchain_script:is_push_only(<<16#60>>)), %% OP_16
+         %% ...and the first opcode above OP_16 is still not.
+         ?assertEqual(false, beamchain_script:is_push_only(<<16#61>>))
        end)
      ]}.
 

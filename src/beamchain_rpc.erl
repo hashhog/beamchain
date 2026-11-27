@@ -9196,6 +9196,8 @@ ds_is_push_only(<<16#00, Rest/binary>>) ->            %% OP_0
     ds_is_push_only(Rest);
 ds_is_push_only(<<16#4f, Rest/binary>>) ->            %% OP_1NEGATE
     ds_is_push_only(Rest);
+ds_is_push_only(<<16#50, Rest/binary>>) ->            %% OP_RESERVED (<= OP_16)
+    ds_is_push_only(Rest);
 ds_is_push_only(<<Op, Rest/binary>>) when Op >= 16#51, Op =< 16#60 ->  %% OP_1..OP_16
     ds_is_push_only(Rest);
 ds_is_push_only(<<16#4c, Len:8, Data:Len/binary, Rest/binary>>) ->    %% OP_PUSHDATA1
